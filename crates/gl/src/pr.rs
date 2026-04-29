@@ -128,18 +128,56 @@ pub enum PrCmd {
 
 pub async fn run(args: PrArgs) -> Result<()> {
     match args.cmd {
-        PrCmd::Create { repo, head, base, title, body, owner, node, dir } =>
-            cmd_create(repo, head, base, title, body, owner, node, dir).await,
+        PrCmd::Create {
+            repo,
+            head,
+            base,
+            title,
+            body,
+            owner,
+            node,
+            dir,
+        } => cmd_create(repo, head, base, title, body, owner, node, dir).await,
         PrCmd::List { repo, node, dir } => cmd_list(repo, node, dir).await,
-        PrCmd::View { repo, number, node, dir } => cmd_view(repo, number, node, dir).await,
-        PrCmd::Diff { repo, number, node, dir } => cmd_diff(repo, number, node, dir).await,
-        PrCmd::Merge { repo, number, node, dir } => cmd_merge(repo, number, node, dir).await,
-        PrCmd::Review { repo, number, status, body, node, dir } =>
-            cmd_review(repo, number, status, body, node, dir).await,
-        PrCmd::Comment { repo, number, body, node, dir } =>
-            cmd_comment(repo, number, body, node, dir).await,
-        PrCmd::Comments { repo, number, node, dir } =>
-            cmd_comments(repo, number, node, dir).await,
+        PrCmd::View {
+            repo,
+            number,
+            node,
+            dir,
+        } => cmd_view(repo, number, node, dir).await,
+        PrCmd::Diff {
+            repo,
+            number,
+            node,
+            dir,
+        } => cmd_diff(repo, number, node, dir).await,
+        PrCmd::Merge {
+            repo,
+            number,
+            node,
+            dir,
+        } => cmd_merge(repo, number, node, dir).await,
+        PrCmd::Review {
+            repo,
+            number,
+            status,
+            body,
+            node,
+            dir,
+        } => cmd_review(repo, number, status, body, node, dir).await,
+        PrCmd::Comment {
+            repo,
+            number,
+            body,
+            node,
+            dir,
+        } => cmd_comment(repo, number, body, node, dir).await,
+        PrCmd::Comments {
+            repo,
+            number,
+            node,
+            dir,
+        } => cmd_comments(repo, number, node, dir).await,
     }
 }
 
@@ -156,7 +194,9 @@ fn detect_remote_owner() -> Option<String> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let url = String::from_utf8(out.stdout).ok()?;
     let rest = url.trim().strip_prefix("gitlawb://")?;
     let slash = rest.rfind('/')?;
@@ -166,8 +206,14 @@ fn detect_remote_owner() -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_create(
-    repo: String, head: String, base: String, title: String,
-    body: Option<String>, owner_override: Option<String>, node: String, dir: Option<PathBuf>,
+    repo: String,
+    head: String,
+    base: String,
+    title: String,
+    body: Option<String>,
+    owner_override: Option<String>,
+    node: String,
+    dir: Option<PathBuf>,
 ) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     // Priority: --owner flag > git remote origin > caller's own DID
@@ -183,7 +229,9 @@ async fn cmd_create(
         "target_branch": base,
     }))?;
 
-    let resp = client.post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &payload).await
+    let resp = client
+        .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &payload)
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let pr: Value = resp.json().await.context("invalid JSON")?;
@@ -206,8 +254,12 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, None);
 
-    let resp: Value = client.get(&format!("/api/v1/repos/{owner}/{repo}/pulls")).await?
-        .json().await.context("invalid JSON")?;
+    let resp: Value = client
+        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
 
     let prs = resp["pulls"].as_array().cloned().unwrap_or_default();
     if prs.is_empty() {
@@ -223,8 +275,17 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         let source = pr["source_branch"].as_str().unwrap_or("?");
         let target = pr["target_branch"].as_str().unwrap_or("?");
         let author = pr["author_did"].as_str().unwrap_or("?");
-        let author_short = author.split(':').next_back().map(|s| &s[..s.len().min(8)]).unwrap_or("?");
-        let status_icon = match status { "open" => "○", "merged" => "✓", "closed" => "✗", _ => "?" };
+        let author_short = author
+            .split(':')
+            .next_back()
+            .map(|s| &s[..s.len().min(8)])
+            .unwrap_or("?");
+        let status_icon = match status {
+            "open" => "○",
+            "merged" => "✓",
+            "closed" => "✗",
+            _ => "?",
+        };
         println!("  {status_icon} #{number}  {title}");
         println!("     {source} → {target}  by {author_short}");
         println!();
@@ -237,8 +298,12 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, None);
 
-    let pr: Value = client.get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}")).await?
-        .json().await.context("invalid JSON")?;
+    let pr: Value = client
+        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
 
     let title = pr["title"].as_str().unwrap_or("?");
     let status = pr["status"].as_str().unwrap_or("?");
@@ -256,31 +321,57 @@ async fn cmd_view(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     }
 
     // Show reviews
-    let reviews: Value = client.get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews")).await?
-        .json().await.context("invalid JSON")?;
+    let reviews: Value = client
+        .get(&format!(
+            "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
+        ))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
     let reviews = reviews["reviews"].as_array().cloned().unwrap_or_default();
     if !reviews.is_empty() {
         println!("\nReviews ({}):", reviews.len());
         for r in &reviews {
             let reviewer = r["reviewer_did"].as_str().unwrap_or("?");
-            let reviewer_short = reviewer.split(':').next_back().map(|s| &s[..s.len().min(8)]).unwrap_or("?");
+            let reviewer_short = reviewer
+                .split(':')
+                .next_back()
+                .map(|s| &s[..s.len().min(8)])
+                .unwrap_or("?");
             let rstatus = r["status"].as_str().unwrap_or("?");
             let rbody = r["body"].as_str().unwrap_or("");
-            let icon = match rstatus { "approved" => "✓", "changes_requested" => "✗", _ => "·" };
+            let icon = match rstatus {
+                "approved" => "✓",
+                "changes_requested" => "✗",
+                _ => "·",
+            };
             println!("  {icon} {reviewer_short}: {rstatus}");
-            if !rbody.is_empty() { println!("    {rbody}"); }
+            if !rbody.is_empty() {
+                println!("    {rbody}");
+            }
         }
     }
 
     // Show comments
-    let comments: Value = client.get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/comments")).await?
-        .json().await.context("invalid JSON")?;
+    let comments: Value = client
+        .get(&format!(
+            "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
+        ))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
     let comments = comments["comments"].as_array().cloned().unwrap_or_default();
     if !comments.is_empty() {
         println!("\nComments ({}):", comments.len());
         for c in &comments {
             let author = c["author_did"].as_str().unwrap_or("?");
-            let author_short = author.split(':').next_back().map(|s| &s[..s.len().min(8)]).unwrap_or("?");
+            let author_short = author
+                .split(':')
+                .next_back()
+                .map(|s| &s[..s.len().min(8)])
+                .unwrap_or("?");
             let cbody = c["body"].as_str().unwrap_or("");
             let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
             println!("  · {author_short} ({created})");
@@ -295,8 +386,12 @@ async fn cmd_diff(repo: String, number: u64, node: String, dir: Option<PathBuf>)
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, None);
 
-    let resp: Value = client.get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff")).await?
-        .json().await.context("invalid JSON")?;
+    let resp: Value = client
+        .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
 
     let diff = resp["diff"].as_str().unwrap_or("");
     if diff.is_empty() {
@@ -313,7 +408,12 @@ async fn cmd_merge(repo: String, number: u64, node: String, dir: Option<PathBuf>
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&serde_json::json!({}))?;
-    let resp = client.post(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"), &body).await
+    let resp = client
+        .post(
+            &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
+            &body,
+        )
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let result: Value = resp.json().await.context("invalid JSON")?;
@@ -330,8 +430,12 @@ async fn cmd_merge(repo: String, number: u64, node: String, dir: Option<PathBuf>
 }
 
 async fn cmd_review(
-    repo: String, number: u64, status: String, body: Option<String>,
-    node: String, dir: Option<PathBuf>,
+    repo: String,
+    number: u64,
+    status: String,
+    body: Option<String>,
+    node: String,
+    dir: Option<PathBuf>,
 ) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
@@ -342,7 +446,12 @@ async fn cmd_review(
         "body": body,
     }))?;
 
-    let resp = client.post(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"), &payload).await
+    let resp = client
+        .post(
+            &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
+            &payload,
+        )
+        .await
         .context("failed to connect to node")?;
     let code = resp.status();
     let result: Value = resp.json().await.context("invalid JSON")?;
@@ -352,21 +461,33 @@ async fn cmd_review(
         anyhow::bail!("review failed ({code}): {msg}");
     }
 
-    let icon = match status.as_str() { "approved" => "✓", "changes_requested" => "✗", _ => "·" };
+    let icon = match status.as_str() {
+        "approved" => "✓",
+        "changes_requested" => "✗",
+        _ => "·",
+    };
     println!("{icon} Review submitted: {status} on PR #{number}");
     Ok(())
 }
 
 async fn cmd_comment(
-    repo: String, number: u64, body: String,
-    node: String, dir: Option<PathBuf>,
+    repo: String,
+    number: u64,
+    body: String,
+    node: String,
+    dir: Option<PathBuf>,
 ) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, Some(keypair));
 
     let payload = serde_json::to_vec(&serde_json::json!({ "body": body }))?;
-    let resp = client.post(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"), &payload).await
+    let resp = client
+        .post(
+            &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"),
+            &payload,
+        )
+        .await
         .context("failed to connect to node")?;
     let code = resp.status();
     let result: Value = resp.json().await.context("invalid JSON")?;
@@ -385,8 +506,14 @@ async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathB
     let owner = resolve_owner(&keypair);
     let client = NodeClient::new(&node, None);
 
-    let resp: Value = client.get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/comments")).await?
-        .json().await.context("invalid JSON")?;
+    let resp: Value = client
+        .get(&format!(
+            "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments"
+        ))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
 
     let comments = resp["comments"].as_array().cloned().unwrap_or_default();
     if comments.is_empty() {
@@ -397,7 +524,11 @@ async fn cmd_comments(repo: String, number: u64, node: String, dir: Option<PathB
     println!("Comments on PR #{number} ({} total)\n", comments.len());
     for c in &comments {
         let author = c["author_did"].as_str().unwrap_or("?");
-        let author_short = author.split(':').next_back().map(|s| &s[..s.len().min(8)]).unwrap_or("?");
+        let author_short = author
+            .split(':')
+            .next_back()
+            .map(|s| &s[..s.len().min(8)])
+            .unwrap_or("?");
         let cbody = c["body"].as_str().unwrap_or("");
         let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
         println!("  · {author_short} ({created})");
@@ -443,9 +574,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list("myrepo".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -465,9 +600,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list("myrepo".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -553,7 +692,9 @@ mod tests {
         let _m2 = server
             .mock(
                 "GET",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1/reviews$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/pulls/1/reviews$".to_string(),
+                ),
             )
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -563,7 +704,9 @@ mod tests {
         let _m3 = server
             .mock(
                 "GET",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string(),
+                ),
             )
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -571,9 +714,14 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_view("myrepo".to_string(), 1, server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_view(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -613,7 +761,9 @@ mod tests {
         let _m = server
             .mock(
                 "POST",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/99/comments$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/pulls/99/comments$".to_string(),
+                ),
             )
             .with_status(404)
             .with_header("content-type", "application/json")
@@ -642,7 +792,9 @@ mod tests {
         let _m = server
             .mock(
                 "GET",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/pulls/1/comments$".to_string(),
+                ),
             )
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -650,9 +802,14 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_comments("myrepo".to_string(), 1, server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_comments(
+            "myrepo".to_string(),
+            1,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -672,9 +829,14 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_comments("myrepo".to_string(), 2, server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_comments(
+            "myrepo".to_string(),
+            2,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -694,8 +856,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_merge("myrepo".to_string(), 2, server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_merge(
+            "myrepo".to_string(),
+            2,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 }

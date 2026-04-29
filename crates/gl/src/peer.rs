@@ -51,7 +51,11 @@ pub enum PeerCmd {
 pub async fn run(args: PeerArgs) -> Result<()> {
     match args.cmd {
         PeerCmd::List { node } => cmd_list(node).await,
-        PeerCmd::Add { peer_url, node, dir } => cmd_add(peer_url, node, dir).await,
+        PeerCmd::Add {
+            peer_url,
+            node,
+            dir,
+        } => cmd_add(peer_url, node, dir).await,
         PeerCmd::Ping { did, node } => cmd_ping(did, node).await,
         PeerCmd::Resolve { did, node } => cmd_resolve(did, node).await,
     }
@@ -59,7 +63,11 @@ pub async fn run(args: PeerArgs) -> Result<()> {
 
 async fn cmd_list(node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
-    let resp: Value = client.get("/api/v1/peers").await?.json().await
+    let resp: Value = client
+        .get("/api/v1/peers")
+        .await?
+        .json()
+        .await
         .context("failed to list peers")?;
 
     let peers = resp["peers"].as_array().cloned().unwrap_or_default();
@@ -76,7 +84,10 @@ async fn cmd_list(node: String) -> Result<()> {
         let did = peer["did"].as_str().unwrap_or("?");
         let url = peer["http_url"].as_str().unwrap_or("?");
         let reachable = peer["reachable"].as_bool().unwrap_or(false);
-        let last_seen = peer["last_seen"].as_str().map(|s| &s[..10]).unwrap_or("never");
+        let last_seen = peer["last_seen"]
+            .as_str()
+            .map(|s| &s[..10])
+            .unwrap_or("never");
         let status = if reachable { "✓" } else { "✗" };
         println!("  {status} {url}");
         println!("    did:  {did}");
@@ -92,9 +103,14 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
 
     // Fetch our node's public URL so we can announce it to the peer
     let local_client = NodeClient::new(&node, None);
-    let node_info: Value = local_client.get("/").await?.json().await
+    let node_info: Value = local_client
+        .get("/")
+        .await?
+        .json()
+        .await
         .context("failed to fetch local node info")?;
-    let my_url = node_info["public_url"].as_str()
+    let my_url = node_info["public_url"]
+        .as_str()
         .unwrap_or(&node)
         .to_string();
 
@@ -106,7 +122,9 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
 
     let remote_client = NodeClient::new(&peer_url, Some(keypair));
     let announce_path = "/api/v1/peers/announce";
-    let resp = remote_client.post(announce_path, &body).await
+    let resp = remote_client
+        .post(announce_path, &body)
+        .await
         .context("failed to connect to peer")?;
     let status = resp.status();
     let result: Value = resp.json().await.context("invalid JSON response")?;
@@ -143,12 +161,20 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
 async fn cmd_ping(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let path = format!("/api/v1/peers/{did}/ping");
-    let resp: Value = client.get(&path).await?.json().await
+    let resp: Value = client
+        .get(&path)
+        .await?
+        .json()
+        .await
         .context("failed to ping peer")?;
 
     let url = resp["http_url"].as_str().unwrap_or("?");
     let reachable = resp["reachable"].as_bool().unwrap_or(false);
-    let status = if reachable { "reachable" } else { "unreachable" };
+    let status = if reachable {
+        "reachable"
+    } else {
+        "unreachable"
+    };
 
     println!("Peer: {did}");
     println!("  URL:    {url}");
@@ -160,7 +186,11 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let encoded = urlencoding::encode(&did);
     let path = format!("/api/v1/resolve/{encoded}");
-    let resp: Value = client.get(&path).await?.json().await
+    let resp: Value = client
+        .get(&path)
+        .await?
+        .json()
+        .await
         .context("failed to resolve DID")?;
 
     let source = resp["source"].as_str().unwrap_or("not found");

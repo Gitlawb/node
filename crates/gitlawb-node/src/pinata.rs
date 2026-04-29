@@ -133,7 +133,11 @@ pub async fn pin_new_objects(
 
 fn list_all_objects(repo_path: &std::path::Path) -> Result<Vec<String>> {
     let out = std::process::Command::new("git")
-        .args(["cat-file", "--batch-all-objects", "--batch-check=%(objectname)"])
+        .args([
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ])
         .current_dir(repo_path)
         .output()
         .map_err(|e| anyhow::anyhow!("failed to run git cat-file: {e}"))?;
@@ -159,7 +163,14 @@ mod tests {
     #[tokio::test]
     async fn test_pin_skipped_when_jwt_empty() {
         let client = reqwest::Client::new();
-        let result = pin_object(&client, "https://uploads.pinata.cloud/v3/files", "", "deadbeef", b"data").await;
+        let result = pin_object(
+            &client,
+            "https://uploads.pinata.cloud/v3/files",
+            "",
+            "deadbeef",
+            b"data",
+        )
+        .await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "", "empty JWT must return empty CID");
     }
@@ -186,7 +197,10 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "pin should succeed: {result:?}");
-        assert_eq!(result.unwrap(), "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG");
+        assert_eq!(
+            result.unwrap(),
+            "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"
+        );
         _mock.assert_async().await;
     }
 
@@ -201,7 +215,14 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let result = pin_object(&client, &server.url(), "bad-jwt", "deadbeef00000000", b"data").await;
+        let result = pin_object(
+            &client,
+            &server.url(),
+            "bad-jwt",
+            "deadbeef00000000",
+            b"data",
+        )
+        .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("401"));
@@ -255,7 +276,14 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let result = pin_object(&client, &server.url(), "my-pinata-jwt", "deadbeef00000000", b"data").await;
+        let result = pin_object(
+            &client,
+            &server.url(),
+            "my-pinata-jwt",
+            "deadbeef00000000",
+            b"data",
+        )
+        .await;
 
         assert!(result.is_ok());
         _mock.assert_async().await;

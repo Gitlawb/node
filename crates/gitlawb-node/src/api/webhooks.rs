@@ -33,12 +33,17 @@ pub async fn create_webhook(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<CreateWebhookRequest>,
 ) -> Result<(StatusCode, Json<Webhook>)> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
     // Validate URL is http/https
     if !req.url.starts_with("http://") && !req.url.starts_with("https://") {
-        return Err(AppError::BadRequest("webhook URL must be http:// or https://".into()));
+        return Err(AppError::BadRequest(
+            "webhook URL must be http:// or https://".into(),
+        ));
     }
 
     let events = req.events.unwrap_or_else(|| vec!["*".into()]);
@@ -64,17 +69,27 @@ pub async fn list_webhooks(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
     let hooks = state.db.list_webhooks(&record.id).await?;
     // Redact secrets in list response
-    let redacted: Vec<_> = hooks.into_iter().map(|mut h| {
-        if h.secret.is_some() { h.secret = Some("***".into()); }
-        h
-    }).collect();
+    let redacted: Vec<_> = hooks
+        .into_iter()
+        .map(|mut h| {
+            if h.secret.is_some() {
+                h.secret = Some("***".into());
+            }
+            h
+        })
+        .collect();
 
-    Ok(Json(serde_json::json!({ "webhooks": redacted, "count": redacted.len() })))
+    Ok(Json(
+        serde_json::json!({ "webhooks": redacted, "count": redacted.len() }),
+    ))
 }
 
 /// DELETE /api/v1/repos/:owner/:repo/hooks/:id
@@ -82,11 +97,17 @@ pub async fn delete_webhook(
     State(state): State<AppState>,
     Path((owner, name, id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
     // Verify the webhook belongs to this repo
-    let hook = state.db.get_webhook(&id).await?
+    let hook = state
+        .db
+        .get_webhook(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("webhook {id} not found")))?;
 
     if hook.repo_id != record.id {

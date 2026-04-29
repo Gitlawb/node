@@ -42,7 +42,11 @@ pub async fn run(args: ChangelogArgs) -> Result<()> {
             did.split(':').next_back().unwrap_or(&did).to_string()
         } else {
             let client = NodeClient::new(&args.node, None);
-            let info: Value = client.get("/").await?.json().await
+            let info: Value = client
+                .get("/")
+                .await?
+                .json()
+                .await
                 .context("failed to fetch node info")?;
             let did = info["did"].as_str().context("node missing DID")?;
             did.split(':').next_back().unwrap_or(did).to_string()
@@ -51,8 +55,14 @@ pub async fn run(args: ChangelogArgs) -> Result<()> {
     };
 
     let client = NodeClient::new(&args.node, None);
-    let url = format!("/api/v1/repos/{owner}/{name}/changelog?limit={}", args.limit);
-    let resp = client.get(&url).await.context("failed to connect to node")?;
+    let url = format!(
+        "/api/v1/repos/{owner}/{name}/changelog?limit={}",
+        args.limit
+    );
+    let resp = client
+        .get(&url)
+        .await
+        .context("failed to connect to node")?;
 
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or_default();
@@ -105,7 +115,9 @@ fn detect_repo_from_remote() -> Option<String> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let url = String::from_utf8(out.stdout).ok()?;
     let rest = url.trim().strip_prefix("gitlawb://")?;
     let slash = rest.rfind('/')?;
@@ -124,7 +136,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("GET", mockito::Matcher::Regex(r"/changelog".to_string()))
@@ -148,7 +164,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let body = r#"{
             "repo":"z/myrepo",
@@ -181,7 +201,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("GET", mockito::Matcher::Regex(r"/changelog".to_string()))
@@ -206,10 +230,17 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"/changelog\?limit=5".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/changelog\?limit=5".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"repo":"z/myrepo","events":[],"count":0}"#)

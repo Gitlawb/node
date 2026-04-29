@@ -89,7 +89,10 @@ async fn serve(node: String, dir: Option<PathBuf>) -> Result<()> {
             }
         };
 
-        tracing::debug!("← {}", msg.get("method").and_then(|v| v.as_str()).unwrap_or("?"));
+        tracing::debug!(
+            "← {}",
+            msg.get("method").and_then(|v| v.as_str()).unwrap_or("?")
+        );
 
         let response = handle(&msg, &node, dir.as_deref()).await;
 
@@ -104,10 +107,7 @@ async fn serve(node: String, dir: Option<PathBuf>) -> Result<()> {
 
 async fn handle(msg: &Value, node: &str, dir: Option<&std::path::Path>) -> Value {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
-    let method = msg
-        .get("method")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
 
     let result = dispatch(method, params, node, dir).await;
@@ -688,8 +688,10 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
             let repo: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}")).await?
-                .json().await?;
+                .get(&format!("/api/v1/repos/{owner}/{name}"))
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&repo)?)
         }
 
@@ -697,8 +699,10 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
             let commits: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/commits")).await?
-                .json().await?;
+                .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&commits)?)
         }
 
@@ -707,8 +711,10 @@ async fn call_tool(
             let path = args["path"].as_str().unwrap_or("");
             let owner = resolve_owner(&args, &client).await?;
             let tree: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}")).await?
-                .json().await?;
+                .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&tree)?)
         }
 
@@ -735,12 +741,21 @@ async fn call_tool(
         }
 
         "agent_capabilities" => Ok(serde_json::to_string_pretty(&json!([
-            "git:push", "git:fetch", "git:admin",
-            "pr:open", "pr:merge", "pr:review",
-            "issue:create", "issue:close",
-            "network:join", "network:gossip",
-            "agent:deploy", "agent:invoke",
-            "repo:admin", "repo:read", "repo:write"
+            "git:push",
+            "git:fetch",
+            "git:admin",
+            "pr:open",
+            "pr:merge",
+            "pr:review",
+            "issue:create",
+            "issue:close",
+            "network:join",
+            "network:gossip",
+            "agent:deploy",
+            "agent:invoke",
+            "repo:admin",
+            "repo:read",
+            "repo:write"
         ]))?),
 
         "ucan_show" => {
@@ -774,7 +789,10 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
             let resp = client
-                .get(&format!("/{owner}/{name}/info/refs?service=git-upload-pack")).await?;
+                .get(&format!(
+                    "/{owner}/{name}/info/refs?service=git-upload-pack"
+                ))
+                .await?;
             let bytes = resp.bytes().await?;
             // Parse pkt-line refs
             let refs = parse_info_refs(&bytes);
@@ -782,7 +800,9 @@ async fn call_tool(
         }
 
         "pr_create" => {
-            keypair.as_ref().context("no identity found — run `gl identity new` first")?;
+            keypair
+                .as_ref()
+                .context("no identity found — run `gl identity new` first")?;
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let head = args["head"].as_str().context("missing 'head'")?;
             let base = args["base"].as_str().unwrap_or("main");
@@ -795,8 +815,10 @@ async fn call_tool(
                 "target_branch": base,
             }))?;
             let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body).await?
-                .json().await?;
+                .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body)
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -804,8 +826,10 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_owner(&args, &client).await?;
             let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls")).await?
-                .json().await?;
+                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -814,12 +838,20 @@ async fn call_tool(
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
             let pr: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}")).await?
-                .json().await?;
+                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+                .await?
+                .json()
+                .await?;
             let reviews: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews")).await?
-                .json().await?;
-            Ok(serde_json::to_string_pretty(&json!({ "pr": pr, "reviews": reviews["reviews"] }))?)
+                .get(&format!(
+                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
+                ))
+                .await?
+                .json()
+                .await?;
+            Ok(serde_json::to_string_pretty(
+                &json!({ "pr": pr, "reviews": reviews["reviews"] }),
+            )?)
         }
 
         "pr_diff" => {
@@ -827,14 +859,18 @@ async fn call_tool(
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
             let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff")).await?
-                .json().await?;
+                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+                .await?
+                .json()
+                .await?;
             let diff = resp["diff"].as_str().unwrap_or("(empty diff)");
             Ok(diff.to_string())
         }
 
         "pr_review" => {
-            keypair.as_ref().context("no identity found — run `gl identity new` first")?;
+            keypair
+                .as_ref()
+                .context("no identity found — run `gl identity new` first")?;
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let status = args["status"].as_str().context("missing 'status'")?;
@@ -844,8 +880,13 @@ async fn call_tool(
                 "body": args["body"],
             }))?;
             let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"), &body).await?
-                .json().await?;
+                .post(
+                    &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
+                    &body,
+                )
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -855,16 +896,24 @@ async fn call_tool(
             let owner = resolve_owner(&args, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
             let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"), &body).await?
-                .json().await?;
+                .post(
+                    &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
+                    &body,
+                )
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "webhook_create" => {
-            keypair.as_ref().context("no identity found — run `gl identity new` first")?;
+            keypair
+                .as_ref()
+                .context("no identity found — run `gl identity new` first")?;
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let url = args["url"].as_str().context("missing 'url'")?;
-            let events = args["events"].as_array()
+            let events = args["events"]
+                .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_else(|| vec!["*"]);
             let owner = resolve_owner(&args, &client).await?;
@@ -874,8 +923,10 @@ async fn call_tool(
                 "events": events,
             }))?;
             let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &body).await?
-                .json().await?;
+                .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &body)
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -883,8 +934,10 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_owner(&args, &client).await?;
             let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/hooks")).await?
-                .json().await?;
+                .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -894,13 +947,14 @@ async fn call_tool(
             let owner = resolve_owner(&args, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
             let resp: Value = client
-                .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &body).await?
-                .json().await?;
+                .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &body)
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         // ── Bounty tools ────────────────────────────────────────────────────
-
         "bounty_list" => {
             let url = if let Some(repo) = args.get("repo").and_then(|v| v.as_str()) {
                 let (owner, name) = repo.split_once('/').context("repo must be owner/name")?;
@@ -922,7 +976,11 @@ async fn call_tool(
 
         "bounty_show" => {
             let id = args["id"].as_str().context("missing 'id'")?;
-            let resp: Value = client.get(&format!("/api/v1/bounties/{id}")).await?.json().await?;
+            let resp: Value = client
+                .get(&format!("/api/v1/bounties/{id}"))
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -936,8 +994,13 @@ async fn call_tool(
                 "tx_hash": args.get("tx_hash").and_then(|v| v.as_str()),
             });
             let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{name}/bounties"), &serde_json::to_vec(&body)?)
-                .await?.json().await?;
+                .post(
+                    &format!("/api/v1/repos/{owner}/{name}/bounties"),
+                    &serde_json::to_vec(&body)?,
+                )
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -945,8 +1008,13 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = json!({ "wallet": args.get("wallet").and_then(|v| v.as_str()) });
             let resp: Value = client
-                .post(&format!("/api/v1/bounties/{id}/claim"), &serde_json::to_vec(&body)?)
-                .await?.json().await?;
+                .post(
+                    &format!("/api/v1/bounties/{id}/claim"),
+                    &serde_json::to_vec(&body)?,
+                )
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -955,8 +1023,13 @@ async fn call_tool(
             let pr_id = args["pr_id"].as_str().context("missing 'pr_id'")?;
             let body = json!({ "pr_id": pr_id });
             let resp: Value = client
-                .post(&format!("/api/v1/bounties/{id}/submit"), &serde_json::to_vec(&body)?)
-                .await?.json().await?;
+                .post(
+                    &format!("/api/v1/bounties/{id}/submit"),
+                    &serde_json::to_vec(&body)?,
+                )
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -966,7 +1039,6 @@ async fn call_tool(
         }
 
         // ── Task tools ────────────────────────────────────────────────────
-
         "task_list" => {
             let limit = args["limit"].as_i64().unwrap_or(50);
             let mut path = format!("/api/v1/tasks?limit={limit}");
@@ -1003,8 +1075,10 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = serde_json::to_vec(&json!({ "assignee_did": assignee_did }))?;
             let resp: Value = client
-                .post(&format!("/api/v1/tasks/{id}/claim"), &body).await?
-                .json().await?;
+                .post(&format!("/api/v1/tasks/{id}/claim"), &body)
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1017,13 +1091,14 @@ async fn call_tool(
                 "by_did": by_did,
             }))?;
             let resp: Value = client
-                .post(&format!("/api/v1/tasks/{id}/complete"), &body).await?
-                .json().await?;
+                .post(&format!("/api/v1/tasks/{id}/complete"), &body)
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         // ── UCAN delegation tools ─────────────────────────────────────────
-
         "ucan_delegate" => {
             let kp = keypair.context("no identity found — run `gl identity new` first")?;
             let to_str = args["to"].as_str().context("missing 'to'")?;
@@ -1034,7 +1109,8 @@ async fn call_tool(
                 .parse()
                 .map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
 
-            let exp = args.get("expiry_hours")
+            let exp = args
+                .get("expiry_hours")
                 .and_then(|v| v.as_i64())
                 .map(|h| chrono::Utc::now() + chrono::Duration::hours(h));
 
@@ -1057,11 +1133,14 @@ async fn call_tool(
 
         "ucan_verify" => {
             let token = args["token"].as_str().context("missing 'token'")?;
-            let ucan = gitlawb_core::ucan::Ucan::decode(token)
-                .context("failed to parse UCAN token")?;
+            let ucan =
+                gitlawb_core::ucan::Ucan::decode(token).context("failed to parse UCAN token")?;
             let sig_valid = ucan.verify_signature().is_ok();
             let expired = ucan.is_expired();
-            let caps: Vec<Value> = ucan.payload.att.iter()
+            let caps: Vec<Value> = ucan
+                .payload
+                .att
+                .iter()
                 .map(|c| json!({ "with": c.with, "can": c.can }))
                 .collect();
 
@@ -1077,7 +1156,6 @@ async fn call_tool(
         }
 
         // ── Issue tools ───────────────────────────────────────────────────
-
         "issue_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let (owner, name) = if let Some((o, n)) = repo.split_once('/') {
@@ -1087,13 +1165,17 @@ async fn call_tool(
                 (owner, repo.to_string())
             };
             let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/issues")).await?
-                .json().await?;
+                .get(&format!("/api/v1/repos/{owner}/{name}/issues"))
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "issue_create" => {
-            keypair.as_ref().context("no identity found — run `gl identity new` first")?;
+            keypair
+                .as_ref()
+                .context("no identity found — run `gl identity new` first")?;
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let title = args["title"].as_str().context("missing 'title'")?;
             let (owner, name) = if let Some((o, n)) = repo.split_once('/') {
@@ -1107,13 +1189,17 @@ async fn call_tool(
                 "body": args.get("body").and_then(|v| v.as_str()),
             }))?;
             let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body).await?
-                .json().await?;
+                .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body)
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "issue_comment" => {
-            keypair.as_ref().context("no identity found — run `gl identity new` first")?;
+            keypair
+                .as_ref()
+                .context("no identity found — run `gl identity new` first")?;
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let issue_id = args["issue_id"].as_str().context("missing 'issue_id'")?;
             let comment_body = args["body"].as_str().context("missing 'body'")?;
@@ -1125,8 +1211,13 @@ async fn call_tool(
             };
             let body = serde_json::to_vec(&json!({ "body": comment_body }))?;
             let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"), &body).await?
-                .json().await?;
+                .post(
+                    &format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"),
+                    &body,
+                )
+                .await?
+                .json()
+                .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1166,10 +1257,19 @@ fn parse_info_refs(bytes: &[u8]) -> Value {
     }
 
     while pos + 4 <= bytes.len() {
-        let Ok(hex) = std::str::from_utf8(&bytes[pos..pos + 4]) else { break };
-        let Ok(len) = usize::from_str_radix(hex, 16) else { break };
-        if len == 0 { pos += 4; continue; }
-        if len < 4 || pos + len > bytes.len() { break; }
+        let Ok(hex) = std::str::from_utf8(&bytes[pos..pos + 4]) else {
+            break;
+        };
+        let Ok(len) = usize::from_str_radix(hex, 16) else {
+            break;
+        };
+        if len == 0 {
+            pos += 4;
+            continue;
+        }
+        if len < 4 || pos + len > bytes.len() {
+            break;
+        }
 
         let line = std::str::from_utf8(&bytes[pos + 4..pos + len]).unwrap_or("");
         let line = line.trim_end_matches('\n');
@@ -1256,7 +1356,11 @@ mod tests {
         assert!(output.contains("\r\n\r\n"));
         // Verify the content-length value matches the JSON body
         let parts: Vec<&str> = output.splitn(2, "\r\n\r\n").collect();
-        let len: usize = parts[0].strip_prefix("Content-Length: ").unwrap().parse().unwrap();
+        let len: usize = parts[0]
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
         assert_eq!(len, parts[1].len());
     }
 
@@ -1301,9 +1405,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatch_notifications_initialized() {
-        let result = dispatch("notifications/initialized", json!({}), "http://localhost", None)
-            .await
-            .unwrap();
+        let result = dispatch(
+            "notifications/initialized",
+            json!({}),
+            "http://localhost",
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result, Value::Null);
     }
 
@@ -1323,10 +1432,7 @@ mod tests {
         assert!(!tools.is_empty());
 
         // Verify expected tools exist
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
+        let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
         assert!(tool_names.contains(&"identity_show"));
         assert!(tool_names.contains(&"repo_create"));
         assert!(tool_names.contains(&"pr_create"));
@@ -1390,8 +1496,14 @@ mod tests {
         let tools = tools.as_array().unwrap();
         for tool in tools {
             assert!(tool.get("name").is_some(), "tool missing name: {tool}");
-            assert!(tool.get("description").is_some(), "tool missing description: {tool}");
-            assert!(tool.get("inputSchema").is_some(), "tool missing inputSchema: {tool}");
+            assert!(
+                tool.get("description").is_some(),
+                "tool missing description: {tool}"
+            );
+            assert!(
+                tool.get("inputSchema").is_some(),
+                "tool missing inputSchema: {tool}"
+            );
             assert_eq!(tool["inputSchema"]["type"], "object");
         }
     }
@@ -1409,8 +1521,12 @@ mod tests {
     #[test]
     fn test_tool_definitions_include_task_tools() {
         let tools = tool_definitions();
-        let names: Vec<&str> = tools.as_array().unwrap()
-            .iter().filter_map(|t| t["name"].as_str()).collect();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
         assert!(names.contains(&"task_list"));
         assert!(names.contains(&"task_create"));
         assert!(names.contains(&"task_claim"));
@@ -1420,8 +1536,12 @@ mod tests {
     #[test]
     fn test_tool_definitions_include_ucan_tools() {
         let tools = tool_definitions();
-        let names: Vec<&str> = tools.as_array().unwrap()
-            .iter().filter_map(|t| t["name"].as_str()).collect();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
         assert!(names.contains(&"ucan_delegate"));
         assert!(names.contains(&"ucan_verify"));
     }
@@ -1429,8 +1549,12 @@ mod tests {
     #[test]
     fn test_tool_definitions_include_issue_tools() {
         let tools = tool_definitions();
-        let names: Vec<&str> = tools.as_array().unwrap()
-            .iter().filter_map(|t| t["name"].as_str()).collect();
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
         assert!(names.contains(&"issue_list"));
         assert!(names.contains(&"issue_create"));
         assert!(names.contains(&"issue_comment"));
@@ -1440,14 +1564,24 @@ mod tests {
     async fn test_task_list_via_mcp() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}]}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
-        let result = call_tool("task_list", json!({"status": "pending"}), &server.url(), None)
-            .await.unwrap();
+        let result = call_tool(
+            "task_list",
+            json!({"status": "pending"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["tasks"][0]["id"], "t1");
     }
@@ -1457,21 +1591,28 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks")
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"t2","kind":"code-review","status":"pending"}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let result = call_tool(
             "task_create",
             json!({"kind": "code-review"}),
             &server.url(),
             Some(dir.path()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["kind"], "code-review");
     }
@@ -1481,18 +1622,28 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks/t3/claim")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"t3","status":"claimed"}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let result = call_tool(
-            "task_claim", json!({"id": "t3"}), &server.url(), Some(dir.path()),
-        ).await.unwrap();
+            "task_claim",
+            json!({"id": "t3"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "claimed");
     }
@@ -1502,19 +1653,28 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks/t4/complete")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"t4","status":"completed"}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let result = call_tool(
-            "task_complete", json!({"id": "t4", "result": "all good"}),
-            &server.url(), Some(dir.path()),
-        ).await.unwrap();
+            "task_complete",
+            json!({"id": "t4", "result": "all good"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "completed");
     }
@@ -1523,7 +1683,11 @@ mod tests {
     async fn test_ucan_delegate_via_mcp() {
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let audience = gitlawb_core::identity::Keypair::generate();
         let result = call_tool(
@@ -1536,7 +1700,9 @@ mod tests {
             }),
             "http://localhost",
             Some(dir.path()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["audience"], audience.did().to_string());
@@ -1549,15 +1715,25 @@ mod tests {
         let kp = gitlawb_core::identity::Keypair::generate();
         let audience = gitlawb_core::identity::Keypair::generate();
         let ucan = gitlawb_core::ucan::Ucan::issue(
-            &kp, audience.did(),
-            vec![gitlawb_core::ucan::Capability::new("gitlawb://test", "git/push")],
+            &kp,
+            audience.did(),
+            vec![gitlawb_core::ucan::Capability::new(
+                "gitlawb://test",
+                "git/push",
+            )],
             None,
-        ).unwrap();
+        )
+        .unwrap();
         let token = ucan.encode().unwrap();
 
         let result = call_tool(
-            "ucan_verify", json!({"token": token}), "http://localhost", None,
-        ).await.unwrap();
+            "ucan_verify",
+            json!({"token": token}),
+            "http://localhost",
+            None,
+        )
+        .await
+        .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["valid"], true);
         assert_eq!(parsed["signature_valid"], true);
@@ -1572,11 +1748,17 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"issues":[{"id":"i1","title":"Bug","status":"open"}]}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let result = call_tool(
-            "issue_list", json!({"repo": "alice/myrepo"}), &server.url(), None,
-        ).await.unwrap();
+            "issue_list",
+            json!({"repo": "alice/myrepo"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["issues"][0]["id"], "i1");
     }
@@ -1586,20 +1768,28 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/repos/alice/myrepo/issues")
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"i2","title":"New bug"}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let result = call_tool(
             "issue_create",
             json!({"repo": "alice/myrepo", "title": "New bug", "body": "steps to reproduce"}),
-            &server.url(), Some(dir.path()),
-        ).await.unwrap();
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["title"], "New bug");
     }
@@ -1609,20 +1799,28 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/repos/alice/myrepo/issues/i1/comments")
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"c1","body":"looks good"}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let result = call_tool(
             "issue_comment",
             json!({"repo": "alice/myrepo", "issue_id": "i1", "body": "looks good"}),
-            &server.url(), Some(dir.path()),
-        ).await.unwrap();
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["body"], "looks good");
     }

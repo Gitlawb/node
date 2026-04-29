@@ -45,9 +45,9 @@ pub enum StarCmd {
 
 pub async fn run(args: StarArgs) -> Result<()> {
     match args.cmd {
-        StarCmd::Add { repo, node, dir }    => cmd_add(repo, node, dir).await,
+        StarCmd::Add { repo, node, dir } => cmd_add(repo, node, dir).await,
         StarCmd::Remove { repo, node, dir } => cmd_remove(repo, node, dir).await,
-        StarCmd::Count { repo, node }       => cmd_count(repo, node).await,
+        StarCmd::Count { repo, node } => cmd_count(repo, node).await,
     }
 }
 
@@ -55,8 +55,8 @@ fn resolve_owner_repo(repo: &str, dir: Option<&std::path::Path>) -> Result<(Stri
     if let Some((owner, name)) = repo.split_once('/') {
         return Ok((owner.to_string(), name.to_string()));
     }
-    let kp = load_keypair_from_dir(dir)
-        .context("identity not found — run `gl identity new` first")?;
+    let kp =
+        load_keypair_from_dir(dir).context("identity not found — run `gl identity new` first")?;
     let did = kp.did().to_string();
     let short = did.split(':').next_back().unwrap_or(&did).to_string();
     Ok((short, repo.to_string()))
@@ -111,7 +111,8 @@ async fn cmd_remove(repo: String, node: String, dir: Option<PathBuf>) -> Result<
 }
 
 async fn cmd_count(repo: String, node: String) -> Result<()> {
-    let (owner, name) = repo.split_once('/')
+    let (owner, name) = repo
+        .split_once('/')
         .map(|(o, n)| (o.to_string(), n.to_string()))
         .context("use owner/repo format for count (e.g. alice/myrepo)")?;
     let client = NodeClient::new(&node, None);
@@ -143,10 +144,17 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
-            .mock("PUT", mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/star$".to_string()))
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/star$".to_string()),
+            )
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"status":"starred","repo":"z/myrepo","star_count":1}"#)
@@ -157,7 +165,9 @@ mod tests {
             "myrepo".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -165,7 +175,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("PUT", mockito::Matcher::Regex(r"/star$".to_string()))
@@ -180,7 +194,9 @@ mod tests {
             "myrepo".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -190,7 +206,9 @@ mod tests {
             "owner/myrepo".to_string(),
             "http://127.0.0.1:1".to_string(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("identity not found"));
     }
 
@@ -199,7 +217,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("PUT", mockito::Matcher::Regex(r"/star$".to_string()))
@@ -213,7 +235,9 @@ mod tests {
             "owner/missing".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("star failed"));
     }
 
@@ -222,7 +246,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("DELETE", mockito::Matcher::Regex(r"/star$".to_string()))
@@ -236,7 +264,9 @@ mod tests {
             "myrepo".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -244,7 +274,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("DELETE", mockito::Matcher::Regex(r"/star$".to_string()))
@@ -258,7 +292,9 @@ mod tests {
             "owner/missing".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("unstar failed"));
     }
 
@@ -274,15 +310,16 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_count("alice/myrepo".to_string(), server.url()).await.unwrap();
+        cmd_count("alice/myrepo".to_string(), server.url())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_count_requires_slash() {
-        let err = cmd_count(
-            "noslash".to_string(),
-            "http://127.0.0.1:1".to_string(),
-        ).await.unwrap_err();
+        let err = cmd_count("noslash".to_string(), "http://127.0.0.1:1".to_string())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("owner/repo format"));
     }
 

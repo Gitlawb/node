@@ -9,11 +9,8 @@
 //!   gl name resolve-did <did>    — resolve DID from on-chain registry
 
 use alloy::{
-    network::EthereumWallet,
-    primitives::Address,
-    providers::ProviderBuilder,
-    signers::local::PrivateKeySigner,
-    sol,
+    network::EthereumWallet, primitives::Address, providers::ProviderBuilder,
+    signers::local::PrivateKeySigner, sol,
 };
 use anyhow::{Context, Result};
 use clap::Subcommand;
@@ -133,18 +130,39 @@ pub enum NameCmd {
 
 pub async fn run(args: NameArgs) -> Result<()> {
     match args.cmd {
-        NameCmd::Register { name, private_key, rpc_url, contract, dir } =>
-            cmd_register(name, private_key, rpc_url, contract, dir).await,
-        NameCmd::Resolve { name, rpc_url, contract } =>
-            cmd_resolve(name, rpc_url, contract).await,
-        NameCmd::Lookup { did, rpc_url, contract } =>
-            cmd_lookup(did, rpc_url, contract).await,
-        NameCmd::Available { name, rpc_url, contract } =>
-            cmd_available(name, rpc_url, contract).await,
-        NameCmd::RegisterDid { private_key, rpc_url, contract, dir } =>
-            cmd_register_did(private_key, rpc_url, contract, dir).await,
-        NameCmd::ResolveDid { did, rpc_url, contract } =>
-            cmd_resolve_did(did, rpc_url, contract).await,
+        NameCmd::Register {
+            name,
+            private_key,
+            rpc_url,
+            contract,
+            dir,
+        } => cmd_register(name, private_key, rpc_url, contract, dir).await,
+        NameCmd::Resolve {
+            name,
+            rpc_url,
+            contract,
+        } => cmd_resolve(name, rpc_url, contract).await,
+        NameCmd::Lookup {
+            did,
+            rpc_url,
+            contract,
+        } => cmd_lookup(did, rpc_url, contract).await,
+        NameCmd::Available {
+            name,
+            rpc_url,
+            contract,
+        } => cmd_available(name, rpc_url, contract).await,
+        NameCmd::RegisterDid {
+            private_key,
+            rpc_url,
+            contract,
+            dir,
+        } => cmd_register_did(private_key, rpc_url, contract, dir).await,
+        NameCmd::ResolveDid {
+            did,
+            rpc_url,
+            contract,
+        } => cmd_resolve_did(did, rpc_url, contract).await,
     }
 }
 
@@ -152,25 +170,35 @@ pub async fn run(args: NameArgs) -> Result<()> {
 
 fn identity_dir(dir: Option<PathBuf>) -> PathBuf {
     dir.unwrap_or_else(|| {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".gitlawb")
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".gitlawb")
     })
 }
 
 fn load_did(dir: Option<PathBuf>) -> Result<String> {
     let path = identity_dir(dir).join("identity.pem");
-    let pem = std::fs::read_to_string(&path)
-        .with_context(|| format!("No identity at {} — run `gl identity new` first", path.display()))?;
-    let keypair = gitlawb_core::identity::Keypair::from_pem(&pem)
-        .context("Failed to parse identity PEM")?;
+    let pem = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "No identity at {} — run `gl identity new` first",
+            path.display()
+        )
+    })?;
+    let keypair =
+        gitlawb_core::identity::Keypair::from_pem(&pem).context("Failed to parse identity PEM")?;
     Ok(keypair.did().to_string())
 }
 
 fn load_did_and_document(dir: Option<PathBuf>) -> Result<(String, String)> {
     let path = identity_dir(dir).join("identity.pem");
-    let pem = std::fs::read_to_string(&path)
-        .with_context(|| format!("No identity at {} — run `gl identity new` first", path.display()))?;
-    let keypair = gitlawb_core::identity::Keypair::from_pem(&pem)
-        .context("Failed to parse identity PEM")?;
+    let pem = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "No identity at {} — run `gl identity new` first",
+            path.display()
+        )
+    })?;
+    let keypair =
+        gitlawb_core::identity::Keypair::from_pem(&pem).context("Failed to parse identity PEM")?;
     let did = keypair.did();
     let vk = keypair.verifying_key();
     let doc = gitlawb_core::did::DidDocument::new(did.clone(), &vk);
@@ -190,21 +218,18 @@ fn build_write_provider(
     private_key: &str,
     rpc_url: &str,
 ) -> Result<impl alloy::providers::Provider + Clone> {
-    let signer: PrivateKeySigner = private_key.trim()
+    let signer: PrivateKeySigner = private_key
+        .trim()
         .parse()
         .context("Invalid Ethereum private key (expected 0x-prefixed hex)")?;
     let wallet = EthereumWallet::from(signer);
-    let url: reqwest::Url = rpc_url.parse()
-        .context("Invalid RPC URL")?;
-    let provider = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(url);
+    let url: reqwest::Url = rpc_url.parse().context("Invalid RPC URL")?;
+    let provider = ProviderBuilder::new().wallet(wallet).connect_http(url);
     Ok(provider)
 }
 
 fn build_read_provider(rpc_url: &str) -> Result<impl alloy::providers::Provider + Clone> {
-    let url: reqwest::Url = rpc_url.parse()
-        .context("Invalid RPC URL")?;
+    let url: reqwest::Url = rpc_url.parse().context("Invalid RPC URL")?;
     Ok(ProviderBuilder::new().connect_http(url))
 }
 

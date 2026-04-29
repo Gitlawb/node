@@ -14,7 +14,9 @@ pub struct ChangelogQuery {
     pub limit: usize,
 }
 
-fn default_limit() -> usize { 20 }
+fn default_limit() -> usize {
+    20
+}
 
 /// GET /api/v1/repos/:owner/:repo/changelog[?limit=N]
 ///
@@ -26,27 +28,36 @@ pub async fn get_changelog(
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<ChangelogQuery>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let limit = query.limit.min(100);
 
     // ── Commits from git log ─────────────────────────────────────────────
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let head_ref = store::resolve_head(&disk_path, &record.default_branch);
     let commits = store::log(&disk_path, &head_ref, limit).unwrap_or_default();
 
-    let mut events: Vec<serde_json::Value> = commits.into_iter().map(|c| {
-        serde_json::json!({
-            "type": "commit",
-            "sha": c.hash,
-            "message": c.subject,
-            "author": c.author_name,
-            "timestamp": c.timestamp,
-            "branch": record.default_branch,
+    let mut events: Vec<serde_json::Value> = commits
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "type": "commit",
+                "sha": c.hash,
+                "message": c.subject,
+                "author": c.author_name,
+                "timestamp": c.timestamp,
+                "branch": record.default_branch,
+            })
         })
-    }).collect();
+        .collect();
 
     // ── Merged PRs ───────────────────────────────────────────────────────
     let prs = state.db.list_prs(&record.id).await.unwrap_or_default();

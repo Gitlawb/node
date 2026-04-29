@@ -12,9 +12,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, Result};
 use crate::did::Did;
 use crate::identity::Keypair;
+use crate::{Error, Result};
 
 /// A UCAN capability: what resource the token grants access to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,7 +30,11 @@ pub struct Capability {
 
 impl Capability {
     pub fn new(with: impl Into<String>, can: impl Into<String>) -> Self {
-        Self { with: with.into(), can: can.into(), constraints: None }
+        Self {
+            with: with.into(),
+            can: can.into(),
+            constraints: None,
+        }
     }
 
     pub fn with_constraints(mut self, constraints: serde_json::Value) -> Self {
@@ -130,16 +134,18 @@ impl Ucan {
 
     /// Verify the signature on this UCAN.
     pub fn verify_signature(&self) -> Result<()> {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use crate::identity::verify;
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 
         let vk = self.payload.iss.to_verifying_key()?;
         let signing_bytes = serde_json::to_vec(&self.payload)?;
 
-        let sig_bytes_vec = URL_SAFE_NO_PAD.decode(&self.s)
+        let sig_bytes_vec = URL_SAFE_NO_PAD
+            .decode(&self.s)
             .map_err(|e| Error::Ucan(format!("invalid base64 signature: {e}")))?;
 
-        let sig_bytes: [u8; 64] = sig_bytes_vec.try_into()
+        let sig_bytes: [u8; 64] = sig_bytes_vec
+            .try_into()
             .map_err(|_| Error::Ucan("signature must be 64 bytes".to_string()))?;
 
         verify(&vk, &signing_bytes, &sig_bytes)
@@ -148,9 +154,10 @@ impl Ucan {
 
     /// Check if this UCAN grants a specific capability on a resource.
     pub fn can(&self, resource: &str, action: &str) -> bool {
-        self.payload.att.iter().any(|cap| {
-            cap.with == resource && cap.can == action
-        })
+        self.payload
+            .att
+            .iter()
+            .any(|cap| cap.with == resource && cap.can == action)
     }
 
     /// Encode to a compact JSON string (the wire format).
@@ -245,7 +252,8 @@ mod tests {
             audience.clone(),
             vec![Capability::new("gitlawb://repos/test/repo", caps::GIT_PUSH)],
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         ucan.verify_signature().unwrap();
         assert!(!ucan.is_expired());
@@ -291,10 +299,12 @@ mod tests {
         let issuer = Keypair::generate();
         let audience = Keypair::generate().did();
         let ucan = Ucan::issue(
-            &issuer, audience,
+            &issuer,
+            audience,
             vec![Capability::new("gitlawb://repos/test", caps::GIT_PUSH)],
             None,
-        ).unwrap();
+        )
+        .unwrap();
         // Root UCAN (no proofs) should verify fine
         ucan.verify_chain().unwrap();
     }
@@ -307,18 +317,22 @@ mod tests {
 
         // Alice grants Bob push access
         let root = Ucan::issue(
-            &alice, bob.did(),
+            &alice,
+            bob.did(),
             vec![Capability::new("gitlawb://repos/test", caps::GIT_PUSH)],
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Bob delegates to Charlie (with proof from Alice)
         let delegated = Ucan::delegate(
-            &bob, charlie.did(),
+            &bob,
+            charlie.did(),
             vec![Capability::new("gitlawb://repos/test", caps::GIT_PUSH)],
             None,
             &root,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Chain should verify: Charlie's token → Bob's proof → Alice signed it
         delegated.verify_chain().unwrap();
@@ -334,18 +348,22 @@ mod tests {
 
         // Alice grants Bob access
         let root = Ucan::issue(
-            &alice, bob.did(),
+            &alice,
+            bob.did(),
             vec![Capability::new("gitlawb://repos/test", caps::GIT_PUSH)],
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Eve (NOT Bob) tries to delegate using Alice's proof
         let bad = Ucan::delegate(
-            &eve, charlie.did(),
+            &eve,
+            charlie.did(),
             vec![Capability::new("gitlawb://repos/test", caps::GIT_PUSH)],
             None,
             &root,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should fail: proof audience (Bob) != UCAN issuer (Eve)
         let err = bad.verify_chain().unwrap_err();
@@ -361,17 +379,21 @@ mod tests {
         // Alice grants Bob access with expiry in the past
         let exp = chrono::Utc::now() - chrono::Duration::hours(1);
         let root = Ucan::issue(
-            &alice, bob.did(),
+            &alice,
+            bob.did(),
             vec![Capability::new("gitlawb://repos/test", caps::GIT_PUSH)],
             Some(exp),
-        ).unwrap();
+        )
+        .unwrap();
 
         let delegated = Ucan::delegate(
-            &bob, charlie.did(),
+            &bob,
+            charlie.did(),
             vec![Capability::new("gitlawb://repos/test", caps::GIT_PUSH)],
             None,
             &root,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should fail: the proof is expired
         let err = delegated.verify_chain().unwrap_err();

@@ -50,7 +50,9 @@ pub async fn list_peers(State(state): State<AppState>) -> Result<Json<serde_json
             reachable: p.last_ping_ok,
         })
         .collect();
-    Ok(Json(serde_json::json!({ "peers": resp, "count": resp.len() })))
+    Ok(Json(
+        serde_json::json!({ "peers": resp, "count": resp.len() }),
+    ))
 }
 
 /// POST /api/v1/peers/announce (auth required)
@@ -63,7 +65,9 @@ pub async fn announce(
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
     // Validate the URL is HTTP/HTTPS
     if !req.http_url.starts_with("http://") && !req.http_url.starts_with("https://") {
-        return Err(AppError::BadRequest("http_url must start with http:// or https://".into()));
+        return Err(AppError::BadRequest(
+            "http_url must start with http:// or https://".into(),
+        ));
     }
 
     state.db.upsert_peer(&req.did, &req.http_url).await?;
@@ -71,13 +75,16 @@ pub async fn announce(
     tracing::info!(did = %req.did, url = %req.http_url, "peer announced");
 
     // Return our own info so the peer can add us back
-    Ok((StatusCode::OK, Json(serde_json::json!({
-        "status": "accepted",
-        "node_did": state.node_did.to_string(),
-        "node_url": state.config.public_url.as_deref().unwrap_or(""),
-        "peer_count": state.db.list_peers().await.map(|p| p.len()).unwrap_or(0),
-        "message": "added to peer list",
-    }))))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "accepted",
+            "node_did": state.node_did.to_string(),
+            "node_url": state.config.public_url.as_deref().unwrap_or(""),
+            "peer_count": state.db.list_peers().await.map(|p| p.len()).unwrap_or(0),
+            "message": "added to peer list",
+        })),
+    ))
 }
 
 /// POST /api/v1/sync/trigger
@@ -86,9 +93,7 @@ pub async fn announce(
 /// peer's repo list over HTTP and enqueues any repos we don't have or are
 /// behind on into the sync_queue. This is the HTTP fallback when Gossipsub
 /// p2p is not yet connected.
-pub async fn trigger_sync(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>> {
+pub async fn trigger_sync(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let peers = state.db.list_peers().await?;
     let client = &state.http_client;
     let mut enqueued = 0u32;
@@ -99,10 +104,8 @@ pub async fn trigger_sync(
             continue;
         }
         let url = format!("{}/api/v1/repos", peer.http_url.trim_end_matches('/'));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.get(&url).send(),
-        ).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(5), client.get(&url).send()).await;
 
         let repos: Vec<serde_json::Value> = match result {
             Ok(Ok(resp)) if resp.status().is_success() => {
@@ -116,8 +119,10 @@ pub async fn trigger_sync(
         };
 
         for repo in repos {
-            let repo_slug = match (repo.get("owner_did").and_then(|v| v.as_str()),
-                                   repo.get("name").and_then(|v| v.as_str())) {
+            let repo_slug = match (
+                repo.get("owner_did").and_then(|v| v.as_str()),
+                repo.get("name").and_then(|v| v.as_str()),
+            ) {
                 (Some(owner), Some(name)) => {
                     // Use short owner (last colon segment) matching DB convention
                     let short = owner.split(':').last().unwrap_or(owner);
@@ -125,13 +130,16 @@ pub async fn trigger_sync(
                 }
                 _ => continue,
             };
-            let _ = state.db.enqueue_sync(
-                &repo_slug,
-                &peer.did,
-                "refs/heads/main",
-                "0000000000000000000000000000000000000000",
-                None,
-            ).await;
+            let _ = state
+                .db
+                .enqueue_sync(
+                    &repo_slug,
+                    &peer.did,
+                    "refs/heads/main",
+                    "0000000000000000000000000000000000000000",
+                    None,
+                )
+                .await;
             enqueued += 1;
         }
     }
@@ -171,13 +179,10 @@ pub async fn notify_sync(
         )));
     }
 
-    state.db.enqueue_sync(
-        &req.repo,
-        &req.node_did,
-        &req.ref_name,
-        &req.new_sha,
-        None,
-    ).await?;
+    state
+        .db
+        .enqueue_sync(&req.repo, &req.node_did, &req.ref_name, &req.new_sha, None)
+        .await?;
 
     tracing::info!(
         repo = %req.repo,
@@ -201,12 +206,17 @@ pub async fn ping_peer(
     Path(did): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
     let peers = state.db.list_peers().await?;
-    let peer = peers.into_iter().find(|p| p.did == did)
+    let peer = peers
+        .into_iter()
+        .find(|p| p.did == did)
         .ok_or_else(|| AppError::RepoNotFound(format!("peer {did} not found")))?;
 
     // Async ping
     let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-    let ok = reqwest::get(&url).await.map(|r| r.status().is_success()).unwrap_or(false);
+    let ok = reqwest::get(&url)
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
 
     let _ = state.db.mark_peer_ping(&did, ok).await;
 

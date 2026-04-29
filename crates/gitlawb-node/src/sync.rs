@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use crate::db::Db;
 use crate::config::Config;
+use crate::db::Db;
 
 /// Start the background sync worker. Returns immediately; the worker runs
 /// as a detached tokio task.
@@ -76,7 +76,8 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
                 continue;
             }
         };
-        let local_path = config.repos_dir
+        let local_path = config
+            .repos_dir
             .join(owner_short)
             .join(format!("{repo_name}.git"));
 
@@ -94,12 +95,14 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
             Ok(()) => {
                 info!(repo = %item.repo, origin = %origin_url, "synced repo from peer");
                 // Register in DB so git smart HTTP can serve the mirrored repo
-                let _ = db.upsert_mirror_repo(
-                    owner_short,
-                    repo_name,
-                    local_path.to_str().unwrap_or(""),
-                    machine_id,
-                ).await;
+                let _ = db
+                    .upsert_mirror_repo(
+                        owner_short,
+                        repo_name,
+                        local_path.to_str().unwrap_or(""),
+                        machine_id,
+                    )
+                    .await;
                 let _ = db.mark_sync_done(&item.id).await;
             }
             Err(e) => {
@@ -113,7 +116,12 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
 /// Mirror-clone a repo from a remote URL into a local bare repo.
 async fn clone_repo(remote_url: &str, local_path: &PathBuf) -> anyhow::Result<()> {
     let out = tokio::process::Command::new("git")
-        .args(["clone", "--mirror", remote_url, local_path.to_str().unwrap_or(".")])
+        .args([
+            "clone",
+            "--mirror",
+            remote_url,
+            local_path.to_str().unwrap_or("."),
+        ])
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("git clone failed to spawn: {e}"))?;
@@ -128,7 +136,14 @@ async fn clone_repo(remote_url: &str, local_path: &PathBuf) -> anyhow::Result<()
 /// Fetch all refs from the remote into an existing mirror repo.
 async fn fetch_repo(local_path: &PathBuf, remote_url: &str) -> anyhow::Result<()> {
     let out = tokio::process::Command::new("git")
-        .args(["-C", local_path.to_str().unwrap_or("."), "fetch", "--prune", remote_url, "+refs/*:refs/*"])
+        .args([
+            "-C",
+            local_path.to_str().unwrap_or("."),
+            "fetch",
+            "--prune",
+            remote_url,
+            "+refs/*:refs/*",
+        ])
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("git fetch failed to spawn: {e}"))?;

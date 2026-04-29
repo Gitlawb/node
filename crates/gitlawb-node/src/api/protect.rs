@@ -17,12 +17,19 @@ pub async fn protect_branch(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, branch)): Path<(String, String, String)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     // Only the repo owner can protect branches
     let caller = &auth.0;
-    let owner_short = record.owner_did.split(':').next_back().unwrap_or(&record.owner_did);
+    let owner_short = record
+        .owner_did
+        .split(':')
+        .next_back()
+        .unwrap_or(&record.owner_did);
     if caller != &record.owner_did && caller != owner_short {
         return Err(AppError::BadRequest(
             "only the repo owner can protect branches".into(),
@@ -33,11 +40,14 @@ pub async fn protect_branch(
 
     tracing::info!(repo = %repo, branch = %branch, caller = %caller, "branch protected");
 
-    Ok((StatusCode::CREATED, Json(serde_json::json!({
-        "status": "protected",
-        "repo": format!("{owner}/{repo}"),
-        "branch": branch,
-    }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "status": "protected",
+            "repo": format!("{owner}/{repo}"),
+            "branch": branch,
+        })),
+    ))
 }
 
 /// DELETE /api/v1/repos/:owner/:repo/branches/:branch/protect
@@ -46,11 +56,18 @@ pub async fn unprotect_branch(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, branch)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let caller = &auth.0;
-    let owner_short = record.owner_did.split(':').next_back().unwrap_or(&record.owner_did);
+    let owner_short = record
+        .owner_did
+        .split(':')
+        .next_back()
+        .unwrap_or(&record.owner_did);
     if caller != &record.owner_did && caller != owner_short {
         return Err(AppError::BadRequest(
             "only the repo owner can unprotect branches".into(),
@@ -73,7 +90,10 @@ pub async fn list_protected_branches(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let branches = state.db.list_protected_branches(&record.id).await?;

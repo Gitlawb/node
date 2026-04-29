@@ -36,7 +36,11 @@ pub enum AgentCmd {
 
 pub async fn run(args: AgentArgs) -> Result<()> {
     match args.cmd {
-        AgentCmd::List { node, capability, dir: _ } => cmd_list(node, capability).await,
+        AgentCmd::List {
+            node,
+            capability,
+            dir: _,
+        } => cmd_list(node, capability).await,
         AgentCmd::Show { did, node } => cmd_show(did, node).await,
     }
 }
@@ -49,7 +53,10 @@ async fn cmd_list(node: String, capability: Option<String>) -> Result<()> {
         None => "/api/v1/agents".to_string(),
     };
 
-    let resp = client.get(&path).await.context("failed to connect to node")?;
+    let resp = client
+        .get(&path)
+        .await
+        .context("failed to connect to node")?;
     let status = resp.status();
 
     if status == reqwest::StatusCode::NOT_FOUND {
@@ -59,7 +66,10 @@ async fn cmd_list(node: String, capability: Option<String>) -> Result<()> {
         );
     }
 
-    let body: Value = resp.json().await.context("invalid JSON from node — is GITLAWB_NODE correct?")?;
+    let body: Value = resp
+        .json()
+        .await
+        .context("invalid JSON from node — is GITLAWB_NODE correct?")?;
 
     if !status.is_success() {
         let msg = body["message"].as_str().unwrap_or("unknown error");
@@ -76,10 +86,20 @@ async fn cmd_list(node: String, capability: Option<String>) -> Result<()> {
     println!("Agents on {} ({} total)\n", node, agents.len());
     for agent in &agents {
         let did = agent["did"].as_str().unwrap_or("?");
-        let short = did.split(':').next_back().map(|s| &s[..s.len().min(16)]).unwrap_or("?");
+        let short = did
+            .split(':')
+            .next_back()
+            .map(|s| &s[..s.len().min(16)])
+            .unwrap_or("?");
         let trust = agent["trust_score"].as_f64().unwrap_or(0.0);
-        let caps = agent["capabilities"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+        let caps = agent["capabilities"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         let model = agent["model"].as_str().unwrap_or("");
         println!("  {short}…  trust={trust:.2}  {caps}");
@@ -106,7 +126,10 @@ async fn cmd_show(did: String, node: String) -> Result<()> {
         );
     }
 
-    let agent: Value = resp.json().await.context("invalid JSON from node — is GITLAWB_NODE correct?")?;
+    let agent: Value = resp
+        .json()
+        .await
+        .context("invalid JSON from node — is GITLAWB_NODE correct?")?;
 
     if !status.is_success() {
         let msg = agent["message"].as_str().unwrap_or("unknown error");
@@ -115,8 +138,14 @@ async fn cmd_show(did: String, node: String) -> Result<()> {
 
     let full_did = agent["did"].as_str().unwrap_or("?");
     let trust = agent["trust_score"].as_f64().unwrap_or(0.0);
-    let caps = agent["capabilities"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+    let caps = agent["capabilities"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
         .unwrap_or_default();
     let registered = agent["registered_at"].as_str().unwrap_or("?");
     let model = agent["model"].as_str().unwrap_or("(none)");
@@ -172,7 +201,9 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list(server.url(), Some("git:push".to_string())).await.unwrap();
+        cmd_list(server.url(), Some("git:push".to_string()))
+            .await
+            .unwrap();
         _m.assert_async().await;
     }
 
@@ -217,7 +248,9 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_show("did:key:z6MkTest".to_string(), server.url()).await.unwrap();
+        cmd_show("did:key:z6MkTest".to_string(), server.url())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -231,7 +264,9 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_show("did:key:z6MkMissing".to_string(), server.url()).await.unwrap_err();
+        let err = cmd_show("did:key:z6MkMissing".to_string(), server.url())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("agents API") || err.to_string().contains("not found"));
     }
 
@@ -246,6 +281,8 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_show("did:key:z6MkHigh".to_string(), server.url()).await.unwrap();
+        cmd_show("did:key:z6MkHigh".to_string(), server.url())
+            .await
+            .unwrap();
     }
 }

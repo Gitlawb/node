@@ -84,7 +84,8 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         if let Ok(r) = pr_resp {
             if let Ok(body) = r.json::<Value>().await {
                 let prs = body["pulls"].as_array().cloned().unwrap_or_default();
-                let open: Vec<_> = prs.iter()
+                let open: Vec<_> = prs
+                    .iter()
                     .filter(|p| p["status"].as_str() == Some("open"))
                     .collect();
                 if open.is_empty() {
@@ -110,7 +111,8 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         if let Ok(r) = issue_resp {
             if let Ok(body) = r.json::<Value>().await {
                 let issues = body["issues"].as_array().cloned().unwrap_or_default();
-                let open: Vec<_> = issues.iter()
+                let open: Vec<_> = issues
+                    .iter()
                     .filter(|i| i["status"].as_str() == Some("open"))
                     .collect();
                 if open.is_empty() {
@@ -148,13 +150,17 @@ fn detect_gitlawb_remote() -> Option<(String, String)> {
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let url = String::from_utf8(out.stdout).ok()?;
     let rest = url.trim().strip_prefix("gitlawb://")?;
     let slash = rest.rfind('/')?;
     let did = rest[..slash].to_string();
     let repo = rest[slash + 1..].to_string();
-    if did.is_empty() || repo.is_empty() { return None; }
+    if did.is_empty() || repo.is_empty() {
+        return None;
+    }
     Some((did, repo))
 }
 
@@ -165,7 +171,9 @@ fn parse_gitlawb_url(url: &str) -> Option<(String, String)> {
     let slash = rest.rfind('/')?;
     let did = rest[..slash].to_string();
     let repo = rest[slash + 1..].to_string();
-    if did.is_empty() || repo.is_empty() { return None; }
+    if did.is_empty() || repo.is_empty() {
+        return None;
+    }
     Some((did, repo))
 }
 
@@ -176,13 +184,19 @@ mod tests {
     #[test]
     fn parse_simple_gitlawb_url() {
         let result = parse_gitlawb_url("gitlawb://did:key:z6Mk1234/myrepo");
-        assert_eq!(result, Some(("did:key:z6Mk1234".to_string(), "myrepo".to_string())));
+        assert_eq!(
+            result,
+            Some(("did:key:z6Mk1234".to_string(), "myrepo".to_string()))
+        );
     }
 
     #[test]
     fn parse_gitlawb_url_with_newline() {
         let result = parse_gitlawb_url("gitlawb://did:key:z6Mk1234/myrepo\n");
-        assert_eq!(result, Some(("did:key:z6Mk1234".to_string(), "myrepo".to_string())));
+        assert_eq!(
+            result,
+            Some(("did:key:z6Mk1234".to_string(), "myrepo".to_string()))
+        );
     }
 
     #[test]
@@ -204,7 +218,10 @@ mod tests {
     #[test]
     fn parse_gitlawb_url_repo_name_with_dash() {
         let result = parse_gitlawb_url("gitlawb://did:key:z6MkAbc/my-cool-repo");
-        assert_eq!(result, Some(("did:key:z6MkAbc".to_string(), "my-cool-repo".to_string())));
+        assert_eq!(
+            result,
+            Some(("did:key:z6MkAbc".to_string(), "my-cool-repo".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -279,7 +296,10 @@ mod tests {
             .create_async()
             .await;
         let _trust = server
-            .mock("GET", mockito::Matcher::Regex(r"^/api/v1/agents/".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/agents/".to_string()),
+            )
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"not found"}"#)

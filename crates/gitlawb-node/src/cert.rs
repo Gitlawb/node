@@ -41,11 +41,11 @@ pub async fn issue_ref_certificate(
     let signature = state.node_keypair.sign_b64(&payload_bytes);
 
     let cert = RefCertificate {
-        id:         Uuid::new_v4().to_string(),
-        repo_id:    repo_id.to_string(),
-        ref_name:   ref_name.to_string(),
-        old_sha:    old_sha.to_string(),
-        new_sha:    new_sha.to_string(),
+        id: Uuid::new_v4().to_string(),
+        repo_id: repo_id.to_string(),
+        ref_name: ref_name.to_string(),
+        old_sha: old_sha.to_string(),
+        new_sha: new_sha.to_string(),
         pusher_did: pusher_did.to_string(),
         node_did,
         signature,

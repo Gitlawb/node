@@ -1,5 +1,5 @@
-pub mod store;
-pub mod smart_http;
 pub mod issues;
-pub mod tigris;
 pub mod repo_store;
+pub mod smart_http;
+pub mod store;
+pub mod tigris;

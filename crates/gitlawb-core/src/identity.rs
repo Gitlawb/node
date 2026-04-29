@@ -3,13 +3,13 @@
 //! A gitlawb identity is an Ed25519 keypair. The public key encodes into a
 //! `did:key` DID. The private key is stored as PKCS#8 PEM on disk.
 
-use ed25519_dalek::{SigningKey, VerifyingKey, Signer, Signature};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::{Error, Result};
 use crate::did::Did;
+use crate::{Error, Result};
 
 /// An Ed25519 keypair that is the root identity for a gitlawb actor.
 #[derive(Clone)]
@@ -47,7 +47,7 @@ impl Keypair {
 
     /// Sign and return base64url-encoded signature string.
     pub fn sign_b64(&self, msg: &[u8]) -> String {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         let sig = self.sign(msg);
         URL_SAFE_NO_PAD.encode(sig.to_bytes())
     }
@@ -69,18 +69,13 @@ impl Keypair {
     /// Load from PEM-encoded PKCS#8 private key string.
     pub fn from_pem(pem: &str) -> Result<Self> {
         use pkcs8::DecodePrivateKey;
-        let signing_key = SigningKey::from_pkcs8_pem(pem)
-            .map_err(|e| Error::Key(e.to_string()))?;
+        let signing_key = SigningKey::from_pkcs8_pem(pem).map_err(|e| Error::Key(e.to_string()))?;
         Ok(Self { signing_key })
     }
 }
 
 /// Verify an Ed25519 signature.
-pub fn verify(
-    verifying_key: &VerifyingKey,
-    msg: &[u8],
-    sig_bytes: &[u8; 64],
-) -> Result<()> {
+pub fn verify(verifying_key: &VerifyingKey, msg: &[u8], sig_bytes: &[u8; 64]) -> Result<()> {
     use ed25519_dalek::Verifier;
     let sig = Signature::from_bytes(sig_bytes);
     verifying_key
@@ -117,8 +112,8 @@ impl<T: Serialize> Signed<T> {
 }
 
 mod sig_b64 {
-    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use serde::{Deserializer, Serializer, Deserialize};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&URL_SAFE_NO_PAD.encode(bytes))
@@ -126,8 +121,12 @@ mod sig_b64 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
         let s = String::deserialize(d)?;
-        let bytes = URL_SAFE_NO_PAD.decode(&s).map_err(serde::de::Error::custom)?;
-        bytes.try_into().map_err(|_| serde::de::Error::custom("expected 64 bytes"))
+        let bytes = URL_SAFE_NO_PAD
+            .decode(&s)
+            .map_err(serde::de::Error::custom)?;
+        bytes
+            .try_into()
+            .map_err(|_| serde::de::Error::custom("expected 64 bytes"))
     }
 }
 

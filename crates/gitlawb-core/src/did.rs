@@ -75,12 +75,13 @@ impl Did {
     pub fn to_verifying_key(&self) -> Result<VerifyingKey> {
         if !self.is_did_key() {
             return Err(Error::InvalidDid(format!(
-                "expected did:key, got did:{}", self.method()
+                "expected did:key, got did:{}",
+                self.method()
             )));
         }
 
-        let (_, bytes) = multibase::decode(self.method_id())
-            .map_err(|e| Error::InvalidDid(e.to_string()))?;
+        let (_, bytes) =
+            multibase::decode(self.method_id()).map_err(|e| Error::InvalidDid(e.to_string()))?;
 
         if !bytes.starts_with(ED25519_MULTICODEC) {
             return Err(Error::InvalidDid(
@@ -92,8 +93,7 @@ impl Did {
             .try_into()
             .map_err(|_| Error::InvalidDid("ed25519 key must be 32 bytes".to_string()))?;
 
-        VerifyingKey::from_bytes(&key_bytes)
-            .map_err(|e| Error::InvalidDid(e.to_string()))
+        VerifyingKey::from_bytes(&key_bytes).map_err(|e| Error::InvalidDid(e.to_string()))
     }
 
     /// Return the full DID string as a `&str`.
@@ -105,7 +105,9 @@ impl Did {
     pub fn validate(&self) -> Result<()> {
         match self.method() {
             "key" | "web" | "gitlawb" => Ok(()),
-            other => Err(Error::InvalidDid(format!("unsupported DID method: {other}"))),
+            other => Err(Error::InvalidDid(format!(
+                "unsupported DID method: {other}"
+            ))),
         }
     }
 }
@@ -121,7 +123,9 @@ impl FromStr for Did {
 
     fn from_str(s: &str) -> Result<Self> {
         if !s.starts_with("did:") {
-            return Err(Error::InvalidDid(format!("'{s}' does not start with 'did:'")));
+            return Err(Error::InvalidDid(format!(
+                "'{s}' does not start with 'did:'"
+            )));
         }
         let did = Self(s.to_string());
         did.validate()?;

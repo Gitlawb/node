@@ -80,7 +80,10 @@ pub async fn create_bounty(
     }
 
     // Verify repo exists
-    let _ = state.db.get_repo(&owner, &repo).await?
+    let _ = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let now = Utc::now().to_rfc3339();
@@ -116,12 +119,15 @@ pub async fn list_repo_bounties(
     Path((owner, repo)): Path<(String, String)>,
     Query(q): Query<ListBountiesQuery>,
 ) -> Result<Json<serde_json::Value>> {
-    let bounties = state.db.list_bounties(
-        Some(&owner),
-        Some(&repo),
-        q.status.as_deref(),
-        q.limit.unwrap_or(50),
-    ).await?;
+    let bounties = state
+        .db
+        .list_bounties(
+            Some(&owner),
+            Some(&repo),
+            q.status.as_deref(),
+            q.limit.unwrap_or(50),
+        )
+        .await?;
 
     Ok(Json(serde_json::json!({ "bounties": bounties })))
 }
@@ -131,12 +137,10 @@ pub async fn list_all_bounties(
     State(state): State<AppState>,
     Query(q): Query<ListBountiesQuery>,
 ) -> Result<Json<serde_json::Value>> {
-    let bounties = state.db.list_bounties(
-        None,
-        None,
-        q.status.as_deref(),
-        q.limit.unwrap_or(50),
-    ).await?;
+    let bounties = state
+        .db
+        .list_bounties(None, None, q.status.as_deref(), q.limit.unwrap_or(50))
+        .await?;
 
     Ok(Json(serde_json::json!({ "bounties": bounties })))
 }
@@ -146,7 +150,10 @@ pub async fn get_bounty(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state.db.get_bounty(&id).await?
+    let bounty = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
     Ok(Json(bounty))
 }
@@ -158,19 +165,31 @@ pub async fn claim_bounty(
     Path(id): Path<String>,
     Json(req): Json<ClaimBountyRequest>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state.db.get_bounty(&id).await?
+    let bounty = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
 
     if bounty.status != "open" {
-        return Err(AppError::BadRequest(format!("bounty is {}, not open", bounty.status)));
+        return Err(AppError::BadRequest(format!(
+            "bounty is {}, not open",
+            bounty.status
+        )));
     }
 
     let now = Utc::now().to_rfc3339();
-    state.db.claim_bounty(&id, &auth.0, req.wallet.as_deref(), &now).await?;
+    state
+        .db
+        .claim_bounty(&id, &auth.0, req.wallet.as_deref(), &now)
+        .await?;
 
     tracing::info!(bounty_id = %id, agent = %auth.0, "bounty claimed");
 
-    let updated = state.db.get_bounty(&id).await?
+    let updated = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
     Ok(Json(updated))
 }
@@ -182,11 +201,17 @@ pub async fn submit_bounty(
     Path(id): Path<String>,
     Json(req): Json<SubmitBountyRequest>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state.db.get_bounty(&id).await?
+    let bounty = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
 
     if bounty.status != "claimed" {
-        return Err(AppError::BadRequest(format!("bounty is {}, not claimed", bounty.status)));
+        return Err(AppError::BadRequest(format!(
+            "bounty is {}, not claimed",
+            bounty.status
+        )));
     }
     if bounty.claimant_did.as_deref() != Some(&auth.0) {
         return Err(AppError::BadRequest("only the claimant can submit".into()));
@@ -197,7 +222,10 @@ pub async fn submit_bounty(
 
     tracing::info!(bounty_id = %id, pr_id = %req.pr_id, "bounty submission");
 
-    let updated = state.db.get_bounty(&id).await?
+    let updated = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
     Ok(Json(updated))
 }
@@ -209,18 +237,29 @@ pub async fn approve_bounty(
     Path(id): Path<String>,
     Json(req): Json<ApproveBountyRequest>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state.db.get_bounty(&id).await?
+    let bounty = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
 
     if bounty.status != "submitted" {
-        return Err(AppError::BadRequest(format!("bounty is {}, not submitted", bounty.status)));
+        return Err(AppError::BadRequest(format!(
+            "bounty is {}, not submitted",
+            bounty.status
+        )));
     }
     if bounty.creator_did != auth.0 {
-        return Err(AppError::BadRequest("only the bounty creator can approve".into()));
+        return Err(AppError::BadRequest(
+            "only the bounty creator can approve".into(),
+        ));
     }
 
     let now = Utc::now().to_rfc3339();
-    state.db.approve_bounty(&id, &now, req.tx_hash.as_deref()).await?;
+    state
+        .db
+        .approve_bounty(&id, &now, req.tx_hash.as_deref())
+        .await?;
 
     // Bump claimant trust score
     if let Some(ref agent_did) = bounty.claimant_did {
@@ -231,7 +270,10 @@ pub async fn approve_bounty(
 
     tracing::info!(bounty_id = %id, "bounty approved");
 
-    let updated = state.db.get_bounty(&id).await?
+    let updated = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
     Ok(Json(updated))
 }
@@ -242,20 +284,31 @@ pub async fn cancel_bounty(
     Extension(auth): Extension<AuthenticatedDid>,
     Path(id): Path<String>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state.db.get_bounty(&id).await?
+    let bounty = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
 
     if bounty.status != "open" {
-        return Err(AppError::BadRequest(format!("can only cancel open bounties, status is {}", bounty.status)));
+        return Err(AppError::BadRequest(format!(
+            "can only cancel open bounties, status is {}",
+            bounty.status
+        )));
     }
     if bounty.creator_did != auth.0 {
-        return Err(AppError::BadRequest("only the bounty creator can cancel".into()));
+        return Err(AppError::BadRequest(
+            "only the bounty creator can cancel".into(),
+        ));
     }
 
     state.db.cancel_bounty(&id).await?;
     tracing::info!(bounty_id = %id, "bounty cancelled");
 
-    let updated = state.db.get_bounty(&id).await?
+    let updated = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
     Ok(Json(updated))
 }
@@ -265,11 +318,17 @@ pub async fn dispute_bounty(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state.db.get_bounty(&id).await?
+    let bounty = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
 
     if bounty.status != "claimed" && bounty.status != "submitted" {
-        return Err(AppError::BadRequest(format!("can only dispute claimed/submitted bounties, status is {}", bounty.status)));
+        return Err(AppError::BadRequest(format!(
+            "can only dispute claimed/submitted bounties, status is {}",
+            bounty.status
+        )));
     }
 
     // Check if deadline exceeded
@@ -277,7 +336,9 @@ pub async fn dispute_bounty(
         if let Ok(claimed) = chrono::DateTime::parse_from_rfc3339(claimed_at) {
             let deadline = claimed + chrono::Duration::seconds(bounty.deadline_secs);
             if Utc::now() < deadline {
-                return Err(AppError::BadRequest("deadline has not been exceeded yet".into()));
+                return Err(AppError::BadRequest(
+                    "deadline has not been exceeded yet".into(),
+                ));
             }
         }
     }
@@ -285,25 +346,37 @@ pub async fn dispute_bounty(
     state.db.dispute_bounty(&id).await?;
     tracing::info!(bounty_id = %id, "bounty disputed — reopened");
 
-    let updated = state.db.get_bounty(&id).await?
+    let updated = state
+        .db
+        .get_bounty(&id)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
     Ok(Json(updated))
 }
 
 /// GET /api/v1/bounties/stats
-pub async fn bounty_stats(
-    State(state): State<AppState>,
-) -> Result<Json<BountyStatsResponse>> {
+pub async fn bounty_stats(State(state): State<AppState>) -> Result<Json<BountyStatsResponse>> {
     let open = state.db.count_bounties_by_status("open").await.unwrap_or(0);
-    let claimed = state.db.count_bounties_by_status("claimed").await.unwrap_or(0);
-    let completed = state.db.count_bounties_by_status("completed").await.unwrap_or(0);
+    let claimed = state
+        .db
+        .count_bounties_by_status("claimed")
+        .await
+        .unwrap_or(0);
+    let completed = state
+        .db
+        .count_bounties_by_status("completed")
+        .await
+        .unwrap_or(0);
 
     let leaders = state.db.bounty_leaderboard(10).await.unwrap_or_default();
-    let leaderboard = leaders.into_iter().map(|(did, cnt, total)| AgentBountyEntry {
-        did,
-        completed: cnt,
-        total_earned: total,
-    }).collect();
+    let leaderboard = leaders
+        .into_iter()
+        .map(|(did, cnt, total)| AgentBountyEntry {
+            did,
+            completed: cnt,
+            total_earned: total,
+        })
+        .collect();
 
     Ok(Json(BountyStatsResponse {
         open,

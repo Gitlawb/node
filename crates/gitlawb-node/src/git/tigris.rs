@@ -23,7 +23,10 @@ impl TigrisClient {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let s3 = S3Client::new(&config);
         info!(bucket = %bucket, "tigris storage client initialized");
-        Ok(Self { s3, bucket: bucket.to_string() })
+        Ok(Self {
+            s3,
+            bucket: bucket.to_string(),
+        })
     }
 
     /// S3 key for a given repo: `repos/v1/{owner_slug}/{repo_name}.tar.zst`
@@ -34,7 +37,9 @@ impl TigrisClient {
     /// Check if a repo archive exists in Tigris.
     pub async fn exists(&self, owner_slug: &str, repo_name: &str) -> Result<bool> {
         let key = Self::repo_key(owner_slug, repo_name);
-        match self.s3.head_object()
+        match self
+            .s3
+            .head_object()
             .bucket(&self.bucket)
             .key(&key)
             .send()
@@ -67,7 +72,8 @@ impl TigrisClient {
 
         let body = aws_sdk_s3::primitives::ByteStream::from(archive_bytes);
 
-        self.s3.put_object()
+        self.s3
+            .put_object()
             .bucket(&self.bucket)
             .key(&key)
             .body(body)
@@ -81,18 +87,28 @@ impl TigrisClient {
     }
 
     /// Download a repo archive from Tigris and extract to local disk.
-    pub async fn download(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()> {
+    pub async fn download(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+    ) -> Result<()> {
         let key = Self::repo_key(owner_slug, repo_name);
         debug!(key = %key, path = %local_path.display(), "downloading repo from tigris");
 
-        let resp = self.s3.get_object()
+        let resp = self
+            .s3
+            .get_object()
             .bucket(&self.bucket)
             .key(&key)
             .send()
             .await
             .context(format!("tigris GET {key}"))?;
 
-        let data = resp.body.collect().await
+        let data = resp
+            .body
+            .collect()
+            .await
             .context("reading tigris response body")?
             .into_bytes()
             .to_vec();
@@ -114,7 +130,8 @@ impl TigrisClient {
     #[allow(dead_code)]
     pub async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
         let key = Self::repo_key(owner_slug, repo_name);
-        self.s3.delete_object()
+        self.s3
+            .delete_object()
             .bucket(&self.bucket)
             .key(&key)
             .send()

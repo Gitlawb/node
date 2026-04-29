@@ -1,0 +1,15 @@
+{
+  "$comment": "Canonical seed list for the Gitlawb network. Merged with GITLAWB_BOOTSTRAP_PEERS at startup. PRs to add public nodes welcome.",
+  "version": 1,
+  "updated": "2026-04-29",
+  "peers": [
+    {
+      "name": "gitlawb",
+      "operator": "Gitlawb (Kevin)",
+      "did": "did:key:z6MkqDnb7Siv3Cwj7pGJq4T5EsUisECqR8KpnDLwcaZq5TPr",
+      "http_url": "https://node.gitlawb.com",
+      "p2p_multiaddr": null,
+      "added": "2026-04-29"
+    }
+  ]
+}

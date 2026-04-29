@@ -35,7 +35,6 @@ pub enum NodeCmd {
     },
 
     // ── On-chain PoS ──────────────────────────────────────────────────────
-
     /// Stake $GITLAWB and register this node on-chain (Base L2)
     Register {
         /// Amount of $GITLAWB to stake (whole tokens, e.g. 10000)
@@ -125,18 +124,47 @@ pub async fn run(args: NodeArgs) -> Result<()> {
         NodeCmd::Status { node } => cmd_status(node).await,
         NodeCmd::Trust { did, node } => cmd_trust(did, node).await,
         NodeCmd::Resolve { did, node } => cmd_resolve(did, node).await,
-        NodeCmd::Register { stake, http_url, private_key, token, contract, rpc_url, dir } =>
-            node_stake::cmd_register(stake, http_url, private_key, token, contract, rpc_url, dir).await,
-        NodeCmd::Heartbeat { private_key, contract, rpc_url, dir } =>
-            node_stake::cmd_heartbeat(private_key, contract, rpc_url, dir).await,
-        NodeCmd::OnchainStatus { contract, rpc_url, dir } =>
-            node_stake::cmd_onchain_status(contract, rpc_url, dir).await,
-        NodeCmd::Claim { private_key, contract, rpc_url, dir } =>
-            node_stake::cmd_claim(private_key, contract, rpc_url, dir).await,
-        NodeCmd::UnstakeRequest { private_key, contract, rpc_url, dir } =>
-            node_stake::cmd_unstake_request(private_key, contract, rpc_url, dir).await,
-        NodeCmd::Unstake { private_key, contract, rpc_url, dir } =>
-            node_stake::cmd_unstake(private_key, contract, rpc_url, dir).await,
+        NodeCmd::Register {
+            stake,
+            http_url,
+            private_key,
+            token,
+            contract,
+            rpc_url,
+            dir,
+        } => {
+            node_stake::cmd_register(stake, http_url, private_key, token, contract, rpc_url, dir)
+                .await
+        }
+        NodeCmd::Heartbeat {
+            private_key,
+            contract,
+            rpc_url,
+            dir,
+        } => node_stake::cmd_heartbeat(private_key, contract, rpc_url, dir).await,
+        NodeCmd::OnchainStatus {
+            contract,
+            rpc_url,
+            dir,
+        } => node_stake::cmd_onchain_status(contract, rpc_url, dir).await,
+        NodeCmd::Claim {
+            private_key,
+            contract,
+            rpc_url,
+            dir,
+        } => node_stake::cmd_claim(private_key, contract, rpc_url, dir).await,
+        NodeCmd::UnstakeRequest {
+            private_key,
+            contract,
+            rpc_url,
+            dir,
+        } => node_stake::cmd_unstake_request(private_key, contract, rpc_url, dir).await,
+        NodeCmd::Unstake {
+            private_key,
+            contract,
+            rpc_url,
+            dir,
+        } => node_stake::cmd_unstake(private_key, contract, rpc_url, dir).await,
     }
 }
 
@@ -153,9 +181,13 @@ async fn cmd_status(node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
     // ── Fetch node info (required — bail if unreachable) ──────────────────
-    let info_resp = client.get("/").await
+    let info_resp = client
+        .get("/")
+        .await
         .map_err(|e| anyhow::anyhow!("Cannot reach node at {node}: {e}"))?;
-    let info: Value = info_resp.json().await
+    let info: Value = info_resp
+        .json()
+        .await
         .map_err(|e| anyhow::anyhow!("Invalid JSON from node: {e}"))?;
 
     let did = info["did"].as_str().unwrap_or("unknown");
@@ -189,10 +221,18 @@ async fn cmd_status(node: String) -> Result<()> {
     println!("Network");
     if let Some(ref peers) = peers_val {
         let count = peers["count"].as_u64().unwrap_or_else(|| {
-            peers["peers"].as_array().map(|a| a.len() as u64).unwrap_or(0)
+            peers["peers"]
+                .as_array()
+                .map(|a| a.len() as u64)
+                .unwrap_or(0)
         });
-        let reachable = peers["peers"].as_array()
-            .map(|a| a.iter().filter(|p| p["reachable"].as_bool().unwrap_or(false)).count())
+        let reachable = peers["peers"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|p| p["reachable"].as_bool().unwrap_or(false))
+                    .count()
+            })
             .unwrap_or(0);
         println!("  Peers:    {count} known ({reachable} reachable)");
     } else {
@@ -204,9 +244,7 @@ async fn cmd_status(node: String) -> Result<()> {
             let peer_id = p2p["peer_id"].as_str().unwrap_or("unknown");
             println!("  P2P:      enabled — peer_id: {peer_id}");
             if let Some(topics) = p2p["topics"].as_array() {
-                let topic_list: Vec<&str> = topics.iter()
-                    .filter_map(|t| t.as_str())
-                    .collect();
+                let topic_list: Vec<&str> = topics.iter().filter_map(|t| t.as_str()).collect();
                 if !topic_list.is_empty() {
                     println!("  Topics:   {}", topic_list.join(", "));
                 }
@@ -245,8 +283,7 @@ async fn cmd_status(node: String) -> Result<()> {
     if let Some(ref events) = events_val {
         println!("Activity (recent ref-updates)");
         // Events may be a top-level array or wrapped in an "events" key
-        let items: Option<&Vec<Value>> = events.as_array()
-            .or_else(|| events["events"].as_array());
+        let items: Option<&Vec<Value>> = events.as_array().or_else(|| events["events"].as_array());
 
         if let Some(arr) = items {
             if arr.is_empty() {
@@ -255,7 +292,8 @@ async fn cmd_status(node: String) -> Result<()> {
                 for ev in arr.iter().take(5) {
                     let repo = ev["repo"].as_str().unwrap_or("?");
                     let ref_name = ev["ref"].as_str().unwrap_or("?");
-                    let ts = ev["timestamp"].as_str()
+                    let ts = ev["timestamp"]
+                        .as_str()
                         .map(|s| &s[..10.min(s.len())])
                         .unwrap_or("?");
                     println!("  {ts}  {repo}  {ref_name}");
@@ -270,9 +308,9 @@ async fn cmd_status(node: String) -> Result<()> {
     // Pins
     println!("Pins");
     if let Some(ref pins) = pins_val {
-        let count = pins["count"].as_u64().unwrap_or_else(|| {
-            pins["pins"].as_array().map(|a| a.len() as u64).unwrap_or(0)
-        });
+        let count = pins["count"]
+            .as_u64()
+            .unwrap_or_else(|| pins["pins"].as_array().map(|a| a.len() as u64).unwrap_or(0));
         println!("  Pinned CIDs: {count}");
     } else {
         println!("  IPFS not configured");
@@ -285,7 +323,9 @@ async fn cmd_status(node: String) -> Result<()> {
 async fn cmd_trust(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let path = format!("/api/v1/agents/{did}/trust");
-    let resp = client.get(&path).await
+    let resp = client
+        .get(&path)
+        .await
         .map_err(|e| anyhow::anyhow!("Cannot reach node at {node}: {e}"))?;
 
     if !resp.status().is_success() {
@@ -293,7 +333,9 @@ async fn cmd_trust(did: String, node: String) -> Result<()> {
         anyhow::bail!("trust query failed ({status}) for {did}");
     }
 
-    let trust: Value = resp.json().await
+    let trust: Value = resp
+        .json()
+        .await
         .map_err(|e| anyhow::anyhow!("Invalid JSON response: {e}"))?;
 
     let score = trust["trust_score"].as_f64().unwrap_or(0.0);
@@ -310,9 +352,12 @@ async fn cmd_trust(did: String, node: String) -> Result<()> {
 
 async fn cmd_resolve(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
-    let info: Value = client.get("/").await
+    let info: Value = client
+        .get("/")
+        .await
         .map_err(|e| anyhow::anyhow!("Cannot reach node at {node}: {e}"))?
-        .json().await
+        .json()
+        .await
         .map_err(|e| anyhow::anyhow!("Invalid JSON from node: {e}"))?;
 
     let node_did = info["did"].as_str().unwrap_or("unknown");
@@ -322,8 +367,14 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
         println!("DID resolution for {did}");
         println!("  DID:      {node_did}");
         println!("  Node URL: {node}");
-        println!("  Version:  {}", info["version"].as_str().unwrap_or("unknown"));
-        println!("  Network:  {}", info["network"].as_str().unwrap_or("unknown"));
+        println!(
+            "  Version:  {}",
+            info["version"].as_str().unwrap_or("unknown")
+        );
+        println!(
+            "  Network:  {}",
+            info["network"].as_str().unwrap_or("unknown")
+        );
         if let Some(peer_id) = info["p2p_peer_id"].as_str() {
             println!("  P2P ID:   {peer_id}");
         }

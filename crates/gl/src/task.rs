@@ -93,16 +93,49 @@ pub enum TaskCmd {
 pub async fn run(args: TaskArgs) -> Result<()> {
     match args.cmd {
         TaskCmd::Create {
-            kind, capability, repo_id, assignee_did, payload,
-            ucan_token, deadline, node, dir,
-        } => cmd_create(kind, capability, repo_id, assignee_did, payload, ucan_token, deadline, node, dir).await,
-        TaskCmd::List { status, assignee_did, limit, node } => {
-            cmd_list(status, assignee_did, limit, node).await
+            kind,
+            capability,
+            repo_id,
+            assignee_did,
+            payload,
+            ucan_token,
+            deadline,
+            node,
+            dir,
+        } => {
+            cmd_create(
+                kind,
+                capability,
+                repo_id,
+                assignee_did,
+                payload,
+                ucan_token,
+                deadline,
+                node,
+                dir,
+            )
+            .await
         }
+        TaskCmd::List {
+            status,
+            assignee_did,
+            limit,
+            node,
+        } => cmd_list(status, assignee_did, limit, node).await,
         TaskCmd::View { id, node } => cmd_view(id, node).await,
         TaskCmd::Claim { id, node, dir } => cmd_claim(id, node, dir).await,
-        TaskCmd::Complete { id, result, node, dir } => cmd_complete(id, result, node, dir).await,
-        TaskCmd::Fail { id, reason, node, dir } => cmd_fail(id, reason, node, dir).await,
+        TaskCmd::Complete {
+            id,
+            result,
+            node,
+            dir,
+        } => cmd_complete(id, result, node, dir).await,
+        TaskCmd::Fail {
+            id,
+            reason,
+            node,
+            dir,
+        } => cmd_fail(id, reason, node, dir).await,
     }
 }
 
@@ -258,7 +291,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks")
@@ -289,7 +326,11 @@ mod tests {
         let err = cmd_create(
             "code-review".to_string(),
             "agent:task".to_string(),
-            None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
             "http://127.0.0.1:1".to_string(),
             Some(dir.path().to_path_buf()),
         )
@@ -303,7 +344,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks")
@@ -317,7 +362,11 @@ mod tests {
         cmd_create(
             "deploy".to_string(),
             "agent:task".to_string(),
-            None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
             server.url(),
             Some(dir.path().to_path_buf()),
         )
@@ -332,7 +381,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
 
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"tasks":[]}"#)
@@ -347,7 +399,10 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
 
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"status=pending".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"status=pending".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"tasks":[{"id":"t1","kind":"test","status":"pending"}]}"#)
@@ -404,7 +459,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks/task-7/claim")
@@ -414,9 +473,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_claim("task-7".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_claim(
+            "task-7".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     // ── complete ─────────────────────────────────────────────────────
@@ -426,7 +489,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks/task-7/complete")
@@ -451,7 +518,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks/task-8/complete")
@@ -461,9 +532,14 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_complete("task-8".to_string(), None, server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_complete(
+            "task-8".to_string(),
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     // ── fail ─────────────────────────────────────────────────────────
@@ -473,7 +549,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks/task-9/fail")
@@ -498,7 +578,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/tasks/task-10/fail")
@@ -508,8 +592,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_fail("task-10".to_string(), None, server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_fail(
+            "task-10".to_string(),
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 }

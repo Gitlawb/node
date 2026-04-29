@@ -111,14 +111,31 @@ pub enum BountyCmd {
 
 pub async fn run(args: BountyArgs) -> Result<()> {
     match args.cmd {
-        BountyCmd::Create { repo, title, amount, issue, tx_hash, deadline, node, dir } => {
-            cmd_create(repo, title, amount, issue, tx_hash, deadline, node, dir).await
-        }
+        BountyCmd::Create {
+            repo,
+            title,
+            amount,
+            issue,
+            tx_hash,
+            deadline,
+            node,
+            dir,
+        } => cmd_create(repo, title, amount, issue, tx_hash, deadline, node, dir).await,
         BountyCmd::List { repo, status, node } => cmd_list(repo, status, node).await,
         BountyCmd::Show { id, node } => cmd_show(id, node).await,
-        BountyCmd::Claim { id, wallet, node, dir } => cmd_claim(id, wallet, node, dir).await,
+        BountyCmd::Claim {
+            id,
+            wallet,
+            node,
+            dir,
+        } => cmd_claim(id, wallet, node, dir).await,
         BountyCmd::Submit { id, pr, node, dir } => cmd_submit(id, pr, node, dir).await,
-        BountyCmd::Approve { id, tx_hash, node, dir } => cmd_approve(id, tx_hash, node, dir).await,
+        BountyCmd::Approve {
+            id,
+            tx_hash,
+            node,
+            dir,
+        } => cmd_approve(id, tx_hash, node, dir).await,
         BountyCmd::Cancel { id, node, dir } => cmd_cancel(id, node, dir).await,
         BountyCmd::Stats { node } => cmd_stats(node).await,
     }
@@ -126,12 +143,19 @@ pub async fn run(args: BountyArgs) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn cmd_create(
-    repo: String, title: String, amount: i64, issue: Option<String>,
-    tx_hash: Option<String>, deadline: Option<i64>, node: String, dir: Option<PathBuf>,
+    repo: String,
+    title: String,
+    amount: i64,
+    issue: Option<String>,
+    tx_hash: Option<String>,
+    deadline: Option<i64>,
+    node: String,
+    dir: Option<PathBuf>,
 ) -> Result<()> {
     let kp = load_keypair_from_dir(dir.as_deref())
         .context("identity not found — run `gl identity new` first")?;
-    let (owner, name) = repo.split_once('/')
+    let (owner, name) = repo
+        .split_once('/')
         .map(|(o, n)| (o.to_string(), n.to_string()))
         .context("use owner/repo format")?;
     let client = NodeClient::new(&node, Some(kp));
@@ -145,7 +169,10 @@ async fn cmd_create(
     });
 
     let resp = client
-        .post(&format!("/api/v1/repos/{owner}/{name}/bounties"), &serde_json::to_vec(&body)?)
+        .post(
+            &format!("/api/v1/repos/{owner}/{name}/bounties"),
+            &serde_json::to_vec(&body)?,
+        )
         .await
         .context("failed to connect to node")?;
 
@@ -169,7 +196,8 @@ async fn cmd_list(repo: Option<String>, status: Option<String>, node: String) ->
     let client = NodeClient::new(&node, None);
 
     let url = if let Some(ref repo) = repo {
-        let (owner, name) = repo.split_once('/')
+        let (owner, name) = repo
+            .split_once('/')
             .map(|(o, n)| (o.to_string(), n.to_string()))
             .context("use owner/repo format")?;
         let mut u = format!("/api/v1/repos/{owner}/{name}/bounties");
@@ -185,7 +213,10 @@ async fn cmd_list(repo: Option<String>, status: Option<String>, node: String) ->
         u
     };
 
-    let resp = client.get(&url).await.context("failed to connect to node")?;
+    let resp = client
+        .get(&url)
+        .await
+        .context("failed to connect to node")?;
     let body: Value = resp.json().await.unwrap_or_default();
 
     let bounties = body["bounties"].as_array();
@@ -222,14 +253,22 @@ async fn cmd_show(id: String, node: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_claim(id: String, wallet: Option<String>, node: String, dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_claim(
+    id: String,
+    wallet: Option<String>,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
     let kp = load_keypair_from_dir(dir.as_deref())
         .context("identity not found — run `gl identity new` first")?;
     let client = NodeClient::new(&node, Some(kp));
 
     let body = serde_json::json!({ "wallet": wallet });
     let resp = client
-        .post(&format!("/api/v1/bounties/{id}/claim"), &serde_json::to_vec(&body)?)
+        .post(
+            &format!("/api/v1/bounties/{id}/claim"),
+            &serde_json::to_vec(&body)?,
+        )
         .await?;
 
     let status = resp.status();
@@ -251,7 +290,10 @@ async fn cmd_submit(id: String, pr: String, node: String, dir: Option<PathBuf>) 
 
     let body = serde_json::json!({ "pr_id": pr });
     let resp = client
-        .post(&format!("/api/v1/bounties/{id}/submit"), &serde_json::to_vec(&body)?)
+        .post(
+            &format!("/api/v1/bounties/{id}/submit"),
+            &serde_json::to_vec(&body)?,
+        )
         .await?;
 
     let status = resp.status();
@@ -266,14 +308,22 @@ async fn cmd_submit(id: String, pr: String, node: String, dir: Option<PathBuf>) 
     Ok(())
 }
 
-async fn cmd_approve(id: String, tx_hash: Option<String>, node: String, dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_approve(
+    id: String,
+    tx_hash: Option<String>,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
     let kp = load_keypair_from_dir(dir.as_deref())
         .context("identity not found — run `gl identity new` first")?;
     let client = NodeClient::new(&node, Some(kp));
 
     let body = serde_json::json!({ "tx_hash": tx_hash });
     let resp = client
-        .post(&format!("/api/v1/bounties/{id}/approve"), &serde_json::to_vec(&body)?)
+        .post(
+            &format!("/api/v1/bounties/{id}/approve"),
+            &serde_json::to_vec(&body)?,
+        )
         .await?;
 
     let status = resp.status();
@@ -295,7 +345,10 @@ async fn cmd_cancel(id: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     let body = serde_json::json!({});
     let resp = client
-        .post(&format!("/api/v1/bounties/{id}/cancel"), &serde_json::to_vec(&body)?)
+        .post(
+            &format!("/api/v1/bounties/{id}/cancel"),
+            &serde_json::to_vec(&body)?,
+        )
         .await?;
 
     let status = resp.status();
@@ -332,7 +385,10 @@ async fn cmd_stats(node: String) -> Result<()> {
                 let count = entry["completed"].as_i64().unwrap_or(0);
                 let earned = entry["total_earned"].as_i64().unwrap_or(0);
                 let short = &did[did.len().saturating_sub(8)..];
-                println!("  {}. ...{short}  {count} bounties  {earned} $GITLAWB", i + 1);
+                println!(
+                    "  {}. ...{short}  {count} bounties  {earned} $GITLAWB",
+                    i + 1
+                );
             }
         }
     }
@@ -348,7 +404,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", mockito::Matcher::Regex(r"/bounties$".to_string()))
@@ -362,10 +422,14 @@ mod tests {
             "owner/repo".to_string(),
             "Fix bug".to_string(),
             50000,
-            None, None, None,
+            None,
+            None,
+            None,
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -375,10 +439,14 @@ mod tests {
             "owner/repo".to_string(),
             "Fix bug".to_string(),
             50000,
-            None, None, None,
+            None,
+            None,
+            None,
             "http://127.0.0.1:1".to_string(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("identity not found"));
     }
 
@@ -402,7 +470,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", mockito::Matcher::Regex(r"/claim$".to_string()))
@@ -417,7 +489,9 @@ mod tests {
             Some("0xWALLET".to_string()),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -432,7 +506,9 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_show("nonexistent".to_string(), server.url()).await.unwrap_err();
+        let err = cmd_show("nonexistent".to_string(), server.url())
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 

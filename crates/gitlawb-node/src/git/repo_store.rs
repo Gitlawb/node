@@ -34,7 +34,12 @@ pub struct RepoStore {
 
 impl RepoStore {
     pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, pool: PgPool) -> Self {
-        Self { repos_dir, tigris, pool, migrated: Arc::new(Mutex::new(HashSet::new())) }
+        Self {
+            repos_dir,
+            tigris,
+            pool,
+            migrated: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     /// Ensure a repo is available on local disk, downloading from Tigris if needed.
@@ -87,10 +92,15 @@ impl RepoStore {
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "cache miss — downloading from tigris");
-                tigris.download(&owner_slug, repo_name, &local_path).await
+                tigris
+                    .download(&owner_slug, repo_name, &local_path)
+                    .await
                     .context("downloading repo from tigris")?;
                 // Mark as migrated since we just downloaded it
-                self.migrated.lock().await.insert(format!("{owner_slug}/{repo_name}"));
+                self.migrated
+                    .lock()
+                    .await
+                    .insert(format!("{owner_slug}/{repo_name}"));
                 return Ok(local_path);
             }
         }
@@ -110,7 +120,9 @@ impl RepoStore {
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
-                tigris.download(&owner_slug, repo_name, &local_path).await
+                tigris
+                    .download(&owner_slug, repo_name, &local_path)
+                    .await
                     .context("downloading repo from tigris (fresh)")?;
                 return Ok(local_path);
             }
@@ -152,7 +164,9 @@ impl RepoStore {
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                tigris.download(&owner_slug, repo_name, &local_path).await
+                tigris
+                    .download(&owner_slug, repo_name, &local_path)
+                    .await
                     .context("downloading repo from tigris for write")?;
             }
         }
@@ -171,8 +185,7 @@ impl RepoStore {
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name);
 
-        store::init_bare(&local_path)
-            .context("initializing bare repo")?;
+        store::init_bare(&local_path).context("initializing bare repo")?;
 
         // Upload to Tigris in background
         if let Some(ref tigris) = self.tigris {
@@ -204,7 +217,10 @@ impl RepoStore {
     /// Compute the local disk path and owner slug for a repo.
     fn local_path(&self, owner_did: &str, repo_name: &str) -> (String, PathBuf) {
         let owner_slug = owner_did.replace(':', "_").replace('/', "_");
-        let local_path = self.repos_dir.join(&owner_slug).join(format!("{repo_name}.git"));
+        let local_path = self
+            .repos_dir
+            .join(&owner_slug)
+            .join(format!("{repo_name}.git"));
         (owner_slug, local_path)
     }
 }
@@ -230,7 +246,10 @@ impl RepoWriteGuard {
     pub async fn release(self) {
         // Upload to Tigris
         if let Some(ref tigris) = self.tigris {
-            if let Err(e) = tigris.upload(&self.owner_slug, &self.repo_name, &self.local_path).await {
+            if let Err(e) = tigris
+                .upload(&self.owner_slug, &self.repo_name, &self.local_path)
+                .await
+            {
                 warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
             }
         }

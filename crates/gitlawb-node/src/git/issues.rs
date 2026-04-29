@@ -25,7 +25,9 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
     let mut child = hash_output;
     if let Some(stdin) = child.stdin.take() {
         let mut stdin = stdin;
-        stdin.write_all(json.as_bytes()).context("failed to write to git hash-object stdin")?;
+        stdin
+            .write_all(json.as_bytes())
+            .context("failed to write to git hash-object stdin")?;
     }
     let output = child.wait_with_output().context("git hash-object failed")?;
 
@@ -34,8 +36,8 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
         anyhow::bail!("git hash-object failed: {stderr}");
     }
 
-    let hash = String::from_utf8(output.stdout)
-        .context("git hash-object output is not valid UTF-8")?;
+    let hash =
+        String::from_utf8(output.stdout).context("git hash-object output is not valid UTF-8")?;
     let hash = hash.trim();
 
     // Update the ref
@@ -58,7 +60,11 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
 pub fn list_issues(repo_path: &Path) -> Result<Vec<String>> {
     // List all refs under refs/gitlawb/issues/
     let list_output = Command::new("git")
-        .args(["for-each-ref", "--format=%(refname)", "refs/gitlawb/issues/"])
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/gitlawb/issues/",
+        ])
         .current_dir(repo_path)
         .output()
         .context("failed to run git for-each-ref")?;
@@ -121,10 +127,7 @@ pub fn resolve_issue_id(repo_path: &Path, id_or_prefix: &str) -> Result<Option<S
     }
 
     let output = String::from_utf8_lossy(&list.stdout);
-    let matches: Vec<&str> = output
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let matches: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
 
     match matches.len() {
         0 => Ok(None),
@@ -156,8 +159,8 @@ pub fn close_issue(repo_path: &Path, issue_id: &str) -> Result<Option<String>> {
     let raw = get_issue(repo_path, &full_id)?
         .expect("ref existed in resolve but not in get — should be impossible");
 
-    let mut issue: serde_json::Value = serde_json::from_str(&raw)
-        .context("invalid issue JSON in git ref")?;
+    let mut issue: serde_json::Value =
+        serde_json::from_str(&raw).context("invalid issue JSON in git ref")?;
     issue["status"] = serde_json::Value::String("closed".to_string());
 
     let updated = serde_json::to_string(&issue).context("failed to serialize updated issue")?;
@@ -225,7 +228,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         init_repo(&dir);
         let full_id = "abc12345-0000-0000-0000-000000000000";
-        create_issue(dir.path(), full_id, r#"{"id":"abc12345-0000-0000-0000-000000000000","status":"open"}"#).unwrap();
+        create_issue(
+            dir.path(),
+            full_id,
+            r#"{"id":"abc12345-0000-0000-0000-000000000000","status":"open"}"#,
+        )
+        .unwrap();
         let resolved = resolve_issue_id(dir.path(), full_id).unwrap();
         assert_eq!(resolved, Some(full_id.to_string()));
     }
@@ -235,7 +243,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         init_repo(&dir);
         let full_id = "abc12345-0000-0000-0000-000000000000";
-        create_issue(dir.path(), full_id, r#"{"id":"abc12345-0000-0000-0000-000000000000","status":"open"}"#).unwrap();
+        create_issue(
+            dir.path(),
+            full_id,
+            r#"{"id":"abc12345-0000-0000-0000-000000000000","status":"open"}"#,
+        )
+        .unwrap();
         let resolved = resolve_issue_id(dir.path(), "abc12345").unwrap();
         assert_eq!(resolved, Some(full_id.to_string()));
     }
@@ -252,8 +265,18 @@ mod tests {
     fn test_resolve_ambiguous_prefix_errors() {
         let dir = TempDir::new().unwrap();
         init_repo(&dir);
-        create_issue(dir.path(), "abc12345-aaaa-0000-0000-000000000000", r#"{"status":"open"}"#).unwrap();
-        create_issue(dir.path(), "abc12345-bbbb-0000-0000-000000000000", r#"{"status":"open"}"#).unwrap();
+        create_issue(
+            dir.path(),
+            "abc12345-aaaa-0000-0000-000000000000",
+            r#"{"status":"open"}"#,
+        )
+        .unwrap();
+        create_issue(
+            dir.path(),
+            "abc12345-bbbb-0000-0000-000000000000",
+            r#"{"status":"open"}"#,
+        )
+        .unwrap();
         let result = resolve_issue_id(dir.path(), "abc12345");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("ambiguous"));
@@ -264,7 +287,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         init_repo(&dir);
         let full_id = "def99999-0000-0000-0000-000000000000";
-        create_issue(dir.path(), full_id, r#"{"id":"def99999-0000-0000-0000-000000000000","status":"open"}"#).unwrap();
+        create_issue(
+            dir.path(),
+            full_id,
+            r#"{"id":"def99999-0000-0000-0000-000000000000","status":"open"}"#,
+        )
+        .unwrap();
 
         let updated = close_issue(dir.path(), "def99999").unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_str(&updated).unwrap();

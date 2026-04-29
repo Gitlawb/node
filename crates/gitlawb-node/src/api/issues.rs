@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::auth::AuthenticatedDid;
 use crate::db::IssueComment;
 use crate::error::{AppError, Result};
-use crate::state::AppState;
 use crate::git::issues as git_issues;
+use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateIssueRequest {
@@ -39,7 +39,10 @@ pub async fn create_issue(
     Path((owner, repo)): Path<(String, String)>,
     Json(req): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueRecord>)> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let issue_id = Uuid::new_v4().to_string();
@@ -58,7 +61,10 @@ pub async fn create_issue(
     let json_str = serde_json::to_string(&issue)
         .map_err(|e| AppError::BadRequest(format!("serialization error: {e}")))?;
 
-    let guard = state.repo_store.acquire_write(&record.owner_did, &record.name).await
+    let guard = state
+        .repo_store
+        .acquire_write(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let disk_path = guard.path().to_path_buf();
 
@@ -85,14 +91,20 @@ pub async fn list_issues(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
 
-    let raw_issues = git_issues::list_issues(&disk_path)
-        .map_err(|e| AppError::Git(e.to_string()))?;
+    let raw_issues =
+        git_issues::list_issues(&disk_path).map_err(|e| AppError::Git(e.to_string()))?;
 
     let mut issues: Vec<serde_json::Value> = Vec::new();
     for raw in raw_issues {
@@ -109,10 +121,16 @@ pub async fn get_issue(
     State(state): State<AppState>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
 
     let raw = git_issues::get_issue(&disk_path, &issue_id)
@@ -138,13 +156,21 @@ pub async fn create_issue_comment(
     Json(req): Json<CreateIssueCommentRequest>,
 ) -> Result<(StatusCode, Json<IssueComment>)> {
     if req.body.trim().is_empty() {
-        return Err(AppError::BadRequest("comment body must not be empty".into()));
+        return Err(AppError::BadRequest(
+            "comment body must not be empty".into(),
+        ));
     }
 
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     // Verify issue exists
     crate::git::issues::get_issue(&disk_path, &issue_id)
@@ -168,7 +194,10 @@ pub async fn list_issue_comments(
     State(state): State<AppState>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let _record = state.db.get_repo(&owner, &repo).await?
+    let _record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let comments = state.db.list_issue_comments(&issue_id).await?;
@@ -181,10 +210,16 @@ pub async fn close_issue(
     Extension(_auth): Extension<AuthenticatedDid>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
-    let guard = state.repo_store.acquire_write(&record.owner_did, &record.name).await
+    let guard = state
+        .repo_store
+        .acquire_write(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let disk_path = guard.path().to_path_buf();
 

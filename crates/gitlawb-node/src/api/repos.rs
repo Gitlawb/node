@@ -1,19 +1,19 @@
-use std::sync::Arc;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
 use axum::response::Response;
+use axum::Json;
 use bytes::Bytes;
+use std::sync::Arc;
 
 use crate::auth::AuthenticatedDid;
-use serde::{Deserialize, Serialize};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::cert;
 use crate::error::{AppError, Result};
+use crate::git::{smart_http, store};
 use crate::state::AppState;
-use crate::git::{store, smart_http};
 use crate::webhooks;
 
 // ── Request / Response types ───────────────────────────────────────────────
@@ -28,8 +28,12 @@ pub struct CreateRepoRequest {
     pub default_branch: String,
 }
 
-fn default_true() -> bool { true }
-fn default_main() -> String { "main".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_main() -> String {
+    "main".to_string()
+}
 
 #[derive(Debug, Serialize)]
 pub struct RepoResponse {
@@ -61,7 +65,11 @@ pub async fn create_repo(
     Json(req): Json<CreateRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
     // Sanitize name: alphanumeric, hyphens, underscores only
-    if !req.name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if !req
+        .name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(AppError::BadRequest(
             "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
         ));
@@ -75,7 +83,10 @@ pub async fn create_repo(
         return Err(AppError::RepoExists(req.name));
     }
 
-    let disk_path = state.repo_store.init(&owner_did, &req.name).await
+    let disk_path = state
+        .repo_store
+        .init(&owner_did, &req.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
 
     let now = Utc::now();
@@ -138,7 +149,10 @@ pub async fn get_repo(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<RepoResponse>> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
     let count = state.db.count_stars(&record.id).await.unwrap_or(0);
     Ok(Json(to_response(&record, &state, count)))
@@ -149,10 +163,16 @@ pub async fn list_commits(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let head_ref = store::resolve_head(&disk_path, &record.default_branch);
     let commits = store::log(&disk_path, &head_ref, 30).unwrap_or_default();
@@ -165,13 +185,19 @@ pub async fn get_blob(
     State(state): State<AppState>,
     Path((owner, name, file_path)): Path<(String, String, String)>,
 ) -> Result<Response> {
-    use axum::response::IntoResponse;
     use axum::http::header;
+    use axum::response::IntoResponse;
 
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let head_ref = store::resolve_head(&disk_path, &record.default_branch);
     let content = store::read_file(&disk_path, &head_ref, &file_path)
@@ -180,12 +206,13 @@ pub async fn get_blob(
     // Guess content type
     let mime = match file_path.rsplit('.').next() {
         Some("html") => "text/html; charset=utf-8",
-        Some("css")  => "text/css; charset=utf-8",
-        Some("js")   => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js") => "application/javascript; charset=utf-8",
         Some("json") => "application/json; charset=utf-8",
-        Some("md")   => "text/markdown; charset=utf-8",
-        Some("rs") | Some("py") | Some("ts") | Some("sh") | Some("txt") | Some("toml") | Some("yaml") | Some("yml") => "text/plain; charset=utf-8",
-        _            => "application/octet-stream",
+        Some("md") => "text/markdown; charset=utf-8",
+        Some("rs") | Some("py") | Some("ts") | Some("sh") | Some("txt") | Some("toml")
+        | Some("yaml") | Some("yml") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
     };
 
     Ok(([(header::CONTENT_TYPE, mime)], content).into_response())
@@ -196,10 +223,16 @@ pub async fn get_tree_root(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let head_ref = store::resolve_head(&disk_path, &record.default_branch);
     let entries = store::ls_tree(&disk_path, &head_ref, "").unwrap_or_default();
@@ -212,15 +245,23 @@ pub async fn get_tree(
     State(state): State<AppState>,
     Path((owner, name, tree_path)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let head_ref = store::resolve_head(&disk_path, &record.default_branch);
     let entries = store::ls_tree(&disk_path, &head_ref, &tree_path).unwrap_or_default();
 
-    Ok(Json(serde_json::json!({ "entries": entries, "path": tree_path })))
+    Ok(Json(
+        serde_json::json!({ "entries": entries, "path": tree_path }),
+    ))
 }
 
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
@@ -233,20 +274,31 @@ pub async fn git_info_refs(
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
-    let record = state.db.get_repo(&owner, name).await?
+    let record = state
+        .db
+        .get_repo(&owner, name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
-    let service = query.service
+    let service = query
+        .service
         .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
     tracing::debug!(service = %service, repo = %name, "info/refs service");
 
     // For receive-pack (push), download the latest from Tigris so the client
     // sees the same refs that acquire_write() will operate on.
     let disk_path = if service == "git-receive-pack" {
-        state.repo_store.acquire_fresh(&record.owner_did, &record.name).await
+        state
+            .repo_store
+            .acquire_fresh(&record.owner_did, &record.name)
+            .await
     } else {
-        state.repo_store.acquire(&record.owner_did, &record.name).await
-    }.map_err(|e| {
+        state
+            .repo_store
+            .acquire(&record.owner_did, &record.name)
+            .await
+    }
+    .map_err(|e| {
         tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
         AppError::Git(e.to_string())
     })?;
@@ -266,10 +318,16 @@ pub async fn git_upload_pack(
     body: Bytes,
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
-    let record = state.db.get_repo(&owner, name).await?
+    let record = state
+        .db
+        .get_repo(&owner, name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
-    let disk_path = state.repo_store.acquire(&record.owner_did, &record.name).await
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     smart_http::upload_pack(&disk_path, body)
         .await
@@ -294,24 +352,41 @@ pub async fn git_receive_pack(
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
     tracing::info!(owner = %owner, repo = %name, "receive-pack request");
-    let record = state.db.get_repo(&owner, name).await?
+    let record = state
+        .db
+        .get_repo(&owner, name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
     // Parse ref updates from pkt-line body before handing to git
     let ref_updates = parse_ref_updates(&body);
-    tracing::debug!(ref_count = ref_updates.len(), "parsed ref updates from pack");
+    tracing::debug!(
+        ref_count = ref_updates.len(),
+        "parsed ref updates from pack"
+    );
 
     // ── Branch protection check ──────────────────────────────────────────
     let pusher_did_for_check = extract_did_from_auth(&headers);
     tracing::debug!(pusher_did = ?pusher_did_for_check, "extracted pusher DID from auth headers");
     for update in &ref_updates {
         // Strip refs/heads/ prefix to get plain branch name
-        let branch = update.ref_name
+        let branch = update
+            .ref_name
             .strip_prefix("refs/heads/")
             .unwrap_or(&update.ref_name);
-        if state.db.is_branch_protected(&record.id, branch).await.unwrap_or(false) {
-            let owner_short = record.owner_did.split(':').next_back().unwrap_or(&record.owner_did);
-            let is_owner = pusher_did_for_check.as_deref()
+        if state
+            .db
+            .is_branch_protected(&record.id, branch)
+            .await
+            .unwrap_or(false)
+        {
+            let owner_short = record
+                .owner_did
+                .split(':')
+                .next_back()
+                .unwrap_or(&record.owner_did);
+            let is_owner = pusher_did_for_check
+                .as_deref()
                 .map(|did| did == record.owner_did || did == owner_short)
                 .unwrap_or(false);
             if !is_owner {
@@ -329,7 +404,10 @@ pub async fn git_receive_pack(
     }
 
     tracing::debug!(repo = %name, "acquiring write lock");
-    let guard = state.repo_store.acquire_write(&record.owner_did, &record.name).await
+    let guard = state
+        .repo_store
+        .acquire_write(&record.owner_did, &record.name)
+        .await
         .map_err(|e| {
             tracing::error!(repo = %name, err = %e, "acquire_write failed");
             AppError::Git(e.to_string())
@@ -354,7 +432,8 @@ pub async fn git_receive_pack(
     let pusher_did = extract_did_from_auth(&headers);
     if let Some(ref did) = pusher_did {
         // Use the first new commit hash we parsed, fall back to timestamp
-        let commit_hash = ref_updates.first()
+        let commit_hash = ref_updates
+            .first()
             .map(|u| u.new_sha.clone())
             .unwrap_or_else(|| Utc::now().timestamp().to_string());
 
@@ -366,34 +445,39 @@ pub async fn git_receive_pack(
             let _ = state.db.update_trust_score(did, new_score).await;
         }
 
-        let ref_name = ref_updates.first()
+        let ref_name = ref_updates
+            .first()
             .map(|u| u.ref_name.as_str())
             .unwrap_or("refs/heads/main");
-        let old_sha = ref_updates.first()
+        let old_sha = ref_updates
+            .first()
             .map(|u| u.old_sha.as_str())
             .unwrap_or("0000000000000000000000000000000000000000");
 
         // Issue a signed ref-update certificate
-        match cert::issue_ref_certificate(
-            &state,
-            &record.id,
-            ref_name,
-            old_sha,
-            &commit_hash,
-            did,
-        ).await {
-            Ok(c) => tracing::info!(cert_id = %c.id, repo = %record.name, pusher = %did, "issued ref certificate"),
+        match cert::issue_ref_certificate(&state, &record.id, ref_name, old_sha, &commit_hash, did)
+            .await
+        {
+            Ok(c) => {
+                tracing::info!(cert_id = %c.id, repo = %record.name, pusher = %did, "issued ref certificate")
+            }
             Err(e) => tracing::warn!(err = %e, "failed to issue ref certificate"),
         }
     }
 
     // Fire push webhooks — one per ref update
     if !ref_updates.is_empty() {
-        let base_url = state.config.public_url
+        let base_url = state
+            .config
+            .public_url
             .as_deref()
             .unwrap_or("http://127.0.0.1:7545")
             .trim_end_matches('/');
-        let owner_short = record.owner_did.split(':').last().unwrap_or(&record.owner_did);
+        let owner_short = record
+            .owner_did
+            .split(':')
+            .last()
+            .unwrap_or(&record.owner_did);
         let clone_url = format!("{}/{}/{}.git", base_url, owner_short, record.name);
 
         for update in &ref_updates {
@@ -429,7 +513,8 @@ pub async fn git_receive_pack(
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
         tokio::spawn(async move {
-            let pinned = crate::ipfs_pin::pin_new_objects(&ipfs_api, &repo_path_clone, &db_clone).await;
+            let pinned =
+                crate::ipfs_pin::pin_new_objects(&ipfs_api, &repo_path_clone, &db_clone).await;
             if !pinned.is_empty() {
                 tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
                 for (sha, cid) in &pinned {
@@ -447,8 +532,17 @@ pub async fn git_receive_pack(
         let db_clone = state.db.clone();
         let http_client = Arc::clone(&state.http_client);
         let node_did_str = state.node_did.to_string();
-        let repo_slug = format!("{}/{}", record.owner_did.split(':').last().unwrap_or(&record.owner_did), record.name);
-        let ref_updates_clone = ref_updates.iter()
+        let repo_slug = format!(
+            "{}/{}",
+            record
+                .owner_did
+                .split(':')
+                .last()
+                .unwrap_or(&record.owner_did),
+            record.name
+        );
+        let ref_updates_clone = ref_updates
+            .iter()
             .map(|u| (u.ref_name.clone(), u.new_sha.clone()))
             .collect::<Vec<_>>();
         let p2p_handle = state.p2p.clone();
@@ -472,17 +566,16 @@ pub async fn git_receive_pack(
             }
 
             // Build sha→cid map from pinned objects
-            let cid_map: std::collections::HashMap<String, String> =
-                pinned.into_iter().collect();
+            let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
 
             // Record branch→CID for each ref update and publish gossip
             for (ref_name, new_sha) in &ref_updates_clone {
                 let cid = cid_map.get(new_sha).map(|s| s.as_str());
 
                 if let Some(cid_str) = cid {
-                    let _ = db_clone.upsert_branch_cid(
-                        &repo_slug, ref_name, new_sha, cid_str, &node_did_str,
-                    ).await;
+                    let _ = db_clone
+                        .upsert_branch_cid(&repo_slug, ref_name, new_sha, cid_str, &node_did_str)
+                        .await;
                 }
 
                 if let Some(p2p) = &p2p_handle {
@@ -496,7 +589,8 @@ pub async fn git_receive_pack(
                         timestamp: chrono::Utc::now().to_rfc3339(),
                         cert_id: None,
                         cid: cid.map(|s| s.to_string()),
-                    }).await;
+                    })
+                    .await;
                 }
             }
 
@@ -504,11 +598,11 @@ pub async fn git_receive_pack(
             // This is the reliable fallback when Gossipsub p2p is not yet connected.
             if let Ok(peers) = db_for_peers.list_peers().await {
                 for peer in peers {
-                    if peer.http_url.is_empty() { continue; }
-                    let notify_url = format!(
-                        "{}/api/v1/sync/notify",
-                        peer.http_url.trim_end_matches('/')
-                    );
+                    if peer.http_url.is_empty() {
+                        continue;
+                    }
+                    let notify_url =
+                        format!("{}/api/v1/sync/notify", peer.http_url.trim_end_matches('/'));
                     let body = serde_json::json!({
                         "repo": repo_slug,
                         "ref_name": ref_updates_clone.first().map(|(r, _)| r).unwrap_or(&String::new()),
@@ -516,12 +610,15 @@ pub async fn git_receive_pack(
                         "node_did": node_did_str,
                     });
                     match http_client.post(&notify_url).json(&body).send().await {
-                        Ok(r) if r.status().is_success() =>
-                            tracing::info!(peer = %peer.did, repo = %repo_slug, "notified peer to sync"),
-                        Ok(r) =>
-                            tracing::warn!(peer = %peer.did, status = %r.status(), "peer sync notify returned error"),
-                        Err(e) =>
-                            tracing::warn!(peer = %peer.did, err = %e, "failed to notify peer"),
+                        Ok(r) if r.status().is_success() => {
+                            tracing::info!(peer = %peer.did, repo = %repo_slug, "notified peer to sync")
+                        }
+                        Ok(r) => {
+                            tracing::warn!(peer = %peer.did, status = %r.status(), "peer sync notify returned error")
+                        }
+                        Err(e) => {
+                            tracing::warn!(peer = %peer.did, err = %e, "failed to notify peer")
+                        }
                     }
                 }
             }
@@ -530,9 +627,15 @@ pub async fn git_receive_pack(
             let now_ts = chrono::Utc::now().to_rfc3339();
             let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
                 repo: repo_slug.clone(),
-                ref_name: ref_updates_clone.first().map(|(r, _)| r.clone()).unwrap_or_default(),
+                ref_name: ref_updates_clone
+                    .first()
+                    .map(|(r, _)| r.clone())
+                    .unwrap_or_default(),
                 old_sha: "0000000000000000000000000000000000000000".to_string(),
-                new_sha: ref_updates_clone.first().map(|(_, s)| s.clone()).unwrap_or_default(),
+                new_sha: ref_updates_clone
+                    .first()
+                    .map(|(_, s)| s.clone())
+                    .unwrap_or_default(),
                 pusher_did: pusher_did_clone.clone(),
                 node_did: node_did_str.clone(),
                 timestamp: now_ts.clone(),
@@ -552,13 +655,23 @@ pub async fn git_receive_pack(
                         timestamp: now_ts.clone(),
                         node_did: node_did_str.clone(),
                     };
-                    match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor).await {
+                    match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor).await
+                    {
                         Ok(tx_id) if !tx_id.is_empty() => {
                             let arweave_url = crate::arweave::arweave_url(&tx_id);
-                            let _ = db_clone.record_arweave_anchor(
-                                &repo_slug, &owner_did_for_arweave, ref_name, "0".repeat(64).as_str(),
-                                new_sha, cid.as_deref(), &tx_id, &arweave_url, &node_did_str,
-                            ).await;
+                            let _ = db_clone
+                                .record_arweave_anchor(
+                                    &repo_slug,
+                                    &owner_did_for_arweave,
+                                    ref_name,
+                                    "0".repeat(64).as_str(),
+                                    new_sha,
+                                    cid.as_deref(),
+                                    &tx_id,
+                                    &arweave_url,
+                                    &node_did_str,
+                                )
+                                .await;
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed"),
@@ -579,13 +692,18 @@ pub async fn list_refs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let _record = state.db.get_repo(&owner, &repo).await?
+    let _record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let repo_slug = format!("{owner}/{repo}");
     let refs = state.db.list_branch_cids(&repo_slug).await?;
 
-    Ok(Json(serde_json::json!({ "refs": refs, "count": refs.len() })))
+    Ok(Json(
+        serde_json::json!({ "refs": refs, "count": refs.len() }),
+    ))
 }
 
 /// GET /api/v1/repos/federated
@@ -598,7 +716,9 @@ pub async fn list_federated_repos(
 ) -> Result<Json<serde_json::Value>> {
     // Our own repos
     let local_repos = state.db.list_all_repos().await?;
-    let local_node_url = state.config.public_url
+    let local_node_url = state
+        .config
+        .public_url
         .clone()
         .unwrap_or_else(|| "http://127.0.0.1:7545".to_string());
     let local_node_did = state.node_did.to_string();
@@ -617,7 +737,8 @@ pub async fn list_federated_repos(
     let peers = state.db.list_peers().await.unwrap_or_default();
     let client = &state.http_client;
 
-    let fetch_tasks: Vec<_> = peers.into_iter()
+    let fetch_tasks: Vec<_> = peers
+        .into_iter()
         .filter(|p| p.last_ping_ok && !p.http_url.is_empty())
         .map(|peer| {
             let client = Arc::clone(client);
@@ -628,16 +749,20 @@ pub async fn list_federated_repos(
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     client.get(&url).send(),
-                ).await;
+                )
+                .await;
                 match result {
                     Ok(Ok(resp)) if resp.status().is_success() => {
                         if let Ok(repos) = resp.json::<Vec<serde_json::Value>>().await {
-                            let enriched: Vec<serde_json::Value> = repos.into_iter().map(|mut r| {
-                                r["node_url"] = serde_json::Value::String(peer_url.clone());
-                                r["node_did"] = serde_json::Value::String(peer_did.clone());
-                                r["local"] = serde_json::Value::Bool(false);
-                                r
-                            }).collect();
+                            let enriched: Vec<serde_json::Value> = repos
+                                .into_iter()
+                                .map(|mut r| {
+                                    r["node_url"] = serde_json::Value::String(peer_url.clone());
+                                    r["node_did"] = serde_json::Value::String(peer_did.clone());
+                                    r["local"] = serde_json::Value::Bool(false);
+                                    r
+                                })
+                                .collect();
                             return enriched;
                         }
                     }
@@ -676,14 +801,20 @@ pub async fn fork_repo(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<ForkRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
-    let source = state.db.get_repo(&owner, &name).await?
+    let source = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
     let fork_name = req.name.unwrap_or_else(|| source.name.clone());
     let forker_did = auth.0;
 
     // Validate fork name
-    if !fork_name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if !fork_name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(AppError::BadRequest(
             "repo name must contain only alphanumeric characters, hyphens, and underscores".into(),
         ));
@@ -692,28 +823,43 @@ pub async fn fork_repo(
     // Check no name conflict under the forker's ownership
     let forker_short = forker_did.split(':').last().unwrap_or(&forker_did);
     if state.db.get_repo(forker_short, &fork_name).await?.is_some() {
-        return Err(AppError::BadRequest(format!("you already have a repo named {fork_name}")));
+        return Err(AppError::BadRequest(format!(
+            "you already have a repo named {fork_name}"
+        )));
     }
 
     // Ensure source repo is on local disk (downloads from Tigris on cache miss)
-    let source_path = state.repo_store.acquire(&source.owner_did, &source.name).await
+    let source_path = state
+        .repo_store
+        .acquire(&source.owner_did, &source.name)
+        .await
         .map_err(|e| AppError::Git(e.to_string()))?;
 
     let disk_path = store::repo_disk_path(&state.config.repos_dir, &forker_did, &fork_name);
 
     // Clone the source repo as a mirror
     let output = std::process::Command::new("git")
-        .args(["clone", "--mirror", source_path.to_str().unwrap_or(""), disk_path.to_str().unwrap_or("")])
+        .args([
+            "clone",
+            "--mirror",
+            source_path.to_str().unwrap_or(""),
+            disk_path.to_str().unwrap_or(""),
+        ])
         .output()
         .map_err(|e| AppError::Git(format!("git clone --mirror failed: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(AppError::Git(format!("git clone --mirror failed: {stderr}")));
+        return Err(AppError::Git(format!(
+            "git clone --mirror failed: {stderr}"
+        )));
     }
 
     // Upload fork to Tigris
-    state.repo_store.release_after_write(&forker_did, &fork_name).await;
+    state
+        .repo_store
+        .release_after_write(&forker_did, &fork_name)
+        .await;
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {
@@ -779,7 +925,11 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
         };
 
         // Strip capabilities (after NUL) and trailing newline
-        let line = line.split('\0').next().unwrap_or(line).trim_end_matches('\n');
+        let line = line
+            .split('\0')
+            .next()
+            .unwrap_or(line)
+            .trim_end_matches('\n');
 
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() == 3 && parts[0].len() == 40 && parts[1].len() == 40 {
@@ -821,12 +971,15 @@ fn extract_did_from_auth(headers: &HeaderMap) -> Option<String> {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64) -> RepoResponse {
-    let owner_short = record.owner_did
+    let owner_short = record
+        .owner_did
         .split(':')
         .last()
         .unwrap_or(&record.owner_did);
 
-    let base_url = state.config.public_url
+    let base_url = state
+        .config
+        .public_url
         .as_deref()
         .unwrap_or("http://127.0.0.1:7545")
         .trim_end_matches('/');

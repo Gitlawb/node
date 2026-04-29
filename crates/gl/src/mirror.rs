@@ -43,12 +43,16 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     // ── 1. Derive repo name ───────────────────────────────────────────────
     let name = match args.repo {
         Some(n) => n,
-        None => extract_repo_name(&source)
-            .with_context(|| format!("could not derive repo name from '{source}' — use --repo <name>"))?,
+        None => extract_repo_name(&source).with_context(|| {
+            format!("could not derive repo name from '{source}' — use --repo <name>")
+        })?,
     };
 
     // Validate: same rules as `gl repo create`
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         bail!("repo name '{name}' must contain only alphanumeric characters, hyphens, and underscores\nUse --repo to provide a valid name");
     }
 
@@ -68,7 +72,11 @@ pub async fn run(args: MirrorArgs) -> Result<()> {
     let mirror_path = tmp_root.join(&name);
     // RAII guard: removes the temp dir when this binding is dropped (success or failure).
     struct TmpGuard(PathBuf);
-    impl Drop for TmpGuard { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    impl Drop for TmpGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
     let _guard = TmpGuard(tmp_root);
 
     println!("Cloning source (this may take a while for large repos)...");
@@ -218,7 +226,11 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
             .mock("POST", "/api/v1/repos")
@@ -232,7 +244,9 @@ mod tests {
         // API error path by calling the create step directly via NodeClient.
         let kp2 = gitlawb_core::identity::Keypair::generate();
         let client = NodeClient::new(server.url(), Some(kp2));
-        let body = serde_json::to_vec(&json!({"name":"myrepo","is_public":true,"default_branch":"main"})).unwrap();
+        let body =
+            serde_json::to_vec(&json!({"name":"myrepo","is_public":true,"default_branch":"main"}))
+                .unwrap();
         let resp = client.post("/api/v1/repos", &body).await.unwrap();
         assert_eq!(resp.status(), 409);
         let payload: Value = resp.json().await.unwrap();
@@ -253,7 +267,9 @@ mod tests {
 
         let kp = gitlawb_core::identity::Keypair::generate();
         let client = NodeClient::new(server.url(), Some(kp));
-        let body = serde_json::to_vec(&json!({"name":"myrepo","is_public":true,"default_branch":"main"})).unwrap();
+        let body =
+            serde_json::to_vec(&json!({"name":"myrepo","is_public":true,"default_branch":"main"}))
+                .unwrap();
         let resp = client.post("/api/v1/repos", &body).await.unwrap();
         assert!(resp.status().is_success());
         let payload: Value = resp.json().await.unwrap();

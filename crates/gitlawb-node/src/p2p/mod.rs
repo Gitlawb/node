@@ -8,7 +8,7 @@
 //! The node's PeerId is derived from its Ed25519 identity keypair,
 //! so the gitlawb DID and libp2p PeerId share the same key.
 
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,11 +17,9 @@ use anyhow::Result;
 use chrono::Utc;
 use libp2p::futures::StreamExt;
 use libp2p::{
-    gossipsub, identify, kad,
-    mdns,
-    noise, tcp, yamux,
+    gossipsub, identify, kad, mdns, noise,
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId,
+    tcp, yamux, Multiaddr, PeerId,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -79,7 +77,10 @@ pub enum P2pCommand {
     /// Store a DID record in the Kademlia DHT (fire-and-forget)
     PutDid(DidRecord),
     /// Look up a DID in the Kademlia DHT; reply on the oneshot sender
-    GetDid { did: String, reply: oneshot::Sender<Option<DidRecord>> },
+    GetDid {
+        did: String,
+        reply: oneshot::Sender<Option<DidRecord>>,
+    },
 }
 
 /// Handle returned to the rest of the node for sending commands to the swarm.
@@ -96,7 +97,10 @@ impl P2pHandle {
 
     #[allow(dead_code)]
     pub async fn add_peer(&self, peer_id: PeerId, addr: Multiaddr) {
-        let _ = self.tx.send(P2pCommand::AddKnownPeer { peer_id, addr }).await;
+        let _ = self
+            .tx
+            .send(P2pCommand::AddKnownPeer { peer_id, addr })
+            .await;
     }
 
     #[allow(dead_code)]
@@ -212,11 +216,8 @@ pub async fn start(
             ));
 
             // mDNS — local network peer discovery
-            let mdns = mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                peer_id,
-            )
-            .expect("mdns behaviour");
+            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                .expect("mdns behaviour");
 
             GitlawbBehaviour {
                 kademlia,

@@ -40,7 +40,9 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     println!();
 
     let dir = args.dir.clone().unwrap_or_else(|| {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".gitlawb")
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".gitlawb")
     });
 
     // ── Step 1: Identity ──────────────────────────────────────────────────
@@ -124,7 +126,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             }
             Err(e) => {
                 println!("  ✗  Could not reach {}: {e}", args.node);
-                println!("     You can retry later with: gl register --node {}", args.node);
+                println!(
+                    "     You can retry later with: gl register --node {}",
+                    args.node
+                );
                 println!();
                 // Non-fatal — continue
             }
@@ -201,11 +206,17 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             let payload: Value = resp.json().await.unwrap_or_default();
             let msg = payload["message"].as_str().unwrap_or("unknown");
             println!("  ✗  Repo creation failed ({status}): {msg}");
-            println!("     Try manually: gl repo create {repo_name} --node {}", args.node);
+            println!(
+                "     Try manually: gl repo create {repo_name} --node {}",
+                args.node
+            );
         }
         Err(e) => {
             println!("  ✗  Could not reach node: {e}");
-            println!("     Try manually: gl repo create {repo_name} --node {}", args.node);
+            println!(
+                "     Try manually: gl repo create {repo_name} --node {}",
+                args.node
+            );
         }
     }
 
@@ -216,8 +227,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn generate_identity(dir: &PathBuf) -> Result<gitlawb_core::identity::Keypair> {
-    std::fs::create_dir_all(dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
     let keypair = gitlawb_core::identity::Keypair::generate();
     let pem = keypair.to_pem()?;

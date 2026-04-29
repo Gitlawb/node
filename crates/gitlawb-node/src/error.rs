@@ -49,36 +49,12 @@ impl IntoResponse for AppError {
                 "repo_exists",
                 format!("repository '{r}' already exists"),
             ),
-            AppError::NotFound(msg) => (
-                StatusCode::NOT_FOUND,
-                "not_found",
-                msg.clone(),
-            ),
-            AppError::Unauthorized(msg) => (
-                StatusCode::UNAUTHORIZED,
-                "not_an_agent",
-                msg.clone(),
-            ),
-            AppError::Forbidden(msg) => (
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                msg.clone(),
-            ),
-            AppError::BadRequest(msg) => (
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                msg.clone(),
-            ),
-            AppError::Git(msg) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "git_error",
-                msg.clone(),
-            ),
-            AppError::Db(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "db_error",
-                e.to_string(),
-            ),
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
+            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "not_an_agent", msg.clone()),
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            AppError::Git(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "git_error", msg.clone()),
+            AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
             AppError::Internal(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",

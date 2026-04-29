@@ -81,7 +81,9 @@ async fn cmd_delegate(
     json_out: bool,
 ) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
-    let audience: Did = to.parse().map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
+    let audience: Did = to
+        .parse()
+        .map_err(|e: gitlawb_core::Error| anyhow::anyhow!("{e}"))?;
 
     let exp = expiry.map(|h| chrono::Utc::now() + chrono::Duration::hours(h as i64));
     let ucan = Ucan::issue(&keypair, audience, vec![Capability::new(&cap, &can)], exp)?;
@@ -94,21 +96,27 @@ async fn cmd_delegate(
     }
 
     if json_out {
-        println!("{}", serde_json::to_string_pretty(&json!({
-            "issuer": ucan.payload.iss.to_string(),
-            "audience": ucan.payload.aud.to_string(),
-            "capability": { "with": cap, "can": can },
-            "expires": ucan.payload.exp,
-            "token": encoded,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "issuer": ucan.payload.iss.to_string(),
+                "audience": ucan.payload.aud.to_string(),
+                "capability": { "with": cap, "can": can },
+                "expires": ucan.payload.exp,
+                "token": encoded,
+            }))?
+        );
     } else {
         println!("Issuer:   {}", ucan.payload.iss);
         println!("Audience: {}", ucan.payload.aud);
         println!("Cap:      {} → {}", cap, can);
         if let Some(exp) = ucan.payload.exp {
-            println!("Expires:  {}", chrono::DateTime::from_timestamp(exp, 0)
-                .map(|d| d.to_rfc3339())
-                .unwrap_or_else(|| exp.to_string()));
+            println!(
+                "Expires:  {}",
+                chrono::DateTime::from_timestamp(exp, 0)
+                    .map(|d| d.to_rfc3339())
+                    .unwrap_or_else(|| exp.to_string())
+            );
         } else {
             println!("Expires:  never");
         }
@@ -335,6 +343,8 @@ mod tests {
         let path = dir.path().join("token.json");
         std::fs::write(&path, ucan.encode().unwrap()).unwrap();
 
-        cmd_verify(path.to_string_lossy().to_string()).await.unwrap();
+        cmd_verify(path.to_string_lossy().to_string())
+            .await
+            .unwrap();
     }
 }

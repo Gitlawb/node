@@ -34,16 +34,17 @@ use gitlawb_core::identity::verify;
 pub async fn require_signature(request: Request, next: Next) -> Response {
     // Buffer the body so we can verify content-digest and pass it downstream
     let (parts, body) = request.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return (
+    let body_bytes =
+        match body.collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "unreadable_body", "message": "could not read request body" })),
+                Json(
+                    json!({ "error": "unreadable_body", "message": "could not read request body" }),
+                ),
             )
-                .into_response()
-        }
-    };
+                .into_response(),
+        };
 
     let sig_input = parts
         .headers
@@ -61,8 +62,9 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
         (Some(i), Some(s)) => (i, s),
         _ => {
             return human_detected(
-                "missing Signature-Input or Signature headers — use RFC 9421 HTTP Signatures"
-            ).into_response();
+                "missing Signature-Input or Signature headers — use RFC 9421 HTTP Signatures",
+            )
+            .into_response();
         }
     };
 
@@ -156,22 +158,21 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     request_values.insert("content-digest".to_string(), content_digest);
 
     // The @signature-params value is the part of Signature-Input after "sig1="
-    let sig_params_value = sig_input
-        .strip_prefix("sig1=")
-        .unwrap_or(&sig_input);
+    let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(&sig_input);
 
     let components_ref: Vec<&str> = sig.components.iter().map(String::as_str).collect();
 
-    let signing_string = match build_signing_string(&components_ref, sig_params_value, &request_values) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "signing_string_error", "message": e.to_string() })),
-            )
-                .into_response()
-        }
-    };
+    let signing_string =
+        match build_signing_string(&components_ref, sig_params_value, &request_values) {
+            Ok(s) => s,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "signing_string_error", "message": e.to_string() })),
+                )
+                    .into_response()
+            }
+        };
 
     // Verify Ed25519 signature
     let sig_array: [u8; 64] = match sig.signature_bytes.as_slice().try_into() {
@@ -200,7 +201,11 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     }
 
     // Verify Content-Digest matches the actual request body
-    if let Some(claimed) = parts.headers.get("content-digest").and_then(|v| v.to_str().ok()) {
+    if let Some(claimed) = parts
+        .headers
+        .get("content-digest")
+        .and_then(|v| v.to_str().ok())
+    {
         let actual = compute_content_digest(&body_bytes);
         if claimed != actual {
             return (
@@ -217,7 +222,9 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     tracing::info!(did = %sig.key_id, "✓ authenticated request");
 
     let mut request = Request::from_parts(parts, Body::from(body_bytes));
-    request.extensions_mut().insert(AuthenticatedDid(sig.key_id.to_string()));
+    request
+        .extensions_mut()
+        .insert(AuthenticatedDid(sig.key_id.to_string()));
     next.run(request).await
 }
 

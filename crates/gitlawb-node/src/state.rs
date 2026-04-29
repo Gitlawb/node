@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use gitlawb_core::did::Did;
 use gitlawb_core::identity::Keypair;
+use std::sync::Arc;
 
 use crate::config::Config;
 use crate::db::Db;

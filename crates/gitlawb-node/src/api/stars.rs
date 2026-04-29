@@ -19,22 +19,32 @@ pub async fn star_repo(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let caller = &auth.0;
     let inserted = state.db.star_repo(&record.id, caller).await?;
     let count = state.db.count_stars(&record.id).await?;
 
-    let status = if inserted { StatusCode::CREATED } else { StatusCode::OK };
+    let status = if inserted {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
 
     tracing::info!(repo = %repo, caller = %caller, "repo starred");
 
-    Ok((status, Json(serde_json::json!({
-        "status": "starred",
-        "repo": format!("{owner}/{repo}"),
-        "star_count": count,
-    }))))
+    Ok((
+        status,
+        Json(serde_json::json!({
+            "status": "starred",
+            "repo": format!("{owner}/{repo}"),
+            "star_count": count,
+        })),
+    ))
 }
 
 /// DELETE /api/v1/repos/:owner/:repo/star
@@ -44,7 +54,10 @@ pub async fn unstar_repo(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let caller = &auth.0;
@@ -66,7 +79,10 @@ pub async fn get_star_status(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &repo).await?
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let count = state.db.count_stars(&record.id).await?;

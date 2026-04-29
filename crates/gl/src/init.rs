@@ -73,7 +73,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
         "did": did.to_string(),
         "capabilities": ["git:push", "git:fetch", "issue:create", "pr:open"],
     }))?;
-    let resp = client.post("/api/register", &body).await
+    let resp = client
+        .post("/api/register", &body)
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let payload: Value = resp.json().await.context("invalid JSON from register")?;
@@ -89,9 +91,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // Save UCAN if returned
     if let Some(ucan) = payload.get("ucan").and_then(|v| v.as_str()) {
         if !ucan.is_empty() {
-            let ucan_dir = args.dir.clone().unwrap_or_else(|| {
-                dirs::home_dir().unwrap_or_default().join(".gitlawb")
-            });
+            let ucan_dir = args
+                .dir
+                .clone()
+                .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".gitlawb"));
             std::fs::create_dir_all(&ucan_dir)?;
             let record = json!({
                 "ucan": ucan,
@@ -99,7 +102,10 @@ pub async fn run(args: InitArgs) -> Result<()> {
                 "did": did.to_string(),
                 "saved_at": chrono::Utc::now().to_rfc3339(),
             });
-            std::fs::write(ucan_dir.join("ucan.json"), serde_json::to_string_pretty(&record)?)?;
+            std::fs::write(
+                ucan_dir.join("ucan.json"),
+                serde_json::to_string_pretty(&record)?,
+            )?;
         }
     }
     println!("  Agent registered.");
@@ -118,7 +124,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
         "description": args.description,
         "is_public": true,
     }))?;
-    let resp = client.post("/api/v1/repos", &body).await
+    let resp = client
+        .post("/api/v1/repos", &body)
+        .await
         .context("failed to create repo")?;
     let repo_status = resp.status();
     let repo_result: Value = resp.json().await.context("invalid JSON from create repo")?;
@@ -199,7 +207,11 @@ mod tests {
 
     fn write_identity(dir: &TempDir) -> gitlawb_core::identity::Keypair {
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
         kp
     }
 
@@ -230,14 +242,16 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"Welcome","ucan":"test.token","trust_score":0.5}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let _repo = server
             .mock("POST", "/api/v1/repos")
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"id":"r1","name":"test-repo"}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         // We can't fully test gl init because it uses std::env::current_dir()
         // but we can test the individual steps
@@ -247,13 +261,26 @@ mod tests {
         let body = serde_json::to_vec(&json!({
             "did": kp.did().to_string(),
             "capabilities": ["git:push"],
-        })).unwrap();
-        let resp: Value = client.post("/api/register", &body).await.unwrap().json().await.unwrap();
+        }))
+        .unwrap();
+        let resp: Value = client
+            .post("/api/register", &body)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(resp["message"], "Welcome");
 
         // Create repo
         let body = serde_json::to_vec(&json!({"name": "test-repo", "is_public": true})).unwrap();
-        let resp: Value = client.post("/api/v1/repos", &body).await.unwrap().json().await.unwrap();
+        let resp: Value = client
+            .post("/api/v1/repos", &body)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(resp["name"], "test-repo");
     }
 
@@ -268,13 +295,15 @@ mod tests {
             .with_status(409)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"already registered"}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let client = NodeClient::new(&server.url(), Some(kp.clone()));
         let body = serde_json::to_vec(&json!({
             "did": kp.did().to_string(),
             "capabilities": ["git:push"],
-        })).unwrap();
+        }))
+        .unwrap();
         let resp = client.post("/api/register", &body).await.unwrap();
         let status = resp.status();
         let payload: Value = resp.json().await.unwrap();
@@ -295,7 +324,8 @@ mod tests {
             .with_status(409)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repository already exists"}"#)
-            .create_async().await;
+            .create_async()
+            .await;
 
         let client = NodeClient::new(&server.url(), Some(kp.clone()));
         let body = serde_json::to_vec(&json!({"name": "existing", "is_public": true})).unwrap();

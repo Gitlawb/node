@@ -63,7 +63,11 @@ async fn cmd_list(node: String) -> Result<()> {
         let sha = pin["sha256_hex"].as_str().unwrap_or("?");
         let pinned_at = pin["pinned_at"].as_str().unwrap_or("?");
         // Trim pinned_at to date+time without subseconds
-        let ts = if pinned_at.len() >= 19 { &pinned_at[..19] } else { pinned_at };
+        let ts = if pinned_at.len() >= 19 {
+            &pinned_at[..19]
+        } else {
+            pinned_at
+        };
         println!("  {cid}");
         println!("    sha256: {sha}");
         println!("    pinned: {ts}");
@@ -98,7 +102,9 @@ async fn cmd_get(cid: String, node: String) -> Result<()> {
     // Write raw bytes to stdout (allows piping to files or other tools)
     let bytes = resp.bytes().await.context("failed to read response body")?;
     use std::io::Write;
-    std::io::stdout().write_all(&bytes).context("failed to write to stdout")?;
+    std::io::stdout()
+        .write_all(&bytes)
+        .context("failed to write to stdout")?;
 
     Ok(())
 }

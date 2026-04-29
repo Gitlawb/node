@@ -35,17 +35,36 @@ struct Check {
     fix: Option<String>,
 }
 
-enum CheckState { Ok, Warn, Fail }
+enum CheckState {
+    Ok,
+    Warn,
+    Fail,
+}
 
 impl Check {
     fn pass(label: &'static str, detail: impl Into<String>) -> Self {
-        Self { label, state: CheckState::Ok, detail: detail.into(), fix: None }
+        Self {
+            label,
+            state: CheckState::Ok,
+            detail: detail.into(),
+            fix: None,
+        }
     }
     fn warn(label: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
-        Self { label, state: CheckState::Warn, detail: detail.into(), fix: Some(fix.into()) }
+        Self {
+            label,
+            state: CheckState::Warn,
+            detail: detail.into(),
+            fix: Some(fix.into()),
+        }
     }
     fn fail(label: &'static str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
-        Self { label, state: CheckState::Fail, detail: detail.into(), fix: Some(fix.into()) }
+        Self {
+            label,
+            state: CheckState::Fail,
+            detail: detail.into(),
+            fix: Some(fix.into()),
+        }
     }
 }
 
@@ -54,7 +73,9 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     println!();
 
     let dir = args.dir.unwrap_or_else(|| {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".gitlawb")
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".gitlawb")
     });
 
     let mut checks = Vec::new();
@@ -97,7 +118,10 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         {
             Some(v) => {
                 let node = v["node"].as_str().unwrap_or("unknown");
-                checks.push(Check::pass("registration", format!("registered with {node}")));
+                checks.push(Check::pass(
+                    "registration",
+                    format!("registered with {node}"),
+                ));
             }
             None => {
                 checks.push(Check::fail(
@@ -123,7 +147,9 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         Ok(v) if v.contains("127.0.0.1") || v.contains("localhost") => {
             checks.push(Check::fail(
                 "GITLAWB_NODE",
-                format!("set to local address ({v}) — git push/clone will fail against remote nodes"),
+                format!(
+                    "set to local address ({v}) — git push/clone will fail against remote nodes"
+                ),
                 "export GITLAWB_NODE=https://node.gitlawb.com",
             ));
         }
@@ -204,7 +230,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
     // ── Render ────────────────────────────────────────────────────────────
     for check in &checks {
         let icon = match check.state {
-            CheckState::Ok   => "✓",
+            CheckState::Ok => "✓",
             CheckState::Warn => "⚠",
             CheckState::Fail => "✗",
         };
@@ -216,7 +242,9 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 
     println!();
 
-    let has_issues = checks.iter().any(|c| matches!(c.state, CheckState::Fail | CheckState::Warn));
+    let has_issues = checks
+        .iter()
+        .any(|c| matches!(c.state, CheckState::Fail | CheckState::Warn));
     if !has_issues {
         println!("Everything looks good. Run `gl quickstart` to create your first repo.");
     } else {
@@ -244,9 +272,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 /// Check if a binary name exists anywhere on PATH.
 fn which_in_path(name: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths).any(|dir| dir.join(name).exists())
-        })
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).exists()))
         .unwrap_or(false)
 }
 
@@ -277,7 +303,12 @@ async fn check_version(current: &'static str) -> Check {
 
     let tag = match body["tag_name"].as_str() {
         Some(t) => t.trim_start_matches('v'),
-        None => return Check::pass("version", format!("v{current} (could not parse latest tag)")),
+        None => {
+            return Check::pass(
+                "version",
+                format!("v{current} (could not parse latest tag)"),
+            )
+        }
     };
 
     if is_newer(tag, current) {
@@ -295,7 +326,11 @@ async fn check_version(current: &'static str) -> Check {
 fn is_newer(latest: &str, current: &str) -> bool {
     fn parse(v: &str) -> (u32, u32, u32) {
         let mut parts = v.splitn(3, '.').map(|p| p.parse::<u32>().unwrap_or(0));
-        (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+        (
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        )
     }
     parse(latest) > parse(current)
 }

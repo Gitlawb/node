@@ -52,13 +52,27 @@ pub enum ProtectCmd {
 
 pub async fn run(args: ProtectArgs) -> Result<()> {
     match args.cmd {
-        ProtectCmd::Set { branch, repo, node, dir } => cmd_set(branch, repo, node, dir).await,
-        ProtectCmd::Remove { branch, repo, node, dir } => cmd_remove(branch, repo, node, dir).await,
+        ProtectCmd::Set {
+            branch,
+            repo,
+            node,
+            dir,
+        } => cmd_set(branch, repo, node, dir).await,
+        ProtectCmd::Remove {
+            branch,
+            repo,
+            node,
+            dir,
+        } => cmd_remove(branch, repo, node, dir).await,
         ProtectCmd::List { repo, node, dir } => cmd_list(repo, node, dir).await,
     }
 }
 
-async fn resolve_owner_repo(repo: &str, node: &str, dir: Option<&std::path::Path>) -> Result<(String, String)> {
+async fn resolve_owner_repo(
+    repo: &str,
+    node: &str,
+    dir: Option<&std::path::Path>,
+) -> Result<(String, String)> {
     if let Some((owner, name)) = repo.split_once('/') {
         return Ok((owner.to_string(), name.to_string()));
     }
@@ -68,7 +82,11 @@ async fn resolve_owner_repo(repo: &str, node: &str, dir: Option<&std::path::Path
         did.split(':').next_back().unwrap_or(&did).to_string()
     } else {
         let client = NodeClient::new(node, None);
-        let info: Value = client.get("/").await?.json().await
+        let info: Value = client
+            .get("/")
+            .await?
+            .json()
+            .await
             .context("failed to fetch node info")?;
         let did = info["did"].as_str().context("node missing DID")?;
         did.split(':').next_back().unwrap_or(did).to_string()
@@ -83,7 +101,10 @@ async fn cmd_set(branch: String, repo: String, node: String, dir: Option<PathBuf
     let client = NodeClient::new(&node, Some(kp));
 
     let resp = client
-        .post(&format!("/api/v1/repos/{owner}/{name}/branches/{branch}/protect"), b"")
+        .post(
+            &format!("/api/v1/repos/{owner}/{name}/branches/{branch}/protect"),
+            b"",
+        )
         .await
         .context("failed to connect to node")?;
 
@@ -100,14 +121,22 @@ async fn cmd_set(branch: String, repo: String, node: String, dir: Option<PathBuf
     Ok(())
 }
 
-async fn cmd_remove(branch: String, repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_remove(
+    branch: String,
+    repo: String,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
     let kp = load_keypair_from_dir(dir.as_deref())
         .context("identity not found — run `gl identity new` first")?;
     let (owner, name) = resolve_owner_repo(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, Some(kp));
 
     let resp = client
-        .delete(&format!("/api/v1/repos/{owner}/{name}/branches/{branch}/protect"), b"")
+        .delete(
+            &format!("/api/v1/repos/{owner}/{name}/branches/{branch}/protect"),
+            b"",
+        )
         .await
         .context("failed to connect to node")?;
 
@@ -140,12 +169,18 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         anyhow::bail!("list protected branches failed ({status}): {msg}");
     }
 
-    let branches = body["protected_branches"].as_array().cloned().unwrap_or_default();
+    let branches = body["protected_branches"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     if branches.is_empty() {
         println!("No protected branches in {owner}/{name}");
     } else {
-        println!("Protected branches in {owner}/{name} ({} total)\n", branches.len());
+        println!(
+            "Protected branches in {owner}/{name} ({} total)\n",
+            branches.len()
+        );
         for b in &branches {
             println!("  🔒 {}", b.as_str().unwrap_or("?"));
         }
@@ -162,10 +197,19 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
-            .mock("POST", mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/branches/main/protect".to_string()))
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/branches/main/protect".to_string(),
+                ),
+            )
             .with_status(201)
             .with_header("content-type", "application/json")
             .with_body(r#"{"status":"protected","repo":"z/myrepo","branch":"main"}"#)
@@ -177,7 +221,9 @@ mod tests {
             "myrepo".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -185,10 +231,17 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
-            .mock("POST", mockito::Matcher::Regex(r"branches/main/protect".to_string()))
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"branches/main/protect".to_string()),
+            )
             .with_status(400)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"only the repo owner can protect branches"}"#)
@@ -200,7 +253,9 @@ mod tests {
             "myrepo".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("protect failed"));
     }
 
@@ -209,10 +264,17 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
-            .mock("DELETE", mockito::Matcher::Regex(r"branches/main/protect".to_string()))
+            .mock(
+                "DELETE",
+                mockito::Matcher::Regex(r"branches/main/protect".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"status":"unprotected","branch":"main"}"#)
@@ -224,7 +286,9 @@ mod tests {
             "myrepo".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -232,17 +296,30 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"branches/protected".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"branches/protected".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"protected_branches":[],"count":0}"#)
             .create_async()
             .await;
 
-        cmd_list("myrepo".to_string(), server.url(), Some(dir.path().to_path_buf())).await.unwrap();
+        cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -250,26 +327,39 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
 
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"branches/protected".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"branches/protected".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"protected_branches":["main","release"],"count":2}"#)
             .create_async()
             .await;
 
-        cmd_list("myrepo".to_string(), server.url(), Some(dir.path().to_path_buf())).await.unwrap();
+        cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
     fn test_resolve_owner_repo_with_slash() {
         // owner/repo format should split correctly
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let (owner, name) = rt.block_on(
-            resolve_owner_repo("alice/myrepo", "http://unused", None)
-        ).unwrap();
+        let (owner, name) = rt
+            .block_on(resolve_owner_repo("alice/myrepo", "http://unused", None))
+            .unwrap();
         assert_eq!(owner, "alice");
         assert_eq!(name, "myrepo");
     }

@@ -16,18 +16,16 @@
 //!   connect git-upload-pack  → GET /info/refs | POST /git-upload-pack
 //!   connect git-receive-pack → GET /info/refs | POST /git-receive-pack (+ auth header)
 
-use std::io::{self, BufRead, Read, Write};
 use anyhow::{bail, Context, Result};
-use gitlawb_core::identity::Keypair;
 use gitlawb_core::http_sig::sign_request;
+use gitlawb_core::identity::Keypair;
+use std::io::{self, BufRead, Read, Write};
 
 fn main() -> Result<()> {
     // All logging goes to stderr so it doesn't corrupt the git protocol on stdout
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            std::env::var("GITLAWB_LOG").unwrap_or_else(|_| "warn".to_string()),
-        )
+        .with_env_filter(std::env::var("GITLAWB_LOG").unwrap_or_else(|_| "warn".to_string()))
         .init();
 
     let args: Vec<String> = std::env::args().collect();
@@ -42,8 +40,8 @@ fn main() -> Result<()> {
     let (_, short_owner, repo_name) = parse_gitlawb_url(url)?;
 
     // v0.1: default to localhost. Override with GITLAWB_NODE env var.
-    let node_base = std::env::var("GITLAWB_NODE")
-        .unwrap_or_else(|_| "http://127.0.0.1:7545".to_string());
+    let node_base =
+        std::env::var("GITLAWB_NODE").unwrap_or_else(|_| "http://127.0.0.1:7545".to_string());
     let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
     tracing::debug!("repo_base: {repo_base}");
 
@@ -62,7 +60,9 @@ fn run_helper(repo_base: &str, keypair: Option<&Keypair>) -> Result<()> {
 
     loop {
         let mut line = String::new();
-        let n = stdin_buf.read_line(&mut line).context("reading command from git")?;
+        let n = stdin_buf
+            .read_line(&mut line)
+            .context("reading command from git")?;
         if n == 0 {
             break; // EOF
         }
@@ -149,7 +149,10 @@ fn handle_connect(
     // But git's `connect` protocol expects raw git-upload-pack output (no HTTP wrapper).
     // Strip the service-line pkt-line + flush before forwarding.
     let advertisement = strip_service_announcement(&refs_bytes);
-    tracing::debug!("ref advertisement: {} bytes (stripped)", advertisement.len());
+    tracing::debug!(
+        "ref advertisement: {} bytes (stripped)",
+        advertisement.len()
+    );
 
     let mut stdout = io::stdout();
     stdout.write_all(advertisement)?;
@@ -172,7 +175,9 @@ fn handle_connect(
         read_upload_pack_request(stdin).context("reading upload-pack request")?
     } else {
         let mut buf = Vec::new();
-        stdin.read_to_end(&mut buf).context("reading receive-pack request")?;
+        stdin
+            .read_to_end(&mut buf)
+            .context("reading receive-pack request")?;
         buf
     };
 
@@ -192,10 +197,7 @@ fn handle_connect(
 
     let mut req = client
         .post(&post_url)
-        .header(
-            "Content-Type",
-            format!("application/x-{}-request", service),
-        )
+        .header("Content-Type", format!("application/x-{}-request", service))
         .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0")
         .body(request_body.clone());
 
@@ -215,9 +217,7 @@ fn handle_connect(
         }
     }
 
-    let pack_resp = req
-        .send()
-        .with_context(|| format!("POST {post_url}"))?;
+    let pack_resp = req.send().with_context(|| format!("POST {post_url}"))?;
 
     if !pack_resp.status().is_success() {
         bail!("POST /{} returned {}", service, pack_resp.status());
@@ -296,7 +296,9 @@ fn read_upload_pack_request(stdin: &mut io::BufReader<io::Stdin>) -> Result<Vec<
 
         let data_len = pkt_len - 4;
         let mut data = vec![0u8; data_len];
-        stdin.read_exact(&mut data).context("reading pkt-line data")?;
+        stdin
+            .read_exact(&mut data)
+            .context("reading pkt-line data")?;
         buf.extend_from_slice(&data);
 
         // "done\n" signals the end of the want/have negotiation
@@ -380,8 +382,8 @@ fn load_keypair() -> Option<Keypair> {
 }
 
 fn resolve_key_path() -> std::path::PathBuf {
-    let path_str = std::env::var("GITLAWB_KEY")
-        .unwrap_or_else(|_| "~/.gitlawb/identity.pem".to_string());
+    let path_str =
+        std::env::var("GITLAWB_KEY").unwrap_or_else(|_| "~/.gitlawb/identity.pem".to_string());
 
     if let Some(stripped) = path_str.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -399,8 +401,7 @@ mod tests {
 
     #[test]
     fn parse_standard_url() {
-        let (did, owner, repo) =
-            parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo").unwrap();
+        let (did, owner, repo) = parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo").unwrap();
         assert_eq!(did, "did:key:z6MkFoo123");
         assert_eq!(owner, "z6MkFoo123");
         assert_eq!(repo, "my-repo");
@@ -408,8 +409,7 @@ mod tests {
 
     #[test]
     fn parse_url_strips_dot_git() {
-        let (_, _, repo) =
-            parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo.git").unwrap();
+        let (_, _, repo) = parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo.git").unwrap();
         assert_eq!(repo, "my-repo");
     }
 

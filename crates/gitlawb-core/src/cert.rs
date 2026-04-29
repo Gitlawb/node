@@ -10,9 +10,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{Error, Result};
 use crate::did::Did;
-use crate::identity::{Keypair, verify};
+use crate::identity::{verify, Keypair};
+use crate::{Error, Result};
 
 /// The certificate type discriminant. Always `"gitlawb/ref-update/v1"`.
 pub const CERT_TYPE: &str = "gitlawb/ref-update/v1";
@@ -110,7 +110,7 @@ impl RefUpdateCert {
     ///
     /// Returns the list of DIDs whose signatures are valid.
     pub fn verify_all(&self) -> Result<Vec<Did>> {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
         let signing_bytes = self.body.to_signing_bytes()?;
         let mut valid = Vec::new();
 
@@ -118,10 +118,12 @@ impl RefUpdateCert {
             // Resolve the verifying key from the DID
             let vk = cert_sig.signer.to_verifying_key()?;
 
-            let sig_bytes_vec = URL_SAFE_NO_PAD.decode(&cert_sig.sig)
+            let sig_bytes_vec = URL_SAFE_NO_PAD
+                .decode(&cert_sig.sig)
                 .map_err(|e| Error::RefCert(format!("invalid base64 sig: {e}")))?;
 
-            let sig_bytes: [u8; 64] = sig_bytes_vec.try_into()
+            let sig_bytes: [u8; 64] = sig_bytes_vec
+                .try_into()
                 .map_err(|_| Error::RefCert("signature must be 64 bytes".to_string()))?;
 
             verify(&vk, &signing_bytes, &sig_bytes)?;
@@ -133,11 +135,7 @@ impl RefUpdateCert {
 
     /// Check if this certificate satisfies a threshold of valid signatures
     /// from the provided set of authorized maintainer DIDs.
-    pub fn satisfies_threshold(
-        &self,
-        maintainers: &[Did],
-        threshold: usize,
-    ) -> Result<bool> {
+    pub fn satisfies_threshold(&self, maintainers: &[Did], threshold: usize) -> Result<bool> {
         let valid = self.verify_all()?;
         let count = valid.iter().filter(|d| maintainers.contains(d)).count();
         Ok(count >= threshold)
@@ -187,7 +185,8 @@ mod tests {
             dummy_hash('a'),
             1,
             &kp,
-        ).unwrap();
+        )
+        .unwrap();
 
         cert.validate_structure().unwrap();
         let valid = cert.verify_all().unwrap();
@@ -208,7 +207,8 @@ mod tests {
             dummy_hash('a'),
             1,
             &kp1,
-        ).unwrap();
+        )
+        .unwrap();
 
         cert.countersign(&kp2).unwrap();
         let valid = cert.verify_all().unwrap();
@@ -228,7 +228,8 @@ mod tests {
             dummy_hash('a'),
             1,
             &kp1,
-        ).unwrap();
+        )
+        .unwrap();
         cert.countersign(&kp2).unwrap();
 
         let maintainers = vec![kp1.did(), kp2.did()];
@@ -246,7 +247,8 @@ mod tests {
             dummy_hash('b'),
             42,
             &kp,
-        ).unwrap();
+        )
+        .unwrap();
 
         let json = serde_json::to_string_pretty(&cert).unwrap();
         assert!(json.contains("gitlawb/ref-update/v1"));

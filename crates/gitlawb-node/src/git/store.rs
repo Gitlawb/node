@@ -1,6 +1,6 @@
+use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use anyhow::{Result, Context, bail};
 
 /// Initialize a new bare git repository with SHA-1 object format (default).
 ///
@@ -107,7 +107,8 @@ pub fn resolve_head(repo_path: &Path, preferred_branch: &str) -> String {
 
     // 3. Walk all refs — prefer main/master, then take the first one
     if let Ok(refs) = list_refs(repo_path) {
-        let branches: Vec<_> = refs.iter()
+        let branches: Vec<_> = refs
+            .iter()
             .filter(|(r, _)| r.starts_with("refs/heads/"))
             .collect();
         // Preferred names in order
@@ -199,7 +200,13 @@ pub fn ls_tree(repo_path: &Path, refname: &str, tree_path: &str) -> Result<Vec<T
             let kind = parts.next()?.to_string();
             let hash = parts.next()?.to_string();
             let size: Option<u64> = parts.next().and_then(|s| s.parse().ok());
-            Some(TreeEntry { mode, kind, hash, path: name.to_string(), size })
+            Some(TreeEntry {
+                mode,
+                kind,
+                hash,
+                path: name.to_string(),
+                size,
+            })
         })
         .collect();
 
@@ -239,7 +246,9 @@ pub struct CommitInfo {
 
 fn serialize_timestamp<S: serde::Serializer>(ts: &i64, s: S) -> Result<S::Ok, S::Error> {
     use chrono::TimeZone;
-    let dt = chrono::Utc.timestamp_opt(*ts, 0).single()
+    let dt = chrono::Utc
+        .timestamp_opt(*ts, 0)
+        .single()
         .unwrap_or_else(chrono::Utc::now);
     s.serialize_str(&dt.to_rfc3339())
 }
@@ -275,7 +284,9 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
         return Ok(None);
     }
 
-    let obj_type = String::from_utf8_lossy(&type_output.stdout).trim().to_string();
+    let obj_type = String::from_utf8_lossy(&type_output.stdout)
+        .trim()
+        .to_string();
 
     // Read the raw content bytes
     let content_output = Command::new("git")
@@ -305,7 +316,13 @@ pub fn branch_diff(repo_path: &Path, target_branch: &str, source_branch: &str) -
 
 /// Merge source_branch into target_branch in a bare repo using a temporary worktree.
 /// Returns the new merge commit hash.
-pub fn merge_branch(repo_path: &Path, target_branch: &str, source_branch: &str, author_did: &str, pr_title: &str) -> Result<String> {
+pub fn merge_branch(
+    repo_path: &Path,
+    target_branch: &str,
+    source_branch: &str,
+    author_did: &str,
+    pr_title: &str,
+) -> Result<String> {
     let worktree_path = repo_path.join("_merge_worktree");
 
     // Clean up any leftover worktree
@@ -324,13 +341,24 @@ pub fn merge_branch(repo_path: &Path, target_branch: &str, source_branch: &str, 
         .output()
         .context("failed to create worktree")?;
     if !wt.status.success() {
-        bail!("git worktree add failed: {}", String::from_utf8_lossy(&wt.stderr));
+        bail!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&wt.stderr)
+        );
     }
 
     // Run merge in worktree
     let merge = Command::new("git")
-        .args(["merge", "--no-ff", source_branch, "-m",
-               &format!("Merge branch '{}' into {} ({})", source_branch, target_branch, pr_title)])
+        .args([
+            "merge",
+            "--no-ff",
+            source_branch,
+            "-m",
+            &format!(
+                "Merge branch '{}' into {} ({})",
+                source_branch, target_branch, pr_title
+            ),
+        ])
         .current_dir(&worktree_path)
         .env("GIT_AUTHOR_NAME", author_did)
         .env("GIT_AUTHOR_EMAIL", format!("{}@gitlawb", author_did))
@@ -349,7 +377,10 @@ pub fn merge_branch(repo_path: &Path, target_branch: &str, source_branch: &str, 
     let _ = std::fs::remove_dir_all(&worktree_path);
 
     if !success {
-        bail!("git merge failed: {}", String::from_utf8_lossy(&merge.stderr));
+        bail!(
+            "git merge failed: {}",
+            String::from_utf8_lossy(&merge.stderr)
+        );
     }
 
     // Get new HEAD of target branch
@@ -365,8 +396,6 @@ pub fn merge_branch(repo_path: &Path, target_branch: &str, source_branch: &str, 
 /// Resolve a repo disk path: {repos_dir}/{owner_slug}/{repo_name}.git
 pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> PathBuf {
     // Sanitize the DID for use as a directory name
-    let owner_slug = owner_did
-        .replace(':', "_")
-        .replace('/', "_");
+    let owner_slug = owner_did.replace(':', "_").replace('/', "_");
     repos_dir.join(owner_slug).join(format!("{repo_name}.git"))
 }

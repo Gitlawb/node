@@ -1,10 +1,10 @@
 //! `gl issue` — issue management commands.
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
-use chrono::Utc;
 use uuid::Uuid;
 
 use crate::http::NodeClient;
@@ -88,19 +88,48 @@ pub enum IssueCmd {
 
 pub async fn run(args: IssueArgs) -> Result<()> {
     match args.cmd {
-        IssueCmd::Create { repo, title, body, node, dir } => {
-            cmd_create(repo, title, body, node, dir).await
-        }
+        IssueCmd::Create {
+            repo,
+            title,
+            body,
+            node,
+            dir,
+        } => cmd_create(repo, title, body, node, dir).await,
         IssueCmd::List { repo, node, dir } => cmd_list(repo, node, dir).await,
-        IssueCmd::Show { repo, id, node, dir } => cmd_show(repo, id, node, dir).await,
-        IssueCmd::Close { repo, id, node, dir } => cmd_close(repo, id, node, dir).await,
-        IssueCmd::Comment { repo, id, body, node, dir } => cmd_issue_comment(repo, id, body, node, dir).await,
-        IssueCmd::Comments { repo, id, node, dir } => cmd_issue_comments(repo, id, node, dir).await,
+        IssueCmd::Show {
+            repo,
+            id,
+            node,
+            dir,
+        } => cmd_show(repo, id, node, dir).await,
+        IssueCmd::Close {
+            repo,
+            id,
+            node,
+            dir,
+        } => cmd_close(repo, id, node, dir).await,
+        IssueCmd::Comment {
+            repo,
+            id,
+            body,
+            node,
+            dir,
+        } => cmd_issue_comment(repo, id, body, node, dir).await,
+        IssueCmd::Comments {
+            repo,
+            id,
+            node,
+            dir,
+        } => cmd_issue_comments(repo, id, node, dir).await,
     }
 }
 
 /// Resolve "repo" into (owner, name) using the caller's keypair DID when no slash given.
-async fn resolve_repo(repo: &str, node: &str, dir: Option<&std::path::Path>) -> Result<(String, String)> {
+async fn resolve_repo(
+    repo: &str,
+    node: &str,
+    dir: Option<&std::path::Path>,
+) -> Result<(String, String)> {
     if let Some((owner, name)) = repo.split_once('/') {
         Ok((owner.to_string(), name.to_string()))
     } else {
@@ -109,7 +138,11 @@ async fn resolve_repo(repo: &str, node: &str, dir: Option<&std::path::Path>) -> 
             did.split(':').next_back().unwrap_or(&did).to_string()
         } else {
             let client = NodeClient::new(node, None);
-            let info: Value = client.get("/").await?.json().await
+            let info: Value = client
+                .get("/")
+                .await?
+                .json()
+                .await
                 .context("failed to fetch node info")?;
             let did = info["did"].as_str().context("node info missing 'did'")?;
             did.split(':').next_back().unwrap_or(did).to_string()
@@ -157,7 +190,9 @@ async fn cmd_create(
 
     let client = NodeClient::new(&node, Some(keypair));
     let path = format!("/api/v1/repos/{owner}/{name}/issues");
-    let resp = client.post(&path, &request_body).await
+    let resp = client
+        .post(&path, &request_body)
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let result: Value = resp.json().await.context("invalid JSON response")?;
@@ -182,7 +217,11 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     let client = NodeClient::new(&node, None);
     let path = format!("/api/v1/repos/{owner}/{name}/issues");
-    let resp: Value = client.get(&path).await?.json().await
+    let resp: Value = client
+        .get(&path)
+        .await?
+        .json()
+        .await
         .context("failed to list issues")?;
 
     let issues = resp["issues"].as_array().cloned().unwrap_or_default();
@@ -198,8 +237,15 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         let id = issue["id"].as_str().unwrap_or("?");
         let title = issue["title"].as_str().unwrap_or("(no title)");
         let status = issue["status"].as_str().unwrap_or("?");
-        let created = issue["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
-        let icon = match status { "open" => "○", "closed" => "✗", _ => "?" };
+        let created = issue["created_at"]
+            .as_str()
+            .map(|s| &s[..10])
+            .unwrap_or("?");
+        let icon = match status {
+            "open" => "○",
+            "closed" => "✗",
+            _ => "?",
+        };
         println!("  {icon} {id:.8}  {created}  {title}");
     }
     Ok(())
@@ -210,7 +256,10 @@ async fn cmd_show(repo: String, id: String, node: String, dir: Option<PathBuf>) 
 
     let client = NodeClient::new(&node, None);
     let path = format!("/api/v1/repos/{owner}/{name}/issues/{id}");
-    let resp = client.get(&path).await.context("failed to connect to node")?;
+    let resp = client
+        .get(&path)
+        .await
+        .context("failed to connect to node")?;
     let status = resp.status();
     let issue: Value = resp.json().await.context("invalid JSON response")?;
 
@@ -244,7 +293,9 @@ async fn cmd_close(repo: String, id: String, node: String, dir: Option<PathBuf>)
 
     let body = serde_json::to_vec(&json!({ "status": "closed" }))?;
     let path = format!("/api/v1/repos/{owner}/{name}/issues/{id}");
-    let resp = client.post(&format!("{path}/close"), &body).await
+    let resp = client
+        .post(&format!("{path}/close"), &body)
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let result: Value = resp.json().await.context("invalid JSON response")?;
@@ -259,15 +310,23 @@ async fn cmd_close(repo: String, id: String, node: String, dir: Option<PathBuf>)
 }
 
 async fn cmd_issue_comment(
-    repo: String, id: String, body: String,
-    node: String, dir: Option<PathBuf>,
+    repo: String,
+    id: String,
+    body: String,
+    node: String,
+    dir: Option<PathBuf>,
 ) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, Some(keypair));
 
     let payload = serde_json::to_vec(&serde_json::json!({ "body": body }))?;
-    let resp = client.post(&format!("/api/v1/repos/{owner}/{name}/issues/{id}/comments"), &payload).await
+    let resp = client
+        .post(
+            &format!("/api/v1/repos/{owner}/{name}/issues/{id}/comments"),
+            &payload,
+        )
+        .await
         .context("failed to connect to node")?;
     let code = resp.status();
     let result: Value = resp.json().await.context("invalid JSON")?;
@@ -281,12 +340,23 @@ async fn cmd_issue_comment(
     Ok(())
 }
 
-async fn cmd_issue_comments(repo: String, id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_issue_comments(
+    repo: String,
+    id: String,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, None);
 
-    let resp: Value = client.get(&format!("/api/v1/repos/{owner}/{name}/issues/{id}/comments")).await?
-        .json().await.context("invalid JSON")?;
+    let resp: Value = client
+        .get(&format!(
+            "/api/v1/repos/{owner}/{name}/issues/{id}/comments"
+        ))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
 
     let comments = resp["comments"].as_array().cloned().unwrap_or_default();
     if comments.is_empty() {
@@ -297,7 +367,11 @@ async fn cmd_issue_comments(repo: String, id: String, node: String, dir: Option<
     println!("Comments on issue {id} ({} total)\n", comments.len());
     for c in &comments {
         let author = c["author_did"].as_str().unwrap_or("?");
-        let author_short = author.split(':').next_back().map(|s| &s[..s.len().min(8)]).unwrap_or("?");
+        let author_short = author
+            .split(':')
+            .next_back()
+            .map(|s| &s[..s.len().min(8)])
+            .unwrap_or("?");
         let cbody = c["body"].as_str().unwrap_or("");
         let created = c["created_at"].as_str().map(|s| &s[..10]).unwrap_or("?");
         println!("  · {author_short} ({created})");
@@ -335,9 +409,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list("myrepo".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -357,9 +435,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list("myrepo".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -458,7 +540,9 @@ mod tests {
         let _m = server
             .mock(
                 "GET",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues/missing-id$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/issues/missing-id$".to_string(),
+                ),
             )
             .with_status(404)
             .with_header("content-type", "application/json")
@@ -487,7 +571,9 @@ mod tests {
         let _m = server
             .mock(
                 "POST",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues/abc-123/close$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/issues/abc-123/close$".to_string(),
+                ),
             )
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -515,7 +601,9 @@ mod tests {
         let _m = server
             .mock(
                 "POST",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues/bad-id/close$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/issues/bad-id/close$".to_string(),
+                ),
             )
             .with_status(404)
             .with_header("content-type", "application/json")
@@ -571,7 +659,9 @@ mod tests {
         let _m = server
             .mock(
                 "POST",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues/bad-id/comments$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/issues/bad-id/comments$".to_string(),
+                ),
             )
             .with_status(404)
             .with_header("content-type", "application/json")
@@ -600,7 +690,9 @@ mod tests {
         let _m = server
             .mock(
                 "GET",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/issues/abc123/comments$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/issues/abc123/comments$".to_string(),
+                ),
             )
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -608,9 +700,14 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_issue_comments("myrepo".to_string(), "abc123".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_issue_comments(
+            "myrepo".to_string(),
+            "abc123".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -630,8 +727,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_issue_comments("myrepo".to_string(), "abc123".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_issue_comments(
+            "myrepo".to_string(),
+            "abc123".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 }

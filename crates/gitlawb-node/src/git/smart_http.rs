@@ -1,12 +1,12 @@
-use std::path::Path;
-use std::process::Stdio;
+use anyhow::{bail, Result};
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
 use bytes::Bytes;
+use std::path::Path;
+use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use anyhow::{bail, Result};
 
 /// Handle `GET /:owner/:repo/info/refs?service=git-upload-pack`
 /// or `?service=git-receive-pack`

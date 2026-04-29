@@ -11,14 +11,14 @@
 //!   Signature-Input:  sig1=("@method" "@path" "content-digest");keyid="did:key:z6Mk...";alg="ed25519";created=<unix>
 //!   Signature:        sig1=:base64signature:
 
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::Utc;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-use crate::{Error, Result};
 use crate::did::Did;
 use crate::identity::Keypair;
+use crate::{Error, Result};
 
 /// The component identifiers covered by every gitlawb signature.
 pub const COVERED_COMPONENTS: &[&str] = &["@method", "@path", "content-digest"];
@@ -53,16 +53,16 @@ impl HttpSignature {
         let sig_input = sig_input.trim();
 
         // Expect: sig1=("@method" "@path" "content-digest");keyid="...";alg="...";created=...
-        let rest = sig_input
-            .strip_prefix("sig1=")
-            .ok_or_else(|| Error::HttpSignature("Signature-Input must start with 'sig1='".into()))?;
+        let rest = sig_input.strip_prefix("sig1=").ok_or_else(|| {
+            Error::HttpSignature("Signature-Input must start with 'sig1='".into())
+        })?;
 
-        let open = rest.find('(').ok_or_else(|| {
-            Error::HttpSignature("missing '(' in Signature-Input".into())
-        })?;
-        let close = rest.find(')').ok_or_else(|| {
-            Error::HttpSignature("missing ')' in Signature-Input".into())
-        })?;
+        let open = rest
+            .find('(')
+            .ok_or_else(|| Error::HttpSignature("missing '(' in Signature-Input".into()))?;
+        let close = rest
+            .find(')')
+            .ok_or_else(|| Error::HttpSignature("missing ')' in Signature-Input".into()))?;
 
         let components_str = &rest[open + 1..close];
         let params_str = &rest[close + 1..]; // starts with ';'
@@ -98,15 +98,19 @@ impl HttpSignature {
             .trim()
             .strip_prefix("sig1=:")
             .and_then(|s| s.strip_suffix(':'))
-            .ok_or_else(|| {
-                Error::HttpSignature("Signature must be 'sig1=:base64:'".into())
-            })?;
+            .ok_or_else(|| Error::HttpSignature("Signature must be 'sig1=:base64:'".into()))?;
 
         let signature_bytes = STANDARD
             .decode(sig_b64)
             .map_err(|e| Error::HttpSignature(format!("invalid base64 in Signature: {e}")))?;
 
-        Ok(Self { key_id, alg, created, components, signature_bytes })
+        Ok(Self {
+            key_id,
+            alg,
+            created,
+            components,
+            signature_bytes,
+        })
     }
 
     /// Reject if the `created` timestamp is more than 5 minutes from now.
@@ -178,12 +182,9 @@ pub fn sign_request(
     request_values.insert("@path".to_string(), path_and_query.to_string());
     request_values.insert("content-digest".to_string(), content_digest.clone());
 
-    let signing_string = build_signing_string(
-        COVERED_COMPONENTS,
-        sig_params_value,
-        &request_values,
-    )
-    .expect("required components always present when building");
+    let signing_string =
+        build_signing_string(COVERED_COMPONENTS, sig_params_value, &request_values)
+            .expect("required components always present when building");
 
     let sig_bytes = keypair.sign(signing_string.as_bytes());
     let sig_b64 = STANDARD.encode(sig_bytes.to_bytes());
@@ -290,10 +291,16 @@ mod tests {
         request_values.insert("content-digest".to_string(), headers.content_digest.clone());
 
         let components_ref: Vec<&str> = sig.components.iter().map(String::as_str).collect();
-        let signing_string = build_signing_string(&components_ref, sig_params_value, &request_values).unwrap();
+        let signing_string =
+            build_signing_string(&components_ref, sig_params_value, &request_values).unwrap();
 
         let vk = sig.key_id.to_verifying_key().unwrap();
-        let sig_b64 = headers.signature.strip_prefix("sig1=:").unwrap().strip_suffix(':').unwrap();
+        let sig_b64 = headers
+            .signature
+            .strip_prefix("sig1=:")
+            .unwrap()
+            .strip_suffix(':')
+            .unwrap();
         let sig_bytes: [u8; 64] = STANDARD.decode(sig_b64).unwrap().try_into().unwrap();
 
         assert!(verify(&vk, signing_string.as_bytes(), &sig_bytes).is_ok());
@@ -321,7 +328,9 @@ mod tests {
         let kp = Keypair::generate();
         let did = kp.did();
         // created=1 is way in the past — should fail clock skew check
-        let sig_input = format!(r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1"#);
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1"#
+        );
         let sig = HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:").unwrap();
         assert!(sig.check_created().is_err());
     }

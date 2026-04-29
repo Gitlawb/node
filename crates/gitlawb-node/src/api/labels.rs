@@ -25,18 +25,31 @@ pub async fn add_label(
     if label.is_empty() || label.len() > 50 {
         return Err(AppError::BadRequest("label must be 1–50 characters".into()));
     }
-    if !label.chars().all(|c| c.is_alphanumeric() || c == '-' || c == ':') {
+    if !label
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == ':')
+    {
         return Err(AppError::BadRequest(
             "label must contain only alphanumeric characters, hyphens, and colons".into(),
         ));
     }
 
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
     let added = state.db.add_label(&record.id, &label).await?;
-    let status = if added { StatusCode::CREATED } else { StatusCode::OK };
-    Ok((status, Json(serde_json::json!({ "label": label, "added": added }))))
+    let status = if added {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((
+        status,
+        Json(serde_json::json!({ "label": label, "added": added })),
+    ))
 }
 
 /// DELETE /api/v1/repos/:owner/:repo/labels/:label
@@ -45,7 +58,10 @@ pub async fn remove_label(
     Extension(_auth): Extension<AuthenticatedDid>,
     Path((owner, name, label)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
     state.db.remove_label(&record.id, &label).await?;
@@ -57,7 +73,10 @@ pub async fn list_labels(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state.db.get_repo(&owner, &name).await?
+    let record = state
+        .db
+        .get_repo(&owner, &name)
+        .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
     let labels = state.db.list_labels(&record.id).await?;

@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use clap::Parser;
+use std::path::PathBuf;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gitlawb-node", about = "gitlawb node daemon", version)]
@@ -9,7 +9,11 @@ pub struct Config {
     pub repos_dir: PathBuf,
 
     /// PostgreSQL connection URL (Supabase or any Postgres instance)
-    #[arg(long, env = "DATABASE_URL", default_value = "postgresql://localhost/gitlawb")]
+    #[arg(
+        long,
+        env = "DATABASE_URL",
+        default_value = "postgresql://localhost/gitlawb"
+    )]
     pub database_url: String,
 
     /// Host to bind to
@@ -45,7 +49,11 @@ pub struct Config {
     pub pinata_jwt: String,
 
     /// Pinata v3 upload URL
-    #[arg(long, env = "GITLAWB_PINATA_UPLOAD_URL", default_value = "https://uploads.pinata.cloud/v3/files")]
+    #[arg(
+        long,
+        env = "GITLAWB_PINATA_UPLOAD_URL",
+        default_value = "https://uploads.pinata.cloud/v3/files"
+    )]
     pub pinata_upload_url: String,
 
     /// libp2p TCP port (0 = disabled)
@@ -75,7 +83,11 @@ pub struct Config {
     pub contract_name_registry: String,
 
     /// Base L2 RPC URL
-    #[arg(long, env = "GITLAWB_CHAIN_RPC_URL", default_value = "https://sepolia.base.org")]
+    #[arg(
+        long,
+        env = "GITLAWB_CHAIN_RPC_URL",
+        default_value = "https://sepolia.base.org"
+    )]
     pub chain_rpc_url: String,
 
     /// Base L2 node staking contract address (GitlawbNodeStaking). When set

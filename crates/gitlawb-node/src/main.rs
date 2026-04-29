@@ -1,6 +1,7 @@
 mod api;
 mod arweave;
 mod auth;
+mod bootstrap;
 mod cert;
 mod config;
 mod db;
@@ -16,9 +17,9 @@ mod state;
 mod sync;
 mod webhooks;
 
-use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -38,33 +39,51 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config = Config::parse();
+    let mut config = Config::parse();
+
+    // Merge the embedded seed list of public network nodes into the runtime
+    // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
+    bootstrap::merge_seeds(&mut config);
 
     // Load or generate the node's identity keypair
     let keypair = load_or_create_keypair(&config)?;
     let node_did = keypair.did();
 
     info!("╔══════════════════════════════════════════╗");
-    info!("║         gitlawb node v{}             ║", env!("CARGO_PKG_VERSION"));
+    info!(
+        "║         gitlawb node v{}             ║",
+        env!("CARGO_PKG_VERSION")
+    );
     info!("╚══════════════════════════════════════════╝");
     info!(did = %node_did, "node identity");
     info!(addr = %config.bind_addr(), "listening");
 
     // Connect to PostgreSQL database
-    let db = Arc::new(Db::connect(&config.database_url)
-        .await
-        .context("failed to connect to database")?);
+    let db = Arc::new(
+        Db::connect(&config.database_url)
+            .await
+            .context("failed to connect to database")?,
+    );
 
     // Ensure repos directory exists
-    std::fs::create_dir_all(&config.repos_dir)
-        .context("failed to create repos directory")?;
+    std::fs::create_dir_all(&config.repos_dir).context("failed to create repos directory")?;
 
     // Start libp2p swarm (if p2p_port > 0)
     let p2p_handle = if config.p2p_port > 0 {
-        let bootstrap_addrs = config.p2p_bootstrap.iter()
+        let bootstrap_addrs = config
+            .p2p_bootstrap
+            .iter()
             .filter_map(|s| s.parse().ok())
             .collect();
-        match p2p::start(&node_did.to_string(), config.p2p_port, bootstrap_addrs, Arc::clone(&db), config.auto_sync).await {
+        match p2p::start(
+            &node_did.to_string(),
+            config.p2p_port,
+            bootstrap_addrs,
+            Arc::clone(&db),
+            config.auto_sync,
+        )
+        .await
+        {
             Ok(handle) => {
                 info!(port = config.p2p_port, peer_id = %handle.local_peer_id, "libp2p swarm started");
                 Some(Arc::new(handle))
@@ -79,9 +98,11 @@ async fn main() -> Result<()> {
         None
     };
 
-    let http_client = Arc::new(reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?);
+    let http_client = Arc::new(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?,
+    );
 
     let (ref_update_tx, _) = tokio::sync::broadcast::channel::<state::RefUpdateBroadcast>(256);
     let (task_event_tx, _) = tokio::sync::broadcast::channel::<state::TaskEventBroadcast>(256);
@@ -114,11 +135,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    let repo_store = git::repo_store::RepoStore::new(
-        config.repos_dir.clone(),
-        tigris,
-        db.pool().clone(),
-    );
+    let repo_store =
+        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
 
     let state = AppState {
         config: Arc::new(config.clone()),
@@ -135,12 +153,16 @@ async fn main() -> Result<()> {
     };
 
     let router = server::build_router(state.clone());
-    let listener = TcpListener::bind(config.bind_addr()).await
+    let listener = TcpListener::bind(config.bind_addr())
+        .await
         .with_context(|| format!("failed to bind to {}", config.bind_addr()))?;
 
     info!("✓ node started — did:{}", node_did);
     info!("  repos dir: {}", config.repos_dir.display());
-    info!("  database:  PostgreSQL ({})", &config.database_url.split('@').last().unwrap_or("?"));
+    info!(
+        "  database:  PostgreSQL ({})",
+        &config.database_url.split('@').last().unwrap_or("?")
+    );
 
     // Publish our DID record to the Kademlia DHT shortly after startup
     if let Some(p2p) = &state.p2p {
@@ -180,20 +202,18 @@ async fn main() -> Result<()> {
         && !state.config.operator_private_key.is_empty()
     {
         match build_operator_client(&state.config, &state.node_did.to_string()) {
-            Ok(client) => {
-                match operator::startup_check(&client).await {
-                    Ok(_) => {
-                        let arc_client = Arc::new(client);
-                        arc_client.spawn_heartbeat_loop();
-                    }
-                    Err(e) => {
-                        if state.config.operator_strict_mode {
-                            return Err(e.context("strict-mode operator check failed"));
-                        }
-                        tracing::warn!(err = %e, "operator startup check failed — continuing without heartbeat loop");
-                    }
+            Ok(client) => match operator::startup_check(&client).await {
+                Ok(_) => {
+                    let arc_client = Arc::new(client);
+                    arc_client.spawn_heartbeat_loop();
                 }
-            }
+                Err(e) => {
+                    if state.config.operator_strict_mode {
+                        return Err(e.context("strict-mode operator check failed"));
+                    }
+                    tracing::warn!(err = %e, "operator startup check failed — continuing without heartbeat loop");
+                }
+            },
             Err(e) => {
                 if state.config.operator_strict_mode {
                     return Err(e.context("strict-mode: failed to build operator client"));
@@ -209,7 +229,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_operator_client(config: &config::Config, node_did: &str) -> Result<operator::OperatorClient> {
+fn build_operator_client(
+    config: &config::Config,
+    node_did: &str,
+) -> Result<operator::OperatorClient> {
     use alloy::primitives::Address;
     use std::str::FromStr;
 
@@ -260,7 +283,9 @@ async fn gossip_task(state: AppState, bootstrap_peers: Vec<String>) {
                     }
                 }
             }
-            Err(e) => tracing::warn!(url = %announce_url, err = %e, "failed to announce to bootstrap peer"),
+            Err(e) => {
+                tracing::warn!(url = %announce_url, err = %e, "failed to announce to bootstrap peer")
+            }
         }
     }
 
@@ -274,7 +299,10 @@ async fn gossip_task(state: AppState, bootstrap_peers: Vec<String>) {
         };
         for peer in peers {
             let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-            let ok = client.get(&url).send().await
+            let ok = client
+                .get(&url)
+                .send()
+                .await
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
             let _ = state.db.mark_peer_ping(&peer.did, ok).await;
@@ -288,13 +316,13 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
     if key_path.exists() {
         let pem = std::fs::read_to_string(&key_path)
             .with_context(|| format!("failed to read key from {}", key_path.display()))?;
-        let kp = Keypair::from_pem(&pem)
-            .map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
         info!(path = %key_path.display(), "loaded existing identity");
         Ok(kp)
     } else {
         let kp = Keypair::generate();
-        let pem = kp.to_pem()
+        let pem = kp
+            .to_pem()
             .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
 
         if let Some(parent) = key_path.parent() {

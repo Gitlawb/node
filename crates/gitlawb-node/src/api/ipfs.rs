@@ -50,7 +50,8 @@ pub async fn get_by_cid(
     // 2. Search all repos for an object with this SHA-256
     let repos = state
         .db
-        .list_all_repos().await
+        .list_all_repos()
+        .await
         .map_err(|e| AppError::Internal(e.into()))?;
 
     for repo in &repos {
@@ -99,12 +100,11 @@ pub async fn get_by_cid(
 /// Returns all CIDs that have been pinned to the local IPFS node from git
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
-pub async fn list_pins(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>> {
+pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let pins = state
         .db
-        .list_pinned_cids().await
+        .list_pinned_cids()
+        .await
         .map_err(|e| AppError::Internal(e.into()))?;
 
     Ok(Json(serde_json::json!({

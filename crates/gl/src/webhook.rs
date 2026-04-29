@@ -58,24 +58,40 @@ pub enum WebhookCmd {
 
 pub async fn run(args: WebhookArgs) -> Result<()> {
     match args.cmd {
-        WebhookCmd::Create { repo, url, events, secret, node, dir } =>
-            cmd_create(repo, url, events, secret, node, dir).await,
-        WebhookCmd::List { repo, node } =>
-            cmd_list(repo, node).await,
-        WebhookCmd::Delete { repo, id, node, dir } =>
-            cmd_delete(repo, id, node, dir).await,
+        WebhookCmd::Create {
+            repo,
+            url,
+            events,
+            secret,
+            node,
+            dir,
+        } => cmd_create(repo, url, events, secret, node, dir).await,
+        WebhookCmd::List { repo, node } => cmd_list(repo, node).await,
+        WebhookCmd::Delete {
+            repo,
+            id,
+            node,
+            dir,
+        } => cmd_delete(repo, id, node, dir).await,
     }
 }
 
 async fn resolve_owner(client: &NodeClient) -> Result<String> {
     let info: Value = client.get("/").await?.json().await?;
-    let did = info["did"].as_str().context("node missing DID")?.to_string();
+    let did = info["did"]
+        .as_str()
+        .context("node missing DID")?
+        .to_string();
     Ok(did.split(':').next_back().unwrap_or(&did).to_string())
 }
 
 async fn cmd_create(
-    repo: String, url: String, events: String, secret: Option<String>,
-    node: String, dir: Option<PathBuf>,
+    repo: String,
+    url: String,
+    events: String,
+    secret: Option<String>,
+    node: String,
+    dir: Option<PathBuf>,
 ) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let client = NodeClient::new(&node, Some(keypair));
@@ -89,7 +105,9 @@ async fn cmd_create(
         "events": event_list,
     }))?;
 
-    let resp = client.post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &payload).await
+    let resp = client
+        .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &payload)
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let hook: Value = resp.json().await.context("invalid JSON")?;
@@ -100,16 +118,27 @@ async fn cmd_create(
     }
 
     let id = hook["id"].as_str().unwrap_or("?");
-    let hook_events = hook["events"].as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+    let hook_events = hook["events"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
         .unwrap_or_else(|| events.clone());
-    let has_secret = hook["secret"].as_str().map(|s| !s.is_empty()).unwrap_or(false);
+    let has_secret = hook["secret"]
+        .as_str()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
 
     println!("✓ Webhook created");
     println!("  ID:     {id}");
     println!("  URL:    {url}");
     println!("  Events: {hook_events}");
-    if has_secret { println!("  Secret: set (HMAC-SHA256 signing enabled)"); }
+    if has_secret {
+        println!("  Secret: set (HMAC-SHA256 signing enabled)");
+    }
     println!("\n  Delete: gl webhook delete {repo} {id}");
     Ok(())
 }
@@ -118,8 +147,12 @@ async fn cmd_list(repo: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let owner = resolve_owner(&client).await?;
 
-    let resp: Value = client.get(&format!("/api/v1/repos/{owner}/{repo}/hooks")).await?
-        .json().await.context("invalid JSON")?;
+    let resp: Value = client
+        .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
 
     let hooks = resp["webhooks"].as_array().cloned().unwrap_or_default();
     if hooks.is_empty() {
@@ -131,8 +164,14 @@ async fn cmd_list(repo: String, node: String) -> Result<()> {
     for hook in &hooks {
         let id = hook["id"].as_str().unwrap_or("?");
         let url = hook["url"].as_str().unwrap_or("?");
-        let events = hook["events"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+        let events = hook["events"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         let active = hook["active"].as_bool().unwrap_or(true);
         let status = if active { "active" } else { "inactive" };
@@ -151,7 +190,11 @@ async fn cmd_delete(repo: String, id: String, node: String, dir: Option<PathBuf>
 
     let payload = serde_json::to_vec(&serde_json::json!({}))?;
     let resp = client
-        .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &payload).await
+        .delete(
+            &format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"),
+            &payload,
+        )
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let result: Value = resp.json().await.context("invalid JSON")?;
@@ -184,7 +227,11 @@ mod tests {
     fn tmp_identity() -> (tempfile::TempDir, gitlawb_core::identity::Keypair) {
         let dir = tempfile::TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
-        std::fs::write(dir.path().join("identity.pem"), kp.to_pem().unwrap().as_bytes()).unwrap();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
         (dir, kp)
     }
 
@@ -328,7 +375,10 @@ mod tests {
         let _root = mock_root(&mut server).await;
 
         let _m = server
-            .mock("DELETE", mockito::Matcher::Regex(r"/hooks/hook-1$".to_string()))
+            .mock(
+                "DELETE",
+                mockito::Matcher::Regex(r"/hooks/hook-1$".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"ok":true}"#)
@@ -352,7 +402,10 @@ mod tests {
         let _root = mock_root(&mut server).await;
 
         let _m = server
-            .mock("DELETE", mockito::Matcher::Regex(r"/hooks/nope$".to_string()))
+            .mock(
+                "DELETE",
+                mockito::Matcher::Regex(r"/hooks/nope$".to_string()),
+            )
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"webhook not found"}"#)

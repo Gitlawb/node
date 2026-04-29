@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
-use gitlawb_core::identity::Keypair;
 use gitlawb_core::did::DidDocument;
+use gitlawb_core::identity::Keypair;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -90,8 +90,12 @@ pub fn load_keypair_from_dir(dir: Option<&std::path::Path>) -> Result<Keypair> {
             .join(".gitlawb")
     };
     let path = key_path(&base);
-    let pem = fs::read_to_string(&path)
-        .with_context(|| format!("no identity found at {}\nRun `gl identity new` to create one", path.display()))?;
+    let pem = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no identity found at {}\nRun `gl identity new` to create one",
+            path.display()
+        )
+    })?;
     Keypair::from_pem(&pem).context("failed to load keypair from PEM")
 }
 
@@ -182,13 +186,21 @@ async fn cmd_backup(out: Option<PathBuf>, dir: Option<PathBuf>) -> Result<()> {
     let base = gitlawb_dir(dir)?;
     let src = key_path(&base);
 
-    let pem = fs::read_to_string(&src)
-        .with_context(|| format!("no identity found at {} — run `gl identity new` first", src.display()))?;
+    let pem = fs::read_to_string(&src).with_context(|| {
+        format!(
+            "no identity found at {} — run `gl identity new` first",
+            src.display()
+        )
+    })?;
 
     // Verify it loads before copying
     let keypair = Keypair::from_pem(&pem).context("identity.pem is corrupted")?;
 
-    let dest = out.unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("identity.pem.bak"));
+    let dest = out.unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join("identity.pem.bak")
+    });
 
     #[cfg(unix)]
     {
@@ -279,18 +291,24 @@ mod tests {
     #[tokio::test]
     async fn test_cmd_new_creates_pem() {
         let dir = TempDir::new().unwrap();
-        cmd_new(Some(dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         assert!(dir.path().join("identity.pem").exists());
     }
 
     #[tokio::test]
     async fn test_cmd_new_force_overwrites_on_confirm() {
         let dir = TempDir::new().unwrap();
-        cmd_new(Some(dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         let pem1 = std::fs::read_to_string(dir.path().join("identity.pem")).unwrap();
         // Simulate user typing "y" at the --force prompt
         let mut reader = std::io::Cursor::new(b"y\n");
-        cmd_new_with_reader(Some(dir.path().to_path_buf()), true, &mut reader).await.unwrap();
+        cmd_new_with_reader(Some(dir.path().to_path_buf()), true, &mut reader)
+            .await
+            .unwrap();
         let pem2 = std::fs::read_to_string(dir.path().join("identity.pem")).unwrap();
         assert_ne!(pem1, pem2);
     }
@@ -298,11 +316,15 @@ mod tests {
     #[tokio::test]
     async fn test_cmd_new_force_aborts_on_n() {
         let dir = TempDir::new().unwrap();
-        cmd_new(Some(dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         let pem1 = std::fs::read_to_string(dir.path().join("identity.pem")).unwrap();
         // Simulate user typing "n" — should abort even with --force
         let mut reader = std::io::Cursor::new(b"n\n");
-        cmd_new_with_reader(Some(dir.path().to_path_buf()), true, &mut reader).await.unwrap();
+        cmd_new_with_reader(Some(dir.path().to_path_buf()), true, &mut reader)
+            .await
+            .unwrap();
         let pem2 = std::fs::read_to_string(dir.path().join("identity.pem")).unwrap();
         assert_eq!(pem1, pem2);
     }
@@ -310,10 +332,14 @@ mod tests {
     #[tokio::test]
     async fn test_cmd_new_no_force_aborts_on_n() {
         let dir = TempDir::new().unwrap();
-        cmd_new(Some(dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         let pem1 = std::fs::read_to_string(dir.path().join("identity.pem")).unwrap();
         let mut reader = std::io::Cursor::new(b"n\n");
-        cmd_new_with_reader(Some(dir.path().to_path_buf()), false, &mut reader).await.unwrap();
+        cmd_new_with_reader(Some(dir.path().to_path_buf()), false, &mut reader)
+            .await
+            .unwrap();
         let pem2 = std::fs::read_to_string(dir.path().join("identity.pem")).unwrap();
         assert_eq!(pem1, pem2);
     }
@@ -321,22 +347,30 @@ mod tests {
     #[tokio::test]
     async fn test_cmd_show_succeeds() {
         let dir = TempDir::new().unwrap();
-        cmd_new(Some(dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         cmd_show(Some(dir.path().to_path_buf())).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_export_produces_did_document() {
         let dir = TempDir::new().unwrap();
-        cmd_new(Some(dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         cmd_export(Some(dir.path().to_path_buf())).await.unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_sign_succeeds() {
         let dir = TempDir::new().unwrap();
-        cmd_new(Some(dir.path().to_path_buf()), false).await.unwrap();
-        cmd_sign("hello gitlawb".to_string(), Some(dir.path().to_path_buf())).await.unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
+        cmd_sign("hello gitlawb".to_string(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -351,7 +385,9 @@ mod tests {
     #[tokio::test]
     async fn test_pem_roundtrip() {
         let dir = TempDir::new().unwrap();
-        cmd_new(Some(dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         // Loading the keypair back should succeed and produce a valid DID
         let kp = load_keypair_from_dir(Some(dir.path())).unwrap();
         let did = kp.did().to_string();
@@ -364,12 +400,21 @@ mod tests {
         let dst_dir = TempDir::new().unwrap();
 
         // Create an identity and back it up
-        cmd_new(Some(src_dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(src_dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         let backup_path = src_dir.path().join("identity.pem.bak");
-        cmd_backup(Some(backup_path.clone()), Some(src_dir.path().to_path_buf())).await.unwrap();
+        cmd_backup(
+            Some(backup_path.clone()),
+            Some(src_dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
 
         // Restore to a fresh directory
-        cmd_restore(backup_path, Some(dst_dir.path().to_path_buf()), false).await.unwrap();
+        cmd_restore(backup_path, Some(dst_dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
 
         // The restored DID should match the original
         let orig = load_keypair_from_dir(Some(src_dir.path())).unwrap();
@@ -403,15 +448,28 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        cmd_new(Some(src_dir.path().to_path_buf()), false).await.unwrap();
-        cmd_new(Some(dst_dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(src_dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
+        cmd_new(Some(dst_dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
 
         let backup = src_dir.path().join("identity.pem.bak");
-        cmd_backup(Some(backup.clone()), Some(src_dir.path().to_path_buf())).await.unwrap();
+        cmd_backup(Some(backup.clone()), Some(src_dir.path().to_path_buf()))
+            .await
+            .unwrap();
 
         // Simulate user typing "y" at the --force prompt
         let mut reader = std::io::Cursor::new(b"y\n");
-        cmd_restore_with_reader(backup, Some(dst_dir.path().to_path_buf()), true, &mut reader).await.unwrap();
+        cmd_restore_with_reader(
+            backup,
+            Some(dst_dir.path().to_path_buf()),
+            true,
+            &mut reader,
+        )
+        .await
+        .unwrap();
 
         let src_kp = load_keypair_from_dir(Some(src_dir.path())).unwrap();
         let dst_kp = load_keypair_from_dir(Some(dst_dir.path())).unwrap();
@@ -423,16 +481,29 @@ mod tests {
         let src_dir = TempDir::new().unwrap();
         let dst_dir = TempDir::new().unwrap();
 
-        cmd_new(Some(src_dir.path().to_path_buf()), false).await.unwrap();
-        cmd_new(Some(dst_dir.path().to_path_buf()), false).await.unwrap();
+        cmd_new(Some(src_dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
+        cmd_new(Some(dst_dir.path().to_path_buf()), false)
+            .await
+            .unwrap();
         let original_did = load_keypair_from_dir(Some(dst_dir.path())).unwrap().did();
 
         let backup = src_dir.path().join("identity.pem.bak");
-        cmd_backup(Some(backup.clone()), Some(src_dir.path().to_path_buf())).await.unwrap();
+        cmd_backup(Some(backup.clone()), Some(src_dir.path().to_path_buf()))
+            .await
+            .unwrap();
 
         // Simulate user typing "n" — should abort
         let mut reader = std::io::Cursor::new(b"n\n");
-        cmd_restore_with_reader(backup, Some(dst_dir.path().to_path_buf()), true, &mut reader).await.unwrap();
+        cmd_restore_with_reader(
+            backup,
+            Some(dst_dir.path().to_path_buf()),
+            true,
+            &mut reader,
+        )
+        .await
+        .unwrap();
 
         let dst_kp = load_keypair_from_dir(Some(dst_dir.path())).unwrap();
         assert_eq!(original_did, dst_kp.did());

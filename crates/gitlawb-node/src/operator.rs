@@ -129,9 +129,7 @@ impl OperatorClient {
             .rpc_url
             .parse()
             .with_context(|| format!("invalid RPC URL: {}", self.cfg.rpc_url))?;
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(rpc_url);
+        let provider = ProviderBuilder::new().wallet(wallet).connect_http(rpc_url);
         let contract = IGitlawbNodeStaking::new(self.cfg.contract_address, provider);
 
         let pending = contract

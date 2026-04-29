@@ -48,8 +48,7 @@ impl MutationRoot {
         assignee_did: String,
     ) -> Result<AgentTaskType> {
         let db = ctx.data_unchecked::<Arc<Db>>();
-        let tx = ctx
-            .data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
+        let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
         let task = db
             .claim_task(&id, &assignee_did)
             .await
@@ -72,8 +71,7 @@ impl MutationRoot {
         input: FinishTaskInput,
     ) -> Result<AgentTaskType> {
         let db = ctx.data_unchecked::<Arc<Db>>();
-        let tx = ctx
-            .data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
+        let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
         let task = db
             .finish_task(&id, "completed", input.result.as_deref())
             .await
@@ -96,8 +94,7 @@ impl MutationRoot {
         input: FinishTaskInput,
     ) -> Result<AgentTaskType> {
         let db = ctx.data_unchecked::<Arc<Db>>();
-        let tx = ctx
-            .data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
+        let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
         let reason = input.reason.unwrap_or_default();
         let task = db
             .finish_task(&id, "failed", Some(&reason))

@@ -122,20 +122,49 @@ pub enum RepoCmd {
 
 pub async fn run(args: RepoArgs) -> Result<()> {
     match args.cmd {
-        RepoCmd::Create { name, description, private, branch, node, dir } => {
-            cmd_create(name, description, !private, branch, node, dir).await
-        }
+        RepoCmd::Create {
+            name,
+            description,
+            private,
+            branch,
+            node,
+            dir,
+        } => cmd_create(name, description, !private, branch, node, dir).await,
         RepoCmd::List { node, dir } => cmd_list(node, dir).await,
         RepoCmd::Clone { name, node, dir } => cmd_clone(name, node, dir).await,
         RepoCmd::Info { repo, node, dir } => cmd_info(repo, node, dir).await,
-        RepoCmd::Commits { repo, branch, limit, node, dir } => {
-            cmd_commits(repo, branch, limit, node, dir).await
-        }
-        RepoCmd::Fork { repo, name, node, dir } => cmd_fork(repo, name, node, dir).await,
-        RepoCmd::LabelAdd { repo, label, node, dir } => cmd_label_add(repo, label, node, dir).await,
-        RepoCmd::LabelRemove { repo, label, node, dir } => cmd_label_remove(repo, label, node, dir).await,
+        RepoCmd::Commits {
+            repo,
+            branch,
+            limit,
+            node,
+            dir,
+        } => cmd_commits(repo, branch, limit, node, dir).await,
+        RepoCmd::Fork {
+            repo,
+            name,
+            node,
+            dir,
+        } => cmd_fork(repo, name, node, dir).await,
+        RepoCmd::LabelAdd {
+            repo,
+            label,
+            node,
+            dir,
+        } => cmd_label_add(repo, label, node, dir).await,
+        RepoCmd::LabelRemove {
+            repo,
+            label,
+            node,
+            dir,
+        } => cmd_label_remove(repo, label, node, dir).await,
         RepoCmd::LabelList { repo, node, dir } => cmd_label_list(repo, node, dir).await,
-        RepoCmd::Owner { repo, node, dir, json } => cmd_owner(repo, node, dir, json).await,
+        RepoCmd::Owner {
+            repo,
+            node,
+            dir,
+            json,
+        } => cmd_owner(repo, node, dir, json).await,
     }
 }
 
@@ -146,7 +175,11 @@ async fn resolve_owner_did(node: &str, dir: Option<&std::path::Path>) -> Result<
         return Ok(did.split(':').next_back().unwrap_or(&did).to_string());
     }
     let client = NodeClient::new(node, None);
-    let info: Value = client.get("/").await?.json().await
+    let info: Value = client
+        .get("/")
+        .await?
+        .json()
+        .await
         .context("failed to fetch node info")?;
     let did = info["did"].as_str().context("node missing DID")?;
     Ok(did.split(':').next_back().unwrap_or(did).to_string())
@@ -163,7 +196,11 @@ async fn cmd_create(
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     // Derive owner DID before keypair is moved into the client
     let owner_did = keypair.did().to_string();
-    let owner_short = owner_did.split(':').next_back().unwrap_or(&owner_did).to_string();
+    let owner_short = owner_did
+        .split(':')
+        .next_back()
+        .unwrap_or(&owner_did)
+        .to_string();
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&json!({
@@ -173,7 +210,9 @@ async fn cmd_create(
         "default_branch": default_branch,
     }))?;
 
-    let resp = client.post("/api/v1/repos", &body).await
+    let resp = client
+        .post("/api/v1/repos", &body)
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let payload: Value = resp.json().await.context("invalid JSON response")?;
@@ -201,7 +240,11 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
     let url = format!("/api/v1/repos?owner={owner}");
-    let repos: Value = client.get(&url).await?.json().await
+    let repos: Value = client
+        .get(&url)
+        .await?
+        .json()
+        .await
         .context("failed to list repos")?;
     let repos = repos.as_array().context("expected array")?;
 
@@ -229,7 +272,10 @@ async fn cmd_clone(name: String, node: String, dir: Option<PathBuf>) -> Result<(
     } else {
         let client = NodeClient::new(&node, None);
         let info: Value = client.get("/").await?.json().await?;
-        info["did"].as_str().context("node missing DID")?.to_string()
+        info["did"]
+            .as_str()
+            .context("node missing DID")?
+            .to_string()
     };
     let url = format!("gitlawb://{did}/{name}");
     println!("  cloning {url}");
@@ -256,8 +302,10 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     };
 
     let r: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{name}")).await?
-        .json().await
+        .get(&format!("/api/v1/repos/{owner}/{name}"))
+        .await?
+        .json()
+        .await
         .context("repo not found")?;
 
     let owner_did = r["owner_did"].as_str().unwrap_or(&owner);
@@ -268,7 +316,10 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     println!("  ID:         {}", r["id"].as_str().unwrap_or("?"));
     println!("  Owner DID:  {owner_did}");
     println!("  Public:     {}", r["is_public"].as_bool().unwrap_or(true));
-    println!("  Branch:     {}", r["default_branch"].as_str().unwrap_or("main"));
+    println!(
+        "  Branch:     {}",
+        r["default_branch"].as_str().unwrap_or("main")
+    );
     println!("  Clone:      git clone {gitlawb_url}");
     println!("  HTTP URL:   {http_url}");
     println!("  Updated:    {}", r["updated_at"].as_str().unwrap_or("?"));
@@ -296,7 +347,11 @@ pub(crate) async fn cmd_commits(
     };
 
     let url = format!("/api/v1/repos/{owner}/{name}/commits?branch={branch}&limit={limit}");
-    let resp: Value = client.get(&url).await?.json().await
+    let resp: Value = client
+        .get(&url)
+        .await?
+        .json()
+        .await
         .context("failed to fetch commits")?;
 
     let commits = resp["commits"].as_array().cloned().unwrap_or_default();
@@ -308,17 +363,20 @@ pub(crate) async fn cmd_commits(
     println!("Commits on {branch} ({owner}/{name})");
     println!();
     for c in &commits {
-        let sha = c["hash"].as_str()
+        let sha = c["hash"]
+            .as_str()
             .or_else(|| c["sha"].as_str())
             .or_else(|| c["oid"].as_str())
             .unwrap_or("?");
         let short_sha = &sha[..sha.len().min(10)];
         let msg = c["message"].as_str().unwrap_or("(no message)");
         let first_line = msg.lines().next().unwrap_or(msg);
-        let author = c["author_name"].as_str()
+        let author = c["author_name"]
+            .as_str()
             .or_else(|| c["author"].as_str())
             .unwrap_or("?");
-        let date = c["date"].as_str()
+        let date = c["date"]
+            .as_str()
             .or_else(|| c["committer_date"].as_str())
             .map(|s| &s[..10.min(s.len())])
             .unwrap_or("?");
@@ -327,7 +385,12 @@ pub(crate) async fn cmd_commits(
     Ok(())
 }
 
-async fn cmd_fork(repo: String, name: Option<String>, node: String, dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_fork(
+    repo: String,
+    name: Option<String>,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let client = NodeClient::new(&node, Some(keypair));
 
@@ -338,7 +401,9 @@ async fn cmd_fork(repo: String, name: Option<String>, node: String, dir: Option<
     };
 
     let body = serde_json::to_vec(&serde_json::json!({ "name": name }))?;
-    let resp = client.post(&format!("/api/v1/repos/{owner}/{repo_name}/fork"), &body).await
+    let resp = client
+        .post(&format!("/api/v1/repos/{owner}/{repo_name}/fork"), &body)
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let result: Value = resp.json().await.context("invalid JSON response")?;
@@ -356,7 +421,11 @@ async fn cmd_fork(repo: String, name: Option<String>, node: String, dir: Option<
 }
 
 /// Returns (owner, repo_name) — if repo contains '/', splits on it; otherwise uses caller's DID.
-async fn resolve_owner_repo_pair(repo: &str, node: &str, dir: Option<&std::path::Path>) -> Result<(String, String)> {
+async fn resolve_owner_repo_pair(
+    repo: &str,
+    node: &str,
+    dir: Option<&std::path::Path>,
+) -> Result<(String, String)> {
     if let Some((o, r)) = repo.split_once('/') {
         Ok((o.to_string(), r.to_string()))
     } else {
@@ -365,13 +434,20 @@ async fn resolve_owner_repo_pair(repo: &str, node: &str, dir: Option<&std::path:
     }
 }
 
-async fn cmd_label_add(repo: String, label: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_label_add(
+    repo: String,
+    label: String,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&serde_json::json!({ "label": label }))?;
-    let resp = client.post(&format!("/api/v1/repos/{owner}/{name}/labels"), &body).await
+    let resp = client
+        .post(&format!("/api/v1/repos/{owner}/{name}/labels"), &body)
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let result: Value = resp.json().await.context("invalid JSON")?;
@@ -390,12 +466,19 @@ async fn cmd_label_add(repo: String, label: String, node: String, dir: Option<Pa
     Ok(())
 }
 
-async fn cmd_label_remove(repo: String, label: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+async fn cmd_label_remove(
+    repo: String,
+    label: String,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, Some(keypair));
 
-    let resp = client.delete(&format!("/api/v1/repos/{owner}/{name}/labels/{label}"), &[]).await
+    let resp = client
+        .delete(&format!("/api/v1/repos/{owner}/{name}/labels/{label}"), &[])
+        .await
         .context("failed to connect to node")?;
     let status = resp.status();
     let result: Value = resp.json().await.context("invalid JSON")?;
@@ -413,8 +496,12 @@ async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Res
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
     let client = NodeClient::new(&node, None);
 
-    let resp: Value = client.get(&format!("/api/v1/repos/{owner}/{name}/labels")).await?
-        .json().await.context("invalid JSON")?;
+    let resp: Value = client
+        .get(&format!("/api/v1/repos/{owner}/{name}/labels"))
+        .await?
+        .json()
+        .await
+        .context("invalid JSON")?;
 
     let labels = resp["labels"].as_array().cloned().unwrap_or_default();
     if labels.is_empty() {
@@ -445,10 +532,7 @@ async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: b
         anyhow::bail!("repo not found: {owner}/{name}");
     }
     let info: Value = resp.json().await.context("invalid JSON")?;
-    let owner_did = info["owner_did"]
-        .as_str()
-        .unwrap_or(&owner)
-        .to_string();
+    let owner_did = info["owner_did"].as_str().unwrap_or(&owner).to_string();
     let owner_short = owner_did
         .split(':')
         .next_back()
@@ -522,7 +606,9 @@ mod tests {
     async fn test_resolve_owner_did_uses_keypair() {
         let dir = TempDir::new().unwrap();
         write_identity(&dir);
-        let owner = resolve_owner_did("http://unused", Some(dir.path())).await.unwrap();
+        let owner = resolve_owner_did("http://unused", Some(dir.path()))
+            .await
+            .unwrap();
         // Should be the key segment of a did:key DID — starts with 'z'
         assert!(owner.starts_with('z'));
         assert!(!owner.contains(':'));
@@ -589,14 +675,19 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"^/api/v1/repos\?owner=".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos\?owner=".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"[]"#)
             .create_async()
             .await;
 
-        cmd_list(server.url(), Some(dir.path().to_path_buf())).await.unwrap();
+        cmd_list(server.url(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -613,7 +704,9 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list(server.url(), Some(dir.path().to_path_buf())).await.unwrap();
+        cmd_list(server.url(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -623,14 +716,21 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("GET", mockito::Matcher::Regex(r"^/api/v1/repos\?owner=z".to_string()))
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos\?owner=z".to_string()),
+            )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"[{"name":"myrepo","is_public":true,"updated_at":"2026-03-20T00:00:00Z"}]"#)
+            .with_body(
+                r#"[{"name":"myrepo","is_public":true,"updated_at":"2026-03-20T00:00:00Z"}]"#,
+            )
             .create_async()
             .await;
 
-        cmd_list(server.url(), Some(dir.path().to_path_buf())).await.unwrap();
+        cmd_list(server.url(), Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         _m.assert_async().await;
     }
 
@@ -703,7 +803,9 @@ mod tests {
             )
             .with_status(201)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"id":"fork-1","name":"myrepo","owner_did":"did:key:z6MkMe","is_public":true}"#)
+            .with_body(
+                r#"{"id":"fork-1","name":"myrepo","owner_did":"did:key:z6MkMe","is_public":true}"#,
+            )
             .create_async()
             .await;
 
@@ -742,7 +844,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("already have a repo"), "got: {err}");
+        assert!(
+            err.to_string().contains("already have a repo"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -797,7 +902,9 @@ mod tests {
         let _m = server
             .mock(
                 "DELETE",
-                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels/language:rust$".to_string()),
+                mockito::Matcher::Regex(
+                    r"^/api/v1/repos/[^/]+/myrepo/labels/language:rust$".to_string(),
+                ),
             )
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -832,9 +939,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_label_list("myrepo".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_label_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -854,9 +965,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_label_list("myrepo".to_string(), server.url(), Some(dir.path().to_path_buf()))
-            .await
-            .unwrap();
+        cmd_label_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -876,7 +991,9 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(format!(r#"{{"name":"myrepo","owner_did":"{did}","is_public":true}}"#))
+            .with_body(format!(
+                r#"{{"name":"myrepo","owner_did":"{did}","is_public":true}}"#
+            ))
             .create_async()
             .await;
         let _prot = server
@@ -915,7 +1032,9 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"name":"myrepo","owner_did":"did:key:z6MkSomeOtherOwner","is_public":true}"#)
+            .with_body(
+                r#"{"name":"myrepo","owner_did":"did:key:z6MkSomeOtherOwner","is_public":true}"#,
+            )
             .create_async()
             .await;
         let _prot = server
@@ -954,7 +1073,9 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"name":"myrepo","owner_did":"did:key:z6MkSomeOtherOwner","is_public":true}"#)
+            .with_body(
+                r#"{"name":"myrepo","owner_did":"did:key:z6MkSomeOtherOwner","is_public":true}"#,
+            )
             .create_async()
             .await;
         let _prot = server

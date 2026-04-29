@@ -67,10 +67,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     }
 
     // Save bootstrap UCAN
-    let ucan = payload
-        .get("ucan")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let ucan = payload.get("ucan").and_then(|v| v.as_str()).unwrap_or("");
 
     if !ucan.is_empty() {
         let ucan_path = ucan_path(args.dir.as_deref())?;
@@ -84,7 +81,10 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
         tracing::debug!("saved UCAN to {}", ucan_path.display());
     }
 
-    let trust = payload.get("trust_score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let trust = payload
+        .get("trust_score")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     let expires = payload
         .get("expires")
         .and_then(|v| v.as_str())
@@ -183,7 +183,10 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid signature"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid signature"));
     }
 
     #[tokio::test]

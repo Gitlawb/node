@@ -89,7 +89,11 @@ pub async fn cmd_register(
     let staking = GitlawbNodeStaking::new(contract_addr, provider);
 
     // 1. Check balance
-    let bal = token_c.balanceOf(operator_addr).call().await.context("balanceOf failed")?;
+    let bal = token_c
+        .balanceOf(operator_addr)
+        .call()
+        .await
+        .context("balanceOf failed")?;
     if bal < stake_wei {
         anyhow::bail!(
             "insufficient $GITLAWB balance: have {}, need {}",
@@ -111,8 +115,14 @@ pub async fn cmd_register(
             .send()
             .await
             .context("approve failed")?;
-        let approve_receipt = approve_tx.get_receipt().await.context("approve receipt failed")?;
-        println!("  approved: {}", explorer_tx_url(&rpc_url, &format!("{:?}", approve_receipt.transaction_hash)));
+        let approve_receipt = approve_tx
+            .get_receipt()
+            .await
+            .context("approve receipt failed")?;
+        println!(
+            "  approved: {}",
+            explorer_tx_url(&rpc_url, &format!("{:?}", approve_receipt.transaction_hash))
+        );
     }
 
     // 3. Register
@@ -122,11 +132,17 @@ pub async fn cmd_register(
         .send()
         .await
         .context("registerNode failed")?;
-    let receipt = register_tx.get_receipt().await.context("registerNode receipt failed")?;
+    let receipt = register_tx
+        .get_receipt()
+        .await
+        .context("registerNode receipt failed")?;
 
     println!();
     println!("✓ Node registered");
-    println!("  Tx: {}", explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash)));
+    println!(
+        "  Tx: {}",
+        explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash))
+    );
     println!("  Operator wallet: {operator_addr}");
     println!();
     println!("Next: set these env vars on the node:");
@@ -154,9 +170,16 @@ pub async fn cmd_heartbeat(
     let staking = GitlawbNodeStaking::new(contract_addr, provider);
 
     println!("Posting heartbeat for {did}...");
-    let tx = staking.heartbeat(did_hash).send().await.context("heartbeat failed")?;
+    let tx = staking
+        .heartbeat(did_hash)
+        .send()
+        .await
+        .context("heartbeat failed")?;
     let receipt = tx.get_receipt().await.context("heartbeat receipt failed")?;
-    println!("✓ heartbeat sent: {}", explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash)));
+    println!(
+        "✓ heartbeat sent: {}",
+        explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash))
+    );
     Ok(())
 }
 
@@ -173,7 +196,11 @@ pub async fn cmd_onchain_status(
     let provider = ProviderBuilder::new().connect_http(url);
     let staking = GitlawbNodeStaking::new(contract_addr, provider);
 
-    let info = staking.getNodeInfo(did_hash).call().await.context("getNodeInfo failed")?;
+    let info = staking
+        .getNodeInfo(did_hash)
+        .call()
+        .await
+        .context("getNodeInfo failed")?;
 
     println!("On-chain status for {did}");
     println!();
@@ -190,9 +217,15 @@ pub async fn cmd_onchain_status(
     println!("  Registered:       {} (unix)", info.registeredAt);
     println!("  Active flag:      {}", info.active);
     println!("  Currently active: {}", info.currentlyActive);
-    println!("  Pending rewards:  {} $GITLAWB", wei_to_tokens(info.pendingRewards));
+    println!(
+        "  Pending rewards:  {} $GITLAWB",
+        wei_to_tokens(info.pendingRewards)
+    );
     if info.unstakeRequestAt > U256::ZERO {
-        println!("  Unstake pending:  yes (requested at unix {})", info.unstakeRequestAt);
+        println!(
+            "  Unstake pending:  yes (requested at unix {})",
+            info.unstakeRequestAt
+        );
     }
 
     Ok(())
@@ -215,9 +248,16 @@ pub async fn cmd_claim(
     let staking = GitlawbNodeStaking::new(contract_addr, provider);
 
     println!("Claiming rewards for {did}...");
-    let tx = staking.claimRewards(did_hash).send().await.context("claimRewards failed")?;
+    let tx = staking
+        .claimRewards(did_hash)
+        .send()
+        .await
+        .context("claimRewards failed")?;
     let receipt = tx.get_receipt().await.context("claim receipt failed")?;
-    println!("✓ rewards claimed: {}", explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash)));
+    println!(
+        "✓ rewards claimed: {}",
+        explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash))
+    );
     Ok(())
 }
 
@@ -238,9 +278,19 @@ pub async fn cmd_unstake_request(
     let staking = GitlawbNodeStaking::new(contract_addr, provider);
 
     println!("Requesting unstake (starts 7-day cooldown)...");
-    let tx = staking.requestUnstake(did_hash).send().await.context("requestUnstake failed")?;
-    let receipt = tx.get_receipt().await.context("requestUnstake receipt failed")?;
-    println!("✓ unstake requested: {}", explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash)));
+    let tx = staking
+        .requestUnstake(did_hash)
+        .send()
+        .await
+        .context("requestUnstake failed")?;
+    let receipt = tx
+        .get_receipt()
+        .await
+        .context("requestUnstake receipt failed")?;
+    println!(
+        "✓ unstake requested: {}",
+        explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash))
+    );
     println!("  Run `gl node unstake` after 7 days to complete withdrawal.");
     Ok(())
 }
@@ -262,9 +312,16 @@ pub async fn cmd_unstake(
     let staking = GitlawbNodeStaking::new(contract_addr, provider);
 
     println!("Completing unstake...");
-    let tx = staking.unstake(did_hash).send().await.context("unstake failed")?;
+    let tx = staking
+        .unstake(did_hash)
+        .send()
+        .await
+        .context("unstake failed")?;
     let receipt = tx.get_receipt().await.context("unstake receipt failed")?;
-    println!("✓ unstaked: {}", explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash)));
+    println!(
+        "✓ unstaked: {}",
+        explorer_tx_url(&rpc_url, &format!("{:?}", receipt.transaction_hash))
+    );
     Ok(())
 }
 
@@ -272,13 +329,19 @@ pub async fn cmd_unstake(
 
 fn load_did(dir: Option<PathBuf>) -> Result<String> {
     let base = dir.unwrap_or_else(|| {
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".gitlawb")
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".gitlawb")
     });
     let path = base.join("identity.pem");
-    let pem = std::fs::read_to_string(&path)
-        .with_context(|| format!("No identity at {} — run `gl identity new` first", path.display()))?;
-    let kp = gitlawb_core::identity::Keypair::from_pem(&pem)
-        .context("failed to parse identity PEM")?;
+    let pem = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "No identity at {} — run `gl identity new` first",
+            path.display()
+        )
+    })?;
+    let kp =
+        gitlawb_core::identity::Keypair::from_pem(&pem).context("failed to parse identity PEM")?;
     Ok(kp.did().to_string())
 }
 

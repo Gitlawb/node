@@ -11,7 +11,7 @@
 use cid::CidGeneric;
 use multihash_codetable::{Code, MultihashDigest};
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::fmt;
 
 use crate::{Error, Result};
@@ -87,9 +87,9 @@ pub fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
 
 /// Parse a 64-character hex SHA-256 string into raw bytes.
 pub fn sha256_hex_to_bytes(hex_str: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| Error::InvalidCid(format!("invalid hex: {e}")))?;
-    bytes.try_into()
+    let bytes = hex::decode(hex_str).map_err(|e| Error::InvalidCid(format!("invalid hex: {e}")))?;
+    bytes
+        .try_into()
         .map_err(|_| Error::InvalidCid("sha256 hash must be 32 bytes (64 hex chars)".to_string()))
 }
 
@@ -110,7 +110,10 @@ mod tests {
         // CIDv1 base32 strings start with 'b'
         let data = b"blob 13\0hello gitlawb";
         let c = Cid::from_git_object_bytes(data);
-        assert!(c.to_string().starts_with('b'), "CIDv1 should be base32 (starts with 'b')");
+        assert!(
+            c.to_string().starts_with('b'),
+            "CIDv1 should be base32 (starts with 'b')"
+        );
     }
 
     #[test]

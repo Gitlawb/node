@@ -48,13 +48,16 @@ pub async fn list_agents(
     Query(params): Query<AgentListQuery>,
 ) -> Result<Json<serde_json::Value>> {
     let agents = state.db.list_agents(params.capability.as_deref()).await?;
-    let list: Vec<AgentResponse> = agents.into_iter().map(|a| AgentResponse {
-        did: a.did,
-        trust_score: a.trust_score,
-        capabilities: a.capabilities,
-        registered_at: a.registered_at,
-        last_seen: a.last_seen,
-    }).collect();
+    let list: Vec<AgentResponse> = agents
+        .into_iter()
+        .map(|a| AgentResponse {
+            did: a.did,
+            trust_score: a.trust_score,
+            capabilities: a.capabilities,
+            registered_at: a.registered_at,
+            last_seen: a.last_seen,
+        })
+        .collect();
     Ok(Json(serde_json::json!({ "agents": list })))
 }
 
@@ -63,15 +66,21 @@ pub async fn show_agent(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<(StatusCode, Json<AgentResponse>)> {
-    let agent = state.db.get_agent(&did).await?
+    let agent = state
+        .db
+        .get_agent(&did)
+        .await?
         .ok_or_else(|| AppError::NotFound(format!("agent {did} not found")))?;
-    Ok((StatusCode::OK, Json(AgentResponse {
-        did: agent.did,
-        trust_score: agent.trust_score,
-        capabilities: agent.capabilities,
-        registered_at: agent.registered_at,
-        last_seen: agent.last_seen,
-    })))
+    Ok((
+        StatusCode::OK,
+        Json(AgentResponse {
+            did: agent.did,
+            trust_score: agent.trust_score,
+            capabilities: agent.capabilities,
+            registered_at: agent.registered_at,
+            last_seen: agent.last_seen,
+        }),
+    ))
 }
 
 /// GET /api/v1/agents/{did}/trust

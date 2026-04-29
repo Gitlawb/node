@@ -20,7 +20,6 @@
 use anyhow::Result;
 use serde_json::json;
 
-
 /// Data describing a ref-update event to be anchored.
 #[derive(Debug, Clone)]
 pub struct RefAnchor {
@@ -178,14 +177,20 @@ mod tests {
 
         let result = anchor_ref_update(&client, &server.url(), &anchor).await;
         assert!(result.is_ok(), "anchor should succeed: {result:?}");
-        assert_eq!(result.unwrap(), "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk");
+        assert_eq!(
+            result.unwrap(),
+            "7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"
+        );
         _mock.assert_async().await;
     }
 
     #[test]
     fn test_arweave_url() {
         let url = arweave_url("7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk");
-        assert_eq!(url, "https://arweave.net/7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk");
+        assert_eq!(
+            url,
+            "https://arweave.net/7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"
+        );
     }
 
     #[test]

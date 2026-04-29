@@ -17,19 +17,28 @@ impl NodeClient {
             .user_agent("gl/0.2.0 gitlawb-cli")
             .build()
             .expect("failed to build HTTP client");
-        Self { inner, node_url: node_url.into(), keypair }
+        Self {
+            inner,
+            node_url: node_url.into(),
+            keypair,
+        }
     }
 
     /// GET request — no auth (public read endpoints).
     pub async fn get(&self, path: &str) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
-        self.inner.get(&url).send().await.with_context(|| format!("GET {url}"))
+        self.inner
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("GET {url}"))
     }
 
     /// POST with JSON body + RFC 9421 HTTP Signature auth.
     pub async fn post(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
-        let mut req = self.inner
+        let mut req = self
+            .inner
             .post(&url)
             .header("Content-Type", "application/json")
             .body(body.to_vec());
@@ -48,7 +57,8 @@ impl NodeClient {
     /// PUT with RFC 9421 HTTP Signature auth (idempotent write).
     pub async fn put(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
-        let mut req = self.inner
+        let mut req = self
+            .inner
             .put(&url)
             .header("Content-Type", "application/json")
             .body(body.to_vec());
@@ -67,7 +77,8 @@ impl NodeClient {
     /// DELETE with RFC 9421 HTTP Signature auth.
     pub async fn delete(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
-        let mut req = self.inner
+        let mut req = self
+            .inner
             .delete(&url)
             .header("Content-Type", "application/json")
             .body(body.to_vec());

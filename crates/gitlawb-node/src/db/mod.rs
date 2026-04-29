@@ -465,7 +465,13 @@ impl Db {
 
     /// Register a mirrored repo from a peer in the local DB so git smart HTTP can serve it.
     /// Uses INSERT OR IGNORE (SQLite) / ON CONFLICT DO NOTHING (Postgres) so it's idempotent.
-    pub async fn upsert_mirror_repo(&self, owner_short: &str, name: &str, disk_path: &str, machine_id: Option<&str>) -> Result<()> {
+    pub async fn upsert_mirror_repo(
+        &self,
+        owner_short: &str,
+        name: &str,
+        disk_path: &str,
+        machine_id: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
         sqlx::query(
@@ -560,12 +566,10 @@ impl Db {
     }
 
     pub async fn get_trust_score(&self, agent_did: &str) -> Result<f64> {
-        let row = sqlx::query(
-            "SELECT trust_score FROM agents WHERE did = $1",
-        )
-        .bind(agent_did)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT trust_score FROM agents WHERE did = $1")
+            .bind(agent_did)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|r| r.get::<f64, _>("trust_score")).unwrap_or(0.0))
     }
@@ -608,12 +612,10 @@ impl Db {
     }
 
     pub async fn get_push_count(&self, agent_did: &str) -> Result<i64> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) as cnt FROM push_events WHERE agent_did = $1",
-        )
-        .bind(agent_did)
-        .fetch_one(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT COUNT(*) as cnt FROM push_events WHERE agent_did = $1")
+            .bind(agent_did)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.get::<i64, _>("cnt"))
     }
 
@@ -631,13 +633,17 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut agents: Vec<AgentRow> = rows.iter().map(|r| AgentRow {
-            did: r.get("did"),
-            trust_score: r.get("trust_score"),
-            capabilities: serde_json::from_str(r.get::<&str, _>("capabilities")).unwrap_or_default(),
-            registered_at: r.get("registered_at"),
-            last_seen: r.get("last_seen"),
-        }).collect();
+        let mut agents: Vec<AgentRow> = rows
+            .iter()
+            .map(|r| AgentRow {
+                did: r.get("did"),
+                trust_score: r.get("trust_score"),
+                capabilities: serde_json::from_str(r.get::<&str, _>("capabilities"))
+                    .unwrap_or_default(),
+                registered_at: r.get("registered_at"),
+                last_seen: r.get("last_seen"),
+            })
+            .collect();
 
         if let Some(cap) = capability {
             agents.retain(|a| a.capabilities.iter().any(|c| c == cap));
@@ -657,7 +663,8 @@ impl Db {
         Ok(row.map(|r| AgentRow {
             did: r.get("did"),
             trust_score: r.get("trust_score"),
-            capabilities: serde_json::from_str(r.get::<&str, _>("capabilities")).unwrap_or_default(),
+            capabilities: serde_json::from_str(r.get::<&str, _>("capabilities"))
+                .unwrap_or_default(),
             registered_at: r.get("registered_at"),
             last_seen: r.get("last_seen"),
         }))
@@ -718,14 +725,17 @@ impl Db {
         .bind(repo)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| BranchCid {
-            repo: r.get("repo"),
-            ref_name: r.get("ref_name"),
-            sha: r.get("sha"),
-            cid: r.get("cid"),
-            node_did: r.get("node_did"),
-            updated_at: r.get("updated_at"),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| BranchCid {
+                repo: r.get("repo"),
+                ref_name: r.get("ref_name"),
+                sha: r.get("sha"),
+                cid: r.get("cid"),
+                node_did: r.get("node_did"),
+                updated_at: r.get("updated_at"),
+            })
+            .collect())
     }
 }
 
@@ -778,37 +788,36 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| SyncQueueItem {
-            id: r.get("id"),
-            repo: r.get("repo"),
-            node_did: r.get("node_did"),
-            ref_name: r.get("ref_name"),
-            new_sha: r.get("new_sha"),
-            cid: r.get("cid"),
-            status: r.get("status"),
-            enqueued_at: r.get("enqueued_at"),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| SyncQueueItem {
+                id: r.get("id"),
+                repo: r.get("repo"),
+                node_did: r.get("node_did"),
+                ref_name: r.get("ref_name"),
+                new_sha: r.get("new_sha"),
+                cid: r.get("cid"),
+                status: r.get("status"),
+                enqueued_at: r.get("enqueued_at"),
+            })
+            .collect())
     }
 
     pub async fn mark_sync_done(&self, id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE sync_queue SET status = 'done', processed_at = $1 WHERE id = $2",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE sync_queue SET status = 'done', processed_at = $1 WHERE id = $2")
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     pub async fn mark_sync_failed(&self, id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE sync_queue SET status = 'failed', processed_at = $1 WHERE id = $2",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE sync_queue SET status = 'failed', processed_at = $1 WHERE id = $2")
+            .bind(Utc::now().to_rfc3339())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 }
@@ -890,13 +899,11 @@ impl Db {
 
     pub async fn close_pr(&self, pr_id: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "UPDATE pull_requests SET status='closed', updated_at=$1 WHERE id=$2",
-        )
-        .bind(&now)
-        .bind(pr_id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE pull_requests SET status='closed', updated_at=$1 WHERE id=$2")
+            .bind(&now)
+            .bind(pr_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1015,13 +1022,15 @@ impl Db {
     }
 
     pub async fn list_labels(&self, repo_id: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT label FROM repo_labels WHERE repo_id = $1 ORDER BY label ASC",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.iter().map(|r| r.try_get::<String, _>("label").unwrap_or_default()).collect())
+        let rows =
+            sqlx::query("SELECT label FROM repo_labels WHERE repo_id = $1 ORDER BY label ASC")
+                .bind(repo_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .iter()
+            .map(|r| r.try_get::<String, _>("label").unwrap_or_default())
+            .collect())
     }
 
     pub async fn list_pr_reviews(&self, pr_id: &str) -> Result<Vec<PrReview>> {
@@ -1098,7 +1107,11 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn list_webhooks_for_event(&self, repo_id: &str, event: &str) -> Result<Vec<Webhook>> {
+    pub async fn list_webhooks_for_event(
+        &self,
+        repo_id: &str,
+        event: &str,
+    ) -> Result<Vec<Webhook>> {
         let all = self.list_webhooks(repo_id).await?;
         Ok(all
             .into_iter()
@@ -1172,14 +1185,12 @@ impl Db {
     }
 
     pub async fn mark_peer_ping(&self, did: &str, ok: bool) -> Result<()> {
-        sqlx::query(
-            "UPDATE peers SET last_seen = $1, last_ping_ok = $2 WHERE did = $3",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(ok)
-        .bind(did)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE peers SET last_seen = $1, last_ping_ok = $2 WHERE did = $3")
+            .bind(Utc::now().to_rfc3339())
+            .bind(ok)
+            .bind(did)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1207,12 +1218,10 @@ impl Db {
 
 impl Db {
     pub async fn is_pinned(&self, sha256_hex: &str) -> Result<bool> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) as cnt FROM pinned_cids WHERE sha256_hex = $1",
-        )
-        .bind(sha256_hex)
-        .fetch_one(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT COUNT(*) as cnt FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
@@ -1316,7 +1325,11 @@ impl Db {
         Ok(rows.into_iter().map(row_to_ref_update).collect())
     }
 
-    pub async fn list_repo_ref_updates(&self, repo: &str, limit: i64) -> Result<Vec<ReceivedRefUpdate>> {
+    pub async fn list_repo_ref_updates(
+        &self,
+        repo: &str,
+        limit: i64,
+    ) -> Result<Vec<ReceivedRefUpdate>> {
         let rows = sqlx::query(
             "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
                     cert_id, received_at, from_peer
@@ -1330,7 +1343,11 @@ impl Db {
     }
 
     /// Filtered ref updates — optionally scoped to a specific repo.
-    pub async fn list_ref_updates_filtered(&self, repo: Option<&str>, limit: i64) -> Result<Vec<ReceivedRefUpdate>> {
+    pub async fn list_ref_updates_filtered(
+        &self,
+        repo: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ReceivedRefUpdate>> {
         let rows = if let Some(r) = repo {
             sqlx::query(
                 "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
@@ -1392,7 +1409,12 @@ impl Db {
         Ok(row.map(row_to_task))
     }
 
-    pub async fn list_tasks(&self, status: Option<&str>, assignee_did: Option<&str>, limit: i64) -> Result<Vec<AgentTask>> {
+    pub async fn list_tasks(
+        &self,
+        status: Option<&str>,
+        assignee_did: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AgentTask>> {
         let rows = match (status, assignee_did) {
             (Some(s), Some(a)) => sqlx::query(
                 "SELECT id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline
@@ -1446,7 +1468,12 @@ impl Db {
             .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))
     }
 
-    pub async fn finish_task(&self, id: &str, new_status: &str, result: Option<&str>) -> Result<AgentTask> {
+    pub async fn finish_task(
+        &self,
+        id: &str,
+        new_status: &str,
+        result: Option<&str>,
+    ) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
@@ -1516,7 +1543,11 @@ impl Db {
         Ok(())
     }
 
-    pub async fn list_arweave_anchors(&self, repo: Option<&str>, limit: i64) -> Result<Vec<ArweaveAnchor>> {
+    pub async fn list_arweave_anchors(
+        &self,
+        repo: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ArweaveAnchor>> {
         let rows = if let Some(repo) = repo {
             sqlx::query(
                 "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
@@ -1536,19 +1567,22 @@ impl Db {
             .await?
         };
 
-        Ok(rows.into_iter().map(|r| ArweaveAnchor {
-            id: r.get("id"),
-            repo: r.get("repo"),
-            owner_did: r.get("owner_did"),
-            ref_name: r.get("ref_name"),
-            old_sha: r.get("old_sha"),
-            new_sha: r.get("new_sha"),
-            cid: r.get("cid"),
-            irys_tx_id: r.get("irys_tx_id"),
-            arweave_url: r.get("arweave_url"),
-            node_did: r.get("node_did"),
-            anchored_at: r.get("anchored_at"),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| ArweaveAnchor {
+                id: r.get("id"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
+                ref_name: r.get("ref_name"),
+                old_sha: r.get("old_sha"),
+                new_sha: r.get("new_sha"),
+                cid: r.get("cid"),
+                irys_tx_id: r.get("irys_tx_id"),
+                arweave_url: r.get("arweave_url"),
+                node_did: r.get("node_did"),
+                anchored_at: r.get("anchored_at"),
+            })
+            .collect())
     }
 }
 
@@ -1564,8 +1598,12 @@ fn row_to_repo(r: sqlx::postgres::PgRow) -> RepoRecord {
         description: r.get("description"),
         is_public: r.get::<bool, _>("is_public"),
         default_branch: r.get("default_branch"),
-        created_at: created_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
-        updated_at: updated_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+        created_at: created_str
+            .parse::<DateTime<Utc>>()
+            .unwrap_or_else(|_| Utc::now()),
+        updated_at: updated_str
+            .parse::<DateTime<Utc>>()
+            .unwrap_or_else(|_| Utc::now()),
         disk_path: r.get("disk_path"),
         forked_from: r.try_get("forked_from").unwrap_or(None),
         machine_id: r.try_get("machine_id").unwrap_or(None),
@@ -1657,7 +1695,12 @@ fn row_to_task(r: sqlx::postgres::PgRow) -> AgentTask {
 // ── Protected Branches ────────────────────────────────────────────────────────
 
 impl Db {
-    pub async fn protect_branch(&self, repo_id: &str, branch: &str, created_by: &str) -> Result<()> {
+    pub async fn protect_branch(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        created_by: &str,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let id = format!("{repo_id}:{branch}");
         sqlx::query(
@@ -1676,34 +1719,33 @@ impl Db {
     }
 
     pub async fn unprotect_branch(&self, repo_id: &str, branch: &str) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM protected_branches WHERE repo_id = $1 AND branch = $2",
-        )
-        .bind(repo_id)
-        .bind(branch)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM protected_branches WHERE repo_id = $1 AND branch = $2")
+            .bind(repo_id)
+            .bind(branch)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     pub async fn list_protected_branches(&self, repo_id: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query(
-            "SELECT branch FROM protected_branches WHERE repo_id = $1 ORDER BY branch",
-        )
-        .bind(repo_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|r| r.get::<String, _>("branch")).collect())
+        let rows =
+            sqlx::query("SELECT branch FROM protected_branches WHERE repo_id = $1 ORDER BY branch")
+                .bind(repo_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("branch"))
+            .collect())
     }
 
     pub async fn is_branch_protected(&self, repo_id: &str, branch: &str) -> Result<bool> {
-        let row = sqlx::query(
-            "SELECT 1 FROM protected_branches WHERE repo_id = $1 AND branch = $2",
-        )
-        .bind(repo_id)
-        .bind(branch)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT 1 FROM protected_branches WHERE repo_id = $1 AND branch = $2")
+                .bind(repo_id)
+                .bind(branch)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.is_some())
     }
 }
@@ -1731,37 +1773,31 @@ impl Db {
 
     /// Unstar a repo. Idempotent — no error if not starred.
     pub async fn unstar_repo(&self, repo_id: &str, agent_did: &str) -> Result<()> {
-        sqlx::query(
-            "DELETE FROM repo_stars WHERE repo_id = $1 AND agent_did = $2",
-        )
-        .bind(repo_id)
-        .bind(agent_did)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("DELETE FROM repo_stars WHERE repo_id = $1 AND agent_did = $2")
+            .bind(repo_id)
+            .bind(agent_did)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     /// Count total stars for a repo.
     pub async fn count_stars(&self, repo_id: &str) -> Result<i64> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) as cnt FROM repo_stars WHERE repo_id = $1",
-        )
-        .bind(repo_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT COUNT(*) as cnt FROM repo_stars WHERE repo_id = $1")
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.get::<i64, _>("cnt"))
     }
 
     /// Check whether a specific agent has starred a repo.
     #[allow(dead_code)]
     pub async fn is_starred(&self, repo_id: &str, agent_did: &str) -> Result<bool> {
-        let row = sqlx::query(
-            "SELECT 1 FROM repo_stars WHERE repo_id = $1 AND agent_did = $2",
-        )
-        .bind(repo_id)
-        .bind(agent_did)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT 1 FROM repo_stars WHERE repo_id = $1 AND agent_did = $2")
+            .bind(repo_id)
+            .bind(agent_did)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.is_some())
     }
 }
@@ -1791,12 +1827,10 @@ impl Db {
     }
 
     pub async fn get_bounty(&self, id: &str) -> Result<Option<BountyRecord>> {
-        let row = sqlx::query(
-            "SELECT * FROM bounties WHERE id = $1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT * FROM bounties WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|r| self.bounty_from_row(&r)))
     }
 
@@ -1838,7 +1872,13 @@ impl Db {
         Ok(rows.iter().map(|r| self.bounty_from_row(r)).collect())
     }
 
-    pub async fn claim_bounty(&self, id: &str, claimant_did: &str, claimant_wallet: Option<&str>, claimed_at: &str) -> Result<()> {
+    pub async fn claim_bounty(
+        &self,
+        id: &str,
+        claimant_did: &str,
+        claimant_wallet: Option<&str>,
+        claimed_at: &str,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE bounties SET claimant_did=$1, claimant_wallet=$2, claimed_at=$3, status='claimed' WHERE id=$4 AND status='open'",
         )
@@ -1863,7 +1903,12 @@ impl Db {
         Ok(())
     }
 
-    pub async fn approve_bounty(&self, id: &str, completed_at: &str, tx_hash: Option<&str>) -> Result<()> {
+    pub async fn approve_bounty(
+        &self,
+        id: &str,
+        completed_at: &str,
+        tx_hash: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE bounties SET completed_at=$1, tx_hash=$2, status='completed' WHERE id=$3 AND status='submitted'",
         )
@@ -1876,12 +1921,10 @@ impl Db {
     }
 
     pub async fn cancel_bounty(&self, id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE bounties SET status='cancelled' WHERE id=$1 AND status='open'",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE bounties SET status='cancelled' WHERE id=$1 AND status='open'")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1920,9 +1963,16 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(|r| {
-            (r.get::<String, _>("claimant_did"), r.get::<i64, _>("cnt"), r.get::<i64, _>("total"))
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("claimant_did"),
+                    r.get::<i64, _>("cnt"),
+                    r.get::<i64, _>("total"),
+                )
+            })
+            .collect())
     }
 
     fn bounty_from_row(&self, r: &sqlx::postgres::PgRow) -> BountyRecord {
