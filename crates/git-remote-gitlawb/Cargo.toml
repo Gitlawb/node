@@ -1,0 +1,17 @@
+[package]
+name = "git-remote-gitlawb"
+description = "Git remote helper — enables 'git clone gitlawb://did:gitlawb:...'"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "git-remote-gitlawb"
+path = "src/main.rs"
+
+[dependencies]
+gitlawb-core = { path = "../gitlawb-core" }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

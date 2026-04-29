@@ -1,0 +1,60 @@
+[package]
+name = "gitlawb-node"
+description = "The gitlawb node daemon — git hosting over HTTP with DID auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gitlawb-node"
+path = "src/main.rs"
+
+[dependencies]
+gitlawb-core = { path = "../gitlawb-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+axum = { version = "0.8", features = ["http1", "http2", "json", "ws"] }
+async-graphql = { version = "7", features = ["chrono", "uuid", "tracing"] }
+async-graphql-axum = "7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "limit"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid"] }
+clap = { version = "4", features = ["derive", "env"] }
+bytes = "1"
+cid = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+http-body-util = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+dirs-next = "2"
+reqwest = { workspace = true }
+libp2p = { version = "0.55", features = ["gossipsub", "kad", "mdns", "noise", "tcp", "tokio", "yamux", "identify", "macros"] }
+futures = "0.3"
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+async-compression = { version = "0.4", features = ["tokio", "zstd"] }
+tar = "0.4"
+zstd = "0.13"
+alloy = { version = "1", default-features = false, features = [
+    "contract",
+    "provider-http",
+    "reqwest",
+    "signer-local",
+    "signers",
+    "sol-types",
+    "network",
+    "rpc-types-eth",
+] }
+
+[dev-dependencies]
+mockito = "1"
+tempfile = "3"

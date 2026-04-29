@@ -1,0 +1,52 @@
+version: '3.9'
+
+# Run a gitlawb node + Postgres locally. For on-chain PoS operation, supply
+# the operator key + contract addresses via a .env file or shell environment.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: gitlawb
+      POSTGRES_USER: gitlawb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitlawb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  node:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "7545:7545"    # HTTP API + git smart-HTTP
+      - "7546:7546"    # libp2p
+    volumes:
+      - gitlawb-data:/data
+    environment:
+      DATABASE_URL: postgresql://gitlawb:${POSTGRES_PASSWORD:-changeme}@postgres:5432/gitlawb
+      GITLAWB_HOST: 0.0.0.0
+      GITLAWB_PUBLIC_URL: ${GITLAWB_PUBLIC_URL:-http://localhost:7545}
+      GITLAWB_P2P_PORT: 7546
+      # On-chain PoS (optional — leave unset for local/dev)
+      GITLAWB_CHAIN_RPC_URL: ${GITLAWB_CHAIN_RPC_URL:-}
+      GITLAWB_CONTRACT_NODE_STAKING: ${GITLAWB_CONTRACT_NODE_STAKING:-}
+      GITLAWB_OPERATOR_PRIVATE_KEY: ${GITLAWB_OPERATOR_PRIVATE_KEY:-}
+      GITLAWB_OPERATOR_STRICT_MODE: ${GITLAWB_OPERATOR_STRICT_MODE:-false}
+      GITLAWB_HEARTBEAT_INTERVAL_HOURS: ${GITLAWB_HEARTBEAT_INTERVAL_HOURS:-20}
+      # Optional shared storage (leave unset to use local disk only)
+      GITLAWB_TIGRIS_BUCKET: ${GITLAWB_TIGRIS_BUCKET:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_ENDPOINT_URL_S3: ${AWS_ENDPOINT_URL_S3:-}
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  gitlawb-data:

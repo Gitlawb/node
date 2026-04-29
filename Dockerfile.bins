@@ -1,0 +1,31 @@
+# Builds gl and git-remote-gitlawb for the target platform.
+# ARG TARGET must be set: x86_64-unknown-linux-musl or aarch64-unknown-linux-musl
+# Used by scripts/build-bins.sh — not used for node deployment.
+ARG TARGET=x86_64-unknown-linux-musl
+
+FROM rust:1.85-bookworm AS builder
+ARG TARGET
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y \
+    musl-tools \
+    gcc-aarch64-linux-gnu \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add the musl targets
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+# Configure cross-linker for aarch64
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+
+RUN cargo build --release --target "$TARGET" -p gl -p git-remote-gitlawb
+
+FROM debian:bookworm-slim
+ARG TARGET
+COPY --from=builder /build/target/$TARGET/release/gl /gl
+COPY --from=builder /build/target/$TARGET/release/git-remote-gitlawb /git-remote-gitlawb
