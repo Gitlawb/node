@@ -29,6 +29,10 @@ RUN mkdir -p crates/gitlawb-core/src crates/gitlawb-node/src crates/gl/src crate
 # and the runtime container exits immediately with code 0.
 COPY crates/ crates/
 RUN find crates -name "*.rs" -exec touch {} + && \
+    rm -f target/release/gitlawb-node target/release/gl target/release/git-remote-gitlawb && \
+    rm -rf target/release/.fingerprint/gitlawb-node-* \
+           target/release/.fingerprint/gl-* \
+           target/release/.fingerprint/git-remote-gitlawb-* && \
     cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb && \
     strip target/release/gitlawb-node target/release/gl target/release/git-remote-gitlawb
 
