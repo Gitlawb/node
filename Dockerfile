@@ -23,9 +23,13 @@ RUN mkdir -p crates/gitlawb-core/src crates/gitlawb-node/src crates/gl/src crate
     echo '' > crates/gitlawb-core/src/lib.rs && \
     cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb || true
 
-# Now copy real sources and build for real
+# Now copy real sources and build for real.
+# Force-bump mtimes so cargo's fingerprint check rebuilds — without this,
+# cargo can keep the dummy `fn main() {}` binaries from the cache layer above
+# and the runtime container exits immediately with code 0.
 COPY crates/ crates/
-RUN cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb && \
+RUN find crates -name "*.rs" -exec touch {} + && \
+    cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb && \
     strip target/release/gitlawb-node target/release/gl target/release/git-remote-gitlawb
 
 # ── Runtime stage ───────────────────────────────────────────────────────────
