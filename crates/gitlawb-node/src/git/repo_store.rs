@@ -34,7 +34,12 @@ pub struct RepoStore {
 
 impl RepoStore {
     pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, pool: PgPool) -> Self {
-        Self { repos_dir, tigris, pool, migrated: Arc::new(Mutex::new(HashSet::new())) }
+        Self {
+            repos_dir,
+            tigris,
+            pool,
+            migrated: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     /// Ensure a repo is available on local disk, downloading from Tigris if needed.
@@ -42,7 +47,7 @@ impl RepoStore {
     /// spawned to lazily migrate it (on-demand migration for pre-Tigris repos).
     /// Returns the local path to the bare repo.
     pub async fn acquire(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
-        let (owner_slug, local_path) = self.local_path(owner_did, repo_name);
+        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         // Fast path: repo exists locally
         if local_path.exists() {
@@ -87,10 +92,15 @@ impl RepoStore {
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "cache miss — downloading from tigris");
-                tigris.download(&owner_slug, repo_name, &local_path).await
+                tigris
+                    .download(&owner_slug, repo_name, &local_path)
+                    .await
                     .context("downloading repo from tigris")?;
                 // Mark as migrated since we just downloaded it
-                self.migrated.lock().await.insert(format!("{owner_slug}/{repo_name}"));
+                self.migrated
+                    .lock()
+                    .await
+                    .insert(format!("{owner_slug}/{repo_name}"));
                 return Ok(local_path);
             }
         }
@@ -105,12 +115,14 @@ impl RepoStore {
     /// `git-receive-pack`) so the client sees the same refs that `acquire_write()`
     /// will operate on.
     pub async fn acquire_fresh(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
-        let (owner_slug, local_path) = self.local_path(owner_did, repo_name);
+        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
-                tigris.download(&owner_slug, repo_name, &local_path).await
+                tigris
+                    .download(&owner_slug, repo_name, &local_path)
+                    .await
                     .context("downloading repo from tigris (fresh)")?;
                 return Ok(local_path);
             }
@@ -123,7 +135,7 @@ impl RepoStore {
     /// Take a write lock (Postgres advisory lock), ensure repo is local, return guard.
     /// The lock prevents concurrent writes to the same repo across machines.
     pub async fn acquire_write(&self, owner_did: &str, repo_name: &str) -> Result<RepoWriteGuard> {
-        let (owner_slug, local_path) = self.local_path(owner_did, repo_name);
+        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
         // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
@@ -152,7 +164,9 @@ impl RepoStore {
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                tigris.download(&owner_slug, repo_name, &local_path).await
+                tigris
+                    .download(&owner_slug, repo_name, &local_path)
+                    .await
                     .context("downloading repo from tigris for write")?;
             }
         }
@@ -169,10 +183,9 @@ impl RepoStore {
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
-        let (owner_slug, local_path) = self.local_path(owner_did, repo_name);
+        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
-        store::init_bare(&local_path)
-            .context("initializing bare repo")?;
+        store::init_bare(&local_path).context("initializing bare repo")?;
 
         // Upload to Tigris in background
         if let Some(ref tigris) = self.tigris {
@@ -194,7 +207,13 @@ impl RepoStore {
     /// Call this after any operation that modifies the git repo on disk.
     pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) {
         if let Some(ref tigris) = self.tigris {
-            let (owner_slug, local_path) = self.local_path(owner_did, repo_name);
+            let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!(repo = %repo_name, err = %e, "rejected unsafe path in release_after_write");
+                    return;
+                }
+            };
             if let Err(e) = tigris.upload(&owner_slug, repo_name, &local_path).await {
                 warn!(repo = %repo_name, err = %e, "failed to upload repo to tigris after write");
             }
@@ -202,11 +221,84 @@ impl RepoStore {
     }
 
     /// Compute the local disk path and owner slug for a repo.
-    fn local_path(&self, owner_did: &str, repo_name: &str) -> (String, PathBuf) {
+    ///
+    /// Rejects any input that could be used for path traversal — strict
+    /// allowlist on both `owner_did` and `repo_name`, length-bounded, and
+    /// the resulting path must remain inside `repos_dir`.
+    fn local_path(&self, owner_did: &str, repo_name: &str) -> Result<(String, PathBuf)> {
+        validate_path_components(owner_did, repo_name)?;
+
         let owner_slug = owner_did.replace(':', "_").replace('/', "_");
-        let local_path = self.repos_dir.join(&owner_slug).join(format!("{repo_name}.git"));
-        (owner_slug, local_path)
+        let local_path = self
+            .repos_dir
+            .join(&owner_slug)
+            .join(format!("{repo_name}.git"));
+
+        // Defence in depth: even though both inputs are allowlisted, verify
+        // the joined path is still rooted at repos_dir.
+        if !local_path.starts_with(&self.repos_dir) {
+            anyhow::bail!(
+                "computed repo path escaped repos_dir: {}",
+                local_path.display()
+            );
+        }
+
+        Ok((owner_slug, local_path))
     }
+}
+
+/// Strict allowlist validator for `owner_did` and `repo_name`.
+///
+/// Rejects any character that isn't explicitly safe, plus length and
+/// special-sequence checks (`..`, leading `.`, leading `-`).
+fn validate_path_components(owner_did: &str, repo_name: &str) -> Result<()> {
+    validate_owner_did(owner_did)?;
+    validate_repo_name(repo_name)?;
+    Ok(())
+}
+
+fn validate_owner_did(owner_did: &str) -> Result<()> {
+    if owner_did.is_empty() {
+        anyhow::bail!("owner_did is empty");
+    }
+    if owner_did.len() > 256 {
+        anyhow::bail!("owner_did exceeds 256 chars");
+    }
+    // DIDs are `did:method:identifier` — `did:key:z6Mk...`, `did:web:host:user`, etc.
+    // Allow alnum + `:`, `.`, `_`, `-`. Reject `..` substring and any `/` or `\`.
+    if owner_did.contains("..") {
+        anyhow::bail!("owner_did contains '..' sequence");
+    }
+    for ch in owner_did.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, ':' | '.' | '_' | '-');
+        if !ok {
+            anyhow::bail!("owner_did contains disallowed character: {ch:?}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_repo_name(repo_name: &str) -> Result<()> {
+    if repo_name.is_empty() {
+        anyhow::bail!("repo_name is empty");
+    }
+    if repo_name.len() > 100 {
+        anyhow::bail!("repo_name exceeds 100 chars");
+    }
+    // Repo names are `[A-Za-z0-9._-]+` minus path-traversal traps.
+    if repo_name.contains("..") {
+        anyhow::bail!("repo_name contains '..' sequence");
+    }
+    if repo_name.starts_with('.') || repo_name.starts_with('-') {
+        anyhow::bail!("repo_name must not start with '.' or '-'");
+    }
+    for ch in repo_name.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-');
+        if !ok {
+            anyhow::bail!("repo_name contains disallowed character: {ch:?}");
+        }
+    }
+    Ok(())
 }
 
 /// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
@@ -230,7 +322,10 @@ impl RepoWriteGuard {
     pub async fn release(self) {
         // Upload to Tigris
         if let Some(ref tigris) = self.tigris {
-            if let Err(e) = tigris.upload(&self.owner_slug, &self.repo_name, &self.local_path).await {
+            if let Err(e) = tigris
+                .upload(&self.owner_slug, &self.repo_name, &self.local_path)
+                .await
+            {
                 warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
             }
         }
@@ -250,4 +345,167 @@ fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
     owner_slug.hash(&mut hasher);
     repo_name.hash(&mut hasher);
     hasher.finish() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── repo_name validation ───────────────────────────────────────────────
+
+    #[test]
+    fn repo_name_accepts_normal_names() {
+        for name in [
+            "hello",
+            "hello-world",
+            "hello_world",
+            "hello.world",
+            "Repo123",
+            "a",
+        ] {
+            validate_repo_name(name).unwrap_or_else(|e| panic!("{name} should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn repo_name_rejects_empty() {
+        assert!(validate_repo_name("").is_err());
+    }
+
+    #[test]
+    fn repo_name_rejects_path_traversal_dotdot() {
+        for name in ["..", "../etc", "../../passwd", "foo/../bar", "a..b"] {
+            assert!(
+                validate_repo_name(name).is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_name_rejects_slashes() {
+        for name in ["foo/bar", "foo\\bar", "/abs", "a/b/c"] {
+            assert!(
+                validate_repo_name(name).is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_name_rejects_leading_dot_or_dash() {
+        for name in [".hidden", ".", "-foo"] {
+            assert!(
+                validate_repo_name(name).is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_name_rejects_null_byte() {
+        assert!(validate_repo_name("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn repo_name_rejects_overlong() {
+        let long = "a".repeat(101);
+        assert!(validate_repo_name(&long).is_err());
+    }
+
+    // ── owner_did validation ───────────────────────────────────────────────
+
+    #[test]
+    fn owner_did_accepts_did_key() {
+        validate_owner_did("did:key:z6MkqDnb7Siv3Cwj7pGJq4T5EsUisECqR8KpnDLwcaZq5TPr").unwrap();
+    }
+
+    #[test]
+    fn owner_did_accepts_did_web_with_dots() {
+        validate_owner_did("did:web:example.com:user").unwrap();
+    }
+
+    #[test]
+    fn owner_did_rejects_empty() {
+        assert!(validate_owner_did("").is_err());
+    }
+
+    #[test]
+    fn owner_did_rejects_path_traversal() {
+        for did in [
+            "did:key:..",
+            "did:key:../../etc",
+            "..",
+            "did:key:foo/../bar",
+        ] {
+            assert!(validate_owner_did(did).is_err(), "{did:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn owner_did_rejects_slashes_and_backslashes() {
+        for did in ["did:key:foo/bar", "did:key:foo\\bar", "did/key/foo"] {
+            assert!(validate_owner_did(did).is_err(), "{did:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn owner_did_rejects_null_byte() {
+        assert!(validate_owner_did("did:key:z6Mk\0evil").is_err());
+    }
+
+    #[test]
+    fn owner_did_rejects_overlong() {
+        let long = format!("did:key:{}", "z".repeat(260));
+        assert!(validate_owner_did(&long).is_err());
+    }
+
+    // ── end-to-end local_path ──────────────────────────────────────────────
+
+    fn make_store() -> RepoStore {
+        // We only exercise the path-construction code, which doesn't touch
+        // the pool or the network. Fabricate a pool reference via PgPool::connect_lazy
+        // so we don't need a live DB.
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").unwrap();
+        RepoStore::new(PathBuf::from("/var/lib/gitlawb/repos"), None, pool)
+    }
+
+    #[tokio::test]
+    async fn local_path_resolves_safe_inputs() {
+        let store = make_store();
+        let (slug, path) = store
+            .local_path(
+                "did:key:z6MkqDnb7Siv3Cwj7pGJq4T5EsUisECqR8KpnDLwcaZq5TPr",
+                "hello",
+            )
+            .unwrap();
+        assert_eq!(
+            slug,
+            "did_key_z6MkqDnb7Siv3Cwj7pGJq4T5EsUisECqR8KpnDLwcaZq5TPr"
+        );
+        assert!(path.starts_with("/var/lib/gitlawb/repos"));
+        assert!(path.ends_with("hello.git"));
+    }
+
+    #[tokio::test]
+    async fn local_path_rejects_traversal_in_repo_name() {
+        let store = make_store();
+        for bad in ["../etc/passwd", "..", "../../shadow"] {
+            assert!(
+                store.local_path("did:key:z6MkAlice", bad).is_err(),
+                "repo_name={bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn local_path_rejects_traversal_in_owner_did() {
+        let store = make_store();
+        for bad in ["did:key:..", "..", "did/key/foo"] {
+            assert!(
+                store.local_path(bad, "hello").is_err(),
+                "owner_did={bad:?} must be rejected"
+            );
+        }
+    }
 }
