@@ -101,6 +101,13 @@ pub struct PeerRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoReplica {
+    pub replica_did: String,
+    pub replica_url: String,
+    pub registered_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinnedCidRecord {
     pub sha256_hex: String,
     pub cid: String,
@@ -379,6 +386,21 @@ impl Db {
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_repo_stars_repo  ON repo_stars(repo_id)",
             "CREATE INDEX IF NOT EXISTS idx_repo_stars_agent ON repo_stars(agent_did)",
+            // ── Repo replicas (network resilience) ──────────────────────────
+            // Tracks which nodes are hosting a replica of a repo. Populated
+            // when a replica node calls PUT /api/v1/repos/{owner}/{repo}/replicas
+            // on the origin. Public via GET on the same path — anyone can see
+            // how many nodes are mirroring a given repo.
+            r#"CREATE TABLE IF NOT EXISTS repo_replicas (
+                id            TEXT NOT NULL PRIMARY KEY,
+                repo_id       TEXT NOT NULL,
+                replica_did   TEXT NOT NULL,
+                replica_url   TEXT NOT NULL,
+                registered_at TEXT NOT NULL,
+                UNIQUE(repo_id, replica_did)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_repo_replicas_repo ON repo_replicas(repo_id)",
+            "CREATE INDEX IF NOT EXISTS idx_repo_replicas_did  ON repo_replicas(replica_did)",
             // ── PR comments ─────────────────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS pr_comments (
                 id         TEXT NOT NULL PRIMARY KEY,
@@ -1784,6 +1806,74 @@ impl Db {
     /// Count total stars for a repo.
     pub async fn count_stars(&self, repo_id: &str) -> Result<i64> {
         let row = sqlx::query("SELECT COUNT(*) as cnt FROM repo_stars WHERE repo_id = $1")
+            .bind(repo_id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("cnt"))
+    }
+
+    // ── Repo replicas ──────────────────────────────────────────────────
+
+    /// Register a replica for a repo. Returns true if inserted, false if the
+    /// replica was already registered (URL updated either way).
+    pub async fn register_replica(
+        &self,
+        repo_id: &str,
+        replica_did: &str,
+        replica_url: &str,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let id = format!("{repo_id}:{replica_did}");
+        let result = sqlx::query(
+            "INSERT INTO repo_replicas (id, repo_id, replica_did, replica_url, registered_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (repo_id, replica_did) DO UPDATE
+               SET replica_url = EXCLUDED.replica_url",
+        )
+        .bind(&id)
+        .bind(repo_id)
+        .bind(replica_did)
+        .bind(replica_url)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Unregister a replica. Idempotent.
+    pub async fn unregister_replica(&self, repo_id: &str, replica_did: &str) -> Result<()> {
+        sqlx::query("DELETE FROM repo_replicas WHERE repo_id = $1 AND replica_did = $2")
+            .bind(repo_id)
+            .bind(replica_did)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// List all replicas for a repo, oldest registration first.
+    pub async fn list_replicas(&self, repo_id: &str) -> Result<Vec<RepoReplica>> {
+        let rows = sqlx::query(
+            "SELECT replica_did, replica_url, registered_at
+             FROM repo_replicas
+             WHERE repo_id = $1
+             ORDER BY registered_at ASC",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RepoReplica {
+                replica_did: r.get("replica_did"),
+                replica_url: r.get("replica_url"),
+                registered_at: r.get("registered_at"),
+            })
+            .collect())
+    }
+
+    /// Count replicas registered for a repo.
+    pub async fn count_replicas(&self, repo_id: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) as cnt FROM repo_replicas WHERE repo_id = $1")
             .bind(repo_id)
             .fetch_one(&self.pool)
             .await?;
