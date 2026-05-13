@@ -222,9 +222,14 @@ impl RepoStore {
 
     /// Compute the local disk path and owner slug for a repo.
     ///
-    /// Rejects any input that could be used for path traversal — strict
-    /// allowlist on both `owner_did` and `repo_name`, length-bounded, and
-    /// the resulting path must remain inside `repos_dir`.
+    /// Three-layer defence against path traversal:
+    ///   1. Strict allowlist on `owner_did` and `repo_name` (no `..`, slashes,
+    ///      null bytes, leading dots; length-bounded).
+    ///   2. The joined path must remain rooted at `repos_dir`.
+    ///   3. Every component of the joined path must be `Component::Normal`
+    ///      (or the prefix/root from `repos_dir`); any `ParentDir`/`CurDir`
+    ///      segment is rejected. This is the CodeQL-recognised barrier
+    ///      pattern for `rust/path-injection`.
     fn local_path(&self, owner_did: &str, repo_name: &str) -> Result<(String, PathBuf)> {
         validate_path_components(owner_did, repo_name)?;
 
@@ -234,13 +239,28 @@ impl RepoStore {
             .join(&owner_slug)
             .join(format!("{repo_name}.git"));
 
-        // Defence in depth: even though both inputs are allowlisted, verify
-        // the joined path is still rooted at repos_dir.
         if !local_path.starts_with(&self.repos_dir) {
             anyhow::bail!(
                 "computed repo path escaped repos_dir: {}",
                 local_path.display()
             );
+        }
+
+        // Explicit component walk — sanitisation barrier that static analysers
+        // (CodeQL `rust/path-injection`) recognise. The path must be composed
+        // entirely of Normal segments after the root prefix; any ParentDir or
+        // CurDir component is a traversal attempt.
+        for component in local_path.components() {
+            use std::path::Component;
+            match component {
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
+                Component::ParentDir => {
+                    anyhow::bail!("path contains parent-directory component");
+                }
+                Component::CurDir => {
+                    anyhow::bail!("path contains current-directory component");
+                }
+            }
         }
 
         Ok((owner_slug, local_path))
