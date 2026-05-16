@@ -1,7 +1,7 @@
 {
   "$comment": "Canonical seed list for the Gitlawb network. Merged with GITLAWB_BOOTSTRAP_PEERS at startup. PRs to add public nodes welcome.",
   "version": 1,
-  "updated": "2026-04-29",
+  "updated": "2026-05-16",
   "peers": [
     {
       "name": "gitlawb",
@@ -10,6 +10,14 @@
       "http_url": "https://node.gitlawb.com",
       "p2p_multiaddr": null,
       "added": "2026-04-29"
+    },
+    {
+      "name": "rapybus-gitlawb",
+      "operator": "RapyBus S.A.C.",
+      "did": "did:key:z6MktERLyhFpjUyN7dnkf7CYY5RXKJ6BTZiKohoi37YVBS7R",
+      "http_url": "https://rapybus-gitlawb.com",
+      "p2p_multiaddr": null,
+      "added": "2026-05-16"
     }
   ]
 }
