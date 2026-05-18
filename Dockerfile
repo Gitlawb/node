@@ -28,6 +28,7 @@ RUN mkdir -p crates/gitlawb-core/src crates/gitlawb-node/src crates/gl/src crate
 # cargo can keep the dummy `fn main() {}` binaries from the cache layer above
 # and the runtime container exits immediately with code 0.
 COPY crates/ crates/
+COPY bootstrap-peers.json ./
 RUN find crates -name "*.rs" -exec touch {} + && \
     rm -f target/release/gitlawb-node target/release/gl target/release/git-remote-gitlawb && \
     rm -rf target/release/.fingerprint/gitlawb-node-* \

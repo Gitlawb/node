@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 Cargo.lock.bak
+dist/
 
 # Local node data
 /data

@@ -108,6 +108,46 @@ crates/
 
 ---
 
+## macOS Menu Bar App
+
+A native Swift/AppKit menu bar app that manages the Docker Compose stack (node + Postgres) without touching the terminal.
+
+**Requirements:** macOS 26+, Xcode Command Line Tools (`xcode-select --install`), and a Docker runtime (Docker Desktop, OrbStack, or Colima).
+
+### Build
+
+```bash
+./scripts/build-macos-app.sh
+```
+
+The resulting `Gitlawb Node.app` and `.dmg` are placed in `dist/`.
+
+To codesign for distribution:
+
+```bash
+./scripts/build-macos-app.sh --sign "Developer ID Application: ..."
+```
+
+### Features
+
+- Start/Stop the node from the menu bar
+- Status indicator (green = running, yellow = starting, red = stopped)
+- Settings GUI (ports, Postgres password, operator config)
+- Auto-start on login
+- Detects Docker Desktop, OrbStack, and Colima automatically
+
+### Running an unsigned build
+
+If you built the app locally without a Developer ID, macOS Gatekeeper will block it. To allow it:
+
+```bash
+xattr -cr "dist/Gitlawb Node.app"
+```
+
+Then open the app normally. Alternatively, go to **System Settings → Privacy & Security** and click **Open Anyway** after the first blocked launch attempt.
+
+---
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: see [`SECURITY.md`](SECURITY.md).
