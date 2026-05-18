@@ -5,6 +5,7 @@ members = [
     "crates/gitlawb-node",
     "crates/gl",
     "crates/git-remote-gitlawb",
+    "crates/gitlawb-attest",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ tokio = { version = "1", features = ["full"] }
 # serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_jcs = "0.2"
 # errors
 thiserror = "2"
 anyhow = "1"
