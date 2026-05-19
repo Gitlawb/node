@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
+fn normalize_agent_did(did: &str) -> String {
+    if did.starts_with("did:") {
+        did.to_string()
+    } else {
+        format!("did:key:{did}")
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct TrustResponse {
     pub did: String,
@@ -66,11 +74,12 @@ pub async fn show_agent(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<(StatusCode, Json<AgentResponse>)> {
+    let normalized_did = normalize_agent_did(&did);
     let agent = state
         .db
-        .get_agent(&did)
+        .get_agent(&normalized_did)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("agent {did} not found")))?;
+        .ok_or_else(|| AppError::NotFound(format!("agent {normalized_did} not found")))?;
     Ok((
         StatusCode::OK,
         Json(AgentResponse {
@@ -88,14 +97,32 @@ pub async fn get_trust(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<Json<TrustResponse>> {
-    let trust_score = state.db.get_trust_score(&did).await?;
-    let push_count = state.db.get_push_count(&did).await?;
+    let normalized_did = normalize_agent_did(&did);
+    let trust_score = state.db.get_trust_score(&normalized_did).await?;
+    let push_count = state.db.get_push_count(&normalized_did).await?;
     let level = trust_level(trust_score);
 
     Ok(Json(TrustResponse {
-        did,
+        did: normalized_did,
         trust_score,
         push_count,
         level,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_agent_did;
+
+    #[test]
+    fn normalize_agent_did_preserves_full_did() {
+        let did = "did:key:z6MkExample";
+
+        assert_eq!(normalize_agent_did(did), did);
+    }
+
+    #[test]
+    fn normalize_agent_did_expands_bare_key() {
+        assert_eq!(normalize_agent_did("z6MkExample"), "did:key:z6MkExample");
+    }
 }

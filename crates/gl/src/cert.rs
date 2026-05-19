@@ -7,6 +7,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 
 use crate::http::NodeClient;
+use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct CertArgs {
@@ -41,20 +42,25 @@ pub async fn run(args: CertArgs) -> Result<()> {
     }
 }
 
-/// Resolve "repo" into (owner, name) — if no slash, use the node's own DID short form.
+/// Resolve "repo" into (owner, name) using the caller's DID when no slash is given.
 async fn resolve_repo(repo: &str, node: &str) -> Result<(String, String)> {
     if let Some((owner, name)) = repo.split_once('/') {
         Ok((owner.to_string(), name.to_string()))
     } else {
-        let client = NodeClient::new(node, None);
-        let info: Value = client
-            .get("/")
-            .await?
-            .json()
-            .await
-            .context("failed to fetch node info")?;
-        let did = info["did"].as_str().context("node info missing 'did'")?;
-        let short = did.split(':').next_back().unwrap_or(did).to_string();
+        let short = if let Ok(kp) = load_keypair_from_dir(None) {
+            let did = kp.did().to_string();
+            did.split(':').next_back().unwrap_or(&did).to_string()
+        } else {
+            let client = NodeClient::new(node, None);
+            let info: Value = client
+                .get("/")
+                .await?
+                .json()
+                .await
+                .context("failed to fetch node info")?;
+            let did = info["did"].as_str().context("node info missing 'did'")?;
+            did.split(':').next_back().unwrap_or(did).to_string()
+        };
         Ok((short, repo.to_string()))
     }
 }
@@ -94,15 +100,16 @@ async fn cmd_show(repo: String, id: String, node: String) -> Result<()> {
     let (owner, name) = resolve_repo(&repo, &node).await?;
 
     let client = NodeClient::new(&node, None);
+    let id = resolve_cert_id(&client, &owner, &name, &id).await?;
 
     // Fetch the certificate
     let path = format!("/api/v1/repos/{owner}/{name}/certs/{id}");
-    let cert: Value = client
+    let resp = client
         .get(&path)
         .await?
-        .json()
-        .await
+        .error_for_status()
         .context("certificate not found")?;
+    let cert: Value = resp.json().await.context("certificate not found")?;
 
     let cert_id = cert["id"].as_str().unwrap_or("?");
     let ref_name = cert["ref_name"].as_str().unwrap_or("?");
@@ -154,4 +161,34 @@ async fn cmd_show(repo: String, id: String, node: String) -> Result<()> {
     println!("  Signature (base64url): {signature}");
 
     Ok(())
+}
+
+async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str) -> Result<String> {
+    if id.len() >= 36 {
+        return Ok(id.to_string());
+    }
+
+    let path = format!("/api/v1/repos/{owner}/{name}/certs");
+    let resp: Value = client
+        .get(&path)
+        .await?
+        .error_for_status()
+        .context("failed to list certificates")?
+        .json()
+        .await
+        .context("failed to list certificates")?;
+
+    let certs = resp["certificates"].as_array().cloned().unwrap_or_default();
+    let matches: Vec<String> = certs
+        .iter()
+        .filter_map(|cert| cert["id"].as_str())
+        .filter(|cert_id| cert_id.starts_with(id))
+        .map(ToString::to_string)
+        .collect();
+
+    match matches.as_slice() {
+        [full_id] => Ok(full_id.to_string()),
+        [] => Ok(id.to_string()),
+        _ => anyhow::bail!("certificate prefix {id} matches multiple certificates"),
+    }
 }
