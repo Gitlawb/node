@@ -16,6 +16,29 @@ fn normalize_agent_did(did: &str) -> String {
     }
 }
 
+fn agent_key_segment(did: &str) -> &str {
+    did.split(':').next_back().unwrap_or(did)
+}
+
+async fn resolve_agent_did(state: &AppState, did: &str) -> Result<String> {
+    let normalized_did = normalize_agent_did(did);
+    if state.db.get_agent(&normalized_did).await?.is_some() {
+        return Ok(normalized_did);
+    }
+
+    let requested_key = agent_key_segment(&normalized_did);
+    let matching_agent = state
+        .db
+        .list_agents(None)
+        .await?
+        .into_iter()
+        .find(|agent| agent_key_segment(&agent.did).starts_with(requested_key));
+
+    Ok(matching_agent
+        .map(|agent| agent.did)
+        .unwrap_or(normalized_did))
+}
+
 #[derive(Debug, Serialize)]
 pub struct TrustResponse {
     pub did: String,
@@ -74,7 +97,7 @@ pub async fn show_agent(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<(StatusCode, Json<AgentResponse>)> {
-    let normalized_did = normalize_agent_did(&did);
+    let normalized_did = resolve_agent_did(&state, &did).await?;
     let agent = state
         .db
         .get_agent(&normalized_did)
@@ -97,7 +120,7 @@ pub async fn get_trust(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<Json<TrustResponse>> {
-    let normalized_did = normalize_agent_did(&did);
+    let normalized_did = resolve_agent_did(&state, &did).await?;
     let trust_score = state.db.get_trust_score(&normalized_did).await?;
     let push_count = state.db.get_push_count(&normalized_did).await?;
     let level = trust_level(trust_score);
@@ -112,7 +135,7 @@ pub async fn get_trust(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_agent_did;
+    use super::{agent_key_segment, normalize_agent_did};
 
     #[test]
     fn normalize_agent_did_preserves_full_did() {
@@ -124,5 +147,11 @@ mod tests {
     #[test]
     fn normalize_agent_did_expands_bare_key() {
         assert_eq!(normalize_agent_did("z6MkExample"), "did:key:z6MkExample");
+    }
+
+    #[test]
+    fn agent_key_segment_extracts_did_key_material() {
+        assert_eq!(agent_key_segment("did:key:z6MkExample"), "z6MkExample");
+        assert_eq!(agent_key_segment("z6MkExample"), "z6MkExample");
     }
 }
