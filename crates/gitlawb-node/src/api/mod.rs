@@ -11,6 +11,7 @@ pub mod peers;
 pub mod protect;
 pub mod pulls;
 pub mod register;
+pub mod replicas;
 pub mod repos;
 pub mod resolve;
 pub mod stars;

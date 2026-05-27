@@ -118,6 +118,35 @@ pub enum RepoCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Register this node as a replica of someone else's repo
+    ReplicaRegister {
+        /// Repository in owner/repo format
+        repo: String,
+        /// Publicly-reachable URL of YOUR node (the one hosting the replica)
+        #[arg(long)]
+        url: String,
+        /// URL of the origin node (where the repo lives)
+        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Unregister this node as a replica
+    ReplicaUnregister {
+        /// Repository in owner/repo format
+        repo: String,
+        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// List nodes currently mirroring a repo
+    Replicas {
+        /// Repository in owner/repo format
+        repo: String,
+        #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
+        node: String,
+    },
 }
 
 pub async fn run(args: RepoArgs) -> Result<()> {
@@ -165,6 +194,16 @@ pub async fn run(args: RepoArgs) -> Result<()> {
             dir,
             json,
         } => cmd_owner(repo, node, dir, json).await,
+        RepoCmd::ReplicaRegister {
+            repo,
+            url,
+            node,
+            dir,
+        } => cmd_replica_register(repo, url, node, dir).await,
+        RepoCmd::ReplicaUnregister { repo, node, dir } => {
+            cmd_replica_unregister(repo, node, dir).await
+        }
+        RepoCmd::Replicas { repo, node } => cmd_replicas(repo, node).await,
     }
 }
 
@@ -325,6 +364,120 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     println!("  Updated:    {}", r["updated_at"].as_str().unwrap_or("?"));
     if let Some(desc) = r["description"].as_str().filter(|s| !s.is_empty()) {
         println!("  Desc:       {desc}");
+    }
+
+    // Replica count — failure to fetch is non-fatal (older nodes don't expose this).
+    if let Ok(resp) = client
+        .get(&format!("/api/v1/repos/{owner}/{name}/replicas"))
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<Value>().await {
+                if let Some(count) = json["replica_count"].as_i64() {
+                    println!("  Replicas:   {count}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn cmd_replica_register(
+    repo: String,
+    url: String,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
+    let (owner, name) = repo
+        .split_once('/')
+        .map(|(o, n)| (o.to_string(), n.to_string()))
+        .context("use owner/repo format (e.g. did:key:.../myrepo)")?;
+
+    let kp = load_keypair_from_dir(dir.as_deref())
+        .context("identity not found — run `gl identity new` first")?;
+    let client = NodeClient::new(&node, Some(kp));
+
+    let body = serde_json::to_vec(&json!({ "url": url }))?;
+    let resp = client
+        .put(&format!("/api/v1/repos/{owner}/{name}/replicas"), &body)
+        .await
+        .context("failed to connect to origin node")?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = body["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("replica register failed ({status}): {msg}");
+    }
+
+    let count = body["replica_count"].as_i64().unwrap_or(0);
+    println!("Registered as replica of {owner}/{name}");
+    println!("  Your URL:   {url}");
+    println!("  Replicas:   {count} total");
+    println!();
+    println!("Next: ensure your node has a copy of the repo —");
+    println!("  git clone gitlawb://{owner}/{name}");
+    Ok(())
+}
+
+async fn cmd_replica_unregister(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+    let (owner, name) = repo
+        .split_once('/')
+        .map(|(o, n)| (o.to_string(), n.to_string()))
+        .context("use owner/repo format")?;
+
+    let kp = load_keypair_from_dir(dir.as_deref())
+        .context("identity not found — run `gl identity new` first")?;
+    let client = NodeClient::new(&node, Some(kp));
+
+    let resp = client
+        .delete(&format!("/api/v1/repos/{owner}/{name}/replicas"), b"")
+        .await
+        .context("failed to connect to origin node")?;
+
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = body["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("replica unregister failed ({status}): {msg}");
+    }
+
+    let count = body["replica_count"].as_i64().unwrap_or(0);
+    println!("Unregistered as replica of {owner}/{name}  ({count} replicas remaining)");
+    Ok(())
+}
+
+async fn cmd_replicas(repo: String, node: String) -> Result<()> {
+    let (owner, name) = repo
+        .split_once('/')
+        .map(|(o, n)| (o.to_string(), n.to_string()))
+        .context("use owner/repo format")?;
+
+    let client = NodeClient::new(&node, None);
+    let resp = client
+        .get(&format!("/api/v1/repos/{owner}/{name}/replicas"))
+        .await
+        .context("failed to connect to node")?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = body["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("replicas list failed ({status}): {msg}");
+    }
+
+    let count = body["replica_count"].as_i64().unwrap_or(0);
+    println!("{owner}/{name}: {count} replicas");
+    if let Some(arr) = body["replicas"].as_array() {
+        for r in arr {
+            let did = r["replica_did"].as_str().unwrap_or("?");
+            let url = r["replica_url"].as_str().unwrap_or("?");
+            let registered = r["registered_at"]
+                .as_str()
+                .map(|s| &s[..10.min(s.len())])
+                .unwrap_or("?");
+            println!("  {registered}  {did}  →  {url}");
+        }
     }
     Ok(())
 }

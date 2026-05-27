@@ -14,7 +14,7 @@ use tracing::Level;
 
 use crate::api::{
     agents, arweave, bounties, certs, changelog, events, ipfs, issues, labels, peers, protect,
-    pulls, register, repos, resolve, stars, tasks, webhooks,
+    pulls, register, replicas, repos, resolve, stars, tasks, webhooks,
 };
 use crate::auth;
 use crate::state::AppState;
@@ -94,6 +94,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/repos/{owner}/{repo}/star",
             axum::routing::delete(stars::unstar_repo),
+        )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/replicas",
+            axum::routing::put(replicas::register_replica),
+        )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/replicas",
+            axum::routing::delete(replicas::unregister_replica),
         )
         .route("/api/v1/repos/{owner}/{repo}/fork", post(repos::fork_repo))
         .route(
@@ -277,6 +285,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/repos/{owner}/{repo}/star",
             get(stars::get_star_status),
+        )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/replicas",
+            get(replicas::list_replicas),
         )
         .route("/{owner}/{repo}/info/refs", get(repos::git_info_refs));
 
