@@ -272,7 +272,13 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 /// Check if a binary name exists anywhere on PATH.
 fn which_in_path(name: &str) -> bool {
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).exists()))
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                dir.join(name).exists()
+                    || (cfg!(target_os = "windows")
+                        && dir.join(format!("{name}.exe")).exists())
+            })
+        })
         .unwrap_or(false)
 }
 
