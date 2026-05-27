@@ -63,6 +63,15 @@ pub struct DidRecord {
     pub timestamp: String,
 }
 
+/// Snapshot of the libp2p swarm state for observability.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SwarmStatus {
+    pub connected_peers: usize,
+    pub gossipsub_mesh_peers: usize,
+    pub gossipsub_all_peers: usize,
+    pub listen_addrs: Vec<String>,
+}
+
 /// Commands sent to the swarm task from the rest of the node.
 #[derive(Debug)]
 pub enum P2pCommand {
@@ -80,6 +89,10 @@ pub enum P2pCommand {
     GetDid {
         did: String,
         reply: oneshot::Sender<Option<DidRecord>>,
+    },
+    /// Get a snapshot of the swarm status
+    GetStatus {
+        reply: oneshot::Sender<SwarmStatus>,
     },
 }
 
@@ -111,6 +124,15 @@ impl P2pHandle {
     /// Store a DID record in the DHT (fire-and-forget).
     pub async fn put_did(&self, record: DidRecord) {
         let _ = self.tx.send(P2pCommand::PutDid(record)).await;
+    }
+
+    pub async fn status(&self) -> Option<SwarmStatus> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.tx.send(P2pCommand::GetStatus { reply: tx }).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
     }
 
     /// Look up a DID in the DHT. Returns None if not found or timeout (10s).
@@ -391,6 +413,16 @@ pub async fn start(
                             let key = did_to_kad_key(&did);
                             let query_id = swarm.behaviour_mut().kademlia.get_record(key);
                             pending_get_did.insert(query_id, reply);
+                        }
+                        P2pCommand::GetStatus { reply } => {
+                            let topic_hash = gossipsub::IdentTopic::new(REF_UPDATES_TOPIC).hash();
+                            let status = SwarmStatus {
+                                connected_peers: swarm.connected_peers().count(),
+                                gossipsub_mesh_peers: swarm.behaviour().gossipsub.mesh_peers(&topic_hash).count(),
+                                gossipsub_all_peers: swarm.behaviour().gossipsub.all_peers().count(),
+                                listen_addrs: swarm.listeners().map(|a| a.to_string()).collect(),
+                            };
+                            let _ = reply.send(status);
                         }
                     }
                 }

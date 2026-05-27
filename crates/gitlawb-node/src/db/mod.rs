@@ -215,6 +215,8 @@ impl Db {
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS machine_id TEXT",
             "CREATE INDEX IF NOT EXISTS idx_repos_owner ON repos(owner_did)",
             "CREATE INDEX IF NOT EXISTS idx_repos_name  ON repos(name)",
+            "CREATE INDEX IF NOT EXISTS idx_repos_owner_short_name ON repos ((split_part(owner_did, ':', -1)), name)",
+            "CREATE INDEX IF NOT EXISTS idx_repos_updated_at ON repos (updated_at DESC)",
             r#"CREATE TABLE IF NOT EXISTS agents (
                 did           TEXT NOT NULL PRIMARY KEY,
                 trust_score   DOUBLE PRECISION NOT NULL DEFAULT 0.0,
@@ -556,6 +558,87 @@ impl Db {
         .await?;
 
         Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    pub async fn list_all_repos_with_stars(&self) -> Result<Vec<(RepoRecord, i64)>> {
+        let rows = sqlx::query(
+            "SELECT r.id, r.name, r.owner_did, r.description, r.is_public, r.default_branch,
+                    r.created_at, r.updated_at, r.disk_path, r.forked_from, r.machine_id,
+                    COALESCE(s.cnt, 0) AS star_count
+             FROM repos r
+             LEFT JOIN (SELECT repo_id, COUNT(*) AS cnt FROM repo_stars GROUP BY repo_id) s
+               ON s.repo_id = r.id
+             ORDER BY r.updated_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| {
+            let stars: i64 = r.get("star_count");
+            (row_to_repo(r), stars)
+        }).collect())
+    }
+
+    pub async fn list_all_repos_paged(
+        &self,
+        owner_filter: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<(RepoRecord, i64)>, i64)> {
+        let rows = sqlx::query(
+            "WITH deduped AS (
+                 SELECT DISTINCT ON (split_part(owner_did, ':', -1), name)
+                     id, name, owner_did, description, is_public, default_branch,
+                     created_at, updated_at, disk_path, forked_from, machine_id
+                 FROM repos
+                 WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)
+                 ORDER BY split_part(owner_did, ':', -1), name,
+                     CASE WHEN description = 'mirrored from peer' THEN 1 ELSE 0 END,
+                     created_at ASC
+             )
+             SELECT
+                 d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id,
+                 COALESCE(s.cnt, 0) AS star_count,
+                 COUNT(*) OVER () AS total_count
+             FROM deduped d
+             LEFT JOIN (
+                 SELECT repo_id, COUNT(*) AS cnt FROM repo_stars GROUP BY repo_id
+             ) s ON s.repo_id = d.id
+             ORDER BY d.updated_at DESC
+             LIMIT $2 OFFSET $3",
+        )
+        .bind(owner_filter)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total = rows.first().map(|r| r.get::<i64, _>("total_count")).unwrap_or(0);
+        let out: Vec<(RepoRecord, i64)> = rows
+            .into_iter()
+            .map(|r| {
+                let stars: i64 = r.get("star_count");
+                (row_to_repo(r), stars)
+            })
+            .collect();
+
+        let total = if out.is_empty() {
+            let row = sqlx::query(
+                "SELECT COUNT(DISTINCT (split_part(owner_did, ':', -1), name)) AS cnt
+                 FROM repos
+                 WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)",
+            )
+            .bind(owner_filter)
+            .fetch_one(&self.pool)
+            .await?;
+            row.get::<i64, _>("cnt")
+        } else {
+            total
+        };
+
+        Ok((out, total))
     }
 
     pub async fn touch_repo(&self, id: &str) -> Result<()> {
@@ -1233,6 +1316,19 @@ impl Db {
                 announced_at: r.get("announced_at"),
             })
             .collect())
+    }
+
+    pub async fn prune_self_peers(&self, public_url: &str) -> Result<u64> {
+        let trimmed = public_url.trim_end_matches('/');
+        let with_slash = format!("{trimmed}/");
+        let result = sqlx::query(
+            "DELETE FROM peers WHERE http_url = $1 OR http_url = $2",
+        )
+        .bind(trimmed)
+        .bind(&with_slash)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }
 

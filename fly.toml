@@ -1,0 +1,51 @@
+app = "gitlawb-node-test"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  GITLAWB_HOST = "0.0.0.0"
+  GITLAWB_PORT = "7545"
+  GITLAWB_P2P_PORT = "7546"
+  GITLAWB_REPOS_DIR = "/data/repos"
+  GITLAWB_KEY = "/data/keys/identity.pem"
+  GITLAWB_PUBLIC_URL = "https://gitlawb-node-test.fly.dev"
+  GITLAWB_BOOTSTRAP_PEERS = "https://node.gitlawb.com,https://node2.gitlawb.com,https://node3.gitlawb.com"
+  GITLAWB_AUTO_SYNC = "true"
+  GITLAWB_MAX_PACK_BYTES = "524288000"
+
+[http_service]
+  internal_port = 7545
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 500
+    soft_limit = 400
+
+  [http_service.http_options]
+    idle_timeout = 600
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 7546
+
+  [[services.ports]]
+    port = 7546
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = 1024
+
+[[mounts]]
+  source = "gitlawb_test_data"
+  destination = "/data"
+  initial_size = "3gb"
+
+[metrics]
+  port = 9091
+  path = "/metrics"

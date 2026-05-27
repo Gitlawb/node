@@ -401,11 +401,18 @@ async fn contracts_info(State(state): State<AppState>) -> Json<serde_json::Value
 
 async fn p2p_info(State(state): State<AppState>) -> Json<serde_json::Value> {
     match &state.p2p {
-        Some(h) => Json(json!({
-            "enabled": true,
-            "peer_id": h.local_peer_id.to_string(),
-            "topics": [crate::p2p::REF_UPDATES_TOPIC],
-        })),
+        Some(h) => {
+            let status = h.status().await;
+            Json(json!({
+                "enabled": true,
+                "peer_id": h.local_peer_id.to_string(),
+                "topics": [crate::p2p::REF_UPDATES_TOPIC],
+                "connected_peers": status.as_ref().map(|s| s.connected_peers),
+                "gossipsub_mesh_peers": status.as_ref().map(|s| s.gossipsub_mesh_peers),
+                "gossipsub_all_peers": status.as_ref().map(|s| s.gossipsub_all_peers),
+                "listen_addrs": status.as_ref().map(|s| s.listen_addrs.clone()),
+            }))
+        }
         None => Json(json!({ "enabled": false })),
     }
 }

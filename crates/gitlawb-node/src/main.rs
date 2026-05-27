@@ -21,7 +21,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use gitlawb_core::identity::Keypair;
 
@@ -64,6 +64,15 @@ async fn main() -> Result<()> {
             .await
             .context("failed to connect to database")?,
     );
+
+    // Prune peer rows that point back at this node (stale self-loop entries)
+    if let Some(public_url) = config.public_url.as_deref() {
+        match db.prune_self_peers(public_url).await {
+            Ok(0) => {}
+            Ok(n) => info!(removed = n, public_url, "pruned self-loop peer rows"),
+            Err(e) => warn!(err = %e, "prune_self_peers failed (non-fatal)"),
+        }
+    }
 
     // Ensure repos directory exists
     std::fs::create_dir_all(&config.repos_dir).context("failed to create repos directory")?;

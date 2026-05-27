@@ -114,20 +114,52 @@ pub async fn create_repo(
 
 #[derive(Debug, Deserialize)]
 pub struct ListReposQuery {
-    /// Filter by owner DID key segment (short form after last colon)
+    /// Filter by owner DID key segment (short form after last colon) or full DID.
     pub owner: Option<String>,
+    /// Page size. If omitted, the legacy "return all rows" path is used so existing
+    /// peer/CLI callers stay backwards-compatible. Capped at 200 when provided.
+    pub limit: Option<i64>,
+    /// Row offset. Ignored unless `limit` is also provided.
+    #[serde(default)]
+    pub offset: Option<i64>,
 }
 
-/// GET /api/v1/repos[?owner=<short>]
-/// List public repositories on this node, optionally filtered by owner.
+/// GET /api/v1/repos[?owner=<short>][&limit=&offset=]
+///
+/// Lists repositories on this node, optionally filtered by owner. When `limit` is
+/// present, returns one page and the `X-Total-Count` response header carries the
+/// total matching row count. Without `limit`, falls back to returning every row
+/// (kept for backwards compat with peer sync and existing CLI tooling).
 pub async fn list_repos(
     State(state): State<AppState>,
     Query(query): Query<ListReposQuery>,
-) -> Result<Json<Vec<RepoResponse>>> {
-    let repos = state.db.list_all_repos().await?;
+) -> Result<Response> {
+    use axum::response::IntoResponse;
+    use axum::http::HeaderValue;
+
+    if let Some(raw_limit) = query.limit {
+        let limit = raw_limit.clamp(1, 200);
+        let offset = query.offset.unwrap_or(0).max(0);
+        let (rows, total) = state
+            .db
+            .list_all_repos_paged(query.owner.as_deref(), limit, offset)
+            .await?;
+        let body: Vec<RepoResponse> = rows
+            .into_iter()
+            .map(|(r, stars)| to_response(&r, &state, stars))
+            .collect();
+        let mut response = Json(body).into_response();
+        response.headers_mut().insert(
+            "X-Total-Count",
+            HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
+        );
+        return Ok(response);
+    }
+
+    let repos = state.db.list_all_repos_with_stars().await?;
     let filtered: Vec<_> = repos
         .iter()
-        .filter(|r| {
+        .filter(|(r, _)| {
             if let Some(owner) = &query.owner {
                 let short = r.owner_did.split(':').next_back().unwrap_or(&r.owner_did);
                 short == owner.as_str() || r.owner_did == owner.as_str()
@@ -136,12 +168,17 @@ pub async fn list_repos(
             }
         })
         .collect();
-    let mut resp = Vec::with_capacity(filtered.len());
-    for r in filtered {
-        let count = state.db.count_stars(&r.id).await.unwrap_or(0);
-        resp.push(to_response(r, &state, count));
-    }
-    Ok(Json(resp))
+    let total = filtered.len() as i64;
+    let resp: Vec<_> = filtered
+        .into_iter()
+        .map(|(r, stars)| to_response(r, &state, *stars))
+        .collect();
+    let mut response = Json(resp).into_response();
+    response.headers_mut().insert(
+        "X-Total-Count",
+        HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
+    );
+    Ok(response)
 }
 
 /// GET /api/v1/repos/:owner/:repo
@@ -551,6 +588,7 @@ pub async fn git_receive_pack(
         let ref_update_tx = state.ref_update_tx.clone();
         let irys_url = state.config.irys_url.clone();
         let owner_did_for_arweave = record.owner_did.clone();
+        let self_public_url = state.config.public_url.clone();
         tokio::spawn(async move {
             let pinned = crate::pinata::pin_new_objects(
                 &http_client,
@@ -601,13 +639,21 @@ pub async fn git_receive_pack(
                     if peer.http_url.is_empty() {
                         continue;
                     }
-                    let notify_url =
-                        format!("{}/api/v1/sync/notify", peer.http_url.trim_end_matches('/'));
+                    let peer_url = peer.http_url.trim_end_matches('/');
+                    if let Some(self_url) = self_public_url.as_deref() {
+                        if peer_url == self_url.trim_end_matches('/') {
+                            continue;
+                        }
+                    }
+                    let notify_url = format!("{peer_url}/api/v1/sync/notify");
                     let body = serde_json::json!({
                         "repo": repo_slug,
                         "ref_name": ref_updates_clone.first().map(|(r, _)| r).unwrap_or(&String::new()),
                         "new_sha": ref_updates_clone.first().map(|(_, s)| s).unwrap_or(&String::new()),
                         "node_did": node_did_str,
+                        "pusher_did": pusher_did_clone,
+                        "old_sha": "0000000000000000000000000000000000000000",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
                     });
                     match http_client.post(&notify_url).json(&body).send().await {
                         Ok(r) if r.status().is_success() => {
@@ -714,8 +760,7 @@ pub async fn list_refs(
 pub async fn list_federated_repos(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>> {
-    // Our own repos
-    let local_repos = state.db.list_all_repos().await?;
+    let local_repos = state.db.list_all_repos_with_stars().await?;
     let local_node_url = state
         .config
         .public_url
@@ -724,9 +769,8 @@ pub async fn list_federated_repos(
     let local_node_did = state.node_did.to_string();
 
     let mut all_repos: Vec<serde_json::Value> = Vec::with_capacity(local_repos.len());
-    for r in &local_repos {
-        let count = state.db.count_stars(&r.id).await.unwrap_or(0);
-        let mut v = serde_json::to_value(to_response(r, &state, count)).unwrap_or_default();
+    for (r, count) in &local_repos {
+        let mut v = serde_json::to_value(to_response(r, &state, *count)).unwrap_or_default();
         v["node_url"] = serde_json::Value::String(local_node_url.clone());
         v["node_did"] = serde_json::Value::String(local_node_did.clone());
         v["local"] = serde_json::Value::Bool(true);
