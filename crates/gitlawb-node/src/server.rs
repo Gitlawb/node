@@ -17,6 +17,7 @@ use crate::api::{
     pulls, register, replicas, repos, resolve, stars, tasks, webhooks,
 };
 use crate::auth;
+use crate::rate_limit;
 use crate::state::AppState;
 
 async fn graphql_handler(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
@@ -50,11 +51,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tasks", get(tasks::list_tasks))
         .route("/api/v1/tasks/{id}", get(tasks::get_task));
 
-    // ── Write routes — require HTTP Signature ──────────────────────────────
-    let write_routes = Router::new()
+    // ── Rate-limited creation routes — require HTTP Signature + per-DID throttle
+    let limiter = state.rate_limiter.clone();
+    let creation_routes = Router::new()
         .route("/api/v1/repos", post(repos::create_repo))
         .route("/api/register", post(register::register))
+        .route("/api/v1/repos/{owner}/{repo}/fork", post(repos::fork_repo))
+        .route(
+            "/api/v1/repos/{owner}/{repo}/issues",
+            post(issues::create_issue),
+        )
         .route("/api/v1/repos/{owner}/{repo}/pulls", post(pulls::create_pr))
+        .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
+        .layer(axum::Extension(limiter))
+        .layer(middleware::from_fn(auth::require_signature));
+
+    // ── Write routes — require HTTP Signature (no rate limit) ─────────────
+    let write_routes = Router::new()
         .route(
             "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
             post(pulls::merge_pr),
@@ -103,7 +116,6 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/replicas",
             axum::routing::delete(replicas::unregister_replica),
         )
-        .route("/api/v1/repos/{owner}/{repo}/fork", post(repos::fork_repo))
         .route(
             "/api/v1/repos/{owner}/{repo}/labels",
             post(labels::add_label),
@@ -175,12 +187,8 @@ pub fn build_router(state: AppState) -> Router {
             get(bounties::agent_bounty_stats),
         );
 
-    // ── Issue routes ──────────────────────────────────────────────────────
+    // ── Issue routes (write — require HTTP Signature, no rate limit) ─────
     let issue_write_routes = Router::new()
-        .route(
-            "/api/v1/repos/{owner}/{repo}/issues",
-            post(issues::create_issue),
-        )
         .route(
             "/api/v1/repos/{owner}/{repo}/issues/{id}/close",
             post(issues::close_issue),
@@ -316,6 +324,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(task_read_routes)
         .merge(bounty_write_routes)
         .merge(bounty_read_routes)
+        .merge(creation_routes)
         .merge(write_routes)
         .merge(git_write_routes)
         .merge(git_read_routes)

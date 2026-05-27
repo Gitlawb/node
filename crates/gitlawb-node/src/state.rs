@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::git::repo_store::RepoStore;
 use crate::p2p::P2pHandle;
+use crate::rate_limit::RateLimiter;
 
 #[derive(Clone, Debug)]
 pub struct RefUpdateBroadcast {
@@ -48,4 +49,6 @@ pub struct AppState {
     pub machine_id: Option<String>,
     /// Centralized repo storage: local disk cache + optional Tigris backend
     pub repo_store: RepoStore,
+    /// Per-DID rate limiter for creation endpoints (repos, issues, PRs)
+    pub rate_limiter: RateLimiter,
 }
