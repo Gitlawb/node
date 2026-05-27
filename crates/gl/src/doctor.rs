@@ -275,8 +275,7 @@ fn which_in_path(name: &str) -> bool {
         .map(|paths| {
             std::env::split_paths(&paths).any(|dir| {
                 dir.join(name).exists()
-                    || (cfg!(target_os = "windows")
-                        && dir.join(format!("{name}.exe")).exists())
+                    || (cfg!(target_os = "windows") && dir.join(format!("{name}.exe")).exists())
             })
         })
         .unwrap_or(false)

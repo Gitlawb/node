@@ -134,8 +134,8 @@ pub async fn list_repos(
     State(state): State<AppState>,
     Query(query): Query<ListReposQuery>,
 ) -> Result<Response> {
-    use axum::response::IntoResponse;
     use axum::http::HeaderValue;
+    use axum::response::IntoResponse;
 
     if let Some(raw_limit) = query.limit {
         let limit = raw_limit.clamp(1, 200);
@@ -706,19 +706,17 @@ pub async fn git_receive_pack(
                         Ok(tx_id) if !tx_id.is_empty() => {
                             let arweave_url = crate::arweave::arweave_url(&tx_id);
                             let _ = db_clone
-                                .record_arweave_anchor(
-                                    &crate::db::RecordAnchorInput {
-                                        repo: &repo_slug,
-                                        owner_did: &owner_did_for_arweave,
-                                        ref_name,
-                                        old_sha: "0".repeat(64).as_str(),
-                                        new_sha,
-                                        cid: cid.as_deref(),
-                                        irys_tx_id: &tx_id,
-                                        arweave_url: &arweave_url,
-                                        node_did: &node_did_str,
-                                    },
-                                )
+                                .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                                    repo: &repo_slug,
+                                    owner_did: &owner_did_for_arweave,
+                                    ref_name,
+                                    old_sha: "0".repeat(64).as_str(),
+                                    new_sha,
+                                    cid: cid.as_deref(),
+                                    irys_tx_id: &tx_id,
+                                    arweave_url: &arweave_url,
+                                    node_did: &node_did_str,
+                                })
                                 .await;
                         }
                         Ok(_) => {}

@@ -47,15 +47,13 @@ impl SubscriptionRoot {
         BroadcastStream::new(rx).filter_map(move |r| {
             let tf = task_id.clone();
             match r {
-                Ok(ev) if tf.as_deref().is_none_or(|id| ev.task_id == id) => {
-                    Some(TaskEventType {
-                        task_id: ev.task_id,
-                        old_status: ev.old_status,
-                        new_status: ev.new_status,
-                        by_did: ev.by_did,
-                        at: ev.at,
-                    })
-                }
+                Ok(ev) if tf.as_deref().is_none_or(|id| ev.task_id == id) => Some(TaskEventType {
+                    task_id: ev.task_id,
+                    old_status: ev.old_status,
+                    new_status: ev.new_status,
+                    by_did: ev.by_did,
+                    at: ev.at,
+                }),
                 _ => None,
             }
         })

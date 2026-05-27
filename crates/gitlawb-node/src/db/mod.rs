@@ -573,10 +573,13 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(|r| {
-            let stars: i64 = r.get("star_count");
-            (row_to_repo(r), stars)
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let stars: i64 = r.get("star_count");
+                (row_to_repo(r), stars)
+            })
+            .collect())
     }
 
     pub async fn list_all_repos_paged(
@@ -615,7 +618,10 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
 
-        let total = rows.first().map(|r| r.get::<i64, _>("total_count")).unwrap_or(0);
+        let total = rows
+            .first()
+            .map(|r| r.get::<i64, _>("total_count"))
+            .unwrap_or(0);
         let out: Vec<(RepoRecord, i64)> = rows
             .into_iter()
             .map(|r| {
@@ -1321,13 +1327,11 @@ impl Db {
     pub async fn prune_self_peers(&self, public_url: &str) -> Result<u64> {
         let trimmed = public_url.trim_end_matches('/');
         let with_slash = format!("{trimmed}/");
-        let result = sqlx::query(
-            "DELETE FROM peers WHERE http_url = $1 OR http_url = $2",
-        )
-        .bind(trimmed)
-        .bind(&with_slash)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("DELETE FROM peers WHERE http_url = $1 OR http_url = $2")
+            .bind(trimmed)
+            .bind(&with_slash)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected())
     }
 }
@@ -1640,10 +1644,7 @@ pub struct RecordAnchorInput<'a> {
 }
 
 impl Db {
-    pub async fn record_arweave_anchor(
-        &self,
-        input: &RecordAnchorInput<'_>,
-    ) -> Result<()> {
+    pub async fn record_arweave_anchor(&self, input: &RecordAnchorInput<'_>) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         sqlx::query(

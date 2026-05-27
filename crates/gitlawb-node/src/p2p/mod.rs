@@ -91,9 +91,7 @@ pub enum P2pCommand {
         reply: oneshot::Sender<Option<DidRecord>>,
     },
     /// Get a snapshot of the swarm status
-    GetStatus {
-        reply: oneshot::Sender<SwarmStatus>,
-    },
+    GetStatus { reply: oneshot::Sender<SwarmStatus> },
 }
 
 /// Handle returned to the rest of the node for sending commands to the swarm.
