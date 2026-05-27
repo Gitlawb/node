@@ -70,7 +70,7 @@ pub async fn list_repo_events(
             record
                 .owner_did
                 .split(':')
-                .last()
+                .next_back()
                 .unwrap_or(&record.owner_did),
             repo_name
         )

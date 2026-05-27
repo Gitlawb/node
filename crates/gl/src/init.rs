@@ -255,7 +255,7 @@ mod tests {
 
         // We can't fully test gl init because it uses std::env::current_dir()
         // but we can test the individual steps
-        let client = NodeClient::new(&server.url(), Some(kp.clone()));
+        let client = NodeClient::new(server.url(), Some(kp.clone()));
 
         // Register
         let body = serde_json::to_vec(&json!({
@@ -298,7 +298,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = NodeClient::new(&server.url(), Some(kp.clone()));
+        let client = NodeClient::new(server.url(), Some(kp.clone()));
         let body = serde_json::to_vec(&json!({
             "did": kp.did().to_string(),
             "capabilities": ["git:push"],
@@ -327,7 +327,7 @@ mod tests {
             .create_async()
             .await;
 
-        let client = NodeClient::new(&server.url(), Some(kp.clone()));
+        let client = NodeClient::new(server.url(), Some(kp.clone()));
         let body = serde_json::to_vec(&json!({"name": "existing", "is_public": true})).unwrap();
         let resp = client.post("/api/v1/repos", &body).await.unwrap();
         let status = resp.status();

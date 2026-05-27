@@ -196,15 +196,6 @@ mod tests {
     use std::process::Command;
     use tempfile::TempDir;
 
-    fn init_bare_repo(dir: &TempDir) {
-        Command::new("git")
-            .args(["init", "--bare"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        // git hash-object -w needs a non-bare repo; use a working repo instead
-    }
-
     fn init_repo(dir: &TempDir) {
         Command::new("git")
             .args(["init"])

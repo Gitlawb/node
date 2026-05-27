@@ -63,7 +63,7 @@ pub async fn pin_git_object(ipfs_api: &str, sha256_hex: &str, data: &[u8]) -> Re
             let v: serde_json::Value = serde_json::from_str(line).ok()?;
             v["Hash"].as_str().map(|s| s.to_string())
         })
-        .last()
+        .next_back()
         .unwrap_or(expected_cid.clone());
 
     tracing::debug!(sha256 = %sha256_hex, %cid, "pinned git object to IPFS");

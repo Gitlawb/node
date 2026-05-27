@@ -22,7 +22,7 @@ impl SubscriptionRoot {
         BroadcastStream::new(rx).filter_map(move |r| {
             let rf = repo.clone();
             match r {
-                Ok(ev) if rf.as_deref().map_or(true, |r| ev.repo == r) => Some(RefUpdateType {
+                Ok(ev) if rf.as_deref().is_none_or(|r| ev.repo == r) => Some(RefUpdateType {
                     repo: ev.repo,
                     ref_name: ev.ref_name,
                     old_sha: ev.old_sha,
@@ -47,7 +47,7 @@ impl SubscriptionRoot {
         BroadcastStream::new(rx).filter_map(move |r| {
             let tf = task_id.clone();
             match r {
-                Ok(ev) if tf.as_deref().map_or(true, |id| ev.task_id == id) => {
+                Ok(ev) if tf.as_deref().is_none_or(|id| ev.task_id == id) => {
                     Some(TaskEventType {
                         task_id: ev.task_id,
                         old_status: ev.old_status,

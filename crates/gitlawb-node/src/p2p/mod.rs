@@ -321,14 +321,12 @@ pub async fn start(
                             kad::Event::OutboundQueryProgressed { id, result, .. }
                         )) => {
                             match result {
-                                kad::QueryResult::GetRecord(Ok(ok)) => {
-                                    if let kad::GetRecordOk::FoundRecord(pr) = ok {
-                                        if let Some(reply) = pending_get_did.remove(&id) {
-                                            let record = serde_json::from_slice::<DidRecord>(
-                                                &pr.record.value
-                                            ).ok();
-                                            let _ = reply.send(record);
-                                        }
+                                kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(pr))) => {
+                                    if let Some(reply) = pending_get_did.remove(&id) {
+                                        let record = serde_json::from_slice::<DidRecord>(
+                                            &pr.record.value
+                                        ).ok();
+                                        let _ = reply.send(record);
                                     }
                                 }
                                 kad::QueryResult::GetRecord(Err(e)) => {

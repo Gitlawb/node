@@ -47,7 +47,7 @@ impl TigrisClient {
         {
             Ok(_) => Ok(true),
             Err(e) => {
-                if e.as_service_error().map_or(false, |e| e.is_not_found()) {
+                if e.as_service_error().is_some_and(|e| e.is_not_found()) {
                     Ok(false)
                 } else {
                     Err(anyhow::anyhow!("tigris HEAD {key}: {e}"))

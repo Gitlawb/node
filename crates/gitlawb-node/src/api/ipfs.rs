@@ -52,7 +52,7 @@ pub async fn get_by_cid(
         .db
         .list_all_repos()
         .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+        .map_err(AppError::Internal)?;
 
     for repo in &repos {
         let repo_path = match state.repo_store.acquire(&repo.owner_did, &repo.name).await {
@@ -105,7 +105,7 @@ pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json:
         .db
         .list_pinned_cids()
         .await
-        .map_err(|e| AppError::Internal(e.into()))?;
+        .map_err(AppError::Internal)?;
 
     Ok(Json(serde_json::json!({
         "pins": pins,

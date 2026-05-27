@@ -1626,18 +1626,23 @@ pub struct ArweaveAnchor {
     pub anchored_at: String,
 }
 
+/// Input parameters for recording an Arweave anchor.
+pub struct RecordAnchorInput<'a> {
+    pub repo: &'a str,
+    pub owner_did: &'a str,
+    pub ref_name: &'a str,
+    pub old_sha: &'a str,
+    pub new_sha: &'a str,
+    pub cid: Option<&'a str>,
+    pub irys_tx_id: &'a str,
+    pub arweave_url: &'a str,
+    pub node_did: &'a str,
+}
+
 impl Db {
     pub async fn record_arweave_anchor(
         &self,
-        repo: &str,
-        owner_did: &str,
-        ref_name: &str,
-        old_sha: &str,
-        new_sha: &str,
-        cid: Option<&str>,
-        irys_tx_id: &str,
-        arweave_url: &str,
-        node_did: &str,
+        input: &RecordAnchorInput<'_>,
     ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -1646,15 +1651,15 @@ impl Db {
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
         )
         .bind(&id)
-        .bind(repo)
-        .bind(owner_did)
-        .bind(ref_name)
-        .bind(old_sha)
-        .bind(new_sha)
-        .bind(cid)
-        .bind(irys_tx_id)
-        .bind(arweave_url)
-        .bind(node_did)
+        .bind(input.repo)
+        .bind(input.owner_did)
+        .bind(input.ref_name)
+        .bind(input.old_sha)
+        .bind(input.new_sha)
+        .bind(input.cid)
+        .bind(input.irys_tx_id)
+        .bind(input.arweave_url)
+        .bind(input.node_did)
         .bind(&now)
         .execute(&self.pool)
         .await?;

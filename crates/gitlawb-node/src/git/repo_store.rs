@@ -233,7 +233,7 @@ impl RepoStore {
     fn local_path(&self, owner_did: &str, repo_name: &str) -> Result<(String, PathBuf)> {
         validate_path_components(owner_did, repo_name)?;
 
-        let owner_slug = owner_did.replace(':', "_").replace('/', "_");
+        let owner_slug = owner_did.replace([':', '/'], "_");
         let local_path = self
             .repos_dir
             .join(&owner_slug)

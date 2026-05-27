@@ -396,6 +396,6 @@ pub fn merge_branch(
 /// Resolve a repo disk path: {repos_dir}/{owner_slug}/{repo_name}.git
 pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> PathBuf {
     // Sanitize the DID for use as a directory name
-    let owner_slug = owner_did.replace(':', "_").replace('/', "_");
+    let owner_slug = owner_did.replace([':', '/'], "_");
     repos_dir.join(owner_slug).join(format!("{repo_name}.git"))
 }

@@ -111,9 +111,9 @@ pub fn arweave_url(tx_id: &str) -> String {
 /// Build the Irys tag header value for Arweave indexing.
 /// Format: comma-separated "name:value" pairs.
 fn build_tags_header(anchor: &RefAnchor) -> String {
-    vec![
-        format!("App-Name:gitlawb"),
-        format!("Schema:gitlawb/ref-update/v1"),
+    [
+        "App-Name:gitlawb".to_string(),
+        "Schema:gitlawb/ref-update/v1".to_string(),
         format!("Repo:{}", sanitize_tag(&anchor.repo)),
         format!("Ref:{}", sanitize_tag(&anchor.ref_name)),
         format!("SHA:{}", &anchor.new_sha[..anchor.new_sha.len().min(16)]),

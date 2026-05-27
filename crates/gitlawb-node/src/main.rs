@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
     info!("  repos dir: {}", config.repos_dir.display());
     info!(
         "  database:  PostgreSQL ({})",
-        &config.database_url.split('@').last().unwrap_or("?")
+        &config.database_url.split('@').next_back().unwrap_or("?")
     );
 
     // Publish our DID record to the Kademlia DHT shortly after startup
@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
     }
 
     // Spawn background gossip: announce to bootstrap peers, then ping known peers periodically
-    if !config.bootstrap_peers.is_empty() || true {
+    {
         let gossip_state = state.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
         tokio::spawn(async move {

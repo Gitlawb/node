@@ -30,7 +30,7 @@ pub async fn list_anchors(
         .db
         .list_arweave_anchors(q.repo.as_deref(), limit)
         .await
-        .map_err(|e| crate::error::AppError::Internal(e.into()))?;
+        .map_err(crate::error::AppError::Internal)?;
 
     Ok(Json(serde_json::json!({
         "anchors": anchors,

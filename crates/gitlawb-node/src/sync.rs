@@ -10,7 +10,7 @@
 //!   3. If it exists → `git fetch --prune` from the origin.
 //!   4. Mark done or failed.
 
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 
 use tracing::{info, warn};
@@ -114,7 +114,7 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
 }
 
 /// Mirror-clone a repo from a remote URL into a local bare repo.
-async fn clone_repo(remote_url: &str, local_path: &PathBuf) -> anyhow::Result<()> {
+async fn clone_repo(remote_url: &str, local_path: &Path) -> anyhow::Result<()> {
     let out = tokio::process::Command::new("git")
         .args([
             "clone",
@@ -134,7 +134,7 @@ async fn clone_repo(remote_url: &str, local_path: &PathBuf) -> anyhow::Result<()
 }
 
 /// Fetch all refs from the remote into an existing mirror repo.
-async fn fetch_repo(local_path: &PathBuf, remote_url: &str) -> anyhow::Result<()> {
+async fn fetch_repo(local_path: &Path, remote_url: &str) -> anyhow::Result<()> {
     let out = tokio::process::Command::new("git")
         .args([
             "-C",

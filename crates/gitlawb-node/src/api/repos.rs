@@ -513,7 +513,7 @@ pub async fn git_receive_pack(
         let owner_short = record
             .owner_did
             .split(':')
-            .last()
+            .next_back()
             .unwrap_or(&record.owner_did);
         let clone_url = format!("{}/{}/{}.git", base_url, owner_short, record.name);
 
@@ -574,7 +574,7 @@ pub async fn git_receive_pack(
             record
                 .owner_did
                 .split(':')
-                .last()
+                .next_back()
                 .unwrap_or(&record.owner_did),
             record.name
         );
@@ -707,15 +707,17 @@ pub async fn git_receive_pack(
                             let arweave_url = crate::arweave::arweave_url(&tx_id);
                             let _ = db_clone
                                 .record_arweave_anchor(
-                                    &repo_slug,
-                                    &owner_did_for_arweave,
-                                    ref_name,
-                                    "0".repeat(64).as_str(),
-                                    new_sha,
-                                    cid.as_deref(),
-                                    &tx_id,
-                                    &arweave_url,
-                                    &node_did_str,
+                                    &crate::db::RecordAnchorInput {
+                                        repo: &repo_slug,
+                                        owner_did: &owner_did_for_arweave,
+                                        ref_name,
+                                        old_sha: "0".repeat(64).as_str(),
+                                        new_sha,
+                                        cid: cid.as_deref(),
+                                        irys_tx_id: &tx_id,
+                                        arweave_url: &arweave_url,
+                                        node_did: &node_did_str,
+                                    },
                                 )
                                 .await;
                         }
@@ -865,7 +867,7 @@ pub async fn fork_repo(
     }
 
     // Check no name conflict under the forker's ownership
-    let forker_short = forker_did.split(':').last().unwrap_or(&forker_did);
+    let forker_short = forker_did.split(':').next_back().unwrap_or(&forker_did);
     if state.db.get_repo(forker_short, &fork_name).await?.is_some() {
         return Err(AppError::BadRequest(format!(
             "you already have a repo named {fork_name}"
@@ -1018,7 +1020,7 @@ fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64
     let owner_short = record
         .owner_did
         .split(':')
-        .last()
+        .next_back()
         .unwrap_or(&record.owner_did);
 
     let base_url = state

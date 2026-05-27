@@ -125,7 +125,7 @@ pub async fn trigger_sync(State(state): State<AppState>) -> Result<Json<serde_js
             ) {
                 (Some(owner), Some(name)) => {
                     // Use short owner (last colon segment) matching DB convention
-                    let short = owner.split(':').last().unwrap_or(owner);
+                    let short = owner.split(':').next_back().unwrap_or(owner);
                     format!("{short}/{name}")
                 }
                 _ => continue,
