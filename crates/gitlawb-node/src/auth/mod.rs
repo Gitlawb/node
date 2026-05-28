@@ -228,6 +228,18 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// Optional variant for rolling upgrades: verify and inject `AuthenticatedDid` when
+/// RFC 9421 signature headers are present, but allow legacy unsigned requests to
+/// continue when no signature attempt was made.
+pub async fn optional_signature(request: Request, next: Next) -> Response {
+    let has_signature_headers = request.headers().contains_key("signature-input")
+        || request.headers().contains_key("signature");
+    if has_signature_headers {
+        return require_signature(request, next).await;
+    }
+    next.run(request).await
+}
+
 fn human_detected(message: &str) -> impl IntoResponse {
     (
         StatusCode::UNAUTHORIZED,

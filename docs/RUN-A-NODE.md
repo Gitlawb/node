@@ -7,7 +7,7 @@ Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earn
 ## Prerequisites
 
 - A wallet with at least **10,000 $GITLAWB** (minimum stake) plus a small amount of ETH on Base for gas
-- Docker or Rust 1.80+ (for running the node process)
+- Docker or Rust 1.85+ (for running the node process)
 - A public HTTP URL (your-host.com) — can be a VPS, Fly.io app, or anything reachable
 
 ---
@@ -69,7 +69,7 @@ docker run -d \
   -e GITLAWB_CONTRACT_NODE_STAKING=$GITLAWB_CONTRACT_NODE_STAKING \
   -e GITLAWB_CHAIN_RPC_URL=$GITLAWB_CHAIN_RPC_URL \
   -e GITLAWB_OPERATOR_STRICT_MODE=true \
-  ghcr.io/gitlawb/gitlawb-node:latest
+  ghcr.io/gitlawb/node:latest
 ```
 
 ### Option B — docker-compose

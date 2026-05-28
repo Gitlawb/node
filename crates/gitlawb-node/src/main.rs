@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
+use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
 
 use config::Config;
@@ -45,6 +46,12 @@ async fn main() -> Result<()> {
     // Merge the embedded seed list of public network nodes into the runtime
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
     bootstrap::merge_seeds(&mut config);
+
+    if !config.public_read {
+        warn!(
+            "GITLAWB_PUBLIC_READ=false is reserved; per-repository private-read enforcement is not wired in alpha"
+        );
+    }
 
     // Load or generate the node's identity keypair
     let keypair = load_or_create_keypair(&config)?;
@@ -285,12 +292,30 @@ async fn gossip_task(state: AppState, bootstrap_peers: Vec<String>) {
 
     // Announce ourselves to each bootstrap peer
     for peer_url in &bootstrap_peers {
-        let announce_url = format!("{}/api/v1/peers/announce", peer_url.trim_end_matches('/'));
+        let path = "/api/v1/peers/announce";
+        let announce_url = format!("{}{}", peer_url.trim_end_matches('/'), path);
         let body = serde_json::json!({
-            "did": my_did,
-            "http_url": my_url,
+            "did": my_did.clone(),
+            "http_url": my_url.clone(),
         });
-        match client.post(&announce_url).json(&body).send().await {
+        let body_bytes = match serde_json::to_vec(&body) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to serialize peer announce body");
+                continue;
+            }
+        };
+        let signed = sign_request(state.node_keypair.as_ref(), "POST", path, &body_bytes);
+        match client
+            .post(&announce_url)
+            .header("Content-Type", "application/json")
+            .header("Content-Digest", signed.content_digest)
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature)
+            .body(body_bytes)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if resp.status().is_success() {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {

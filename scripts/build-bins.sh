@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build gl and git-remote-gitlawb binaries for all platforms.
-# Output goes to web/public/bin/
+# Output goes to dist/bin/
 #
 # Usage:
 #   ./scripts/build-bins.sh                       # linux-x86_64 + linux-arm64
@@ -11,7 +11,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
-OUT="$ROOT/web/public/bin"
+OUT="$ROOT/dist/bin"
 
 mkdir -p "$OUT"
 
