@@ -257,4 +257,105 @@ mod tests {
         // Round-trip
         let _: RefUpdateCert = serde_json::from_str(&json).unwrap();
     }
+
+    #[test]
+    fn validate_structure_rejects_wrong_cert_type() {
+        let kp = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+        cert.body.type_ = "gitlawb/ref-update/v0".to_string();
+        assert!(cert.validate_structure().is_err());
+    }
+
+    #[test]
+    fn validate_structure_rejects_invalid_to_hash() {
+        let kp = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+        cert.body.to = "not-a-valid-sha256".to_string();
+        assert!(cert.validate_structure().is_err());
+    }
+
+    #[test]
+    fn validate_structure_rejects_empty_signatures() {
+        let kp = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+        cert.signatures.clear();
+        assert!(cert.validate_structure().is_err());
+    }
+
+    #[test]
+    fn tampered_signature_fails_verify_all() {
+        let kp = Keypair::generate();
+        let kp2 = Keypair::generate();
+        let mut cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+        // Replace kp's signature with a signature from kp2 over different bytes.
+        // The signer DID still points to kp, so verification must fail.
+        cert.signatures[0].sig = kp2.sign_b64(b"unrelated bytes");
+        assert!(cert.verify_all().is_err());
+    }
+
+    #[test]
+    fn threshold_not_met_when_signer_outside_maintainer_list() {
+        let kp_pusher = Keypair::generate();
+        let kp_maintainer = Keypair::generate();
+
+        let cert = RefUpdateCert::new(
+            kp_pusher.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp_pusher,
+        )
+        .unwrap();
+
+        let maintainers = vec![kp_maintainer.did()];
+        assert!(!cert.satisfies_threshold(&maintainers, 1).unwrap());
+    }
+
+    #[test]
+    fn threshold_zero_is_always_satisfied() {
+        let kp = Keypair::generate();
+        let cert = RefUpdateCert::new(
+            kp.did(),
+            "refs/heads/main".to_string(),
+            dummy_hash('0'),
+            dummy_hash('a'),
+            1,
+            &kp,
+        )
+        .unwrap();
+        assert!(cert.satisfies_threshold(&[], 0).unwrap());
+    }
 }
