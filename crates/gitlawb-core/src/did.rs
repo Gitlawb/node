@@ -252,4 +252,54 @@ mod tests {
         let json = serde_json::to_string_pretty(&doc).unwrap();
         assert!(json.contains("Ed25519VerificationKey2020"));
     }
+
+    #[test]
+    fn to_verifying_key_fails_for_did_web() {
+        let web = Did::web("example.com");
+        let result = web.to_verifying_key();
+        assert!(result.is_err(), "did:web cannot resolve to a verifying key locally");
+    }
+
+    #[test]
+    fn to_verifying_key_fails_for_did_gitlawb() {
+        let gl = Did::gitlawb("z6MkSomeKey");
+        let result = gl.to_verifying_key();
+        assert!(result.is_err(), "did:gitlawb cannot resolve to a verifying key locally");
+    }
+
+    #[test]
+    fn from_str_rejects_missing_did_prefix() {
+        let result = "key:z6MkABCD".parse::<Did>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_str_rejects_unsupported_method() {
+        let result = "did:ethr:0x1234abcd".parse::<Did>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_accepts_all_supported_methods() {
+        Did::web("example.com").validate().unwrap();
+        Did::gitlawb("z6MkSomeKey").validate().unwrap();
+        Keypair::generate().did().validate().unwrap();
+    }
+
+    #[test]
+    fn is_did_key_and_is_did_gitlawb_predicates() {
+        let key_did = Keypair::generate().did();
+        assert!(key_did.is_did_key());
+        assert!(!key_did.is_did_gitlawb());
+
+        let gl = Did::gitlawb("z6MkSomeKey");
+        assert!(!gl.is_did_key());
+        assert!(gl.is_did_gitlawb());
+    }
+
+    #[test]
+    fn method_id_extraction() {
+        assert_eq!(Did::web("example.com").method_id(), "example.com");
+        assert_eq!(Did::gitlawb("z6MkSomeKey").method_id(), "z6MkSomeKey");
+    }
 }
