@@ -129,4 +129,61 @@ mod tests {
         let bytes = sha256_hex_to_bytes(&hex).unwrap();
         assert_eq!(sha256_bytes(data), bytes);
     }
+
+    #[test]
+    fn from_sha256_bytes_matches_object_bytes() {
+        // from_sha256_bytes must produce the same CID as from_git_object_bytes
+        // when given the SHA-256 of those bytes — the two construction paths
+        // must be equivalent for self-verifying content addressing to hold.
+        let data = b"blob 5\0hello";
+        let cid_from_object = Cid::from_git_object_bytes(data);
+        let hash = sha256_bytes(data);
+        let cid_from_hash = Cid::from_sha256_bytes(&hash);
+        assert_eq!(cid_from_object, cid_from_hash);
+    }
+
+    #[test]
+    fn from_str_parses_valid_cid() {
+        let data = b"tree content for test";
+        let cid = Cid::from_git_object_bytes(data);
+        let parsed = Cid::from_str(cid.as_str()).unwrap();
+        assert_eq!(cid, parsed);
+    }
+
+    #[test]
+    fn from_str_rejects_invalid_string() {
+        let result = Cid::from_str("not-a-valid-cid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn different_data_produces_different_cids() {
+        let c1 = Cid::from_git_object_bytes(b"blob 5\0hello");
+        let c2 = Cid::from_git_object_bytes(b"blob 5\0world");
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn sha256_hex_to_bytes_rejects_non_hex() {
+        let non_hex = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        assert_eq!(non_hex.len(), 64);
+        let result = sha256_hex_to_bytes(non_hex);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sha256_hex_to_bytes_rejects_wrong_length() {
+        let result = sha256_hex_to_bytes("deadbeef");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sha256_hex_of_empty_input_is_well_known() {
+        // SHA-256("") is a fixed constant; verifies the hasher is wired correctly.
+        let h = sha256_hex(b"");
+        assert_eq!(
+            h,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
 }
