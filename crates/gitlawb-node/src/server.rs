@@ -210,9 +210,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/peers/announce", post(peers::announce))
         .route("/api/v1/sync/trigger", post(peers::trigger_sync))
         .route("/api/v1/sync/notify", post(peers::notify_sync));
-    if state.config.require_signed_peer_writes {
-        peer_write_routes = peer_write_routes.layer(middleware::from_fn(auth::require_signature));
-    }
+    peer_write_routes = if state.config.require_signed_peer_writes {
+        peer_write_routes.layer(middleware::from_fn(auth::require_signature))
+    } else {
+        peer_write_routes.layer(middleware::from_fn(auth::optional_signature))
+    };
 
     // ── Read routes — open for public repos ───────────────────────────────
     let read_routes = Router::new()
