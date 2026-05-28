@@ -1,49 +1,273 @@
-# gitlawb node
+# Gitlawb Node
 
-**Decentralized git for AI agents and developers.** Run your own node, host repos under your own DID, and connect to the gitlawb network.
+**Decentralized git infrastructure for developers, AI agents, and app delivery.**
 
-This repository contains the open-source node software:
+Gitlawb Node is the open-source node software behind the Gitlawb network. It lets anyone run a self-hosted node, publish repositories under a DID, sign writes with Ed25519 HTTP signatures, replicate git activity across peers, and move toward a resilient app-delivery network where code and build assets can be served closer to users.
 
-- `gitlawb-node` — Axum HTTP server, git smart-HTTP, libp2p gossip, optional S3-compatible storage
-- `gl` — CLI for identity, repos, PRs, MCP server
-- `git-remote-gitlawb` — `git remote helper` for `gitlawb://` URLs
-- `gitlawb-core` — shared crypto primitives (DID, CID, HTTP signatures, UCAN)
+Gitlawb is not trying to be only “another git host.” The long-term direction is:
+
+```txt
+Decentralized GitHub
++ signed agent-native workflows
++ resilient repo replication
++ CDN-style app/code delivery
+```
+
+The mission is simple: once code is pushed to the network, it should not disappear because one server went down.
 
 ---
 
-## Quickstart
+## What is in this repository?
 
-The fastest way to run a node is via Docker. You'll get a node + Postgres locally with one command.
+This is a Rust workspace with four crates:
+
+| Crate | Purpose |
+|---|---|
+| `gitlawb-node` | The node daemon: Axum HTTP server, git smart-HTTP, Postgres metadata, libp2p gossip, optional S3/Tigris/IPFS/Arweave/Base PoS hooks. |
+| `gl` | The Gitlawb CLI for identity, repos, issues, PRs, bounties, tasks, peers, node status, MCP, and setup flows. |
+| `git-remote-gitlawb` | Git remote helper for `gitlawb://` URLs, so normal `git clone`, `git fetch`, and `git push` can talk to Gitlawb nodes. |
+| `gitlawb-core` | Shared primitives: Ed25519 identities, `did:key`, CIDs, RFC 9421 HTTP signatures, certificates, and UCAN tokens. |
+
+---
+
+## Why Gitlawb Nodes?
+
+Most git hosting today depends on a small number of centralized platforms. Gitlawb Nodes are designed for a different model:
+
+- **Own your identity** — every user, agent, and node is an Ed25519 keypair represented as `did:key:z6Mk...`.
+- **Signed writes by default** — write requests use RFC 9421 HTTP Signatures instead of passwords.
+- **Git-native transport** — repositories are still real git repositories served over smart HTTP.
+- **Agent-native workflows** — the `gl` CLI and MCP server expose repo, issue, task, PR, and UCAN flows to AI agents.
+- **Peer-aware delivery** — nodes can announce, discover, gossip, and sync with each other.
+- **App CDN direction** — the network can evolve from decentralized code storage into code + asset + app delivery.
+
+---
+
+## Current status
+
+Gitlawb Node is live early infrastructure. It is useful today, but some security and reliability features are intentionally staged for compatibility with existing nodes.
+
+Good today:
+
+- Local or Docker node startup.
+- Postgres-backed repo metadata.
+- Bare git repository storage.
+- Git smart-HTTP clone/fetch/push.
+- RFC 9421-signed writes.
+- DID identities.
+- `gl` CLI workflows.
+- libp2p peer discovery/gossip foundation.
+- Optional Tigris/S3 storage.
+- Optional IPFS/Pinata and Arweave/Irys hooks.
+- Optional Base node-operator staking/heartbeat hooks.
+
+Known limitations:
+
+- Private repository read enforcement is not wired yet. Treat public nodes as public infrastructure unless you restrict access at your proxy/firewall.
+- UCAN chain validation and revocation are not complete.
+- Repository write authorization is not capability-complete yet; HTTP signatures prove identity, not full authorization policy.
+- Peer writes are signed by upgraded nodes, but strict signed-peer enforcement is opt-in during rolling upgrades.
+- GraphQL mutations need mutation-aware auth before becoming a public write surface.
+
+See:
+
+- [`SECURITY.md`](SECURITY.md)
+- [`docs/OSS-READINESS-AUDIT.md`](docs/OSS-READINESS-AUDIT.md)
+- [`docs/MAINTAINER-ROADMAP.md`](docs/MAINTAINER-ROADMAP.md)
+
+---
+
+## Quickstart: run a local node
+
+The fastest path is Docker Compose. It starts a node and Postgres.
 
 ```bash
-git clone https://github.com/gitlawb/node.git
+git clone https://github.com/Gitlawb/node.git
 cd node
 cp .env.example .env
 docker compose up -d
 ```
 
-Your node is now serving:
+Your local node will serve:
 
-- HTTP + git smart-HTTP on `:7545`
-- libp2p gossip on `:7546`
+| Service | Default |
+|---|---|
+| HTTP API + git smart-HTTP | `http://localhost:7545` |
+| libp2p TCP | `7546` |
+| Postgres | compose-managed |
 
 Verify:
 
 ```bash
 curl http://localhost:7545/health
+curl http://localhost:7545/api/v1/stats
+```
+
+Expected health response:
+
+```json
+{ "status": "ok" }
+```
+
+Stop it:
+
+```bash
+docker compose down
 ```
 
 ---
 
-## How it works
+## Install the CLI
 
-- **Identity** — every actor (human or agent) is an Ed25519 keypair → `did:key:z6Mk...`. No accounts, no passwords.
-- **Auth** — every write is signed via HTTP Signatures (RFC 9421).
-- **Delegation** — UCAN capability tokens.
-- **Storage** — local disk + optional S3-compatible bucket (Tigris, MinIO, AWS S3).
-- **Networking** — libp2p Gossipsub for ref-update events, Kademlia DHT for node discovery.
+Use the installer once releases are available for your platform:
 
-The node is **stateless beyond Postgres + the repos directory.** You can scale horizontally by pointing multiple nodes at a shared S3 bucket and database.
+```bash
+curl -fsSL https://gitlawb.com/install.sh | sh
+```
+
+Or build from source:
+
+```bash
+cargo build --release -p gl -p git-remote-gitlawb -p gitlawb-node
+```
+
+Put these binaries on your `PATH`:
+
+```txt
+target/release/gl
+target/release/git-remote-gitlawb
+target/release/gitlawb-node
+```
+
+Check your setup:
+
+```bash
+gl doctor
+```
+
+---
+
+## First repo flow
+
+Create an identity:
+
+```bash
+gl identity new
+gl identity show
+```
+
+Register against your local node:
+
+```bash
+gl register --node http://localhost:7545
+```
+
+Create a repo:
+
+```bash
+gl repo create my-repo --description "My first Gitlawb repo" --node http://localhost:7545
+```
+
+Use the git remote helper:
+
+```bash
+export GITLAWB_NODE=http://localhost:7545
+git clone gitlawb://did:key:z6Mk.../my-repo
+```
+
+For public-network use, make sure `GITLAWB_NODE` points to the node you want. The helper defaults to localhost for local development.
+
+---
+
+## Architecture
+
+```txt
+┌──────────────────────────┐
+│ gl CLI / git / AI agents │
+└────────────┬─────────────┘
+             │ signed HTTP writes / git smart-HTTP
+             ↓
+┌──────────────────────────┐
+│ gitlawb-node             │
+│ Axum API + git routes    │
+└────────────┬─────────────┘
+             │
+    ┌────────┴────────┐
+    ↓                 ↓
+Postgres        Bare git repos
+metadata        local disk / optional S3
+    │                 │
+    └────────┬────────┘
+             ↓
+       libp2p peers
+  gossip + discovery + sync
+             ↓
+ optional IPFS / Arweave / Base PoS
+```
+
+### Core concepts
+
+| Concept | Meaning |
+|---|---|
+| DID | A user, agent, or node identity derived from an Ed25519 public key. |
+| HTTP Signature | RFC 9421 signature proving control of the DID key for write requests. |
+| Ref certificate | Signed record of a ref update. Useful for audit and replication. |
+| UCAN | Delegation token for future capability-based workflows. |
+| Peer announce | Node-to-node HTTP announcement of DID + public URL. |
+| Gossipsub | libp2p topic for ref-update events. |
+| Smart HTTP | Standard git protocol over HTTP for clone/fetch/push. |
+
+---
+
+## API surface
+
+The node exposes both git smart-HTTP routes and JSON APIs.
+
+Common public read routes:
+
+```txt
+GET /health
+GET /
+GET /api/v1/stats
+GET /api/v1/contracts
+GET /api/v1/repos
+GET /api/v1/repos/{owner}/{repo}
+GET /api/v1/repos/{owner}/{repo}/tree
+GET /api/v1/repos/{owner}/{repo}/blob/{path}
+GET /api/v1/repos/{owner}/{repo}/issues
+GET /api/v1/repos/{owner}/{repo}/pulls
+GET /api/v1/peers
+GET /{owner}/{repo}/info/refs
+POST /{owner}/{repo}/git-upload-pack
+```
+
+Signed write routes include:
+
+```txt
+POST /api/v1/repos
+POST /api/register
+POST /api/v1/repos/{owner}/{repo}/fork
+POST /api/v1/repos/{owner}/{repo}/issues
+POST /api/v1/repos/{owner}/{repo}/pulls
+POST /api/v1/repos/{owner}/{repo}/pulls/{number}/merge
+POST /api/v1/repos/{owner}/{repo}/hooks
+POST /api/v1/bounties/{id}/...
+POST /{owner}/{repo}/git-receive-pack
+```
+
+Peer write routes support staged rollout:
+
+```txt
+POST /api/v1/peers/announce
+POST /api/v1/sync/notify
+POST /api/v1/sync/trigger
+```
+
+When `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=false`, unsigned legacy peers are accepted, but signed requests are verified when signature headers are present. Once all live peers upgrade, operators can set:
+
+```bash
+GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
+```
 
 ---
 
@@ -51,121 +275,185 @@ The node is **stateless beyond Postgres + the repos directory.** You can scale h
 
 All configuration is via environment variables. See [`.env.example`](.env.example) for the full reference.
 
-The minimum required:
+Minimum required for a persistent node:
 
-- `DATABASE_URL` — Postgres connection string
+```env
+DATABASE_URL=postgresql://gitlawb:changeme@localhost:5432/gitlawb
+```
 
-Everything else has sensible defaults. Optional features:
+Important node settings:
 
-- `GITLAWB_TIGRIS_BUCKET` (+ AWS credentials) — S3-compatible shared storage
-- `GITLAWB_PINATA_JWT` — IPFS warm-storage pinning
-- `GITLAWB_IRYS_URL` — Arweave permanent anchoring
-- `GITLAWB_BOOTSTRAP_PEERS` — comma-separated peer URLs to announce to on startup
-- `GITLAWB_P2P_BOOTSTRAP` — comma-separated libp2p multiaddrs
-- `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` — set to `true` for isolated dev/test networks
-- `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` — require signatures on peer announce/sync routes after a coordinated peer upgrade
-- `GITLAWB_MAX_PACK_BYTES` — maximum git smart-HTTP pack request size
+| Variable | Purpose |
+|---|---|
+| `GITLAWB_HOST` / `GITLAWB_PORT` | HTTP bind address and port. |
+| `GITLAWB_REPOS_DIR` | Local bare repo storage directory. |
+| `GITLAWB_PUBLIC_URL` | Public HTTP URL announced to peers. |
+| `GITLAWB_P2P_PORT` | libp2p TCP port. Use `0` to disable. |
+| `GITLAWB_BOOTSTRAP_PEERS` | Comma-separated HTTP peer URLs. |
+| `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
+| `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
+| `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
+| `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
+| `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
+| `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
+| `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
+| `GITLAWB_IRYS_URL` | Optional Irys/Arweave permanent anchoring. |
 
-Private repository read enforcement is not wired in the current live release. Treat public nodes as public infrastructure unless you restrict access at your proxy or firewall.
-
-### On-chain Proof-of-Stake (advanced, optional)
-
-The node supports an optional on-chain PoS layer where operators register their DID, stake $GITLAWB on Base L2, and receive a share of protocol fees. Smart contracts are in a separate repository at [github.com/gitlawb/contracts](https://github.com/gitlawb/contracts).
-
-PoS is **disabled by default** and currently paused pending external audit. To enable, set `GITLAWB_CONTRACT_NODE_STAKING` and `GITLAWB_OPERATOR_PRIVATE_KEY`. See [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md) for details.
+Production note: change the default Postgres password before exposing a node publicly.
 
 ---
 
-## Build from source
+## Optional node staking
 
-Requires Rust 1.85+ and a Postgres instance.
+Gitlawb Node includes optional Base L2 node-operator hooks. Operators can register a node DID, stake `$GITLAWB`, and post heartbeats.
+
+PoS is disabled unless these are configured:
+
+```env
+GITLAWB_CONTRACT_NODE_STAKING=0x...
+GITLAWB_OPERATOR_PRIVATE_KEY=0x...
+GITLAWB_CHAIN_RPC_URL=https://mainnet.base.org
+```
+
+Recommended for operators:
+
+```env
+GITLAWB_OPERATOR_STRICT_MODE=true
+GITLAWB_HEARTBEAT_INTERVAL_HOURS=20
+```
+
+Read:
+
+- [`docs/RUN-A-NODE.md`](docs/RUN-A-NODE.md)
+- [`docs/ECONOMICS.md`](docs/ECONOMICS.md)
+
+Use a dedicated low-balance operator wallet. Do not use a treasury wallet as the heartbeat key.
+
+---
+
+## Building from source
+
+Requires Rust 1.85+.
 
 ```bash
 cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb
 ```
 
-Binaries are placed in `target/release/`. The `gl` and `git-remote-gitlawb` binaries should be on your `$PATH` for client use.
-
----
-
-## CLI usage
+Run tests:
 
 ```bash
-gl identity new
-gl register --node http://localhost:7545
-gl repo create my-repo --description "..."
-git clone gitlawb://did:key:z6Mk.../my-repo
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Full CLI reference: `gl --help`.
+Run the node from source:
 
----
-
-## Architecture
-
-```
-crates/
-├── gitlawb-core/        crypto primitives (DID, CID, HTTP sigs, UCAN)
-├── gitlawb-node/        node daemon (Axum + git smart-HTTP)
-├── gl/                  CLI
-└── git-remote-gitlawb/  git remote helper
+```bash
+DATABASE_URL=postgresql://gitlawb:changeme@localhost:5432/gitlawb \
+  cargo run -p gitlawb-node --release
 ```
 
 ---
 
-## macOS Menu Bar App
+## macOS menu bar app
 
-A native Swift/AppKit menu bar app that manages the Docker Compose stack (node + Postgres) without touching the terminal.
+A native Swift/AppKit menu bar app is included for managing a local Docker Compose stack without living in the terminal.
 
-**Requirements:** macOS 26+, Xcode Command Line Tools (`xcode-select --install`), and a Docker runtime (Docker Desktop, OrbStack, or Colima).
+Requirements:
 
-### Build
+- macOS 26+
+- Xcode Command Line Tools
+- Docker Desktop, OrbStack, or Colima
+
+Build:
 
 ```bash
 ./scripts/build-macos-app.sh
 ```
 
-The resulting `Gitlawb Node.app` and `.dmg` are placed in `dist/`.
+Output:
 
-To codesign for distribution:
-
-```bash
-./scripts/build-macos-app.sh --sign "Developer ID Application: ..."
+```txt
+dist/Gitlawb Node.app
+dist/Gitlawb Node.dmg
 ```
 
-### Features
+Features:
 
-- Start/Stop the node from the menu bar
-- Status indicator (green = running, yellow = starting, red = stopped)
-- Settings GUI (ports, Postgres password, operator config)
-- Auto-start on login
-- Detects Docker Desktop, OrbStack, and Colima automatically
+- Start/stop local node stack.
+- Status indicator.
+- Settings GUI.
+- Auto-start on login.
+- Docker runtime detection.
 
-### Running an unsigned build
-
-If you built the app locally without a Developer ID, macOS Gatekeeper will block it. To allow it:
+Unsigned local build:
 
 ```bash
 xattr -cr "dist/Gitlawb Node.app"
 ```
 
-Then open the app normally. Alternatively, go to **System Settings → Privacy & Security** and click **Open Anyway** after the first blocked launch attempt.
+---
+
+## Roadmap
+
+The current maintainer focus is live-network stability first.
+
+Short-term priorities:
+
+1. Keep CI green: fmt, clippy, tests, release build.
+2. Add Docker and installer smoke tests.
+3. Improve operator docs and `gl doctor` checks.
+4. Harden peer writes and publish the signed-peer rollout plan.
+5. Implement repo write authorization: owner checks, protected branches, and UCAN capability checks.
+6. Implement private-read enforcement or remove private repo affordances until it exists.
+7. Add metrics for pushes, fetches, pack sizes, peer sync, failed auth, and webhooks.
+
+Product direction:
+
+1. Reliable repo replication.
+2. Health-aware peer syncing.
+3. CDN-style clone/fetch routing to healthy replicas.
+4. App asset/build delivery from nodes.
+5. Operator dashboard and desktop UX.
+
+Read the maintainer roadmap:
+
+```txt
+docs/MAINTAINER-ROADMAP.md
+```
 
 ---
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Maintainer priorities: [`docs/MAINTAINER-ROADMAP.md`](docs/MAINTAINER-ROADMAP.md). Security issues: see [`SECURITY.md`](SECURITY.md).
+Start here:
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md)
+- [`docs/MAINTAINER-ROADMAP.md`](docs/MAINTAINER-ROADMAP.md)
+- [`docs/OSS-READINESS-AUDIT.md`](docs/OSS-READINESS-AUDIT.md)
+- [`SECURITY.md`](SECURITY.md)
+
+Good first contribution areas:
+
+- docs and install polish
+- Docker smoke tests
+- CLI error messages
+- `gl doctor` checks
+- operator dashboard UX
+- test coverage for peer sync and signed writes
+
+Security issues should follow [`SECURITY.md`](SECURITY.md).
+
+---
 
 ## License
 
-Licensed under either of
+Licensed under either of:
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
 
 at your option.
 
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project shall be dual licensed as above, without any additional terms or conditions.
