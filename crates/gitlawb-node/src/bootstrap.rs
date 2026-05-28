@@ -11,7 +11,7 @@
 
 use std::str::FromStr;
 
-use libp2p::Multiaddr;
+use libp2p_core::Multiaddr;
 use serde::Deserialize;
 use tracing::{info, warn};
 

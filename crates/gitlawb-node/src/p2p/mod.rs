@@ -3,7 +3,6 @@
 //! Provides:
 //!   - Peer discovery via Kademlia DHT (DID → multiaddr mapping)
 //!   - Real-time ref-update events via Gossipsub
-//!   - Local network discovery via mDNS
 //!
 //! The node's PeerId is derived from its Ed25519 identity keypair,
 //! so the gitlawb DID and libp2p PeerId share the same key.
@@ -15,12 +14,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
-use libp2p::futures::StreamExt;
-use libp2p::{
-    gossipsub, identify, kad, mdns, noise,
-    swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, PeerId,
-};
+use futures::StreamExt;
+use libp2p_core::{muxing::StreamMuxerBox, Multiaddr, PeerId, Transport};
+use libp2p_gossipsub as gossipsub;
+use libp2p_identify as identify;
+use libp2p_identity as identity;
+use libp2p_kad as kad;
+use libp2p_swarm::{NetworkBehaviour, Swarm, SwarmEvent};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -152,11 +152,11 @@ fn did_to_kad_key(did: &str) -> kad::RecordKey {
 
 /// Combined libp2p behaviour.
 #[derive(NetworkBehaviour)]
+#[behaviour(prelude = "libp2p_swarm::derive_prelude")]
 struct GitlawbBehaviour {
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
-    mdns: mdns::tokio::Behaviour,
 }
 
 /// Start the libp2p swarm. Returns a handle for sending commands and the
@@ -183,7 +183,7 @@ pub async fn start(
         seed_bytes[i * 8..(i + 1) * 8].copy_from_slice(&seed.wrapping_add(i as u64).to_le_bytes());
     }
 
-    let local_key = libp2p::identity::Keypair::ed25519_from_bytes(seed_bytes)
+    let local_key = identity::Keypair::ed25519_from_bytes(seed_bytes)
         .map_err(|e| anyhow::anyhow!("failed to create p2p keypair: {e}"))?;
     let local_peer_id = PeerId::from(local_key.public());
 
@@ -196,64 +196,52 @@ pub async fn start(
         local_peer_id,
     };
 
-    // Build the swarm
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(local_key)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_behaviour(|key| {
-            let peer_id = PeerId::from(key.public());
+    let kad_store = kad::store::MemoryStore::new(local_peer_id);
+    let mut kademlia = kad::Behaviour::new(local_peer_id, kad_store);
+    kademlia.set_mode(Some(kad::Mode::Server));
 
-            // Kademlia
-            let kad_store = kad::store::MemoryStore::new(peer_id);
-            let mut kademlia = kad::Behaviour::new(peer_id, kad_store);
-            kademlia.set_mode(Some(kad::Mode::Server));
+    let gossipsub_config = gossipsub::ConfigBuilder::default()
+        .heartbeat_interval(Duration::from_secs(10))
+        .validation_mode(gossipsub::ValidationMode::Permissive)
+        .message_id_fn(|msg: &gossipsub::Message| {
+            let mut h = DefaultHasher::new();
+            msg.data.hash(&mut h);
+            gossipsub::MessageId::from(h.finish().to_string())
+        })
+        .build()
+        .expect("gossipsub config");
+    let gossipsub = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(local_key.clone()),
+        gossipsub_config,
+    )
+    .expect("gossipsub behaviour");
 
-            // Gossipsub — message_id based on content hash to deduplicate
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10))
-                .validation_mode(gossipsub::ValidationMode::Permissive)
-                .message_id_fn(|msg: &gossipsub::Message| {
-                    let mut h = DefaultHasher::new();
-                    msg.data.hash(&mut h);
-                    gossipsub::MessageId::from(h.finish().to_string())
-                })
-                .build()
-                .expect("gossipsub config");
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )
-            .expect("gossipsub behaviour");
+    let identify = identify::Behaviour::new(identify::Config::new(
+        "/gitlawb/1.0.0".to_string(),
+        local_key.public(),
+    ));
 
-            // Identify — so peers can exchange their observed addresses
-            let identify = identify::Behaviour::new(identify::Config::new(
-                "/gitlawb/1.0.0".to_string(),
-                key.public(),
-            ));
-
-            // mDNS — local network peer discovery
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-                .expect("mdns behaviour");
-
-            GitlawbBehaviour {
-                kademlia,
-                gossipsub,
-                identify,
-                mdns,
-            }
-        })?
-        .build();
+    let behaviour = GitlawbBehaviour {
+        kademlia,
+        gossipsub,
+        identify,
+    };
+    let transport = libp2p_quic::tokio::Transport::new(libp2p_quic::Config::new(&local_key))
+        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
+        .boxed();
+    let mut swarm = Swarm::new(
+        transport,
+        behaviour,
+        local_peer_id,
+        libp2p_swarm::Config::with_tokio_executor(),
+    );
 
     // Subscribe to the ref-updates topic
     let topic = gossipsub::IdentTopic::new(REF_UPDATES_TOPIC);
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     // Listen
-    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{listen_port}").parse()?;
+    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
     swarm.listen_on(listen_addr)?;
 
     // Bootstrap Kademlia with known peers
@@ -343,15 +331,6 @@ pub async fn start(
                             }
                         }
 
-                        SwarmEvent::Behaviour(GitlawbBehaviourEvent::Mdns(
-                            mdns::Event::Discovered(peers)
-                        )) => {
-                            for (peer_id, addr) in peers {
-                                debug!(peer = %peer_id, addr = %addr, "mDNS discovered peer");
-                                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
-                                let _ = swarm.dial(addr);
-                            }
-                        }
                         SwarmEvent::Behaviour(GitlawbBehaviourEvent::Identify(
                             identify::Event::Received { peer_id, info, .. }
                         )) => {

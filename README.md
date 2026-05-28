@@ -93,7 +93,7 @@ Your local node will serve:
 | Service | Default |
 |---|---|
 | HTTP API + git smart-HTTP | `http://localhost:7545` |
-| libp2p TCP | `7546` |
+| libp2p QUIC/UDP | `7546` |
 | Postgres | compose-managed |
 
 Verify:
@@ -288,7 +288,7 @@ Important node settings:
 | `GITLAWB_HOST` / `GITLAWB_PORT` | HTTP bind address and port. |
 | `GITLAWB_REPOS_DIR` | Local bare repo storage directory. |
 | `GITLAWB_PUBLIC_URL` | Public HTTP URL announced to peers. |
-| `GITLAWB_P2P_PORT` | libp2p TCP port. Use `0` to disable. |
+| `GITLAWB_P2P_PORT` | libp2p QUIC/UDP port. Use `0` to disable. |
 | `GITLAWB_BOOTSTRAP_PEERS` | Comma-separated HTTP peer URLs. |
 | `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
@@ -333,7 +333,7 @@ Use a dedicated low-balance operator wallet. Do not use a treasury wallet as the
 
 ## Building from source
 
-Requires Rust 1.85+.
+Requires Rust 1.91+.
 
 ```bash
 cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb

@@ -24,7 +24,7 @@ services:
         condition: service_healthy
     ports:
       - "${GITLAWB_PORT:-7545}:${GITLAWB_PORT:-7545}"    # HTTP API + git smart-HTTP
-      - "${GITLAWB_P2P_PORT:-7546}:${GITLAWB_P2P_PORT:-7546}"    # libp2p
+      - "${GITLAWB_P2P_PORT:-7546}:${GITLAWB_P2P_PORT:-7546}/udp"    # libp2p QUIC
     volumes:
       - gitlawb-data:/data
     environment:

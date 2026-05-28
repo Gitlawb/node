@@ -65,12 +65,12 @@ pub struct Config {
     )]
     pub pinata_upload_url: String,
 
-    /// libp2p TCP port (0 = disabled)
+    /// libp2p QUIC/UDP port (0 = disabled)
     #[arg(long, env = "GITLAWB_P2P_PORT", default_value_t = 7546)]
     pub p2p_port: u16,
 
     /// libp2p bootstrap multiaddrs (comma-separated)
-    /// Example: /ip4/1.2.3.4/tcp/7546/p2p/12D3KooW...
+    /// Example: /ip4/1.2.3.4/udp/7546/quic-v1/p2p/12D3KooW...
     #[arg(long, env = "GITLAWB_P2P_BOOTSTRAP", value_delimiter = ',')]
     pub p2p_bootstrap: Vec<String>,
 

@@ -31,7 +31,7 @@ primary_region = "iad"
     idle_timeout = 600
 
 [[services]]
-  protocol = "tcp"
+  protocol = "udp"
   internal_port = 7546
 
   [[services.ports]]

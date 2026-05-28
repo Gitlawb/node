@@ -32,6 +32,8 @@ docker build -t gitlawb-node:oss-audit .
 - `cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb` passed.
 - `target/release/gitlawb-node --version` and `target/release/gl --version` report `0.3.9`.
 - `git-remote-gitlawb` has no `--version` flag; release smoke tests should use a helper-specific invocation.
+- Open Rust Dependabot alerts were removed from the active dependency graph by upgrading vulnerable crates and switching P2P from TCP/Yamux to QUIC/UDP.
+- `cargo-audit` is not installed in this environment, so advisory validation used GitHub Dependabot API output plus `cargo tree`/`Cargo.lock` checks.
 - Full Docker image build could not run in this environment because the Docker CLI is installed but the Docker Desktop Linux engine pipe is not available.
 - `bash -n install.sh` could not run in this Windows environment because `bash` is routed through WSL and WSL has no `/bin/bash` installed.
 
@@ -40,17 +42,18 @@ Recommended next CI additions:
 - Add a PR Docker image smoke test (`docker build` plus `gitlawb-node --version`).
 - Add installer smoke tests for Linux/macOS archive names and extraction layout.
 - Add `cargo audit` or equivalent advisory reporting, with documented ignores for accepted advisories.
-- Add an MSRV check if Rust 1.85+ is a supported contract.
+- Add an MSRV check so Rust 1.91+ remains an explicit supported contract.
 
 ## Install and docs accuracy
 
 Fixed in this pass:
 
 - `install.sh` now downloads from `Gitlawb/node`, matches release asset names (`gitlawb-node-<version>-<target>.tar.gz`), handles `--version vX.Y.Z`, extracts the packaged directory, verifies checksums, and installs `gl`, `git-remote-gitlawb`, and `gitlawb-node` when present.
-- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.85+`) and the release workflow's GHCR image path (`ghcr.io/gitlawb/node:latest`).
+- `docs/RUN-A-NODE.md` now matches the README Rust requirement (`1.91+`) and the release workflow's GHCR image path (`ghcr.io/gitlawb/node:latest`).
 - `docs/ECONOMICS.md` no longer claims this repo ships a `keeper-distribute.yml` workflow that is not present.
 - `.env.example` now distinguishes HTTP bootstrap peers from libp2p multiaddrs and documents seed-list opt-out.
 - `scripts/build-bins.sh` now writes to `dist/bin` instead of a missing `web/public/bin` path.
+- P2P docs/config now describe QUIC/UDP on `GITLAWB_P2P_PORT`; Docker and Fly configs expose that port as UDP.
 
 Remaining doc caveats:
 

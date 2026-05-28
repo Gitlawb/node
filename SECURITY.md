@@ -42,10 +42,9 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 
 ## Dependency Vulnerability Status
 
-| Crate | Advisory | Severity | Status |
-|-------|----------|----------|--------|
-| `rsa 0.9.x` | RUSTSEC-2023-0071 Marvin Attack | Medium | Unexploitable — bundled via `sqlx-mysql` internals; gitlawb uses PostgreSQL only, MySQL auth code is never executed. No upstream fix available. |
-| `lru 0.12.x` | RUSTSEC-2026-0002 unsound IterMut | Warning | In `libp2p-swarm`; the specific unsafe code path is internal to libp2p and not reachable through gitlawb's usage. No upstream fix yet. |
+| Area | Status |
+|------|--------|
+| Dependabot alerts | Current open Rust alerts were addressed by updating vulnerable dependencies, removing libp2p mDNS, and moving P2P transport from TCP/Yamux to QUIC/UDP. |
 
 ---
 

@@ -58,7 +58,7 @@ Smart contracts live in a separate repo: [github.com/Gitlawb/contracts](https://
 ## Development environment
 
 **Requirements:**
-- Rust stable (≥ 1.85) — install via [rustup](https://rustup.rs)
+- Rust stable (≥ 1.91) — install via [rustup](https://rustup.rs)
 - PostgreSQL — required for the node. Use the bundled `docker-compose.yml` for local dev.
 - Docker (optional, for full-stack local testing)
 
