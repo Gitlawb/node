@@ -14,7 +14,7 @@ impl NodeClient {
     pub fn new(node_url: impl Into<String>, keypair: Option<Keypair>) -> Self {
         let inner = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .user_agent("gl/0.2.0 gitlawb-cli")
+            .user_agent(format!("gl/{} gitlawb-cli", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("failed to build HTTP client");
         Self {

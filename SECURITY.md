@@ -16,7 +16,7 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 
 ## Current Security Architecture
 
-### What is production-ready (v0.1)
+### Current live security controls
 
 **Ed25519 identity and HTTP Signatures**
 - Every write operation is signed with RFC 9421 HTTP Signatures
@@ -51,25 +51,37 @@ We will acknowledge receipt within 48 hours and aim to release a fix within 14 d
 
 ## Known Limitations (Planned for v0.2)
 
-These are **documented, accepted limitations** for the current testnet release. They will be addressed before mainnet.
+These are **documented, accepted limitations** for the current live release and should be prioritized without breaking existing nodes during rolling upgrades.
 
 ### UCAN chain validation
 - The auth middleware verifies HTTP Signatures and token structure, but does not yet walk the full UCAN delegation chain.
 - **Impact:** A node cannot yet enforce fine-grained capability delegation. Currently, any registered agent with a valid HTTP Signature can push.
-- **Mitigation:** Nodes can set `GITLAWB_PUBLIC_READ=false` to restrict access. The v0.1 trust score system provides soft rate limiting.
+- **Mitigation:** Keep write endpoints signed, treat public nodes as public infrastructure, and treat trust scores as soft rate-limiting signals rather than authorization.
 - **Fix target:** v0.2
 
 ### UCAN revocation
 - Issued UCAN tokens cannot be revoked before expiry.
 - **Impact:** If a keypair is compromised, the attacker retains access until the UCAN expires (default: 30 days).
-- **Mitigation:** Regenerate your identity (`gl identity new --force`) and re-register to issue a new UCAN. Nodes will reject the old DID on sight if manually blocklisted.
+- **Mitigation:** Regenerate your identity (`gl identity new --force`) and re-register to issue a new UCAN. Until revocation/blocklisting is implemented, operators should remove compromised DIDs directly from their local database.
 - **Fix target:** v0.2
 
 ### git-receive-pack authentication
-- The `git-receive-pack` endpoint enforces HTTP Signature auth via the `git-remote-gitlawb` remote helper. Direct HTTP push without the helper is currently unauthenticated on v0.1 nodes.
-- **Impact:** A node operator accepting direct HTTP git pushes (not via `gitlawb://`) cannot verify the pusher's identity.
-- **Mitigation:** Use `gitlawb://` remote URLs. Do not expose `POST /*/git-receive-pack` to untrusted networks.
+- The `git-receive-pack` endpoint enforces HTTP Signature auth. Plain Git smart-HTTP clients do not generate those headers, so the `git-remote-gitlawb` helper is required for pushes.
+- **Impact:** Direct HTTP pushes without RFC 9421 headers are rejected; users need `gitlawb://` remotes or equivalent signed clients.
+- **Mitigation:** Use `gitlawb://` remote URLs and keep `git-remote-gitlawb` on the user's `PATH`.
 - **Fix target:** v0.2
+
+### Private repository reads
+- Repository records have an `is_public` field and the node exposes `GITLAWB_PUBLIC_READ`, but per-repository private-read enforcement is not wired in the current live release.
+- **Impact:** Do not store private repositories or secrets on public nodes.
+- **Mitigation:** Run isolated nodes for non-public data and restrict network access at the reverse proxy or firewall layer.
+- **Fix target:** v0.2
+
+### Peer route hardening rollout
+- Peer announce and sync notification routes accept signed requests and verify DID matches when a signature is present.
+- **Impact:** Unsigned peer writes are still accepted by default so existing live nodes can keep communicating during rolling upgrades.
+- **Mitigation:** After all active peers run signed-node builds, operators can set `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true`.
+- **Fix target:** staged rollout
 
 ---
 

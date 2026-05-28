@@ -589,6 +589,7 @@ pub async fn git_receive_pack(
         let irys_url = state.config.irys_url.clone();
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
+        let node_keypair = Arc::clone(&state.node_keypair);
         tokio::spawn(async move {
             let pinned = crate::pinata::pin_new_objects(
                 &http_client,
@@ -645,17 +646,40 @@ pub async fn git_receive_pack(
                             continue;
                         }
                     }
-                    let notify_url = format!("{peer_url}/api/v1/sync/notify");
+                    let path = "/api/v1/sync/notify";
+                    let notify_url = format!("{peer_url}{path}");
                     let body = serde_json::json!({
-                        "repo": repo_slug,
+                        "repo": repo_slug.clone(),
                         "ref_name": ref_updates_clone.first().map(|(r, _)| r).unwrap_or(&String::new()),
                         "new_sha": ref_updates_clone.first().map(|(_, s)| s).unwrap_or(&String::new()),
-                        "node_did": node_did_str,
-                        "pusher_did": pusher_did_clone,
+                        "node_did": node_did_str.clone(),
+                        "pusher_did": pusher_did_clone.clone(),
                         "old_sha": "0000000000000000000000000000000000000000",
                         "timestamp": chrono::Utc::now().to_rfc3339(),
                     });
-                    match http_client.post(&notify_url).json(&body).send().await {
+                    let body_bytes = match serde_json::to_vec(&body) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            tracing::warn!(peer = %peer.did, err = %e, "failed to serialize peer sync notify");
+                            continue;
+                        }
+                    };
+                    let signed = gitlawb_core::http_sig::sign_request(
+                        node_keypair.as_ref(),
+                        "POST",
+                        path,
+                        &body_bytes,
+                    );
+                    match http_client
+                        .post(&notify_url)
+                        .header("Content-Type", "application/json")
+                        .header("Content-Digest", signed.content_digest)
+                        .header("Signature-Input", signed.signature_input)
+                        .header("Signature", signed.signature)
+                        .body(body_bytes)
+                        .send()
+                        .await
+                    {
                         Ok(r) if r.status().is_success() => {
                             tracing::info!(peer = %peer.did, repo = %repo_slug, "notified peer to sync")
                         }

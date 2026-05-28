@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use std::path::PathBuf;
 
 use crate::http::NodeClient;
+use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
 pub struct SyncArgs {
@@ -11,6 +13,10 @@ pub struct SyncArgs {
     /// Node URL
     #[arg(long, env = "GITLAWB_NODE", default_value = "https://node.gitlawb.com")]
     pub node: String,
+
+    /// Identity directory for signed sync trigger requests
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -22,10 +28,10 @@ pub enum SyncCmd {
 }
 
 pub async fn run(args: SyncArgs) -> Result<()> {
-    let client = NodeClient::new(&args.node, None);
-
     match args.cmd {
         SyncCmd::Trigger => {
+            let keypair = load_keypair_from_dir(args.dir.as_deref()).ok();
+            let client = NodeClient::new(&args.node, keypair);
             let resp: serde_json::Value = client
                 .post("/api/v1/sync/trigger", b"{}")
                 .await?
@@ -39,6 +45,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
             println!("  worker picks up within 30s");
         }
         SyncCmd::Status => {
+            let client = NodeClient::new(&args.node, None);
             // Just show peer list and node stats for now
             let stats: serde_json::Value = client.get("/api/v1/stats").await?.json().await?;
             let peers: serde_json::Value = client.get("/api/v1/peers").await?.json().await?;

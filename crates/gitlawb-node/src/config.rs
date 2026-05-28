@@ -28,7 +28,7 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_KEY", default_value = "~/.gitlawb/identity.pem")]
     pub key_path: String,
 
-    /// Allow unauthenticated reads (default: true for public repos)
+    /// Reserved for private-read mode; per-repo read enforcement is not wired in alpha
     #[arg(long, env = "GITLAWB_PUBLIC_READ", default_value_t = true)]
     pub public_read: bool,
 
@@ -39,6 +39,15 @@ pub struct Config {
     /// Comma-separated list of bootstrap peer URLs to announce to on startup
     #[arg(long, env = "GITLAWB_BOOTSTRAP_PEERS", value_delimiter = ',')]
     pub bootstrap_peers: Vec<String>,
+
+    /// Require RFC 9421 signatures on peer announce/sync write routes.
+    /// Keep false during rolling upgrades so existing live nodes can still gossip.
+    #[arg(
+        long,
+        env = "GITLAWB_REQUIRE_SIGNED_PEER_WRITES",
+        default_value_t = false
+    )]
+    pub require_signed_peer_writes: bool,
 
     /// URL of local IPFS/Kubo node HTTP API (e.g. http://127.0.0.1:5001)
     #[arg(long, env = "GITLAWB_IPFS_API", default_value = "")]

@@ -10,11 +10,13 @@
 //!   POST /api/v1/sync/notify           — receive push notification from a peer node
 //!   POST /api/v1/sync/trigger          — manually pull all repos from known peers
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use gitlawb_core::did::Did;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
@@ -61,8 +63,26 @@ pub async fn list_peers(State(state): State<AppState>) -> Result<Json<serde_json
 /// The Authorization header's DID must match the `did` in the body.
 pub async fn announce(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
     Json(req): Json<AnnounceRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
+    let announced_did: Did = req
+        .did
+        .parse()
+        .map_err(|e: gitlawb_core::Error| AppError::BadRequest(e.to_string()))?;
+    if let Some(Extension(auth)) = auth {
+        if auth.0 != announced_did.to_string() {
+            return Err(AppError::BadRequest(
+                "Signature keyid must match announced DID".into(),
+            ));
+        }
+    } else {
+        tracing::warn!(
+            did = %announced_did,
+            "accepted unsigned peer announce; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
+        );
+    }
+
     // Validate the URL is HTTP/HTTPS
     if !req.http_url.starts_with("http://") && !req.http_url.starts_with("https://") {
         return Err(AppError::BadRequest(
@@ -167,8 +187,22 @@ pub struct NotifyRequest {
 
 pub async fn notify_sync(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
     Json(req): Json<NotifyRequest>,
 ) -> Result<Json<serde_json::Value>> {
+    if let Some(Extension(auth)) = auth {
+        if auth.0 != req.node_did {
+            return Err(AppError::BadRequest(
+                "Signature keyid must match notification node_did".into(),
+            ));
+        }
+    } else {
+        tracing::warn!(
+            did = %req.node_did,
+            "accepted unsigned sync notify; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
+        );
+    }
+
     // Only accept notifications from known peers
     let peers = state.db.list_peers().await?;
     let known = peers.iter().any(|p| p.did == req.node_did);

@@ -167,6 +167,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/bounties/{id}/cancel",
             post(bounties::cancel_bounty),
         )
+        .route(
+            "/api/v1/bounties/{id}/dispute",
+            post(bounties::dispute_bounty),
+        )
         .layer(middleware::from_fn(auth::require_signature));
 
     // ── Bounty routes (read — open) ──────────────────────────────────────
@@ -177,10 +181,6 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/bounties", get(bounties::list_all_bounties))
         .route("/api/v1/bounties/{id}", get(bounties::get_bounty))
-        .route(
-            "/api/v1/bounties/{id}/dispute",
-            post(bounties::dispute_bounty),
-        )
         .route("/api/v1/bounties/stats", get(bounties::bounty_stats))
         .route(
             "/api/v1/agents/{did}/bounties",
@@ -200,14 +200,19 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn(auth::require_signature));
 
     // ── Peer discovery routes ─────────────────────────────────────────────
-    // announce is intentionally unauthenticated — nodes announce by DID which
-    // is self-proving; rate-limiting and blocklisting are handled elsewhere.
+    // Peer writes accept signatures when present and can require them after a
+    // coordinated live-network upgrade.
     let peer_read_routes = Router::new()
         .route("/api/v1/peers", get(peers::list_peers))
+        .route("/api/v1/peers/{did}/ping", get(peers::ping_peer));
+
+    let mut peer_write_routes = Router::new()
         .route("/api/v1/peers/announce", post(peers::announce))
-        .route("/api/v1/peers/{did}/ping", get(peers::ping_peer))
         .route("/api/v1/sync/trigger", post(peers::trigger_sync))
         .route("/api/v1/sync/notify", post(peers::notify_sync));
+    if state.config.require_signed_peer_writes {
+        peer_write_routes = peer_write_routes.layer(middleware::from_fn(auth::require_signature));
+    }
 
     // ── Read routes — open for public repos ───────────────────────────────
     let read_routes = Router::new()
@@ -331,6 +336,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(issue_write_routes)
         .merge(read_routes)
         .merge(peer_read_routes)
+        .merge(peer_write_routes)
         .merge(ipfs_routes)
         .merge(arweave_routes)
         .merge(meta_routes)

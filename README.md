@@ -62,6 +62,11 @@ Everything else has sensible defaults. Optional features:
 - `GITLAWB_IRYS_URL` — Arweave permanent anchoring
 - `GITLAWB_BOOTSTRAP_PEERS` — comma-separated peer URLs to announce to on startup
 - `GITLAWB_P2P_BOOTSTRAP` — comma-separated libp2p multiaddrs
+- `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` — set to `true` for isolated dev/test networks
+- `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` — require signatures on peer announce/sync routes after a coordinated peer upgrade
+- `GITLAWB_MAX_PACK_BYTES` — maximum git smart-HTTP pack request size
+
+Private repository read enforcement is not wired in the current live release. Treat public nodes as public infrastructure unless you restrict access at your proxy or firewall.
 
 ### On-chain Proof-of-Stake (advanced, optional)
 
@@ -150,7 +155,7 @@ Then open the app normally. Alternatively, go to **System Settings → Privacy &
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: see [`SECURITY.md`](SECURITY.md).
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Maintainer priorities: [`docs/MAINTAINER-ROADMAP.md`](docs/MAINTAINER-ROADMAP.md). Security issues: see [`SECURITY.md`](SECURITY.md).
 
 ## License
 

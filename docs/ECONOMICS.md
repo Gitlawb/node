@@ -114,7 +114,7 @@ The caller of `distribute()` receives 1% of the pot. At 100k weekly, that's 1,00
 
 Why: removes operational burden. Even if the official keeper misses a run, any staker or searcher has financial incentive to call it.
 
-Repo ships a GitHub Actions workflow (`keeper-distribute.yml`) that runs Sundays as a default keeper — the wallet it uses self-funds its gas from the 1% reward.
+Operators can run a weekly keeper job that calls `distribute()`; the caller wallet self-funds its gas from the 1% reward.
 
 ---
 

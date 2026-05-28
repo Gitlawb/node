@@ -316,6 +316,7 @@ pub async fn cancel_bounty(
 /// POST /api/v1/bounties/{id}/dispute
 pub async fn dispute_bounty(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path(id): Path<String>,
 ) -> Result<Json<BountyRecord>> {
     let bounty = state
@@ -344,7 +345,7 @@ pub async fn dispute_bounty(
     }
 
     state.db.dispute_bounty(&id).await?;
-    tracing::info!(bounty_id = %id, "bounty disputed — reopened");
+    tracing::info!(bounty_id = %id, actor = %auth.0, "bounty disputed - reopened");
 
     let updated = state
         .db
