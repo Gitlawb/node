@@ -157,4 +157,60 @@ mod tests {
         let did = kp.did();
         assert!(did.to_string().starts_with("did:key:z6Mk"));
     }
+
+    #[test]
+    fn from_seed_round_trip() {
+        let kp = Keypair::generate();
+        let seed = kp.to_seed();
+        let kp2 = Keypair::from_seed(&seed).unwrap();
+        assert_eq!(kp.verifying_key(), kp2.verifying_key());
+    }
+
+    #[test]
+    fn sign_b64_decodes_to_valid_signature() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let kp = Keypair::generate();
+        let msg = b"test payload for b64 signing";
+        let b64 = kp.sign_b64(msg);
+        let sig_bytes: [u8; 64] = URL_SAFE_NO_PAD
+            .decode(&b64)
+            .expect("sign_b64 must produce valid base64url")
+            .try_into()
+            .expect("Ed25519 signature must be 64 bytes");
+        verify(&kp.verifying_key(), msg, &sig_bytes).unwrap();
+    }
+
+    #[test]
+    fn verify_rejects_wrong_key() {
+        let kp1 = Keypair::generate();
+        let kp2 = Keypair::generate();
+        let msg = b"some message";
+        let sig = kp1.sign(msg);
+        let result = verify(&kp2.verifying_key(), msg, &sig.to_bytes());
+        assert!(result.is_err(), "signature from kp1 must not verify under kp2");
+    }
+
+    #[test]
+    fn signed_payload_round_trip() {
+        let kp = Keypair::generate();
+        let payload = serde_json::json!({"action": "push", "repo": "my-repo"});
+        let signed = Signed::new(payload, &kp).unwrap();
+        signed.verify(&kp.verifying_key()).unwrap();
+    }
+
+    #[test]
+    fn signed_payload_wrong_key_fails() {
+        let kp1 = Keypair::generate();
+        let kp2 = Keypair::generate();
+        let payload = serde_json::json!({"action": "push"});
+        let signed = Signed::new(payload, &kp1).unwrap();
+        let result = signed.verify(&kp2.verifying_key());
+        assert!(result.is_err(), "Signed payload must not verify under a different key");
+    }
+
+    #[test]
+    fn from_pem_invalid_input_fails() {
+        let result = Keypair::from_pem("this is not valid PEM at all");
+        assert!(result.is_err());
+    }
 }
