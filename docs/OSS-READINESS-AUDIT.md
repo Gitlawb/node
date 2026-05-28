@@ -33,7 +33,7 @@ docker build -t gitlawb-node:oss-audit .
 - `target/release/gitlawb-node --version` and `target/release/gl --version` report `0.3.9`.
 - `git-remote-gitlawb` has no `--version` flag; release smoke tests should use a helper-specific invocation.
 - Open Rust Dependabot alerts were removed from the active dependency graph by upgrading vulnerable crates and switching P2P from TCP/Yamux to QUIC/UDP.
-- `cargo-audit` is not installed in this environment, so advisory validation used GitHub Dependabot API output plus `cargo tree`/`Cargo.lock` checks.
+- `cargo-audit` is not installed in this environment, so advisory validation used GitHub Dependabot API output plus `cargo tree`/`Cargo.lock` checks confirming the alerted vulnerable package versions are no longer present.
 - Full Docker image build could not run in this environment because the Docker CLI is installed but the Docker Desktop Linux engine pipe is not available.
 - `bash -n install.sh` could not run in this Windows environment because `bash` is routed through WSL and WSL has no `/bin/bash` installed.
 
