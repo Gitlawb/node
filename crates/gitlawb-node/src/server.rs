@@ -31,6 +31,19 @@ async fn graphql_playground() -> impl IntoResponse {
     ))
 }
 
+/// Applies the standard auth middleware pair to a router: HTTP Signature verification
+/// followed by UCAN chain validation. The two layers run in this order for every
+/// matched request: `require_signature` first (sets `AuthenticatedDid`), then
+/// `require_ucan_chain` (reads it).
+fn add_auth_layers(router: Router<AppState>, state: AppState) -> Router<AppState> {
+    router
+        .layer(middleware::from_fn_with_state(
+            state,
+            auth::require_ucan_chain,
+        ))
+        .layer(middleware::from_fn(auth::require_signature))
+}
+
 pub fn build_router(state: AppState) -> Router {
     // ── GraphQL routes ─────────────────────────────────────────────────────
     let schema = state.graphql_schema.as_ref().clone();
@@ -39,16 +52,14 @@ pub fn build_router(state: AppState) -> Router {
         .route_service("/graphql/ws", GraphQLSubscription::new(schema));
 
     // ── Task routes (write — require HTTP Signature) ───────────────────────
-    let task_write_routes = Router::new()
-        .route("/api/v1/tasks", post(tasks::create_task))
-        .route("/api/v1/tasks/{id}/claim", post(tasks::claim_task))
-        .route("/api/v1/tasks/{id}/complete", post(tasks::complete_task))
-        .route("/api/v1/tasks/{id}/fail", post(tasks::fail_task))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_ucan_chain,
-        ))
-        .layer(middleware::from_fn(auth::require_signature));
+    let task_write_routes = add_auth_layers(
+        Router::new()
+            .route("/api/v1/tasks", post(tasks::create_task))
+            .route("/api/v1/tasks/{id}/claim", post(tasks::claim_task))
+            .route("/api/v1/tasks/{id}/complete", post(tasks::complete_task))
+            .route("/api/v1/tasks/{id}/fail", post(tasks::fail_task)),
+        state.clone(),
+    );
 
     // ── Task routes (read — open) ──────────────────────────────────────────
     let task_read_routes = Router::new()
@@ -57,104 +68,98 @@ pub fn build_router(state: AppState) -> Router {
 
     // ── Rate-limited creation routes — require HTTP Signature + per-DID throttle
     let limiter = state.rate_limiter.clone();
-    let creation_routes = Router::new()
-        .route("/api/v1/repos", post(repos::create_repo))
-        .route("/api/register", post(register::register))
-        .route("/api/v1/repos/{owner}/{repo}/fork", post(repos::fork_repo))
-        .route(
-            "/api/v1/repos/{owner}/{repo}/issues",
-            post(issues::create_issue),
-        )
-        .route("/api/v1/repos/{owner}/{repo}/pulls", post(pulls::create_pr))
-        .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
-        .layer(axum::Extension(limiter))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_ucan_chain,
-        ))
-        .layer(middleware::from_fn(auth::require_signature));
+    let creation_routes = add_auth_layers(
+        Router::new()
+            .route("/api/v1/repos", post(repos::create_repo))
+            .route("/api/register", post(register::register))
+            .route("/api/v1/repos/{owner}/{repo}/fork", post(repos::fork_repo))
+            .route(
+                "/api/v1/repos/{owner}/{repo}/issues",
+                post(issues::create_issue),
+            )
+            .route("/api/v1/repos/{owner}/{repo}/pulls", post(pulls::create_pr))
+            .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
+            .layer(axum::Extension(limiter)),
+        state.clone(),
+    );
 
     // ── Write routes — require HTTP Signature (no rate limit) ─────────────
-    let write_routes = Router::new()
-        .route(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
-            post(pulls::merge_pr),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/close",
-            post(pulls::close_pr),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews",
-            post(pulls::create_review),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments",
-            post(pulls::create_comment),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/hooks",
-            post(webhooks::create_webhook),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/hooks/{id}",
-            axum::routing::delete(webhooks::delete_webhook),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/branches/{branch}/protect",
-            post(protect::protect_branch),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/branches/{branch}/protect",
-            axum::routing::delete(protect::unprotect_branch),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/star",
-            axum::routing::put(stars::star_repo),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/star",
-            axum::routing::delete(stars::unstar_repo),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/replicas",
-            axum::routing::put(replicas::register_replica),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/replicas",
-            axum::routing::delete(replicas::unregister_replica),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/labels",
-            post(labels::add_label),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/labels/{label}",
-            axum::routing::delete(labels::remove_label),
-        )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_ucan_chain,
-        ))
-        .layer(middleware::from_fn(auth::require_signature));
+    let write_routes = add_auth_layers(
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                post(pulls::merge_pr),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/close",
+                post(pulls::close_pr),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews",
+                post(pulls::create_review),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments",
+                post(pulls::create_comment),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/hooks",
+                post(webhooks::create_webhook),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/hooks/{id}",
+                axum::routing::delete(webhooks::delete_webhook),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/branches/{branch}/protect",
+                post(protect::protect_branch),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/branches/{branch}/protect",
+                axum::routing::delete(protect::unprotect_branch),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/star",
+                axum::routing::put(stars::star_repo),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/star",
+                axum::routing::delete(stars::unstar_repo),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/replicas",
+                axum::routing::put(replicas::register_replica),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/replicas",
+                axum::routing::delete(replicas::unregister_replica),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/labels",
+                post(labels::add_label),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/labels/{label}",
+                axum::routing::delete(labels::remove_label),
+            ),
+        state.clone(),
+    );
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.
     // HTTP Signature is enforced on receive-pack (push) — the git-remote-gitlawb
     // helper signs requests with RFC 9421 signatures using the agent's keypair.
     let pack_limit = state.config.max_pack_bytes;
-    let git_write_routes = Router::new()
-        .route(
-            "/{owner}/{repo}/git-receive-pack",
-            post(repos::git_receive_pack),
-        )
-        .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(pack_limit))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_ucan_chain,
-        ))
-        .layer(middleware::from_fn(auth::require_signature));
+    let git_write_routes = add_auth_layers(
+        Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                post(repos::git_receive_pack),
+            )
+            .layer(DefaultBodyLimit::disable())
+            .layer(RequestBodyLimitLayer::new(pack_limit)),
+        state.clone(),
+    );
 
     // ── IPFS content-addressed retrieval and pin listing ──────────────────
     let ipfs_routes = Router::new()
@@ -165,33 +170,31 @@ pub fn build_router(state: AppState) -> Router {
     let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
-    let bounty_write_routes = Router::new()
-        .route(
-            "/api/v1/repos/{owner}/{repo}/bounties",
-            post(bounties::create_bounty),
-        )
-        .route("/api/v1/bounties/{id}/claim", post(bounties::claim_bounty))
-        .route(
-            "/api/v1/bounties/{id}/submit",
-            post(bounties::submit_bounty),
-        )
-        .route(
-            "/api/v1/bounties/{id}/approve",
-            post(bounties::approve_bounty),
-        )
-        .route(
-            "/api/v1/bounties/{id}/cancel",
-            post(bounties::cancel_bounty),
-        )
-        .route(
-            "/api/v1/bounties/{id}/dispute",
-            post(bounties::dispute_bounty),
-        )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_ucan_chain,
-        ))
-        .layer(middleware::from_fn(auth::require_signature));
+    let bounty_write_routes = add_auth_layers(
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/bounties",
+                post(bounties::create_bounty),
+            )
+            .route("/api/v1/bounties/{id}/claim", post(bounties::claim_bounty))
+            .route(
+                "/api/v1/bounties/{id}/submit",
+                post(bounties::submit_bounty),
+            )
+            .route(
+                "/api/v1/bounties/{id}/approve",
+                post(bounties::approve_bounty),
+            )
+            .route(
+                "/api/v1/bounties/{id}/cancel",
+                post(bounties::cancel_bounty),
+            )
+            .route(
+                "/api/v1/bounties/{id}/dispute",
+                post(bounties::dispute_bounty),
+            ),
+        state.clone(),
+    );
 
     // ── Bounty routes (read — open) ──────────────────────────────────────
     let bounty_read_routes = Router::new()
@@ -208,20 +211,18 @@ pub fn build_router(state: AppState) -> Router {
         );
 
     // ── Issue routes (write — require HTTP Signature, no rate limit) ─────
-    let issue_write_routes = Router::new()
-        .route(
-            "/api/v1/repos/{owner}/{repo}/issues/{id}/close",
-            post(issues::close_issue),
-        )
-        .route(
-            "/api/v1/repos/{owner}/{repo}/issues/{id}/comments",
-            post(issues::create_issue_comment),
-        )
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::require_ucan_chain,
-        ))
-        .layer(middleware::from_fn(auth::require_signature));
+    let issue_write_routes = add_auth_layers(
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/issues/{id}/close",
+                post(issues::close_issue),
+            )
+            .route(
+                "/api/v1/repos/{owner}/{repo}/issues/{id}/comments",
+                post(issues::create_issue_comment),
+            ),
+        state.clone(),
+    );
 
     // ── Peer discovery routes ─────────────────────────────────────────────
     // Peer writes accept signatures when present and can require them after a
@@ -235,12 +236,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sync/trigger", post(peers::trigger_sync))
         .route("/api/v1/sync/notify", post(peers::notify_sync));
     peer_write_routes = if state.config.require_signed_peer_writes {
-        peer_write_routes
-            .layer(middleware::from_fn_with_state(
-                state.clone(),
-                auth::require_ucan_chain,
-            ))
-            .layer(middleware::from_fn(auth::require_signature))
+        add_auth_layers(peer_write_routes, state.clone())
     } else {
         peer_write_routes.layer(middleware::from_fn(auth::optional_signature))
     };
