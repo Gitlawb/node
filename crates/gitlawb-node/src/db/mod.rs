@@ -190,6 +190,11 @@ impl Db {
         &self.pool
     }
 
+    #[cfg(test)]
+    pub fn for_testing(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPool::connect(database_url).await?;
         let db = Self { pool };
