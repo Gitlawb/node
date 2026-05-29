@@ -261,7 +261,7 @@ fn validate_ucan_chain(
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let ucan = Ucan::decode(token).map_err(|e| {
         (
-            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "invalid_ucan", "message": e.to_string() })),
         )
     })?;
@@ -326,11 +326,12 @@ pub async fn require_ucan_chain(
         Some(a) => match a.0.parse() {
             Ok(did) => did,
             Err(e) => {
+                tracing::warn!(raw_did = %a.0, err = %e, "failed to parse DID from authenticated identity");
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": "internal_error", "message": e.to_string() })),
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "invalid_identity", "message": "invalid DID in token" })),
                 )
-                    .into_response()
+                    .into_response();
             }
         },
         None => {
@@ -349,7 +350,7 @@ pub async fn require_ucan_chain(
         return (status, body).into_response();
     }
 
-    tracing::info!(did = %signer_did, "✓ UCAN chain validated");
+    tracing::debug!(did = %signer_did, "UCAN chain validated");
     next.run(request).await
 }
 
@@ -375,8 +376,11 @@ fn human_detected(message: &str) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{middleware, Router};
     use gitlawb_core::identity::Keypair;
     use gitlawb_core::ucan::{caps, Capability, Ucan};
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use tower::ServiceExt;
 
     fn bootstrap_ucan(node: &Keypair, agent_did: Did) -> Ucan {
         Ucan::bootstrap(node, agent_did).unwrap()
@@ -467,5 +471,125 @@ mod tests {
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         let body = err.1 .0.to_string();
         assert!(body.contains("expired"));
+    }
+
+    fn make_test_state(node_did: gitlawb_core::did::Did) -> crate::state::AppState {
+        use crate::{config::Config, graphql, rate_limit::RateLimiter};
+        use clap::Parser;
+
+        let keypair = Keypair::generate();
+        let (ref_tx, _) = tokio::sync::broadcast::channel(1);
+        let (task_tx, _) = tokio::sync::broadcast::channel(1);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
+            .expect("lazy pool creation should not fail");
+        let db = Arc::new(crate::db::Db::for_testing(pool.clone()));
+        let schema = Arc::new(graphql::build_schema(
+            db.clone(),
+            ref_tx.clone(),
+            task_tx.clone(),
+        ));
+        crate::state::AppState {
+            config: Arc::new(Config::parse_from(["gitlawb-node"])),
+            db,
+            node_did,
+            node_keypair: Arc::new(keypair),
+            p2p: None,
+            http_client: Arc::new(reqwest::Client::new()),
+            ref_update_tx: ref_tx,
+            task_event_tx: task_tx,
+            graphql_schema: schema,
+            machine_id: None,
+            repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
+            rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_ucan_chain_no_header_passes_through() {
+        let state = make_test_state(Keypair::generate().did());
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(state, require_ucan_chain));
+
+        let req = Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn require_ucan_chain_missing_did_returns_401() {
+        let state = make_test_state(Keypair::generate().did());
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(state, require_ucan_chain));
+
+        // x-ucan present but no AuthenticatedDid extension → 401
+        let req = Request::builder()
+            .uri("/")
+            .header("x-ucan", "any-token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_ucan_chain_wrong_issuer_returns_401() {
+        let node = Keypair::generate();
+        let agent = Keypair::generate();
+        let other = Keypair::generate();
+        let node_did = node.did();
+        let agent_did = agent.did();
+
+        // Build a valid token where iss = agent, but supply `other` as the signer.
+        let proof = bootstrap_ucan(&node, agent_did.clone());
+        let token = delegation_ucan(&agent, node_did.clone(), &proof)
+            .encode()
+            .unwrap();
+
+        let state = make_test_state(node_did);
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(state, require_ucan_chain));
+
+        // AuthenticatedDid is `other`, UCAN iss is `agent` → issuer mismatch → 401
+        let req = Request::builder()
+            .uri("/")
+            .header("x-ucan", token)
+            .extension(AuthenticatedDid(other.did().to_string()))
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn require_ucan_chain_malformed_token_returns_401() {
+        let state = make_test_state(Keypair::generate().did());
+        let app = Router::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }))
+            .layer(middleware::from_fn_with_state(state, require_ucan_chain));
+
+        // Malformed x-ucan (invalid JSON)
+        let req = Request::builder()
+            .uri("/")
+            .header("x-ucan", "invalid-token-structure")
+            .extension(AuthenticatedDid(Keypair::generate().did().to_string()))
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 2048).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json["error"], "invalid_ucan");
     }
 }
