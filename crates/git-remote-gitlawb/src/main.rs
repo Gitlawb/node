@@ -127,11 +127,22 @@ fn handle_connect(
     let refs_url = format!("{}/info/refs?service={}", repo_base, service);
     tracing::debug!("GET {refs_url}");
 
-    let refs_resp = client
+    let mut refs_req = client
         .get(&refs_url)
-        .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0")
-        .send()
-        .with_context(|| format!("GET {refs_url}"))?;
+        .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0");
+
+    // Sign the read so the node can authorize private-repo fetches (RFC 9421).
+    // GET has no body, so content-digest covers the empty body. Harmless for
+    // public repos — the node verifies only when the headers are present.
+    if let Some(kp) = keypair {
+        let signed = sign_request(kp, "GET", &url_path(&refs_url), &[]);
+        refs_req = refs_req
+            .header("Content-Digest", signed.content_digest)
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature);
+    }
+
+    let refs_resp = refs_req.send().with_context(|| format!("GET {refs_url}"))?;
 
     if !refs_resp.status().is_success() {
         bail!(
@@ -201,20 +212,17 @@ fn handle_connect(
         .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0")
         .body(request_body.clone());
 
-    // Add RFC 9421 HTTP Signature auth on push operations
-    if service == "git-receive-pack" {
-        if let Some(kp) = keypair {
-            let signed = sign_request(kp, "POST", &path_for_sig, &request_body);
-            req = req
-                .header("Content-Digest", signed.content_digest)
-                .header("Signature-Input", signed.signature_input)
-                .header("Signature", signed.signature);
-            tracing::debug!("attached RFC 9421 HTTP Signature (DID: {})", kp.did());
-        } else {
-            tracing::warn!(
-                "no identity keypair found — push will be unsigned (v0.1 local alpha only)"
-            );
-        }
+    // Sign both push (receive-pack) and fetch (upload-pack). Fetch signing lets
+    // the node authorize private-repo clones; ignored by the node for public repos.
+    if let Some(kp) = keypair {
+        let signed = sign_request(kp, "POST", &path_for_sig, &request_body);
+        req = req
+            .header("Content-Digest", signed.content_digest)
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature);
+        tracing::debug!("attached RFC 9421 HTTP Signature (DID: {})", kp.did());
+    } else if service == "git-receive-pack" {
+        tracing::warn!("no identity keypair found — push will be unsigned (v0.1 local alpha only)");
     }
 
     let pack_resp = req.send().with_context(|| format!("POST {post_url}"))?;

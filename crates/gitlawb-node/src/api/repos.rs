@@ -303,11 +303,47 @@ pub async fn get_tree(
 
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
 
+/// Authorize a read (clone/fetch) against a repo's visibility.
+///
+/// Public repos are world-readable. Private repos require the caller's
+/// *authenticated* DID (verified upstream by `optional_signature`) to match the
+/// owner. Returns `RepoNotFound` (404, NOT 403) when unauthorized so the node
+/// does not leak the existence of a private repo.
+///
+/// Whole-repo (`is_public`) only. Path/package-scoped visibility is a follow-up
+/// that needs a `visibility_rules` table and a way to filter subtrees out of the
+/// pack — see issue discussion.
+fn authorize_read(
+    record: &crate::db::RepoRecord,
+    auth: Option<&AuthenticatedDid>,
+    owner: &str,
+    name: &str,
+) -> Result<()> {
+    if record.is_public {
+        return Ok(());
+    }
+    let caller = match auth {
+        Some(AuthenticatedDid(did)) => did.as_str(),
+        None => return Err(AppError::RepoNotFound(format!("{owner}/{name}"))),
+    };
+    // Mirror the owner-match idiom from api/protect.rs (full did:key vs short form).
+    let owner_short = record
+        .owner_did
+        .split(':')
+        .next_back()
+        .unwrap_or(record.owner_did.as_str());
+    if caller != record.owner_did.as_str() && caller != owner_short {
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
+    Ok(())
+}
+
 /// GET /:owner/:repo.git/info/refs?service=git-upload-pack
 pub async fn git_info_refs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<InfoRefsQuery>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
@@ -321,6 +357,13 @@ pub async fn git_info_refs(
         .service
         .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
     tracing::debug!(service = %service, repo = %name, "info/refs service");
+
+    // Enforce read (clone/fetch) visibility. The push advertisement
+    // (service=git-receive-pack) is authorized separately on the
+    // git-receive-pack POST, so leave it untouched here.
+    if service == "git-upload-pack" {
+        authorize_read(&record, auth.as_ref().map(|e| &e.0), &owner, name)?;
+    }
 
     // For receive-pack (push), download the latest from Tigris so the client
     // sees the same refs that acquire_write() will operate on.
@@ -352,6 +395,7 @@ pub async fn git_info_refs(
 pub async fn git_upload_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
     body: Bytes,
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
@@ -360,6 +404,8 @@ pub async fn git_upload_pack(
         .get_repo(&owner, name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+
+    authorize_read(&record, auth.as_ref().map(|e| &e.0), &owner, name)?;
 
     let disk_path = state
         .repo_store

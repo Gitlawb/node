@@ -304,18 +304,19 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/repos/{owner}/{repo}/replicas",
             get(replicas::list_replicas),
-        )
-        .route("/{owner}/{repo}/info/refs", get(repos::git_info_refs));
+        );
 
     // git-upload-pack (clone/fetch) — same raised body limit as receive-pack so
     // large pack responses from the server don't get truncated on the client side.
     let git_read_routes = Router::new()
+        .route("/{owner}/{repo}/info/refs", get(repos::git_info_refs))
         .route(
             "/{owner}/{repo}/git-upload-pack",
             post(repos::git_upload_pack),
         )
         .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(pack_limit));
+        .layer(RequestBodyLimitLayer::new(pack_limit))
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Meta ──────────────────────────────────────────────────────────────
     let meta_routes = Router::new()
