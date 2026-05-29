@@ -1112,3 +1112,78 @@ fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64
         forked_from: record.forked_from.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A repo owned by `did:key:z6MkOWNER` with the given visibility.
+    fn repo(is_public: bool) -> crate::db::RepoRecord {
+        crate::db::RepoRecord {
+            id: "r1".into(),
+            name: "secret".into(),
+            owner_did: "did:key:z6MkOWNER".into(),
+            description: None,
+            is_public,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/x".into(),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    fn did(s: &str) -> AuthenticatedDid {
+        AuthenticatedDid(s.to_string())
+    }
+
+    #[test]
+    fn public_repo_allows_anonymous() {
+        authorize_read(&repo(true), None, "owner", "secret").unwrap();
+    }
+
+    #[test]
+    fn public_repo_allows_any_authenticated_did() {
+        let other = did("did:key:z6MkOTHER");
+        authorize_read(&repo(true), Some(&other), "owner", "secret").unwrap();
+    }
+
+    #[test]
+    fn private_repo_allows_owner() {
+        let owner = did("did:key:z6MkOWNER");
+        authorize_read(&repo(false), Some(&owner), "owner", "secret").unwrap();
+    }
+
+    #[test]
+    fn private_repo_denies_anonymous() {
+        let err = authorize_read(&repo(false), None, "owner", "secret").unwrap_err();
+        assert!(
+            matches!(err, AppError::RepoNotFound(_)),
+            "anonymous read of a private repo must 404 (no-leak), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn private_repo_denies_non_owner() {
+        let other = did("did:key:z6MkOTHER");
+        let err = authorize_read(&repo(false), Some(&other), "owner", "secret").unwrap_err();
+        assert!(
+            matches!(err, AppError::RepoNotFound(_)),
+            "non-owner read of a private repo must 404, not 403, got {err:?}"
+        );
+    }
+
+    /// The denial must be byte-identical to a genuinely-missing repo so a private
+    /// repo's existence cannot be inferred. `get_repo()` returns
+    /// `RepoNotFound("{owner}/{name}")` when a repo is absent; `authorize_read`
+    /// must produce the same payload for an unauthorized private read.
+    #[test]
+    fn private_denial_is_indistinguishable_from_missing() {
+        let err = authorize_read(&repo(false), None, "owner", "secret").unwrap_err();
+        match err {
+            AppError::RepoNotFound(msg) => assert_eq!(msg, "owner/secret"),
+            other => panic!("expected RepoNotFound, got {other:?}"),
+        }
+    }
+}
