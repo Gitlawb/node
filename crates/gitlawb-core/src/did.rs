@@ -257,14 +257,20 @@ mod tests {
     fn to_verifying_key_fails_for_did_web() {
         let web = Did::web("example.com");
         let result = web.to_verifying_key();
-        assert!(result.is_err(), "did:web cannot resolve to a verifying key locally");
+        assert!(
+            result.is_err(),
+            "did:web cannot resolve to a verifying key locally"
+        );
     }
 
     #[test]
     fn to_verifying_key_fails_for_did_gitlawb() {
         let gl = Did::gitlawb("z6MkSomeKey");
         let result = gl.to_verifying_key();
-        assert!(result.is_err(), "did:gitlawb cannot resolve to a verifying key locally");
+        assert!(
+            result.is_err(),
+            "did:gitlawb cannot resolve to a verifying key locally"
+        );
     }
 
     #[test]
