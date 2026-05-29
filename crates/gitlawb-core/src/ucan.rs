@@ -45,8 +45,10 @@ impl Capability {
     /// Returns `true` if `self` is a valid attenuation of `parent`.
     ///
     /// A delegated capability is only valid if it is at most as permissive as
-    /// the parent capability backing it. `"*"` in either field and `repo/admin`
-    /// in the action position act as wildcards that cover any value.
+    /// the parent capability backing it. `"*"` on the **parent**'s resource or
+    /// action field and `repo/admin` in the parent's action position act as
+    /// wildcards that cover any delegated value; wildcards on `self` carry no
+    /// special meaning.
     pub fn is_attenuated_by(&self, parent: &Capability) -> bool {
         let resource_ok = parent.with == self.with || parent.with == "*";
         let action_ok =
