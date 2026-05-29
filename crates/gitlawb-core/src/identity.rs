@@ -187,7 +187,10 @@ mod tests {
         let msg = b"some message";
         let sig = kp1.sign(msg);
         let result = verify(&kp2.verifying_key(), msg, &sig.to_bytes());
-        assert!(result.is_err(), "signature from kp1 must not verify under kp2");
+        assert!(
+            result.is_err(),
+            "signature from kp1 must not verify under kp2"
+        );
     }
 
     #[test]
@@ -205,7 +208,10 @@ mod tests {
         let payload = serde_json::json!({"action": "push"});
         let signed = Signed::new(payload, &kp1).unwrap();
         let result = signed.verify(&kp2.verifying_key());
-        assert!(result.is_err(), "Signed payload must not verify under a different key");
+        assert!(
+            result.is_err(),
+            "Signed payload must not verify under a different key"
+        );
     }
 
     #[test]
