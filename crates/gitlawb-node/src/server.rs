@@ -44,6 +44,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tasks/{id}/claim", post(tasks::claim_task))
         .route("/api/v1/tasks/{id}/complete", post(tasks::complete_task))
         .route("/api/v1/tasks/{id}/fail", post(tasks::fail_task))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_ucan_chain,
+        ))
         .layer(middleware::from_fn(auth::require_signature));
 
     // ── Task routes (read — open) ──────────────────────────────────────────
@@ -64,6 +68,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/repos/{owner}/{repo}/pulls", post(pulls::create_pr))
         .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
         .layer(axum::Extension(limiter))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_ucan_chain,
+        ))
         .layer(middleware::from_fn(auth::require_signature));
 
     // ── Write routes — require HTTP Signature (no rate limit) ─────────────
@@ -124,6 +132,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/labels/{label}",
             axum::routing::delete(labels::remove_label),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_ucan_chain,
+        ))
         .layer(middleware::from_fn(auth::require_signature));
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
@@ -138,6 +150,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(pack_limit))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_ucan_chain,
+        ))
         .layer(middleware::from_fn(auth::require_signature));
 
     // ── IPFS content-addressed retrieval and pin listing ──────────────────
@@ -171,6 +187,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/bounties/{id}/dispute",
             post(bounties::dispute_bounty),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_ucan_chain,
+        ))
         .layer(middleware::from_fn(auth::require_signature));
 
     // ── Bounty routes (read — open) ──────────────────────────────────────
@@ -197,6 +217,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/issues/{id}/comments",
             post(issues::create_issue_comment),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_ucan_chain,
+        ))
         .layer(middleware::from_fn(auth::require_signature));
 
     // ── Peer discovery routes ─────────────────────────────────────────────
@@ -211,7 +235,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sync/trigger", post(peers::trigger_sync))
         .route("/api/v1/sync/notify", post(peers::notify_sync));
     peer_write_routes = if state.config.require_signed_peer_writes {
-        peer_write_routes.layer(middleware::from_fn(auth::require_signature))
+        peer_write_routes
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth::require_ucan_chain,
+            ))
+            .layer(middleware::from_fn(auth::require_signature))
     } else {
         peer_write_routes.layer(middleware::from_fn(auth::optional_signature))
     };
