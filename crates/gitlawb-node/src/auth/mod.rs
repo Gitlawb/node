@@ -1,5 +1,5 @@
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -7,6 +7,11 @@ use axum::Json;
 use http_body_util::BodyExt;
 use serde_json::json;
 use std::collections::HashMap;
+
+use gitlawb_core::did::Did;
+use gitlawb_core::ucan::Ucan;
+
+use crate::state::AppState;
 
 /// The authenticated agent's DID, injected into request extensions by `require_signature`.
 #[derive(Clone, Debug)]
@@ -240,6 +245,114 @@ pub async fn optional_signature(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// Validate a raw UCAN token string supplied in `X-Ucan`.
+///
+/// Checks performed:
+///   1. The token decodes to a valid [`Ucan`] structure.
+///   2. The UCAN issuer (`iss`) matches `signer_did` — the DID that signed the
+///      HTTP request — preventing replay of another agent's UCAN.
+///   3. The UCAN audience (`aud`) matches `expected_aud` — the node's own DID.
+///   4. The full proof chain is cryptographically valid (signatures, expiry,
+///      not-before, chain linkage, and capability attenuation).
+fn validate_ucan_chain(
+    token: &str,
+    expected_aud: &Did,
+    signer_did: &Did,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let ucan = Ucan::decode(token).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid_ucan", "message": e.to_string() })),
+        )
+    })?;
+
+    if &ucan.payload.iss != signer_did {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "invalid_ucan",
+                "message": format!(
+                    "UCAN issuer {} does not match request signer {}",
+                    ucan.payload.iss, signer_did
+                ),
+            })),
+        ));
+    }
+
+    ucan.verify_audience(expected_aud).map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid_ucan", "message": e.to_string() })),
+        )
+    })?;
+
+    ucan.verify_chain().map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "invalid_ucan", "message": e.to_string() })),
+        )
+    })?;
+
+    Ok(())
+}
+
+/// Axum middleware that validates a UCAN chain when `X-Ucan` is present.
+///
+/// Must be layered so that it runs after [`require_signature`], which sets the
+/// [`AuthenticatedDid`] extension consumed here.
+///
+/// When `X-Ucan` is absent the request passes through unchanged, preserving
+/// backward compatibility for agents that pre-date UCAN delegation. When the
+/// header is present the full chain is validated: the UCAN issuer must match
+/// the HTTP Signature identity, the audience must be this node's DID, and
+/// every proof in the chain must be cryptographically sound with no capability
+/// escalation.
+pub async fn require_ucan_chain(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let token = match request
+        .headers()
+        .get("x-ucan")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    {
+        Some(t) => t,
+        None => return next.run(request).await,
+    };
+
+    let signer_did: Did = match request.extensions().get::<AuthenticatedDid>() {
+        Some(a) => match a.0.parse() {
+            Ok(did) => did,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "internal_error", "message": e.to_string() })),
+                )
+                    .into_response()
+            }
+        },
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": "invalid_ucan",
+                    "message": "UCAN validation requires a valid HTTP Signature",
+                })),
+            )
+                .into_response()
+        }
+    };
+
+    if let Err((status, body)) = validate_ucan_chain(&token, &state.node_did, &signer_did) {
+        return (status, body).into_response();
+    }
+
+    tracing::info!(did = %signer_did, "✓ UCAN chain validated");
+    next.run(request).await
+}
+
 fn human_detected(message: &str) -> impl IntoResponse {
     (
         StatusCode::UNAUTHORIZED,
@@ -257,4 +370,102 @@ fn human_detected(message: &str) -> impl IntoResponse {
             "docs": "https://gitlawb.com/agents",
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitlawb_core::identity::Keypair;
+    use gitlawb_core::ucan::{caps, Capability, Ucan};
+
+    fn bootstrap_ucan(node: &Keypair, agent_did: Did) -> Ucan {
+        Ucan::bootstrap(node, agent_did).unwrap()
+    }
+
+    fn delegation_ucan(agent: &Keypair, node_did: Did, proof: &Ucan) -> Ucan {
+        Ucan::delegate(
+            agent,
+            node_did,
+            vec![Capability::new("gitlawb://alpha", caps::NETWORK_JOIN)],
+            None,
+            proof,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_ucan_chain_valid() {
+        let node = Keypair::generate();
+        let agent = Keypair::generate();
+        let node_did = node.did();
+        let agent_did = agent.did();
+
+        let proof = bootstrap_ucan(&node, agent_did.clone());
+        let delegation = delegation_ucan(&agent, node_did.clone(), &proof);
+        let token = delegation.encode().unwrap();
+
+        assert!(validate_ucan_chain(&token, &node_did, &agent_did).is_ok());
+    }
+
+    #[test]
+    fn validate_ucan_chain_wrong_issuer() {
+        let node = Keypair::generate();
+        let agent = Keypair::generate();
+        let other = Keypair::generate();
+        let node_did = node.did();
+        let agent_did = agent.did();
+
+        let proof = bootstrap_ucan(&node, agent_did.clone());
+        let delegation = delegation_ucan(&agent, node_did.clone(), &proof);
+        let token = delegation.encode().unwrap();
+
+        // signer_did is `other` but UCAN iss is `agent` — must be rejected
+        let err = validate_ucan_chain(&token, &node_did, &other.did()).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        let body = err.1 .0.to_string();
+        assert!(body.contains("does not match request signer"));
+    }
+
+    #[test]
+    fn validate_ucan_chain_wrong_audience() {
+        let node = Keypair::generate();
+        let agent = Keypair::generate();
+        let other_node = Keypair::generate();
+        let node_did = node.did();
+        let agent_did = agent.did();
+
+        let proof = bootstrap_ucan(&node, agent_did.clone());
+        let delegation = delegation_ucan(&agent, node_did.clone(), &proof);
+        let token = delegation.encode().unwrap();
+
+        // expected_aud is a different node — must be rejected
+        let err = validate_ucan_chain(&token, &other_node.did(), &agent_did).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        let body = err.1 .0.to_string();
+        assert!(body.contains("audience mismatch"));
+    }
+
+    #[test]
+    fn validate_ucan_chain_expired_proof() {
+        let node = Keypair::generate();
+        let agent = Keypair::generate();
+        let node_did = node.did();
+        let agent_did = agent.did();
+
+        let exp = chrono::Utc::now() - chrono::Duration::hours(1);
+        let proof = Ucan::issue(
+            &node,
+            agent_did.clone(),
+            vec![Capability::new("gitlawb://alpha", caps::NETWORK_JOIN)],
+            Some(exp),
+        )
+        .unwrap();
+        let delegation = delegation_ucan(&agent, node_did.clone(), &proof);
+        let token = delegation.encode().unwrap();
+
+        let err = validate_ucan_chain(&token, &node_did, &agent_did).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        let body = err.1 .0.to_string();
+        assert!(body.contains("expired"));
+    }
 }
