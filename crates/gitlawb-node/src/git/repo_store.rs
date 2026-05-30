@@ -33,6 +33,16 @@ pub struct RepoStore {
 }
 
 impl RepoStore {
+    #[cfg(test)]
+    pub fn for_testing(repos_dir: PathBuf, pool: PgPool) -> Self {
+        Self {
+            repos_dir,
+            tigris: None,
+            pool,
+            migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+        }
+    }
+
     pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, pool: PgPool) -> Self {
         Self {
             repos_dir,

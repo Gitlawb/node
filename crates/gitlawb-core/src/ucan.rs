@@ -41,6 +41,20 @@ impl Capability {
         self.constraints = Some(constraints);
         self
     }
+
+    /// Returns `true` if `self` is a valid attenuation of `parent`.
+    ///
+    /// A delegated capability is only valid if it is at most as permissive as
+    /// the parent capability backing it. `"*"` on the **parent**'s resource or
+    /// action field and `repo/admin` in the parent's action position act as
+    /// wildcards that cover any delegated value; wildcards on `self` carry no
+    /// special meaning.
+    pub fn is_attenuated_by(&self, parent: &Capability) -> bool {
+        let resource_ok = parent.with == self.with || parent.with == "*";
+        let action_ok =
+            parent.can == self.can || parent.can == "*" || parent.can == caps::REPO_ADMIN;
+        resource_ok && action_ok
+    }
 }
 
 /// Well-known gitlawb capability strings.
@@ -132,6 +146,26 @@ impl Ucan {
         }
     }
 
+    /// Check if this UCAN's not-before time is in the future (token not yet valid).
+    pub fn is_before_valid(&self) -> bool {
+        if let Some(nbf) = self.payload.nbf {
+            Utc::now().timestamp() < nbf
+        } else {
+            false
+        }
+    }
+
+    /// Verify this UCAN's audience matches `expected`.
+    pub fn verify_audience(&self, expected: &Did) -> Result<()> {
+        if &self.payload.aud != expected {
+            return Err(Error::Ucan(format!(
+                "audience mismatch: expected {expected}, got {}",
+                self.payload.aud
+            )));
+        }
+        Ok(())
+    }
+
     /// Verify the signature on this UCAN.
     pub fn verify_signature(&self) -> Result<()> {
         use crate::identity::verify;
@@ -217,6 +251,10 @@ impl Ucan {
             return Err(Error::Ucan("token is expired".to_string()));
         }
 
+        if self.is_before_valid() {
+            return Err(Error::Ucan("token is not yet valid".to_string()));
+        }
+
         for proof_token in &self.payload.prf {
             let proof = Self::decode(proof_token)
                 .map_err(|e| Error::Ucan(format!("failed to decode proof: {e}")))?;
@@ -227,6 +265,17 @@ impl Ucan {
                     "proof chain broken: proof audience {} does not match issuer {}",
                     proof.payload.aud, self.payload.iss
                 )));
+            }
+
+            // Every delegated capability must be covered by the proof (attenuation).
+            for cap in &self.payload.att {
+                let covered = proof.payload.att.iter().any(|p| cap.is_attenuated_by(p));
+                if !covered {
+                    return Err(Error::Ucan(format!(
+                        "capability attenuation violated: '{}' on '{}' not covered by proof",
+                        cap.can, cap.with
+                    )));
+                }
             }
 
             // Verify the proof's signature and chain recursively
@@ -398,5 +447,158 @@ mod tests {
         // Should fail: the proof is expired
         let err = delegated.verify_chain().unwrap_err();
         assert!(err.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn is_before_valid_future_nbf() {
+        let issuer = Keypair::generate();
+        let audience = Keypair::generate().did();
+        let nbf_future = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let payload = UcanPayload {
+            ucan: "1.0.0".to_string(),
+            iss: issuer.did(),
+            aud: audience,
+            att: vec![],
+            exp: None,
+            nbf: Some(nbf_future.timestamp()),
+            prf: vec![],
+        };
+        let signing_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = issuer.sign_b64(&signing_bytes);
+        let ucan = Ucan { payload, s: sig };
+
+        assert!(ucan.is_before_valid());
+        let err = ucan.verify_chain().unwrap_err();
+        assert!(err.to_string().contains("not yet valid"));
+    }
+
+    #[test]
+    fn is_before_valid_past_nbf() {
+        let issuer = Keypair::generate();
+        let audience = Keypair::generate().did();
+        let nbf_past = chrono::Utc::now() - chrono::Duration::hours(1);
+
+        let payload = UcanPayload {
+            ucan: "1.0.0".to_string(),
+            iss: issuer.did(),
+            aud: audience,
+            att: vec![Capability::new("gitlawb://repos/test", caps::GIT_PUSH)],
+            exp: None,
+            nbf: Some(nbf_past.timestamp()),
+            prf: vec![],
+        };
+        let signing_bytes = serde_json::to_vec(&payload).unwrap();
+        let sig = issuer.sign_b64(&signing_bytes);
+        let ucan = Ucan { payload, s: sig };
+
+        assert!(!ucan.is_before_valid());
+        ucan.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn verify_audience_matches() {
+        let issuer = Keypair::generate();
+        let audience = Keypair::generate().did();
+        let ucan = Ucan::issue(&issuer, audience.clone(), vec![], None).unwrap();
+        ucan.verify_audience(&audience).unwrap();
+    }
+
+    #[test]
+    fn verify_audience_mismatch() {
+        let issuer = Keypair::generate();
+        let audience = Keypair::generate().did();
+        let wrong = Keypair::generate().did();
+        let ucan = Ucan::issue(&issuer, audience, vec![], None).unwrap();
+        let err = ucan.verify_audience(&wrong).unwrap_err();
+        assert!(err.to_string().contains("audience mismatch"));
+    }
+
+    #[test]
+    fn attenuation_valid_subset() {
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let charlie = Keypair::generate();
+
+        // Alice grants Bob push on a specific repo
+        let root = Ucan::issue(
+            &alice,
+            bob.did(),
+            vec![Capability::new("gitlawb://repos/org/repo", caps::GIT_PUSH)],
+            None,
+        )
+        .unwrap();
+
+        // Bob delegates the same capability (exact subset) to Charlie
+        let delegated = Ucan::delegate(
+            &bob,
+            charlie.did(),
+            vec![Capability::new("gitlawb://repos/org/repo", caps::GIT_PUSH)],
+            None,
+            &root,
+        )
+        .unwrap();
+
+        delegated.verify_chain().unwrap();
+    }
+
+    #[test]
+    fn attenuation_exceeds_parent_is_rejected() {
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let charlie = Keypair::generate();
+
+        // Alice grants Bob push on one repo only
+        let root = Ucan::issue(
+            &alice,
+            bob.did(),
+            vec![Capability::new("gitlawb://repos/org/repo", caps::GIT_PUSH)],
+            None,
+        )
+        .unwrap();
+
+        // Bob tries to delegate merge (not in the original grant) to Charlie
+        let delegated = Ucan::delegate(
+            &bob,
+            charlie.did(),
+            vec![Capability::new("gitlawb://repos/org/repo", caps::PR_MERGE)],
+            None,
+            &root,
+        )
+        .unwrap();
+
+        let err = delegated.verify_chain().unwrap_err();
+        assert!(err.to_string().contains("attenuation violated"));
+    }
+
+    #[test]
+    fn attenuation_repo_admin_covers_all() {
+        let alice = Keypair::generate();
+        let bob = Keypair::generate();
+        let charlie = Keypair::generate();
+
+        // Alice grants Bob repo/admin (superpower)
+        let root = Ucan::issue(
+            &alice,
+            bob.did(),
+            vec![Capability::new(
+                "gitlawb://repos/org/repo",
+                caps::REPO_ADMIN,
+            )],
+            None,
+        )
+        .unwrap();
+
+        // Bob delegates a more specific capability — covered by repo/admin
+        let delegated = Ucan::delegate(
+            &bob,
+            charlie.did(),
+            vec![Capability::new("gitlawb://repos/org/repo", caps::GIT_PUSH)],
+            None,
+            &root,
+        )
+        .unwrap();
+
+        delegated.verify_chain().unwrap();
     }
 }
