@@ -1,0 +1,21 @@
+[package]
+name = "gitlawb-attest"
+description = "External Attestation v1: pluggable provenance attachments for gitlawb ref-update certs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_jcs = { workspace = true }
+thiserror = { workspace = true }
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+multibase = { workspace = true }
+
+[dev-dependencies]
+gitlawb-core = { path = "../gitlawb-core" }
+rand = { workspace = true }
