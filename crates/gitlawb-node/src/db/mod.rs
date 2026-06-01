@@ -1,7 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
+use tracing::info;
 use uuid::Uuid;
 
 // ── Public data types ─────────────────────────────────────────────────────────
@@ -202,8 +203,172 @@ impl Db {
         Ok(db)
     }
 
+    /// Run all pending versioned migrations in order, inside a single
+    /// transaction per migration. Idempotent — migrations whose version is
+    /// already recorded in `schema_migrations` are skipped.
+    ///
+    /// For an existing installation upgrading from a pre-migration-versioning
+    /// build, we detect the already-applied v1 schema (the `repos` table is
+    /// canonical and present on every production node) and mark v1 as
+    /// applied without re-running its statements. This lets us ship versioned
+    /// migrations on a live network without forcing operators to drop tables.
     async fn migrate(&self) -> Result<()> {
-        let stmts = [
+        // Bootstrap: ensure the `schema_migrations` table itself exists.
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS schema_migrations (
+                version    BIGINT  NOT NULL PRIMARY KEY,
+                name       TEXT    NOT NULL,
+                applied_at TEXT    NOT NULL
+            )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("creating schema_migrations table")?;
+
+        // Backfill: if the schema is already in place (legacy install) but no
+        // rows exist in `schema_migrations`, mark v1 as already applied.
+        // We use the `repos` table as the canonical signal — it has existed
+        // since the first public release and is present on every production
+        // node. If it's there but `schema_migrations` is empty, the schema
+        // was created by the old inline migration system.
+        let v1_already_applied: bool = sqlx::query(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 1) AS applied",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .get::<bool, _>("applied");
+
+        if !v1_already_applied {
+            let legacy_present: bool = sqlx::query(
+                "SELECT EXISTS(
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'repos'
+                ) AS present",
+            )
+            .fetch_one(&self.pool)
+            .await?
+            .get::<bool, _>("present");
+
+            if legacy_present {
+                sqlx::query(
+                    "INSERT INTO schema_migrations (version, name, applied_at)
+                     VALUES ($1, $2, $3)",
+                )
+                .bind(1_i64)
+                .bind(MIGRATION_V1_NAME)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&self.pool)
+                .await
+                .context("backfilling schema_migrations for legacy v1 schema")?;
+                info!(
+                    name = MIGRATION_V1_NAME,
+                    "detected legacy schema, marked v1 as already applied"
+                );
+            }
+        }
+
+        // Apply any pending migrations in version order.
+        for m in MIGRATIONS {
+            let already: bool = sqlx::query(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
+            )
+            .bind(m.version)
+            .fetch_one(&self.pool)
+            .await?
+            .get::<bool, _>("applied");
+
+            if already {
+                continue;
+            }
+
+            let started = std::time::Instant::now();
+            info!(
+                version = m.version,
+                name = m.name,
+                statements = m.stmts.len(),
+                "applying migration"
+            );
+
+            // Run the migration body in a single transaction so a failure
+            // mid-way leaves the database in its prior state rather than
+            // partially mutated.
+            let mut tx = self.pool.begin().await?;
+            for stmt in m.stmts {
+                sqlx::query(stmt).execute(&mut *tx).await.with_context(|| {
+                    format!(
+                        "migration v{} ({}) failed on statement: {}",
+                        m.version, m.name, stmt
+                    )
+                })?;
+            }
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(m.version)
+            .bind(m.name)
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *tx)
+            .await
+            .context("recording migration as applied")?;
+            tx.commit()
+                .await
+                .with_context(|| format!("committing migration v{}", m.version))?;
+
+            info!(
+                version = m.version,
+                name = m.name,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "migration applied"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Returns `(version, name, applied_at)` for every applied migration,
+    /// oldest first. Useful for ops/observability — surface via `gl status`
+    /// or `/api/v1/stats` in a follow-up.
+    #[allow(dead_code)]
+    pub async fn migration_status(&self) -> Result<Vec<(i64, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<i64, _>("version"),
+                    r.get("name"),
+                    r.get("applied_at"),
+                )
+            })
+            .collect())
+    }
+}
+
+// ── Migration catalogue ──────────────────────────────────────────────────────
+//
+// All schema statements are bundled into a single v1 migration so we can ship
+// versioned migrations on a live network without breaking the existing
+// install base. Future schema changes MUST be added as v2, v3, … — never
+// appended to v1. Operators can read `schema_migrations` to confirm a node
+// is at the expected version.
+
+const MIGRATION_V1_NAME: &str = "initial_schema";
+
+struct Migration {
+    version: i64,
+    name: &'static str,
+    stmts: &'static [&'static str],
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: MIGRATION_V1_NAME,
+    stmts: &[
             r#"CREATE TABLE IF NOT EXISTS repos (
                 id             TEXT NOT NULL PRIMARY KEY,
                 name           TEXT NOT NULL,
@@ -458,14 +623,8 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS idx_bounties_status ON bounties(status)",
             "CREATE INDEX IF NOT EXISTS idx_bounties_repo ON bounties(repo_owner, repo_name)",
             "CREATE INDEX IF NOT EXISTS idx_bounties_claimant ON bounties(claimant_did)",
-        ];
-
-        for stmt in &stmts {
-            sqlx::query(stmt).execute(&self.pool).await?;
-        }
-        Ok(())
-    }
-}
+        ],
+}];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
@@ -2192,5 +2351,95 @@ impl Db {
             deadline_secs: r.get("deadline_secs"),
             tx_hash: r.get("tx_hash"),
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+//
+// These tests don't require a live Postgres connection. They validate the
+// static migration catalogue is well-formed so a future maintainer can't
+// ship a regression like duplicate versions, negative versions, or empty
+// migration bodies. The actual SQL execution is exercised by integration
+// tests / first-run on a real node.
+
+#[cfg(test)]
+mod migration_tests {
+    use super::{MIGRATIONS, MIGRATION_V1_NAME};
+
+    #[test]
+    fn migrations_are_non_empty() {
+        assert!(
+            !MIGRATIONS.is_empty(),
+            "MIGRATIONS must contain at least the initial v1 schema"
+        );
+    }
+
+    #[test]
+    fn migration_versions_are_strictly_increasing() {
+        let mut last = i64::MIN;
+        for m in MIGRATIONS {
+            assert!(
+                m.version > last,
+                "migration versions must be strictly increasing; \
+                 found {} after {}",
+                m.version,
+                last
+            );
+            last = m.version;
+        }
+    }
+
+    #[test]
+    fn migration_versions_start_at_one() {
+        // A version of 0 (or negative) would be a footgun: any future
+        // `WHERE version > current_max` style query would skip it.
+        assert_eq!(
+            MIGRATIONS.first().map(|m| m.version),
+            Some(1),
+            "the first migration must have version 1"
+        );
+    }
+
+    #[test]
+    fn migration_names_are_non_empty_and_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for m in MIGRATIONS {
+            assert!(
+                !m.name.is_empty(),
+                "migration v{} has empty name",
+                m.version
+            );
+            assert!(
+                !m.name.contains(char::is_whitespace),
+                "migration v{} name {:?} contains whitespace",
+                m.version,
+                m.name
+            );
+            assert!(
+                seen.insert(m.name),
+                "duplicate migration name: {:?}",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn migration_bodies_are_non_empty() {
+        for m in MIGRATIONS {
+            assert!(
+                !m.stmts.is_empty(),
+                "migration v{} ({}) has no SQL statements",
+                m.version,
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn v1_name_is_the_initial_schema() {
+        // This is what the legacy-install backfill writes to
+        // `schema_migrations` when an existing node upgrades. If you rename
+        // it, you must also update the backfill.
+        assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
     }
 }
