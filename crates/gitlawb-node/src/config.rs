@@ -131,6 +131,19 @@ pub struct Config {
     /// Default: 2 GB.  Set lower on resource-constrained nodes.
     #[arg(long, env = "GITLAWB_MAX_PACK_BYTES", default_value_t = 2_147_483_648)]
     pub max_pack_bytes: usize,
+
+    /// Optional address to bind a Prometheus `/metrics` exposition endpoint on.
+    /// Example: `127.0.0.1:9091`. Leave empty (default) to disable.
+    /// Bind to localhost or a private interface — the metrics endpoint is
+    /// unauthenticated.
+    #[arg(long, env = "GITLAWB_METRICS_ADDR", default_value = "")]
+    pub metrics_addr: String,
+
+    /// Maximum time to wait for in-flight requests to drain on shutdown, in
+    /// seconds. After this elapses, the server returns 503 to anything still
+    /// in flight and exits. Default: 30s.
+    #[arg(long, env = "GITLAWB_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
+    pub shutdown_grace_secs: u64,
 }
 
 impl Config {

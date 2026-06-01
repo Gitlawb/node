@@ -51,6 +51,10 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 tar = "0.4"
 zstd = "0.13"
+# Prometheus metrics. Used to expose a /metrics endpoint for ops/observability
+# on the opt-in GITLAWB_METRICS_ADDR listener. The crate is also the de-facto
+# exposition format encoder in the Rust ecosystem.
+prometheus = { version = "0.13", default-features = false }
 alloy = { version = "1", default-features = false, features = [
     "contract",
     "provider-http",

@@ -366,7 +366,8 @@ pub async fn git_upload_pack(
         .acquire(&record.owner_did, &record.name)
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
-    smart_http::upload_pack(&disk_path, body)
+    let body_len = body.len();
+    let resp = smart_http::upload_pack(&disk_path, body)
         .await
         .map_err(|e| {
             let msg = e.to_string();
@@ -377,7 +378,10 @@ pub async fn git_upload_pack(
                 tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
                 AppError::Git(msg)
             }
-        })
+        })?;
+    crate::metrics::record_fetch(&format!("{owner}/{name}"));
+    crate::metrics::observe_pack_size(body_len as f64);
+    Ok(resp)
 }
 
 /// POST /:owner/:repo.git/git-receive-pack  (AUTH REQUIRED — enforced by middleware)
@@ -451,6 +455,7 @@ pub async fn git_receive_pack(
         })?;
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
+    let body_len = body.len();
     let receive_result = smart_http::receive_pack(&disk_path, body).await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
@@ -464,6 +469,11 @@ pub async fn git_receive_pack(
 
     // Update the repo's updated_at timestamp after a successful push
     let _ = state.db.touch_repo(&record.id).await;
+
+    // Record the successful push for metrics. The body has already been
+    // consumed by smart_http::receive_pack so we observe size up front.
+    crate::metrics::record_push(&record.id);
+    crate::metrics::observe_pack_size(body_len as f64);
 
     // Record push event for trust score and issue a signed ref certificate
     let pusher_did = extract_did_from_auth(&headers);

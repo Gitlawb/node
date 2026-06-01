@@ -19,20 +19,38 @@ use crate::config::Config;
 use crate::db::Db;
 
 /// Start the background sync worker. Returns immediately; the worker runs
-/// as a detached tokio task.
-pub fn start(db: Arc<Db>, config: Arc<Config>) {
+/// as a detached tokio task that exits cleanly when `shutdown_rx` flips
+/// to `true`.
+pub fn start(
+    db: Arc<Db>,
+    config: Arc<Config>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     tokio::spawn(async move {
-        run(db, config).await;
+        run(db, config, &mut shutdown_rx).await;
     });
 }
 
-async fn run(db: Arc<Db>, config: Arc<Config>) {
+async fn run(
+    db: Arc<Db>,
+    config: Arc<Config>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+) {
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
     info!("sync worker started (auto_sync=true)");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
-        interval.tick().await;
-        process_batch(&db, &config, machine_id.as_deref()).await;
+        tokio::select! {
+            _ = interval.tick() => {
+                process_batch(&db, &config, machine_id.as_deref()).await;
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("sync worker: shutdown signal received, exiting");
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -104,10 +122,12 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
                     )
                     .await;
                 let _ = db.mark_sync_done(&item.id).await;
+                crate::metrics::record_sync_processed("done");
             }
             Err(e) => {
                 warn!(repo = %item.repo, origin = %origin_url, err = %e, "repo sync failed");
                 let _ = db.mark_sync_failed(&item.id).await;
+                crate::metrics::record_sync_processed("failed");
             }
         }
     }
