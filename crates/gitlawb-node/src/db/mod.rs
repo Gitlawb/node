@@ -207,11 +207,19 @@ impl Db {
     /// transaction per migration. Idempotent — migrations whose version is
     /// already recorded in `schema_migrations` are skipped.
     ///
-    /// For an existing installation upgrading from a pre-migration-versioning
-    /// build, we detect the already-applied v1 schema (the `repos` table is
-    /// canonical and present on every production node) and mark v1 as
-    /// applied without re-running its statements. This lets us ship versioned
-    /// migrations on a live network without forcing operators to drop tables.
+    /// Concurrency: the whole routine is guarded by a Postgres advisory lock so
+    /// two node instances pointed at the same database (e.g. during a
+    /// blue/green or rolling deploy) cannot race to apply the same migration
+    /// and trip the `schema_migrations` primary key.
+    ///
+    /// Legacy installs: v1 bundles the entire pre-versioning schema, and every
+    /// statement in it is idempotent (`CREATE TABLE IF NOT EXISTS`,
+    /// `CREATE INDEX IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`). So an existing
+    /// node that predates this system just runs v1 once: existing objects are
+    /// no-ops, and any objects it was missing are created. We deliberately do
+    /// *not* short-circuit on the presence of a single canonical table — a node
+    /// that was behind on schema would then be marked complete while still
+    /// missing newer objects.
     async fn migrate(&self) -> Result<()> {
         // Bootstrap: ensure the `schema_migrations` table itself exists.
         sqlx::query(
@@ -225,49 +233,35 @@ impl Db {
         .await
         .context("creating schema_migrations table")?;
 
-        // Backfill: if the schema is already in place (legacy install) but no
-        // rows exist in `schema_migrations`, mark v1 as already applied.
-        // We use the `repos` table as the canonical signal — it has existed
-        // since the first public release and is present on every production
-        // node. If it's there but `schema_migrations` is empty, the schema
-        // was created by the old inline migration system.
-        let v1_already_applied: bool = sqlx::query(
-            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 1) AS applied",
-        )
-        .fetch_one(&self.pool)
-        .await?
-        .get::<bool, _>("applied");
+        // Serialize migrations across processes: hold a session-level advisory
+        // lock on a dedicated connection for the whole run. Another instance
+        // starting up blocks here until we finish. The lock is released when we
+        // explicitly unlock below, or automatically if the connection is
+        // dropped (e.g. on panic), so a crash can't wedge future restarts.
+        let mut lock_conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquiring connection for migration advisory lock")?;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK)
+            .execute(&mut *lock_conn)
+            .await
+            .context("acquiring migration advisory lock")?;
 
-        if !v1_already_applied {
-            let legacy_present: bool = sqlx::query(
-                "SELECT EXISTS(
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = 'public' AND table_name = 'repos'
-                ) AS present",
-            )
-            .fetch_one(&self.pool)
-            .await?
-            .get::<bool, _>("present");
+        let result = self.run_pending_migrations().await;
 
-            if legacy_present {
-                sqlx::query(
-                    "INSERT INTO schema_migrations (version, name, applied_at)
-                     VALUES ($1, $2, $3)",
-                )
-                .bind(1_i64)
-                .bind(MIGRATION_V1_NAME)
-                .bind(Utc::now().to_rfc3339())
-                .execute(&self.pool)
-                .await
-                .context("backfilling schema_migrations for legacy v1 schema")?;
-                info!(
-                    name = MIGRATION_V1_NAME,
-                    "detected legacy schema, marked v1 as already applied"
-                );
-            }
-        }
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK)
+            .execute(&mut *lock_conn)
+            .await;
 
-        // Apply any pending migrations in version order.
+        result
+    }
+
+    /// Apply every migration whose version isn't yet recorded, in order.
+    /// Must be called while holding the migration advisory lock.
+    async fn run_pending_migrations(&self) -> Result<()> {
         for m in MIGRATIONS {
             let already: bool = sqlx::query(
                 "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
@@ -356,6 +350,14 @@ impl Db {
 // install base. Future schema changes MUST be added as v2, v3, … — never
 // appended to v1. Operators can read `schema_migrations` to confirm a node
 // is at the expected version.
+//
+// Each migration runs in a single transaction, so statements that Postgres
+// forbids inside a transaction (notably `CREATE INDEX CONCURRENTLY`) cannot be
+// used here. Build such indexes the ordinary, transaction-safe way, or stage
+// them as a dedicated out-of-band operational step.
+
+// Arbitrary but stable key for the migration advisory lock ("gitlawb_" bytes).
+const MIGRATION_ADVISORY_LOCK: i64 = 0x6769_746C_6177_625F;
 
 const MIGRATION_V1_NAME: &str = "initial_schema";
 
