@@ -178,6 +178,19 @@ pub struct AgentRow {
     pub last_seen: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileRecord {
+    pub did: String,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_url: Option<String>,
+    pub website: Option<String>,
+    pub socials: Option<String>,
+    pub profile_cid: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 // ── Db ────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -367,7 +380,8 @@ struct Migration {
     stmts: &'static [&'static str],
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
+const MIGRATIONS: &[Migration] = &[
+    Migration {
     version: 1,
     name: MIGRATION_V1_NAME,
     stmts: &[
@@ -626,7 +640,25 @@ const MIGRATIONS: &[Migration] = &[Migration {
             "CREATE INDEX IF NOT EXISTS idx_bounties_repo ON bounties(repo_owner, repo_name)",
             "CREATE INDEX IF NOT EXISTS idx_bounties_claimant ON bounties(claimant_did)",
         ],
-}];
+    },
+    Migration {
+        version: 2,
+        name: "agent_profiles",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS agent_profiles (
+                did          TEXT NOT NULL PRIMARY KEY,
+                display_name TEXT,
+                bio          TEXT,
+                avatar_url   TEXT,
+                website      TEXT,
+                socials      TEXT,
+                profile_cid  TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
+            )"#,
+        ],
+    },
+];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
@@ -2353,6 +2385,120 @@ impl Db {
             deadline_secs: r.get("deadline_secs"),
             tx_hash: r.get("tx_hash"),
         }
+    }
+}
+
+// ── Agent Profiles ───────────────────────────────────────────────────────────
+
+impl Db {
+    pub async fn upsert_profile(
+        &self,
+        did: &str,
+        display_name: Option<&str>,
+        bio: Option<&str>,
+        avatar_url: Option<&str>,
+        website: Option<&str>,
+        socials: Option<&str>,
+    ) -> Result<ProfileRecord> {
+        let now = Utc::now().to_rfc3339();
+
+        // Try update first for existing profiles (merge fields)
+        let existing = self.get_profile(did).await?;
+
+        if let Some(existing) = existing {
+            let new_name = display_name.or(existing.display_name.as_deref());
+            let new_bio = bio.or(existing.bio.as_deref());
+            let new_avatar = avatar_url.or(existing.avatar_url.as_deref());
+            let new_website = website.or(existing.website.as_deref());
+            let new_socials = socials.or(existing.socials.as_deref());
+
+            sqlx::query(
+                "UPDATE agent_profiles
+                 SET display_name=$1, bio=$2, avatar_url=$3, website=$4, socials=$5, updated_at=$6
+                 WHERE did=$7",
+            )
+            .bind(new_name)
+            .bind(new_bio)
+            .bind(new_avatar)
+            .bind(new_website)
+            .bind(new_socials)
+            .bind(&now)
+            .bind(did)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(ProfileRecord {
+                did: did.to_string(),
+                display_name: new_name.map(String::from),
+                bio: new_bio.map(String::from),
+                avatar_url: new_avatar.map(String::from),
+                website: new_website.map(String::from),
+                socials: new_socials.map(String::from),
+                profile_cid: existing.profile_cid,
+                created_at: existing.created_at,
+                updated_at: now,
+            })
+        } else {
+            sqlx::query(
+                "INSERT INTO agent_profiles (did, display_name, bio, avatar_url, website, socials, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(did)
+            .bind(display_name)
+            .bind(bio)
+            .bind(avatar_url)
+            .bind(website)
+            .bind(socials)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+
+            Ok(ProfileRecord {
+                did: did.to_string(),
+                display_name: display_name.map(String::from),
+                bio: bio.map(String::from),
+                avatar_url: avatar_url.map(String::from),
+                website: website.map(String::from),
+                socials: socials.map(String::from),
+                profile_cid: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+        }
+    }
+
+    pub async fn get_profile(&self, did: &str) -> Result<Option<ProfileRecord>> {
+        let row = sqlx::query(
+            "SELECT did, display_name, bio, avatar_url, website, socials, profile_cid, created_at, updated_at
+             FROM agent_profiles
+             WHERE did = $1 OR did LIKE '%:' || $1",
+        )
+        .bind(did)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| ProfileRecord {
+            did: r.get("did"),
+            display_name: r.get("display_name"),
+            bio: r.get("bio"),
+            avatar_url: r.get("avatar_url"),
+            website: r.get("website"),
+            socials: r.get("socials"),
+            profile_cid: r.get("profile_cid"),
+            created_at: r.get("created_at"),
+            updated_at: r.get("updated_at"),
+        }))
+    }
+
+    pub async fn set_profile_cid(&self, did: &str, cid: &str) -> Result<()> {
+        sqlx::query("UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE did = $3")
+            .bind(cid)
+            .bind(Utc::now().to_rfc3339())
+            .bind(did)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

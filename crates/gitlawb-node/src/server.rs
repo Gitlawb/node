@@ -13,8 +13,8 @@ use tower_http::trace::{DefaultOnFailure, DefaultOnResponse, TraceLayer};
 use tracing::Level;
 
 use crate::api::{
-    agents, arweave, bounties, certs, changelog, events, ipfs, issues, labels, peers, protect,
-    pulls, register, replicas, repos, resolve, stars, tasks, webhooks,
+    agents, arweave, bounties, certs, changelog, events, ipfs, issues, labels, peers, profiles,
+    protect, pulls, register, replicas, repos, resolve, stars, tasks, webhooks,
 };
 use crate::auth;
 use crate::rate_limit;
@@ -210,6 +210,15 @@ pub fn build_router(state: AppState) -> Router {
             get(bounties::agent_bounty_stats),
         );
 
+    // ── Profile routes (write — require HTTP Signature) ─────────────────
+    let profile_write_routes = add_auth_layers(
+        Router::new().route(
+            "/api/v1/profile",
+            axum::routing::put(profiles::set_profile),
+        ),
+        state.clone(),
+    );
+
     // ── Issue routes (write — require HTTP Signature, no rate limit) ─────
     let issue_write_routes = add_auth_layers(
         Router::new()
@@ -290,6 +299,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/agents", get(agents::list_agents))
         .route("/api/v1/agents/{did}", get(agents::show_agent))
         .route("/api/v1/agents/{did}/trust", get(agents::get_trust))
+        .route(
+            "/api/v1/agents/{did}/profile",
+            get(profiles::get_profile),
+        )
         .route("/api/v1/events/ref-updates", get(events::list_ref_updates))
         .route("/api/v1/resolve/{did}", get(resolve::resolve_did))
         .route("/api/v1/repos/{owner}/{repo}/pulls", get(pulls::list_prs))
@@ -356,6 +369,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(task_read_routes)
         .merge(bounty_write_routes)
         .merge(bounty_read_routes)
+        .merge(profile_write_routes)
         .merge(creation_routes)
         .merge(write_routes)
         .merge(git_write_routes)

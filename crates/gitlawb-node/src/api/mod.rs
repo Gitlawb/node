@@ -8,6 +8,7 @@ pub mod ipfs;
 pub mod issues;
 pub mod labels;
 pub mod peers;
+pub mod profiles;
 pub mod protect;
 pub mod pulls;
 pub mod register;
