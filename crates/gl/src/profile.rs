@@ -288,10 +288,7 @@ async fn cmd_show(node: String, dir: Option<PathBuf>) -> Result<()> {
 async fn cmd_get(did: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
     let path = format!("/api/v1/agents/{did}/profile");
-    let resp = client
-        .get(&path)
-        .await
-        .context("failed to fetch profile")?;
+    let resp = client.get(&path).await.context("failed to fetch profile")?;
 
     let status = resp.status();
     if status.as_u16() == 404 {
@@ -371,12 +368,7 @@ async fn cmd_get(did: String, node: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_import(
-    path: PathBuf,
-    pin: bool,
-    node: String,
-    dir: Option<PathBuf>,
-) -> Result<()> {
+async fn cmd_import(path: PathBuf, pin: bool, node: String, dir: Option<PathBuf>) -> Result<()> {
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("could not read {}", path.display()))?;
 
@@ -428,10 +420,7 @@ async fn cmd_export(node: String, dir: Option<PathBuf>) -> Result<()> {
 
     let client = NodeClient::new(&node, None);
     let path = format!("/api/v1/agents/{short}/profile");
-    let resp = client
-        .get(&path)
-        .await
-        .context("failed to fetch profile")?;
+    let resp = client.get(&path).await.context("failed to fetch profile")?;
 
     let status = resp.status();
     if status.as_u16() == 404 {

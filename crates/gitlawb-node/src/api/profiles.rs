@@ -115,17 +115,13 @@ pub async fn get_profile(
     State(state): State<AppState>,
     Path(did): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let profile = state
-        .db
-        .get_profile(&did)
-        .await
-        .map_err(|e| {
-            tracing::error!(did = %did, error = %e, "failed to fetch profile");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "message": "failed to fetch profile" })),
-            )
-        })?;
+    let profile = state.db.get_profile(&did).await.map_err(|e| {
+        tracing::error!(did = %did, error = %e, "failed to fetch profile");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "message": "failed to fetch profile" })),
+        )
+    })?;
 
     match profile {
         Some(p) => {

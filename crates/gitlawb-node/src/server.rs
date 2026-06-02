@@ -212,10 +212,7 @@ pub fn build_router(state: AppState) -> Router {
 
     // ── Profile routes (write — require HTTP Signature) ─────────────────
     let profile_write_routes = add_auth_layers(
-        Router::new().route(
-            "/api/v1/profile",
-            axum::routing::put(profiles::set_profile),
-        ),
+        Router::new().route("/api/v1/profile", axum::routing::put(profiles::set_profile)),
         state.clone(),
     );
 
@@ -299,10 +296,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/agents", get(agents::list_agents))
         .route("/api/v1/agents/{did}", get(agents::show_agent))
         .route("/api/v1/agents/{did}/trust", get(agents::get_trust))
-        .route(
-            "/api/v1/agents/{did}/profile",
-            get(profiles::get_profile),
-        )
+        .route("/api/v1/agents/{did}/profile", get(profiles::get_profile))
         .route("/api/v1/events/ref-updates", get(events::list_ref_updates))
         .route("/api/v1/resolve/{did}", get(resolve::resolve_did))
         .route("/api/v1/repos/{owner}/{repo}/pulls", get(pulls::list_prs))
