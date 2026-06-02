@@ -21,6 +21,7 @@ pub struct SetProfileRequest {
     pub avatar_url: Option<String>,
     pub website: Option<String>,
     pub socials: Option<SocialsInput>,
+    #[allow(dead_code)]
     pub pin_to_ipfs: Option<bool>,
 }
 
