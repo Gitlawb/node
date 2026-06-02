@@ -9,6 +9,7 @@ mod error;
 mod git;
 mod graphql;
 mod ipfs_pin;
+mod metrics;
 mod operator;
 mod p2p;
 mod pinata;
@@ -22,6 +23,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use gitlawb_core::http_sig::sign_request;
@@ -57,6 +59,12 @@ async fn main() -> Result<()> {
     let keypair = load_or_create_keypair(&config)?;
     let node_did = keypair.did();
 
+    // One-time metrics init. Must run before any handler that calls into
+    // `metrics::record_*` so the registry exists when the first event fires.
+    // Safe to call even when GITLAWB_METRICS_ADDR is unset — those helpers
+    // are simply no-ops until something reads from the registry.
+    metrics::init(env!("CARGO_PKG_VERSION"), &node_did.to_string());
+
     info!("╔══════════════════════════════════════════╗");
     info!(
         "║         gitlawb node v{}             ║",
@@ -65,6 +73,12 @@ async fn main() -> Result<()> {
     info!("╚══════════════════════════════════════════╝");
     info!(did = %node_did, "node identity");
     info!(addr = %config.bind_addr(), "listening");
+
+    // Process-wide shutdown signal. One sender lives in AppState (cloned
+    // into every handler); main() keeps a clone and flips it on SIGINT
+    // or SIGTERM. Tasks that hold a watch::Receiver get notified at
+    // their next await point.
+    let (shutdown_tx, _shutdown_rx_for_main) = watch::channel(false);
 
     // Connect to PostgreSQL database
     let db = Arc::new(
@@ -92,12 +106,14 @@ async fn main() -> Result<()> {
             .iter()
             .filter_map(|s| s.parse().ok())
             .collect();
+        let shutdown_rx = shutdown_tx.subscribe();
         match p2p::start(
             &node_did.to_string(),
             config.p2p_port,
             bootstrap_addrs,
             Arc::clone(&db),
             config.auto_sync,
+            shutdown_rx,
         )
         .await
         {
@@ -170,15 +186,79 @@ async fn main() -> Result<()> {
         machine_id,
         repo_store,
         rate_limiter,
+        shutdown_tx: shutdown_tx.clone(),
     };
+
+    // Periodic peer-count poll for the metrics gauge. If p2p is disabled
+    // we still set the gauge to 0 so dashboards don't show "no data".
+    {
+        let p2p_for_metrics = state.p2p.clone();
+        let mut shutdown_rx = state.subscribe_shutdown();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let count = match &p2p_for_metrics {
+                            Some(h) => h.status().await.map(|s| s.connected_peers).unwrap_or(0),
+                            None => 0,
+                        };
+                        metrics::set_peers_connected(count as i64);
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Spawn a task that flips the shutdown signal on SIGINT or SIGTERM.
+    // On Unix, both signals are handled. On Windows, only Ctrl-C is
+    // supported by tokio::signal::ctrl_c.
+    {
+        let tx = shutdown_tx.clone();
+        tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal as unix_signal, SignalKind};
+                let mut sigterm =
+                    unix_signal(SignalKind::terminate()).expect("install SIGTERM handler");
+                let mut sigint =
+                    unix_signal(SignalKind::interrupt()).expect("install SIGINT handler");
+                tokio::select! {
+                    _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+                    _ = sigint.recv()  => info!("SIGINT received, shutting down"),
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                use tokio::signal;
+                let _ = signal::ctrl_c().await;
+                info!("Ctrl-C received, shutting down");
+            }
+            tx.send(true).ok();
+        });
+    }
 
     // Periodic cleanup of expired rate limit entries
     {
         let rl = state.rate_limiter.clone();
+        let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                rl.cleanup().await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                        rl.cleanup().await;
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
             }
         });
     }
@@ -195,6 +275,23 @@ async fn main() -> Result<()> {
         &config.database_url.split('@').next_back().unwrap_or("?")
     );
 
+    // Optional Prometheus metrics listener on a separate port.
+    let metrics_handle = if !config.metrics_addr.is_empty() {
+        match spawn_metrics_server(&config.metrics_addr, state.clone()).await {
+            Ok(handle) => {
+                info!(addr = %config.metrics_addr, "metrics endpoint listening");
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(err = %e, addr = %config.metrics_addr, "failed to start metrics endpoint — continuing without");
+                None
+            }
+        }
+    } else {
+        info!("metrics endpoint disabled (GITLAWB_METRICS_ADDR not set)");
+        None
+    };
+
     // Publish our DID record to the Kademlia DHT shortly after startup
     if let Some(p2p) = &state.p2p {
         let did_record = p2p::DidRecord {
@@ -205,9 +302,13 @@ async fn main() -> Result<()> {
             timestamp: chrono::Utc::now().to_rfc3339(),
         };
         let p2p_clone = Arc::clone(p2p);
+        let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             // Small delay so Kademlia can find peers first
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                _ = shutdown_rx.changed() => return,
+            }
             p2p_clone.put_did(did_record).await;
             info!("DID record published to Kademlia DHT");
         });
@@ -217,14 +318,19 @@ async fn main() -> Result<()> {
     {
         let gossip_state = state.clone();
         let bootstrap_peers = config.bootstrap_peers.clone();
+        let shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
-            gossip_task(gossip_state, bootstrap_peers).await;
+            gossip_task(gossip_state, bootstrap_peers, shutdown_rx).await;
         });
     }
 
     // Start multi-node sync worker if auto_sync is enabled
     if config.auto_sync {
-        sync::start(Arc::clone(&state.db), Arc::clone(&state.config));
+        sync::start(
+            Arc::clone(&state.db),
+            Arc::clone(&state.config),
+            state.subscribe_shutdown(),
+        );
         info!("auto-sync worker started");
     }
 
@@ -236,7 +342,7 @@ async fn main() -> Result<()> {
             Ok(client) => match operator::startup_check(&client).await {
                 Ok(_) => {
                     let arc_client = Arc::new(client);
-                    arc_client.spawn_heartbeat_loop();
+                    arc_client.spawn_heartbeat_loop(state.subscribe_shutdown());
                 }
                 Err(e) => {
                     if state.config.operator_strict_mode {
@@ -256,8 +362,88 @@ async fn main() -> Result<()> {
         info!("on-chain PoS disabled (GITLAWB_CONTRACT_NODE_STAKING or GITLAWB_OPERATOR_PRIVATE_KEY unset)");
     }
 
-    axum::serve(listener, router).await?;
+    // axum's `with_graceful_shutdown` waits for in-flight requests to
+    // complete (up to the configured grace) once the future resolves.
+    let shutdown_signal_for_axum = state.subscribe_shutdown();
+    let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
+    info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
+
+    let serve_result = axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            let mut rx = shutdown_signal_for_axum;
+            // Wait until the watcher flips to true, then return so axum
+            // can begin draining.
+            while !*rx.borrow_and_update() {
+                if rx.changed().await.is_err() {
+                    // Sender dropped — treat as shutdown.
+                    break;
+                }
+            }
+        })
+        .await;
+
+    // Server has stopped accepting new connections and drained in-flight
+    // requests. Tear the rest of the system down.
+    info!("HTTP server stopped, beginning process shutdown");
+    if let Some(h) = metrics_handle {
+        h.abort();
+    }
+    let _ = grace; // recorded for operators in the log above; not enforced
+    serve_result?;
+    info!("clean exit");
     Ok(())
+}
+
+/// Spawn a small axum router that exposes only `GET /metrics` on its own
+/// listener. Returns the JoinHandle so `main()` can abort it on shutdown.
+/// This is deliberately separate from the main router so the metrics port
+/// can be firewalled differently from the API port — bind to localhost
+/// or a private interface only.
+async fn spawn_metrics_server(addr: &str, state: AppState) -> Result<tokio::task::JoinHandle<()>> {
+    use axum::{response::IntoResponse, routing::get, Router};
+
+    async fn metrics_handler() -> impl IntoResponse {
+        match metrics::encode() {
+            Ok(body) => (
+                axum::http::StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                body,
+            ),
+            Err(e) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
+                format!("metrics encode error: {e}"),
+            ),
+        }
+    }
+
+    let mut shutdown_rx = state.subscribe_shutdown();
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind metrics listener to {addr}"))?;
+    let app = Router::new().route("/metrics", get(metrics_handler));
+
+    let handle = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                while !*shutdown_rx.borrow_and_update() {
+                    if shutdown_rx.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .await
+        {
+            warn!(err = %e, "metrics server exited with error");
+        }
+    });
+    Ok(handle)
 }
 
 fn build_operator_client(
@@ -282,9 +468,21 @@ fn build_operator_client(
 }
 
 /// Announce to bootstrap peers on startup, then periodically ping all known peers.
-async fn gossip_task(state: AppState, bootstrap_peers: Vec<String>) {
-    // Small delay to let the HTTP server come up before we try to announce
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+async fn gossip_task(
+    state: AppState,
+    bootstrap_peers: Vec<String>,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    // If shutdown arrives during the initial delay, exit before announcing.
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+        _ = shutdown_rx.changed() => {
+            if *shutdown_rx.borrow() {
+                info!("gossip: shutdown during startup delay, exiting");
+                return;
+            }
+        }
+    }
 
     let client = reqwest::Client::new();
     let my_did = state.node_did.to_string();
@@ -292,6 +490,12 @@ async fn gossip_task(state: AppState, bootstrap_peers: Vec<String>) {
 
     // Announce ourselves to each bootstrap peer
     for peer_url in &bootstrap_peers {
+        // Cooperative shutdown between peers — a slow peer shouldn't
+        // block the node exiting.
+        if *shutdown_rx.borrow() {
+            info!("gossip: shutdown signalled during peer announce, exiting");
+            return;
+        }
         let path = "/api/v1/peers/announce";
         let announce_url = format!("{}{}", peer_url.trim_end_matches('/'), path);
         let body = serde_json::json!({
@@ -306,17 +510,23 @@ async fn gossip_task(state: AppState, bootstrap_peers: Vec<String>) {
             }
         };
         let signed = sign_request(state.node_keypair.as_ref(), "POST", path, &body_bytes);
-        match client
-            .post(&announce_url)
-            .header("Content-Type", "application/json")
-            .header("Content-Digest", signed.content_digest)
-            .header("Signature-Input", signed.signature_input)
-            .header("Signature", signed.signature)
-            .body(body_bytes)
-            .send()
-            .await
+        // Per-request timeout inside the loop; do not let one hung peer
+        // block others. The request itself is a normal tokio future so
+        // it's cancel-safe on shutdown.
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .post(&announce_url)
+                .header("Content-Type", "application/json")
+                .header("Content-Digest", signed.content_digest)
+                .header("Signature-Input", signed.signature_input)
+                .header("Signature", signed.signature)
+                .body(body_bytes)
+                .send(),
+        )
+        .await
         {
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 if resp.status().is_success() {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {
                         // Add them back to our peer list
@@ -332,29 +542,39 @@ async fn gossip_task(state: AppState, bootstrap_peers: Vec<String>) {
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(url = %announce_url, err = %e, "failed to announce to bootstrap peer")
             }
+            Err(_) => tracing::warn!(url = %announce_url, "bootstrap peer announce timed out (5s)"),
         }
     }
 
-    // Periodic ping every 5 minutes
+    // Periodic ping every 5 minutes — exit on shutdown.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
     loop {
-        interval.tick().await;
-        let peers = match state.db.list_peers().await {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        for peer in peers {
-            let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-            let ok = client
-                .get(&url)
-                .send()
-                .await
-                .map(|r| r.status().is_success())
-                .unwrap_or(false);
-            let _ = state.db.mark_peer_ping(&peer.did, ok).await;
+        tokio::select! {
+            _ = interval.tick() => {
+                let peers = match state.db.list_peers().await {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                for peer in peers {
+                    let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
+                    let ok = client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false);
+                    let _ = state.db.mark_peer_ping(&peer.did, ok).await;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    info!("gossip task: shutdown signal received, exiting");
+                    return;
+                }
+            }
         }
     }
 }

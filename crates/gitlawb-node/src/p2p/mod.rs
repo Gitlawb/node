@@ -160,13 +160,15 @@ struct GitlawbBehaviour {
 }
 
 /// Start the libp2p swarm. Returns a handle for sending commands and the
-/// listening multiaddrs. Runs the event loop as a background tokio task.
+/// listening multiaddrs. Runs the event loop as a background tokio task
+/// that exits cleanly when `shutdown_rx` flips to `true`.
 pub async fn start(
     node_did: &str,
     listen_port: u16,
     bootstrap_addrs: Vec<Multiaddr>,
     db: Arc<Db>,
     auto_sync: bool,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<P2pHandle> {
     // Derive a stable libp2p Ed25519 key from a seed based on the node DID.
     // In production you'd load/persist this key alongside the identity PEM.
@@ -258,8 +260,18 @@ pub async fn start(
 
     // Start the event loop as a background task
     tokio::spawn(async move {
+        let mut shutdown_rx = shutdown_rx;
         loop {
             tokio::select! {
+                // Graceful shutdown: exit the swarm loop when the
+                // process-wide signal flips. This drops the Swarm
+                // which closes all libp2p connections cleanly.
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("p2p swarm: shutdown signal received, exiting event loop");
+                        break;
+                    }
+                }
                 // Handle swarm events
                 event = swarm.select_next_some() => {
                     match event {

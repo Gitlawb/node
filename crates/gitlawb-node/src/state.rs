@@ -51,4 +51,41 @@ pub struct AppState {
     pub repo_store: RepoStore,
     /// Per-DID rate limiter for creation endpoints (repos, issues, PRs)
     pub rate_limiter: RateLimiter,
+    /// Process-wide graceful-shutdown signal. Sending `true` causes every
+    /// task that holds a `watch::Receiver` to exit at its next await point.
+    /// Used by:
+    ///   * the SIGINT/SIGTERM handler in `main()`
+    ///   * axum's `with_graceful_shutdown` to drain in-flight HTTP requests
+    ///   * the libp2p swarm task
+    ///   * the gossip, sync, operator heartbeat, and rate-limit cleanup loops
+    pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl AppState {
+    /// Subscribe to the shutdown signal. Returns a fresh receiver whose
+    /// initial value matches the current state.
+    pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    /// Trigger graceful shutdown. Idempotent — calling more than once
+    /// has no effect. Returns `true` if this call was the one that
+    /// flipped the signal.
+    #[allow(dead_code)] // used by tests; main() drives the signal directly
+    pub fn shutdown(&self) -> bool {
+        self.shutdown_tx.send_if_modified(|v| {
+            if *v {
+                false
+            } else {
+                *v = true;
+                true
+            }
+        })
+    }
+
+    /// `true` once shutdown has been signalled.
+    #[allow(dead_code)] // used by tests and any future handler that wants to short-circuit
+    pub fn is_shutting_down(&self) -> bool {
+        *self.shutdown_tx.borrow()
+    }
 }

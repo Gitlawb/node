@@ -145,8 +145,12 @@ impl OperatorClient {
     }
 
     /// Spawn a background task that posts a heartbeat on `heartbeat_interval` cadence.
-    /// Errors are logged and retried on the next tick.
-    pub fn spawn_heartbeat_loop(self: Arc<Self>) {
+    /// Errors are logged and retried on the next tick. The task exits cleanly
+    /// when `shutdown_rx` flips to `true`.
+    pub fn spawn_heartbeat_loop(
+        self: Arc<Self>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
         let interval_secs = self.cfg.heartbeat_interval.as_secs();
         info!(
             interval_hours = interval_secs / 3600,
@@ -158,11 +162,20 @@ impl OperatorClient {
             // First tick fires immediately — use it to send an initial heartbeat
             interval.tick().await;
             loop {
-                match self.send_heartbeat().await {
-                    Ok(tx) => info!(tx = %tx, "operator heartbeat sent"),
-                    Err(e) => warn!(err = %e, "operator heartbeat failed — will retry"),
+                tokio::select! {
+                    _ = interval.tick() => {
+                        match self.send_heartbeat().await {
+                            Ok(tx) => info!(tx = %tx, "operator heartbeat sent"),
+                            Err(e) => warn!(err = %e, "operator heartbeat failed — will retry"),
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            info!("operator heartbeat loop: shutdown signal received, exiting");
+                            return;
+                        }
+                    }
                 }
-                interval.tick().await;
             }
         });
     }

@@ -93,18 +93,29 @@ async fn fire_event_async(
             }
 
             match req.send().await {
-                Ok(resp) => tracing::info!(
-                    url = %hook.url,
-                    event = %event_name,
-                    status = %resp.status(),
-                    "webhook delivered"
-                ),
-                Err(e) => tracing::warn!(
-                    url = %hook.url,
-                    event = %event_name,
-                    err = %e,
-                    "webhook delivery failed"
-                ),
+                Ok(resp) => {
+                    let result_label = if resp.status().is_success() {
+                        "ok"
+                    } else {
+                        "http_error"
+                    };
+                    crate::metrics::record_webhook_delivery(result_label);
+                    tracing::info!(
+                        url = %hook.url,
+                        event = %event_name,
+                        status = %resp.status(),
+                        "webhook delivered"
+                    )
+                }
+                Err(e) => {
+                    crate::metrics::record_webhook_delivery("network_error");
+                    tracing::warn!(
+                        url = %hook.url,
+                        event = %event_name,
+                        err = %e,
+                        "webhook delivery failed"
+                    )
+                }
             }
         });
     }
