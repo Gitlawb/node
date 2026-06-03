@@ -1,0 +1,159 @@
+//! Path-scoped visibility management API. Owner-only, mirrors `api/protect.rs`.
+
+use axum::extract::{Extension, Path, State};
+use axum::http::StatusCode;
+use axum::Json;
+use serde::Deserialize;
+
+use crate::auth::AuthenticatedDid;
+use crate::db::VisibilityMode;
+use crate::error::{AppError, Result};
+use crate::state::AppState;
+
+#[derive(Deserialize)]
+pub struct SetVisibilityRequest {
+    pub path_glob: String,
+    /// "a" or "b"; defaults to "b" if absent or unrecognized.
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub reader_dids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct RemoveVisibilityRequest {
+    pub path_glob: String,
+}
+
+fn require_owner(record: &crate::db::RepoRecord, caller: &str) -> Result<()> {
+    let owner_short = record
+        .owner_did
+        .split(':')
+        .next_back()
+        .unwrap_or(&record.owner_did);
+    if caller != record.owner_did && caller != owner_short {
+        return Err(AppError::BadRequest(
+            "only the repo owner can manage visibility".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// PUT /api/v1/repos/{owner}/{repo}/visibility
+pub async fn set_visibility(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(req): Json<SetVisibilityRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>)> {
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
+        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    require_owner(&record, &auth.0)?;
+
+    let mode = match req.mode.as_deref() {
+        Some("a") => VisibilityMode::A,
+        _ => VisibilityMode::B,
+    };
+
+    // Mode A hides existence and is only coherent for the whole repo; a subtree
+    // cannot hide its existence without rewriting git history (see spec).
+    if mode == VisibilityMode::A && req.path_glob != "/" {
+        return Err(AppError::BadRequest(
+            "mode 'a' (hide) is only allowed for the whole repo (path_glob '/'); use mode 'b' for subtrees".into(),
+        ));
+    }
+
+    // An empty reader_dids list is valid and intentional: the owner is always
+    // allowed by visibility_check, so a "/" rule with no readers is exactly the
+    // whole-repo "private to owner only" case.
+    state
+        .db
+        .set_visibility_rule(&record.id, &req.path_glob, mode, &req.reader_dids, &auth.0)
+        .await?;
+
+    let subtree_warning = req.path_glob != "/";
+    tracing::info!(
+        repo = %repo, caller = %auth.0, path_glob = %req.path_glob, mode = %mode.as_str(),
+        subtree_pending = subtree_warning,
+        "visibility rule set"
+    );
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "status": "set",
+            "repo": format!("{owner}/{repo}"),
+            "path_glob": req.path_glob,
+            "mode": mode.as_str(),
+            "reader_dids": req.reader_dids,
+            "subtree_clone_enforcement_pending": subtree_warning,
+        })),
+    ))
+}
+
+/// DELETE /api/v1/repos/{owner}/{repo}/visibility
+pub async fn remove_visibility(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
+    Path((owner, repo)): Path<(String, String)>,
+    Json(req): Json<RemoveVisibilityRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
+        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    require_owner(&record, &auth.0)?;
+
+    state
+        .db
+        .remove_visibility_rule(&record.id, &req.path_glob)
+        .await?;
+
+    tracing::info!(
+        repo = %repo, caller = %auth.0, path_glob = %req.path_glob,
+        "visibility rule removed"
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "removed",
+        "repo": format!("{owner}/{repo}"),
+        "path_glob": req.path_glob,
+    })))
+}
+
+/// GET /api/v1/repos/{owner}/{repo}/visibility
+pub async fn list_visibility(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
+        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    require_owner(&record, &auth.0)?;
+
+    let rules = state.db.list_visibility_rules(&record.id).await?;
+    let rules_json: Vec<_> = rules
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "path_glob": r.path_glob,
+                "mode": r.mode.as_str(),
+                "reader_dids": r.reader_dids,
+                "created_by": r.created_by,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "repo": format!("{owner}/{repo}"),
+        "count": rules_json.len(),
+        "rules": rules_json,
+    })))
+}

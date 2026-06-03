@@ -34,6 +34,24 @@ impl NodeClient {
             .with_context(|| format!("GET {url}"))
     }
 
+    /// GET with RFC 9421 HTTP Signature auth, for owner-only read endpoints.
+    /// Signs over the empty body (same shape the node verifies for signed reads).
+    pub async fn get_signed(&self, path: &str) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.node_url, path);
+        let kp = self
+            .keypair
+            .as_ref()
+            .context("get_signed requires an identity keypair")?;
+        let signed = sign_request(kp, "GET", path, b"");
+        let req = self
+            .inner
+            .get(&url)
+            .header("Content-Digest", signed.content_digest)
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature);
+        req.send().await.with_context(|| format!("GET {url}"))
+    }
+
     /// POST with JSON body + RFC 9421 HTTP Signature auth.
     pub async fn post(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);

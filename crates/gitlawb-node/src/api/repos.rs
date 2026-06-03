@@ -14,6 +14,7 @@ use crate::cert;
 use crate::error::{AppError, Result};
 use crate::git::{smart_http, store};
 use crate::state::AppState;
+use crate::visibility::{visibility_check, Decision};
 use crate::webhooks;
 
 // ── Request / Response types ───────────────────────────────────────────────
@@ -308,6 +309,7 @@ pub async fn git_info_refs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<InfoRefsQuery>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
@@ -321,6 +323,20 @@ pub async fn git_info_refs(
         .service
         .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
     tracing::debug!(service = %service, repo = %name, "info/refs service");
+
+    // Enforce read (clone/fetch) visibility. The push advertisement
+    // (service=git-receive-pack) is authorized separately on the
+    // git-receive-pack POST, so leave it untouched here.
+    if service == "git-upload-pack" {
+        let rules = state.db.list_visibility_rules(&record.id).await?;
+        let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+        if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
+            == Decision::Deny
+        {
+            tracing::debug!(repo = %name, caller = ?caller, "info/refs read denied by visibility");
+            return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+        }
+    }
 
     // For receive-pack (push), download the latest from Tigris so the client
     // sees the same refs that acquire_write() will operate on.
@@ -352,6 +368,7 @@ pub async fn git_info_refs(
 pub async fn git_upload_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
     body: Bytes,
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
@@ -360,6 +377,14 @@ pub async fn git_upload_pack(
         .get_repo(&owner, name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+
+    let rules = state.db.list_visibility_rules(&record.id).await?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/") == Decision::Deny
+    {
+        tracing::debug!(repo = %name, caller = ?caller, "upload-pack read denied by visibility");
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
 
     let disk_path = state
         .repo_store

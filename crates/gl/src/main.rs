@@ -30,6 +30,7 @@ mod status;
 mod sync;
 mod task;
 mod ucan_cmd;
+mod visibility;
 mod webhook;
 mod whoami;
 
@@ -119,6 +120,9 @@ enum Commands {
     /// Manage branch protection rules
     Protect(protect::ProtectArgs),
 
+    /// Manage path-scoped read visibility rules
+    Visibility(visibility::VisibilityArgs),
+
     /// Show unified activity changelog for a repository
     Changelog(changelog::ChangelogArgs),
 
@@ -167,6 +171,7 @@ async fn main() -> Result<()> {
         Commands::Agent(args) => agent::run(args).await,
         Commands::Profile(args) => profile::run(args).await,
         Commands::Protect(args) => protect::run(args).await,
+        Commands::Visibility(args) => visibility::run(args).await,
         Commands::Changelog(args) => changelog::run(args).await,
         Commands::Bounty(args) => bounty::run(args).await,
         Commands::Ucan(args) => ucan_cmd::run(args).await,

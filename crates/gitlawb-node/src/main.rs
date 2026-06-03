@@ -17,6 +17,7 @@ mod rate_limit;
 mod server;
 mod state;
 mod sync;
+mod visibility;
 mod webhooks;
 
 use anyhow::{Context, Result};

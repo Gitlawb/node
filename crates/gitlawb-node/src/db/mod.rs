@@ -22,6 +22,51 @@ pub struct RepoRecord {
     pub machine_id: Option<String>,
 }
 
+/// Per-rule replication mode for a visibility rule.
+/// `A` hides existence entirely (only valid at whole-repo scope `/`).
+/// `B` keeps object SHAs and the path visible but withholds content
+/// (the only mode allowed for subtrees; enforced on clones in Phase 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VisibilityMode {
+    A,
+    B,
+}
+
+impl VisibilityMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VisibilityMode::A => "a",
+            VisibilityMode::B => "b",
+        }
+    }
+
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "a" => VisibilityMode::A,
+            "b" => VisibilityMode::B,
+            other => {
+                tracing::warn!("unknown visibility mode in DB: {other:?}, defaulting to B");
+                VisibilityMode::B
+            }
+        }
+    }
+}
+
+/// A path-scoped visibility rule. `path_glob` is "/" for whole-repo, or a
+/// subtree pattern such as "/secret-pkg/**". The repo owner is always an
+/// implicit reader regardless of `reader_dids`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisibilityRule {
+    pub id: String,
+    pub repo_id: String,
+    pub path_glob: String,
+    pub mode: VisibilityMode,
+    pub reader_dids: Vec<String>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequest {
     pub id: String,
@@ -564,6 +609,18 @@ const MIGRATIONS: &[Migration] = &[
                 UNIQUE(repo_id, branch)
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_protected_branches_repo ON protected_branches(repo_id)",
+            // ── Path-scoped visibility ────────────────────────────────────────
+            r#"CREATE TABLE IF NOT EXISTS visibility_rules (
+                id          TEXT NOT NULL PRIMARY KEY,
+                repo_id     TEXT NOT NULL,
+                path_glob   TEXT NOT NULL,
+                mode        TEXT NOT NULL,
+                reader_dids TEXT NOT NULL,
+                created_by  TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                UNIQUE(repo_id, path_glob)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_visibility_rules_repo ON visibility_rules(repo_id)",
             // ── Repo stars ──────────────────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS repo_stars (
                 id         TEXT NOT NULL PRIMARY KEY,
@@ -2069,6 +2126,80 @@ impl Db {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.is_some())
+    }
+}
+
+// ── Path-scoped Visibility ────────────────────────────────────────────────────
+
+impl Db {
+    pub async fn set_visibility_rule(
+        &self,
+        repo_id: &str,
+        path_glob: &str,
+        mode: VisibilityMode,
+        reader_dids: &[String],
+        created_by: &str,
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let readers = serde_json::to_string(reader_dids).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query(
+            "INSERT INTO visibility_rules
+                 (id, repo_id, path_glob, mode, reader_dids, created_by, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (repo_id, path_glob) DO UPDATE
+             SET mode = EXCLUDED.mode,
+                 reader_dids = EXCLUDED.reader_dids,
+                 created_by = EXCLUDED.created_by,
+                 created_at = EXCLUDED.created_at",
+        )
+        .bind(&id)
+        .bind(repo_id)
+        .bind(path_glob)
+        .bind(mode.as_str())
+        .bind(&readers)
+        .bind(created_by)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_visibility_rule(&self, repo_id: &str, path_glob: &str) -> Result<()> {
+        sqlx::query("DELETE FROM visibility_rules WHERE repo_id = $1 AND path_glob = $2")
+            .bind(repo_id)
+            .bind(path_glob)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_visibility_rules(&self, repo_id: &str) -> Result<Vec<VisibilityRule>> {
+        let rows = sqlx::query(
+            "SELECT id, repo_id, path_glob, mode, reader_dids, created_by, created_at
+             FROM visibility_rules WHERE repo_id = $1 ORDER BY path_glob",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let readers: String = r.get("reader_dids");
+                let created_at: String = r.get("created_at");
+                VisibilityRule {
+                    id: r.get("id"),
+                    repo_id: r.get("repo_id"),
+                    path_glob: r.get("path_glob"),
+                    mode: VisibilityMode::from_db(&r.get::<String, _>("mode")),
+                    reader_dids: serde_json::from_str(&readers).unwrap_or_default(),
+                    created_by: r.get("created_by"),
+                    created_at: created_at
+                        .parse::<DateTime<Utc>>()
+                        .unwrap_or_else(|_| Utc::now()),
+                }
+            })
+            .collect())
     }
 }
 

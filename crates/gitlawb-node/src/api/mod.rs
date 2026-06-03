@@ -17,4 +17,5 @@ pub mod repos;
 pub mod resolve;
 pub mod stars;
 pub mod tasks;
+pub mod visibility;
 pub mod webhooks;
