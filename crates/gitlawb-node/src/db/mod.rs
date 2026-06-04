@@ -609,18 +609,6 @@ const MIGRATIONS: &[Migration] = &[
                 UNIQUE(repo_id, branch)
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_protected_branches_repo ON protected_branches(repo_id)",
-            // ── Path-scoped visibility ────────────────────────────────────────
-            r#"CREATE TABLE IF NOT EXISTS visibility_rules (
-                id          TEXT NOT NULL PRIMARY KEY,
-                repo_id     TEXT NOT NULL,
-                path_glob   TEXT NOT NULL,
-                mode        TEXT NOT NULL,
-                reader_dids TEXT NOT NULL,
-                created_by  TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
-                UNIQUE(repo_id, path_glob)
-            )"#,
-            "CREATE INDEX IF NOT EXISTS idx_visibility_rules_repo ON visibility_rules(repo_id)",
             // ── Repo stars ──────────────────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS repo_stars (
                 id         TEXT NOT NULL PRIMARY KEY,
@@ -713,6 +701,23 @@ const MIGRATIONS: &[Migration] = &[
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
             )"#,
+        ],
+    },
+    Migration {
+        version: 3,
+        name: "visibility_rules",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS visibility_rules (
+                id          TEXT NOT NULL PRIMARY KEY,
+                repo_id     TEXT NOT NULL,
+                path_glob   TEXT NOT NULL,
+                mode        TEXT NOT NULL,
+                reader_dids TEXT NOT NULL,
+                created_by  TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                UNIQUE(repo_id, path_glob)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_visibility_rules_repo ON visibility_rules(repo_id)",
         ],
     },
 ];

@@ -39,6 +39,32 @@ fn require_owner(record: &crate::db::RepoRecord, caller: &str) -> Result<()> {
     Ok(())
 }
 
+/// Reject malformed globs before they reach the store, where they would
+/// silently misconfigure access (an empty glob behaves like "/", and a glob
+/// without a leading "/" never matches a real repo path). The accepted forms
+/// match what `visibility_check` understands: "/", "/prefix", or "/prefix/**".
+fn validate_path_glob(path_glob: &str) -> Result<()> {
+    if !path_glob.starts_with('/') {
+        return Err(AppError::BadRequest("path_glob must start with '/'".into()));
+    }
+    if path_glob == "/**" {
+        return Err(AppError::BadRequest(
+            "use '/' for whole-repo scope, not '/**'".into(),
+        ));
+    }
+    if path_glob != "/" && path_glob.ends_with('/') {
+        return Err(AppError::BadRequest(
+            "path_glob must not end with '/'".into(),
+        ));
+    }
+    if path_glob.contains('*') && !path_glob.ends_with("/**") {
+        return Err(AppError::BadRequest(
+            "the only supported wildcard is a trailing '/**'".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// PUT /api/v1/repos/{owner}/{repo}/visibility
 pub async fn set_visibility(
     State(state): State<AppState>,
@@ -52,6 +78,7 @@ pub async fn set_visibility(
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
     require_owner(&record, &auth.0)?;
+    validate_path_glob(&req.path_glob)?;
 
     let mode = match req.mode.as_deref() {
         Some("a") => VisibilityMode::A,
@@ -156,4 +183,25 @@ pub async fn list_visibility(
         "count": rules_json.len(),
         "rules": rules_json,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_path_glob;
+
+    #[test]
+    fn accepts_supported_globs() {
+        for g in ["/", "/secret", "/secret/**", "/a/b/c", "/a/b/**"] {
+            assert!(validate_path_glob(g).is_ok(), "{g} should be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_globs() {
+        // empty, no leading slash, whole-repo via "/**", trailing slash, and
+        // non-trailing wildcards are all rejected.
+        for g in ["", "secret/**", "/**", "/secret/", "/a*b", "/*/x"] {
+            assert!(validate_path_glob(g).is_err(), "{g} should be rejected");
+        }
+    }
 }
