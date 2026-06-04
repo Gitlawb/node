@@ -20,6 +20,7 @@ mod node;
 mod node_stake;
 mod peer;
 mod pr;
+mod profile;
 mod protect;
 mod quickstart;
 mod register;
@@ -112,6 +113,9 @@ enum Commands {
     /// List and inspect registered agents on a node
     Agent(agent::AgentArgs),
 
+    /// Manage your agent profile (name, bio, avatar, social links)
+    Profile(profile::ProfileArgs),
+
     /// Manage branch protection rules
     Protect(protect::ProtectArgs),
 
@@ -161,6 +165,7 @@ async fn main() -> Result<()> {
         Commands::Star(args) => star::run(args).await,
         Commands::Status(args) => status::run(args).await,
         Commands::Agent(args) => agent::run(args).await,
+        Commands::Profile(args) => profile::run(args).await,
         Commands::Protect(args) => protect::run(args).await,
         Commands::Changelog(args) => changelog::run(args).await,
         Commands::Bounty(args) => bounty::run(args).await,
