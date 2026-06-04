@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::auth::AuthenticatedDid;
+use crate::pinata;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -21,7 +22,6 @@ pub struct SetProfileRequest {
     pub avatar_url: Option<String>,
     pub website: Option<String>,
     pub socials: Option<SocialsInput>,
-    #[allow(dead_code)]
     pub pin_to_ipfs: Option<bool>,
 }
 
@@ -92,11 +92,29 @@ pub async fn set_profile(
                 }
             }
 
-            // IPFS pinning via Pinata can be added in a follow-up PR
-            // when the node gains a shared Pinata client on AppState.
-            // For now, profiles are stored in Postgres and served via the API.
-
-            if let Some(cid) = profile.profile_cid {
+            if req.pin_to_ipfs.unwrap_or(false) && !state.config.pinata_jwt.is_empty() {
+                let profile_json = serde_json::to_vec(&resp).unwrap_or_default();
+                match pinata::pin_object(
+                    &state.http_client,
+                    &state.config.pinata_upload_url,
+                    &state.config.pinata_jwt,
+                    &format!("profile-{}", &did),
+                    &profile_json,
+                )
+                .await
+                {
+                    Ok(cid) if !cid.is_empty() => {
+                        if let Err(e) = state.db.set_profile_cid(&did, &cid).await {
+                            tracing::warn!(did = %did, err = %e, "failed to store profile CID");
+                        }
+                        resp["profile_cid"] = json!(cid);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(did = %did, err = %e, "IPFS pin failed — profile saved without CID");
+                    }
+                }
+            } else if let Some(cid) = profile.profile_cid {
                 resp["profile_cid"] = json!(cid);
             }
 

@@ -2491,7 +2491,6 @@ impl Db {
         }))
     }
 
-    #[allow(dead_code)]
     pub async fn set_profile_cid(&self, did: &str, cid: &str) -> Result<()> {
         sqlx::query("UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE did = $3")
             .bind(cid)
