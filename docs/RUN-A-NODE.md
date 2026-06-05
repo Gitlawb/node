@@ -8,7 +8,7 @@ Step-by-step guide to staking $GITLAWB, registering your node on-chain, and earn
 
 - A wallet with at least **10,000 $GITLAWB** (minimum stake) plus a small amount of ETH on Base for gas
 - Docker or Rust 1.91+ (for running the node process)
-- A public HTTP URL (your-host.com) — can be a VPS, Fly.io app, or anything reachable
+- A public HTTP URL (your-host.com) — can be a VPS, Fly.io app, or anything reachable. A Fly.io config is provided at `infra/fly/fly.toml` (deploy from the repo root with `fly deploy -c infra/fly/fly.toml`)
 
 ---
 

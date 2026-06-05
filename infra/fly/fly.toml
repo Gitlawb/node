@@ -2,7 +2,7 @@ app = "gitlawb-node-test"
 primary_region = "iad"
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = "../../Dockerfile"
 
 [env]
   GITLAWB_HOST = "0.0.0.0"
