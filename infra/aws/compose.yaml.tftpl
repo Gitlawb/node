@@ -1,0 +1,57 @@
+# Rendered by Terraform (compose.yaml.tftpl) and written to /opt/gitlawb/compose.yaml
+# by user-data. Adapted from the repo-root docker-compose.yml: pulls the published
+# image instead of building, and binds data dirs to the dedicated EBS volume.
+# `$${VAR}` entries are resolved by docker compose from /opt/gitlawb/.env at runtime.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${pg_db}
+      POSTGRES_USER: ${pg_user}
+      POSTGRES_PASSWORD: $${POSTGRES_PASSWORD}
+    volumes:
+      - /mnt/data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${pg_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  node:
+    image: ${image_repo}:${image_tag}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${gitlawb_port}:${gitlawb_port}"          # HTTP API + git smart-HTTP
+      - "${p2p_port}:${p2p_port}/udp"              # libp2p QUIC
+%{ if expose_metrics ~}
+      - "${metrics_port}:${metrics_port}"          # Prometheus /metrics
+%{ endif ~}
+    volumes:
+      - /mnt/data/node:/data
+    environment:
+      DATABASE_URL: postgresql://${pg_user}:$${POSTGRES_PASSWORD}@postgres:5432/${pg_db}
+      GITLAWB_HOST: 0.0.0.0
+      GITLAWB_PORT: "${gitlawb_port}"
+      GITLAWB_P2P_PORT: "${p2p_port}"
+      GITLAWB_REPOS_DIR: /data/repos
+      GITLAWB_KEY: /data/keys/identity.pem
+      GITLAWB_PUBLIC_URL: $${GITLAWB_PUBLIC_URL}
+      GITLAWB_BOOTSTRAP_PEERS: $${GITLAWB_BOOTSTRAP_PEERS}
+      GITLAWB_AUTO_SYNC: $${GITLAWB_AUTO_SYNC}
+      GITLAWB_MAX_PACK_BYTES: $${GITLAWB_MAX_PACK_BYTES}
+      # On-chain PoS (optional — empty unless set in terraform.tfvars)
+      GITLAWB_CHAIN_RPC_URL: $${GITLAWB_CHAIN_RPC_URL}
+      GITLAWB_CONTRACT_NODE_STAKING: $${GITLAWB_CONTRACT_NODE_STAKING}
+      GITLAWB_OPERATOR_PRIVATE_KEY: $${GITLAWB_OPERATOR_PRIVATE_KEY}
+      # IPFS pinning (optional)
+      GITLAWB_PINATA_JWT: $${GITLAWB_PINATA_JWT}
+      # Shared S3-compatible pack storage (optional)
+      GITLAWB_TIGRIS_BUCKET: $${GITLAWB_TIGRIS_BUCKET}
+      AWS_ACCESS_KEY_ID: $${S3_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: $${S3_SECRET_ACCESS_KEY}
+      AWS_ENDPOINT_URL_S3: $${S3_ENDPOINT_URL}
+    restart: unless-stopped

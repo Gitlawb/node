@@ -1,0 +1,13 @@
+# Terraform state and workdir — never commit (state contains secrets)
+*.tfstate
+*.tfstate.*
+.terraform/
+crash.log
+crash.*.log
+
+# Local variable files may contain secrets; keep the example only
+*.tfvars
+*.tfvars.json
+!terraform.tfvars.example
+
+# Note: .terraform.lock.hcl IS committed (reproducible provider versions)

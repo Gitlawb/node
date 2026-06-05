@@ -1,0 +1,97 @@
+#!/bin/bash
+# Rendered by Terraform (user-data.sh.tftpl). Runs once at first boot via cloud-init.
+set -euxo pipefail
+exec > >(tee -a /var/log/gitlawb-bootstrap.log) 2>&1
+
+COMPOSE_VERSION="v2.32.4"
+
+# ---------------------------------------------------------------------------
+# Docker + compose plugin (Amazon Linux 2023)
+# ---------------------------------------------------------------------------
+dnf install -y docker
+systemctl enable --now docker
+mkdir -p /usr/local/lib/docker/cli-plugins
+curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-$(uname -m)" \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+# ---------------------------------------------------------------------------
+# Data volume: find the attached EBS volume (Nitro presents /dev/sdf as NVMe;
+# attachment can lag first boot, so retry). The data disk is the one that is
+# not the root disk (no mounted partitions).
+# ---------------------------------------------------------------------------
+DATA_DEV=""
+for i in $(seq 1 60); do
+  for dev in $(lsblk -dpno NAME,TYPE | awk '$2 == "disk" { print $1 }'); do
+    if ! lsblk -no MOUNTPOINTS "$dev" | grep -q .; then
+      DATA_DEV="$dev"
+      break
+    fi
+  done
+  [ -n "$DATA_DEV" ] && break
+  sleep 5
+done
+if [ -z "$DATA_DEV" ]; then
+  echo "FATAL: data EBS volume never attached" >&2
+  exit 1
+fi
+
+# Format ONLY on first boot (no existing filesystem). Never reformat on
+# reattach — this is what preserves repos + the node identity key.
+if ! blkid "$DATA_DEV"; then
+  mkfs.ext4 -L gitlawb-data "$DATA_DEV"
+fi
+mkdir -p /mnt/data
+grep -q 'LABEL=gitlawb-data' /etc/fstab || \
+  echo 'LABEL=gitlawb-data /mnt/data ext4 defaults,nofail 0 2' >> /etc/fstab
+mount -a
+
+# Node container runs as uid/gid 1000 (gitlawb). Postgres manages its own dir.
+mkdir -p /mnt/data/node/repos /mnt/data/node/keys /mnt/data/postgres
+chown -R 1000:1000 /mnt/data/node
+
+# ---------------------------------------------------------------------------
+# Secrets from SSM Parameter Store (instance profile grants read on these only)
+# ---------------------------------------------------------------------------
+fetch_param() {
+  if [ -z "$1" ]; then echo ""; return; fi
+  aws ssm get-parameter --name "$1" --with-decryption \
+    --region '${region}' --query Parameter.Value --output text
+}
+PGPASS="$(fetch_param '${pg_password_param}')"
+OPERATOR_KEY="$(fetch_param '${operator_key_param}')"
+PINATA_JWT="$(fetch_param '${pinata_jwt_param}')"
+S3_SECRET="$(fetch_param '${s3_secret_param}')"
+
+# ---------------------------------------------------------------------------
+# Compose stack
+# ---------------------------------------------------------------------------
+mkdir -p /opt/gitlawb
+
+cat > /opt/gitlawb/.env <<ENV_EOF
+POSTGRES_PASSWORD=$PGPASS
+GITLAWB_PUBLIC_URL=${public_url}
+GITLAWB_BOOTSTRAP_PEERS=${bootstrap_peers}
+GITLAWB_AUTO_SYNC=${auto_sync}
+GITLAWB_MAX_PACK_BYTES=${max_pack_bytes}
+GITLAWB_CHAIN_RPC_URL=${chain_rpc_url}
+GITLAWB_CONTRACT_NODE_STAKING=${contract_node_staking}
+GITLAWB_OPERATOR_PRIVATE_KEY=$OPERATOR_KEY
+GITLAWB_PINATA_JWT=$PINATA_JWT
+GITLAWB_TIGRIS_BUCKET=${tigris_bucket}
+S3_ACCESS_KEY_ID=${s3_access_key_id}
+S3_SECRET_ACCESS_KEY=$S3_SECRET
+S3_ENDPOINT_URL=${s3_endpoint_url}
+ENV_EOF
+chmod 600 /opt/gitlawb/.env
+
+# Quoted heredoc: $${VAR} placeholders inside stay literal for docker compose.
+cat > /opt/gitlawb/compose.yaml <<'COMPOSE_EOF'
+${compose_yaml}
+COMPOSE_EOF
+
+cd /opt/gitlawb
+docker compose pull
+docker compose up -d
+
+echo "gitlawb-node bootstrap complete"

@@ -1,0 +1,42 @@
+# Copy to terraform.tfvars and adjust. terraform.tfvars is gitignored.
+
+region        = "us-east-1"
+name_prefix   = "gitlawb-node"
+instance_type = "t4g.small" # ARM/Graviton; node image is multi-arch
+
+# --- Image -----------------------------------------------------------------
+# image_repo = "ghcr.io/gitlawb/node"
+# image_tag  = "latest" # pin a version for production, e.g. "0.9.2"
+
+# --- Storage ---------------------------------------------------------------
+# data_volume_size_gb   = 20
+# snapshot_retain_count = 7
+
+# --- Node configuration (defaults mirror infra/fly/fly.toml) ---------------
+# Set to your real DNS name for production; defaults to http://<elastic-ip>:7545
+# public_url = "https://node.example.com"
+
+# bootstrap_peers = "https://node.gitlawb.com,https://node2.gitlawb.com,https://node3.gitlawb.com"
+# auto_sync       = "true"
+# max_pack_bytes  = "524288000"
+
+# --- Ingress ---------------------------------------------------------------
+# api_ingress_cidr     = "0.0.0.0/0"    # public node
+# p2p_ingress_cidr     = "0.0.0.0/0"
+# metrics_ingress_cidr = "203.0.113.10/32" # your Prometheus scraper; null = closed
+# ssh_ingress_cidr     = null            # keep null — use SSM Session Manager
+# ssh_key_name         = null
+
+# --- Optional: on-chain PoS operator ----------------------------------------
+# chain_rpc_url         = "https://mainnet.base.org"
+# contract_node_staking = "0x..."
+# operator_private_key  = "0x..." # stored in SSM SecureString, not user-data
+
+# --- Optional: IPFS / shared storage ----------------------------------------
+# pinata_jwt           = "..."
+# tigris_bucket        = "my-bucket"
+# s3_access_key_id     = "..."
+# s3_secret_access_key = "..." # stored in SSM SecureString
+# s3_endpoint_url      = "https://fly.storage.tigris.dev"
+
+# tags = { Environment = "production" }
