@@ -141,6 +141,14 @@ resource "aws_iam_role_policy" "ssm_params_read" {
         Effect   = "Allow"
         Action   = ["kms:Decrypt"]
         Resource = [data.aws_kms_key.ssm[0].arn]
+        # Only via Parameter Store, and only for this stack's parameters —
+        # not arbitrary ciphertext encrypted under the same CMK.
+        Condition = {
+          StringEquals = {
+            "kms:ViaService"                      = "ssm.${var.region}.amazonaws.com"
+            "kms:EncryptionContext:PARAMETER_ARN" = local.secret_param_arns
+          }
+        }
       }] : []
     )
   })
