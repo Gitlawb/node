@@ -2,7 +2,7 @@
 
 Deployment configuration, organized by target — one subdirectory per platform.
 
-```
+```text
 infra/
 ├── fly/
 │   └── fly.toml    # Fly.io app config (gitlawb-node-test)

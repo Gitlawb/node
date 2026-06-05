@@ -4,8 +4,8 @@ output "elastic_ip" {
 }
 
 output "api_url" {
-  description = "HTTP API endpoint"
-  value       = "http://${aws_eip.node.public_ip}:${var.gitlawb_port}"
+  description = "HTTP API endpoint (honors the public_url override)"
+  value       = local.public_url
 }
 
 output "instance_id" {

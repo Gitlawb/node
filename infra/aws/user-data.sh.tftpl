@@ -11,7 +11,9 @@ COMPOSE_VERSION="v2.32.4"
 dnf install -y docker
 systemctl enable --now docker
 mkdir -p /usr/local/lib/docker/cli-plugins
-curl -fsSL "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-$(uname -m)" \
+curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+  --connect-timeout 10 --max-time 300 \
+  "https://github.com/docker/compose/releases/download/$COMPOSE_VERSION/docker-compose-linux-$(uname -m)" \
   -o /usr/local/lib/docker/cli-plugins/docker-compose
 chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
@@ -52,7 +54,9 @@ chown -R 1000:1000 /mnt/data/node
 
 # ---------------------------------------------------------------------------
 # Secrets from SSM Parameter Store (instance profile grants read on these only)
+# xtrace is disabled through the .env write so secret values never hit the log.
 # ---------------------------------------------------------------------------
+set +x
 fetch_param() {
   if [ -z "$1" ]; then echo ""; return; fi
   aws ssm get-parameter --name "$1" --with-decryption \
@@ -84,6 +88,7 @@ S3_SECRET_ACCESS_KEY=$S3_SECRET
 S3_ENDPOINT_URL=${s3_endpoint_url}
 ENV_EOF
 chmod 600 /opt/gitlawb/.env
+set -x
 
 # Quoted heredoc: $${VAR} placeholders inside stay literal for docker compose.
 cat > /opt/gitlawb/compose.yaml <<'COMPOSE_EOF'

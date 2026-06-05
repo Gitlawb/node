@@ -52,6 +52,11 @@ variable "snapshot_retain_count" {
   description = "How many daily EBS snapshots of the data volume to retain"
   type        = number
   default     = 7
+
+  validation {
+    condition     = var.snapshot_retain_count >= 1 && var.snapshot_retain_count <= 1000
+    error_message = "snapshot_retain_count must be between 1 and 1000 (DLM retain rule limits)."
+  }
 }
 
 # ---------------------------------------------------------------------------
