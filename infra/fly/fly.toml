@@ -1,3 +1,5 @@
+# NOTE: this config targets the shared TEST instance. To deploy your own
+# node, change `app` (and the volume/URL below) or use `fly deploy -a <app>`.
 app = "gitlawb-node-test"
 primary_region = "iad"
 

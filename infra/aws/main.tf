@@ -72,12 +72,21 @@ resource "aws_ssm_parameter" "s3_secret" {
   tags  = local.common_tags
 }
 
+resource "aws_ssm_parameter" "s3_access_key" {
+  count = var.s3_access_key_id != "" ? 1 : 0
+  name  = "/${var.name_prefix}/s3_access_key_id"
+  type  = "SecureString"
+  value = var.s3_access_key_id
+  tags  = local.common_tags
+}
+
 locals {
   secret_param_arns = concat(
     [aws_ssm_parameter.postgres_password.arn],
     aws_ssm_parameter.operator_key[*].arn,
     aws_ssm_parameter.pinata_jwt[*].arn,
     aws_ssm_parameter.s3_secret[*].arn,
+    aws_ssm_parameter.s3_access_key[*].arn,
   )
 }
 
@@ -131,7 +140,7 @@ resource "aws_iam_instance_profile" "node" {
 resource "aws_security_group" "node" {
   name        = "${var.name_prefix}-sg"
   description = "gitlawb node: HTTP API + libp2p UDP"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = data.aws_subnet.selected.vpc_id # follows subnet_id overrides into non-default VPCs
   tags        = local.common_tags
 
   ingress {
@@ -229,6 +238,7 @@ locals {
     operator_key_param    = try(aws_ssm_parameter.operator_key[0].name, "")
     pinata_jwt_param      = try(aws_ssm_parameter.pinata_jwt[0].name, "")
     s3_secret_param       = try(aws_ssm_parameter.s3_secret[0].name, "")
+    s3_access_key_param   = try(aws_ssm_parameter.s3_access_key[0].name, "")
     public_url            = local.public_url
     bootstrap_peers       = var.bootstrap_peers
     auto_sync             = var.auto_sync
@@ -236,7 +246,6 @@ locals {
     chain_rpc_url         = var.chain_rpc_url
     contract_node_staking = var.contract_node_staking
     tigris_bucket         = var.tigris_bucket
-    s3_access_key_id      = var.s3_access_key_id
     s3_endpoint_url       = var.s3_endpoint_url
     compose_yaml          = local.compose_yaml
   })
@@ -264,10 +273,14 @@ resource "aws_instance" "node" {
   }
 
   lifecycle {
-    # New AL2023 AMI releases shouldn't force-replace the instance; replace
-    # deliberately (taint) for OS upgrades. user_data changes also only apply
-    # at first boot — use the upgrade SSM command for image bumps.
-    ignore_changes = [ami]
+    # ami: new AL2023 releases shouldn't churn the instance; replace
+    # deliberately for OS upgrades.
+    # user_data: only runs at first boot, so re-rendering it on a live
+    # instance is a pointless stop/start. Config changes that feed user-data
+    # (bootstrap peers, integrations, image tag) require a deliberate
+    # `terraform apply -replace=aws_instance.node` — see README "Changing
+    # configuration".
+    ignore_changes = [ami, user_data]
   }
 }
 
@@ -313,7 +326,12 @@ resource "aws_dlm_lifecycle_policy" "data" {
 
   policy_details {
     resource_types = ["VOLUME"]
-    target_tags    = { Snapshot = "true" }
+    # Name makes the target stack-specific — a bare Snapshot=true would also
+    # match unrelated tagged volumes in a shared account.
+    target_tags = {
+      Snapshot = "true"
+      Name     = "${var.name_prefix}-data"
+    }
 
     schedule {
       name = "daily"

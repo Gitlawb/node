@@ -66,6 +66,7 @@ PGPASS="$(fetch_param '${pg_password_param}')"
 OPERATOR_KEY="$(fetch_param '${operator_key_param}')"
 PINATA_JWT="$(fetch_param '${pinata_jwt_param}')"
 S3_SECRET="$(fetch_param '${s3_secret_param}')"
+S3_KEY_ID="$(fetch_param '${s3_access_key_param}')"
 
 # ---------------------------------------------------------------------------
 # Compose stack
@@ -83,7 +84,7 @@ GITLAWB_CONTRACT_NODE_STAKING=${contract_node_staking}
 GITLAWB_OPERATOR_PRIVATE_KEY=$OPERATOR_KEY
 GITLAWB_PINATA_JWT=$PINATA_JWT
 GITLAWB_TIGRIS_BUCKET=${tigris_bucket}
-S3_ACCESS_KEY_ID=${s3_access_key_id}
+S3_ACCESS_KEY_ID=$S3_KEY_ID
 S3_SECRET_ACCESS_KEY=$S3_SECRET
 S3_ENDPOINT_URL=${s3_endpoint_url}
 ENV_EOF
@@ -97,6 +98,6 @@ COMPOSE_EOF
 
 cd /opt/gitlawb
 docker compose pull
-docker compose up -d
+docker compose up -d --remove-orphans
 
 echo "gitlawb-node bootstrap complete"

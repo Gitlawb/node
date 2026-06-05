@@ -86,6 +86,21 @@ Replace the instance itself (OS/AMI/instance-type changes) with
 `terraform apply -replace=aws_instance.node` — the data volume reattaches and
 `/data` (including the identity key) survives.
 
+## Changing configuration
+
+User-data only runs at first boot, and the instance ignores `user_data` drift
+(`ignore_changes`), so editing terraform.tfvars values that feed the bootstrap
+(`bootstrap_peers`, `public_url`, integrations, `image_tag`) does **not**
+affect a running instance on `terraform apply`. To roll out such changes,
+either edit `/opt/gitlawb/.env` on the instance (SSM session, then
+`docker compose up -d`), or replace the instance:
+
+```sh
+terraform apply -replace=aws_instance.node
+```
+
+The data volume reattaches; repos, postgres data, and the identity key survive.
+
 ## Remote state (optional)
 
 Local state is the default. To move state to S3: create a versioned bucket,

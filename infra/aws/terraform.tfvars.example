@@ -35,8 +35,8 @@ instance_type = "t4g.small" # ARM/Graviton; node image is multi-arch
 # --- Optional: IPFS / shared storage ----------------------------------------
 # pinata_jwt           = "..."
 # tigris_bucket        = "my-bucket"
-# s3_access_key_id     = "..."
-# s3_secret_access_key = "..." # stored in SSM SecureString
+# s3_access_key_id     = "..." # stored in SSM SecureString, not user-data
+# s3_secret_access_key = "..." # stored in SSM SecureString, not user-data
 # s3_endpoint_url      = "https://fly.storage.tigris.dev"
 
 # tags = { Environment = "production" }
