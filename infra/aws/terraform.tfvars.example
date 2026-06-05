@@ -39,4 +39,7 @@ instance_type = "t4g.small" # ARM/Graviton; node image is multi-arch
 # s3_secret_access_key = "..." # stored in SSM SecureString, not user-data
 # s3_endpoint_url      = "https://fly.storage.tigris.dev"
 
+# Encrypt SSM secrets with a customer-managed KMS key instead of aws/ssm
+# ssm_kms_key_id = "alias/my-key"
+
 # tags = { Environment = "production" }

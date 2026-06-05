@@ -42,42 +42,47 @@ resource "random_password" "postgres" {
 }
 
 resource "aws_ssm_parameter" "postgres_password" {
-  name  = "/${var.name_prefix}/postgres_password"
-  type  = "SecureString"
-  value = random_password.postgres.result
-  tags  = local.common_tags
+  name   = "/${var.name_prefix}/postgres_password"
+  type   = "SecureString"
+  key_id = var.ssm_kms_key_id
+  value  = random_password.postgres.result
+  tags   = local.common_tags
 }
 
 resource "aws_ssm_parameter" "operator_key" {
-  count = var.operator_private_key != "" ? 1 : 0
-  name  = "/${var.name_prefix}/operator_private_key"
-  type  = "SecureString"
-  value = var.operator_private_key
-  tags  = local.common_tags
+  count  = var.operator_private_key != "" ? 1 : 0
+  name   = "/${var.name_prefix}/operator_private_key"
+  type   = "SecureString"
+  key_id = var.ssm_kms_key_id
+  value  = var.operator_private_key
+  tags   = local.common_tags
 }
 
 resource "aws_ssm_parameter" "pinata_jwt" {
-  count = var.pinata_jwt != "" ? 1 : 0
-  name  = "/${var.name_prefix}/pinata_jwt"
-  type  = "SecureString"
-  value = var.pinata_jwt
-  tags  = local.common_tags
+  count  = var.pinata_jwt != "" ? 1 : 0
+  name   = "/${var.name_prefix}/pinata_jwt"
+  type   = "SecureString"
+  key_id = var.ssm_kms_key_id
+  value  = var.pinata_jwt
+  tags   = local.common_tags
 }
 
 resource "aws_ssm_parameter" "s3_secret" {
-  count = var.s3_secret_access_key != "" ? 1 : 0
-  name  = "/${var.name_prefix}/s3_secret_access_key"
-  type  = "SecureString"
-  value = var.s3_secret_access_key
-  tags  = local.common_tags
+  count  = var.s3_secret_access_key != "" ? 1 : 0
+  name   = "/${var.name_prefix}/s3_secret_access_key"
+  type   = "SecureString"
+  key_id = var.ssm_kms_key_id
+  value  = var.s3_secret_access_key
+  tags   = local.common_tags
 }
 
 resource "aws_ssm_parameter" "s3_access_key" {
-  count = var.s3_access_key_id != "" ? 1 : 0
-  name  = "/${var.name_prefix}/s3_access_key_id"
-  type  = "SecureString"
-  value = var.s3_access_key_id
-  tags  = local.common_tags
+  count  = var.s3_access_key_id != "" ? 1 : 0
+  name   = "/${var.name_prefix}/s3_access_key_id"
+  type   = "SecureString"
+  key_id = var.ssm_kms_key_id
+  value  = var.s3_access_key_id
+  tags   = local.common_tags
 }
 
 locals {
@@ -92,8 +97,14 @@ locals {
 
 # ---------------------------------------------------------------------------
 # IAM: SSM Session Manager access + least-privilege read of our parameters.
-# (AWS-managed aws/ssm KMS key needs no explicit kms:Decrypt grant.)
+# The AWS-managed aws/ssm KMS key needs no explicit kms:Decrypt grant; a
+# customer-managed key (ssm_kms_key_id) gets one scoped to that key.
 # ---------------------------------------------------------------------------
+
+data "aws_kms_key" "ssm" {
+  count  = var.ssm_kms_key_id != null ? 1 : 0
+  key_id = var.ssm_kms_key_id
+}
 
 resource "aws_iam_role" "node" {
   name = "${var.name_prefix}-instance"
@@ -120,11 +131,18 @@ resource "aws_iam_role_policy" "ssm_params_read" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["ssm:GetParameter"]
-      Resource = local.secret_param_arns
-    }]
+    Statement = concat(
+      [{
+        Effect   = "Allow"
+        Action   = ["ssm:GetParameter"]
+        Resource = local.secret_param_arns
+      }],
+      var.ssm_kms_key_id != null ? [{
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [data.aws_kms_key.ssm[0].arn]
+      }] : []
+    )
   })
 }
 

@@ -155,6 +155,12 @@ variable "max_pack_bytes" {
   default     = "524288000"
 }
 
+variable "ssm_kms_key_id" {
+  description = "Customer-managed KMS key (ID, alias, or ARN) for encrypting the SSM SecureString secrets. null = AWS-managed aws/ssm key."
+  type        = string
+  default     = null
+}
+
 # ---------------------------------------------------------------------------
 # Postgres
 # ---------------------------------------------------------------------------

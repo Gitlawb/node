@@ -129,7 +129,10 @@ them up in the EC2 console if unwanted. The Elastic IP is released on destroy.
   files on disk (only in `/opt/gitlawb/.env`, mode 600). It IS in Terraform
   state — treat state as sensitive (another reason for the S3 backend).
 - Sensitive optional vars (`operator_private_key`, `pinata_jwt`,
-  `s3_secret_access_key`) follow the same SSM path.
+  `s3_access_key_id`, `s3_secret_access_key`) follow the same SSM path.
+- SSM secrets use the AWS-managed `aws/ssm` key by default; set
+  `ssm_kms_key_id` to encrypt with a customer-managed KMS key instead (the
+  instance role is granted `kms:Decrypt` on that key automatically).
 - IMDSv2 is required; metrics port is closed unless `metrics_ingress_cidr` is set.
 - The node serves plain HTTP on 7545. For TLS, put a DNS name + proxy
   (ALB/CloudFront/Caddy) in front and set `public_url` accordingly.
