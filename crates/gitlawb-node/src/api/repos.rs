@@ -330,6 +330,8 @@ pub async fn git_info_refs(
     if service == "git-upload-pack" {
         let rules = state.db.list_visibility_rules(&record.id).await?;
         let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+        // Subtree (mode B) rules do not gate the advertisement: refs expose commit
+        // tips only, and blob withholding happens in the upload-pack pack build.
         if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
             == Decision::Deny
         {
