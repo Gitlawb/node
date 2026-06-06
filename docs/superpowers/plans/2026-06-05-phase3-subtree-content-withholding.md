@@ -8,7 +8,9 @@
 
 **Tech Stack:** Rust, axum, the system `git` CLI (shelled out, as the codebase already does in `git/store.rs` and `git/smart_http.rs`), `tempfile` for fixture repos in tests.
 
-**Scope boundary:** This plan covers the node-side enforcement and the security guarantee (private blob bytes are never placed in the served pack), proven by inspecting the produced pack. It deliberately does NOT cover: the `git-remote-gitlawb` client-side change that lets a non-reader get a *clean* partial checkout (a stock `git clone` of a repo with a withheld blob will fail at checkout on the missing object; that UX work is a separate follow-up plan), filtered-pack caching, or incremental-fetch (`have`-line) hardening beyond what falls out naturally. Those are listed under "Out of scope / follow-ups" at the end.
+**Scope boundary:** This plan covers the node-side enforcement and the security guarantee (private blob bytes are never placed in the served pack), proven by inspecting the produced pack and by a real `git` partial clone. It deliberately does NOT cover: the `git-remote-gitlawb` client-side change that lets a non-reader get a *clean* clone without passing `--filter` (see the corrected client-behavior note below), filtered-pack caching, or incremental-fetch (`have`-line) hardening beyond what falls out naturally. Those are listed under "Out of scope / follow-ups" at the end.
+
+**Corrected client behavior (verified during execution, supersedes an earlier assumption in this plan):** a served pack that omits a blob still referenced by a sent tree is not closed under reachability. A stock *full* `git clone` therefore rejects it at *fetch* time with "remote did not send all necessary objects" (the connectivity check), NOT at checkout. Only a *partial* clone (the client passes `--filter`, which marks a promisor remote and relaxes that check) accepts the pack with the private blob absent; tree and commit SHAs stay intact. The security guarantee (private bytes never leave the node) holds for every client. Making a normal `git clone` Just Work without `--filter` is the git-remote-gitlawb follow-up.
 
 ---
 
@@ -703,7 +705,7 @@ Set a subtree rule on a local repo via `gl visibility`, clone as a non-reader th
 
 ## Out of scope / follow-ups (separate plans)
 
-1. **`git-remote-gitlawb` partial-clone UX.** Make a non-reader's clone produce a clean partial checkout rather than a checkout error on the missing blob: the helper requests partial-clone semantics and treats withheld blobs as deliberately absent. Without this, a stock `git clone` of a repo with a withheld blob succeeds at fetch but errors at checkout. The security guarantee (bytes never sent) holds regardless; this is purely UX.
+1. **`git-remote-gitlawb` partial-clone UX.** Make a non-reader's clone Just Work without the user passing `--filter`: the helper requests partial-clone semantics, advertises the `filter` capability cleanly (so there is no "filtering not recognized by server, ignoring" warning), and treats withheld blobs as deliberately absent. Without this, a stock full `git clone` of a repo with a withheld blob is refused at fetch time ("remote did not send all necessary objects"); only `git clone --filter=...` succeeds. The security guarantee (bytes never sent) holds regardless; this is purely UX.
 2. **Filtered-pack caching.** `build_filtered_pack` recomputes per request. If hot, cache by (repo, tip-OIDs, withheld-set) and invalidate on push.
 3. **Incremental fetch (`have` lines).** This plan targets the clone case. Confirm and, if needed, harden the filtered serve for fetches that send `have` lines so withheld blobs are never sent incrementally either.
 4. **Replication-path enforcement (Phase 2).** Still blocked on the maintainer A/B decision; unrelated to this HTTP-path work.
