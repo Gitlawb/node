@@ -125,8 +125,6 @@ fn pkt_line(data: &str) -> Vec<u8> {
 /// Build a packfile containing every object reachable from all refs EXCEPT the
 /// given blob OIDs. Commits and trees are always included, so SHAs stay intact;
 /// only the named blobs are dropped.
-// #[allow(dead_code)] removed when wired into the upload-pack handler in the next task.
-#[allow(dead_code)]
 pub fn build_filtered_pack(repo_path: &Path, withheld: &HashSet<String>) -> Result<Vec<u8>> {
     // All reachable objects as "oid [path]" lines.
     let rev = std::process::Command::new("git")
@@ -173,8 +171,6 @@ pub fn build_filtered_pack(repo_path: &Path, withheld: &HashSet<String>) -> Resu
 /// Serve a clone/fetch with the withheld blobs removed from the response pack.
 /// Framing: the body wraps `build_filtered_pack` output in the upload-pack
 /// `packfile` section with sideband-64k band 1, terminated by flush.
-// #[allow(dead_code)] removed when wired into the upload-pack handler in the next task.
-#[allow(dead_code)]
 pub async fn upload_pack_excluding(
     repo_path: &Path,
     _request_body: Bytes,

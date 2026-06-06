@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::cert;
 use crate::error::{AppError, Result};
-use crate::git::{smart_http, store};
+use crate::git::{smart_http, store, visibility_pack};
 use crate::state::AppState;
 use crate::visibility::{visibility_check, Decision};
 use crate::webhooks;
@@ -392,18 +392,32 @@ pub async fn git_upload_pack(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let body_len = body.len();
-    let resp = smart_http::upload_pack(&disk_path, body)
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("bad line length") || msg.contains("protocol error") {
-                tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request");
-                AppError::BadRequest(msg)
-            } else {
-                tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
-                AppError::Git(msg)
-            }
-        })?;
+
+    let withheld = visibility_pack::withheld_blob_oids(
+        &disk_path,
+        &rules,
+        record.is_public,
+        &record.owner_did,
+        caller,
+    )
+    .map_err(|e| AppError::Git(e.to_string()))?;
+
+    let resp = if withheld.is_empty() {
+        smart_http::upload_pack(&disk_path, body).await
+    } else {
+        tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
+        smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
+    }
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("bad line length") || msg.contains("protocol error") {
+            tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request");
+            AppError::BadRequest(msg)
+        } else {
+            tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
+            AppError::Git(msg)
+        }
+    })?;
     crate::metrics::record_fetch(&format!("{owner}/{name}"));
     crate::metrics::observe_pack_size(body_len as f64);
     Ok(resp)

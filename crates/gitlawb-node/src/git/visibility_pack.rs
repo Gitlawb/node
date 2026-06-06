@@ -10,7 +10,6 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::Path;
 
-#[allow(dead_code)]
 /// List every (blob_oid, "/repo/relative/path") pair reachable from any branch
 /// ref in `repo_path`. Uses `git ls-tree -r` per ref so each path a blob lives
 /// at is represented (the same blob content can appear at several paths). Paths
@@ -50,7 +49,6 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-#[allow(dead_code)]
 /// Blob OIDs the caller may not read. A blob is withheld only if visibility
 /// denies the caller at *every* path the blob appears at; a blob that is also
 /// reachable through an allowed path is sent (its content is public elsewhere).
