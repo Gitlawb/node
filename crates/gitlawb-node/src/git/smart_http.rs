@@ -183,6 +183,14 @@ pub fn build_filtered_pack(repo_path: &Path, withheld: &HashSet<String>) -> Resu
 /// intact either way. The clean partial-clone client UX is a separate follow-up
 /// (git-remote-gitlawb); the security guarantee (private bytes never leave the
 /// node) holds regardless of client.
+///
+/// Negotiation is intentionally ignored: rather than honoring the client's
+/// `want`/`have` lines, this always sends a self-contained pack of every object
+/// across all refs minus the withheld blobs, and replies `NAK`. A fresh clone
+/// and an incremental fetch are both correct (the client de-duplicates objects
+/// it already has); the cost is that a fetch re-sends the full object set
+/// instead of a thin delta. Honoring negotiation for smaller fetch packs is an
+/// optimization follow-up, not a correctness requirement.
 pub async fn upload_pack_excluding(
     repo_path: &Path,
     request_body: Bytes,
@@ -405,40 +413,80 @@ mod tests {
         out
     }
 
-    /// End-to-end: a real `git` client clones through `info_refs` +
-    /// `upload_pack_excluding` and ends up without the withheld blob's bytes
-    /// while still seeing its tree entry (SHA). Uses a partial clone
-    /// (`--filter`) because a pack that omits a referenced blob is only
-    /// accepted by a promisor-aware client; a stock full clone is refused at
-    /// fetch time by the connectivity check.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn real_git_partial_clone_omits_withheld_blob() {
-        use axum::extract::{Query, State};
-        use axum::routing::{get, post};
-        use axum::Router;
-        use std::collections::HashMap;
-        use std::sync::Arc;
+    // Shared harness for the real-git server tests: a minimal smart-HTTP server
+    // backed by the real info_refs + upload_pack_excluding.
 
-        let td = TempDir::new().unwrap();
+    #[derive(Clone)]
+    struct FilterState {
+        repo: std::path::PathBuf,
+        withheld: HashSet<String>,
+    }
+
+    async fn refs_handler(
+        axum::extract::State(st): axum::extract::State<std::sync::Arc<FilterState>>,
+        axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> Response {
+        let service = q.get("service").cloned().unwrap_or_default();
+        info_refs(&st.repo, &service).await.unwrap()
+    }
+
+    async fn pack_handler(
+        axum::extract::State(st): axum::extract::State<std::sync::Arc<FilterState>>,
+        body: Bytes,
+    ) -> Response {
+        upload_pack_excluding(&st.repo, body, &st.withheld)
+            .await
+            .unwrap()
+    }
+
+    /// Spawn the server for `bare`, withholding `withheld`. Returns the clone URL
+    /// and the server task (abort it when done).
+    async fn spawn_filter_server(
+        bare: std::path::PathBuf,
+        withheld: HashSet<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::routing::{get, post};
+        let state = std::sync::Arc::new(FilterState {
+            repo: bare,
+            withheld,
+        });
+        let app = axum::Router::new()
+            .route("/repo.git/info/refs", get(refs_handler))
+            .route("/repo.git/git-upload-pack", post(pack_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://127.0.0.1:{port}/repo.git"), handle)
+    }
+
+    fn run_git(args: &[&str], dir: &std::path::Path) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    /// Build a work repo (public/a.txt, secret/b.txt) and a bare clone of it.
+    /// Returns (work, bare, secret_blob_oid, public_blob_oid).
+    fn fixture_with_secret(
+        td: &TempDir,
+    ) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
         let work = td.path().join("work");
         let bare = td.path().join("bare.git");
-        let g = |args: &[&str], dir: &std::path::Path| {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .status()
-                .unwrap()
-                .success());
-        };
         std::fs::create_dir_all(work.join("secret")).unwrap();
         std::fs::create_dir_all(work.join("public")).unwrap();
         std::fs::write(work.join("public/a.txt"), b"pub\n").unwrap();
         std::fs::write(work.join("secret/b.txt"), b"SECRET\n").unwrap();
-        g(&["init", "-q"], &work);
-        g(&["config", "user.email", "t@t"], &work);
-        g(&["config", "user.name", "t"], &work);
-        g(&["add", "."], &work);
-        g(&["commit", "-qm", "init"], &work);
+        run_git(&["init", "-q"], &work);
+        run_git(&["config", "user.email", "t@t"], &work);
+        run_git(&["config", "user.name", "t"], &work);
+        run_git(&["add", "."], &work);
+        run_git(&["commit", "-qm", "init"], &work);
         let oid = |p: &str| {
             let o = Command::new("git")
                 .args(["rev-parse", &format!("HEAD:{p}")])
@@ -449,7 +497,7 @@ mod tests {
         };
         let secret_oid = oid("secret/b.txt");
         let public_oid = oid("public/a.txt");
-        g(
+        run_git(
             &[
                 "clone",
                 "-q",
@@ -459,43 +507,34 @@ mod tests {
             ],
             td.path(),
         );
+        (work, bare, secret_oid, public_oid)
+    }
 
-        #[derive(Clone)]
-        struct St {
-            repo: std::path::PathBuf,
-            withheld: HashSet<String>,
-        }
-        let state = Arc::new(St {
-            repo: bare.clone(),
-            withheld: HashSet::from([secret_oid.clone()]),
-        });
+    /// Enumerate exactly the objects a repo physically has (no promisor lazy
+    /// fetch), so tests assert on what bytes actually crossed the wire.
+    fn local_object_ids(repo: &std::path::Path) -> String {
+        let out = Command::new("git")
+            .args(["cat-file", "--batch-all-objects", "--batch-check"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
 
-        async fn refs(
-            State(st): State<Arc<St>>,
-            Query(q): Query<HashMap<String, String>>,
-        ) -> Response {
-            let service = q.get("service").cloned().unwrap_or_default();
-            info_refs(&st.repo, &service).await.unwrap()
-        }
-        async fn pack(State(st): State<Arc<St>>, body: Bytes) -> Response {
-            upload_pack_excluding(&st.repo, body, &st.withheld)
-                .await
-                .unwrap()
-        }
+    /// End-to-end: a real `git` client clones through `info_refs` +
+    /// `upload_pack_excluding` and ends up without the withheld blob's bytes
+    /// while still seeing its tree entry (SHA). Uses a partial clone
+    /// (`--filter`) because a pack that omits a referenced blob is only
+    /// accepted by a promisor-aware client; a stock full clone is refused at
+    /// fetch time by the connectivity check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_git_partial_clone_omits_withheld_blob() {
+        let td = TempDir::new().unwrap();
+        let (_work, bare, secret_oid, public_oid) = fixture_with_secret(&td);
 
-        let app = Router::new()
-            .route("/repo.git/info/refs", get(refs))
-            .route("/repo.git/git-upload-pack", post(pack))
-            .with_state(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (url, server) = spawn_filter_server(bare, HashSet::from([secret_oid.clone()])).await;
 
         let dest = td.path().join("clone");
-        let url = format!("http://127.0.0.1:{port}/repo.git");
         let dest_s = dest.to_str().unwrap().to_string();
         let out = tokio::task::spawn_blocking(move || {
             Command::new("git")
@@ -521,15 +560,8 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
 
-        // Enumerate exactly the objects the clone physically received (no
-        // promisor lazy-fetch): the public blob is present, the withheld blob is
-        // not. This asserts on the bytes that actually crossed the wire.
-        let local = Command::new("git")
-            .args(["cat-file", "--batch-all-objects", "--batch-check"])
-            .current_dir(&dest)
-            .output()
-            .unwrap();
-        let local = String::from_utf8_lossy(&local.stdout);
+        // The public blob is present in the clone, the withheld blob is not.
+        let local = local_object_ids(&dest);
         assert!(
             local.contains(&public_oid),
             "public blob should be present in the clone"
@@ -549,6 +581,100 @@ mod tests {
         assert!(
             tree.contains(&secret_oid) && tree.contains("secret/b.txt"),
             "the private path and its blob SHA must remain visible: {tree}"
+        );
+
+        server.abort();
+    }
+
+    /// End-to-end: an incremental `git fetch` after a partial clone still works
+    /// and still withholds the private blob. The serve path ignores the client's
+    /// have/want negotiation and always sends a self-contained pack of all refs
+    /// minus the withheld blobs (it replies NAK, so the client treats it as "no
+    /// common commits" and accepts the full set). This is correct, just not
+    /// bandwidth-optimal; thin-pack/negotiation is an optimization follow-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_git_fetch_after_partial_clone_still_withholds() {
+        let td = TempDir::new().unwrap();
+        let (work, bare, secret_oid, _public_oid) = fixture_with_secret(&td);
+        let branch = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        let (url, server) =
+            spawn_filter_server(bare.clone(), HashSet::from([secret_oid.clone()])).await;
+
+        // Partial-clone the initial state.
+        let dest = td.path().join("clone");
+        let dest_s = dest.to_str().unwrap().to_string();
+        let url_c = url.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            Command::new("git")
+                .args([
+                    "-c",
+                    "protocol.version=2",
+                    "clone",
+                    "--filter=blob:none",
+                    "--no-checkout",
+                    "-q",
+                    &url_c,
+                    &dest_s,
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Add a new public commit on the server side.
+        std::fs::write(work.join("public/c.txt"), b"v2\n").unwrap();
+        run_git(&["add", "."], &work);
+        run_git(&["commit", "-qm", "c2"], &work);
+        let new_oid = {
+            let o = Command::new("git")
+                .args(["rev-parse", "HEAD:public/c.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        run_git(&["push", "-q", bare.to_str().unwrap(), &branch], &work);
+
+        // Incremental fetch: the client has c1 and asks for the update.
+        let dest_f = dest.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            Command::new("git")
+                .args(["-c", "protocol.version=2", "fetch", "-q", "origin"])
+                .current_dir(&dest_f)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "fetch failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The new commit's blob arrived; the withheld blob is still absent.
+        let local = local_object_ids(&dest);
+        assert!(
+            local.contains(&new_oid),
+            "the new commit's blob must be fetched"
+        );
+        assert!(
+            !local.contains(&secret_oid),
+            "withheld blob must remain absent after fetch"
         );
 
         server.abort();
