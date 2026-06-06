@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -196,7 +196,16 @@ pub async fn upload_pack_excluding(
     request_body: Bytes,
     withheld: &HashSet<String>,
 ) -> Result<Response> {
-    let pack = build_filtered_pack(repo_path, withheld)?;
+    // build_filtered_pack shells out to git (rev-list, pack-objects) with
+    // blocking std::process I/O; run it off the async worker so a large repo's
+    // pack build does not stall the tokio runtime.
+    let pack = {
+        let repo_path = repo_path.to_path_buf();
+        let withheld = withheld.clone();
+        tokio::task::spawn_blocking(move || build_filtered_pack(&repo_path, &withheld))
+            .await
+            .context("filtered-pack build task panicked")??
+    };
 
     // The client lists its capabilities on the first `want` line. Honor
     // side-band-64k when offered (every modern smart-HTTP client offers it);

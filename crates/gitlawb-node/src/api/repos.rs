@@ -395,14 +395,27 @@ pub async fn git_upload_pack(
         .map_err(|e| AppError::Git(e.to_string()))?;
     let body_len = body.len();
 
-    let withheld = visibility_pack::withheld_blob_oids(
-        &disk_path,
-        &rules,
-        record.is_public,
-        &record.owner_did,
-        caller,
-    )
-    .map_err(|e| AppError::Git(e.to_string()))?;
+    // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep that
+    // off the async worker thread.
+    let withheld = {
+        let path = disk_path.clone();
+        let rules = rules.clone();
+        let owner_did = record.owner_did.clone();
+        let caller_owned = caller.map(str::to_string);
+        let is_public = record.is_public;
+        tokio::task::spawn_blocking(move || {
+            visibility_pack::withheld_blob_oids(
+                &path,
+                &rules,
+                is_public,
+                &owner_did,
+                caller_owned.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| AppError::Git(e.to_string()))?
+        .map_err(|e| AppError::Git(e.to_string()))?
+    };
 
     let resp = if withheld.is_empty() {
         smart_http::upload_pack(&disk_path, body).await

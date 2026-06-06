@@ -99,13 +99,11 @@ Executed 2026-06-06. Results:
   - `git rev-list --objects --all` (in repo dir) to enumerate reachable objects as `oid [path]` lines.
   - Filter out withheld OIDs (first whitespace column), feed remaining OIDs newline-delimited to `git pack-objects --stdout`.
   - Verified exclusion by `git index-pack <pack>` then `git verify-pack -v <pack>`: secret blob absent, public blob present. Confirmed.
-- **Protocol version targeted:** v2 packfile section. The serve hand-frames the body, so no `GIT_PROTOCOL`/`-c protocol.version` flag is passed to our own process; we emit the v2 `packfile` section bytes directly.
-- **Response framing (captured by driving `git upload-pack --stateless-rpc` with `GIT_PROTOCOL=version=2`):**
-  - `pkt_line("packfile\n")` (plain control pkt-line, not a sideband band).
-  - Then sideband-64k bands: `0x02` = progress (optional, we omit), `0x01` = pack data whose payload begins `PACK...`.
-  - Pack data chunked under the pkt-line limit, each chunk prefixed with `0x01`.
-  - Terminated by `0000` flush.
-  - This matches the plan's Option B framing in Task 2 exactly; no adjustment needed.
+- **Protocol version targeted:** v0. `info_refs` runs `git upload-pack --advertise-refs` with no `GIT_PROTOCOL=version=2`, so it advertises v0 and clients negotiate v0; the serve path must hand-frame a v0 response. (An earlier draft of this block recorded v2 framing; that path was implemented, failed against a real client with "expected ACK/NAK, got 'packfile'", and was corrected to v0. The record below reflects the shipped v0 contract.)
+- **Response framing (v0):**
+  - `pkt_line("NAK\n")` first (no `packfile\n` control line; that is v2 only).
+  - If the client offered `side-band-64k`: band 1 (`0x01`) carries pack data whose payload begins `PACK...`, chunked under the pkt-line size limit (65515), each chunk prefixed with `0x01`; terminated by a `0000` flush.
+  - If no side-band was offered: the raw pack bytes follow `NAK\n` directly, with no flush.
 - **Confirmed:** served pack contains PUBLIC_OID, excludes SECRET_OID.
 
 ---
@@ -709,4 +707,3 @@ Set a subtree rule on a local repo via `gl visibility`, clone as a non-reader th
 2. **Filtered-pack caching.** `build_filtered_pack` recomputes per request. If hot, cache by (repo, tip-OIDs, withheld-set) and invalidate on push.
 3. **Incremental fetch efficiency.** Verified during execution: an incremental `git fetch` after a partial clone is already correct and still withholds the private blob (covered by `real_git_fetch_after_partial_clone_still_withholds`). The serve ignores the client's `have`/`want` negotiation and always sends a self-contained pack of all refs minus the withheld blobs, replying `NAK`; the client de-duplicates, so nothing breaks. The only cost is that a fetch re-sends the full object set instead of a thin delta. Honoring negotiation to produce smaller fetch packs is the optimization left here.
 4. **Replication-path enforcement (Phase 2).** Still blocked on the maintainer A/B decision; unrelated to this HTTP-path work.
-```
