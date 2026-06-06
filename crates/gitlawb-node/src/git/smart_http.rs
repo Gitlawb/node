@@ -281,4 +281,83 @@ mod tests {
             "secret blob must NOT be in the pack"
         );
     }
+
+    #[tokio::test]
+    async fn client_clone_lacks_withheld_blob_bytes() {
+        use axum::body::to_bytes;
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let g = |args: &[&str], dir: &std::path::Path| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+        };
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"pub\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"SECRET\n").unwrap();
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "init"], &work);
+        let secret_oid = {
+            let o = Command::new("git")
+                .args(["rev-parse", "HEAD:secret/b.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let mut withheld = std::collections::HashSet::new();
+        withheld.insert(secret_oid.clone());
+
+        let resp = upload_pack_excluding(&bare, Bytes::new(), &withheld)
+            .await
+            .unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let ids = pack_object_ids(&extract_pack(&body));
+        assert!(
+            !ids.contains(&secret_oid),
+            "withheld blob must be absent from served pack"
+        );
+    }
+
+    /// Strip the upload-pack `packfile` section framing, returning the raw pack.
+    /// Mirrors how a client de-frames the sideband-64k band-1 stream.
+    fn extract_pack(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 4 <= body.len() {
+            let len =
+                usize::from_str_radix(std::str::from_utf8(&body[i..i + 4]).unwrap_or("0000"), 16)
+                    .unwrap_or(0);
+            if len == 0 {
+                i += 4;
+                continue;
+            }
+            let chunk = &body[i + 4..i + len];
+            // band 1 = pack data; skip "packfile\n" control line and other bands.
+            if chunk.first() == Some(&0x01) {
+                out.extend_from_slice(&chunk[1..]);
+            }
+            i += len;
+        }
+        out
+    }
 }
