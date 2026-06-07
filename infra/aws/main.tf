@@ -244,11 +244,38 @@ resource "aws_eip" "node" {
   tags   = merge(local.common_tags, { Name = var.name_prefix })
 }
 
+# ---------------------------------------------------------------------------
+# Optional private ECR repository — self-contained image hosting in this
+# account instead of an external registry. Push with: see README "Building
+# and pushing the image".
+# ---------------------------------------------------------------------------
+
+resource "aws_ecr_repository" "node" {
+  count = var.create_ecr_repo ? 1 : 0
+  name  = var.name_prefix
+  tags  = local.common_tags
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "aws_iam_role_policy_attachment" "ecr_read" {
+  count      = var.create_ecr_repo ? 1 : 0
+  role       = aws_iam_role.node.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+locals {
+  image_repo   = var.create_ecr_repo ? aws_ecr_repository.node[0].repository_url : var.image_repo
+  ecr_registry = var.create_ecr_repo ? split("/", aws_ecr_repository.node[0].repository_url)[0] : ""
+}
+
 locals {
   public_url = var.public_url != "" ? var.public_url : "http://${aws_eip.node.public_ip}:${var.gitlawb_port}"
 
   compose_yaml = templatefile("${path.module}/compose.yaml.tftpl", {
-    image_repo     = var.image_repo
+    image_repo     = local.image_repo
     image_tag      = var.image_tag
     gitlawb_port   = var.gitlawb_port
     p2p_port       = var.gitlawb_p2p_port
@@ -273,6 +300,7 @@ locals {
     contract_node_staking = var.contract_node_staking
     tigris_bucket         = var.tigris_bucket
     s3_endpoint_url       = var.s3_endpoint_url
+    ecr_registry          = local.ecr_registry
     compose_yaml          = local.compose_yaml
   })
 }

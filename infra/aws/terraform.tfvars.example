@@ -7,6 +7,9 @@ instance_type = "t4g.small" # ARM/Graviton; node image is multi-arch
 # --- Image -----------------------------------------------------------------
 # image_repo = "ghcr.io/gitlawb/node"
 # image_tag  = "latest" # pin a version for production, e.g. "0.9.2"
+# Or host the image in a private ECR repo in this account (image_repo is then
+# ignored; build & push per README "Building and pushing the image"):
+# create_ecr_repo = true
 
 # --- Storage ---------------------------------------------------------------
 # data_volume_size_gb   = 20

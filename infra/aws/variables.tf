@@ -64,9 +64,15 @@ variable "snapshot_retain_count" {
 # ---------------------------------------------------------------------------
 
 variable "image_repo" {
-  description = "Container image repository for the node (public, multi-arch)"
+  description = "Container image repository for the node. Ignored when create_ecr_repo is true (the module-managed ECR repo is used instead)."
   type        = string
   default     = "ghcr.io/gitlawb/node"
+}
+
+variable "create_ecr_repo" {
+  description = "Create a private ECR repository in this account and pull the node image from it (instance role gets pull rights via a credential helper). Push images with scripts in the README."
+  type        = bool
+  default     = false
 }
 
 variable "image_tag" {

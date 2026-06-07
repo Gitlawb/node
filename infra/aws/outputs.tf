@@ -18,6 +18,11 @@ output "data_volume_id" {
   value       = aws_ebs_volume.data.id
 }
 
+output "ecr_repository_url" {
+  description = "Private ECR repo for the node image (null unless create_ecr_repo)"
+  value       = try(aws_ecr_repository.node[0].repository_url, null)
+}
+
 output "postgres_password_ssm_param" {
   description = "SSM parameter holding the postgres password (value not shown)"
   value       = aws_ssm_parameter.postgres_password.name

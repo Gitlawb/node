@@ -17,6 +17,16 @@ curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
   -o /usr/local/lib/docker/cli-plugins/docker-compose
 chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
+%{ if ecr_registry != "" ~}
+# Pull from the account's private ECR via the instance role — the credential
+# helper avoids expiring `docker login` tokens (works for upgrades too).
+dnf install -y amazon-ecr-credential-helper
+mkdir -p /root/.docker
+cat > /root/.docker/config.json <<'DOCKER_EOF'
+{ "credHelpers": { "${ecr_registry}": "ecr-login" } }
+DOCKER_EOF
+%{ endif ~}
+
 # ---------------------------------------------------------------------------
 # Data volume: find the attached EBS volume (Nitro presents /dev/sdf as NVMe;
 # attachment can lag first boot, so retry). The data disk is the one that is
