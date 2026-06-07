@@ -22,15 +22,33 @@ use gitlawb_core::identity::Keypair;
 use std::io::{self, BufRead, Read, Write};
 
 fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Handle informational flags before anything else. Git always invokes a
+    // remote helper as `git-remote-gitlawb <remote-name> <url>`, so these flags
+    // only ever appear on direct user or release-smoke-test invocations. Print
+    // to stdout and exit before tracing init so the output stays clean.
+    match classify_args(&args) {
+        Invocation::Version => {
+            println!("{}", version_line());
+            return Ok(());
+        }
+        Invocation::Help => {
+            print!("{}", help_text());
+            return Ok(());
+        }
+        Invocation::Helper => {}
+    }
+
     // All logging goes to stderr so it doesn't corrupt the git protocol on stdout
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(std::env::var("GITLAWB_LOG").unwrap_or_else(|_| "warn".to_string()))
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("usage: git-remote-gitlawb <remote-name> <url>");
+        eprintln!("try 'git-remote-gitlawb --help' for more information");
         std::process::exit(1);
     }
 
@@ -49,6 +67,62 @@ fn main() -> Result<()> {
     let keypair = load_keypair();
 
     run_helper(&repo_base, keypair.as_ref())
+}
+
+// ── CLI argument handling ──────────────────────────────────────────────────────
+
+/// How the binary was invoked, derived from its CLI arguments.
+#[derive(Debug, PartialEq, Eq)]
+enum Invocation {
+    /// `--version` / `-V`: print the version line and exit.
+    Version,
+    /// `--help` / `-h`: print usage and exit.
+    Help,
+    /// Normal git remote-helper invocation: `<remote-name> <url>`.
+    Helper,
+}
+
+/// Classify the process arguments.
+///
+/// Git always calls a remote helper as `git-remote-gitlawb <remote-name> <url>`,
+/// so the informational flags are only recognized as the first argument; this
+/// keeps the remote-helper protocol path untouched for git's own invocations.
+fn classify_args(args: &[String]) -> Invocation {
+    match args.get(1).map(String::as_str) {
+        Some("--version") | Some("-V") => Invocation::Version,
+        Some("--help") | Some("-h") => Invocation::Help,
+        _ => Invocation::Helper,
+    }
+}
+
+/// The version line, matching the `<bin> <version>` format that the clap-based
+/// `gl` and `gitlawb-node` binaries emit, so release smoke tests can treat all
+/// three binaries uniformly.
+fn version_line() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
+/// Usage text for `--help`.
+fn help_text() -> String {
+    format!(
+        "{}\n\
+         \n\
+         Git remote helper for gitlawb:// URLs. Git invokes this automatically\n\
+         when it encounters a gitlawb:// remote; you normally do not run it directly.\n\
+         \n\
+         USAGE:\n\
+         \x20   git clone gitlawb://did:key:z6Mk.../<repo>\n\
+         \n\
+         ENVIRONMENT:\n\
+         \x20   GITLAWB_NODE   Node base URL (default: http://127.0.0.1:7545)\n\
+         \x20   GITLAWB_KEY    Identity PEM path for signed pushes (default: ~/.gitlawb/identity.pem)\n\
+         \x20   GITLAWB_LOG    Log filter (default: warn)\n\
+         \n\
+         FLAGS:\n\
+         \x20   -V, --version   Print version and exit\n\
+         \x20   -h, --help      Print this help and exit\n",
+        version_line()
+    )
 }
 
 // ── Remote helper protocol loop ───────────────────────────────────────────────
@@ -444,5 +518,86 @@ mod tests {
             url_path("http://127.0.0.1:7545/z6Mk/myrepo/git-receive-pack"),
             "/z6Mk/myrepo/git-receive-pack"
         );
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_version_flags() {
+        assert_eq!(
+            classify_args(&args(&["git-remote-gitlawb", "--version"])),
+            Invocation::Version
+        );
+        assert_eq!(
+            classify_args(&args(&["git-remote-gitlawb", "-V"])),
+            Invocation::Version
+        );
+    }
+
+    #[test]
+    fn classify_help_flags() {
+        assert_eq!(
+            classify_args(&args(&["git-remote-gitlawb", "--help"])),
+            Invocation::Help
+        );
+        assert_eq!(
+            classify_args(&args(&["git-remote-gitlawb", "-h"])),
+            Invocation::Help
+        );
+    }
+
+    #[test]
+    fn classify_normal_helper_invocation() {
+        // How git actually calls us: `<remote-name> <url>`.
+        assert_eq!(
+            classify_args(&args(&[
+                "git-remote-gitlawb",
+                "origin",
+                "gitlawb://did:key:z6MkFoo123/my-repo",
+            ])),
+            Invocation::Helper
+        );
+    }
+
+    #[test]
+    fn classify_no_args_is_helper() {
+        // No flag → falls through to the helper path, which reports its own
+        // usage error. `--version`/`--help` must not be inferred from emptiness.
+        assert_eq!(
+            classify_args(&args(&["git-remote-gitlawb"])),
+            Invocation::Helper
+        );
+    }
+
+    #[test]
+    fn classify_flag_only_in_first_position() {
+        // A remote literally named "--version" must not be treated as the flag.
+        assert_eq!(
+            classify_args(&args(&["git-remote-gitlawb", "origin", "--version",])),
+            Invocation::Helper
+        );
+    }
+
+    #[test]
+    fn version_line_matches_package_metadata() {
+        let line = version_line();
+        assert_eq!(
+            line,
+            format!("git-remote-gitlawb {}", env!("CARGO_PKG_VERSION"))
+        );
+        // Single line, no trailing newline (println! adds the newline).
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn help_text_includes_version_and_flags() {
+        let help = help_text();
+        assert!(help.starts_with(&version_line()));
+        assert!(help.contains("--version"));
+        assert!(help.contains("--help"));
+        assert!(help.contains("GITLAWB_NODE"));
+        assert!(help.ends_with('\n'));
     }
 }
