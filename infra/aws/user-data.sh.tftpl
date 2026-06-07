@@ -57,9 +57,12 @@ mkdir -p /mnt/data
 grep -q 'LABEL=gitlawb-data' /etc/fstab || \
   echo 'LABEL=gitlawb-data /mnt/data ext4 defaults,nofail 0 2' >> /etc/fstab
 mount -a
+# Grow the filesystem if the EBS volume was enlarged (no-op otherwise)
+resize2fs "$DATA_DEV" || true
 
 # Node container runs as uid/gid 1000 (gitlawb). Postgres manages its own dir.
-mkdir -p /mnt/data/node/repos /mnt/data/node/keys /mnt/data/postgres
+# caddy/ holds TLS certs (only used when a domain is configured).
+mkdir -p /mnt/data/node/repos /mnt/data/node/keys /mnt/data/postgres /mnt/data/caddy
 chown -R 1000:1000 /mnt/data/node
 
 # ---------------------------------------------------------------------------

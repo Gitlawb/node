@@ -23,6 +23,11 @@ output "ecr_repository_url" {
   value       = try(aws_ecr_repository.node[0].repository_url, null)
 }
 
+output "rds_endpoint" {
+  description = "RDS Postgres endpoint (null unless use_rds)"
+  value       = try(aws_db_instance.node[0].address, null)
+}
+
 output "postgres_password_ssm_param" {
   description = "SSM parameter holding the postgres password (value not shown)"
   value       = aws_ssm_parameter.postgres_password.name

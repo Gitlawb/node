@@ -151,5 +151,7 @@ them up in the EC2 console if unwanted. The Elastic IP is released on destroy.
   `ssm_kms_key_id` to encrypt with a customer-managed KMS key instead (the
   instance role is granted `kms:Decrypt` on that key automatically).
 - IMDSv2 is required; metrics port is closed unless `metrics_ingress_cidr` is set.
-- The node serves plain HTTP on 7545. For TLS, put a DNS name + proxy
-  (ALB/CloudFront/Caddy) in front and set `public_url` accordingly.
+- The node itself serves plain HTTP on 7545. Set `domain_name` (with DNS
+  pointing at the Elastic IP) to run a Caddy sidecar with automatic Let's
+  Encrypt TLS on 443 (+ http→https redirect on 80) — matching the Fly nodes.
+  Certs persist on the data volume (`/mnt/data/caddy`).

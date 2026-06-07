@@ -12,15 +12,12 @@ terraform {
     }
   }
 
-  # Remote state (optional). Create the bucket first, then uncomment and run
-  # `terraform init -migrate-state`. See README.md "Remote state".
-  #
-  # backend "s3" {
-  #   bucket       = "gitlawb-terraform-state"
-  #   key          = "infra/aws/terraform.tfstate"
-  #   region       = "us-east-1"
-  #   use_lockfile = true
-  # }
+  backend "s3" {
+    bucket       = "gitlawb-tfstate-874373491455"
+    key          = "infra/aws/terraform.tfstate"
+    region       = "us-east-1"
+    use_lockfile = true
+  }
 }
 
 provider "aws" {

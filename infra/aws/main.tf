@@ -186,6 +186,17 @@ resource "aws_security_group" "node" {
   }
 
   dynamic "ingress" {
+    for_each = var.domain_name != "" ? [80, 443] : []
+    content {
+      description = "Caddy HTTP/HTTPS (TLS for ${var.domain_name})"
+      from_port   = ingress.value
+      to_port     = ingress.value
+      protocol    = "tcp"
+      cidr_blocks = ["0.0.0.0/0"]
+    }
+  }
+
+  dynamic "ingress" {
     for_each = local.expose_metrics ? [1] : []
     content {
       description = "Prometheus metrics"
@@ -272,11 +283,17 @@ locals {
 }
 
 locals {
-  public_url = var.public_url != "" ? var.public_url : "http://${aws_eip.node.public_ip}:${var.gitlawb_port}"
+  public_url = (
+    var.public_url != "" ? var.public_url :
+    var.domain_name != "" ? "https://${var.domain_name}" :
+    "http://${aws_eip.node.public_ip}:${var.gitlawb_port}"
+  )
 
   compose_yaml = templatefile("${path.module}/compose.yaml.tftpl", {
     image_repo     = local.image_repo
     image_tag      = var.image_tag
+    domain_name    = var.domain_name
+    db_host        = var.use_rds ? aws_db_instance.node[0].address : ""
     gitlawb_port   = var.gitlawb_port
     p2p_port       = var.gitlawb_p2p_port
     metrics_port   = var.metrics_port
