@@ -62,6 +62,18 @@ fn git_global(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Sparse-checkout pattern(s) for a visibility glob. A subtree glob
+/// (`/secret/**`) maps to the directory `/secret/`. A wildcard-free glob
+/// (`/docs/private`) matches both the exact path and a subtree at that path
+/// (mirroring the node's `glob_matches`), so it maps to both `/docs/private`
+/// and `/docs/private/`. Callers prefix these with `!` to exclude.
+fn sparse_patterns(glob: &str) -> Vec<String> {
+    match glob.strip_suffix("/**") {
+        Some(base) => vec![format!("{base}/")],
+        None => vec![glob.to_string(), format!("{glob}/")],
+    }
+}
+
 /// Clone `remote_url` into `dest`, excluding `withheld_globs` from checkout.
 /// `dest` must not already exist. With nothing withheld this is a plain full
 /// clone. With globs withheld it clones as a promisor (`--filter=blob:none`,
@@ -72,6 +84,7 @@ pub fn setup_partial_clone(
     dest: &Path,
     remote_url: &str,
     withheld_globs: &[String],
+    reinclude_globs: &[String],
     branch: Option<&str>,
 ) -> Result<()> {
     let dest_str = dest
@@ -95,13 +108,22 @@ pub fn setup_partial_clone(
         dest_str,
     ])?;
     git(dest, &["sparse-checkout", "init", "--no-cone"])?;
+    // Non-cone sparse-checkout, gitignore-style and order-sensitive: include
+    // everything, exclude the withheld globs, then re-include any allowed globs
+    // nested under an excluded one (later patterns win).
     let mut spec = String::from("/*\n");
     for g in withheld_globs {
-        // "/secret/**" -> "!/secret/"
-        let dir = g.trim_end_matches("**").trim_end_matches('/');
-        spec.push('!');
-        spec.push_str(dir);
-        spec.push_str("/\n");
+        for pat in sparse_patterns(g) {
+            spec.push('!');
+            spec.push_str(&pat);
+            spec.push('\n');
+        }
+    }
+    for g in reinclude_globs {
+        for pat in sparse_patterns(g) {
+            spec.push_str(&pat);
+            spec.push('\n');
+        }
     }
     std::fs::write(dest.join(".git/info/sparse-checkout"), spec)
         .context("writing sparse-checkout spec")?;
@@ -144,9 +166,11 @@ fn parse_repo(repo: &str) -> Result<(String, String, String)> {
     ))
 }
 
-/// Ask the node which globs are withheld for this caller. Any error or non-2xx
-/// is treated as "nothing withheld" so public repos clone normally.
-async fn fetch_withheld(node: &str, owner: &str, name: &str) -> Vec<String> {
+/// Ask the node which globs are withheld for this caller and which allowed globs
+/// nested under them must be re-included. Returns `(withheld, reinclude)`. Any
+/// error or non-2xx is treated as "nothing withheld" so public repos clone
+/// normally.
+async fn fetch_withheld(node: &str, owner: &str, name: &str) -> (Vec<String>, Vec<String>) {
     let kp = load_keypair_from_dir(None).ok();
     let signed = kp.is_some();
     let client = NodeClient::new(node, kp);
@@ -158,17 +182,20 @@ async fn fetch_withheld(node: &str, owner: &str, name: &str) -> Vec<String> {
     };
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,
-        _ => return Vec::new(),
+        _ => return (Vec::new(), Vec::new()),
     };
     let body: Value = resp.json().await.unwrap_or_default();
-    body.get("withheld")
-        .and_then(|w| w.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
+    let globs = |field: &str| -> Vec<String> {
+        body.get(field)
+            .and_then(|w| w.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (globs("withheld"), globs("reinclude"))
 }
 
 pub async fn run(args: CloneArgs) -> Result<()> {
@@ -179,7 +206,7 @@ pub async fn run(args: CloneArgs) -> Result<()> {
         bail!("destination '{dest_name}' already exists");
     }
 
-    let withheld = fetch_withheld(&args.node, &owner, &name).await;
+    let (withheld, reinclude) = fetch_withheld(&args.node, &owner, &name).await;
     if withheld.is_empty() {
         println!("Cloning {url} into {dest_name}");
     } else {
@@ -189,7 +216,7 @@ pub async fn run(args: CloneArgs) -> Result<()> {
         );
     }
 
-    setup_partial_clone(&dest, &url, &withheld, args.branch.as_deref())?;
+    setup_partial_clone(&dest, &url, &withheld, &reinclude, args.branch.as_deref())?;
     println!("Done. Cloned into {dest_name}");
     Ok(())
 }
@@ -237,12 +264,93 @@ mod tests {
         // file:// so --filter is honored (local-path clones ignore it).
         let dest = td.path().join("dest");
         let url = format!("file://{}", bare.display());
-        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], None).unwrap();
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
 
         assert!(dest.join("public/a.txt").exists(), "public file present");
         assert!(
             !dest.join("secret/b.txt").exists(),
             "withheld path must be excluded from checkout"
+        );
+    }
+
+    /// Build a bare remote with the given files (relative path -> contents),
+    /// committed on one branch. Returns (tempdir, file:// url).
+    fn bare_remote(files: &[(&str, &[u8])]) -> (TempDir, String) {
+        let td = TempDir::new().unwrap();
+        let origin = td.path().join("origin");
+        let bare = td.path().join("bare.git");
+        for (path, contents) in files {
+            let full = origin.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, contents).unwrap();
+        }
+        g(&["init", "-q"], &origin);
+        g(&["config", "user.email", "t@t"], &origin);
+        g(&["config", "user.name", "t"], &origin);
+        g(&["add", "."], &origin);
+        g(&["commit", "-qm", "init"], &origin);
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                origin.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        let url = format!("file://{}", bare.display());
+        (td, url)
+    }
+
+    #[test]
+    fn reinclude_restores_allowed_nested_path() {
+        let (td, url) = bare_remote(&[
+            ("public/a.txt", b"pub\n"),
+            ("secret/private/p.txt", b"PRIV\n"),
+            ("secret/public/s.txt", b"SHARED\n"),
+        ]);
+        let dest = td.path().join("dest");
+        setup_partial_clone(
+            &dest,
+            &url,
+            &["/secret/**".to_string()],
+            &["/secret/public/**".to_string()],
+            None,
+        )
+        .unwrap();
+
+        assert!(dest.join("public/a.txt").exists(), "public present");
+        assert!(
+            dest.join("secret/public/s.txt").exists(),
+            "allowed nested path must be re-included"
+        );
+        assert!(
+            !dest.join("secret/private/p.txt").exists(),
+            "denied nested path must stay excluded"
+        );
+    }
+
+    #[test]
+    fn exact_path_glob_is_excluded() {
+        // A wildcard-free glob must exclude the exact file, not just a subtree.
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("docs/private", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        setup_partial_clone(&dest, &url, &["/docs/private".to_string()], &[], None).unwrap();
+
+        assert!(dest.join("public/a.txt").exists(), "public present");
+        assert!(
+            !dest.join("docs/private").exists(),
+            "exact-path withheld file must be excluded"
+        );
+    }
+
+    #[test]
+    fn sparse_patterns_subtree_and_exact() {
+        assert_eq!(sparse_patterns("/secret/**"), vec!["/secret/".to_string()]);
+        assert_eq!(
+            sparse_patterns("/docs/private"),
+            vec!["/docs/private".to_string(), "/docs/private/".to_string()]
         );
     }
 

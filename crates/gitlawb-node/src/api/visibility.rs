@@ -187,9 +187,11 @@ pub async fn list_visibility(
 
 /// GET /api/v1/repos/{owner}/{repo}/withheld-paths
 ///
-/// Returns only the path globs the (optionally authenticated) caller is denied,
-/// so a clean-clone client can sparse-exclude them. Unlike `list_visibility`
-/// this is not owner-gated and never exposes reader_dids.
+/// Returns the path globs the (optionally authenticated) caller is denied
+/// (`withheld`) plus any more-specific globs that are allowed underneath a
+/// denied one (`reinclude`), so a clean-clone client can sparse-exclude the
+/// denied subtrees while re-including the allowed nested paths. Unlike
+/// `list_visibility` this is not owner-gated and never exposes reader_dids.
 pub async fn withheld_paths(
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
@@ -203,12 +205,25 @@ pub async fn withheld_paths(
 
     let rules = state.db.list_visibility_rules(&record.id).await?;
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+
+    // Whole-repo read gate: a caller who cannot read "/" gets repo-not-found,
+    // matching the git read endpoints, so this never discloses a private repo's
+    // existence or its path layout to an unauthorized caller.
+    if crate::visibility::visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
+        == crate::visibility::Decision::Deny
+    {
+        return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
+    }
+
     let withheld =
         crate::visibility::withheld_globs(&rules, record.is_public, &record.owner_did, caller);
+    let reinclude =
+        crate::visibility::reincluded_globs(&rules, record.is_public, &record.owner_did, caller);
 
     Ok(Json(serde_json::json!({
         "repo": format!("{owner}/{repo}"),
         "withheld": withheld,
+        "reinclude": reinclude,
     })))
 }
 
