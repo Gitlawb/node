@@ -245,4 +245,22 @@ mod tests {
             "withheld path must be excluded from checkout"
         );
     }
+
+    #[test]
+    fn parse_repo_accepts_url_and_bare() {
+        let (url, o, n) = parse_repo("gitlawb://did:key:zAbc/myrepo").unwrap();
+        assert_eq!(url, "gitlawb://did:key:zAbc/myrepo");
+        assert_eq!((o.as_str(), n.as_str()), ("did:key:zAbc", "myrepo"));
+
+        let (url2, o2, n2) = parse_repo("did:key:zAbc/myrepo").unwrap();
+        assert_eq!(url2, "gitlawb://did:key:zAbc/myrepo");
+        assert_eq!((o2.as_str(), n2.as_str()), ("did:key:zAbc", "myrepo"));
+    }
+
+    #[test]
+    fn parse_repo_rejects_malformed() {
+        assert!(parse_repo("noslash").is_err());
+        assert!(parse_repo("gitlawb://owner/").is_err());
+        assert!(parse_repo("/name").is_err());
+    }
 }
