@@ -352,6 +352,10 @@ pub fn build_router(state: AppState) -> Router {
             "/{owner}/{repo}/git-upload-pack",
             post(repos::git_upload_pack),
         )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/withheld-paths",
+            axum::routing::get(visibility::withheld_paths),
+        )
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(pack_limit))
         .layer(middleware::from_fn(auth::optional_signature));

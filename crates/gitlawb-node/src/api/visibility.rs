@@ -185,6 +185,33 @@ pub async fn list_visibility(
     })))
 }
 
+/// GET /api/v1/repos/{owner}/{repo}/withheld-paths
+///
+/// Returns only the path globs the (optionally authenticated) caller is denied,
+/// so a clean-clone client can sparse-exclude them. Unlike `list_visibility`
+/// this is not owner-gated and never exposes reader_dids.
+pub async fn withheld_paths(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
+        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+
+    let rules = state.db.list_visibility_rules(&record.id).await?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let withheld =
+        crate::visibility::withheld_globs(&rules, record.is_public, &record.owner_did, caller);
+
+    Ok(Json(serde_json::json!({
+        "repo": format!("{owner}/{repo}"),
+        "withheld": withheld,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_path_glob;
