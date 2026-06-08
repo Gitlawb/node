@@ -157,6 +157,24 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_caller_withholds_only_private_blob() {
+        let (_td, bare, secret_oid, public_oid) = fixture();
+        let rules = [rule("/secret/**", &[])];
+        // caller = None models the public / any peer: what must not replicate.
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob must be withheld"
+        );
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must replicate"
+        );
+        // Trees and commits are never withheld; the set holds only the secret blob.
+        assert_eq!(withheld.len(), 1, "only the secret blob OID is withheld");
+    }
+
+    #[test]
     fn non_reader_withholds_only_the_private_blob() {
         let (_td, bare, secret, public) = fixture();
         let rules = [rule("/secret/**", &["did:key:zFriend"])];
