@@ -156,7 +156,7 @@ fn parse_repo(repo: &str) -> Result<(String, String, String)> {
         .trim_end_matches('/')
         .split_once('/')
         .context("repo must be <owner>/<name> or gitlawb://<owner>/<name>")?;
-    if owner.is_empty() || name.is_empty() {
+    if owner.is_empty() || name.is_empty() || name.contains('/') {
         bail!("repo must be <owner>/<name> or gitlawb://<owner>/<name>");
     }
     Ok((
@@ -167,10 +167,13 @@ fn parse_repo(repo: &str) -> Result<(String, String, String)> {
 }
 
 /// Ask the node which globs are withheld for this caller and which allowed globs
-/// nested under them must be re-included. Returns `(withheld, reinclude)`. Any
-/// error or non-2xx is treated as "nothing withheld" so public repos clone
-/// normally.
-async fn fetch_withheld(node: &str, owner: &str, name: &str) -> (Vec<String>, Vec<String>) {
+/// nested under them must be re-included. Returns `(withheld, reinclude)`. A
+/// node that does not implement the endpoint (404/501) yields empties so public
+/// repos on older nodes still clone normally. Other failures (network, auth,
+/// 5xx, malformed JSON) are propagated: failing open here would silently fall
+/// back to a stock clone, which the node refuses once blobs are withheld, hiding
+/// the real cause behind a confusing fetch error.
+async fn fetch_withheld(node: &str, owner: &str, name: &str) -> Result<(Vec<String>, Vec<String>)> {
     let kp = load_keypair_from_dir(None).ok();
     let signed = kp.is_some();
     let client = NodeClient::new(node, kp);
@@ -182,9 +185,14 @@ async fn fetch_withheld(node: &str, owner: &str, name: &str) -> (Vec<String>, Ve
     };
     let resp = match resp {
         Ok(r) if r.status().is_success() => r,
-        _ => return (Vec::new(), Vec::new()),
+        Ok(r) if matches!(r.status().as_u16(), 404 | 501) => return Ok((Vec::new(), Vec::new())),
+        Ok(r) => bail!("withheld-paths lookup failed: {}", r.status()),
+        Err(err) => return Err(err).context("fetching withheld paths"),
     };
-    let body: Value = resp.json().await.unwrap_or_default();
+    let body: Value = resp
+        .json()
+        .await
+        .context("parsing withheld-paths response")?;
     let globs = |field: &str| -> Vec<String> {
         body.get(field)
             .and_then(|w| w.as_array())
@@ -195,7 +203,7 @@ async fn fetch_withheld(node: &str, owner: &str, name: &str) -> (Vec<String>, Ve
             })
             .unwrap_or_default()
     };
-    (globs("withheld"), globs("reinclude"))
+    Ok((globs("withheld"), globs("reinclude")))
 }
 
 pub async fn run(args: CloneArgs) -> Result<()> {
@@ -206,7 +214,7 @@ pub async fn run(args: CloneArgs) -> Result<()> {
         bail!("destination '{dest_name}' already exists");
     }
 
-    let (withheld, reinclude) = fetch_withheld(&args.node, &owner, &name).await;
+    let (withheld, reinclude) = fetch_withheld(&args.node, &owner, &name).await?;
     if withheld.is_empty() {
         println!("Cloning {url} into {dest_name}");
     } else {
@@ -370,5 +378,7 @@ mod tests {
         assert!(parse_repo("noslash").is_err());
         assert!(parse_repo("gitlawb://owner/").is_err());
         assert!(parse_repo("/name").is_err());
+        // An extra slash would otherwise smuggle a path segment into the name.
+        assert!(parse_repo("owner/name/extra").is_err());
     }
 }
