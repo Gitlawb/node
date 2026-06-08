@@ -614,8 +614,13 @@ pub async fn git_receive_pack(
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
         tokio::spawn(async move {
-            let pinned =
-                crate::ipfs_pin::pin_new_objects(&ipfs_api, &repo_path_clone, &db_clone).await;
+            let pinned = crate::ipfs_pin::pin_new_objects(
+                &ipfs_api,
+                &repo_path_clone,
+                &db_clone,
+                &std::collections::HashSet::new(),
+            )
+            .await;
             if !pinned.is_empty() {
                 tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
                 for (sha, cid) in &pinned {
