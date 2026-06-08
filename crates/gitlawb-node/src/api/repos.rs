@@ -666,6 +666,7 @@ pub async fn git_receive_pack(
                 &pinata_jwt,
                 &repo_path_clone,
                 &db_clone,
+                &std::collections::HashSet::new(),
             )
             .await;
 
