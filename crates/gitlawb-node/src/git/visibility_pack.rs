@@ -77,6 +77,16 @@ pub fn withheld_blob_oids(
     Ok(denied.difference(&allowed).cloned().collect())
 }
 
+/// Objects that may replicate to the public: everything not in `withheld`.
+/// Order-preserving. The single seam every replication site (IPFS, Pinata)
+/// passes its object list through; option B would later reroute the withheld
+/// ones through encrypt-then-pin instead of dropping them.
+pub fn replicable_objects(all: Vec<String>, withheld: &HashSet<String>) -> Vec<String> {
+    all.into_iter()
+        .filter(|oid| !withheld.contains(oid))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +195,21 @@ mod tests {
             withheld.is_empty(),
             "public repo, no rules, nothing withheld"
         );
+    }
+
+    #[test]
+    fn replicable_objects_drops_withheld_keeps_rest() {
+        let all = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
+        let withheld: HashSet<String> = ["bbb".to_string()].into_iter().collect();
+        let got = replicable_objects(all, &withheld);
+        assert_eq!(got, vec!["aaa".to_string(), "ccc".to_string()]);
+    }
+
+    #[test]
+    fn replicable_objects_empty_withheld_keeps_all() {
+        let all = vec!["aaa".to_string(), "bbb".to_string()];
+        let withheld: HashSet<String> = HashSet::new();
+        let got = replicable_objects(all.clone(), &withheld);
+        assert_eq!(got, all);
     }
 }
