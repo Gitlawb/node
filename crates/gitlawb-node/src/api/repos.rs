@@ -628,17 +628,30 @@ pub async fn git_receive_pack(
     } else {
         match &rules_opt {
             Some(rules) if rules.is_empty() => Some(std::collections::HashSet::new()),
-            Some(rules) => crate::git::visibility_pack::withheld_blob_oids(
-                &disk_path,
-                rules,
-                record.is_public,
-                &record.owner_did,
-                None,
-            )
-            .map_err(|e| {
-                tracing::warn!(err = %e, "withheld_blob_oids failed; skipping replication for this push")
-            })
-            .ok(),
+            // withheld_blob_oids walks every ref with blocking `git ls-tree`;
+            // keep that off the async worker thread.
+            Some(rules) => {
+                let path = disk_path.clone();
+                let rules = rules.clone();
+                let owner_did = record.owner_did.clone();
+                let is_public = record.is_public;
+                tokio::task::spawn_blocking(move || {
+                    crate::git::visibility_pack::withheld_blob_oids(
+                        &path, &rules, is_public, &owner_did, None,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    tracing::warn!(err = %e, "withheld_blob_oids task panicked; skipping replication for this push")
+                })
+                .ok()
+                .and_then(|r| {
+                    r.map_err(|e| {
+                        tracing::warn!(err = %e, "withheld_blob_oids failed; skipping replication for this push")
+                    })
+                    .ok()
+                })
+            }
             None => None,
         }
     };
