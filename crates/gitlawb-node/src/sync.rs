@@ -81,7 +81,12 @@ async fn run(
     }
 }
 
-async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>, client: &reqwest::Client) {
+async fn process_batch(
+    db: &Db,
+    config: &Config,
+    machine_id: Option<&str>,
+    client: &reqwest::Client,
+) {
     let items = match db.dequeue_pending_syncs(10).await {
         Ok(v) => v,
         Err(e) => {
@@ -240,8 +245,11 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
     if mode == MirrorMode::Promisor {
         git_run(&["-C", local_str, "config", "remote.origin.promisor", "true"]).await?;
         git_run(&[
-            "-C", local_str,
-            "config", "remote.origin.partialclonefilter", "blob:limit=10g",
+            "-C",
+            local_str,
+            "config",
+            "remote.origin.partialclonefilter",
+            "blob:limit=10g",
         ])
         .await?;
     }
@@ -301,7 +309,13 @@ mod tests {
         g(&["add", "."], &origin);
         g(&["commit", "-qm", "init"], &origin);
         g(
-            &["clone", "-q", "--bare", origin.to_str().unwrap(), bare.to_str().unwrap()],
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                origin.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
             td.path(),
         );
         let url = format!("file://{}", bare.display());
