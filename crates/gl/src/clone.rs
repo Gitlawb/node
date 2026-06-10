@@ -217,6 +217,105 @@ struct WithheldPathsResponse {
     reinclude: Vec<String>,
 }
 
+/// After the base clone, recover encrypted blobs the caller is authorized for
+/// that are missing locally: fetch the envelope, decrypt with the caller's key,
+/// install as a loose object. Returns the repo-relative paths recovered.
+/// Best-effort; logs and continues on any per-blob failure.
+async fn recover_encrypted_blobs(
+    node: &str,
+    owner: &str,
+    name: &str,
+    dest: &Path,
+    keypair: &gitlawb_core::identity::Keypair,
+) -> Result<Vec<String>> {
+    use gitlawb_core::encrypt::open_blob;
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    let dest_str = dest.to_str().context("dest path not utf-8")?;
+    let client = NodeClient::new(node, Some(keypair.clone()));
+
+    let resp = match client
+        .get_signed(&format!("/api/v1/repos/{owner}/{name}/encrypted-blobs"))
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(vec![]),
+    };
+    let body: serde_json::Value = resp.json().await.context("parsing encrypted-blobs")?;
+    let blobs = body
+        .get("blobs")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if blobs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Map oid -> repo-relative path from the cloned tree.
+    let ls = Command::new("git")
+        .args(["-C", dest_str, "ls-tree", "-r", "HEAD"])
+        .output()?;
+    let mut oid_to_path: HashMap<String, String> = HashMap::new();
+    for line in String::from_utf8_lossy(&ls.stdout).lines() {
+        if let Some((meta, path)) = line.split_once('\t') {
+            if let Some(oid) = meta.split_whitespace().nth(2) {
+                oid_to_path.insert(oid.to_string(), path.to_string());
+            }
+        }
+    }
+
+    let mut recovered = Vec::new();
+    for entry in blobs {
+        let Some(oid) = entry.get("oid").and_then(|o| o.as_str()) else {
+            continue;
+        };
+        // Skip if already present locally.
+        let present = Command::new("git")
+            .args(["-C", dest_str, "cat-file", "-e", oid])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if present {
+            continue;
+        }
+        let env_resp = match client
+            .get_signed(&format!("/api/v1/repos/{owner}/{name}/encrypted-blob/{oid}"))
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let Ok(envelope) = env_resp.bytes().await else {
+            continue;
+        };
+        let plaintext = match open_blob(&envelope, keypair) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: could not decrypt {oid}: {e}");
+                continue;
+            }
+        };
+        // Install as a loose object; verify the OID matches.
+        let mut child = Command::new("git")
+            .args(["-C", dest_str, "hash-object", "-w", "-t", "blob", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(&plaintext)?;
+        let out = child.wait_with_output()?;
+        let written = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if written == oid {
+            if let Some(p) = oid_to_path.get(oid) {
+                recovered.push(p.clone());
+            }
+        } else {
+            eprintln!("warning: recovered blob {oid} hashed to {written}; discarding");
+        }
+    }
+    Ok(recovered)
+}
+
 pub async fn run(args: CloneArgs) -> Result<()> {
     let (url, owner, name) = parse_repo(&args.repo)?;
     let dest_name = args.dir.unwrap_or_else(|| name.clone());
@@ -236,6 +335,30 @@ pub async fn run(args: CloneArgs) -> Result<()> {
     }
 
     setup_partial_clone(&dest, &url, &withheld, &reinclude, args.branch.as_deref())?;
+
+    if let Ok(keypair) = load_keypair_from_dir(None) {
+        if let Ok(paths) = recover_encrypted_blobs(&args.node, &owner, &name, &dest, &keypair).await {
+            if !paths.is_empty() {
+                // Re-include recovered paths if this was a sparse clone, then
+                // materialize them in the working tree.
+                let spec = dest.join(".git/info/sparse-checkout");
+                if spec.exists() {
+                    if let Ok(mut s) = std::fs::read_to_string(&spec) {
+                        for p in &paths {
+                            s.push_str(&format!("/{p}\n"));
+                        }
+                        let _ = std::fs::write(&spec, s);
+                    }
+                }
+                let _ = git(&dest, &["checkout", "--", "."]);
+                println!(
+                    "Recovered {} private file(s) you are authorized to read",
+                    paths.len()
+                );
+            }
+        }
+    }
+
     println!("Done. Cloned into {dest_name}");
     Ok(())
 }
@@ -446,5 +569,34 @@ mod tests {
         assert!(parse_repo("/name").is_err());
         // An extra slash would otherwise smuggle a path segment into the name.
         assert!(parse_repo("owner/name/extra").is_err());
+    }
+
+    #[test]
+    fn recovered_blob_installs_with_matching_oid() {
+        use gitlawb_core::encrypt::{open_blob, seal_blob};
+        use gitlawb_core::identity::Keypair;
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+        let oid = {
+            let out = std::process::Command::new("git")
+                .args(["-C", dest.to_str().unwrap(), "rev-parse", "HEAD:secret/b.txt"])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let reader = Keypair::generate();
+        let env = seal_blob(b"SECRET\n", &[reader.verifying_key()]).unwrap();
+        let plaintext = open_blob(&env, &reader).unwrap();
+        let mut child = std::process::Command::new("git")
+            .args(["-C", dest.to_str().unwrap(), "hash-object", "-w", "-t", "blob", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(&plaintext).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), oid);
     }
 }
