@@ -662,6 +662,10 @@ pub async fn git_receive_pack(
         let ipfs_api = state.config.ipfs_api.clone();
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
+        let rules_for_enc = rules_opt.clone();
+        let repo_id = record.id.clone();
+        let owner_did = record.owner_did.clone();
+        let is_public = record.is_public;
         tokio::spawn(async move {
             let pinned = crate::ipfs_pin::pin_new_objects(
                 &ipfs_api,
@@ -674,6 +678,29 @@ pub async fn git_receive_pack(
                 tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
                 for (sha, cid) in &pinned {
                     tracing::info!(sha = %sha, %cid, "pinned");
+                }
+            }
+
+            // Option B1: encrypt-then-pin the withheld blobs so authorized
+            // readers can recover them when the origin cannot serve them.
+            if let Some(rules) = rules_for_enc.filter(|r| !r.is_empty()) {
+                let p = repo_path_clone.clone();
+                let owner = owner_did.clone();
+                let recip = tokio::task::spawn_blocking(move || {
+                    crate::git::visibility_pack::withheld_blob_recipients(
+                        &p, &rules, is_public, &owner,
+                    )
+                })
+                .await;
+                if let Ok(Ok(recipients)) = recip {
+                    crate::encrypted_pin::encrypt_and_pin(
+                        &ipfs_api,
+                        &repo_path_clone,
+                        &db_clone,
+                        &repo_id,
+                        &recipients,
+                    )
+                    .await;
                 }
             }
         });
