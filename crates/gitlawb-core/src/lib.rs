@@ -1,6 +1,7 @@
 pub mod cert;
 pub mod cid;
 pub mod did;
+pub mod encrypt;
 pub mod error;
 pub mod http_sig;
 pub mod identity;
