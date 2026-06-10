@@ -24,7 +24,7 @@ uuid = { workspace = true }
 zeroize = { version = "1", features = ["derive"] }
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 curve25519-dalek = "4"
-crypto_box = { version = "0.9", features = ["std"] }
+crypto_box = { version = "0.9", features = ["std", "chacha20"] }
 chacha20poly1305 = "0.10"
 
 [dev-dependencies]
