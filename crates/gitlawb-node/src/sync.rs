@@ -18,6 +18,32 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::db::Db;
 
+/// How to mirror a repo, decided from the origin's `withheld-paths` answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorMode {
+    /// No withheld content: a normal full mirror.
+    Plain,
+    /// Withheld content present: a promisor mirror that tolerates the blobs the
+    /// origin omits for an anonymous caller.
+    Promisor,
+}
+
+/// Decide the mirror mode from the origin's `withheld-paths` response.
+///
+/// `Some(non-empty)` → the repo has a private subtree → `Promisor`.
+/// `Some(empty)`     → fully public → `Plain`.
+/// `None`            → the lookup 404'd or failed. Attempt a `Plain` mirror; a
+///                     mode-A repo also 404s the git read endpoint, so the clone
+///                     fails and nothing is mirrored (fail-closed at the git
+///                     layer), while a public repo on a peer that predates the
+///                     `withheld-paths` route still gets mirrored.
+fn classify_mirror(withheld: Option<Vec<String>>) -> MirrorMode {
+    match withheld {
+        Some(globs) if !globs.is_empty() => MirrorMode::Promisor,
+        _ => MirrorMode::Plain,
+    }
+}
+
 /// Start the background sync worker. Returns immediately; the worker runs
 /// as a detached tokio task that exits cleanly when `shutdown_rx` flips
 /// to `true`.
@@ -173,4 +199,29 @@ async fn fetch_repo(local_path: &Path, remote_url: &str) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("git fetch failed: {stderr}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_promisor_when_withheld_nonempty() {
+        let mode = classify_mirror(Some(vec!["/secret/**".to_string()]));
+        assert!(matches!(mode, MirrorMode::Promisor));
+    }
+
+    #[test]
+    fn classify_plain_when_withheld_empty() {
+        let mode = classify_mirror(Some(vec![]));
+        assert!(matches!(mode, MirrorMode::Plain));
+    }
+
+    #[test]
+    fn classify_plain_when_lookup_failed() {
+        // None == 404 / network error / parse failure: attempt a plain mirror
+        // and let the git read endpoint fail-close a mode-A repo.
+        let mode = classify_mirror(None);
+        assert!(matches!(mode, MirrorMode::Plain));
+    }
 }
