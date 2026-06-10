@@ -54,3 +54,27 @@ pub async fn get_encrypted_blob(
         .map_err(|e| AppError::Git(e.to_string()))?;
     Ok(bytes)
 }
+
+/// GET /api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate
+/// Returns [{oid, cid, recipients}] for every encrypted blob in the repo, for
+/// peer-mirror replication (Option B2). Not recipient-scoped: recipient DIDs are
+/// already public via the IPFS-pinned envelopes, so this exposes only ciphertext
+/// metadata (content-addressed OIDs/CIDs and recipient DIDs), never plaintext.
+pub async fn replicate_encrypted_blobs(
+    State(state): State<AppState>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let record = state
+        .db
+        .get_repo(&owner, &repo)
+        .await?
+        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let rows = state.db.list_all_encrypted_blobs(&record.id).await?;
+    let blobs: Vec<_> = rows
+        .into_iter()
+        .map(|(oid, cid, recipients)| {
+            serde_json::json!({ "oid": oid, "cid": cid, "recipients": recipients })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "blobs": blobs })))
+}
