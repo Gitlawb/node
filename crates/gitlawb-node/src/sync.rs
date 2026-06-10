@@ -132,7 +132,7 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
         let result = if local_path.exists() {
             fetch_repo(&local_path, &remote_url).await
         } else {
-            clone_repo(&remote_url, &local_path).await
+            clone_repo(&remote_url, &local_path, MirrorMode::Plain).await
         };
 
         match result {
@@ -160,14 +160,20 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
 }
 
 /// Mirror-clone a repo from a remote URL into a local bare repo.
-async fn clone_repo(remote_url: &str, local_path: &Path) -> anyhow::Result<()> {
+/// `Promisor` mode adds `--filter=blob:limit=10g`, which marks the repo a git
+/// promisor (so a pack with origin-omitted withheld blobs is accepted) while
+/// the huge size limit means every blob the origin *does* send is kept.
+async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> anyhow::Result<()> {
+    let local_str = local_path.to_str().unwrap_or(".");
+    let mut args = vec!["clone", "--mirror"];
+    if mode == MirrorMode::Promisor {
+        args.push("--filter=blob:limit=10g");
+    }
+    args.push(remote_url);
+    args.push(local_str);
+
     let out = tokio::process::Command::new("git")
-        .args([
-            "clone",
-            "--mirror",
-            remote_url,
-            local_path.to_str().unwrap_or("."),
-        ])
+        .args(&args)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("git clone failed to spawn: {e}"))?;
@@ -204,6 +210,8 @@ async fn fetch_repo(local_path: &Path, remote_url: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
 
     #[test]
     fn classify_promisor_when_withheld_nonempty() {
@@ -223,5 +231,86 @@ mod tests {
         // and let the git read endpoint fail-close a mode-A repo.
         let mode = classify_mirror(None);
         assert!(matches!(mode, MirrorMode::Plain));
+    }
+
+    fn g(args: &[&str], dir: &Path) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    /// Build a bare remote containing `files`, committed on one branch.
+    /// Returns (tempdir, file:// url). file:// makes git honor --filter.
+    fn bare_remote(files: &[(&str, &[u8])]) -> (TempDir, String) {
+        let td = TempDir::new().unwrap();
+        let origin = td.path().join("origin");
+        let bare = td.path().join("bare.git");
+        for (path, contents) in files {
+            let full = origin.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, contents).unwrap();
+        }
+        g(&["init", "-q"], &origin);
+        g(&["config", "user.email", "t@t"], &origin);
+        g(&["config", "user.name", "t"], &origin);
+        g(&["add", "."], &origin);
+        g(&["commit", "-qm", "init"], &origin);
+        g(
+            &["clone", "-q", "--bare", origin.to_str().unwrap(), bare.to_str().unwrap()],
+            td.path(),
+        );
+        let url = format!("file://{}", bare.display());
+        (td, url)
+    }
+
+    fn git_config(repo: &Path, key: &str) -> String {
+        let out = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "config", "--get", key])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn object_count(repo: &Path) -> usize {
+        let out = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn promisor_clone_marks_promisor_and_keeps_objects() {
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
+        assert_eq!(git_config(&dest, "remote.origin.mirror"), "true");
+        // No withholding on a plain bare origin, so every object is present:
+        // 1 commit + 1 root tree + 2 subtrees + 2 blobs = 6.
+        assert_eq!(object_count(&dest), 6);
+    }
+
+    #[tokio::test]
+    async fn plain_clone_is_not_promisor() {
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Plain).await.unwrap();
+
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "");
+        assert_eq!(git_config(&dest, "remote.origin.mirror"), "true");
     }
 }
