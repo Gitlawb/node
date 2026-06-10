@@ -87,7 +87,6 @@ pub fn replicable_objects(all: Vec<String>, withheld: &HashSet<String>) -> Vec<S
         .collect()
 }
 
-#[allow(dead_code)]
 /// For every blob withheld from anonymous, the DIDs allowed to read it: the
 /// owner plus any reader DID that `visibility_check` Allows at some path the
 /// blob appears at. Least-privilege: a reader of one private subtree is not a
@@ -282,5 +281,16 @@ mod tests {
             !map.contains_key(&public_oid),
             "public blob is not encrypted"
         );
+    }
+
+    #[test]
+    fn node_seal_open_round_trip() {
+        use gitlawb_core::encrypt::{open_blob, seal_blob};
+        use gitlawb_core::identity::Keypair;
+        let (_td, repo, secret_oid, _public) = fixture();
+        let (_t, bytes) = crate::git::store::read_object(&repo, &secret_oid).unwrap().unwrap();
+        let reader = Keypair::generate();
+        let env = seal_blob(&bytes, &[reader.verifying_key()]).unwrap();
+        assert_eq!(open_blob(&env, &reader).unwrap(), bytes);
     }
 }

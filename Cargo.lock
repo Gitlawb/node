@@ -3370,6 +3370,7 @@ dependencies = [
  "cid",
  "clap",
  "dirs-next",
+ "ed25519-dalek",
  "futures",
  "gitlawb-core",
  "hex",
