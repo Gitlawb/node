@@ -18,6 +18,32 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::db::Db;
 
+/// How to mirror a repo, decided from the origin's `withheld-paths` answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorMode {
+    /// No withheld content: a normal full mirror.
+    Plain,
+    /// Withheld content present: a promisor mirror that tolerates the blobs the
+    /// origin omits for an anonymous caller.
+    Promisor,
+}
+
+/// Decide the mirror mode from the origin's `withheld-paths` response.
+///
+/// `Some(non-empty)` → the repo has a private subtree → `Promisor`.
+/// `Some(empty)`     → fully public → `Plain`.
+/// `None`            → the lookup 404'd or failed. Attempt a `Plain` mirror; a
+///                     mode-A repo also 404s the git read endpoint, so the clone
+///                     fails and nothing is mirrored (fail-closed at the git
+///                     layer), while a public repo on a peer that predates the
+///                     `withheld-paths` route still gets mirrored.
+fn classify_mirror(withheld: Option<Vec<String>>) -> MirrorMode {
+    match withheld {
+        Some(globs) if !globs.is_empty() => MirrorMode::Promisor,
+        _ => MirrorMode::Plain,
+    }
+}
+
 /// Start the background sync worker. Returns immediately; the worker runs
 /// as a detached tokio task that exits cleanly when `shutdown_rx` flips
 /// to `true`.
@@ -37,12 +63,17 @@ async fn run(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
+    // Bound each withheld-paths lookup so a stalled peer cannot hang the worker.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     info!("sync worker started (auto_sync=true)");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                process_batch(&db, &config, machine_id.as_deref()).await;
+                process_batch(&db, &config, machine_id.as_deref(), &client).await;
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -54,7 +85,12 @@ async fn run(
     }
 }
 
-async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
+async fn process_batch(
+    db: &Db,
+    config: &Config,
+    machine_id: Option<&str>,
+    client: &reqwest::Client,
+) {
     let items = match db.dequeue_pending_syncs(10).await {
         Ok(v) => v,
         Err(e) => {
@@ -103,10 +139,13 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
         // (no .git suffix — the server routes don't include it)
         let remote_url = format!("{}/{}", origin_url, item.repo);
 
+        let withheld = fetch_withheld(client, &origin_url, owner_short, repo_name).await;
+        let mode = classify_mirror(withheld);
+
         let result = if local_path.exists() {
-            fetch_repo(&local_path, &remote_url).await
+            fetch_repo(&local_path, &remote_url, mode).await
         } else {
-            clone_repo(&remote_url, &local_path).await
+            clone_repo(&remote_url, &local_path, mode).await
         };
 
         match result {
@@ -133,15 +172,82 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
     }
 }
 
-/// Mirror-clone a repo from a remote URL into a local bare repo.
-async fn clone_repo(remote_url: &str, local_path: &Path) -> anyhow::Result<()> {
+/// Query the origin's anonymous `withheld-paths` endpoint. Returns the withheld
+/// glob list on a 2xx, or `None` on any non-success / network / parse error
+/// (treated as "unknown" by `classify_mirror`).
+async fn fetch_withheld(
+    client: &reqwest::Client,
+    origin_url: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<Vec<String>> {
+    let url = format!("{origin_url}/api/v1/repos/{owner}/{repo}/withheld-paths");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let globs = body
+        .get("withheld")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    Some(globs)
+}
+
+/// Run a git subprocess, returning an error with stderr on non-zero exit.
+async fn git_run(args: &[&str]) -> anyhow::Result<()> {
     let out = tokio::process::Command::new("git")
-        .args([
-            "clone",
-            "--mirror",
-            remote_url,
-            local_path.to_str().unwrap_or("."),
-        ])
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("git failed to spawn: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow::anyhow!("git {args:?} failed: {stderr}"));
+    }
+    Ok(())
+}
+
+/// Run a git subprocess, ignoring a non-zero exit. Used for idempotent
+/// `config --unset`, which exits non-zero when the key is already absent.
+async fn git_run_lenient(args: &[&str]) {
+    let _ = tokio::process::Command::new("git")
+        .args(args)
+        .output()
+        .await;
+}
+
+/// Read a single git config value; `None` if unset or on error.
+async fn git_config_get(repo: &str, key: &str) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", repo, "config", "--get", key])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Mirror-clone a repo from a remote URL into a local bare repo.
+/// `Promisor` mode adds `--filter=blob:limit=10g`, which marks the repo a git
+/// promisor (so a pack with origin-omitted withheld blobs is accepted) while
+/// the huge size limit means every blob the origin *does* send is kept.
+async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> anyhow::Result<()> {
+    let local_str = local_path.to_str().unwrap_or(".");
+    let mut args = vec!["clone", "--mirror"];
+    if mode == MirrorMode::Promisor {
+        args.push("--filter=blob:limit=10g");
+    }
+    args.push(remote_url);
+    args.push(local_str);
+
+    let out = tokio::process::Command::new("git")
+        .args(&args)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("git clone failed to spawn: {e}"))?;
@@ -153,24 +259,210 @@ async fn clone_repo(remote_url: &str, local_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fetch all refs from the remote into an existing mirror repo.
-async fn fetch_repo(local_path: &Path, remote_url: &str) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new("git")
-        .args([
-            "-C",
-            local_path.to_str().unwrap_or("."),
-            "fetch",
-            "--prune",
-            remote_url,
-            "+refs/*:refs/*",
-        ])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("git fetch failed to spawn: {e}"))?;
+/// Fetch all refs from the remote into an existing mirror repo. Refreshes the
+/// stored `origin` URL (the peer's URL may have changed) and fetches via the
+/// `origin` remote so any stored promisor settings are honored.
+///
+/// `Promisor` applies the promisor config first (covers a repo that became
+/// mode-B after a plain initial mirror). `Plain` on a mirror that was previously
+/// a promisor (the repo went private -> public) clears the partial-clone config
+/// and `--refetch`es, so the once-withheld, now-public blobs are backfilled
+/// rather than left permanently missing.
+async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> anyhow::Result<()> {
+    let local_str = local_path.to_str().unwrap_or(".");
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow::anyhow!("git fetch failed: {stderr}"));
+    git_run(&["-C", local_str, "remote", "set-url", "origin", remote_url]).await?;
+
+    match mode {
+        MirrorMode::Promisor => {
+            git_run(&["-C", local_str, "config", "remote.origin.promisor", "true"]).await?;
+            git_run(&[
+                "-C",
+                local_str,
+                "config",
+                "remote.origin.partialclonefilter",
+                "blob:limit=10g",
+            ])
+            .await?;
+            git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
+        }
+        MirrorMode::Plain => {
+            let was_promisor = git_config_get(local_str, "remote.origin.promisor")
+                .await
+                .as_deref()
+                == Some("true");
+            if was_promisor {
+                git_run_lenient(&[
+                    "-C",
+                    local_str,
+                    "config",
+                    "--unset",
+                    "remote.origin.promisor",
+                ])
+                .await;
+                git_run_lenient(&[
+                    "-C",
+                    local_str,
+                    "config",
+                    "--unset",
+                    "remote.origin.partialclonefilter",
+                ])
+                .await;
+                git_run(&["-C", local_str, "fetch", "--refetch", "--prune", "origin"]).await
+            } else {
+                git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
+            }
+        }
     }
-    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    #[test]
+    fn classify_promisor_when_withheld_nonempty() {
+        let mode = classify_mirror(Some(vec!["/secret/**".to_string()]));
+        assert!(matches!(mode, MirrorMode::Promisor));
+    }
+
+    #[test]
+    fn classify_plain_when_withheld_empty() {
+        let mode = classify_mirror(Some(vec![]));
+        assert!(matches!(mode, MirrorMode::Plain));
+    }
+
+    #[test]
+    fn classify_plain_when_lookup_failed() {
+        // None == 404 / network error / parse failure: attempt a plain mirror
+        // and let the git read endpoint fail-close a mode-A repo.
+        let mode = classify_mirror(None);
+        assert!(matches!(mode, MirrorMode::Plain));
+    }
+
+    fn g(args: &[&str], dir: &Path) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    /// Build a bare remote containing `files`, committed on one branch.
+    /// Returns (tempdir, file:// url). file:// makes git honor --filter.
+    fn bare_remote(files: &[(&str, &[u8])]) -> (TempDir, String) {
+        let td = TempDir::new().unwrap();
+        let origin = td.path().join("origin");
+        let bare = td.path().join("bare.git");
+        for (path, contents) in files {
+            let full = origin.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, contents).unwrap();
+        }
+        g(&["init", "-q"], &origin);
+        g(&["config", "user.email", "t@t"], &origin);
+        g(&["config", "user.name", "t"], &origin);
+        g(&["add", "."], &origin);
+        g(&["commit", "-qm", "init"], &origin);
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                origin.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        let url = format!("file://{}", bare.display());
+        (td, url)
+    }
+
+    fn git_config(repo: &Path, key: &str) -> String {
+        let out = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "config", "--get", key])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn object_count(repo: &Path) -> usize {
+        let out = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "cat-file",
+                "--batch-all-objects",
+                "--batch-check=%(objectname)",
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+
+    #[tokio::test]
+    async fn promisor_clone_marks_promisor_and_keeps_objects() {
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
+        assert_eq!(git_config(&dest, "remote.origin.mirror"), "true");
+        // No withholding on a plain bare origin, so every object is present:
+        // 1 commit + 1 root tree + 2 subtrees + 2 blobs = 6.
+        assert_eq!(object_count(&dest), 6);
+    }
+
+    #[tokio::test]
+    async fn plain_clone_is_not_promisor() {
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Plain).await.unwrap();
+
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "");
+        assert_eq!(git_config(&dest, "remote.origin.mirror"), "true");
+    }
+
+    #[tokio::test]
+    async fn promisor_fetch_updates_existing_mirror() {
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+        let before = object_count(&dest);
+
+        // Add a second commit to the origin working tree and push to the bare
+        // (the working repo has no named remote, so push via the file:// URL).
+        let origin = td.path().join("origin");
+        std::fs::write(origin.join("public/c.txt"), b"more\n").unwrap();
+        g(&["add", "."], &origin);
+        g(&["commit", "-qm", "second"], &origin);
+        g(&["push", "-q", &url, "HEAD"], &origin);
+
+        fetch_repo(&dest, &url, MirrorMode::Promisor).await.unwrap();
+
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
+        assert!(object_count(&dest) > before, "fetch pulled the new commit");
+    }
+
+    #[tokio::test]
+    async fn plain_fetch_clears_promisor_config_on_transition() {
+        // Repo started mode-B (promisor mirror), then went fully public, so the
+        // next sync classifies Plain. fetch_repo must drop the partial-clone
+        // config and refetch instead of leaving the mirror a promisor forever.
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
+
+        fetch_repo(&dest, &url, MirrorMode::Plain).await.unwrap();
+
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "");
+        assert_eq!(git_config(&dest, "remote.origin.partialclonefilter"), "");
+    }
 }

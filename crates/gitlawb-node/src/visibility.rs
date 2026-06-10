@@ -96,6 +96,78 @@ pub fn visibility_check(
     }
 }
 
+/// The subtree path globs that `caller` (None = anonymous) may NOT read, given
+/// the repo's rules. Whole-repo ("/") rules are excluded: a denied whole-repo
+/// read is handled by the 404 gate before a clone ever starts. Each remaining
+/// rule is reported when `visibility_check` denies the caller at the glob's
+/// representative path. Used by the clean-clone client to sparse-exclude the
+/// private paths from checkout.
+pub fn withheld_globs(
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Vec<String> {
+    rules
+        .iter()
+        .filter(|r| r.path_glob != "/")
+        .filter(|r| {
+            let probe = glob_prefix(&r.path_glob);
+            visibility_check(rules, is_public, owner_did, caller, probe) == Decision::Deny
+        })
+        .map(|r| r.path_glob.clone())
+        .collect()
+}
+
+/// The allowed globs that sit strictly underneath a denied glob. A clean-clone
+/// client sparse-excludes everything in `withheld_globs`, which would also hide
+/// these nested allowed paths; re-including them restores the caller's access.
+/// Example: with `/secret/**` denied and `/secret/public/**` allowed for the
+/// same caller, `/secret/public/**` is returned here so the client re-includes
+/// it after excluding `/secret/`.
+pub fn reincluded_globs(
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Vec<String> {
+    let denied: Vec<&str> = rules
+        .iter()
+        .filter(|r| r.path_glob != "/")
+        .filter(|r| {
+            visibility_check(
+                rules,
+                is_public,
+                owner_did,
+                caller,
+                glob_prefix(&r.path_glob),
+            ) == Decision::Deny
+        })
+        .map(|r| glob_prefix(&r.path_glob))
+        .collect();
+
+    rules
+        .iter()
+        .filter(|r| r.path_glob != "/")
+        .filter(|r| {
+            visibility_check(
+                rules,
+                is_public,
+                owner_did,
+                caller,
+                glob_prefix(&r.path_glob),
+            ) == Decision::Allow
+        })
+        .filter(|r| {
+            let p = glob_prefix(&r.path_glob);
+            denied
+                .iter()
+                .any(|d| *d != p && p.starts_with(&format!("{d}/")))
+        })
+        .map(|r| r.path_glob.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +187,43 @@ mod tests {
     }
 
     const OWNER: &str = "did:key:z6MkOwner";
+
+    #[test]
+    fn withheld_globs_lists_only_denied_subtrees() {
+        let rules = [
+            rule("/secret/**", VisibilityMode::B, &["did:key:z6MkFriend"]),
+            rule("/docs/**", VisibilityMode::B, &["did:key:z6MkStranger"]),
+        ];
+        // Stranger is denied /secret but allowed /docs.
+        let mut got = withheld_globs(&rules, true, OWNER, Some("did:key:z6MkStranger"));
+        got.sort();
+        assert_eq!(got, vec!["/secret/**".to_string()]);
+        // Owner is denied nothing.
+        assert!(withheld_globs(&rules, true, OWNER, Some(OWNER)).is_empty());
+        // Anonymous is denied both.
+        let mut anon = withheld_globs(&rules, true, OWNER, None);
+        anon.sort();
+        assert_eq!(anon, vec!["/docs/**".to_string(), "/secret/**".to_string()]);
+    }
+
+    #[test]
+    fn reincluded_globs_restores_allowed_nested_path() {
+        let rules = [
+            rule("/secret/**", VisibilityMode::B, &["did:key:z6MkFriend"]),
+            rule(
+                "/secret/public/**",
+                VisibilityMode::B,
+                &["did:key:z6MkFriend", "did:key:z6MkStranger"],
+            ),
+        ];
+        // Stranger is denied /secret/** but allowed the nested /secret/public/**.
+        let withheld = withheld_globs(&rules, true, OWNER, Some("did:key:z6MkStranger"));
+        assert_eq!(withheld, vec!["/secret/**".to_string()]);
+        let reinc = reincluded_globs(&rules, true, OWNER, Some("did:key:z6MkStranger"));
+        assert_eq!(reinc, vec!["/secret/public/**".to_string()]);
+        // Owner is denied nothing, so there is nothing to re-include.
+        assert!(reincluded_globs(&rules, true, OWNER, Some(OWNER)).is_empty());
+    }
 
     #[test]
     fn no_rules_public_allows_anonymous() {
