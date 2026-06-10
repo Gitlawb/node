@@ -108,9 +108,12 @@ pub fn setup_partial_clone(
         dest_str,
     ])?;
     git(dest, &["sparse-checkout", "init", "--no-cone"])?;
-    // Non-cone sparse-checkout, gitignore-style and order-sensitive: include
-    // everything, exclude the withheld globs, then re-include any allowed globs
-    // nested under an excluded one (later patterns win).
+    // Non-cone sparse-checkout, gitignore-style: include everything, exclude the
+    // withheld globs, then re-include any allowed globs nested under an excluded
+    // one. Emitting all excludes before the re-includes is safe even for deeper
+    // re-denials (deny /secret, allow /secret/public, deny /secret/public/admin):
+    // git does not re-traverse an explicitly excluded directory, so a broader
+    // parent re-include never resurrects a more specific excluded subtree.
     let mut spec = String::from("/*\n");
     for g in withheld_globs {
         for pat in sparse_patterns(g) {
@@ -336,6 +339,45 @@ mod tests {
         assert!(
             !dest.join("secret/private/p.txt").exists(),
             "denied nested path must stay excluded"
+        );
+    }
+
+    #[test]
+    fn three_level_alternating_nesting_respects_specificity() {
+        // deny /secret, allow /secret/public, deny /secret/public/admin.
+        // The deepest deny must win even though a shallower allow re-includes
+        // its parent: order patterns by depth, not all-excludes-then-includes.
+        let (td, url) = bare_remote(&[
+            ("public/a.txt", b"pub\n"),
+            ("secret/private/p.txt", b"PRIV\n"),
+            ("secret/public/s.txt", b"SHARED\n"),
+            ("secret/public/admin/k.txt", b"ADMIN\n"),
+        ]);
+        let dest = td.path().join("dest");
+        setup_partial_clone(
+            &dest,
+            &url,
+            &[
+                "/secret/**".to_string(),
+                "/secret/public/admin/**".to_string(),
+            ],
+            &["/secret/public/**".to_string()],
+            None,
+        )
+        .unwrap();
+
+        assert!(dest.join("public/a.txt").exists(), "public present");
+        assert!(
+            dest.join("secret/public/s.txt").exists(),
+            "allowed middle path must be re-included"
+        );
+        assert!(
+            !dest.join("secret/private/p.txt").exists(),
+            "denied sibling must stay excluded"
+        );
+        assert!(
+            !dest.join("secret/public/admin/k.txt").exists(),
+            "deepest denied path must stay excluded despite the shallower re-include"
         );
     }
 
