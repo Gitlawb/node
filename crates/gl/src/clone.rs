@@ -8,7 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use serde_json::Value;
+use serde::Deserialize;
 use std::path::Path;
 use std::process::Command;
 
@@ -134,17 +134,25 @@ pub fn setup_partial_clone(
     match branch {
         Some(b) => git(dest, &["checkout", "-q", b])?,
         None => {
+            // Read the default branch from the local `origin/HEAD` symref that
+            // clone just set, instead of parsing `git remote show origin`, whose
+            // "HEAD branch:" line is localized and needs a network round-trip.
             let out = Command::new("git")
-                .args(["remote", "show", "origin"])
+                .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
                 .current_dir(dest)
                 .output()?;
-            let text = String::from_utf8_lossy(&out.stdout);
-            let head = text
-                .lines()
-                .find_map(|l| l.trim().strip_prefix("HEAD branch: "))
-                .map(|s| s.to_string())
-                .context("could not determine default branch")?;
-            git(dest, &["checkout", "-q", &head])?;
+            if !out.status.success() {
+                bail!(
+                    "could not determine default branch: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let symref = String::from_utf8_lossy(&out.stdout);
+            let head = symref
+                .trim()
+                .strip_prefix("origin/")
+                .context("unexpected origin/HEAD format")?;
+            git(dest, &["checkout", "-q", head])?;
         }
     }
     Ok(())
@@ -192,21 +200,21 @@ async fn fetch_withheld(node: &str, owner: &str, name: &str) -> Result<(Vec<Stri
         Ok(r) => bail!("withheld-paths lookup failed: {}", r.status()),
         Err(err) => return Err(err).context("fetching withheld paths"),
     };
-    let body: Value = resp
+    let body: WithheldPathsResponse = resp
         .json()
         .await
         .context("parsing withheld-paths response")?;
-    let globs = |field: &str| -> Vec<String> {
-        body.get(field)
-            .and_then(|w| w.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    Ok((globs("withheld"), globs("reinclude")))
+    Ok((body.withheld, body.reinclude))
+}
+
+/// The node's `/withheld-paths` 200 body. Both fields are always emitted as JSON
+/// arrays; deserializing into this struct (rather than poking at a `Value`) makes
+/// a missing or mistyped field a hard error instead of silently becoming `[]`,
+/// which would mask a server regression behind a confusing later clone failure.
+#[derive(Deserialize)]
+struct WithheldPathsResponse {
+    withheld: Vec<String>,
+    reinclude: Vec<String>,
 }
 
 pub async fn run(args: CloneArgs) -> Result<()> {
@@ -402,6 +410,22 @@ mod tests {
             sparse_patterns("/docs/private"),
             vec!["/docs/private".to_string(), "/docs/private/".to_string()]
         );
+    }
+
+    #[test]
+    fn withheld_response_requires_both_fields() {
+        let ok: WithheldPathsResponse =
+            serde_json::from_str(r#"{"withheld":["/secret/**"],"reinclude":[]}"#).unwrap();
+        assert_eq!(ok.withheld, vec!["/secret/**".to_string()]);
+        assert!(ok.reinclude.is_empty());
+
+        // A missing field is a schema mismatch: it must error, not default to [].
+        assert!(serde_json::from_str::<WithheldPathsResponse>(r#"{"withheld":[]}"#).is_err());
+        // A wrong-typed field must error too.
+        assert!(serde_json::from_str::<WithheldPathsResponse>(
+            r#"{"withheld":"nope","reinclude":[]}"#
+        )
+        .is_err());
     }
 
     #[test]
