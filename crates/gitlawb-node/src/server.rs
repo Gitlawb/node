@@ -364,6 +364,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/encrypted-blob/{oid}",
             axum::routing::get(crate::api::encrypted::get_encrypted_blob),
         )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate",
+            axum::routing::get(crate::api::encrypted::replicate_encrypted_blobs),
+        )
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(pack_limit))
         .layer(middleware::from_fn(auth::optional_signature));
