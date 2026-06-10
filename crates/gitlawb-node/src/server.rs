@@ -356,6 +356,14 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/withheld-paths",
             axum::routing::get(visibility::withheld_paths),
         )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/encrypted-blobs",
+            axum::routing::get(crate::api::encrypted::list_encrypted_blobs),
+        )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/encrypted-blob/{oid}",
+            axum::routing::get(crate::api::encrypted::get_encrypted_blob),
+        )
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(pack_limit))
         .layer(middleware::from_fn(auth::optional_signature));
