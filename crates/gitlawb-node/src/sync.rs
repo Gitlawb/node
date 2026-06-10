@@ -63,7 +63,11 @@ async fn run(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
-    let client = reqwest::Client::new();
+    // Bound each withheld-paths lookup so a stalled peer cannot hang the worker.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     info!("sync worker started (auto_sync=true)");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
@@ -206,6 +210,29 @@ async fn git_run(args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Run a git subprocess, ignoring a non-zero exit. Used for idempotent
+/// `config --unset`, which exits non-zero when the key is already absent.
+async fn git_run_lenient(args: &[&str]) {
+    let _ = tokio::process::Command::new("git")
+        .args(args)
+        .output()
+        .await;
+}
+
+/// Read a single git config value; `None` if unset or on error.
+async fn git_config_get(repo: &str, key: &str) -> Option<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", repo, "config", "--get", key])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 /// Mirror-clone a repo from a remote URL into a local bare repo.
 /// `Promisor` mode adds `--filter=blob:limit=10g`, which marks the repo a git
 /// promisor (so a pack with origin-omitted withheld blobs is accepted) while
@@ -233,28 +260,60 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
 }
 
 /// Fetch all refs from the remote into an existing mirror repo. Refreshes the
-/// stored `origin` URL (the peer's URL may have changed), applies promisor
-/// config when `Promisor` (covers a repo that became mode-B after a plain
-/// initial mirror), and fetches via the `origin` remote so any stored promisor
-/// settings are honored.
+/// stored `origin` URL (the peer's URL may have changed) and fetches via the
+/// `origin` remote so any stored promisor settings are honored.
+///
+/// `Promisor` applies the promisor config first (covers a repo that became
+/// mode-B after a plain initial mirror). `Plain` on a mirror that was previously
+/// a promisor (the repo went private -> public) clears the partial-clone config
+/// and `--refetch`es, so the once-withheld, now-public blobs are backfilled
+/// rather than left permanently missing.
 async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> anyhow::Result<()> {
     let local_str = local_path.to_str().unwrap_or(".");
 
     git_run(&["-C", local_str, "remote", "set-url", "origin", remote_url]).await?;
 
-    if mode == MirrorMode::Promisor {
-        git_run(&["-C", local_str, "config", "remote.origin.promisor", "true"]).await?;
-        git_run(&[
-            "-C",
-            local_str,
-            "config",
-            "remote.origin.partialclonefilter",
-            "blob:limit=10g",
-        ])
-        .await?;
+    match mode {
+        MirrorMode::Promisor => {
+            git_run(&["-C", local_str, "config", "remote.origin.promisor", "true"]).await?;
+            git_run(&[
+                "-C",
+                local_str,
+                "config",
+                "remote.origin.partialclonefilter",
+                "blob:limit=10g",
+            ])
+            .await?;
+            git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
+        }
+        MirrorMode::Plain => {
+            let was_promisor = git_config_get(local_str, "remote.origin.promisor")
+                .await
+                .as_deref()
+                == Some("true");
+            if was_promisor {
+                git_run_lenient(&[
+                    "-C",
+                    local_str,
+                    "config",
+                    "--unset",
+                    "remote.origin.promisor",
+                ])
+                .await;
+                git_run_lenient(&[
+                    "-C",
+                    local_str,
+                    "config",
+                    "--unset",
+                    "remote.origin.partialclonefilter",
+                ])
+                .await;
+                git_run(&["-C", local_str, "fetch", "--refetch", "--prune", "origin"]).await
+            } else {
+                git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
+            }
+        }
     }
-
-    git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
 }
 
 #[cfg(test)]
@@ -389,5 +448,21 @@ mod tests {
 
         assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
         assert!(object_count(&dest) > before, "fetch pulled the new commit");
+    }
+
+    #[tokio::test]
+    async fn plain_fetch_clears_promisor_config_on_transition() {
+        // Repo started mode-B (promisor mirror), then went fully public, so the
+        // next sync classifies Plain. fetch_repo must drop the partial-clone
+        // config and refetch instead of leaving the mirror a promisor forever.
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
+
+        fetch_repo(&dest, &url, MirrorMode::Plain).await.unwrap();
+
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "");
+        assert_eq!(git_config(&dest, "remote.origin.partialclonefilter"), "");
     }
 }
