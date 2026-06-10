@@ -1714,15 +1714,23 @@ impl Db {
         }
     }
 
-    /// Whether an encrypted blob row exists (recipient-agnostic), to avoid
-    /// re-pinning on subsequent pushes.
-    pub async fn has_encrypted_blob(&self, repo_id: &str, oid: &str) -> Result<bool> {
-        let row = sqlx::query("SELECT 1 AS x FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2")
-            .bind(repo_id)
-            .bind(oid)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.is_some())
+    /// The recipient DID list stored for an encrypted blob, or None if there is
+    /// no row. Used to decide whether a re-seal is needed (recipients changed).
+    pub async fn encrypted_blob_recipients(
+        &self,
+        repo_id: &str,
+        oid: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let row =
+            sqlx::query("SELECT recipients FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2")
+                .bind(repo_id)
+                .bind(oid)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| {
+            let recipients: String = r.get("recipients");
+            serde_json::from_str::<Vec<String>>(&recipients).unwrap_or_default()
+        }))
     }
 
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {

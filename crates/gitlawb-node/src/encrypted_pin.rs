@@ -28,8 +28,15 @@ pub async fn encrypt_and_pin(
     recipients: &HashMap<String, BTreeSet<String>>,
 ) {
     for (oid, dids) in recipients {
-        if db.has_encrypted_blob(repo_id, oid).await.unwrap_or(false) {
-            continue;
+        // Skip only if an existing envelope already covers exactly these
+        // recipients. If the recipient set changed (e.g. a reader was added to
+        // the rule), re-seal so the new reader can recover the blob. Reader
+        // removal is not retroactive: the old envelope is already public.
+        if let Ok(Some(stored)) = db.encrypted_blob_recipients(repo_id, oid).await {
+            let stored: BTreeSet<String> = stored.into_iter().collect();
+            if &stored == dids {
+                continue;
+            }
         }
         let keys: Vec<VerifyingKey> = dids.iter().filter_map(|d| did_to_key(d)).collect();
         if keys.is_empty() {
