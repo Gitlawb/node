@@ -63,12 +63,13 @@ async fn run(
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) {
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
+    let client = reqwest::Client::new();
     info!("sync worker started (auto_sync=true)");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                process_batch(&db, &config, machine_id.as_deref()).await;
+                process_batch(&db, &config, machine_id.as_deref(), &client).await;
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -80,7 +81,7 @@ async fn run(
     }
 }
 
-async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
+async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>, client: &reqwest::Client) {
     let items = match db.dequeue_pending_syncs(10).await {
         Ok(v) => v,
         Err(e) => {
@@ -129,10 +130,13 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
         // (no .git suffix — the server routes don't include it)
         let remote_url = format!("{}/{}", origin_url, item.repo);
 
+        let withheld = fetch_withheld(client, &origin_url, owner_short, repo_name).await;
+        let mode = classify_mirror(withheld);
+
         let result = if local_path.exists() {
-            fetch_repo(&local_path, &remote_url, MirrorMode::Plain).await
+            fetch_repo(&local_path, &remote_url, mode).await
         } else {
-            clone_repo(&remote_url, &local_path, MirrorMode::Plain).await
+            clone_repo(&remote_url, &local_path, mode).await
         };
 
         match result {
@@ -157,6 +161,30 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
             }
         }
     }
+}
+
+/// Query the origin's anonymous `withheld-paths` endpoint. Returns the withheld
+/// glob list on a 2xx, or `None` on any non-success / network / parse error
+/// (treated as "unknown" by `classify_mirror`).
+async fn fetch_withheld(
+    client: &reqwest::Client,
+    origin_url: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<Vec<String>> {
+    let url = format!("{origin_url}/api/v1/repos/{owner}/{repo}/withheld-paths");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let globs = body
+        .get("withheld")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    Some(globs)
 }
 
 /// Run a git subprocess, returning an error with stderr on non-zero exit.
