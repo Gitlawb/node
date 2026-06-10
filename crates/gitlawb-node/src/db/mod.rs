@@ -1665,10 +1665,11 @@ impl Db {
         repo_id: &str,
         caller: &str,
     ) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query("SELECT oid, cid, recipients FROM encrypted_blobs WHERE repo_id = $1")
-            .bind(repo_id)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query("SELECT oid, cid, recipients FROM encrypted_blobs WHERE repo_id = $1")
+                .bind(repo_id)
+                .fetch_all(&self.pool)
+                .await?;
         let mut out = Vec::new();
         for row in rows {
             let oid: String = row.get("oid");
@@ -1689,11 +1690,13 @@ impl Db {
         oid: &str,
         caller: &str,
     ) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT cid, recipients FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2")
-            .bind(repo_id)
-            .bind(oid)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT cid, recipients FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2",
+        )
+        .bind(repo_id)
+        .bind(oid)
+        .fetch_optional(&self.pool)
+        .await?;
         let Some(row) = row else { return Ok(None) };
         let recipients: String = row.get("recipients");
         let recipients: Vec<String> = serde_json::from_str(&recipients).unwrap_or_default();

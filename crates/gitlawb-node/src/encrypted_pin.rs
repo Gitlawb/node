@@ -52,7 +52,10 @@ pub async fn encrypt_and_pin(
             _ => continue,
         };
         let dids_vec: Vec<String> = dids.iter().cloned().collect();
-        if let Err(e) = db.record_encrypted_blob(repo_id, oid, &cid, &dids_vec).await {
+        if let Err(e) = db
+            .record_encrypted_blob(repo_id, oid, &cid, &dids_vec)
+            .await
+        {
             tracing::warn!(oid = %oid, err = %e, "record_encrypted_blob failed");
         }
     }

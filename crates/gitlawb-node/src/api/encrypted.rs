@@ -20,7 +20,10 @@ pub async fn list_encrypted_blobs(
         .get_repo(&owner, &repo)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
-    let rows = state.db.list_encrypted_blobs_for(&record.id, caller).await?;
+    let rows = state
+        .db
+        .list_encrypted_blobs_for(&record.id, caller)
+        .await?;
     let blobs: Vec<_> = rows
         .into_iter()
         .map(|(oid, cid)| serde_json::json!({ "oid": oid, "cid": cid }))

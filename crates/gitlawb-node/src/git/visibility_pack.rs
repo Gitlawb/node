@@ -288,7 +288,9 @@ mod tests {
         use gitlawb_core::encrypt::{open_blob, seal_blob};
         use gitlawb_core::identity::Keypair;
         let (_td, repo, secret_oid, _public) = fixture();
-        let (_t, bytes) = crate::git::store::read_object(&repo, &secret_oid).unwrap().unwrap();
+        let (_t, bytes) = crate::git::store::read_object(&repo, &secret_oid)
+            .unwrap()
+            .unwrap();
         let reader = Keypair::generate();
         let env = seal_blob(&bytes, &[reader.verifying_key()]).unwrap();
         assert_eq!(open_blob(&env, &reader).unwrap(), bytes);
