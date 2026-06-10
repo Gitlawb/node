@@ -130,7 +130,7 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
         let remote_url = format!("{}/{}", origin_url, item.repo);
 
         let result = if local_path.exists() {
-            fetch_repo(&local_path, &remote_url).await
+            fetch_repo(&local_path, &remote_url, MirrorMode::Plain).await
         } else {
             clone_repo(&remote_url, &local_path, MirrorMode::Plain).await
         };
@@ -159,6 +159,20 @@ async fn process_batch(db: &Db, config: &Config, machine_id: Option<&str>) {
     }
 }
 
+/// Run a git subprocess, returning an error with stderr on non-zero exit.
+async fn git_run(args: &[&str]) -> anyhow::Result<()> {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("git failed to spawn: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow::anyhow!("git {args:?} failed: {stderr}"));
+    }
+    Ok(())
+}
+
 /// Mirror-clone a repo from a remote URL into a local bare repo.
 /// `Promisor` mode adds `--filter=blob:limit=10g`, which marks the repo a git
 /// promisor (so a pack with origin-omitted withheld blobs is accepted) while
@@ -185,26 +199,26 @@ async fn clone_repo(remote_url: &str, local_path: &Path, mode: MirrorMode) -> an
     Ok(())
 }
 
-/// Fetch all refs from the remote into an existing mirror repo.
-async fn fetch_repo(local_path: &Path, remote_url: &str) -> anyhow::Result<()> {
-    let out = tokio::process::Command::new("git")
-        .args([
-            "-C",
-            local_path.to_str().unwrap_or("."),
-            "fetch",
-            "--prune",
-            remote_url,
-            "+refs/*:refs/*",
-        ])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("git fetch failed to spawn: {e}"))?;
+/// Fetch all refs from the remote into an existing mirror repo. Refreshes the
+/// stored `origin` URL (the peer's URL may have changed), applies promisor
+/// config when `Promisor` (covers a repo that became mode-B after a plain
+/// initial mirror), and fetches via the `origin` remote so any stored promisor
+/// settings are honored.
+async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> anyhow::Result<()> {
+    let local_str = local_path.to_str().unwrap_or(".");
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow::anyhow!("git fetch failed: {stderr}"));
+    git_run(&["-C", local_str, "remote", "set-url", "origin", remote_url]).await?;
+
+    if mode == MirrorMode::Promisor {
+        git_run(&["-C", local_str, "config", "remote.origin.promisor", "true"]).await?;
+        git_run(&[
+            "-C", local_str,
+            "config", "remote.origin.partialclonefilter", "blob:limit=10g",
+        ])
+        .await?;
     }
-    Ok(())
+
+    git_run(&["-C", local_str, "fetch", "--prune", "origin"]).await
 }
 
 #[cfg(test)]
@@ -312,5 +326,26 @@ mod tests {
 
         assert_eq!(git_config(&dest, "remote.origin.promisor"), "");
         assert_eq!(git_config(&dest, "remote.origin.mirror"), "true");
+    }
+
+    #[tokio::test]
+    async fn promisor_fetch_updates_existing_mirror() {
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+        let before = object_count(&dest);
+
+        // Add a second commit to the origin working tree and push to the bare
+        // (the working repo has no named remote, so push via the file:// URL).
+        let origin = td.path().join("origin");
+        std::fs::write(origin.join("public/c.txt"), b"more\n").unwrap();
+        g(&["add", "."], &origin);
+        g(&["commit", "-qm", "second"], &origin);
+        g(&["push", "-q", &url, "HEAD"], &origin);
+
+        fetch_repo(&dest, &url, MirrorMode::Promisor).await.unwrap();
+
+        assert_eq!(git_config(&dest, "remote.origin.promisor"), "true");
+        assert!(object_count(&dest) > before, "fetch pulled the new commit");
     }
 }
