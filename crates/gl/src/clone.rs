@@ -280,7 +280,9 @@ async fn recover_encrypted_blobs(
             continue;
         }
         let env_resp = match client
-            .get_signed(&format!("/api/v1/repos/{owner}/{name}/encrypted-blob/{oid}"))
+            .get_signed(&format!(
+                "/api/v1/repos/{owner}/{name}/encrypted-blob/{oid}"
+            ))
             .await
         {
             Ok(r) if r.status().is_success() => r,
@@ -337,7 +339,8 @@ pub async fn run(args: CloneArgs) -> Result<()> {
     setup_partial_clone(&dest, &url, &withheld, &reinclude, args.branch.as_deref())?;
 
     if let Ok(keypair) = load_keypair_from_dir(None) {
-        if let Ok(paths) = recover_encrypted_blobs(&args.node, &owner, &name, &dest, &keypair).await {
+        if let Ok(paths) = recover_encrypted_blobs(&args.node, &owner, &name, &dest, &keypair).await
+        {
             if !paths.is_empty() {
                 // Re-include recovered paths if this was a sparse clone, then
                 // materialize them in the working tree.
@@ -580,7 +583,12 @@ mod tests {
         setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
         let oid = {
             let out = std::process::Command::new("git")
-                .args(["-C", dest.to_str().unwrap(), "rev-parse", "HEAD:secret/b.txt"])
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD:secret/b.txt",
+                ])
                 .output()
                 .unwrap();
             String::from_utf8_lossy(&out.stdout).trim().to_string()
@@ -589,7 +597,15 @@ mod tests {
         let env = seal_blob(b"SECRET\n", &[reader.verifying_key()]).unwrap();
         let plaintext = open_blob(&env, &reader).unwrap();
         let mut child = std::process::Command::new("git")
-            .args(["-C", dest.to_str().unwrap(), "hash-object", "-w", "-t", "blob", "--stdin"])
+            .args([
+                "-C",
+                dest.to_str().unwrap(),
+                "hash-object",
+                "-w",
+                "-t",
+                "blob",
+                "--stdin",
+            ])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()

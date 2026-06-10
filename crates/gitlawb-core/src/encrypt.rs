@@ -180,7 +180,10 @@ mod tests {
 
         assert_eq!(open_blob(&env, &owner).unwrap(), msg);
         assert_eq!(open_blob(&env, &reader_a).unwrap(), msg);
-        assert!(open_blob(&env, &reader_b).is_err(), "non-recipient must fail");
+        assert!(
+            open_blob(&env, &reader_b).is_err(),
+            "non-recipient must fail"
+        );
     }
 
     #[test]
