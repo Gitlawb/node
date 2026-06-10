@@ -1683,6 +1683,30 @@ impl Db {
         Ok(out)
     }
 
+    /// (oid, cid, recipients) for every encrypted blob in the repo, unscoped by
+    /// caller. This is the replication view used by peer mirrors (Option B2),
+    /// distinct from the recipient-scoped `list_encrypted_blobs_for`. It returns
+    /// only ciphertext metadata; no plaintext or key material is involved.
+    pub async fn list_all_encrypted_blobs(
+        &self,
+        repo_id: &str,
+    ) -> Result<Vec<(String, String, Vec<String>)>> {
+        let rows =
+            sqlx::query("SELECT oid, cid, recipients FROM encrypted_blobs WHERE repo_id = $1")
+                .bind(repo_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            let oid: String = row.get("oid");
+            let cid: String = row.get("cid");
+            let recipients: String = row.get("recipients");
+            let recipients: Vec<String> = serde_json::from_str(&recipients).unwrap_or_default();
+            out.push((oid, cid, recipients));
+        }
+        Ok(out)
+    }
+
     /// The CID of one encrypted blob, only if `caller` is a recipient.
     pub async fn encrypted_blob_cid(
         &self,
