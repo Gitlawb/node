@@ -289,7 +289,11 @@ mod tests {
     #[tokio::test]
     async fn test_manifest_anchor_noop_when_url_empty() {
         let client = reqwest::Client::new();
-        let blobs = vec![("oid1".to_string(), "cid1".to_string(), vec!["did:key:zA".to_string()])];
+        let blobs = vec![(
+            "oid1".to_string(),
+            "cid1".to_string(),
+            vec!["did:key:zA".to_string()],
+        )];
         let m = EncryptedManifest {
             repo: "alice/r",
             owner_did: "did:key:zO",
@@ -297,7 +301,10 @@ mod tests {
             timestamp: "2026-06-11T00:00:00Z",
             blobs: &blobs,
         };
-        assert_eq!(anchor_encrypted_manifest(&client, "", &m).await.unwrap(), "");
+        assert_eq!(
+            anchor_encrypted_manifest(&client, "", &m).await.unwrap(),
+            ""
+        );
     }
 
     #[tokio::test]
@@ -332,7 +339,11 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let blobs = vec![("oid1".to_string(), "cid1".to_string(), vec!["did:key:zA".to_string()])];
+        let blobs = vec![(
+            "oid1".to_string(),
+            "cid1".to_string(),
+            vec!["did:key:zA".to_string()],
+        )];
         let m = EncryptedManifest {
             repo: "alice/r",
             owner_did: "did:key:zO",

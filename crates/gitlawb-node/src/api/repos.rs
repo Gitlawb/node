@@ -710,8 +710,7 @@ pub async fn git_receive_pack(
                     // this push to Arweave, so the oid->cid index survives total
                     // node loss. Best-effort; never fails the push.
                     if !delta.is_empty() && !irys_url.is_empty() {
-                        let owner_short =
-                            owner_did.split(':').next_back().unwrap_or(&owner_did);
+                        let owner_short = owner_did.split(':').next_back().unwrap_or(&owner_did);
                         let repo_slug = format!("{owner_short}/{repo_name}");
                         let ts = chrono::Utc::now().to_rfc3339();
                         let manifest = crate::arweave::EncryptedManifest {
