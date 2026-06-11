@@ -666,6 +666,10 @@ pub async fn git_receive_pack(
         let repo_id = record.id.clone();
         let owner_did = record.owner_did.clone();
         let is_public = record.is_public;
+        let irys_url = state.config.irys_url.clone();
+        let http_client = std::sync::Arc::clone(&state.http_client);
+        let node_did_str = state.node_did.to_string();
+        let repo_name = record.name.clone();
         tokio::spawn(async move {
             let pinned = crate::ipfs_pin::pin_new_objects(
                 &ipfs_api,
@@ -693,7 +697,7 @@ pub async fn git_receive_pack(
                 })
                 .await;
                 if let Ok(Ok(recipients)) = recip {
-                    crate::encrypted_pin::encrypt_and_pin(
+                    let delta = crate::encrypted_pin::encrypt_and_pin(
                         &ipfs_api,
                         &repo_path_clone,
                         &db_clone,
@@ -701,6 +705,41 @@ pub async fn git_receive_pack(
                         &recipients,
                     )
                     .await;
+
+                    // Option B3: anchor a per-push manifest of the blobs sealed
+                    // this push to Arweave, so the oid->cid index survives total
+                    // node loss. Best-effort; never fails the push.
+                    if !delta.is_empty() && !irys_url.is_empty() {
+                        let owner_short = owner_did.split(':').next_back().unwrap_or(&owner_did);
+                        let repo_slug = format!("{owner_short}/{repo_name}");
+                        let ts = chrono::Utc::now().to_rfc3339();
+                        let manifest = crate::arweave::EncryptedManifest {
+                            repo: &repo_slug,
+                            owner_did: &owner_did,
+                            node_did: &node_did_str,
+                            timestamp: &ts,
+                            blobs: &delta,
+                        };
+                        match crate::arweave::anchor_encrypted_manifest(
+                            &http_client,
+                            &irys_url,
+                            &manifest,
+                        )
+                        .await
+                        {
+                            Ok(tx) if !tx.is_empty() => tracing::info!(
+                                repo = %repo_slug,
+                                tx_id = %tx,
+                                "anchored encrypted manifest to Arweave"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                repo = %repo_slug,
+                                err = %e,
+                                "encrypted manifest anchor failed"
+                            ),
+                        }
+                    }
                 }
             }
         });
