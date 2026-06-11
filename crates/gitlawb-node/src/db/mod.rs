@@ -1666,6 +1666,16 @@ impl Db {
         Ok(())
     }
 
+    /// Deserialize the stored recipients JSON. Corruption is surfaced as an
+    /// error rather than silently treated as an empty recipient list, which
+    /// would deny access to every legitimate reader and hand peers incomplete
+    /// replication metadata.
+    fn parse_recipients(repo_id: &str, oid: &str, raw: &str) -> Result<Vec<String>> {
+        serde_json::from_str(raw).with_context(|| {
+            format!("corrupt recipients JSON in encrypted_blobs (repo_id={repo_id}, oid={oid})")
+        })
+    }
+
     /// (oid, cid) for every encrypted blob in the repo that `caller` may decrypt.
     pub async fn list_encrypted_blobs_for(
         &self,
@@ -1682,7 +1692,7 @@ impl Db {
             let oid: String = row.get("oid");
             let cid: String = row.get("cid");
             let recipients: String = row.get("recipients");
-            let recipients: Vec<String> = serde_json::from_str(&recipients).unwrap_or_default();
+            let recipients = Self::parse_recipients(repo_id, &oid, &recipients)?;
             if recipients.iter().any(|d| d == caller) {
                 out.push((oid, cid));
             }
@@ -1708,7 +1718,7 @@ impl Db {
             let oid: String = row.get("oid");
             let cid: String = row.get("cid");
             let recipients: String = row.get("recipients");
-            let recipients: Vec<String> = serde_json::from_str(&recipients).unwrap_or_default();
+            let recipients = Self::parse_recipients(repo_id, &oid, &recipients)?;
             out.push((oid, cid, recipients));
         }
         Ok(out)
@@ -1730,7 +1740,7 @@ impl Db {
         .await?;
         let Some(row) = row else { return Ok(None) };
         let recipients: String = row.get("recipients");
-        let recipients: Vec<String> = serde_json::from_str(&recipients).unwrap_or_default();
+        let recipients = Self::parse_recipients(repo_id, oid, &recipients)?;
         if recipients.iter().any(|d| d == caller) {
             Ok(Some(row.get("cid")))
         } else {
@@ -1751,10 +1761,13 @@ impl Db {
                 .bind(oid)
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(row.map(|r| {
-            let recipients: String = r.get("recipients");
-            serde_json::from_str::<Vec<String>>(&recipients).unwrap_or_default()
-        }))
+        match row {
+            None => Ok(None),
+            Some(r) => {
+                let recipients: String = r.get("recipients");
+                Ok(Some(Self::parse_recipients(repo_id, oid, &recipients)?))
+            }
+        }
     }
 
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
