@@ -10,6 +10,7 @@
 //!   3. If it exists → `git fetch --prune` from the origin.
 //!   4. Mark done or failed.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -42,6 +43,52 @@ fn classify_mirror(withheld: Option<Vec<String>>) -> MirrorMode {
         Some(globs) if !globs.is_empty() => MirrorMode::Promisor,
         _ => MirrorMode::Plain,
     }
+}
+
+/// One encrypted blob as advertised by an origin's `encrypted-blobs/replicate`
+/// endpoint (Option B2). Ciphertext metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct ReplicaBlob {
+    oid: String,
+    cid: String,
+    #[serde(default)]
+    recipients: Vec<String>,
+}
+
+/// The shape of the `encrypted-blobs/replicate` JSON response.
+#[derive(Debug, serde::Deserialize)]
+struct ReplicateResponse {
+    #[serde(default)]
+    blobs: Vec<ReplicaBlob>,
+}
+
+/// Decide which of the origin's encrypted blobs this mirror must (re)replicate.
+///
+/// `have` maps each already-stored blob's oid to its stored recipient DIDs. A
+/// remote blob is returned when the mirror has no row for that oid, or when the
+/// stored recipient set differs from the remote one (the origin re-sealed after a
+/// reader-set change; same semantics as B1). Recipient order is ignored.
+fn blobs_needing_replication(
+    remote: &[ReplicaBlob],
+    have: &HashMap<String, Vec<String>>,
+) -> Vec<ReplicaBlob> {
+    remote
+        .iter()
+        .filter(|b| match have.get(&b.oid) {
+            None => true,
+            Some(stored) => !same_recipients(stored, &b.recipients),
+        })
+        .cloned()
+        .collect()
+}
+
+/// Order-insensitive equality of two recipient DID lists.
+fn same_recipients(a: &[String], b: &[String]) -> bool {
+    let mut a: Vec<&String> = a.iter().collect();
+    let mut b: Vec<&String> = b.iter().collect();
+    a.sort();
+    b.sort();
+    a == b
 }
 
 /// Start the background sync worker. Returns immediately; the worker runs
@@ -160,6 +207,20 @@ async fn process_batch(
                         machine_id,
                     )
                     .await;
+                // Option B2: carry the encrypted withheld-blob envelopes too, so an
+                // authorized reader can recover private content from this mirror if
+                // the origin dies. `item.repo` is the slug "{owner_short}/{name}",
+                // which is the id upsert_mirror_repo wrote (the local repo_id).
+                replicate_encrypted_blobs(
+                    client,
+                    &origin_url,
+                    owner_short,
+                    repo_name,
+                    db,
+                    &item.repo,
+                    &config.ipfs_api,
+                )
+                .await;
                 let _ = db.mark_sync_done(&item.id).await;
                 crate::metrics::record_sync_processed("done");
             }
@@ -194,6 +255,86 @@ async fn fetch_withheld(
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     Some(globs)
+}
+
+/// Replicate the origin's encrypted withheld blobs onto this mirror (Option B2).
+///
+/// After the git objects are mirrored, fetch the origin's replication listing,
+/// then for each blob the mirror does not already hold (or whose recipients
+/// changed) pull the ciphertext envelope over IPFS, pin it locally, and record
+/// the `encrypted_blobs` row keyed by this mirror's local `repo_id`.
+///
+/// Best-effort and idempotent: any per-blob failure is logged and skipped, to be
+/// retried on the next sync. Confidentiality is never at risk; the mirror only
+/// ever handles ciphertext and never decrypts. Cleanly a no-op when IPFS is
+/// unconfigured, the origin reports no encrypted blobs, or the replicate endpoint
+/// is absent (older peer) or unreachable.
+async fn replicate_encrypted_blobs(
+    client: &reqwest::Client,
+    origin_url: &str,
+    owner: &str,
+    repo: &str,
+    db: &Db,
+    repo_id: &str,
+    ipfs_api: &str,
+) {
+    if ipfs_api.is_empty() {
+        return;
+    }
+
+    let url = format!("{origin_url}/api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate");
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+    let parsed: ReplicateResponse = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(repo = %repo, err = %e, "failed to parse encrypted-blobs/replicate response");
+            return;
+        }
+    };
+    if parsed.blobs.is_empty() {
+        return;
+    }
+
+    let have: HashMap<String, Vec<String>> = match db.list_all_encrypted_blobs(repo_id).await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(oid, _cid, recipients)| (oid, recipients))
+            .collect(),
+        Err(e) => {
+            warn!(repo = %repo, err = %e, "failed to list local encrypted blobs for replication");
+            return;
+        }
+    };
+
+    for blob in blobs_needing_replication(&parsed.blobs, &have) {
+        let envelope = match crate::ipfs_pin::cat(ipfs_api, &blob.cid).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(oid = %blob.oid, cid = %blob.cid, err = %e, "failed to fetch encrypted envelope over IPFS; will retry next sync");
+                continue;
+            }
+        };
+        match crate::ipfs_pin::pin_git_object(ipfs_api, &blob.oid, &envelope).await {
+            Ok(cid) if !cid.is_empty() => {
+                if cid != blob.cid {
+                    warn!(oid = %blob.oid, expected = %blob.cid, got = %cid, "replicated envelope CID mismatch; skipping record");
+                    continue;
+                }
+                if let Err(e) = db
+                    .record_encrypted_blob(repo_id, &blob.oid, &cid, &blob.recipients)
+                    .await
+                {
+                    warn!(oid = %blob.oid, err = %e, "failed to record replicated encrypted blob");
+                }
+            }
+            _ => {
+                warn!(oid = %blob.oid, "failed to pin replicated encrypted envelope; will retry next sync");
+            }
+        }
+    }
 }
 
 /// Run a git subprocess, returning an error with stderr on non-zero exit.
@@ -340,6 +481,61 @@ mod tests {
         // and let the git read endpoint fail-close a mode-A repo.
         let mode = classify_mirror(None);
         assert!(matches!(mode, MirrorMode::Plain));
+    }
+
+    fn rb(oid: &str, cid: &str, recipients: &[&str]) -> ReplicaBlob {
+        ReplicaBlob {
+            oid: oid.to_string(),
+            cid: cid.to_string(),
+            recipients: recipients.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn replicate_stores_new_blob() {
+        let remote = vec![rb("oid1", "cidA", &["did:key:zA"])];
+        let have = HashMap::new();
+        assert_eq!(blobs_needing_replication(&remote, &have), remote);
+    }
+
+    #[test]
+    fn replicate_skips_already_present_same_recipients() {
+        let remote = vec![rb("oid1", "cidA", &["did:key:zA", "did:key:zB"])];
+        let mut have = HashMap::new();
+        // stored in a different order: must still count as present
+        have.insert(
+            "oid1".to_string(),
+            vec!["did:key:zB".to_string(), "did:key:zA".to_string()],
+        );
+        assert!(blobs_needing_replication(&remote, &have).is_empty());
+    }
+
+    #[test]
+    fn replicate_restores_on_recipient_change() {
+        let remote = vec![rb("oid1", "cidB", &["did:key:zA", "did:key:zC"])];
+        let mut have = HashMap::new();
+        have.insert("oid1".to_string(), vec!["did:key:zA".to_string()]);
+        assert_eq!(blobs_needing_replication(&remote, &have), remote);
+    }
+
+    #[test]
+    fn replicate_empty_remote_is_noop() {
+        assert!(blobs_needing_replication(&[], &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn replicate_response_parses() {
+        let json = r#"{"blobs":[{"oid":"o1","cid":"c1","recipients":["did:key:zA"]}]}"#;
+        let parsed: ReplicateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.blobs.len(), 1);
+        assert_eq!(parsed.blobs[0].oid, "o1");
+        assert_eq!(parsed.blobs[0].recipients, vec!["did:key:zA".to_string()]);
+    }
+
+    #[test]
+    fn replicate_response_empty_blobs_parses() {
+        let parsed: ReplicateResponse = serde_json::from_str(r#"{"blobs":[]}"#).unwrap();
+        assert!(parsed.blobs.is_empty());
     }
 
     fn g(args: &[&str], dir: &Path) {
