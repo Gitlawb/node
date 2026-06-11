@@ -416,7 +416,13 @@ async fn recover_from_arweave(
     let slug = format!("{owner_short}/{name}");
     let ag = arweave_gateway.trim_end_matches('/');
     let ig = ipfs_gateway.trim_end_matches('/');
-    let client = reqwest::Client::new();
+    // Bound every gateway request: this runs on every clone, so a slow or hung
+    // public gateway must not stall it. Best-effort recovery, so a timeout just
+    // skips the affected blob.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
 
     // 1. Discover manifest transaction ids via Arweave GraphQL.
     let query = r#"query($repo:String!){transactions(tags:[{name:"App-Name",values:["gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100){edges{node{id}}}}"#;
