@@ -29,6 +29,15 @@ pub struct CloneArgs {
 
     #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
     pub node: String,
+
+    /// Arweave gateway for B3 manifest discovery/fetch when a node cannot supply
+    /// the encrypted-blob mapping.
+    #[arg(long, default_value = "https://arweave.net", env = "GITLAWB_ARWEAVE_GATEWAY")]
+    pub arweave_gateway: String,
+
+    /// Public IPFS gateway for fetching encrypted envelopes during B3 recovery.
+    #[arg(long, default_value = "https://dweb.link", env = "GITLAWB_IPFS_GATEWAY")]
+    pub ipfs_gateway: String,
 }
 
 /// Run a git command inside `dir`, erroring with stderr on failure.
@@ -510,26 +519,40 @@ pub async fn run(args: CloneArgs) -> Result<()> {
     setup_partial_clone(&dest, &url, &withheld, &reinclude, args.branch.as_deref())?;
 
     if let Ok(keypair) = load_keypair_from_dir(None) {
-        if let Ok(paths) = recover_encrypted_blobs(&args.node, &owner, &name, &dest, &keypair).await
-        {
-            if !paths.is_empty() {
-                // Re-include recovered paths if this was a sparse clone, then
-                // materialize them in the working tree.
-                let spec = dest.join(".git/info/sparse-checkout");
-                if spec.exists() {
-                    if let Ok(mut s) = std::fs::read_to_string(&spec) {
-                        for p in &paths {
-                            s.push_str(&format!("/{p}\n"));
-                        }
-                        let _ = std::fs::write(&spec, s);
+        // Node-based recovery first (B1/B2), then the B3 Arweave/IPFS gateway
+        // fallback for any authorized blobs the node could not supply.
+        let mut paths = recover_encrypted_blobs(&args.node, &owner, &name, &dest, &keypair)
+            .await
+            .unwrap_or_default();
+        let from_arweave = recover_from_arweave(
+            &args.arweave_gateway,
+            &args.ipfs_gateway,
+            &owner,
+            &name,
+            &dest,
+            &keypair,
+        )
+        .await
+        .unwrap_or_default();
+        paths.extend(from_arweave);
+
+        if !paths.is_empty() {
+            // Re-include recovered paths if this was a sparse clone, then
+            // materialize them in the working tree.
+            let spec = dest.join(".git/info/sparse-checkout");
+            if spec.exists() {
+                if let Ok(mut s) = std::fs::read_to_string(&spec) {
+                    for p in &paths {
+                        s.push_str(&format!("/{p}\n"));
                     }
+                    let _ = std::fs::write(&spec, s);
                 }
-                let _ = git(&dest, &["checkout", "--", "."]);
-                println!(
-                    "Recovered {} private file(s) you are authorized to read",
-                    paths.len()
-                );
             }
+            let _ = git(&dest, &["checkout", "--", "."]);
+            println!(
+                "Recovered {} private file(s) you are authorized to read",
+                paths.len()
+            );
         }
     }
 
