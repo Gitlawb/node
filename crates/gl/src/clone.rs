@@ -32,11 +32,19 @@ pub struct CloneArgs {
 
     /// Arweave gateway for B3 manifest discovery/fetch when a node cannot supply
     /// the encrypted-blob mapping.
-    #[arg(long, default_value = "https://arweave.net", env = "GITLAWB_ARWEAVE_GATEWAY")]
+    #[arg(
+        long,
+        default_value = "https://arweave.net",
+        env = "GITLAWB_ARWEAVE_GATEWAY"
+    )]
     pub arweave_gateway: String,
 
     /// Public IPFS gateway for fetching encrypted envelopes during B3 recovery.
-    #[arg(long, default_value = "https://dweb.link", env = "GITLAWB_IPFS_GATEWAY")]
+    #[arg(
+        long,
+        default_value = "https://dweb.link",
+        env = "GITLAWB_IPFS_GATEWAY"
+    )]
     pub ipfs_gateway: String,
 }
 
@@ -413,7 +421,12 @@ async fn recover_from_arweave(
     // 1. Discover manifest transaction ids via Arweave GraphQL.
     let query = r#"query($repo:String!){transactions(tags:[{name:"App-Name",values:["gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100){edges{node{id}}}}"#;
     let gql_body = serde_json::json!({ "query": query, "variables": { "repo": slug } });
-    let resp = match client.post(format!("{ag}/graphql")).json(&gql_body).send().await {
+    let resp = match client
+        .post(format!("{ag}/graphql"))
+        .json(&gql_body)
+        .send()
+        .await
+    {
         Ok(r) if r.status().is_success() => r,
         _ => return Ok(vec![]),
     };
@@ -780,13 +793,22 @@ mod tests {
     fn merge_manifests_latest_wins_per_oid() {
         let older = Manifest {
             timestamp: "2026-06-10T00:00:00Z".to_string(),
-            blobs: vec![ManifestBlob { oid: "o1".to_string(), cid: "cidOLD".to_string() }],
+            blobs: vec![ManifestBlob {
+                oid: "o1".to_string(),
+                cid: "cidOLD".to_string(),
+            }],
         };
         let newer = Manifest {
             timestamp: "2026-06-11T00:00:00Z".to_string(),
             blobs: vec![
-                ManifestBlob { oid: "o1".to_string(), cid: "cidNEW".to_string() },
-                ManifestBlob { oid: "o2".to_string(), cid: "cid2".to_string() },
+                ManifestBlob {
+                    oid: "o1".to_string(),
+                    cid: "cidNEW".to_string(),
+                },
+                ManifestBlob {
+                    oid: "o2".to_string(),
+                    cid: "cid2".to_string(),
+                },
             ],
         };
         let merged = merge_manifests(vec![older, newer]);
@@ -798,11 +820,17 @@ mod tests {
     fn merge_manifests_is_order_independent() {
         let older = Manifest {
             timestamp: "2026-06-10T00:00:00Z".to_string(),
-            blobs: vec![ManifestBlob { oid: "o1".to_string(), cid: "cidOLD".to_string() }],
+            blobs: vec![ManifestBlob {
+                oid: "o1".to_string(),
+                cid: "cidOLD".to_string(),
+            }],
         };
         let newer = Manifest {
             timestamp: "2026-06-11T00:00:00Z".to_string(),
-            blobs: vec![ManifestBlob { oid: "o1".to_string(), cid: "cidNEW".to_string() }],
+            blobs: vec![ManifestBlob {
+                oid: "o1".to_string(),
+                cid: "cidNEW".to_string(),
+            }],
         };
         // Newer first, older second: newer must still win.
         let merged = merge_manifests(vec![newer, older]);
