@@ -565,14 +565,29 @@ pub async fn run(args: CloneArgs) -> Result<()> {
             // materialize them in the working tree.
             let spec = dest.join(".git/info/sparse-checkout");
             if spec.exists() {
-                if let Ok(mut s) = std::fs::read_to_string(&spec) {
-                    for p in &paths {
-                        s.push_str(&format!("/{p}\n"));
+                match std::fs::read_to_string(&spec) {
+                    Ok(mut s) => {
+                        for p in &paths {
+                            s.push_str(&format!("/{p}\n"));
+                        }
+                        if let Err(e) = std::fs::write(&spec, &s) {
+                            eprintln!(
+                                "warning: failed to update sparse-checkout, recovered files may not appear: {e}"
+                            );
+                        }
                     }
-                    let _ = std::fs::write(&spec, s);
+                    Err(e) => {
+                        eprintln!(
+                            "warning: failed to read sparse-checkout, recovered files may not appear: {e}"
+                        );
+                    }
                 }
             }
-            let _ = git(&dest, &["checkout", "--", "."]);
+            if let Err(e) = git(&dest, &["checkout", "--", "."]) {
+                eprintln!(
+                    "warning: checkout after recovery failed, recovered files may not appear: {e}"
+                );
+            }
             println!(
                 "Recovered {} private file(s) you are authorized to read",
                 paths.len()
