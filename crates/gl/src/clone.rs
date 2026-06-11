@@ -477,10 +477,15 @@ async fn recover_from_arweave(
     // 3. Recover each missing blob the caller can decrypt.
     let mut recovered = Vec::new();
     for (oid, cid) in oid_cid {
+        // Local presence check. GIT_NO_LAZY_FETCH stops git from making a wasted
+        // promisor fetch attempt (we are recovering precisely because the promisor
+        // cannot supply the blob), and `.output()` captures git's "missing object"
+        // stderr so that expected case does not leak a confusing error to the user.
         let present = Command::new("git")
             .args(["-C", dest_str, "cat-file", "-e", &oid])
-            .status()
-            .map(|s| s.success())
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .map(|o| o.status.success())
             .unwrap_or(false);
         if present {
             continue;
@@ -841,6 +846,193 @@ mod tests {
         // Newer first, older second: newer must still win.
         let merged = merge_manifests(vec![newer, older]);
         assert_eq!(merged.get("o1").map(String::as_str), Some("cidNEW"));
+    }
+
+    /// Read-path end-to-end over a mocked Arweave + IPFS gateway: discover the
+    /// manifest via GraphQL, fetch it, fetch the envelope, decrypt with the
+    /// caller's key, and install the previously-withheld blob.
+    #[tokio::test]
+    async fn recover_from_arweave_installs_authorized_blob() {
+        use gitlawb_core::encrypt::seal_blob;
+        use gitlawb_core::identity::Keypair;
+
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        // Make the bare honor `--filter=blob:none` over file:// so the withheld
+        // blob is genuinely omitted from the local store, not just unchecked-out.
+        let bare = url.strip_prefix("file://").unwrap();
+        assert!(Command::new("git")
+            .args(["-C", bare, "config", "uploadpack.allowFilter", "true"])
+            .status()
+            .unwrap()
+            .success());
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+        assert!(
+            !dest.join("secret/b.txt").exists(),
+            "secret starts withheld"
+        );
+
+        let oid = {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD:secret/b.txt",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Simulate origin death: drop the promisor remote so `cat-file -e` cannot
+        // lazily fetch the withheld blob. This is exactly the B3 premise (the node
+        // can no longer serve it), and forces recovery to go through Arweave/IPFS.
+        std::fs::remove_dir_all(url.strip_prefix("file://").unwrap()).unwrap();
+
+        let reader = Keypair::generate();
+        let envelope = seal_blob(b"SECRET\n", &[reader.verifying_key()]).unwrap();
+
+        let cid = "testcid123";
+        let mut server = mockito::Server::new_async().await;
+        let _gql = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"transactions":{"edges":[{"node":{"id":"TX1"}}]}}}"#)
+            .create_async()
+            .await;
+        let manifest_body = serde_json::json!({
+            "timestamp": "2026-06-11T00:00:00Z",
+            "blobs": [{ "oid": oid, "cid": cid, "recipients": [] }],
+        })
+        .to_string();
+        let _tx = server
+            .mock("GET", "/TX1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(manifest_body)
+            .create_async()
+            .await;
+        let _blob = server
+            .mock("GET", format!("/ipfs/{cid}").as_str())
+            .with_status(200)
+            .with_body(envelope)
+            .create_async()
+            .await;
+
+        let paths = recover_from_arweave(
+            &server.url(),
+            &server.url(),
+            "alice",
+            "myrepo",
+            &dest,
+            &reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(paths, vec!["secret/b.txt".to_string()]);
+
+        let present = Command::new("git")
+            .args(["-C", dest.to_str().unwrap(), "cat-file", "-e", &oid])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(
+            present,
+            "authorized reader's blob must be installed locally"
+        );
+    }
+
+    /// A caller who is not a recipient cannot decrypt the envelope, so nothing is
+    /// recovered even though the manifest and envelope are reachable.
+    #[tokio::test]
+    async fn recover_from_arweave_skips_unauthorized() {
+        use gitlawb_core::encrypt::seal_blob;
+        use gitlawb_core::identity::Keypair;
+
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        let bare = url.strip_prefix("file://").unwrap();
+        assert!(Command::new("git")
+            .args(["-C", bare, "config", "uploadpack.allowFilter", "true"])
+            .status()
+            .unwrap()
+            .success());
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+
+        let oid = {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD:secret/b.txt",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Simulate origin death (see the authorized test) so the withheld blob
+        // cannot be lazily fetched from the promisor remote.
+        std::fs::remove_dir_all(url.strip_prefix("file://").unwrap()).unwrap();
+
+        // Sealed to a different reader; the caller below is not a recipient.
+        let authorized = Keypair::generate();
+        let envelope = seal_blob(b"SECRET\n", &[authorized.verifying_key()]).unwrap();
+        let intruder = Keypair::generate();
+
+        let cid = "testcid123";
+        let mut server = mockito::Server::new_async().await;
+        let _gql = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"transactions":{"edges":[{"node":{"id":"TX1"}}]}}}"#)
+            .create_async()
+            .await;
+        let manifest_body = serde_json::json!({
+            "timestamp": "2026-06-11T00:00:00Z",
+            "blobs": [{ "oid": oid, "cid": cid, "recipients": [] }],
+        })
+        .to_string();
+        let _tx = server
+            .mock("GET", "/TX1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(manifest_body)
+            .create_async()
+            .await;
+        let _blob = server
+            .mock("GET", format!("/ipfs/{cid}").as_str())
+            .with_status(200)
+            .with_body(envelope)
+            .create_async()
+            .await;
+
+        let paths = recover_from_arweave(
+            &server.url(),
+            &server.url(),
+            "alice",
+            "myrepo",
+            &dest,
+            &intruder,
+        )
+        .await
+        .unwrap();
+        assert!(paths.is_empty(), "non-recipient must recover nothing");
+
+        let present = Command::new("git")
+            .args(["-C", dest.to_str().unwrap(), "cat-file", "-e", &oid])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!present, "non-recipient must not install the blob");
     }
 
     #[test]
