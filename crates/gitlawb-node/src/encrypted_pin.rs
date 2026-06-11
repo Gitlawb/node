@@ -20,13 +20,16 @@ fn did_to_key(did: &str) -> Option<VerifyingKey> {
 }
 
 /// Encrypt and pin every withheld blob. `recipients` maps blob oid -> DID set.
+/// Returns `(oid, cid, recipients)` for each blob actually sealed and recorded
+/// this call (the per-push delta), used by Option B3 to anchor a manifest.
 pub async fn encrypt_and_pin(
     ipfs_api: &str,
     repo_path: &Path,
     db: &Db,
     repo_id: &str,
     recipients: &HashMap<String, BTreeSet<String>>,
-) {
+) -> Vec<(String, String, Vec<String>)> {
+    let mut sealed = Vec::new();
     for (oid, dids) in recipients {
         // Skip only if an existing envelope already covers exactly these
         // recipients. If the recipient set changed (e.g. a reader was added to
@@ -64,6 +67,9 @@ pub async fn encrypt_and_pin(
             .await
         {
             tracing::warn!(oid = %oid, err = %e, "record_encrypted_blob failed");
+            continue;
         }
+        sealed.push((oid.clone(), cid.clone(), dids_vec));
     }
+    sealed
 }
