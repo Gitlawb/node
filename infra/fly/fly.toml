@@ -30,7 +30,9 @@ primary_region = "iad"
     soft_limit = 400
 
   [http_service.http_options]
-    idle_timeout = 600
+    # 120s, not 600: long idle windows let hung clients pin Fly's connection
+    # slots (hard_limit) — root factor in the 2026-06-12 prod outage
+    idle_timeout = 120
 
 [[services]]
   protocol = "udp"
