@@ -42,11 +42,10 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8] = b"GLENC";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct Recipient {
-    kid: String,   // base64 recipient ed25519 pubkey (32B)
     eph: String,   // base64 ephemeral x25519 pubkey (32B)
     nonce: String, // base64 box nonce (24B)
     wrap: String,  // base64 wrapped content key
@@ -84,7 +83,6 @@ pub fn seal_blob(plaintext: &[u8], recipients: &[VerifyingKey]) -> Result<Vec<u8
             .encrypt(&nonce, &content_key[..])
             .map_err(|e| anyhow::anyhow!("wrap: {e}"))?;
         wrapped.push(Recipient {
-            kid: B64.encode(vk.as_bytes()),
             eph: B64.encode(eph.public_key().as_bytes()),
             nonce: B64.encode(nonce),
             wrap: B64.encode(ct),
@@ -125,24 +123,39 @@ pub fn open_blob(envelope: &[u8], keypair: &Keypair) -> Result<Vec<u8>> {
             .context("decode header")?;
     let body = &envelope[p + hlen..];
 
-    let my_kid = B64.encode(keypair.verifying_key().as_bytes());
     let my_x = XSecret::from(x25519_secret_from_seed(&keypair.seed_bytes()));
 
-    let entry = header
-        .recipients
-        .iter()
-        .find(|r| r.kid == my_kid)
-        .context("not a recipient of this envelope")?;
-    let eph = XPublic::from(<[u8; 32]>::try_from(B64.decode(&entry.eph)?.as_slice())?);
-    let nonce = B64.decode(&entry.nonce)?;
-    let wrap = B64.decode(&entry.wrap)?;
-    let abox = ChaChaBox::new(&eph, &my_x);
-    let content_key = abox
-        .decrypt(
+    // Identities are blinded: no entry says which recipient it belongs to, so
+    // try each one. The ChaChaBox AEAD tag authenticates, so exactly the
+    // reader's own entry unwraps; every other entry fails cleanly.
+    let mut content_key: Option<Vec<u8>> = None;
+    for entry in &header.recipients {
+        let eph = match B64
+            .decode(&entry.eph)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        {
+            Some(b) => XPublic::from(b),
+            None => continue,
+        };
+        let nonce = match B64.decode(&entry.nonce) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let wrap = match B64.decode(&entry.wrap) {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        let abox = ChaChaBox::new(&eph, &my_x);
+        if let Ok(ck) = abox.decrypt(
             crypto_box::aead::generic_array::GenericArray::from_slice(&nonce),
             wrap.as_slice(),
-        )
-        .map_err(|_| anyhow::anyhow!("content-key unwrap failed"))?;
+        ) {
+            content_key = Some(ck);
+            break;
+        }
+    }
+    let content_key = content_key.context("not a recipient of this envelope")?;
 
     let body_cipher = XChaCha20Poly1305::new_from_slice(&content_key)
         .map_err(|e| anyhow::anyhow!("content key: {e}"))?;
@@ -193,5 +206,39 @@ mod tests {
         let last = env.len() - 1;
         env[last] ^= 0x01;
         assert!(open_blob(&env, &owner).is_err());
+    }
+
+    #[test]
+    fn v2_header_contains_no_recipient_pubkey() {
+        // The blinded envelope header must not carry any recipient's public key.
+        let reader = Keypair::generate();
+        let env = seal_blob(b"private blob contents", &[reader.verifying_key()]).unwrap();
+
+        // Slice out the header bytes using the envelope framing:
+        // MAGIC | version(1B) | header_len(4B LE) | header_json | body
+        let mut p = MAGIC.len() + 1; // skip MAGIC + version byte
+        let hlen = u32::from_le_bytes(env[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let header = &env[p..p + hlen];
+        let header_str = String::from_utf8_lossy(header);
+
+        let pubkey_b64 = B64.encode(reader.verifying_key().as_bytes());
+        assert!(
+            !header_str.contains(&pubkey_b64),
+            "recipient public key must not appear in the blinded header"
+        );
+    }
+
+    #[test]
+    fn v1_envelope_is_rejected() {
+        let reader = Keypair::generate();
+        let mut env = seal_blob(b"hi", &[reader.verifying_key()]).unwrap();
+        // Flip the version byte (immediately after MAGIC) from 2 to 1.
+        env[MAGIC.len()] = 1;
+        let err = open_blob(&env, &reader).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported envelope version"),
+            "expected version-rejection error, got: {err}"
+        );
     }
 }
