@@ -735,6 +735,17 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_encrypted_blobs_repo ON encrypted_blobs(repo_id)",
         ],
     },
+    Migration {
+        version: 5,
+        name: "encrypted_blobs_blind_recipients",
+        stmts: &[
+            // Replace the cleartext recipient DID list with an opaque, node-keyed
+            // tag used only to detect a recipient-set change. Existing rows get an
+            // empty tag and are re-sealed on the next push.
+            "ALTER TABLE encrypted_blobs DROP COLUMN IF EXISTS recipients",
+            "ALTER TABLE encrypted_blobs ADD COLUMN IF NOT EXISTS recipients_tag TEXT NOT NULL DEFAULT ''",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1641,126 +1652,69 @@ impl Db {
         repo_id: &str,
         oid: &str,
         cid: &str,
-        recipients: &[String],
+        recipients_tag: &str,
     ) -> Result<()> {
-        let recipients_json = serde_json::to_string(recipients)?;
         sqlx::query(
-            "INSERT INTO encrypted_blobs (repo_id, oid, cid, recipients, created_at)
+            "INSERT INTO encrypted_blobs (repo_id, oid, cid, recipients_tag, created_at)
              VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (repo_id, oid) DO UPDATE SET cid = EXCLUDED.cid, recipients = EXCLUDED.recipients",
+             ON CONFLICT (repo_id, oid) DO UPDATE SET cid = EXCLUDED.cid, recipients_tag = EXCLUDED.recipients_tag",
         )
         .bind(repo_id)
         .bind(oid)
         .bind(cid)
-        .bind(recipients_json)
+        .bind(recipients_tag)
         .bind(Utc::now().to_rfc3339())
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Deserialize the stored recipients JSON. Corruption is surfaced as an
-    /// error rather than silently treated as an empty recipient list, which
-    /// would deny access to every legitimate reader and hand peers incomplete
-    /// replication metadata.
-    fn parse_recipients(repo_id: &str, oid: &str, raw: &str) -> Result<Vec<String>> {
-        serde_json::from_str(raw).with_context(|| {
-            format!("corrupt recipients JSON in encrypted_blobs (repo_id={repo_id}, oid={oid})")
-        })
-    }
-
-    /// (oid, cid) for every encrypted blob in the repo that `caller` may decrypt.
-    pub async fn list_encrypted_blobs_for(
-        &self,
-        repo_id: &str,
-        caller: &str,
-    ) -> Result<Vec<(String, String)>> {
-        let rows =
-            sqlx::query("SELECT oid, cid, recipients FROM encrypted_blobs WHERE repo_id = $1")
-                .bind(repo_id)
-                .fetch_all(&self.pool)
-                .await?;
+    /// (oid, cid) for every encrypted blob in the repo, unscoped by caller. Used
+    /// by both the B2 replication view and B1 discovery. Recipient identities are
+    /// not stored, so authorization is the caller's repo readability, not a per
+    /// recipient check. Ciphertext metadata only.
+    pub async fn list_all_encrypted_blobs(&self, repo_id: &str) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT oid, cid FROM encrypted_blobs WHERE repo_id = $1")
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await?;
         let mut out = Vec::new();
         for row in rows {
             let oid: String = row.get("oid");
             let cid: String = row.get("cid");
-            let recipients: String = row.get("recipients");
-            let recipients = Self::parse_recipients(repo_id, &oid, &recipients)?;
-            if recipients.iter().any(|d| d == caller) {
-                out.push((oid, cid));
-            }
+            out.push((oid, cid));
         }
         Ok(out)
     }
 
-    /// (oid, cid, recipients) for every encrypted blob in the repo, unscoped by
-    /// caller. This is the replication view used by peer mirrors (Option B2),
-    /// distinct from the recipient-scoped `list_encrypted_blobs_for`. It returns
-    /// only ciphertext metadata; no plaintext or key material is involved.
-    pub async fn list_all_encrypted_blobs(
-        &self,
-        repo_id: &str,
-    ) -> Result<Vec<(String, String, Vec<String>)>> {
-        let rows =
-            sqlx::query("SELECT oid, cid, recipients FROM encrypted_blobs WHERE repo_id = $1")
-                .bind(repo_id)
-                .fetch_all(&self.pool)
-                .await?;
-        let mut out = Vec::new();
-        for row in rows {
-            let oid: String = row.get("oid");
-            let cid: String = row.get("cid");
-            let recipients: String = row.get("recipients");
-            let recipients = Self::parse_recipients(repo_id, &oid, &recipients)?;
-            out.push((oid, cid, recipients));
-        }
-        Ok(out)
+    /// The CID of one encrypted blob, or None if there is no such row. Recipient
+    /// authorization is not enforced here: the handler checks repo readability and
+    /// the envelope crypto gates decryption.
+    pub async fn encrypted_blob_cid(&self, repo_id: &str, oid: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2")
+            .bind(repo_id)
+            .bind(oid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("cid")))
     }
 
-    /// The CID of one encrypted blob, only if `caller` is a recipient.
-    pub async fn encrypted_blob_cid(
+    /// The opaque recipients tag stored for an encrypted blob, or None if there is
+    /// no row. Used only to decide whether a re-seal is needed (the recipient set
+    /// changed); the tag is a node-keyed fingerprint, not the DID list.
+    pub async fn encrypted_blob_recipients_tag(
         &self,
         repo_id: &str,
         oid: &str,
-        caller: &str,
     ) -> Result<Option<String>> {
         let row = sqlx::query(
-            "SELECT cid, recipients FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2",
+            "SELECT recipients_tag FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2",
         )
         .bind(repo_id)
         .bind(oid)
         .fetch_optional(&self.pool)
         .await?;
-        let Some(row) = row else { return Ok(None) };
-        let recipients: String = row.get("recipients");
-        let recipients = Self::parse_recipients(repo_id, oid, &recipients)?;
-        if recipients.iter().any(|d| d == caller) {
-            Ok(Some(row.get("cid")))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// The recipient DID list stored for an encrypted blob, or None if there is
-    /// no row. Used to decide whether a re-seal is needed (recipients changed).
-    pub async fn encrypted_blob_recipients(
-        &self,
-        repo_id: &str,
-        oid: &str,
-    ) -> Result<Option<Vec<String>>> {
-        let row =
-            sqlx::query("SELECT recipients FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2")
-                .bind(repo_id)
-                .bind(oid)
-                .fetch_optional(&self.pool)
-                .await?;
-        match row {
-            None => Ok(None),
-            Some(r) => {
-                let recipients: String = r.get("recipients");
-                Ok(Some(Self::parse_recipients(repo_id, oid, &recipients)?))
-            }
-        }
+        Ok(row.map(|r| r.get("recipients_tag")))
     }
 
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {

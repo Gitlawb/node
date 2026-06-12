@@ -669,6 +669,7 @@ pub async fn git_receive_pack(
         let irys_url = state.config.irys_url.clone();
         let http_client = std::sync::Arc::clone(&state.http_client);
         let node_did_str = state.node_did.to_string();
+        let node_seed = state.node_keypair.seed_bytes();
         let repo_name = record.name.clone();
         tokio::spawn(async move {
             let pinned = crate::ipfs_pin::pin_new_objects(
@@ -702,6 +703,7 @@ pub async fn git_receive_pack(
                         &repo_path_clone,
                         &db_clone,
                         &repo_id,
+                        &node_seed,
                         &recipients,
                     )
                     .await;

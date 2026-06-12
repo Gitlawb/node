@@ -292,10 +292,7 @@ async fn replicate_encrypted_blobs(
     }
 
     let have: HashMap<String, String> = match db.list_all_encrypted_blobs(repo_id).await {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|(oid, cid, _recipients)| (oid, cid))
-            .collect(),
+        Ok(rows) => rows.into_iter().collect(),
         Err(e) => {
             warn!(repo = %repo, err = %e, "failed to list local encrypted blobs for replication");
             return;
@@ -316,10 +313,7 @@ async fn replicate_encrypted_blobs(
                     warn!(oid = %blob.oid, expected = %blob.cid, got = %cid, "replicated envelope CID mismatch; skipping record");
                     continue;
                 }
-                if let Err(e) = db
-                    .record_encrypted_blob(repo_id, &blob.oid, &cid, &[])
-                    .await
-                {
+                if let Err(e) = db.record_encrypted_blob(repo_id, &blob.oid, &cid, "").await {
                     warn!(oid = %blob.oid, err = %e, "failed to record replicated encrypted blob");
                 }
             }
