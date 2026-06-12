@@ -58,8 +58,14 @@ pub async fn encrypt_and_pin(
         // removal is not retroactive: the old envelope is already public. The
         // comparison is on the opaque node-keyed tag, never the DID list.
         let tag = recipients_tag(node_seed, dids);
-        if let Ok(Some(stored_tag)) = db.encrypted_blob_recipients_tag(repo_id, oid).await {
-            if stored_tag == tag {
+        match db.encrypted_blob_recipients_tag(repo_id, oid).await {
+            Ok(Some(stored_tag)) if stored_tag == tag => continue,
+            Ok(_) => {}
+            Err(e) => {
+                // A DB read failure is not a cache miss: re-sealing here would do
+                // an avoidable IPFS write during a partial outage. Skip and retry
+                // on the next push.
+                tracing::warn!(oid = %oid, err = %e, "recipients_tag lookup failed; skipping reseal");
                 continue;
             }
         }
