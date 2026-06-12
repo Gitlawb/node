@@ -90,6 +90,23 @@ pub async fn announce(
         ));
     }
 
+    // Reject self-announcements: a peer row whose http_url is our own public
+    // URL makes the HTTP-notify path fan out to ourselves. Seen in prod when
+    // misconfigured dev nodes announce with their upstream's URL.
+    // prune_self_peers clears stale rows at boot; this stops new ones.
+    if let Some(self_url) = state.config.public_url.as_deref() {
+        if req.http_url.trim_end_matches('/') == self_url.trim_end_matches('/') {
+            return Err(AppError::BadRequest(
+                "http_url is this node's own public URL; refusing to register self as peer".into(),
+            ));
+        }
+    }
+    if announced_did.to_string() == state.node_did.to_string() {
+        return Err(AppError::BadRequest(
+            "did is this node's own DID; refusing to register self as peer".into(),
+        ));
+    }
+
     state.db.upsert_peer(&req.did, &req.http_url).await?;
 
     tracing::info!(did = %req.did, url = %req.http_url, "peer announced");
@@ -124,16 +141,30 @@ pub async fn trigger_sync(State(state): State<AppState>) -> Result<Json<serde_js
             continue;
         }
         let url = format!("{}/api/v1/repos", peer.http_url.trim_end_matches('/'));
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(5), client.get(&url).send()).await;
-
-        let repos: Vec<serde_json::Value> = match result {
-            Ok(Ok(resp)) if resp.status().is_success() => {
-                peers_reached += 1;
-                resp.json().await.unwrap_or_default()
+        // 30s with the body read inside the timeout: 5s only covered the
+        // response headers, so canonical nodes serving large unpaginated repo
+        // lists (and transpacific round trips) aborted mid-body.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let resp = client.get(&url).send().await?;
+            if !resp.status().is_success() {
+                return Err(anyhow::anyhow!("peer returned status {}", resp.status()));
             }
-            _ => {
-                tracing::warn!(peer = %peer.did, "trigger_sync: could not reach peer");
+            let repos: Vec<serde_json::Value> = resp.json().await?;
+            Ok::<_, anyhow::Error>(repos)
+        })
+        .await;
+
+        let repos = match result {
+            Ok(Ok(repos)) => {
+                peers_reached += 1;
+                repos
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(peer = %peer.did, err = %e, "trigger_sync: peer fetch failed");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(peer = %peer.did, "trigger_sync: peer timed out");
                 continue;
             }
         };
