@@ -104,8 +104,9 @@ pub async fn anchor_ref_update(
 }
 
 /// A per-push manifest of the blobs encrypted this push (Option B3). The
-/// `blobs` slice is `(oid, cid, recipients)` tuples. Anchored directly to
-/// Arweave as its JSON body so the discovery index survives total node loss.
+/// `blobs` slice is `(oid, cid, recipients)` tuples; only `oid` and `cid` are
+/// anchored. Anchored directly to Arweave as its JSON body so the discovery
+/// index survives total node loss.
 pub struct EncryptedManifest<'a> {
     pub repo: &'a str,
     pub owner_did: &'a str,
@@ -116,8 +117,9 @@ pub struct EncryptedManifest<'a> {
 
 /// Anchor a per-push encrypted-blob manifest to Arweave via Irys. The manifest
 /// JSON body is the payload (not a CID pointer to IPFS), so the index is
-/// permanent and self-contained. Recipient DIDs are already public via the
-/// pinned envelopes, so the manifest carries no new secret.
+/// permanent and self-contained. Recipient identities are deliberately omitted:
+/// the anchor is permanent and public, and the v2 envelopes no longer expose
+/// recipients, so the reader set must not be written to Arweave either.
 ///
 /// Returns the Irys/Arweave transaction ID, or `Ok("")` when `irys_url` is empty
 /// (anchoring disabled) or there are no blobs to anchor.
@@ -133,7 +135,7 @@ pub async fn anchor_encrypted_manifest(
     let blobs_json: Vec<serde_json::Value> = manifest
         .blobs
         .iter()
-        .map(|(oid, cid, recipients)| json!({ "oid": oid, "cid": cid, "recipients": recipients }))
+        .map(|(oid, cid, _recipients)| manifest_blob_json(oid, cid))
         .collect();
 
     let payload = json!({
@@ -181,6 +183,13 @@ pub async fn anchor_encrypted_manifest(
     );
 
     Ok(tx_id)
+}
+
+/// Serialize one blob for the Arweave manifest. Recipient identities are
+/// intentionally absent so the permanent public anchor never records who can
+/// read a blob.
+fn manifest_blob_json(oid: &str, cid: &str) -> serde_json::Value {
+    json!({ "oid": oid, "cid": cid })
 }
 
 /// Build the Irys tag header for an encrypted-blob manifest. `Repo` and `Schema`
@@ -354,6 +363,17 @@ mod tests {
         let r = anchor_encrypted_manifest(&client, &server.url(), &m).await;
         assert_eq!(r.unwrap(), "MANIFESTTX123");
         _mock.assert_async().await;
+    }
+
+    #[test]
+    fn manifest_blob_json_omits_recipients() {
+        let v = manifest_blob_json("oid1", "cidA");
+        assert_eq!(v["oid"], "oid1");
+        assert_eq!(v["cid"], "cidA");
+        assert!(
+            v.get("recipients").is_none(),
+            "Arweave manifest must not anchor recipient identities"
+        );
     }
 
     #[test]
