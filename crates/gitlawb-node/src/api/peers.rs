@@ -214,6 +214,18 @@ pub struct NotifyRequest {
     pub ref_name: String,
     pub new_sha: String,
     pub node_did: String,
+    // Optional fields — older senders only included the four above. New
+    // senders include these so received_ref_updates has full provenance
+    // even when the libp2p mesh isn't delivering and the HTTP fallback
+    // is the only path that fired.
+    #[serde(default)]
+    pub pusher_did: Option<String>,
+    #[serde(default)]
+    pub old_sha: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    #[serde(default)]
+    pub cert_id: Option<String>,
 }
 
 pub async fn notify_sync(
@@ -248,6 +260,27 @@ pub async fn notify_sync(
         .db
         .enqueue_sync(&req.repo, &req.node_did, &req.ref_name, &req.new_sha, None)
         .await?;
+
+    // Mirror the gossipsub-receive handler: insert the same record we'd
+    // get from the libp2p path, so /api/v1/events/ref-updates reflects
+    // pushes that arrive over either transport.
+    let now = chrono::Utc::now().to_rfc3339();
+    let update = crate::db::ReceivedRefUpdate {
+        id: uuid::Uuid::new_v4().to_string(),
+        node_did: req.node_did.clone(),
+        pusher_did: req.pusher_did.clone().unwrap_or_default(),
+        repo: req.repo.clone(),
+        ref_name: req.ref_name.clone(),
+        old_sha: req.old_sha.clone().unwrap_or_default(),
+        new_sha: req.new_sha.clone(),
+        timestamp: req.timestamp.clone().unwrap_or_else(|| now.clone()),
+        cert_id: req.cert_id.clone(),
+        received_at: now,
+        from_peer: format!("http:{}", req.node_did),
+    };
+    if let Err(e) = state.db.insert_ref_update(&update).await {
+        tracing::warn!(err = %e, repo = %req.repo, "failed to insert ref-update from sync notify");
+    }
 
     tracing::info!(
         repo = %req.repo,
