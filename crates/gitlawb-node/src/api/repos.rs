@@ -226,6 +226,18 @@ pub async fn get_blob(
     use axum::http::header;
     use axum::response::IntoResponse;
 
+    // Unnormalized paths ("../..", "./", "//") can't resolve in `git show`
+    // and crawlers combinatorially explode them from relative links — that's
+    // a client error, not a 500.
+    let file_path = file_path.trim_matches('/');
+    if file_path.is_empty()
+        || file_path
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(AppError::BadRequest("invalid file path".into()));
+    }
+
     let record = state
         .db
         .get_repo(&owner, &name)
@@ -238,8 +250,19 @@ pub async fn get_blob(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let head_ref = store::resolve_head(&disk_path, &record.default_branch);
-    let content = store::read_file(&disk_path, &head_ref, &file_path)
-        .map_err(|e| AppError::Git(e.to_string()))?;
+    let content = store::read_file(&disk_path, &head_ref, file_path).map_err(|e| {
+        let msg = e.to_string();
+        // `git show ref:path` on a path absent from the tree is a 404,
+        // not a server error
+        if msg.contains("does not exist in")
+            || msg.contains("invalid object name")
+            || msg.contains("exists on disk, but not in")
+        {
+            AppError::NotFound(format!("file not found: {file_path}"))
+        } else {
+            AppError::Git(msg)
+        }
+    })?;
 
     // Guess content type
     let mime = match file_path.rsplit('.').next() {
