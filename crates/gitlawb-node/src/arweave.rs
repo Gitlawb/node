@@ -104,15 +104,15 @@ pub async fn anchor_ref_update(
 }
 
 /// A per-push manifest of the blobs encrypted this push (Option B3). The
-/// `blobs` slice is `(oid, cid, recipients)` tuples; only `oid` and `cid` are
-/// anchored. Anchored directly to Arweave as its JSON body so the discovery
-/// index survives total node loss.
+/// `blobs` slice is `(oid, cid)` tuples. Anchored directly to Arweave as its JSON
+/// body so the discovery index survives total node loss. Recipient identities are
+/// never part of the manifest.
 pub struct EncryptedManifest<'a> {
     pub repo: &'a str,
     pub owner_did: &'a str,
     pub node_did: &'a str,
     pub timestamp: &'a str,
-    pub blobs: &'a [(String, String, Vec<String>)],
+    pub blobs: &'a [(String, String)],
 }
 
 /// Anchor a per-push encrypted-blob manifest to Arweave via Irys. The manifest
@@ -135,7 +135,7 @@ pub async fn anchor_encrypted_manifest(
     let blobs_json: Vec<serde_json::Value> = manifest
         .blobs
         .iter()
-        .map(|(oid, cid, _recipients)| manifest_blob_json(oid, cid))
+        .map(|(oid, cid)| manifest_blob_json(oid, cid))
         .collect();
 
     let payload = json!({
@@ -298,11 +298,7 @@ mod tests {
     #[tokio::test]
     async fn test_manifest_anchor_noop_when_url_empty() {
         let client = reqwest::Client::new();
-        let blobs = vec![(
-            "oid1".to_string(),
-            "cid1".to_string(),
-            vec!["did:key:zA".to_string()],
-        )];
+        let blobs = vec![("oid1".to_string(), "cid1".to_string())];
         let m = EncryptedManifest {
             repo: "alice/r",
             owner_did: "did:key:zO",
@@ -319,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn test_manifest_anchor_noop_when_no_blobs() {
         let client = reqwest::Client::new();
-        let blobs: Vec<(String, String, Vec<String>)> = vec![];
+        let blobs: Vec<(String, String)> = vec![];
         let m = EncryptedManifest {
             repo: "alice/r",
             owner_did: "did:key:zO",
@@ -348,11 +344,7 @@ mod tests {
             .await;
 
         let client = reqwest::Client::new();
-        let blobs = vec![(
-            "oid1".to_string(),
-            "cid1".to_string(),
-            vec!["did:key:zA".to_string()],
-        )];
+        let blobs = vec![("oid1".to_string(), "cid1".to_string())];
         let m = EncryptedManifest {
             repo: "alice/r",
             owner_did: "did:key:zO",
