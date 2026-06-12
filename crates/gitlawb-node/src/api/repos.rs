@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::cert;
 use crate::error::{AppError, Result};
-use crate::git::{smart_http, store};
+use crate::git::{smart_http, store, visibility_pack};
 use crate::state::AppState;
 use crate::visibility::{visibility_check, Decision};
 use crate::webhooks;
@@ -330,6 +330,8 @@ pub async fn git_info_refs(
     if service == "git-upload-pack" {
         let rules = state.db.list_visibility_rules(&record.id).await?;
         let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+        // Subtree (mode B) rules do not gate the advertisement: refs expose commit
+        // tips only, and blob withholding happens in the upload-pack pack build.
         if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
             == Decision::Deny
         {
@@ -392,18 +394,45 @@ pub async fn git_upload_pack(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let body_len = body.len();
-    let resp = smart_http::upload_pack(&disk_path, body)
+
+    // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep that
+    // off the async worker thread.
+    let withheld = {
+        let path = disk_path.clone();
+        let rules = rules.clone();
+        let owner_did = record.owner_did.clone();
+        let caller_owned = caller.map(str::to_string);
+        let is_public = record.is_public;
+        tokio::task::spawn_blocking(move || {
+            visibility_pack::withheld_blob_oids(
+                &path,
+                &rules,
+                is_public,
+                &owner_did,
+                caller_owned.as_deref(),
+            )
+        })
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("bad line length") || msg.contains("protocol error") {
-                tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request");
-                AppError::BadRequest(msg)
-            } else {
-                tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
-                AppError::Git(msg)
-            }
-        })?;
+        .map_err(|e| AppError::Git(e.to_string()))?
+        .map_err(|e| AppError::Git(e.to_string()))?
+    };
+
+    let resp = if withheld.is_empty() {
+        smart_http::upload_pack(&disk_path, body).await
+    } else {
+        tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
+        smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
+    }
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("bad line length") || msg.contains("protocol error") {
+            tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request");
+            AppError::BadRequest(msg)
+        } else {
+            tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
+            AppError::Git(msg)
+        }
+    })?;
     crate::metrics::record_fetch(&format!("{owner}/{name}"));
     crate::metrics::observe_pack_size(body_len as f64);
     Ok(resp)
@@ -579,18 +608,140 @@ pub async fn git_receive_pack(
         }
     }
 
-    // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty)
-    {
+    // Replication enforcement (Phase 2): decide once per push whether the public
+    // may read this repo at all and, if so, which blob OIDs must not leave the
+    // node. `withheld == None` means replicate nothing (private / mode A /
+    // undetermined): skip every pin so even commit and tree objects (which
+    // withheld_blob_oids never lists) stay local. `announce` gates the
+    // network-facing announcements. Fail closed: a private or undetermined repo
+    // never leaks.
+    let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
+    let announce = match &rules_opt {
+        Some(rules) => {
+            visibility_check(rules, record.is_public, &record.owner_did, None, "/")
+                == Decision::Allow
+        }
+        None => false,
+    };
+    let withheld: Option<std::collections::HashSet<String>> = if !announce {
+        None
+    } else {
+        match &rules_opt {
+            Some(rules) if rules.is_empty() => Some(std::collections::HashSet::new()),
+            // withheld_blob_oids walks every ref with blocking `git ls-tree`;
+            // keep that off the async worker thread.
+            Some(rules) => {
+                let path = disk_path.clone();
+                let rules = rules.clone();
+                let owner_did = record.owner_did.clone();
+                let is_public = record.is_public;
+                tokio::task::spawn_blocking(move || {
+                    crate::git::visibility_pack::withheld_blob_oids(
+                        &path, &rules, is_public, &owner_did, None,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    tracing::warn!(err = %e, "withheld_blob_oids task panicked; skipping replication for this push")
+                })
+                .ok()
+                .and_then(|r| {
+                    r.map_err(|e| {
+                        tracing::warn!(err = %e, "withheld_blob_oids failed; skipping replication for this push")
+                    })
+                    .ok()
+                })
+            }
+            None => None,
+        }
+    };
+
+    // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
+    // Skipped entirely when the public cannot read the repo (withheld == None).
+    if let Some(withheld_ipfs) = withheld.clone() {
         let ipfs_api = state.config.ipfs_api.clone();
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
+        let rules_for_enc = rules_opt.clone();
+        let repo_id = record.id.clone();
+        let owner_did = record.owner_did.clone();
+        let is_public = record.is_public;
+        let irys_url = state.config.irys_url.clone();
+        let http_client = std::sync::Arc::clone(&state.http_client);
+        let node_did_str = state.node_did.to_string();
+        let node_seed = state.node_keypair.seed_bytes();
+        let repo_name = record.name.clone();
         tokio::spawn(async move {
-            let pinned =
-                crate::ipfs_pin::pin_new_objects(&ipfs_api, &repo_path_clone, &db_clone).await;
+            let pinned = crate::ipfs_pin::pin_new_objects(
+                &ipfs_api,
+                &repo_path_clone,
+                &db_clone,
+                &withheld_ipfs,
+            )
+            .await;
             if !pinned.is_empty() {
                 tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
                 for (sha, cid) in &pinned {
                     tracing::info!(sha = %sha, %cid, "pinned");
+                }
+            }
+
+            // Option B1: encrypt-then-pin the withheld blobs so authorized
+            // readers can recover them when the origin cannot serve them.
+            if let Some(rules) = rules_for_enc.filter(|r| !r.is_empty()) {
+                let p = repo_path_clone.clone();
+                let owner = owner_did.clone();
+                let recip = tokio::task::spawn_blocking(move || {
+                    crate::git::visibility_pack::withheld_blob_recipients(
+                        &p, &rules, is_public, &owner,
+                    )
+                })
+                .await;
+                if let Ok(Ok(recipients)) = recip {
+                    let delta = crate::encrypted_pin::encrypt_and_pin(
+                        &ipfs_api,
+                        &repo_path_clone,
+                        &db_clone,
+                        &repo_id,
+                        &node_seed,
+                        &recipients,
+                    )
+                    .await;
+
+                    // Option B3: anchor a per-push manifest of the blobs sealed
+                    // this push to Arweave, so the oid->cid index survives total
+                    // node loss. Best-effort; never fails the push.
+                    if !delta.is_empty() && !irys_url.is_empty() {
+                        let owner_short = owner_did.split(':').next_back().unwrap_or(&owner_did);
+                        let repo_slug = format!("{owner_short}/{repo_name}");
+                        let ts = chrono::Utc::now().to_rfc3339();
+                        let manifest = crate::arweave::EncryptedManifest {
+                            repo: &repo_slug,
+                            owner_did: &owner_did,
+                            node_did: &node_did_str,
+                            timestamp: &ts,
+                            blobs: &delta,
+                        };
+                        match crate::arweave::anchor_encrypted_manifest(
+                            &http_client,
+                            &irys_url,
+                            &manifest,
+                        )
+                        .await
+                        {
+                            Ok(tx) if !tx.is_empty() => tracing::info!(
+                                repo = %repo_slug,
+                                tx_id = %tx,
+                                "anchored encrypted manifest to Arweave"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                repo = %repo_slug,
+                                err = %e,
+                                "encrypted manifest anchor failed"
+                            ),
+                        }
+                    }
                 }
             }
         });
@@ -625,15 +776,22 @@ pub async fn git_receive_pack(
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
+        let withheld_pinata = withheld;
         tokio::spawn(async move {
-            let pinned = crate::pinata::pin_new_objects(
-                &http_client,
-                &pinata_upload_url,
-                &pinata_jwt,
-                &repo_path_clone,
-                &db_clone,
-            )
-            .await;
+            let pinned = match &withheld_pinata {
+                Some(withheld) => {
+                    crate::pinata::pin_new_objects(
+                        &http_client,
+                        &pinata_upload_url,
+                        &pinata_jwt,
+                        &repo_path_clone,
+                        &db_clone,
+                        withheld,
+                    )
+                    .await
+                }
+                None => Vec::new(),
+            };
 
             if !pinned.is_empty() {
                 tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
@@ -652,77 +810,82 @@ pub async fn git_receive_pack(
                         .await;
                 }
 
-                if let Some(p2p) = &p2p_handle {
-                    p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
-                        node_did: node_did_str.clone(),
-                        pusher_did: pusher_did_clone.clone(),
-                        repo: repo_slug.clone(),
-                        ref_name: ref_name.clone(),
-                        old_sha: "".to_string(),
-                        new_sha: new_sha.clone(),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                        cert_id: None,
-                        cid: cid.map(|s| s.to_string()),
-                    })
-                    .await;
+                if announce {
+                    if let Some(p2p) = &p2p_handle {
+                        p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
+                            node_did: node_did_str.clone(),
+                            pusher_did: pusher_did_clone.clone(),
+                            repo: repo_slug.clone(),
+                            ref_name: ref_name.clone(),
+                            old_sha: "".to_string(),
+                            new_sha: new_sha.clone(),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                            cert_id: None,
+                            cid: cid.map(|s| s.to_string()),
+                        })
+                        .await;
+                    }
                 }
             }
 
             // HTTP peer notification — notify all known peers to pull from us.
             // This is the reliable fallback when Gossipsub p2p is not yet connected.
-            if let Ok(peers) = db_for_peers.list_peers().await {
-                for peer in peers {
-                    if peer.http_url.is_empty() {
-                        continue;
-                    }
-                    let peer_url = peer.http_url.trim_end_matches('/');
-                    if let Some(self_url) = self_public_url.as_deref() {
-                        if peer_url == self_url.trim_end_matches('/') {
+            // Suppressed for repos the public cannot read.
+            if announce {
+                if let Ok(peers) = db_for_peers.list_peers().await {
+                    for peer in peers {
+                        if peer.http_url.is_empty() {
                             continue;
                         }
-                    }
-                    let path = "/api/v1/sync/notify";
-                    let notify_url = format!("{peer_url}{path}");
-                    let body = serde_json::json!({
-                        "repo": repo_slug.clone(),
-                        "ref_name": ref_updates_clone.first().map(|(r, _)| r).unwrap_or(&String::new()),
-                        "new_sha": ref_updates_clone.first().map(|(_, s)| s).unwrap_or(&String::new()),
-                        "node_did": node_did_str.clone(),
-                        "pusher_did": pusher_did_clone.clone(),
-                        "old_sha": "0000000000000000000000000000000000000000",
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                    });
-                    let body_bytes = match serde_json::to_vec(&body) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            tracing::warn!(peer = %peer.did, err = %e, "failed to serialize peer sync notify");
-                            continue;
+                        let peer_url = peer.http_url.trim_end_matches('/');
+                        if let Some(self_url) = self_public_url.as_deref() {
+                            if peer_url == self_url.trim_end_matches('/') {
+                                continue;
+                            }
                         }
-                    };
-                    let signed = gitlawb_core::http_sig::sign_request(
-                        node_keypair.as_ref(),
-                        "POST",
-                        path,
-                        &body_bytes,
-                    );
-                    match http_client
-                        .post(&notify_url)
-                        .header("Content-Type", "application/json")
-                        .header("Content-Digest", signed.content_digest)
-                        .header("Signature-Input", signed.signature_input)
-                        .header("Signature", signed.signature)
-                        .body(body_bytes)
-                        .send()
-                        .await
-                    {
-                        Ok(r) if r.status().is_success() => {
-                            tracing::info!(peer = %peer.did, repo = %repo_slug, "notified peer to sync")
-                        }
-                        Ok(r) => {
-                            tracing::warn!(peer = %peer.did, status = %r.status(), "peer sync notify returned error")
-                        }
-                        Err(e) => {
-                            tracing::warn!(peer = %peer.did, err = %e, "failed to notify peer")
+                        let path = "/api/v1/sync/notify";
+                        let notify_url = format!("{peer_url}{path}");
+                        let body = serde_json::json!({
+                            "repo": repo_slug.clone(),
+                            "ref_name": ref_updates_clone.first().map(|(r, _)| r).unwrap_or(&String::new()),
+                            "new_sha": ref_updates_clone.first().map(|(_, s)| s).unwrap_or(&String::new()),
+                            "node_did": node_did_str.clone(),
+                            "pusher_did": pusher_did_clone.clone(),
+                            "old_sha": "0000000000000000000000000000000000000000",
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                        });
+                        let body_bytes = match serde_json::to_vec(&body) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(peer = %peer.did, err = %e, "failed to serialize peer sync notify");
+                                continue;
+                            }
+                        };
+                        let signed = gitlawb_core::http_sig::sign_request(
+                            node_keypair.as_ref(),
+                            "POST",
+                            path,
+                            &body_bytes,
+                        );
+                        match http_client
+                            .post(&notify_url)
+                            .header("Content-Type", "application/json")
+                            .header("Content-Digest", signed.content_digest)
+                            .header("Signature-Input", signed.signature_input)
+                            .header("Signature", signed.signature)
+                            .body(body_bytes)
+                            .send()
+                            .await
+                        {
+                            Ok(r) if r.status().is_success() => {
+                                tracing::info!(peer = %peer.did, repo = %repo_slug, "notified peer to sync")
+                            }
+                            Ok(r) => {
+                                tracing::warn!(peer = %peer.did, status = %r.status(), "peer sync notify returned error")
+                            }
+                            Err(e) => {
+                                tracing::warn!(peer = %peer.did, err = %e, "failed to notify peer")
+                            }
                         }
                     }
                 }
@@ -746,8 +909,9 @@ pub async fn git_receive_pack(
                 timestamp: now_ts.clone(),
             });
 
-            // Arweave permanent anchoring — fire for each ref update
-            if !irys_url.is_empty() {
+            // Arweave permanent anchoring — fire for each ref update.
+            // Suppressed for repos the public cannot read (public permanent ledger).
+            if announce && !irys_url.is_empty() {
                 for (ref_name, new_sha) in &ref_updates_clone {
                     let cid = cid_map.get(new_sha).cloned();
                     let anchor = crate::arweave::RefAnchor {

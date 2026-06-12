@@ -52,6 +52,12 @@ impl Keypair {
         URL_SAFE_NO_PAD.encode(sig.to_bytes())
     }
 
+    /// The raw 32-byte Ed25519 seed. Used to derive the X25519 secret for
+    /// envelope decryption (see `crate::encrypt`).
+    pub fn seed_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
     /// Export the signing key as raw 32-byte seed (wrapped in Zeroizing).
     pub fn to_seed(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.signing_key.to_bytes())

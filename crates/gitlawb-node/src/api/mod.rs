@@ -3,6 +3,7 @@ pub mod arweave;
 pub mod bounties;
 pub mod certs;
 pub mod changelog;
+pub mod encrypted;
 pub mod events;
 pub mod ipfs;
 pub mod issues;

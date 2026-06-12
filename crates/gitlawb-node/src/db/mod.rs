@@ -720,6 +720,32 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_visibility_rules_repo ON visibility_rules(repo_id)",
         ],
     },
+    Migration {
+        version: 4,
+        name: "encrypted_blobs",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS encrypted_blobs (
+                repo_id    TEXT NOT NULL,
+                oid        TEXT NOT NULL,
+                cid        TEXT NOT NULL,
+                recipients TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (repo_id, oid)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_encrypted_blobs_repo ON encrypted_blobs(repo_id)",
+        ],
+    },
+    Migration {
+        version: 5,
+        name: "encrypted_blobs_blind_recipients",
+        stmts: &[
+            // Replace the cleartext recipient DID list with an opaque, node-keyed
+            // tag used only to detect a recipient-set change. Existing rows get an
+            // empty tag and are re-sealed on the next push.
+            "ALTER TABLE encrypted_blobs DROP COLUMN IF EXISTS recipients",
+            "ALTER TABLE encrypted_blobs ADD COLUMN IF NOT EXISTS recipients_tag TEXT NOT NULL DEFAULT ''",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1619,6 +1645,76 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn record_encrypted_blob(
+        &self,
+        repo_id: &str,
+        oid: &str,
+        cid: &str,
+        recipients_tag: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO encrypted_blobs (repo_id, oid, cid, recipients_tag, created_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (repo_id, oid) DO UPDATE SET cid = EXCLUDED.cid, recipients_tag = EXCLUDED.recipients_tag",
+        )
+        .bind(repo_id)
+        .bind(oid)
+        .bind(cid)
+        .bind(recipients_tag)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// (oid, cid) for every encrypted blob in the repo, unscoped by caller. Used
+    /// by both the B2 replication view and B1 discovery. Recipient identities are
+    /// not stored, so authorization is the caller's repo readability, not a per
+    /// recipient check. Ciphertext metadata only.
+    pub async fn list_all_encrypted_blobs(&self, repo_id: &str) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT oid, cid FROM encrypted_blobs WHERE repo_id = $1")
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            let oid: String = row.get("oid");
+            let cid: String = row.get("cid");
+            out.push((oid, cid));
+        }
+        Ok(out)
+    }
+
+    /// The CID of one encrypted blob, or None if there is no such row. Recipient
+    /// authorization is not enforced here: the handler checks repo readability and
+    /// the envelope crypto gates decryption.
+    pub async fn encrypted_blob_cid(&self, repo_id: &str, oid: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2")
+            .bind(repo_id)
+            .bind(oid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("cid")))
+    }
+
+    /// The opaque recipients tag stored for an encrypted blob, or None if there is
+    /// no row. Used only to decide whether a re-seal is needed (the recipient set
+    /// changed); the tag is a node-keyed fingerprint, not the DID list.
+    pub async fn encrypted_blob_recipients_tag(
+        &self,
+        repo_id: &str,
+        oid: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT recipients_tag FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2",
+        )
+        .bind(repo_id)
+        .bind(oid)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("recipients_tag")))
     }
 
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {

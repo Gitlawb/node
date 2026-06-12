@@ -7,6 +7,8 @@
 //! If `ipfs_api` is empty the functions are no-ops, so the node works fine
 //! without a local IPFS daemon.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use gitlawb_core::cid::Cid;
 
@@ -70,6 +72,19 @@ pub async fn pin_git_object(ipfs_api: &str, sha256_hex: &str, data: &[u8]) -> Re
     Ok(cid)
 }
 
+/// Fetch raw bytes for a CID from the local Kubo node (`/api/v0/cat`).
+pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
+    if ipfs_api.is_empty() {
+        return Err(anyhow::anyhow!("IPFS not configured"));
+    }
+    let url = format!("{}/api/v0/cat?arg={}", ipfs_api.trim_end_matches('/'), cid);
+    let resp = reqwest::Client::new().post(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!("ipfs cat {cid}: {}", resp.status()));
+    }
+    Ok(resp.bytes().await?.to_vec())
+}
+
 /// List all git objects in the given bare repo and pin any that are not yet
 /// recorded in `pinned_cids`.
 ///
@@ -78,6 +93,7 @@ pub async fn pin_new_objects(
     ipfs_api: &str,
     repo_path: &std::path::Path,
     db: &crate::db::Db,
+    withheld: &HashSet<String>,
 ) -> Vec<(String, String)> {
     if ipfs_api.is_empty() {
         return vec![];
@@ -91,6 +107,8 @@ pub async fn pin_new_objects(
             return vec![];
         }
     };
+
+    let object_list = crate::git::visibility_pack::replicable_objects(object_list, withheld);
 
     let mut pinned = Vec::new();
 
