@@ -138,9 +138,15 @@ pub fn open_blob(envelope: &[u8], keypair: &Keypair) -> Result<Vec<u8>> {
             Some(b) => XPublic::from(b),
             None => continue,
         };
-        let nonce = match B64.decode(&entry.nonce) {
-            Ok(n) => n,
-            Err(_) => continue,
+        // from_slice panics on a wrong length, and the envelope is attacker
+        // controlled, so validate the 24-byte box nonce before using it.
+        let nonce = match B64
+            .decode(&entry.nonce)
+            .ok()
+            .and_then(|n| <[u8; 24]>::try_from(n.as_slice()).ok())
+        {
+            Some(n) => n,
+            None => continue,
         };
         let wrap = match B64.decode(&entry.wrap) {
             Ok(w) => w,
@@ -159,7 +165,11 @@ pub fn open_blob(envelope: &[u8], keypair: &Keypair) -> Result<Vec<u8>> {
 
     let body_cipher = XChaCha20Poly1305::new_from_slice(&content_key)
         .map_err(|e| anyhow::anyhow!("content key: {e}"))?;
-    let body_nonce = B64.decode(&header.nonce)?;
+    let body_nonce = B64
+        .decode(&header.nonce)
+        .ok()
+        .and_then(|n| <[u8; 24]>::try_from(n.as_slice()).ok())
+        .context("invalid body nonce")?;
     body_cipher
         .decrypt(XNonce::from_slice(&body_nonce), body)
         .map_err(|_| anyhow::anyhow!("body decrypt failed"))
@@ -240,5 +250,42 @@ mod tests {
             err.to_string().contains("unsupported envelope version"),
             "expected version-rejection error, got: {err}"
         );
+    }
+
+    #[test]
+    fn malformed_nonce_returns_err_not_panic() {
+        // from_slice panics on wrong-length input; a crafted envelope on the
+        // public recovery path must surface an error, never panic.
+        let reader = Keypair::generate();
+        let env = seal_blob(b"private blob contents", &[reader.verifying_key()]).unwrap();
+
+        // Split the envelope framing into header JSON and body.
+        let mut p = MAGIC.len() + 1;
+        let hlen = u32::from_le_bytes(env[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let header_bytes = &env[p..p + hlen];
+        let body = &env[p + hlen..];
+
+        let reframe = |header: &serde_json::Value| -> Vec<u8> {
+            let hj = serde_json::to_vec(header).unwrap();
+            let mut out = Vec::new();
+            out.extend_from_slice(MAGIC);
+            out.push(VERSION);
+            out.extend_from_slice(&(hj.len() as u32).to_le_bytes());
+            out.extend_from_slice(&hj);
+            out.extend_from_slice(body);
+            out
+        };
+        let bad_nonce = serde_json::Value::String(B64.encode([0u8; 12]));
+
+        // Corrupted per-recipient nonce: entry is skipped, no match.
+        let mut header: serde_json::Value = serde_json::from_slice(header_bytes).unwrap();
+        header["recipients"][0]["nonce"] = bad_nonce.clone();
+        assert!(open_blob(&reframe(&header), &reader).is_err());
+
+        // Corrupted body nonce: unwrap succeeds, body nonce is rejected.
+        let mut header: serde_json::Value = serde_json::from_slice(header_bytes).unwrap();
+        header["nonce"] = bad_nonce;
+        assert!(open_blob(&reframe(&header), &reader).is_err());
     }
 }
