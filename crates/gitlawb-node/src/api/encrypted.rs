@@ -38,7 +38,8 @@ pub async fn list_encrypted_blobs(
 }
 
 /// GET /api/v1/repos/{owner}/{repo}/encrypted-blob/{oid}
-/// Returns raw envelope bytes if the caller is a recipient.
+/// Returns raw envelope bytes to callers who can read the repo; the envelope
+/// crypto still ensures only true recipients can decrypt.
 pub async fn get_encrypted_blob(
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
@@ -68,12 +69,16 @@ pub async fn get_encrypted_blob(
 
 /// GET /api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate
 /// Returns [{oid, cid}] for every encrypted blob in the repo, for peer-mirror
-/// replication (Option B2). Recipient identities are deliberately withheld: the
-/// v2 envelopes no longer carry recipient public keys, so peers must not learn
-/// the reader set either. A mirror detects a re-seal by the CID changing (the
-/// OID is stable across re-seals). Ciphertext metadata only, never plaintext.
+/// replication (Option B2). Gated by repo readability, like discovery, so a
+/// non-readable repo does not expose its blob index; for the intended case (a
+/// public repo with withheld subtrees) the public root keeps this open to peers.
+/// Recipient identities are deliberately withheld: the v2 envelopes no longer
+/// carry recipient public keys, so peers must not learn the reader set either. A
+/// mirror detects a re-seal by the CID changing (the OID is stable across
+/// re-seals). Ciphertext metadata only, never plaintext.
 pub async fn replicate_encrypted_blobs(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
     let record = state
@@ -81,6 +86,12 @@ pub async fn replicate_encrypted_blobs(
         .get_repo(&owner, &repo)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let rules = state.db.list_visibility_rules(&record.id).await?;
+    if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/") == Decision::Deny
+    {
+        return Err(AppError::RepoNotFound(format!("{owner}/{repo}")));
+    }
     let rows = state.db.list_all_encrypted_blobs(&record.id).await?;
     let blobs: Vec<_> = rows
         .into_iter()
