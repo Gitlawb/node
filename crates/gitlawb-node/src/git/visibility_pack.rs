@@ -10,25 +10,32 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-/// List every (blob_oid, "/repo/relative/path") pair reachable from any branch
-/// ref in `repo_path`. Uses `git ls-tree -r` per ref so each path a blob lives
-/// at is represented (the same blob content can appear at several paths). Paths
-/// are returned with a leading "/" to match the glob form used by visibility
-/// rules ("/secret/**").
+/// List every (blob_oid, "/repo/relative/path") pair reachable from any ref in
+/// `repo_path`. Walks every ref, not just `refs/heads/*` and `refs/tags/*`, so
+/// the withheld set covers the same object graph the pack and pin paths expose;
+/// a blob reachable only through another namespace (e.g. `refs/notes/*`) must not
+/// escape withholding. Uses `git ls-tree -r` per ref so each path a blob lives
+/// at is represented (the same blob content can appear at several paths). This is
+/// why it is not `git rev-list --objects`, which reports only one path per object.
+/// Paths carry a leading "/" to match the glob form used by visibility rules
+/// ("/secret/**").
+///
+/// Fails closed: if a ref cannot be traversed, returns an error so the caller
+/// aborts the serve/pin rather than producing a partial (under-withheld) set.
 fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
     let refs = store::list_refs(repo_path).context("list_refs failed")?;
     let mut out = Vec::new();
     for (refname, _oid) in refs {
-        if !refname.starts_with("refs/heads/") && !refname.starts_with("refs/tags/") {
-            continue;
-        }
         let listing = std::process::Command::new("git")
             .args(["ls-tree", "-r", &refname])
             .current_dir(repo_path)
             .output()
             .context("git ls-tree -r failed")?;
         if !listing.status.success() {
-            continue;
+            anyhow::bail!(
+                "git ls-tree -r {refname} failed: {}",
+                String::from_utf8_lossy(&listing.stderr)
+            );
         }
         for line in String::from_utf8_lossy(&listing.stdout).lines() {
             // "<mode> blob <oid>\t<path>"
@@ -294,5 +301,56 @@ mod tests {
         let reader = Keypair::generate();
         let env = seal_blob(&bytes, &[reader.verifying_key()]).unwrap();
         assert_eq!(open_blob(&env, &reader).unwrap(), bytes);
+    }
+
+    #[test]
+    fn withholds_blob_reachable_only_via_nonstandard_ref() {
+        let (_td, bare, secret_oid, _public) = fixture();
+        // Move the sole ref out of refs/heads/* into a custom namespace so the
+        // secret blob is reachable only through a ref the old heads/tags filter
+        // skipped. It must still be withheld.
+        let head_ref = {
+            let out = Command::new("git")
+                .args(["symbolic-ref", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["update-ref", "refs/custom/snap", "HEAD"]);
+        run(&["update-ref", "-d", &head_ref]);
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "blob reachable only via refs/custom/* must still be withheld"
+        );
+    }
+
+    #[test]
+    fn fails_closed_when_a_ref_cannot_be_traversed() {
+        let (_td, bare, secret, _public) = fixture();
+        // Point a ref at a blob (a valid object that is not tree-ish). `ls-tree -r`
+        // fails on it; that must propagate as Err rather than silently dropping the
+        // ref and under-withholding.
+        std::fs::write(bare.join("refs/heads/blobref"), format!("{secret}\n")).unwrap();
+        let rules = [rule("/secret/**", &[])];
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            result.is_err(),
+            "a ref that cannot be traversed must fail closed (Err)"
+        );
     }
 }
