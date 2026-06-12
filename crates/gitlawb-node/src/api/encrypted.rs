@@ -56,10 +56,11 @@ pub async fn get_encrypted_blob(
 }
 
 /// GET /api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate
-/// Returns [{oid, cid, recipients}] for every encrypted blob in the repo, for
-/// peer-mirror replication (Option B2). Not recipient-scoped: recipient DIDs are
-/// already public via the IPFS-pinned envelopes, so this exposes only ciphertext
-/// metadata (content-addressed OIDs/CIDs and recipient DIDs), never plaintext.
+/// Returns [{oid, cid}] for every encrypted blob in the repo, for peer-mirror
+/// replication (Option B2). Recipient identities are deliberately withheld: the
+/// v2 envelopes no longer carry recipient public keys, so peers must not learn
+/// the reader set either. A mirror detects a re-seal by the CID changing (the
+/// OID is stable across re-seals). Ciphertext metadata only, never plaintext.
 pub async fn replicate_encrypted_blobs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
@@ -72,9 +73,29 @@ pub async fn replicate_encrypted_blobs(
     let rows = state.db.list_all_encrypted_blobs(&record.id).await?;
     let blobs: Vec<_> = rows
         .into_iter()
-        .map(|(oid, cid, recipients)| {
-            serde_json::json!({ "oid": oid, "cid": cid, "recipients": recipients })
-        })
+        .map(|(oid, cid, _recipients)| replicate_blob_json(oid, cid))
         .collect();
     Ok(Json(serde_json::json!({ "blobs": blobs })))
+}
+
+/// Serialize one blob for the replication wire. Recipient identities are
+/// intentionally absent so a mirror never learns the reader set.
+fn replicate_blob_json(oid: String, cid: String) -> serde_json::Value {
+    serde_json::json!({ "oid": oid, "cid": cid })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replicate_blob_json;
+
+    #[test]
+    fn replicate_blob_json_omits_recipients() {
+        let v = replicate_blob_json("oid1".into(), "cidA".into());
+        assert_eq!(v["oid"], "oid1");
+        assert_eq!(v["cid"], "cidA");
+        assert!(
+            v.get("recipients").is_none(),
+            "replication wire must not carry recipient identities"
+        );
+    }
 }

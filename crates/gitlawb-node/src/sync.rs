@@ -46,13 +46,12 @@ fn classify_mirror(withheld: Option<Vec<String>>) -> MirrorMode {
 }
 
 /// One encrypted blob as advertised by an origin's `encrypted-blobs/replicate`
-/// endpoint (Option B2). Ciphertext metadata only.
+/// endpoint (Option B2). Ciphertext metadata only; recipient identities are
+/// withheld from peers, so a re-seal is detected by the CID changing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct ReplicaBlob {
     oid: String,
     cid: String,
-    #[serde(default)]
-    recipients: Vec<String>,
 }
 
 /// The shape of the `encrypted-blobs/replicate` JSON response.
@@ -64,31 +63,24 @@ struct ReplicateResponse {
 
 /// Decide which of the origin's encrypted blobs this mirror must (re)replicate.
 ///
-/// `have` maps each already-stored blob's oid to its stored recipient DIDs. A
+/// `have` maps each already-stored blob's oid to the CID the mirror pinned. A
 /// remote blob is returned when the mirror has no row for that oid, or when the
-/// stored recipient set differs from the remote one (the origin re-sealed after a
-/// reader-set change; same semantics as B1). Recipient order is ignored.
+/// stored CID differs from the advertised one. A re-seal regenerates the
+/// envelope (new content key, nonce, and per-recipient wraps), so the CID
+/// changes while the OID stays stable; comparing CIDs detects a re-seal without
+/// the mirror ever holding recipient identities.
 fn blobs_needing_replication(
     remote: &[ReplicaBlob],
-    have: &HashMap<String, Vec<String>>,
+    have: &HashMap<String, String>,
 ) -> Vec<ReplicaBlob> {
     remote
         .iter()
         .filter(|b| match have.get(&b.oid) {
             None => true,
-            Some(stored) => !same_recipients(stored, &b.recipients),
+            Some(stored_cid) => stored_cid != &b.cid,
         })
         .cloned()
         .collect()
-}
-
-/// Order-insensitive equality of two recipient DID lists.
-fn same_recipients(a: &[String], b: &[String]) -> bool {
-    let mut a: Vec<&String> = a.iter().collect();
-    let mut b: Vec<&String> = b.iter().collect();
-    a.sort();
-    b.sort();
-    a == b
 }
 
 /// Start the background sync worker. Returns immediately; the worker runs
@@ -260,9 +252,10 @@ async fn fetch_withheld(
 /// Replicate the origin's encrypted withheld blobs onto this mirror (Option B2).
 ///
 /// After the git objects are mirrored, fetch the origin's replication listing,
-/// then for each blob the mirror does not already hold (or whose recipients
-/// changed) pull the ciphertext envelope over IPFS, pin it locally, and record
-/// the `encrypted_blobs` row keyed by this mirror's local `repo_id`.
+/// then for each blob the mirror does not already hold (or whose CID changed,
+/// i.e. the origin re-sealed) pull the ciphertext envelope over IPFS, pin it
+/// locally, and record the `encrypted_blobs` row keyed by this mirror's local
+/// `repo_id`. The mirror stores no recipient identities.
 ///
 /// Best-effort and idempotent: any per-blob failure is logged and skipped, to be
 /// retried on the next sync. Confidentiality is never at risk; the mirror only
@@ -298,10 +291,10 @@ async fn replicate_encrypted_blobs(
         return;
     }
 
-    let have: HashMap<String, Vec<String>> = match db.list_all_encrypted_blobs(repo_id).await {
+    let have: HashMap<String, String> = match db.list_all_encrypted_blobs(repo_id).await {
         Ok(rows) => rows
             .into_iter()
-            .map(|(oid, _cid, recipients)| (oid, recipients))
+            .map(|(oid, cid, _recipients)| (oid, cid))
             .collect(),
         Err(e) => {
             warn!(repo = %repo, err = %e, "failed to list local encrypted blobs for replication");
@@ -324,7 +317,7 @@ async fn replicate_encrypted_blobs(
                     continue;
                 }
                 if let Err(e) = db
-                    .record_encrypted_blob(repo_id, &blob.oid, &cid, &blob.recipients)
+                    .record_encrypted_blob(repo_id, &blob.oid, &cid, &[])
                     .await
                 {
                     warn!(oid = %blob.oid, err = %e, "failed to record replicated encrypted blob");
@@ -483,38 +476,34 @@ mod tests {
         assert!(matches!(mode, MirrorMode::Plain));
     }
 
-    fn rb(oid: &str, cid: &str, recipients: &[&str]) -> ReplicaBlob {
+    fn rb(oid: &str, cid: &str) -> ReplicaBlob {
         ReplicaBlob {
             oid: oid.to_string(),
             cid: cid.to_string(),
-            recipients: recipients.iter().map(|s| s.to_string()).collect(),
         }
     }
 
     #[test]
     fn replicate_stores_new_blob() {
-        let remote = vec![rb("oid1", "cidA", &["did:key:zA"])];
+        let remote = vec![rb("oid1", "cidA")];
         let have = HashMap::new();
         assert_eq!(blobs_needing_replication(&remote, &have), remote);
     }
 
     #[test]
-    fn replicate_skips_already_present_same_recipients() {
-        let remote = vec![rb("oid1", "cidA", &["did:key:zA", "did:key:zB"])];
+    fn replicate_skips_already_present_same_cid() {
+        let remote = vec![rb("oid1", "cidA")];
         let mut have = HashMap::new();
-        // stored in a different order: must still count as present
-        have.insert(
-            "oid1".to_string(),
-            vec!["did:key:zB".to_string(), "did:key:zA".to_string()],
-        );
+        have.insert("oid1".to_string(), "cidA".to_string());
         assert!(blobs_needing_replication(&remote, &have).is_empty());
     }
 
     #[test]
-    fn replicate_restores_on_recipient_change() {
-        let remote = vec![rb("oid1", "cidB", &["did:key:zA", "did:key:zC"])];
+    fn replicate_restores_on_cid_change() {
+        // The origin re-sealed: same oid, new envelope, new cid.
+        let remote = vec![rb("oid1", "cidB")];
         let mut have = HashMap::new();
-        have.insert("oid1".to_string(), vec!["did:key:zA".to_string()]);
+        have.insert("oid1".to_string(), "cidA".to_string());
         assert_eq!(blobs_needing_replication(&remote, &have), remote);
     }
 
@@ -525,11 +514,12 @@ mod tests {
 
     #[test]
     fn replicate_response_parses() {
+        // An older origin may still send a recipients field; it must be ignored.
         let json = r#"{"blobs":[{"oid":"o1","cid":"c1","recipients":["did:key:zA"]}]}"#;
         let parsed: ReplicateResponse = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.blobs.len(), 1);
         assert_eq!(parsed.blobs[0].oid, "o1");
-        assert_eq!(parsed.blobs[0].recipients, vec!["did:key:zA".to_string()]);
+        assert_eq!(parsed.blobs[0].cid, "c1");
     }
 
     #[test]
