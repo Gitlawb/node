@@ -65,6 +65,7 @@ alloy = { version = "1", default-features = false, features = [
     "network",
     "rpc-types-eth",
 ] }
+libp2p-dns = { version = "0.44.0", features = ["tokio"] }
 
 [dev-dependencies]
 mockito = "1"
