@@ -186,12 +186,11 @@ pub async fn list_repos(
 pub async fn get_repo(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<RepoResponse>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
     let count = state.db.count_stars(&record.id).await.unwrap_or(0);
     Ok(Json(to_response(&record, &state, count)))
 }
@@ -200,12 +199,11 @@ pub async fn get_repo(
 pub async fn list_commits(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let disk_path = state
         .repo_store
@@ -222,15 +220,15 @@ pub async fn list_commits(
 pub async fn get_blob(
     State(state): State<AppState>,
     Path((owner, name, file_path)): Path<(String, String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     use axum::http::header;
     use axum::response::IntoResponse;
 
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let gate_path = format!("/{}", file_path.trim_start_matches('/'));
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
 
     let disk_path = state
         .repo_store
@@ -260,12 +258,11 @@ pub async fn get_blob(
 pub async fn get_tree_root(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let disk_path = state
         .repo_store
@@ -282,12 +279,11 @@ pub async fn get_tree_root(
 pub async fn get_tree(
     State(state): State<AppState>,
     Path((owner, name, tree_path)): Path<(String, String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let disk_path = state
         .repo_store
@@ -796,12 +792,11 @@ pub async fn git_receive_pack(
 pub async fn list_refs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let _record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (_record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let repo_slug = format!("{owner}/{repo}");
     let refs = state.db.list_branch_cids(&repo_slug).await?;
@@ -904,11 +899,10 @@ pub async fn fork_repo(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<ForkRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
-    let source = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // Enforce read visibility on the source before cloning: an unauthorized
+    // caller must not be able to fork (full mirror) a repo they cannot read.
+    let (source, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let fork_name = req.name.unwrap_or_else(|| source.name.clone());
     let forker_did = auth.0;
