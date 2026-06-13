@@ -4,8 +4,8 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 
-use crate::error::{AppError, Result};
 use crate::auth::AuthenticatedDid;
+use crate::error::{AppError, Result};
 use crate::git::store;
 use crate::state::AppState;
 

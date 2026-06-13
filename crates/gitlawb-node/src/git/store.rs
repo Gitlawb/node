@@ -331,6 +331,10 @@ pub fn branch_diff_names(
         .current_dir(repo_path)
         .output()
         .context("failed to run git diff --name-only")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff --name-only failed: {stderr}");
+    }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.is_empty())

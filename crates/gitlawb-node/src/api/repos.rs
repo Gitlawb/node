@@ -899,11 +899,10 @@ pub async fn fork_repo(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<ForkRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
-    let source = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // Enforce read visibility on the source before cloning: an unauthorized
+    // caller must not be able to fork (full mirror) a repo they cannot read.
+    let (source, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let fork_name = req.name.unwrap_or_else(|| source.name.clone());
     let forker_did = auth.0;
