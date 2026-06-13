@@ -103,6 +103,108 @@ pub async fn anchor_ref_update(
     Ok(tx_id)
 }
 
+/// A per-push manifest of the blobs encrypted this push (Option B3). The
+/// `blobs` slice is `(oid, cid)` tuples. Anchored directly to Arweave as its JSON
+/// body so the discovery index survives total node loss. Recipient identities are
+/// never part of the manifest.
+pub struct EncryptedManifest<'a> {
+    pub repo: &'a str,
+    pub owner_did: &'a str,
+    pub node_did: &'a str,
+    pub timestamp: &'a str,
+    pub blobs: &'a [(String, String)],
+}
+
+/// Anchor a per-push encrypted-blob manifest to Arweave via Irys. The manifest
+/// JSON body is the payload (not a CID pointer to IPFS), so the index is
+/// permanent and self-contained. Recipient identities are deliberately omitted:
+/// the anchor is permanent and public, and the v2 envelopes no longer expose
+/// recipients, so the reader set must not be written to Arweave either.
+///
+/// Returns the Irys/Arweave transaction ID, or `Ok("")` when `irys_url` is empty
+/// (anchoring disabled) or there are no blobs to anchor.
+pub async fn anchor_encrypted_manifest(
+    client: &reqwest::Client,
+    irys_url: &str,
+    manifest: &EncryptedManifest<'_>,
+) -> Result<String> {
+    if irys_url.is_empty() || manifest.blobs.is_empty() {
+        return Ok(String::new());
+    }
+
+    let blobs_json: Vec<serde_json::Value> = manifest
+        .blobs
+        .iter()
+        .map(|(oid, cid)| manifest_blob_json(oid, cid))
+        .collect();
+
+    let payload = json!({
+        "schema": "gitlawb/encrypted-manifest/v1",
+        "repo": manifest.repo,
+        "owner_did": manifest.owner_did,
+        "node_did": manifest.node_did,
+        "timestamp": manifest.timestamp,
+        "blobs": blobs_json,
+    });
+
+    let body = serde_json::to_vec(&payload)?;
+    let url = format!("{}/upload", irys_url.trim_end_matches('/'));
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("x-irys-tags", build_manifest_tags_header(manifest))
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Irys upload failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("Irys returned {status}: {body}"));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to parse Irys response: {e}"))?;
+
+    let tx_id = json["id"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("no 'id' in Irys response: {json}"))?
+        .to_string();
+
+    tracing::info!(
+        repo = %manifest.repo,
+        tx_id = %tx_id,
+        blobs = manifest.blobs.len(),
+        "anchored encrypted manifest to Arweave"
+    );
+
+    Ok(tx_id)
+}
+
+/// Serialize one blob for the Arweave manifest. Recipient identities are
+/// intentionally absent so the permanent public anchor never records who can
+/// read a blob.
+fn manifest_blob_json(oid: &str, cid: &str) -> serde_json::Value {
+    json!({ "oid": oid, "cid": cid })
+}
+
+/// Build the Irys tag header for an encrypted-blob manifest. `Repo` and `Schema`
+/// are the tags the `gl` recovery query filters on.
+fn build_manifest_tags_header(manifest: &EncryptedManifest<'_>) -> String {
+    [
+        "App-Name:gitlawb".to_string(),
+        "Schema:gitlawb/encrypted-manifest/v1".to_string(),
+        format!("Repo:{}", sanitize_tag(manifest.repo)),
+        format!("Owner-DID:{}", sanitize_tag(manifest.owner_did)),
+        format!("Node-DID:{}", sanitize_tag(manifest.node_did)),
+    ]
+    .join(",")
+}
+
 /// Arweave permanent URL for a given Irys transaction ID.
 pub fn arweave_url(tx_id: &str) -> String {
     format!("https://arweave.net/{tx_id}")
@@ -190,6 +292,79 @@ mod tests {
         assert_eq!(
             url,
             "https://arweave.net/7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_anchor_noop_when_url_empty() {
+        let client = reqwest::Client::new();
+        let blobs = vec![("oid1".to_string(), "cid1".to_string())];
+        let m = EncryptedManifest {
+            repo: "alice/r",
+            owner_did: "did:key:zO",
+            node_did: "did:key:zN",
+            timestamp: "2026-06-11T00:00:00Z",
+            blobs: &blobs,
+        };
+        assert_eq!(
+            anchor_encrypted_manifest(&client, "", &m).await.unwrap(),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_anchor_noop_when_no_blobs() {
+        let client = reqwest::Client::new();
+        let blobs: Vec<(String, String)> = vec![];
+        let m = EncryptedManifest {
+            repo: "alice/r",
+            owner_did: "did:key:zO",
+            node_did: "did:key:zN",
+            timestamp: "2026-06-11T00:00:00Z",
+            blobs: &blobs,
+        };
+        // Non-empty URL, but no blobs: still a no-op.
+        assert_eq!(
+            anchor_encrypted_manifest(&client, "https://example.invalid", &m)
+                .await
+                .unwrap(),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manifest_anchor_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/upload")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"MANIFESTTX123","timestamp":1710000000000,"version":"1.0.0"}"#)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let blobs = vec![("oid1".to_string(), "cid1".to_string())];
+        let m = EncryptedManifest {
+            repo: "alice/r",
+            owner_did: "did:key:zO",
+            node_did: "did:key:zN",
+            timestamp: "2026-06-11T00:00:00Z",
+            blobs: &blobs,
+        };
+        let r = anchor_encrypted_manifest(&client, &server.url(), &m).await;
+        assert_eq!(r.unwrap(), "MANIFESTTX123");
+        _mock.assert_async().await;
+    }
+
+    #[test]
+    fn manifest_blob_json_omits_recipients() {
+        let v = manifest_blob_json("oid1", "cidA");
+        assert_eq!(v["oid"], "oid1");
+        assert_eq!(v["cid"], "cidA");
+        assert!(
+            v.get("recipients").is_none(),
+            "Arweave manifest must not anchor recipient identities"
         );
     }
 
