@@ -1,8 +1,9 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
 use bytes::Bytes;
+use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
@@ -119,4 +120,572 @@ fn validate_service(service: &str) -> Result<()> {
 fn pkt_line(data: &str) -> Vec<u8> {
     let len = data.len() + 4;
     format!("{len:04x}{data}").into_bytes()
+}
+
+/// Build a packfile containing every object reachable from all refs EXCEPT the
+/// given blob OIDs. Commits and trees are always included, so SHAs stay intact;
+/// only the named blobs are dropped.
+pub fn build_filtered_pack(repo_path: &Path, withheld: &HashSet<String>) -> Result<Vec<u8>> {
+    // All reachable objects as "oid [path]" lines.
+    let rev = std::process::Command::new("git")
+        .args(["rev-list", "--objects", "--all"])
+        .current_dir(repo_path)
+        .output()?;
+    if !rev.status.success() {
+        bail!(
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&rev.stderr)
+        );
+    }
+    let mut keep = Vec::new();
+    for line in String::from_utf8_lossy(&rev.stdout).lines() {
+        let oid = line.split_whitespace().next().unwrap_or("");
+        if oid.is_empty() || withheld.contains(oid) {
+            continue;
+        }
+        keep.push(oid.to_string());
+    }
+    let mut child = std::process::Command::new("git")
+        .args(["pack-objects", "--stdout"])
+        .current_dir(repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin.write_all(keep.join("\n").as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "git pack-objects failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(out.stdout)
+}
+
+/// Serve a clone/fetch with the withheld blobs removed from the response pack.
+///
+/// The framing is git protocol v0 (`NAK` then the pack), matching the v0 ref
+/// advertisement that `info_refs` emits (it runs `git upload-pack
+/// --advertise-refs` without `GIT_PROTOCOL=version=2`, so clients negotiate v0).
+/// If `info_refs` ever advertises v2, this serve path must learn v2 framing too.
+///
+/// Because the pack deliberately omits blobs that the sent trees still
+/// reference, the pack is not closed under reachability. A stock full clone
+/// rejects it at fetch time ("remote did not send all necessary objects"); only
+/// a partial clone (the client passes `--filter`, marking a promisor remote)
+/// accepts the pack with the private blobs absent. Tree and commit SHAs stay
+/// intact either way. The clean partial-clone client UX is a separate follow-up
+/// (git-remote-gitlawb); the security guarantee (private bytes never leave the
+/// node) holds regardless of client.
+///
+/// Negotiation is intentionally ignored: rather than honoring the client's
+/// `want`/`have` lines, this always sends a self-contained pack of every object
+/// across all refs minus the withheld blobs, and replies `NAK`. A fresh clone
+/// and an incremental fetch are both correct (the client de-duplicates objects
+/// it already has); the cost is that a fetch re-sends the full object set
+/// instead of a thin delta. Honoring negotiation for smaller fetch packs is an
+/// optimization follow-up, not a correctness requirement.
+pub async fn upload_pack_excluding(
+    repo_path: &Path,
+    request_body: Bytes,
+    withheld: &HashSet<String>,
+) -> Result<Response> {
+    // build_filtered_pack shells out to git (rev-list, pack-objects) with
+    // blocking std::process I/O; run it off the async worker so a large repo's
+    // pack build does not stall the tokio runtime.
+    let pack = {
+        let repo_path = repo_path.to_path_buf();
+        let withheld = withheld.clone();
+        tokio::task::spawn_blocking(move || build_filtered_pack(&repo_path, &withheld))
+            .await
+            .context("filtered-pack build task panicked")??
+    };
+
+    // The client lists its capabilities on the first `want` line. Honor
+    // side-band-64k when offered (every modern smart-HTTP client offers it);
+    // otherwise stream the raw pack after NAK.
+    let sideband = memmem(&request_body, b"side-band-64k");
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&pkt_line("NAK\n"));
+    if sideband {
+        // Band 1 carries pack data, chunked under the pkt-line size limit.
+        for chunk in pack.chunks(65515) {
+            let mut framed = Vec::with_capacity(chunk.len() + 1);
+            framed.push(0x01);
+            framed.extend_from_slice(chunk);
+            let len = framed.len() + 4;
+            body.extend_from_slice(format!("{len:04x}").as_bytes());
+            body.extend_from_slice(&framed);
+        }
+        body.extend_from_slice(b"0000");
+    } else {
+        body.extend_from_slice(&pack);
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/x-git-upload-pack-result")
+        .header("Cache-Control", "no-cache")
+        .body(Body::from(body))?)
+}
+
+/// True if `needle` occurs anywhere in `haystack`. Small substring scan used to
+/// detect a client capability token in the upload-pack request body.
+fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return needle.is_empty();
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    /// List OIDs in a pack by writing it to a temp dir and running verify-pack.
+    pub(super) fn pack_object_ids(pack: &[u8]) -> std::collections::HashSet<String> {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.pack");
+        std::fs::write(&path, pack).unwrap();
+        // index-pack creates the matching .idx next to the pack.
+        let ok = Command::new("git")
+            .args(["index-pack", path.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "index-pack failed");
+        let out = Command::new("git")
+            .args(["verify-pack", "-v", path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .filter(|t| t.len() == 40 && t.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn filtered_serve_excludes_withheld_blob() {
+        // Build a bare repo, capture the secret + public blob OIDs.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let g = |args: &[&str], dir: &std::path::Path| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+        };
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"pub\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"SECRET\n").unwrap();
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "init"], &work);
+        let oid = |p: &str| {
+            let o = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{p}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let secret = oid("secret/b.txt");
+        let public = oid("public/a.txt");
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let mut withheld = std::collections::HashSet::new();
+        withheld.insert(secret.clone());
+
+        let pack = build_filtered_pack(&bare, &withheld).unwrap();
+        let ids = pack_object_ids(&pack);
+        assert!(ids.contains(&public), "public blob must be in the pack");
+        assert!(
+            !ids.contains(&secret),
+            "secret blob must NOT be in the pack"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_clone_lacks_withheld_blob_bytes() {
+        use axum::body::to_bytes;
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let g = |args: &[&str], dir: &std::path::Path| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success());
+        };
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"pub\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"SECRET\n").unwrap();
+        g(&["init", "-q"], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        g(&["add", "."], &work);
+        g(&["commit", "-qm", "init"], &work);
+        let oid = |p: &str| {
+            let o = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{p}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let secret_oid = oid("secret/b.txt");
+        let public_oid = oid("public/a.txt");
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let mut withheld = std::collections::HashSet::new();
+        withheld.insert(secret_oid.clone());
+
+        // A realistic v0 request advertises side-band-64k, so the serve frames
+        // the pack in band 1 (the path real clients exercise).
+        let req = Bytes::from_static(
+            b"0098want 0000000000000000000000000000000000000000 \
+              side-band-64k ofs-delta agent=git/2\n00000009done\n",
+        );
+        let resp = upload_pack_excluding(&bare, req, &withheld).await.unwrap();
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let ids = pack_object_ids(&extract_pack(&body));
+        assert!(
+            ids.contains(&public_oid),
+            "public blob must be present in served pack"
+        );
+        assert!(
+            !ids.contains(&secret_oid),
+            "withheld blob must be absent from served pack"
+        );
+    }
+
+    /// Strip the v0 upload-pack framing (NAK line + sideband-64k bands),
+    /// returning the raw pack. Mirrors how a client de-frames the band-1 stream.
+    fn extract_pack(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 4 <= body.len() {
+            let len =
+                usize::from_str_radix(std::str::from_utf8(&body[i..i + 4]).unwrap_or("0000"), 16)
+                    .unwrap_or(0);
+            if len == 0 {
+                i += 4;
+                continue;
+            }
+            let chunk = &body[i + 4..i + len];
+            // band 1 = pack data; skip the NAK line and any other bands.
+            if chunk.first() == Some(&0x01) {
+                out.extend_from_slice(&chunk[1..]);
+            }
+            i += len;
+        }
+        out
+    }
+
+    // Shared harness for the real-git server tests: a minimal smart-HTTP server
+    // backed by the real info_refs + upload_pack_excluding.
+
+    #[derive(Clone)]
+    struct FilterState {
+        repo: std::path::PathBuf,
+        withheld: HashSet<String>,
+    }
+
+    async fn refs_handler(
+        axum::extract::State(st): axum::extract::State<std::sync::Arc<FilterState>>,
+        axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    ) -> Response {
+        let service = q.get("service").cloned().unwrap_or_default();
+        info_refs(&st.repo, &service).await.unwrap()
+    }
+
+    async fn pack_handler(
+        axum::extract::State(st): axum::extract::State<std::sync::Arc<FilterState>>,
+        body: Bytes,
+    ) -> Response {
+        upload_pack_excluding(&st.repo, body, &st.withheld)
+            .await
+            .unwrap()
+    }
+
+    /// Spawn the server for `bare`, withholding `withheld`. Returns the clone URL
+    /// and the server task (abort it when done).
+    async fn spawn_filter_server(
+        bare: std::path::PathBuf,
+        withheld: HashSet<String>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::routing::{get, post};
+        let state = std::sync::Arc::new(FilterState {
+            repo: bare,
+            withheld,
+        });
+        let app = axum::Router::new()
+            .route("/repo.git/info/refs", get(refs_handler))
+            .route("/repo.git/git-upload-pack", post(pack_handler))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://127.0.0.1:{port}/repo.git"), handle)
+    }
+
+    fn run_git(args: &[&str], dir: &std::path::Path) {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    /// Build a work repo (public/a.txt, secret/b.txt) and a bare clone of it.
+    /// Returns (work, bare, secret_blob_oid, public_blob_oid).
+    fn fixture_with_secret(
+        td: &TempDir,
+    ) -> (std::path::PathBuf, std::path::PathBuf, String, String) {
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"pub\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"SECRET\n").unwrap();
+        run_git(&["init", "-q"], &work);
+        run_git(&["config", "user.email", "t@t"], &work);
+        run_git(&["config", "user.name", "t"], &work);
+        run_git(&["add", "."], &work);
+        run_git(&["commit", "-qm", "init"], &work);
+        let oid = |p: &str| {
+            let o = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{p}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        let secret_oid = oid("secret/b.txt");
+        let public_oid = oid("public/a.txt");
+        run_git(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        (work, bare, secret_oid, public_oid)
+    }
+
+    /// Enumerate exactly the objects a repo physically has (no promisor lazy
+    /// fetch), so tests assert on what bytes actually crossed the wire.
+    fn local_object_ids(repo: &std::path::Path) -> String {
+        let out = Command::new("git")
+            .args(["cat-file", "--batch-all-objects", "--batch-check"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// End-to-end: a real `git` client clones through `info_refs` +
+    /// `upload_pack_excluding` and ends up without the withheld blob's bytes
+    /// while still seeing its tree entry (SHA). Uses a partial clone
+    /// (`--filter`) because a pack that omits a referenced blob is only
+    /// accepted by a promisor-aware client; a stock full clone is refused at
+    /// fetch time by the connectivity check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_git_partial_clone_omits_withheld_blob() {
+        let td = TempDir::new().unwrap();
+        let (_work, bare, secret_oid, public_oid) = fixture_with_secret(&td);
+
+        let (url, server) = spawn_filter_server(bare, HashSet::from([secret_oid.clone()])).await;
+
+        let dest = td.path().join("clone");
+        let dest_s = dest.to_str().unwrap().to_string();
+        let out = tokio::task::spawn_blocking(move || {
+            Command::new("git")
+                .args([
+                    "-c",
+                    "protocol.version=2",
+                    "clone",
+                    "--filter=blob:none",
+                    "--no-checkout",
+                    "-q",
+                    &url,
+                    &dest_s,
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            out.status.success(),
+            "clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The public blob is present in the clone, the withheld blob is not.
+        let local = local_object_ids(&dest);
+        assert!(
+            local.contains(&public_oid),
+            "public blob should be present in the clone"
+        );
+        assert!(
+            !local.contains(&secret_oid),
+            "withheld blob bytes must be absent from the clone"
+        );
+
+        // The tree entry (and SHA) for the private file is still visible.
+        let tree = Command::new("git")
+            .args(["ls-tree", "-r", "HEAD"])
+            .current_dir(&dest)
+            .output()
+            .unwrap();
+        let tree = String::from_utf8_lossy(&tree.stdout);
+        assert!(
+            tree.contains(&secret_oid) && tree.contains("secret/b.txt"),
+            "the private path and its blob SHA must remain visible: {tree}"
+        );
+
+        server.abort();
+    }
+
+    /// End-to-end: an incremental `git fetch` after a partial clone still works
+    /// and still withholds the private blob. The serve path ignores the client's
+    /// have/want negotiation and always sends a self-contained pack of all refs
+    /// minus the withheld blobs (it replies NAK, so the client treats it as "no
+    /// common commits" and accepts the full set). This is correct, just not
+    /// bandwidth-optimal; thin-pack/negotiation is an optimization follow-up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_git_fetch_after_partial_clone_still_withholds() {
+        let td = TempDir::new().unwrap();
+        let (work, bare, secret_oid, _public_oid) = fixture_with_secret(&td);
+        let branch = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+
+        let (url, server) =
+            spawn_filter_server(bare.clone(), HashSet::from([secret_oid.clone()])).await;
+
+        // Partial-clone the initial state.
+        let dest = td.path().join("clone");
+        let dest_s = dest.to_str().unwrap().to_string();
+        let url_c = url.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            Command::new("git")
+                .args([
+                    "-c",
+                    "protocol.version=2",
+                    "clone",
+                    "--filter=blob:none",
+                    "--no-checkout",
+                    "-q",
+                    &url_c,
+                    &dest_s,
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Add a new public commit on the server side.
+        std::fs::write(work.join("public/c.txt"), b"v2\n").unwrap();
+        run_git(&["add", "."], &work);
+        run_git(&["commit", "-qm", "c2"], &work);
+        let new_oid = {
+            let o = Command::new("git")
+                .args(["rev-parse", "HEAD:public/c.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        run_git(&["push", "-q", bare.to_str().unwrap(), &branch], &work);
+
+        // Incremental fetch: the client has c1 and asks for the update.
+        let dest_f = dest.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            Command::new("git")
+                .args(["-c", "protocol.version=2", "fetch", "-q", "origin"])
+                .current_dir(&dest_f)
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "fetch failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The new commit's blob arrived; the withheld blob is still absent.
+        let local = local_object_ids(&dest);
+        assert!(
+            local.contains(&new_oid),
+            "the new commit's blob must be fetched"
+        );
+        assert!(
+            !local.contains(&secret_oid),
+            "withheld blob must remain absent after fetch"
+        );
+
+        server.abort();
+    }
 }
