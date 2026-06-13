@@ -7,6 +7,7 @@
 //! no-op, so nodes without Pinata backing work fine.
 
 use anyhow::Result;
+use std::collections::HashSet;
 
 /// Pin a single git object's raw bytes on Pinata (v3 API).
 ///
@@ -76,6 +77,7 @@ pub async fn pin_new_objects(
     jwt: &str,
     repo_path: &std::path::Path,
     db: &crate::db::Db,
+    withheld: &HashSet<String>,
 ) -> Vec<(String, String)> {
     if jwt.is_empty() {
         return vec![];
@@ -92,6 +94,7 @@ pub async fn pin_new_objects(
             return vec![];
         }
     };
+    let object_list = crate::git::visibility_pack::replicable_objects(object_list, withheld);
 
     let mut pinned = Vec::new();
 
