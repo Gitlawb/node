@@ -342,7 +342,8 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/repos/{owner}/{repo}/replicas",
             get(replicas::list_replicas),
-        );
+        )
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // git-upload-pack (clone/fetch) — same raised body limit as receive-pack so
     // large pack responses from the server don't get truncated on the client side.
