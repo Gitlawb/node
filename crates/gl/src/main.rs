@@ -7,6 +7,7 @@ mod agent;
 mod bounty;
 mod cert;
 mod changelog;
+mod clone;
 mod doctor;
 mod http;
 mod identity;
@@ -56,6 +57,9 @@ enum Commands {
 
     /// Register this agent with a gitlawb node
     Register(register::RegisterArgs),
+
+    /// Clone a gitlawb repo, handling private subtrees cleanly
+    Clone(clone::CloneArgs),
 
     /// Manage repositories
     Repo(repo::RepoArgs),
@@ -150,6 +154,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Identity { cmd } => identity::run(cmd).await,
         Commands::Register(args) => register::run(args).await,
+        Commands::Clone(args) => clone::run(args).await,
         Commands::Repo(args) => repo::run(args).await,
         Commands::Issue(args) => issue::run(args).await,
         Commands::Pr(args) => pr::run(args).await,
