@@ -326,6 +326,7 @@ pub fn branch_diff_names(
         .args([
             "diff",
             "--name-only",
+            "-z",
             &format!("{target_branch}...{source_branch}"),
         ])
         .current_dir(repo_path)
@@ -335,10 +336,14 @@ pub fn branch_diff_names(
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("git diff --name-only failed: {stderr}");
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_string())
+    // Split on NUL (`-z`) so paths containing newlines keep their exact bytes;
+    // `--name-only` without `-z` would quote/escape such paths and they would no
+    // longer match the visibility globs in get_pr_diff, leaking the diff.
+    Ok(output
+        .stdout
+        .split(|b| *b == b'\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect())
 }
 
