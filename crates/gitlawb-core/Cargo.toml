@@ -3,6 +3,7 @@ name = "gitlawb-core"
 description = "Core cryptographic primitives for the gitlawb network: DIDs, CIDs, UCAN, HTTP Signatures, ref-update certificates"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
