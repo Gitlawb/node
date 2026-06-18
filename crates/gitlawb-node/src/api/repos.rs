@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::cert;
 use crate::error::{AppError, Result};
-use crate::git::{smart_http, store};
+use crate::git::{smart_http, store, visibility_pack};
 use crate::state::AppState;
 use crate::visibility::{visibility_check, Decision};
 use crate::webhooks;
@@ -330,6 +330,8 @@ pub async fn git_info_refs(
     if service == "git-upload-pack" {
         let rules = state.db.list_visibility_rules(&record.id).await?;
         let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+        // Subtree (mode B) rules do not gate the advertisement: refs expose commit
+        // tips only, and blob withholding happens in the upload-pack pack build.
         if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
             == Decision::Deny
         {
@@ -392,18 +394,45 @@ pub async fn git_upload_pack(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let body_len = body.len();
-    let resp = smart_http::upload_pack(&disk_path, body)
+
+    // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep that
+    // off the async worker thread.
+    let withheld = {
+        let path = disk_path.clone();
+        let rules = rules.clone();
+        let owner_did = record.owner_did.clone();
+        let caller_owned = caller.map(str::to_string);
+        let is_public = record.is_public;
+        tokio::task::spawn_blocking(move || {
+            visibility_pack::withheld_blob_oids(
+                &path,
+                &rules,
+                is_public,
+                &owner_did,
+                caller_owned.as_deref(),
+            )
+        })
         .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("bad line length") || msg.contains("protocol error") {
-                tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request");
-                AppError::BadRequest(msg)
-            } else {
-                tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
-                AppError::Git(msg)
-            }
-        })?;
+        .map_err(|e| AppError::Git(e.to_string()))?
+        .map_err(|e| AppError::Git(e.to_string()))?
+    };
+
+    let resp = if withheld.is_empty() {
+        smart_http::upload_pack(&disk_path, body).await
+    } else {
+        tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
+        smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
+    }
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("bad line length") || msg.contains("protocol error") {
+            tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request");
+            AppError::BadRequest(msg)
+        } else {
+            tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
+            AppError::Git(msg)
+        }
+    })?;
     crate::metrics::record_fetch(&format!("{owner}/{name}"));
     crate::metrics::observe_pack_size(body_len as f64);
     Ok(resp)
