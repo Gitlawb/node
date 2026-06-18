@@ -330,6 +330,7 @@ async fn main() -> Result<()> {
         sync::start(
             Arc::clone(&state.db),
             Arc::clone(&state.config),
+            Arc::clone(&state.node_keypair),
             state.subscribe_shutdown(),
         );
         info!("auto-sync worker started");
