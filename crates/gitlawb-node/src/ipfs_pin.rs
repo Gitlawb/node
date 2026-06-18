@@ -7,6 +7,8 @@
 //! If `ipfs_api` is empty the functions are no-ops, so the node works fine
 //! without a local IPFS daemon.
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use gitlawb_core::cid::Cid;
 
@@ -78,6 +80,7 @@ pub async fn pin_new_objects(
     ipfs_api: &str,
     repo_path: &std::path::Path,
     db: &crate::db::Db,
+    withheld: &HashSet<String>,
 ) -> Vec<(String, String)> {
     if ipfs_api.is_empty() {
         return vec![];
@@ -91,6 +94,8 @@ pub async fn pin_new_objects(
             return vec![];
         }
     };
+
+    let object_list = crate::git::visibility_pack::replicable_objects(object_list, withheld);
 
     let mut pinned = Vec::new();
 

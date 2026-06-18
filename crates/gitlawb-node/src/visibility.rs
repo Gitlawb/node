@@ -351,4 +351,24 @@ mod tests {
             Decision::Allow
         );
     }
+
+    // Mirrors the gossip-announce gate in git_receive_pack: announce iff an
+    // anonymous caller can read "/".
+    #[test]
+    fn announce_gate_matches_public_readability() {
+        let announce = |rules: &[VisibilityRule], is_public: bool| {
+            visibility_check(rules, is_public, OWNER, None, "/") == Decision::Allow
+        };
+        // Public repo, no rules → announce.
+        assert!(announce(&[], true));
+        // Legacy private repo (is_public false, no rules) → silent.
+        assert!(!announce(&[], false));
+        // Mode A whole-repo rule with no public readers → silent.
+        assert!(!announce(&[rule("/", VisibilityMode::A, &[])], true));
+        // Mode B public repo with a private subtree → still announce.
+        assert!(announce(
+            &[rule("/secret/**", VisibilityMode::B, &[])],
+            true
+        ));
+    }
 }

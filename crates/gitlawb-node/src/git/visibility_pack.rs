@@ -77,6 +77,16 @@ pub fn withheld_blob_oids(
     Ok(denied.difference(&allowed).cloned().collect())
 }
 
+/// Objects that may replicate to the public: everything not in `withheld`.
+/// Order-preserving. The single seam every replication site (IPFS, Pinata)
+/// passes its object list through; option B would later reroute the withheld
+/// ones through encrypt-then-pin instead of dropping them.
+pub fn replicable_objects(all: Vec<String>, withheld: &HashSet<String>) -> Vec<String> {
+    all.into_iter()
+        .filter(|oid| !withheld.contains(oid))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,6 +157,24 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_caller_withholds_only_private_blob() {
+        let (_td, bare, secret_oid, public_oid) = fixture();
+        let rules = [rule("/secret/**", &[])];
+        // caller = None models the public / any peer: what must not replicate.
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob must be withheld"
+        );
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must replicate"
+        );
+        // Trees and commits are never withheld; the set holds only the secret blob.
+        assert_eq!(withheld.len(), 1, "only the secret blob OID is withheld");
+    }
+
+    #[test]
     fn non_reader_withholds_only_the_private_blob() {
         let (_td, bare, secret, public) = fixture();
         let rules = [rule("/secret/**", &["did:key:zFriend"])];
@@ -185,5 +213,21 @@ mod tests {
             withheld.is_empty(),
             "public repo, no rules, nothing withheld"
         );
+    }
+
+    #[test]
+    fn replicable_objects_drops_withheld_keeps_rest() {
+        let all = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
+        let withheld: HashSet<String> = ["bbb".to_string()].into_iter().collect();
+        let got = replicable_objects(all, &withheld);
+        assert_eq!(got, vec!["aaa".to_string(), "ccc".to_string()]);
+    }
+
+    #[test]
+    fn replicable_objects_empty_withheld_keeps_all() {
+        let all = vec!["aaa".to_string(), "bbb".to_string()];
+        let withheld: HashSet<String> = HashSet::new();
+        let got = replicable_objects(all.clone(), &withheld);
+        assert_eq!(got, all);
     }
 }
