@@ -130,10 +130,19 @@ impl RepoStore {
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
-                tigris
-                    .download(&owner_slug, repo_name, &local_path)
-                    .await
-                    .context("downloading repo from tigris (fresh)")?;
+                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
+                    // The Tigris archive is present (HEAD ok) but unreadable — a
+                    // corrupt/partial upload, or a transient GET failure. If we have a
+                    // valid local copy, proceed with it rather than blocking the write;
+                    // the post-write upload re-syncs (self-heals) Tigris. Only hard-fail
+                    // when there is no local copy to fall back to.
+                    if local_path.exists() {
+                        warn!(repo = %repo_name, err = %e,
+                            "acquire_fresh: tigris download failed — falling back to local copy");
+                        return Ok(local_path);
+                    }
+                    return Err(e).context("downloading repo from tigris (fresh)");
+                }
                 return Ok(local_path);
             }
         }
@@ -174,10 +183,17 @@ impl RepoStore {
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                tigris
-                    .download(&owner_slug, repo_name, &local_path)
-                    .await
-                    .context("downloading repo from tigris for write")?;
+                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
+                    // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
+                    // Tigris archive must not block a write when a valid local copy
+                    // exists — release(success) will re-upload a good archive.
+                    if local_path.exists() {
+                        warn!(repo = %repo_name, err = %e,
+                            "write acquire: tigris download failed — falling back to local copy");
+                    } else {
+                        return Err(e).context("downloading repo from tigris for write");
+                    }
+                }
             }
         }
 
@@ -348,16 +364,24 @@ impl RepoWriteGuard {
         &self.local_path
     }
 
-    /// Upload to Tigris and release the advisory lock. Call this when the write is done.
-    pub async fn release(self) {
-        // Upload to Tigris
-        if let Some(ref tigris) = self.tigris {
-            if let Err(e) = tigris
-                .upload(&self.owner_slug, &self.repo_name, &self.local_path)
-                .await
-            {
-                warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+    /// Upload to Tigris (only when the write succeeded) and release the advisory
+    /// lock. Pass `success = false` when the write operation failed — uploading a
+    /// half-applied or otherwise inconsistent repo would propagate corruption to
+    /// Tigris (and to every node that later downloads it). The lock is always
+    /// released regardless, to avoid stale locks blocking future writes.
+    pub async fn release(self, success: bool) {
+        // Upload to Tigris only on success.
+        if success {
+            if let Some(ref tigris) = self.tigris {
+                if let Err(e) = tigris
+                    .upload(&self.owner_slug, &self.repo_name, &self.local_path)
+                    .await
+                {
+                    warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+                }
             }
+        } else {
+            warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
         // Release advisory lock

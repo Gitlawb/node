@@ -484,8 +484,9 @@ pub async fn git_receive_pack(
     let receive_result = smart_http::receive_pack(&disk_path, body).await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes to the same repo.
-    guard.release().await;
+    // from blocking subsequent pushes. Only upload to Tigris when the push
+    // succeeded; uploading a half-applied repo would propagate corruption.
+    guard.release(receive_result.is_ok()).await;
 
     let result = receive_result.map_err(|e| {
         tracing::error!(repo = %name, err = %e, "git receive-pack failed");
