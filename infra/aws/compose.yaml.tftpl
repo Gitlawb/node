@@ -4,6 +4,22 @@
 # `$${VAR}` entries are resolved by docker compose from /opt/gitlawb/.env at runtime.
 
 services:
+%{ if domain_name != "" ~}
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      node:
+        condition: service_healthy
+    ports:
+      - "80:80"    # redirects to https
+      - "443:443"  # Let's Encrypt cert, auto-renewed; certs persist on the EBS volume
+    command: caddy reverse-proxy --from ${domain_name} --to node:${gitlawb_port}
+    volumes:
+      - /mnt/data/caddy:/data
+    restart: unless-stopped
+
+%{ endif ~}
+%{ if db_host == "" ~}
   postgres:
     image: postgres:16-alpine
     environment:
@@ -19,11 +35,14 @@ services:
       retries: 5
     restart: unless-stopped
 
+%{ endif ~}
   node:
     image: ${image_repo}:${image_tag}
+%{ if db_host == "" ~}
     depends_on:
       postgres:
         condition: service_healthy
+%{ endif ~}
     ports:
       - "${gitlawb_port}:${gitlawb_port}"          # HTTP API + git smart-HTTP
       - "${p2p_port}:${p2p_port}/udp"              # libp2p QUIC
@@ -33,7 +52,7 @@ services:
     volumes:
       - /mnt/data/node:/data
     environment:
-      DATABASE_URL: postgresql://${pg_user}:$${POSTGRES_PASSWORD}@postgres:5432/${pg_db}
+      DATABASE_URL: postgresql://${pg_user}:$${POSTGRES_PASSWORD}@${db_host != "" ? db_host : "postgres"}:5432/${pg_db}
       GITLAWB_HOST: 0.0.0.0
       GITLAWB_PORT: "${gitlawb_port}"
       GITLAWB_P2P_PORT: "${p2p_port}"

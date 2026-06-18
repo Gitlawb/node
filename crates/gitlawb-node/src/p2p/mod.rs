@@ -228,9 +228,14 @@ pub async fn start(
         gossipsub,
         identify,
     };
-    let transport = libp2p_quic::tokio::Transport::new(libp2p_quic::Config::new(&local_key))
-        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
-        .boxed();
+    // DNS wraps QUIC so multiaddrs like /dns6/<app>.internal/udp/…/quic-v1
+    // resolve at dial time. On Fly, peer nodes must dial each other over the
+    // private 6PN network via <app>.internal hostnames — dialing through the
+    // public anycast edge breaks the handshake (the proxy closes the
+    // connection mid-stream).
+    let quic = libp2p_quic::tokio::Transport::new(libp2p_quic::Config::new(&local_key))
+        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)));
+    let transport = libp2p_dns::tokio::Transport::system(quic)?.boxed();
     let mut swarm = Swarm::new(
         transport,
         behaviour,
@@ -242,9 +247,17 @@ pub async fn start(
     let topic = gossipsub::IdentTopic::new(REF_UPDATES_TOPIC);
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
-    // Listen
-    let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
-    swarm.listen_on(listen_addr)?;
+    // Listen on both IPv4 (local/mDNS + any IPv4 dials) and IPv6 (required
+    // for Fly's 6PN inter-app network — <app>.internal DNS only returns AAAA
+    // records, so peers dial us via IPv6 and need a matching IPv6 socket).
+    let v4: Multiaddr = format!("/ip4/0.0.0.0/udp/{listen_port}/quic-v1").parse()?;
+    if let Err(e) = swarm.listen_on(v4) {
+        warn!(err = %e, "failed to listen on IPv4");
+    }
+    let v6: Multiaddr = format!("/ip6/::/udp/{listen_port}/quic-v1").parse()?;
+    if let Err(e) = swarm.listen_on(v6) {
+        warn!(err = %e, "failed to listen on IPv6");
+    }
 
     // Bootstrap Kademlia with known peers
     for addr in bootstrap_addrs {

@@ -7,13 +7,21 @@ instance_type = "t4g.small" # ARM/Graviton; node image is multi-arch
 # --- Image -----------------------------------------------------------------
 # image_repo = "ghcr.io/gitlawb/node"
 # image_tag  = "latest" # pin a version for production, e.g. "0.9.2"
+# Or host the image in a private ECR repo in this account (image_repo is then
+# ignored; build & push per README "Building and pushing the image"):
+# create_ecr_repo = true
 
 # --- Storage ---------------------------------------------------------------
 # data_volume_size_gb   = 20
 # snapshot_retain_count = 7
 
 # --- Node configuration (defaults mirror infra/fly/fly.toml) ---------------
-# Set to your real DNS name for production; defaults to http://<elastic-ip>:7545
+# DNS name pointing at the Elastic IP: enables a Caddy sidecar with automatic
+# HTTPS (Let's Encrypt) on 80/443, and public_url becomes https://<domain>
+# domain_name = "node.example.com"
+
+# Explicit override; rarely needed when domain_name is set.
+# Defaults to https://<domain_name>, else http://<elastic-ip>:7545
 # public_url = "https://node.example.com"
 
 # bootstrap_peers = "https://node.gitlawb.com,https://node2.gitlawb.com,https://node3.gitlawb.com"

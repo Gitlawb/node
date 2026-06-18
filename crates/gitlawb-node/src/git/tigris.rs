@@ -157,16 +157,46 @@ fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
 }
 
 /// Decompress a tar.zst byte vector into a local directory.
+///
+/// Extraction is atomic with respect to `local_path`: the archive is unpacked
+/// into a sibling temp directory first, and only swapped into place once it
+/// fully succeeds. A corrupt or truncated archive therefore can never clobber a
+/// good existing copy at `local_path` — on failure we discard the temp dir and
+/// leave `local_path` exactly as it was.
 fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
-    // Ensure parent directory exists
-    if let Some(parent) = local_path.parent() {
-        std::fs::create_dir_all(parent).context("creating parent dir")?;
-    }
-    std::fs::create_dir_all(local_path).context("creating repo dir")?;
+    let parent = local_path.parent().context("repo path has no parent")?;
+    std::fs::create_dir_all(parent).context("creating parent dir")?;
 
-    let decoder = zstd::stream::Decoder::new(data)?;
-    let mut archive = tar::Archive::new(decoder);
-    archive.unpack(local_path).context("unpacking tar.zst")?;
+    let file_name = local_path
+        .file_name()
+        .context("repo path has no file name")?
+        .to_string_lossy();
+    let tmp_dir = parent.join(format!(".{file_name}.tmp-extract"));
+
+    // Clear any leftover temp dir from a previously-interrupted extraction.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
+
+    // Unpack into the temp dir; on any failure, clean up and bail without
+    // touching local_path.
+    let unpack = (|| -> Result<()> {
+        let decoder = zstd::stream::Decoder::new(data)?;
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(&tmp_dir).context("unpacking tar.zst")?;
+        Ok(())
+    })();
+    if let Err(e) = unpack {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+
+    // Swap the freshly-extracted repo into place. rename within the same parent
+    // is effectively atomic, but most platforms refuse to rename onto a
+    // non-empty dir, so remove the old copy first.
+    if local_path.exists() {
+        std::fs::remove_dir_all(local_path).context("removing stale repo dir")?;
+    }
+    std::fs::rename(&tmp_dir, local_path).context("swapping extracted repo into place")?;
 
     Ok(())
 }

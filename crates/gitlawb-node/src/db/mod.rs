@@ -852,7 +852,14 @@ impl Db {
             "WITH deduped AS (
                  SELECT DISTINCT ON (split_part(owner_did, ':', -1), name)
                      id, name, owner_did, description, is_public, default_branch,
-                     created_at, updated_at, disk_path, forked_from, machine_id
+                     created_at,
+                     -- group MAX, not the canonical row's own value: pushes that
+                     -- arrive via gossip touch only the mirror row, so the
+                     -- canonical updated_at goes stale
+                     MAX(updated_at) OVER (
+                         PARTITION BY split_part(owner_did, ':', -1), name
+                     ) AS updated_at,
+                     disk_path, forked_from, machine_id
                  FROM repos
                  WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)
                  ORDER BY split_part(owner_did, ':', -1), name,
