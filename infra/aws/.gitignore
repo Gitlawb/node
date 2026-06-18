@@ -11,3 +11,7 @@ crash.*.log
 !terraform.tfvars.example
 
 # Note: .terraform.lock.hcl IS committed (reproducible provider versions)
+
+# Saved plan files can embed sensitive values
+tfplan
+*.tfplan

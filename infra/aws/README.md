@@ -66,6 +66,23 @@ Bootstrap log: `/var/log/gitlawb-bootstrap.log`. Stack lives in `/opt/gitlawb`
 
 SSH is off by default; set `ssh_ingress_cidr` + `ssh_key_name` if you need it.
 
+## Building and pushing the image (ECR mode)
+
+With `create_ecr_repo = true` the instance pulls from a private ECR repo in
+this account instead of an external registry (the instance role gets pull
+rights via the amazon-ecr-credential-helper). Build from the repo root —
+arm64 to match t4g (native on Apple Silicon):
+
+```sh
+ECR_URL=$(terraform -chdir=infra/aws output -raw ecr_repository_url)
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin "${ECR_URL%%/*}"
+docker build --platform linux/arm64 -t "$ECR_URL:latest" .
+docker push "$ECR_URL:latest"
+```
+
+Then run the upgrade command (below) to roll it out.
+
 ## Upgrading the node
 
 User-data only runs at first boot, so upgrades go through SSM:
@@ -134,5 +151,7 @@ them up in the EC2 console if unwanted. The Elastic IP is released on destroy.
   `ssm_kms_key_id` to encrypt with a customer-managed KMS key instead (the
   instance role is granted `kms:Decrypt` on that key automatically).
 - IMDSv2 is required; metrics port is closed unless `metrics_ingress_cidr` is set.
-- The node serves plain HTTP on 7545. For TLS, put a DNS name + proxy
-  (ALB/CloudFront/Caddy) in front and set `public_url` accordingly.
+- The node itself serves plain HTTP on 7545. Set `domain_name` (with DNS
+  pointing at the Elastic IP) to run a Caddy sidecar with automatic Let's
+  Encrypt TLS on 443 (+ http→https redirect on 80) — matching the Fly nodes.
+  Certs persist on the data volume (`/mnt/data/caddy`).

@@ -64,9 +64,15 @@ variable "snapshot_retain_count" {
 # ---------------------------------------------------------------------------
 
 variable "image_repo" {
-  description = "Container image repository for the node (public, multi-arch)"
+  description = "Container image repository for the node. Ignored when create_ecr_repo is true (the module-managed ECR repo is used instead)."
   type        = string
   default     = "ghcr.io/gitlawb/node"
+}
+
+variable "create_ecr_repo" {
+  description = "Create a private ECR repository in this account and pull the node image from it (instance role gets pull rights via a credential helper). Push images with scripts in the README."
+  type        = bool
+  default     = false
 }
 
 variable "image_tag" {
@@ -131,6 +137,12 @@ variable "ssh_key_name" {
 # Node configuration (defaults mirror infra/fly/fly.toml)
 # ---------------------------------------------------------------------------
 
+variable "domain_name" {
+  description = "DNS name pointing at the Elastic IP. When set, a Caddy sidecar terminates TLS on 80/443 with an auto-renewed Let's Encrypt cert, and public_url defaults to https://<domain_name>."
+  type        = string
+  default     = ""
+}
+
 variable "public_url" {
   description = "Public URL of this node (GITLAWB_PUBLIC_URL). Leave empty to default to http://<elastic-ip>:<port> after apply — set a real DNS name for production."
   type        = string
@@ -164,6 +176,36 @@ variable "ssm_kms_key_id" {
 # ---------------------------------------------------------------------------
 # Postgres
 # ---------------------------------------------------------------------------
+
+variable "use_rds" {
+  description = "Run Postgres in RDS instead of a container on the instance. The DB then survives instance loss with automated backups."
+  type        = bool
+  default     = false
+}
+
+variable "rds_instance_class" {
+  description = "RDS instance class (only used when use_rds)"
+  type        = string
+  default     = "db.t4g.micro"
+}
+
+variable "rds_allocated_storage_gb" {
+  description = "RDS storage in GB (only used when use_rds)"
+  type        = number
+  default     = 20
+}
+
+variable "rds_backup_retention_days" {
+  description = "RDS automated backup retention (only used when use_rds)"
+  type        = number
+  default     = 7
+}
+
+variable "alert_email" {
+  description = "Email for CloudWatch alarm notifications via SNS (confirm the subscription email once). Empty = no alarms."
+  type        = string
+  default     = ""
+}
 
 variable "postgres_user" {
   description = "Postgres user for the node database"
