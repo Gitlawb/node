@@ -763,7 +763,7 @@ mod tests {
 
     // ── #53 regression: served-git process-group teardown ──────────────────
     //
-    // run_git_service runs git in its own process group and SIGKILLs that group
+    // run_git_service runs git in its own process group and SIGTERMs that group
     // when the request future is dropped (client disconnect) or returns early, so
     // git AND its pack-objects child die together instead of orphaning a zombie.
     // These exercise the KillGroupOnDrop guard that wires that up.
@@ -787,7 +787,7 @@ mod tests {
 
         {
             let _guard = KillGroupOnDrop { pgid };
-        } // guard drops here -> SIGKILL to the group
+        } // guard drops here -> SIGTERM to the group
 
         use std::os::unix::process::ExitStatusExt;
         let status = child.wait().await.unwrap();
