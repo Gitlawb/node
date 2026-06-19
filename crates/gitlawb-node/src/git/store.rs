@@ -314,6 +314,39 @@ pub fn branch_diff(repo_path: &Path, target_branch: &str, source_branch: &str) -
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// The repo-relative paths changed by `git diff target...source` (the same range
+/// as `branch_diff`). Used to enforce per-path visibility on a PR diff: if the
+/// caller cannot read one of these paths, the diff is withheld.
+pub fn branch_diff_names(
+    repo_path: &Path,
+    target_branch: &str,
+    source_branch: &str,
+) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            &format!("{target_branch}...{source_branch}"),
+        ])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git diff --name-only")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git diff --name-only failed: {stderr}");
+    }
+    // Split on NUL (`-z`) so paths containing newlines keep their exact bytes;
+    // `--name-only` without `-z` would quote/escape such paths and they would no
+    // longer match the visibility globs in get_pr_diff, leaking the diff.
+    Ok(output
+        .stdout
+        .split(|b| *b == b'\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect())
+}
+
 /// Merge source_branch into target_branch in a bare repo using a temporary worktree.
 /// Returns the new merge commit hash.
 pub fn merge_branch(
@@ -398,4 +431,54 @@ pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> Pat
     // Sanitize the DID for use as a directory name
     let owner_slug = owner_did.replace([':', '/'], "_");
     repos_dir.join(owner_slug).join(format!("{repo_name}.git"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::branch_diff_names;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn branch_diff_names_lists_changed_paths() {
+        let td = tempfile::TempDir::new().unwrap();
+        let work: &Path = td.path();
+        let g = |args: &[&str]| {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(work)
+                .status()
+                .unwrap()
+                .success());
+        };
+        g(&["init", "-q"]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(work.join("base.txt"), b"base\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "base"]);
+        let main = {
+            let o = Command::new("git")
+                .args(["symbolic-ref", "--short", "HEAD"])
+                .current_dir(work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        g(&["checkout", "-q", "-b", "feature"]);
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("secret/x.txt"), b"secret\n").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-qm", "feat"]);
+
+        let names = branch_diff_names(work, &main, "feature").unwrap();
+        assert!(
+            names.iter().any(|p| p == "secret/x.txt"),
+            "expected secret/x.txt in changed paths, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|p| p == "base.txt"),
+            "unchanged file must not appear: {names:?}"
+        );
+    }
 }

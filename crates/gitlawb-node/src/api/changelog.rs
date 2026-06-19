@@ -1,9 +1,10 @@
 //! Changelog endpoint — unified timeline of commits, merged PRs, and closed issues.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 
+use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::git::store;
 use crate::state::AppState;
@@ -27,12 +28,11 @@ pub async fn get_changelog(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<ChangelogQuery>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let limit = query.limit.min(100);
 
