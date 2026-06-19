@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest an improvement or new capability
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that's hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: Does this touch the protocol?
+      description: Identity, signatures, UCAN, ref certs, or P2P wire formats. Protocol changes need an issue discussion before any PR.
+      options:
+        - "No"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: true
