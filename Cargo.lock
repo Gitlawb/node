@@ -3295,6 +3295,7 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "libc",
  "libp2p-core",
  "libp2p-dns",
  "libp2p-gossipsub",

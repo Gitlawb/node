@@ -75,15 +75,64 @@ pub async fn receive_pack(repo_path: &Path, request_body: Bytes) -> Result<Respo
         .body(Body::from(output))?)
 }
 
+/// SIGKILLs a child's whole process group on drop, unless disarmed first.
+///
+/// A served `git upload-pack`/`receive-pack` forks helpers such as `pack-objects`.
+/// If the request future is dropped (client disconnect) or returns early, dropping
+/// the tokio `Child` does not kill `git`; it dies later on EPIPE, and its
+/// `pack-objects` child reparents to PID 1 and is never reaped — a zombie that
+/// accumulates until `fork()` fails with EAGAIN (#53). Spawning the child in its
+/// own process group and killing that group here tears the whole tree down at the
+/// source. The guard is disarmed once `wait_with_output()` returns, so a request
+/// that completed cleanly never signals anything.
+#[cfg(unix)]
+struct KillGroupOnDrop {
+    pgid: Option<i32>,
+}
+
+#[cfg(unix)]
+impl KillGroupOnDrop {
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            // SAFETY: kill(2) is async-signal-safe and takes no borrowed memory.
+            // Signalling a stale group just returns ESRCH, which we ignore.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
 async fn run_git_service(service: &str, repo_path: &Path, input: Bytes) -> Result<Vec<u8>> {
-    let mut child = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg(service_to_command(service))
         .arg("--stateless-rpc")
         .arg(repo_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+
+    // Run git in its own process group so the whole tree (git + pack-objects)
+    // can be killed together on disconnect rather than orphaning a grandchild.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn()?;
+
+    // Arm the group-kill guard for the lifetime of the request. With
+    // process_group(0) the child is its own group leader, so pgid == its pid.
+    #[cfg(unix)]
+    let mut group_guard = KillGroupOnDrop {
+        pgid: child.id().map(|id| id as i32),
+    };
 
     // Write request body to git's stdin
     if let Some(mut stdin) = child.stdin.take() {
@@ -91,6 +140,10 @@ async fn run_git_service(service: &str, repo_path: &Path, input: Bytes) -> Resul
     }
 
     let output = child.wait_with_output().await?;
+
+    // Clean completion: git and its group have exited, nothing to kill.
+    #[cfg(unix)]
+    group_guard.disarm();
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -152,13 +205,25 @@ pub fn build_filtered_pack(repo_path: &Path, withheld: &HashSet<String>) -> Resu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    {
+    // Feed the object ids on stdin, but always reap the child afterward even if
+    // the write fails or stdin is missing, so an error can't drop the Child
+    // unwaited and leak a zombie (#53).
+    let write_result: std::io::Result<()> = {
         use std::io::Write as _;
-        let mut stdin = child.stdin.take().expect("stdin");
-        stdin.write_all(keep.join("\n").as_bytes())?;
-        stdin.write_all(b"\n")?;
-    }
+        match child.stdin.take() {
+            Some(mut stdin) => {
+                let mut data = keep.join("\n").into_bytes();
+                data.push(b'\n');
+                stdin.write_all(&data)
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "git pack-objects stdin unavailable",
+            )),
+        }
+    };
     let out = child.wait_with_output()?;
+    write_result.context("failed to write object ids to git pack-objects stdin")?;
     if !out.status.success() {
         bail!(
             "git pack-objects failed: {}",
@@ -687,5 +752,117 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    // ── #53 regression: served-git process-group teardown ──────────────────
+    //
+    // run_git_service runs git in its own process group and SIGKILLs that group
+    // when the request future is dropped (client disconnect) or returns early, so
+    // git AND its pack-objects child die together instead of orphaning a zombie.
+    // These exercise the KillGroupOnDrop guard that wires that up.
+
+    #[cfg(unix)]
+    fn alive(pid: i32) -> bool {
+        // kill(pid, 0) probes existence: 0/EPERM => exists, ESRCH => gone.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_guard_terminates_child_on_drop() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id().map(|id| id as i32);
+
+        {
+            let _guard = KillGroupOnDrop { pgid };
+        } // guard drops here -> SIGKILL to the group
+
+        use std::os::unix::process::ExitStatusExt;
+        let status = child.wait().await.unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "child must be killed by SIGKILL via its process group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_guard_reaps_grandchild_on_drop() {
+        // The #53 scenario: git forks pack-objects. A group kill must reach the
+        // grandchild, not just the direct child. sh (the group leader) backgrounds
+        // a sleep (standing in for pack-objects) and prints its pid.
+        use tokio::io::AsyncReadExt;
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 300 & echo \"$!\"; wait")
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = child.id().map(|id| id as i32);
+
+        // Read the backgrounded grandchild's pid from the first stdout line.
+        let mut stdout = child.stdout.take().unwrap();
+        let mut buf = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            let n = stdout.read(&mut byte).await.unwrap();
+            if n == 0 || byte[0] == b'\n' {
+                break;
+            }
+            buf.push(byte[0]);
+        }
+        let grandchild: i32 = String::from_utf8(buf).unwrap().trim().parse().unwrap();
+        assert!(alive(grandchild), "grandchild should be running");
+
+        {
+            let _guard = KillGroupOnDrop { pgid };
+        } // group SIGKILL kills sh AND the sleep grandchild
+
+        let _ = child.wait().await; // reap sh
+
+        // The grandchild reparents to init and is reaped; poll until it's gone.
+        let mut gone = false;
+        for _ in 0..200 {
+            if !alive(grandchild) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gone, "grandchild must be killed by the group SIGKILL (#53)");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_guard_disarmed_does_not_kill() {
+        // A request that completed cleanly disarms the guard; dropping it must not
+        // signal anything.
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+
+        {
+            let mut guard = KillGroupOnDrop {
+                pgid: child.id().map(|id| id as i32),
+            };
+            guard.disarm();
+        } // disarmed -> no kill
+
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "disarmed guard must not kill the child"
+        );
+
+        // Clean up the still-running child.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
     }
 }

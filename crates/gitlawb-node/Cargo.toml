@@ -29,6 +29,7 @@ tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "limi
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid"] }
 clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
+libc = "0.2"
 cid = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
