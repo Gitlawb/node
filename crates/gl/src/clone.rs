@@ -29,6 +29,23 @@ pub struct CloneArgs {
 
     #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
     pub node: String,
+
+    /// Arweave gateway for B3 manifest discovery/fetch when a node cannot supply
+    /// the encrypted-blob mapping.
+    #[arg(
+        long,
+        default_value = "https://arweave.net",
+        env = "GITLAWB_ARWEAVE_GATEWAY"
+    )]
+    pub arweave_gateway: String,
+
+    /// Public IPFS gateway for fetching encrypted envelopes during B3 recovery.
+    #[arg(
+        long,
+        default_value = "https://dweb.link",
+        env = "GITLAWB_IPFS_GATEWAY"
+    )]
+    pub ipfs_gateway: String,
 }
 
 /// Run a git command inside `dir`, erroring with stderr on failure.
@@ -217,6 +234,294 @@ struct WithheldPathsResponse {
     reinclude: Vec<String>,
 }
 
+/// After the base clone, recover encrypted blobs the caller is authorized for
+/// that are missing locally: fetch the envelope, decrypt with the caller's key,
+/// install as a loose object. Returns the repo-relative paths recovered.
+/// Best-effort; logs and continues on any per-blob failure.
+async fn recover_encrypted_blobs(
+    node: &str,
+    owner: &str,
+    name: &str,
+    dest: &Path,
+    keypair: &gitlawb_core::identity::Keypair,
+) -> Result<Vec<String>> {
+    use gitlawb_core::encrypt::open_blob;
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    let dest_str = dest.to_str().context("dest path not utf-8")?;
+    let client = NodeClient::new(node, Some(keypair.clone()));
+
+    let resp = match client
+        .get_signed(&format!("/api/v1/repos/{owner}/{name}/encrypted-blobs"))
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(vec![]),
+    };
+    let body: serde_json::Value = resp.json().await.context("parsing encrypted-blobs")?;
+    let blobs = body
+        .get("blobs")
+        .and_then(|b| b.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if blobs.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Map oid -> repo-relative path from the cloned tree.
+    let ls = Command::new("git")
+        .args(["-C", dest_str, "ls-tree", "-r", "HEAD"])
+        .output()?;
+    let mut oid_to_path: HashMap<String, String> = HashMap::new();
+    for line in String::from_utf8_lossy(&ls.stdout).lines() {
+        if let Some((meta, path)) = line.split_once('\t') {
+            if let Some(oid) = meta.split_whitespace().nth(2) {
+                oid_to_path.insert(oid.to_string(), path.to_string());
+            }
+        }
+    }
+
+    let mut recovered = Vec::new();
+    for entry in blobs {
+        let Some(oid) = entry.get("oid").and_then(|o| o.as_str()) else {
+            continue;
+        };
+        // Skip if already present locally.
+        let present = Command::new("git")
+            .args(["-C", dest_str, "cat-file", "-e", oid])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if present {
+            continue;
+        }
+        let env_resp = match client
+            .get_signed(&format!(
+                "/api/v1/repos/{owner}/{name}/encrypted-blob/{oid}"
+            ))
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let Ok(envelope) = env_resp.bytes().await else {
+            continue;
+        };
+        let plaintext = match open_blob(&envelope, keypair) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: could not decrypt {oid}: {e}");
+                continue;
+            }
+        };
+        // Install as a loose object; verify the OID matches.
+        let mut child = Command::new("git")
+            .args(["-C", dest_str, "hash-object", "-w", "-t", "blob", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(&plaintext)?;
+        let out = child.wait_with_output()?;
+        let written = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if written == oid {
+            if let Some(p) = oid_to_path.get(oid) {
+                recovered.push(p.clone());
+            }
+        } else {
+            eprintln!("warning: recovered blob {oid} hashed to {written}; discarding");
+        }
+    }
+    Ok(recovered)
+}
+
+/// One blob entry in an Arweave-anchored encrypted manifest. The manifest also
+/// carries a `recipients` field per blob, but `gl` does not need it: authorization
+/// is enforced by whether `open_blob` can decrypt with the caller's key. Unknown
+/// JSON fields are ignored by serde, so `recipients` is simply not declared here.
+#[derive(Deserialize)]
+struct ManifestBlob {
+    oid: String,
+    cid: String,
+}
+
+/// An Arweave-anchored per-push encrypted manifest (Option B3).
+#[derive(Deserialize)]
+struct Manifest {
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    blobs: Vec<ManifestBlob>,
+}
+
+/// Extract transaction ids from an Arweave GraphQL `transactions` response.
+fn parse_tx_ids(v: &serde_json::Value) -> Vec<String> {
+    v.get("data")
+        .and_then(|d| d.get("transactions"))
+        .and_then(|t| t.get("edges"))
+        .and_then(|e| e.as_array())
+        .map(|edges| {
+            edges
+                .iter()
+                .filter_map(|edge| {
+                    edge.get("node")
+                        .and_then(|n| n.get("id"))
+                        .and_then(|i| i.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Merge per-push manifests into a single `oid -> cid` map, latest-wins by the
+/// manifest `timestamp` (RFC3339, compared lexicographically; a later push that
+/// re-sealed a blob overrides the earlier entry).
+fn merge_manifests(manifests: Vec<Manifest>) -> std::collections::HashMap<String, String> {
+    let mut best: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new(); // oid -> (cid, timestamp)
+    for m in manifests {
+        for b in m.blobs {
+            match best.get(&b.oid) {
+                Some((_, ts)) if ts.as_str() >= m.timestamp.as_str() => {}
+                _ => {
+                    best.insert(b.oid, (b.cid, m.timestamp.clone()));
+                }
+            }
+        }
+    }
+    best.into_iter().map(|(oid, (cid, _))| (oid, cid)).collect()
+}
+
+/// Option B3 fallback recovery, with no dependency on a gitlawb node API. Query
+/// the Arweave gateway for this repo's encrypted manifests, merge them, and for
+/// each blob still missing locally that the caller can decrypt, pull the envelope
+/// from a public IPFS gateway, decrypt, and install it as a loose object. Returns
+/// the repo-relative paths recovered. Best-effort; silent when gateways are
+/// unreachable, leaving the clone exactly as node-based recovery left it.
+async fn recover_from_arweave(
+    arweave_gateway: &str,
+    ipfs_gateway: &str,
+    owner: &str,
+    name: &str,
+    dest: &Path,
+    keypair: &gitlawb_core::identity::Keypair,
+) -> Result<Vec<String>> {
+    use gitlawb_core::encrypt::open_blob;
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    let dest_str = dest.to_str().context("dest path not utf-8")?;
+    let owner_short = owner.split(':').next_back().unwrap_or(owner);
+    let slug = format!("{owner_short}/{name}");
+    let ag = arweave_gateway.trim_end_matches('/');
+    let ig = ipfs_gateway.trim_end_matches('/');
+    // Bound every gateway request: this runs on every clone, so a slow or hung
+    // public gateway must not stall it. Best-effort recovery, so a timeout just
+    // skips the affected blob.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    // 1. Discover manifest transaction ids via Arweave GraphQL.
+    let query = r#"query($repo:String!){transactions(tags:[{name:"App-Name",values:["gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100){edges{node{id}}}}"#;
+    let gql_body = serde_json::json!({ "query": query, "variables": { "repo": slug } });
+    let resp = match client
+        .post(format!("{ag}/graphql"))
+        .json(&gql_body)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(vec![]),
+    };
+    let gql: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return Ok(vec![]),
+    };
+    let tx_ids = parse_tx_ids(&gql);
+    if tx_ids.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // 2. Fetch and parse each manifest body, then merge latest-wins per oid.
+    let mut manifests = Vec::new();
+    for tx in tx_ids {
+        let m = match client.get(format!("{ag}/{tx}")).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        if let Ok(parsed) = m.json::<Manifest>().await {
+            manifests.push(parsed);
+        }
+    }
+    let oid_cid = merge_manifests(manifests);
+    if oid_cid.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Map oid -> repo-relative path from the cloned tree.
+    let ls = Command::new("git")
+        .args(["-C", dest_str, "ls-tree", "-r", "HEAD"])
+        .output()?;
+    let mut oid_to_path: HashMap<String, String> = HashMap::new();
+    for line in String::from_utf8_lossy(&ls.stdout).lines() {
+        if let Some((meta, path)) = line.split_once('\t') {
+            if let Some(oid) = meta.split_whitespace().nth(2) {
+                oid_to_path.insert(oid.to_string(), path.to_string());
+            }
+        }
+    }
+
+    // 3. Recover each missing blob the caller can decrypt.
+    let mut recovered = Vec::new();
+    for (oid, cid) in oid_cid {
+        // Local presence check. GIT_NO_LAZY_FETCH stops git from making a wasted
+        // promisor fetch attempt (we are recovering precisely because the promisor
+        // cannot supply the blob), and `.output()` captures git's "missing object"
+        // stderr so that expected case does not leak a confusing error to the user.
+        let present = Command::new("git")
+            .args(["-C", dest_str, "cat-file", "-e", &oid])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if present {
+            continue;
+        }
+        let env_resp = match client.get(format!("{ig}/ipfs/{cid}")).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let Ok(envelope) = env_resp.bytes().await else {
+            continue;
+        };
+        // open_blob succeeds only if this caller is a recipient: this is the
+        // authorization gate (no node, no DID check needed).
+        let plaintext = match open_blob(&envelope, keypair) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let mut child = Command::new("git")
+            .args(["-C", dest_str, "hash-object", "-w", "-t", "blob", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        child.stdin.take().unwrap().write_all(&plaintext)?;
+        let out = child.wait_with_output()?;
+        let written = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if written == oid {
+            if let Some(p) = oid_to_path.get(&oid) {
+                recovered.push(p.clone());
+            }
+        } else {
+            eprintln!("warning: recovered blob {oid} hashed to {written}; discarding");
+        }
+    }
+    Ok(recovered)
+}
+
 pub async fn run(args: CloneArgs) -> Result<()> {
     let (url, owner, name) = parse_repo(&args.repo)?;
     let dest_name = args.dir.unwrap_or_else(|| name.clone());
@@ -236,6 +541,60 @@ pub async fn run(args: CloneArgs) -> Result<()> {
     }
 
     setup_partial_clone(&dest, &url, &withheld, &reinclude, args.branch.as_deref())?;
+
+    if let Ok(keypair) = load_keypair_from_dir(None) {
+        // Node-based recovery first (B1/B2), then the B3 Arweave/IPFS gateway
+        // fallback for any authorized blobs the node could not supply.
+        let mut paths = recover_encrypted_blobs(&args.node, &owner, &name, &dest, &keypair)
+            .await
+            .unwrap_or_default();
+        let from_arweave = recover_from_arweave(
+            &args.arweave_gateway,
+            &args.ipfs_gateway,
+            &owner,
+            &name,
+            &dest,
+            &keypair,
+        )
+        .await
+        .unwrap_or_default();
+        paths.extend(from_arweave);
+
+        if !paths.is_empty() {
+            // Re-include recovered paths if this was a sparse clone, then
+            // materialize them in the working tree.
+            let spec = dest.join(".git/info/sparse-checkout");
+            if spec.exists() {
+                match std::fs::read_to_string(&spec) {
+                    Ok(mut s) => {
+                        for p in &paths {
+                            s.push_str(&format!("/{p}\n"));
+                        }
+                        if let Err(e) = std::fs::write(&spec, &s) {
+                            eprintln!(
+                                "warning: failed to update sparse-checkout, recovered files may not appear: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "warning: failed to read sparse-checkout, recovered files may not appear: {e}"
+                        );
+                    }
+                }
+            }
+            if let Err(e) = git(&dest, &["checkout", "--", "."]) {
+                eprintln!(
+                    "warning: checkout after recovery failed, recovered files may not appear: {e}"
+                );
+            }
+            println!(
+                "Recovered {} private file(s) you are authorized to read",
+                paths.len()
+            );
+        }
+    }
+
     println!("Done. Cloned into {dest_name}");
     Ok(())
 }
@@ -429,6 +788,269 @@ mod tests {
     }
 
     #[test]
+    fn parse_tx_ids_extracts_node_ids() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"data":{"transactions":{"edges":[{"node":{"id":"TX1"}},{"node":{"id":"TX2"}}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_tx_ids(&v), vec!["TX1".to_string(), "TX2".to_string()]);
+    }
+
+    #[test]
+    fn parse_tx_ids_empty_on_no_edges() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"data":{"transactions":{"edges":[]}}}"#).unwrap();
+        assert!(parse_tx_ids(&v).is_empty());
+    }
+
+    #[test]
+    fn manifest_parses_and_ignores_recipients() {
+        let m: Manifest = serde_json::from_str(
+            r#"{"timestamp":"2026-06-11T00:00:00Z","blobs":[{"oid":"o1","cid":"c1","recipients":["did:key:zA"]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.timestamp, "2026-06-11T00:00:00Z");
+        assert_eq!(m.blobs.len(), 1);
+        assert_eq!(m.blobs[0].oid, "o1");
+        assert_eq!(m.blobs[0].cid, "c1");
+    }
+
+    #[test]
+    fn merge_manifests_latest_wins_per_oid() {
+        let older = Manifest {
+            timestamp: "2026-06-10T00:00:00Z".to_string(),
+            blobs: vec![ManifestBlob {
+                oid: "o1".to_string(),
+                cid: "cidOLD".to_string(),
+            }],
+        };
+        let newer = Manifest {
+            timestamp: "2026-06-11T00:00:00Z".to_string(),
+            blobs: vec![
+                ManifestBlob {
+                    oid: "o1".to_string(),
+                    cid: "cidNEW".to_string(),
+                },
+                ManifestBlob {
+                    oid: "o2".to_string(),
+                    cid: "cid2".to_string(),
+                },
+            ],
+        };
+        let merged = merge_manifests(vec![older, newer]);
+        assert_eq!(merged.get("o1").map(String::as_str), Some("cidNEW"));
+        assert_eq!(merged.get("o2").map(String::as_str), Some("cid2"));
+    }
+
+    #[test]
+    fn merge_manifests_is_order_independent() {
+        let older = Manifest {
+            timestamp: "2026-06-10T00:00:00Z".to_string(),
+            blobs: vec![ManifestBlob {
+                oid: "o1".to_string(),
+                cid: "cidOLD".to_string(),
+            }],
+        };
+        let newer = Manifest {
+            timestamp: "2026-06-11T00:00:00Z".to_string(),
+            blobs: vec![ManifestBlob {
+                oid: "o1".to_string(),
+                cid: "cidNEW".to_string(),
+            }],
+        };
+        // Newer first, older second: newer must still win.
+        let merged = merge_manifests(vec![newer, older]);
+        assert_eq!(merged.get("o1").map(String::as_str), Some("cidNEW"));
+    }
+
+    /// Read-path end-to-end over a mocked Arweave + IPFS gateway: discover the
+    /// manifest via GraphQL, fetch it, fetch the envelope, decrypt with the
+    /// caller's key, and install the previously-withheld blob.
+    #[tokio::test]
+    async fn recover_from_arweave_installs_authorized_blob() {
+        use gitlawb_core::encrypt::seal_blob;
+        use gitlawb_core::identity::Keypair;
+
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        // Make the bare honor `--filter=blob:none` over file:// so the withheld
+        // blob is genuinely omitted from the local store, not just unchecked-out.
+        let bare = url.strip_prefix("file://").unwrap();
+        assert!(Command::new("git")
+            .args(["-C", bare, "config", "uploadpack.allowFilter", "true"])
+            .status()
+            .unwrap()
+            .success());
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+        assert!(
+            !dest.join("secret/b.txt").exists(),
+            "secret starts withheld"
+        );
+
+        let oid = {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD:secret/b.txt",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Simulate origin death: drop the promisor remote so `cat-file -e` cannot
+        // lazily fetch the withheld blob. This is exactly the B3 premise (the node
+        // can no longer serve it), and forces recovery to go through Arweave/IPFS.
+        std::fs::remove_dir_all(url.strip_prefix("file://").unwrap()).unwrap();
+
+        let reader = Keypair::generate();
+        let envelope = seal_blob(b"SECRET\n", &[reader.verifying_key()]).unwrap();
+
+        let cid = "testcid123";
+        let mut server = mockito::Server::new_async().await;
+        let _gql = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"transactions":{"edges":[{"node":{"id":"TX1"}}]}}}"#)
+            .create_async()
+            .await;
+        let manifest_body = serde_json::json!({
+            "timestamp": "2026-06-11T00:00:00Z",
+            "blobs": [{ "oid": oid, "cid": cid, "recipients": [] }],
+        })
+        .to_string();
+        let _tx = server
+            .mock("GET", "/TX1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(manifest_body)
+            .create_async()
+            .await;
+        let _blob = server
+            .mock("GET", format!("/ipfs/{cid}").as_str())
+            .with_status(200)
+            .with_body(envelope)
+            .create_async()
+            .await;
+
+        let paths = recover_from_arweave(
+            &server.url(),
+            &server.url(),
+            "alice",
+            "myrepo",
+            &dest,
+            &reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(paths, vec!["secret/b.txt".to_string()]);
+
+        let present = Command::new("git")
+            .args(["-C", dest.to_str().unwrap(), "cat-file", "-e", &oid])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(
+            present,
+            "authorized reader's blob must be installed locally"
+        );
+    }
+
+    /// A caller who is not a recipient cannot decrypt the envelope, so nothing is
+    /// recovered even though the manifest and envelope are reachable.
+    #[tokio::test]
+    async fn recover_from_arweave_skips_unauthorized() {
+        use gitlawb_core::encrypt::seal_blob;
+        use gitlawb_core::identity::Keypair;
+
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        let bare = url.strip_prefix("file://").unwrap();
+        assert!(Command::new("git")
+            .args(["-C", bare, "config", "uploadpack.allowFilter", "true"])
+            .status()
+            .unwrap()
+            .success());
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+
+        let oid = {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD:secret/b.txt",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Simulate origin death (see the authorized test) so the withheld blob
+        // cannot be lazily fetched from the promisor remote.
+        std::fs::remove_dir_all(url.strip_prefix("file://").unwrap()).unwrap();
+
+        // Sealed to a different reader; the caller below is not a recipient.
+        let authorized = Keypair::generate();
+        let envelope = seal_blob(b"SECRET\n", &[authorized.verifying_key()]).unwrap();
+        let intruder = Keypair::generate();
+
+        let cid = "testcid123";
+        let mut server = mockito::Server::new_async().await;
+        let _gql = server
+            .mock("POST", "/graphql")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":{"transactions":{"edges":[{"node":{"id":"TX1"}}]}}}"#)
+            .create_async()
+            .await;
+        let manifest_body = serde_json::json!({
+            "timestamp": "2026-06-11T00:00:00Z",
+            "blobs": [{ "oid": oid, "cid": cid, "recipients": [] }],
+        })
+        .to_string();
+        let _tx = server
+            .mock("GET", "/TX1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(manifest_body)
+            .create_async()
+            .await;
+        let _blob = server
+            .mock("GET", format!("/ipfs/{cid}").as_str())
+            .with_status(200)
+            .with_body(envelope)
+            .create_async()
+            .await;
+
+        let paths = recover_from_arweave(
+            &server.url(),
+            &server.url(),
+            "alice",
+            "myrepo",
+            &dest,
+            &intruder,
+        )
+        .await
+        .unwrap();
+        assert!(paths.is_empty(), "non-recipient must recover nothing");
+
+        let present = Command::new("git")
+            .args(["-C", dest.to_str().unwrap(), "cat-file", "-e", &oid])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!present, "non-recipient must not install the blob");
+    }
+
+    #[test]
     fn parse_repo_accepts_url_and_bare() {
         let (url, o, n) = parse_repo("gitlawb://did:key:zAbc/myrepo").unwrap();
         assert_eq!(url, "gitlawb://did:key:zAbc/myrepo");
@@ -446,5 +1068,47 @@ mod tests {
         assert!(parse_repo("/name").is_err());
         // An extra slash would otherwise smuggle a path segment into the name.
         assert!(parse_repo("owner/name/extra").is_err());
+    }
+
+    #[test]
+    fn recovered_blob_installs_with_matching_oid() {
+        use gitlawb_core::encrypt::{open_blob, seal_blob};
+        use gitlawb_core::identity::Keypair;
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+        let oid = {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD:secret/b.txt",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let reader = Keypair::generate();
+        let env = seal_blob(b"SECRET\n", &[reader.verifying_key()]).unwrap();
+        let plaintext = open_blob(&env, &reader).unwrap();
+        let mut child = std::process::Command::new("git")
+            .args([
+                "-C",
+                dest.to_str().unwrap(),
+                "hash-object",
+                "-w",
+                "-t",
+                "blob",
+                "--stdin",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(&plaintext).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), oid);
     }
 }

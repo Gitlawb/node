@@ -5,6 +5,7 @@ mod bootstrap;
 mod cert;
 mod config;
 mod db;
+mod encrypted_pin;
 mod error;
 mod git;
 mod graphql;
