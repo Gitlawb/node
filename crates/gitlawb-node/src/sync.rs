@@ -32,19 +32,27 @@ enum MirrorMode {
     Promisor,
 }
 
-/// Decide the mirror mode from the origin's `withheld-paths` response.
+/// Decide the mirror mode from the origin's `withheld-paths` response and the
+/// mirror's current state.
 ///
 /// `Some(non-empty)` → the repo has a private subtree → `Promisor`.
 /// `Some(empty)`     → fully public → `Plain`.
-/// `None`            → the lookup 404'd or failed. Attempt a `Plain` mirror; a
-///                     mode-A repo also 404s the git read endpoint, so the clone
-///                     fails and nothing is mirrored (fail-closed at the git
-///                     layer), while a public repo on a peer that predates the
-///                     `withheld-paths` route still gets mirrored.
-fn classify_mirror(withheld: Option<Vec<String>>) -> MirrorMode {
+/// `None`            → the lookup 404'd, failed, or didn't parse, i.e. the state
+///                     is *unknown*. Preserve the mirror's existing mode rather
+///                     than downgrading: an existing promisor mirror stays
+///                     `Promisor`, so a transient `withheld-paths` outage cannot
+///                     strip its partial-clone config and break fetches of a
+///                     still-withheld repo. With no existing promisor state (a
+///                     fresh clone) attempt `Plain`; a mode-A repo then 404s the
+///                     git read endpoint and the clone fails (fail-closed at the
+///                     git layer), while a public repo on a peer that predates
+///                     the `withheld-paths` route still gets mirrored.
+fn decide_mode(withheld: Option<Vec<String>>, existing_promisor: bool) -> MirrorMode {
     match withheld {
         Some(globs) if !globs.is_empty() => MirrorMode::Promisor,
-        _ => MirrorMode::Plain,
+        Some(_) => MirrorMode::Plain,
+        None if existing_promisor => MirrorMode::Promisor,
+        None => MirrorMode::Plain,
     }
 }
 
@@ -186,7 +194,15 @@ async fn process_batch(
         let remote_url = format!("{}/{}", origin_url, item.repo);
 
         let withheld = fetch_withheld(client, &origin_url, owner_short, repo_name).await;
-        let mode = classify_mirror(withheld);
+        // When the lookup is unknown (None), preserve an existing promisor mirror
+        // so a transient withheld-paths outage doesn't strip its partial-clone
+        // config and break fetches of a still-withheld repo.
+        let existing_promisor = local_path.exists()
+            && git_config_get(local_path.to_str().unwrap_or("."), "remote.origin.promisor")
+                .await
+                .as_deref()
+                == Some("true");
+        let mode = decide_mode(withheld, existing_promisor);
 
         let result = if local_path.exists() {
             fetch_repo(&local_path, &remote_url, mode).await
@@ -533,22 +549,32 @@ mod tests {
 
     #[test]
     fn classify_promisor_when_withheld_nonempty() {
-        let mode = classify_mirror(Some(vec!["/secret/**".to_string()]));
+        let mode = decide_mode(Some(vec!["/secret/**".to_string()]), false);
         assert!(matches!(mode, MirrorMode::Promisor));
     }
 
     #[test]
     fn classify_plain_when_withheld_empty() {
-        let mode = classify_mirror(Some(vec![]));
+        let mode = decide_mode(Some(vec![]), false);
         assert!(matches!(mode, MirrorMode::Plain));
     }
 
     #[test]
-    fn classify_plain_when_lookup_failed() {
-        // None == 404 / network error / parse failure: attempt a plain mirror
-        // and let the git read endpoint fail-close a mode-A repo.
-        let mode = classify_mirror(None);
+    fn classify_plain_when_lookup_failed_on_fresh_clone() {
+        // None == 404 / network error / parse failure with no existing mirror:
+        // attempt a plain mirror and let the git read endpoint fail-close a
+        // mode-A repo.
+        let mode = decide_mode(None, false);
         assert!(matches!(mode, MirrorMode::Plain));
+    }
+
+    #[test]
+    fn classify_preserves_promisor_when_lookup_failed_on_existing_mirror() {
+        // A transient withheld-paths outage (None) on a repo that is already a
+        // promisor mirror must NOT downgrade to Plain: doing so would strip the
+        // partial-clone config and break the fetch of a still-withheld repo.
+        let mode = decide_mode(None, true);
+        assert!(matches!(mode, MirrorMode::Promisor));
     }
 
     fn rb(oid: &str, cid: &str) -> ReplicaBlob {

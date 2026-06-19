@@ -38,6 +38,17 @@ fn did_to_key(did: &str) -> Option<VerifyingKey> {
     Did::from_str(did).ok()?.to_verifying_key().ok()
 }
 
+/// Resolve every recipient DID to its verifying key. Returns `None` if *any* DID
+/// fails to resolve locally (e.g. a did:web / did:gitlawb reader).
+///
+/// Fail closed rather than sealing to the resolvable subset: a partial seal would
+/// silently exclude an authorized reader, and because `recipients_tag` is computed
+/// over the full DID set the blob would never be re-sealed once that DID later
+/// resolves — locking the reader out permanently.
+fn resolve_recipient_keys(dids: &BTreeSet<String>) -> Option<Vec<VerifyingKey>> {
+    dids.iter().map(|d| did_to_key(d)).collect()
+}
+
 /// Encrypt and pin every withheld blob. `recipients` maps blob oid -> DID set;
 /// `node_seed` keys the opaque recipients tag. Returns `(oid, cid)` for each blob
 /// actually sealed and recorded this call (the per-push delta), used by Option B3
@@ -69,11 +80,19 @@ pub async fn encrypt_and_pin(
                 continue;
             }
         }
-        let keys: Vec<VerifyingKey> = dids.iter().filter_map(|d| did_to_key(d)).collect();
-        if keys.is_empty() {
-            tracing::warn!(oid = %oid, "no resolvable recipient keys; skipping encrypted pin");
-            continue;
-        }
+        let keys = match resolve_recipient_keys(dids) {
+            Some(keys) if !keys.is_empty() => keys,
+            Some(_) => {
+                tracing::warn!(oid = %oid, "empty recipient set; skipping encrypted pin");
+                continue;
+            }
+            None => {
+                // At least one recipient DID is unresolvable; sealing now would
+                // exclude it permanently. Skip and retry on the next push.
+                tracing::warn!(oid = %oid, "unresolvable recipient DID; skipping encrypted pin rather than sealing to a partial set");
+                continue;
+            }
+        };
         let data = match crate::git::store::read_object(repo_path, oid) {
             Ok(Some((_t, bytes))) => bytes,
             _ => continue,
@@ -100,11 +119,31 @@ pub async fn encrypt_and_pin(
 
 #[cfg(test)]
 mod tests {
-    use super::recipients_tag;
+    use super::{recipients_tag, resolve_recipient_keys};
+    use gitlawb_core::did::Did;
+    use gitlawb_core::identity::Keypair;
     use std::collections::BTreeSet;
 
     fn set(dids: &[&str]) -> BTreeSet<String> {
         dids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_returns_all_keys_when_every_did_resolves() {
+        let a = Keypair::generate().did().to_string();
+        let b = Keypair::generate().did().to_string();
+        let keys = resolve_recipient_keys(&set(&[&a, &b]));
+        assert_eq!(keys.map(|k| k.len()), Some(2));
+    }
+
+    #[test]
+    fn resolve_returns_none_when_any_did_is_unresolvable() {
+        let a = Keypair::generate().did().to_string();
+        let web = Did::web("example.com").to_string();
+        assert!(
+            resolve_recipient_keys(&set(&[&a, &web])).is_none(),
+            "an unresolvable did:web recipient must abort sealing, not seal to a partial set"
+        );
     }
 
     #[test]
