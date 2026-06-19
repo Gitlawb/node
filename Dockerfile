@@ -44,6 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         ca-certificates \
         curl \
+        tini \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user for runtime
@@ -72,4 +73,10 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://127.0.0.1:${GITLAWB_PORT}/health || exit 1
 
-ENTRYPOINT ["gitlawb-node"]
+# Run under tini so the node is never PID 1. As PID 1 a process must reap
+# reparented orphans itself; the node does not, so git's reparented grandchildren
+# (e.g. pack-objects orphaned when a served upload-pack dies on a client
+# disconnect) would accumulate as zombies until fork() fails with EAGAIN (#53).
+# tini reaps them. `-g` forwards signals to the child's process group so graceful
+# shutdown still reaches the node.
+ENTRYPOINT ["tini", "-g", "--", "gitlawb-node"]
