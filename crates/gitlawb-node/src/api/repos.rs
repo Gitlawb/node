@@ -52,7 +52,13 @@ async fn replication_withheld_set(
         return (false, None);
     }
     let withheld = match rules {
-        Some(rules) if rules.is_empty() => Some(std::collections::HashSet::new()),
+        // No path-scoped rule can withhold anything (covers the empty-rules and
+        // root-only-rules cases), so skip the full withheld_blob_oids walk and
+        // withhold nothing. The predicate's safety-invariant test guards that
+        // this short-circuit matches what the walk would have returned.
+        Some(rules) if !crate::git::visibility_pack::has_path_scoped_rule(&rules) => {
+            Some(std::collections::HashSet::new())
+        }
         // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
         // that off the async worker thread.
         Some(rules) => {
@@ -499,33 +505,40 @@ pub async fn git_upload_pack(
         .map_err(|e| AppError::Git(e.to_string()))?;
     let body_len = body.len();
 
-    // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep that
-    // off the async worker thread.
-    let withheld = {
-        let path = disk_path.clone();
-        let rules = rules.clone();
-        let owner_did = record.owner_did.clone();
-        let caller_owned = caller.map(str::to_string);
-        let is_public = record.is_public;
-        tokio::task::spawn_blocking(move || {
-            visibility_pack::withheld_blob_oids(
-                &path,
-                &rules,
-                is_public,
-                &owner_did,
-                caller_owned.as_deref(),
-            )
-        })
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?
-        .map_err(|e| AppError::Git(e.to_string()))?
-    };
-
-    let resp = if withheld.is_empty() {
+    // No path-scoped rule can withhold an individual blob, and the whole-repo
+    // "/" gate above already enforced repo-level access. Skip the per-blob
+    // withheld walk and serve the pack directly.
+    let resp = if !visibility_pack::has_path_scoped_rule(&rules) {
         smart_http::upload_pack(&disk_path, body).await
     } else {
-        tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
-        smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
+        // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
+        // that off the async worker thread.
+        let withheld = {
+            let path = disk_path.clone();
+            let rules = rules.clone();
+            let owner_did = record.owner_did.clone();
+            let caller_owned = caller.map(str::to_string);
+            let is_public = record.is_public;
+            tokio::task::spawn_blocking(move || {
+                visibility_pack::withheld_blob_oids(
+                    &path,
+                    &rules,
+                    is_public,
+                    &owner_did,
+                    caller_owned.as_deref(),
+                )
+            })
+            .await
+            .map_err(|e| AppError::Git(e.to_string()))?
+            .map_err(|e| AppError::Git(e.to_string()))?
+        };
+
+        if withheld.is_empty() {
+            smart_http::upload_pack(&disk_path, body).await
+        } else {
+            tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
+            smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
+        }
     }
     .map_err(|e| {
         let msg = e.to_string();
