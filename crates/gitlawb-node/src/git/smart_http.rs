@@ -75,16 +75,18 @@ pub async fn receive_pack(repo_path: &Path, request_body: Bytes) -> Result<Respo
         .body(Body::from(output))?)
 }
 
-/// SIGKILLs a child's whole process group on drop, unless disarmed first.
+/// Sends SIGTERM to a child's whole process group on drop, unless disarmed first.
 ///
 /// A served `git upload-pack`/`receive-pack` forks helpers such as `pack-objects`.
 /// If the request future is dropped (client disconnect) or returns early, dropping
-/// the tokio `Child` does not kill `git`; it dies later on EPIPE, and its
-/// `pack-objects` child reparents to PID 1 and is never reaped — a zombie that
+/// the tokio `Child` does not signal `git`; it lingers until EPIPE, and its
+/// `pack-objects` child can reparent to PID 1 and never be reaped — a zombie that
 /// accumulates until `fork()` fails with EAGAIN (#53). Spawning the child in its
-/// own process group and killing that group here tears the whole tree down at the
-/// source. The guard is disarmed once `wait_with_output()` returns, so a request
-/// that completed cleanly never signals anything.
+/// own process group and signalling that group here tears the whole tree down at
+/// the source. SIGTERM (not SIGKILL) lets `git` run its cleanup — notably removing
+/// `.git/*.lock` files mid-`receive-pack` — before it exits, so an aborted push
+/// can't leave a stale lock that blocks the next one. The guard is disarmed once
+/// `wait_with_output()` returns, so a request that completed cleanly never signals.
 #[cfg(unix)]
 struct KillGroupOnDrop {
     pgid: Option<i32>,
@@ -104,7 +106,7 @@ impl Drop for KillGroupOnDrop {
             // SAFETY: kill(2) takes only integer arguments and borrows no Rust
             // memory. Signalling a stale group just returns ESRCH, which we ignore.
             unsafe {
-                libc::kill(-pgid, libc::SIGKILL);
+                libc::kill(-pgid, libc::SIGTERM);
             }
         }
     }
@@ -121,7 +123,7 @@ async fn run_git_service(service: &str, repo_path: &Path, input: Bytes) -> Resul
         .stderr(Stdio::piped());
 
     // Run git in its own process group so the whole tree (git + pack-objects)
-    // can be killed together on disconnect rather than orphaning a grandchild.
+    // can be signalled together on disconnect rather than orphaning a grandchild.
     #[cfg(unix)]
     command.process_group(0);
 
@@ -791,8 +793,8 @@ mod tests {
         let status = child.wait().await.unwrap();
         assert_eq!(
             status.signal(),
-            Some(libc::SIGKILL),
-            "child must be killed by SIGKILL via its process group"
+            Some(libc::SIGTERM),
+            "child must be terminated by SIGTERM via its process group"
         );
     }
 
@@ -828,7 +830,7 @@ mod tests {
 
         {
             let _guard = KillGroupOnDrop { pgid };
-        } // group SIGKILL kills sh AND the sleep grandchild
+        } // group SIGTERM reaches sh AND the sleep grandchild
 
         let _ = child.wait().await; // reap sh
 
@@ -841,7 +843,10 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(gone, "grandchild must be killed by the group SIGKILL (#53)");
+        assert!(
+            gone,
+            "grandchild must be terminated by the group signal (#53)"
+        );
     }
 
     #[cfg(unix)]
