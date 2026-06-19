@@ -146,6 +146,27 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p gl -p git-remote-gitlawb -p gitlawb-node
 
+      # Run each packaged binary's --version so a broken release artifact fails the
+      # build instead of shipping. Skipped for cross-compiled targets that can't run
+      # on the host runner (aarch64 linux on an x86_64 runner).
+      - name: Smoke test binaries
+        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.release-please.outputs.version }}"
+          BIN_DIR="target/${{ matrix.target }}/release"
+          for bin in gl git-remote-gitlawb gitlawb-node; do
+            echo "== $bin --version =="
+            out="$("$BIN_DIR/$bin" --version)"
+            echo "$out"
+            # Each binary prints "<name> <version>"; assert the released version is present.
+            grep -qF "$VERSION" <<<"$out" || {
+              echo "::error::$bin --version did not report expected version $VERSION (got: $out)"
+              exit 1
+            }
+          done
+
       - name: Package
         id: pkg
         shell: bash
