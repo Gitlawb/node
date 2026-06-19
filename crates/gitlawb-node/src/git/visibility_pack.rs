@@ -77,6 +77,25 @@ pub fn withheld_blob_oids(
     Ok(denied.difference(&allowed).cloned().collect())
 }
 
+/// True if any rule scopes a sub-path of the repo (i.e. is not the whole-repo
+/// "/" rule). When this returns `false`, no rule can withhold an individual
+/// blob: the only rules present are whole-repo "/" rules, which are already
+/// resolved by the "/" gate the caller runs *before* reaching the serve /
+/// replication walk (a denying "/" rule 404s the caller; see
+/// `withheld_blob_oids` above). For any caller that has passed that gate,
+/// `withheld_blob_oids` therefore returns an empty set, so such callers may
+/// skip the (potentially expensive) per-blob walk. Do not skip the walk on this
+/// predicate without the "/" gate having run first.
+///
+/// Validator dependency: this predicate treats `path_glob == "/"` as the only
+/// whole-repo scope. That holds because `validate_path_glob`
+/// (crates/gitlawb-node/src/api/visibility.rs) rejects `/**`, the only other
+/// glob whose prefix collapses to `/` and would therefore match every path. If
+/// glob syntax is ever extended, revisit this predicate.
+pub fn has_path_scoped_rule(rules: &[VisibilityRule]) -> bool {
+    rules.iter().any(|r| r.path_glob != "/")
+}
+
 /// Objects that may replicate to the public: everything not in `withheld`.
 /// Order-preserving. The single seam every replication site (IPFS, Pinata)
 /// passes its object list through; option B would later reroute the withheld
@@ -249,6 +268,66 @@ mod tests {
             withheld.is_empty(),
             "public repo, no rules, nothing withheld"
         );
+    }
+
+    #[test]
+    fn has_path_scoped_rule_empty_is_false() {
+        assert!(!has_path_scoped_rule(&[]));
+    }
+
+    #[test]
+    fn has_path_scoped_rule_single_root_is_false() {
+        assert!(!has_path_scoped_rule(&[rule("/", &[])]));
+    }
+
+    #[test]
+    fn has_path_scoped_rule_single_scoped_is_true() {
+        assert!(has_path_scoped_rule(&[rule("/secret/**", &[])]));
+    }
+
+    #[test]
+    fn has_path_scoped_rule_mixed_is_true() {
+        assert!(has_path_scoped_rule(&[
+            rule("/", &[]),
+            rule("/secret/**", &[]),
+        ]));
+    }
+
+    #[test]
+    fn has_path_scoped_rule_multiple_root_is_false() {
+        assert!(!has_path_scoped_rule(&[rule("/", &[]), rule("/", &[])]));
+    }
+
+    #[test]
+    fn has_path_scoped_rule_safety_invariant_matches_withheld_walk() {
+        // Pin the claim the predicate's docs make, with its real precondition:
+        // when no rule is path-scoped, then *for any caller that has passed the
+        // whole-repo "/" gate*, withheld_blob_oids returns an empty set, so the
+        // walk is safe to skip. The "/" gate (resolved before the serve /
+        // replication call sites) is what excludes the denying-root caller; this
+        // function does not re-check it, so the test models only gate-passing
+        // callers — matching how U2/U3 consult the predicate.
+        let (_td, bare, _secret, _public) = fixture();
+        // (rules, caller) pairs where the caller is Allowed at "/":
+        //  - public repo, no rules, anonymous: "/" allows (is_public).
+        //  - root-only allow-rule, the listed reader: "/" allows them.
+        //  - root-only deny-all rule, the owner: owner bypasses every rule.
+        let cases: [(Vec<VisibilityRule>, Option<&str>); 3] = [
+            (Vec::new(), None),
+            (
+                vec![rule("/", &["did:key:zFriend"])],
+                Some("did:key:zFriend"),
+            ),
+            (vec![rule("/", &[])], Some(OWNER)),
+        ];
+        for (rules, caller) in cases {
+            assert!(!has_path_scoped_rule(&rules));
+            let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, caller).unwrap();
+            assert!(
+                withheld.is_empty(),
+                "no path-scoped rule must withhold nothing for a gate-passing caller (caller={caller:?})"
+            );
+        }
     }
 
     #[test]
