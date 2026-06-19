@@ -77,6 +77,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # reparented orphans itself; the node does not, so git's reparented grandchildren
 # (e.g. pack-objects orphaned when a served upload-pack dies on a client
 # disconnect) would accumulate as zombies until fork() fails with EAGAIN (#53).
-# tini reaps them. `-g` forwards signals to the child's process group so graceful
-# shutdown still reaches the node.
-ENTRYPOINT ["tini", "-g", "--", "gitlawb-node"]
+# tini reaps them and forwards SIGTERM/SIGINT to the node, which runs its own
+# graceful shutdown. (No `-g`: the node manages its own children, so group-wide
+# signalling would only disturb in-flight git helpers during shutdown.)
+ENTRYPOINT ["tini", "--", "gitlawb-node"]

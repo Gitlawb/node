@@ -101,8 +101,8 @@ impl KillGroupOnDrop {
 impl Drop for KillGroupOnDrop {
     fn drop(&mut self) {
         if let Some(pgid) = self.pgid {
-            // SAFETY: kill(2) is async-signal-safe and takes no borrowed memory.
-            // Signalling a stale group just returns ESRCH, which we ignore.
+            // SAFETY: kill(2) takes only integer arguments and borrows no Rust
+            // memory. Signalling a stale group just returns ESRCH, which we ignore.
             unsafe {
                 libc::kill(-pgid, libc::SIGKILL);
             }
@@ -134,16 +134,21 @@ async fn run_git_service(service: &str, repo_path: &Path, input: Bytes) -> Resul
         pgid: child.id().map(|id| id as i32),
     };
 
-    // Write request body to git's stdin
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&input).await?;
-    }
+    // Write the request body to git's stdin, but don't early-return on a write
+    // error: always reap the child first (below), so the guard only ever fires on
+    // an actual future-drop (client disconnect), never on a pid we just reaped.
+    let write_result: std::io::Result<()> = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(&input).await,
+        None => Ok(()),
+    };
 
     let output = child.wait_with_output().await?;
 
-    // Clean completion: git and its group have exited, nothing to kill.
+    // Child reaped, so its group is gone: disarm before surfacing any error.
     #[cfg(unix)]
     group_guard.disarm();
+
+    write_result.context("failed to write to git stdin")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -763,7 +768,8 @@ mod tests {
 
     #[cfg(unix)]
     fn alive(pid: i32) -> bool {
-        // kill(pid, 0) probes existence: 0/EPERM => exists, ESRCH => gone.
+        // kill(pid, 0) probes existence: returns 0 while the pid exists, -1 once
+        // it's gone (ESRCH). Same-uid here, so EPERM never applies.
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
