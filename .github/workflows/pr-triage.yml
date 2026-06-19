@@ -1,0 +1,114 @@
+name: PR Triage
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: pr-triage-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    name: Quality-signal triage
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Label and guide
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const prNumber = pr.number;
+
+            // Trusted authors bypass triage entirely.
+            const trusted = ["OWNER", "MEMBER", "COLLABORATOR"];
+            if (trusted.includes(pr.author_association)) {
+              core.info(`Author association ${pr.author_association} is trusted; skipping triage.`);
+              return;
+            }
+
+            // Labels this workflow owns. Anything here may be added or removed each run.
+            const MANAGED = ["needs-issue", "needs-description", "needs-tests", "workflow-change"];
+            const want = new Set();
+
+            const body = pr.body || "";
+
+            // Linked issue: look for "closes/fixes/resolves #N" or any bare #N reference.
+            const hasLinkedIssue =
+              /\b(close[sd]?|fix(e[sd])?|resolve[sd]?)\b[^\n]*#\d+/i.test(body) ||
+              /#\d+/.test(body);
+            if (!hasLinkedIssue) want.add("needs-issue");
+
+            // Description substance: strip HTML comments and markdown headings, then measure.
+            const stripped = body
+              .replace(/<!--[\s\S]*?-->/g, "")
+              .replace(/^#+.*$/gm, "")
+              .trim();
+            if (stripped.length < 50) want.add("needs-description");
+
+            // File-based signals.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+            const names = files.map(f => f.filename);
+
+            const isFork = pr.head.repo && pr.head.repo.full_name !== pr.base.repo.full_name;
+            const touchesWorkflows = names.some(n => n.startsWith(".github/workflows/"));
+            if (isFork && touchesWorkflows) want.add("workflow-change");
+
+            const changedRust = names.some(n => n.startsWith("crates/") && n.endsWith(".rs"));
+            const touchedTests = names.some(n => n.includes("/tests/") || n.endsWith("_test.rs"));
+            if (changedRust && !touchedTests) want.add("needs-tests");
+
+            // Reconcile labels: add wanted managed labels, remove managed labels no longer wanted.
+            const current = (await github.rest.issues.listLabelsOnIssue({
+              owner, repo, issue_number: prNumber,
+            })).data.map(l => l.name);
+
+            const toAdd = [...want].filter(l => !current.includes(l));
+            const toRemove = MANAGED.filter(l => current.includes(l) && !want.has(l));
+
+            if (toAdd.length) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: toAdd });
+            }
+            for (const name of toRemove) {
+              await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name })
+                .catch(() => {}); // ignore if already gone
+            }
+
+            // Guidance comment: only for advisory signals, and only once.
+            const advisory = ["needs-issue", "needs-description", "needs-tests"].filter(l => want.has(l));
+            if (!advisory.length) return;
+
+            const MARKER = "<!-- gitlawb-triage -->";
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            if (comments.some(c => c.body && c.body.includes(MARKER))) {
+              core.info("Guidance comment already present; not reposting.");
+              return;
+            }
+
+            const reasons = {
+              "needs-issue": "Link the issue this addresses (`Closes #123`). For protocol changes, open an issue first.",
+              "needs-description": "Add a short summary of what changes and why — the template's Summary and Motivation sections.",
+              "needs-tests": "This changes Rust source but no tests changed. Tests are required for fixes and strongly encouraged for features.",
+            };
+            const lines = advisory.map(l => `- ${reasons[l]}`).join("\n");
+            const comment = [
+              MARKER,
+              "Thanks for the contribution. A couple of things will help us review this faster:",
+              "",
+              lines,
+              "",
+              "See [CONTRIBUTING.md](https://github.com/Gitlawb/node/blob/main/CONTRIBUTING.md). Update the PR and these notes clear automatically.",
+            ].join("\n");
+
+            await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: comment });
