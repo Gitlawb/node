@@ -221,6 +221,8 @@ pub struct AgentRow {
     pub capabilities: Vec<String>,
     pub registered_at: String,
     pub last_seen: Option<String>,
+    /// Lifecycle status: `active` (default) or `revoked` (self-deregistered).
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -735,6 +737,16 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_encrypted_blobs_repo ON encrypted_blobs(repo_id)",
         ],
     },
+    Migration {
+        version: 5,
+        name: "agent_retirement",
+        stmts: &[
+            // Agent lifecycle status for issue #29. `active` is the default;
+            // the key holder can self-deregister to `revoked` (terminal).
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS deactivated_at TEXT",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -941,10 +953,41 @@ impl Db {
 
 // ── Agents / Trust ────────────────────────────────────────────────────────────
 
+/// Map an `agents` row (selected with the status columns) into an `AgentRow`.
+fn row_to_agent(r: &sqlx::postgres::PgRow) -> AgentRow {
+    AgentRow {
+        did: r.get("did"),
+        trust_score: r.get("trust_score"),
+        capabilities: serde_json::from_str(r.get::<&str, _>("capabilities")).unwrap_or_default(),
+        registered_at: r.get("registered_at"),
+        last_seen: r.get("last_seen"),
+        status: r.get("status"),
+    }
+}
+
+/// Reduce a trust-ranked agent list to what discovery should surface: only
+/// `active` agents, optionally narrowed to those advertising `capability`.
+/// Revoked agents are dropped so an orphaned DID can never win capability
+/// routing. Input order is preserved, so an already trust-sorted list stays
+/// active-first.
+fn filter_discoverable(agents: Vec<AgentRow>, capability: Option<&str>) -> Vec<AgentRow> {
+    agents
+        .into_iter()
+        .filter(|a| a.status == "active")
+        .filter(|a| match capability {
+            Some(cap) => a.capabilities.iter().any(|c| c == cap),
+            None => true,
+        })
+        .collect()
+}
+
 impl Db {
     pub async fn register_agent(&self, did: &str, capabilities: &[String]) -> Result<()> {
         let caps = serde_json::to_string(capabilities)?;
         let now = Utc::now().to_rfc3339();
+        // The ON CONFLICT clause deliberately updates only `last_seen` and
+        // never touches `status`. That makes revocation terminal: re-registering
+        // a `revoked` DID does not bring it back to `active` (issue #29).
         sqlx::query(
             "INSERT INTO agents (did, trust_score, capabilities, registered_at)
              VALUES ($1, 0.0, $2, $3)
@@ -1021,46 +1064,43 @@ impl Db {
 
     pub async fn list_agents(&self, capability: Option<&str>) -> Result<Vec<AgentRow>> {
         let rows = sqlx::query(
-            "SELECT did, trust_score, capabilities, registered_at, last_seen FROM agents ORDER BY trust_score DESC",
+            "SELECT did, trust_score, capabilities, registered_at, last_seen, status \
+             FROM agents ORDER BY trust_score DESC",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let mut agents: Vec<AgentRow> = rows
-            .iter()
-            .map(|r| AgentRow {
-                did: r.get("did"),
-                trust_score: r.get("trust_score"),
-                capabilities: serde_json::from_str(r.get::<&str, _>("capabilities"))
-                    .unwrap_or_default(),
-                registered_at: r.get("registered_at"),
-                last_seen: r.get("last_seen"),
-            })
-            .collect();
+        let agents: Vec<AgentRow> = rows.iter().map(row_to_agent).collect();
 
-        if let Some(cap) = capability {
-            agents.retain(|a| a.capabilities.iter().any(|c| c == cap));
-        }
-
-        Ok(agents)
+        Ok(filter_discoverable(agents, capability))
     }
 
     pub async fn get_agent(&self, did: &str) -> Result<Option<AgentRow>> {
         let row = sqlx::query(
-            "SELECT did, trust_score, capabilities, registered_at, last_seen FROM agents WHERE did = $1",
+            "SELECT did, trust_score, capabilities, registered_at, last_seen, status \
+             FROM agents WHERE did = $1",
         )
         .bind(did)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| AgentRow {
-            did: r.get("did"),
-            trust_score: r.get("trust_score"),
-            capabilities: serde_json::from_str(r.get::<&str, _>("capabilities"))
-                .unwrap_or_default(),
-            registered_at: r.get("registered_at"),
-            last_seen: r.get("last_seen"),
-        }))
+        // Unfiltered by design: a revoked DID must still resolve so callers
+        // can read its `status` and see it is retired.
+        Ok(row.as_ref().map(row_to_agent))
+    }
+
+    /// Mark an agent `revoked` (terminal self-deregistration, issue #29).
+    /// Returns `false` when no such agent exists so the caller can surface a
+    /// 404. Revoking an already-revoked agent is idempotent.
+    pub async fn revoke_agent(&self, did: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let result =
+            sqlx::query("UPDATE agents SET status = 'revoked', deactivated_at = $2 WHERE did = $1")
+                .bind(did)
+                .bind(&now)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn count_pushes(&self) -> Result<i64> {
@@ -2874,5 +2914,93 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+}
+
+#[cfg(test)]
+mod agent_discovery_tests {
+    use super::{filter_discoverable, AgentRow};
+
+    fn agent(did: &str, trust: f64, status: &str, caps: &[&str]) -> AgentRow {
+        AgentRow {
+            did: did.to_string(),
+            trust_score: trust,
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            registered_at: "2026-06-19T00:00:00Z".to_string(),
+            last_seen: None,
+            status: status.to_string(),
+        }
+    }
+
+    fn dids(rows: &[AgentRow]) -> Vec<&str> {
+        rows.iter().map(|a| a.did.as_str()).collect()
+    }
+
+    #[test]
+    fn only_active_agents_are_returned() {
+        let rows = vec![
+            agent("did:key:active1", 0.5, "active", &["reputation:score"]),
+            agent("did:key:revoked1", 0.4, "revoked", &["reputation:score"]),
+            agent("did:key:revoked2", 0.3, "revoked", &["reputation:score"]),
+        ];
+
+        let out = filter_discoverable(rows, None);
+
+        assert_eq!(dids(&out), vec!["did:key:active1"]);
+    }
+
+    #[test]
+    fn revoked_orphan_never_wins_capability_routing() {
+        // Reproduces issue #29: a self-deregistered orphan sharing the
+        // canonical agent's capability and equal trust must be excluded so the
+        // active replacement is the only capability match.
+        let rows = vec![
+            agent("did:key:orphan", 0.1, "revoked", &["reputation:score"]),
+            agent("did:key:canonical", 0.1, "active", &["reputation:score"]),
+        ];
+
+        let out = filter_discoverable(rows, Some("reputation:score"));
+
+        assert_eq!(dids(&out), vec!["did:key:canonical"]);
+    }
+
+    #[test]
+    fn capability_and_status_filters_compose() {
+        let rows = vec![
+            // matches capability but retired -> excluded
+            agent("did:key:revoked", 0.9, "revoked", &["attestation:verify"]),
+            // active but wrong capability -> excluded
+            agent("did:key:other", 0.8, "active", &["oracle:agent-trust"]),
+            // active and matches -> kept
+            agent("did:key:match", 0.7, "active", &["attestation:verify"]),
+        ];
+
+        let out = filter_discoverable(rows, Some("attestation:verify"));
+
+        assert_eq!(dids(&out), vec!["did:key:match"]);
+    }
+
+    #[test]
+    fn input_order_is_preserved_so_active_stays_trust_ranked() {
+        // Input arrives pre-sorted by trust desc; filtering must not reorder.
+        let rows = vec![
+            agent("did:key:high", 0.9, "active", &[]),
+            agent("did:key:retired", 0.8, "revoked", &[]),
+            agent("did:key:mid", 0.5, "active", &[]),
+            agent("did:key:low", 0.2, "active", &[]),
+        ];
+
+        let out = filter_discoverable(rows, None);
+
+        assert_eq!(
+            dids(&out),
+            vec!["did:key:high", "did:key:mid", "did:key:low"]
+        );
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert!(filter_discoverable(vec![], None).is_empty());
+        assert!(filter_discoverable(vec![], Some("reputation:score")).is_empty());
     }
 }

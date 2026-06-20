@@ -147,6 +147,10 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::put(visibility::set_visibility)
                     .delete(visibility::remove_visibility)
                     .get(visibility::list_visibility),
+            )
+            .route(
+                "/api/v1/agents/{did}",
+                axum::routing::delete(agents::deregister_agent),
             ),
         state.clone(),
     );
