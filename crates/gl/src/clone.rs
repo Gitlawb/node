@@ -373,6 +373,11 @@ struct TxRef {
     height: Option<u64>,
 }
 
+/// Edges requested per Arweave GraphQL page (`first:` in the discovery query) and
+/// the per-page bound enforced when parsing a response. The `first:N` literal in
+/// the query string MUST equal this constant.
+const ARWEAVE_PAGE_SIZE: usize = 100;
+
 /// A parsed page of an Arweave GraphQL `transactions` response: the edge refs
 /// plus pagination state. `has_next` is `None` when the response omitted
 /// `pageInfo` entirely (an older or partial gateway), which the discovery loop
@@ -387,6 +392,11 @@ struct TxPage {
 /// height, plus `pageInfo` for cursor pagination. Hand-walks the `Value` (the
 /// envelope nests `data.transactions.{edges,pageInfo}`) rather than deriving a
 /// wrapper struct, matching the surrounding style.
+///
+/// At most `ARWEAVE_PAGE_SIZE` edges are taken from a single page: the query asks
+/// for `first:100`, so a response with more edges is a misbehaving (or hostile)
+/// gateway. Bounding here caps per-page allocation and the downstream per-id fetch
+/// loop so the `MAX_TX_IDS` budget can't be defeated by one oversized page.
 fn parse_tx_page(v: &serde_json::Value) -> TxPage {
     let txns = v.get("data").and_then(|d| d.get("transactions"));
     let refs: Vec<TxRef> = txns
@@ -395,6 +405,7 @@ fn parse_tx_page(v: &serde_json::Value) -> TxPage {
         .map(|edges| {
             edges
                 .iter()
+                .take(ARWEAVE_PAGE_SIZE)
                 .filter_map(|edge| {
                     let node = edge.get("node")?;
                     let id = node.get("id").and_then(|i| i.as_str())?.to_string();
@@ -530,7 +541,9 @@ async fn recover_from_arweave(
     //    is then knowingly partial.
     const MAX_PAGES: usize = 1000;
     const MAX_TX_IDS: usize = 10_000;
-    const PAGE_SIZE: usize = 100;
+    // `first:100` below must equal ARWEAVE_PAGE_SIZE (the per-page bound enforced
+    // in `parse_tx_page`); the query string keeps the literal because formatting
+    // it would mean escaping the brace-heavy GraphQL body.
     let query = r#"query($repo:String!,$cursor:String){transactions(tags:[{name:"App-Name",values:["gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100,after:$cursor){pageInfo{hasNextPage endCursor}edges{cursor node{id block{height}}}}}"#;
     let mut after: Option<String> = None;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -548,27 +561,22 @@ async fn recover_from_arweave(
         page_num += 1;
         let gql_body =
             serde_json::json!({ "query": query, "variables": { "repo": slug, "cursor": after } });
-        let value: serde_json::Value = match client
+        // Any gateway failure (non-2xx, send error, unparseable body) ends the loop.
+        let response = match client
             .post(format!("{ag}/graphql"))
             .json(&gql_body)
             .send()
             .await
         {
-            Ok(r) if r.status().is_success() => match r.json().await {
-                Ok(v) => v,
-                Err(_) => {
-                    if !refs.is_empty() {
-                        eprintln!(
-                            "warning: Arweave manifest discovery was interrupted by a gateway \
-                             error; some authorized files may not be recovered"
-                        );
-                    }
-                    break;
-                }
-            },
-            // Whole-gateway failure on the first page is the benign unconfigured/
-            // unreachable case: stay silent, exactly as before.
-            _ => {
+            Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+            _ => None,
+        };
+        let value = match response {
+            Some(v) => v,
+            None => {
+                // A failure *after* discovery began means recovery is knowingly
+                // partial, so warn. A page-1 failure is the benign unconfigured/
+                // unreachable-gateway case and stays silent, exactly as before.
                 if !refs.is_empty() {
                     eprintln!(
                         "warning: Arweave manifest discovery was interrupted by a gateway \
@@ -579,7 +587,7 @@ async fn recover_from_arweave(
             }
         };
         let page = parse_tx_page(&value);
-        let full = page.refs.len() >= PAGE_SIZE;
+        let full = page.refs.len() >= ARWEAVE_PAGE_SIZE;
         for r in page.refs {
             if seen.insert(r.id.clone()) {
                 refs.push(r);
@@ -1056,6 +1064,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_tx_page_bounds_edges_per_page() {
+        // A hostile gateway returning more than ARWEAVE_PAGE_SIZE edges on one
+        // page must not defeat the MAX_TX_IDS budget: parse caps per-page refs so
+        // the downstream fetch loop stays bounded.
+        let edges: String = (0..ARWEAVE_PAGE_SIZE + 50)
+            .map(|i| format!(r#"{{"node":{{"id":"TX{i}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let v: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"data":{{"transactions":{{"edges":[{edges}]}}}}}}"#
+        ))
+        .unwrap();
+        let page = parse_tx_page(&v);
+        assert_eq!(page.refs.len(), ARWEAVE_PAGE_SIZE);
+    }
+
+    #[test]
     fn manifest_parses_and_ignores_recipients() {
         let m: Manifest = serde_json::from_str(
             r#"{"timestamp":"2026-06-11T00:00:00Z","blobs":[{"oid":"o1","cid":"c1","recipients":["did:key:zA"]}]}"#,
@@ -1510,6 +1535,183 @@ mod tests {
             vec!["secret/b.txt".to_string()],
             "page-1 blob must still be recovered when page 2 fails"
         );
+    }
+
+    /// A gateway that reports `hasNextPage=true` but never advances the cursor
+    /// (returns the same `endCursor` every page) must not loop forever: the
+    /// degenerate-cursor guard terminates the loop and recovery returns based on
+    /// what was seen. The test completing at all proves no hang.
+    #[tokio::test]
+    async fn recover_from_arweave_terminates_on_nonadvancing_cursor() {
+        use gitlawb_core::encrypt::seal_blob;
+        use gitlawb_core::identity::Keypair;
+
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        let bare = url.strip_prefix("file://").unwrap();
+        assert!(Command::new("git")
+            .args(["-C", bare, "config", "uploadpack.allowFilter", "true"])
+            .status()
+            .unwrap()
+            .success());
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+        let oid = {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD:secret/b.txt",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::remove_dir_all(url.strip_prefix("file://").unwrap()).unwrap();
+
+        let reader = Keypair::generate();
+        let envelope = seal_blob(b"SECRET\n", &[reader.verifying_key()]).unwrap();
+        let cid = "testcid123";
+
+        let mut server = mockito::Server::new_async().await;
+        // Every GraphQL POST returns hasNextPage=true with the SAME endCursor.
+        // Without the guard this would request pages until MAX_PAGES; with it the
+        // loop breaks after the first non-advancing cursor.
+        let manifest_body = serde_json::json!({
+            "timestamp": "2026-06-11T00:00:00Z",
+            "blobs": [{ "oid": oid, "cid": cid, "recipients": [] }],
+        })
+        .to_string();
+        let _gql = server
+            .mock("POST", "/graphql")
+            .expect_at_most(3) // a couple at most; certainly not MAX_PAGES
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"transactions":{"pageInfo":{"hasNextPage":true,"endCursor":"STUCK"},"edges":[{"node":{"id":"TX1","block":{"height":20}}}]}}}"#,
+            )
+            .create_async()
+            .await;
+        let _tx1 = server
+            .mock("GET", "/TX1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(manifest_body)
+            .create_async()
+            .await;
+        let _blob = server
+            .mock("GET", format!("/ipfs/{cid}").as_str())
+            .with_status(200)
+            .with_body(envelope)
+            .create_async()
+            .await;
+
+        let paths = recover_from_arweave(
+            &server.url(),
+            &server.url(),
+            "alice",
+            "myrepo",
+            &dest,
+            &reader,
+        )
+        .await
+        .expect("non-advancing cursor must terminate, not hang or error");
+        assert_eq!(paths, vec!["secret/b.txt".to_string()]);
+    }
+
+    /// A tx id repeated across pages must be fetched only once: the cross-page
+    /// dedup (R8) bounds the downstream per-id manifest fetch loop.
+    #[tokio::test]
+    async fn recover_from_arweave_dedups_tx_ids_across_pages() {
+        use gitlawb_core::encrypt::seal_blob;
+        use gitlawb_core::identity::Keypair;
+
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n"), ("secret/b.txt", b"SECRET\n")]);
+        let dest = td.path().join("dest");
+        let bare = url.strip_prefix("file://").unwrap();
+        assert!(Command::new("git")
+            .args(["-C", bare, "config", "uploadpack.allowFilter", "true"])
+            .status()
+            .unwrap()
+            .success());
+        setup_partial_clone(&dest, &url, &["/secret/**".to_string()], &[], None).unwrap();
+        let oid = {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    dest.to_str().unwrap(),
+                    "rev-parse",
+                    "HEAD:secret/b.txt",
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::remove_dir_all(url.strip_prefix("file://").unwrap()).unwrap();
+
+        let reader = Keypair::generate();
+        let envelope = seal_blob(b"SECRET\n", &[reader.verifying_key()]).unwrap();
+        let cid = "testcid123";
+
+        let mut server = mockito::Server::new_async().await;
+        // Page 1 and page 2 both list TX1 (cursor advances); the dedup must fetch
+        // the /TX1 manifest exactly once.
+        let _gql_p1 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"variables":{"cursor":null}}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"transactions":{"pageInfo":{"hasNextPage":true,"endCursor":"C1"},"edges":[{"node":{"id":"TX1","block":{"height":20}}}]}}}"#,
+            )
+            .create_async()
+            .await;
+        let _gql_p2 = server
+            .mock("POST", "/graphql")
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"variables":{"cursor":"C1"}}"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"data":{"transactions":{"pageInfo":{"hasNextPage":false,"endCursor":"C2"},"edges":[{"node":{"id":"TX1","block":{"height":20}}}]}}}"#,
+            )
+            .create_async()
+            .await;
+        let manifest_body = serde_json::json!({
+            "timestamp": "2026-06-11T00:00:00Z",
+            "blobs": [{ "oid": oid, "cid": cid, "recipients": [] }],
+        })
+        .to_string();
+        let tx1 = server
+            .mock("GET", "/TX1")
+            .expect(1) // dedup: fetched once despite appearing on both pages
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(manifest_body)
+            .create_async()
+            .await;
+        let _blob = server
+            .mock("GET", format!("/ipfs/{cid}").as_str())
+            .with_status(200)
+            .with_body(envelope)
+            .create_async()
+            .await;
+
+        let paths = recover_from_arweave(
+            &server.url(),
+            &server.url(),
+            "alice",
+            "myrepo",
+            &dest,
+            &reader,
+        )
+        .await
+        .unwrap();
+        assert_eq!(paths, vec!["secret/b.txt".to_string()]);
+        tx1.assert_async().await; // exactly one /TX1 fetch
     }
 
     /// A caller who is not a recipient cannot decrypt the envelope, so nothing is
