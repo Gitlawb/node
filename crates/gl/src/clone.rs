@@ -375,8 +375,14 @@ struct TxRef {
 
 /// Edges requested per Arweave GraphQL page (`first:` in the discovery query) and
 /// the per-page bound enforced when parsing a response. The `first:N` literal in
-/// the query string MUST equal this constant.
+/// `ARWEAVE_DISCOVERY_QUERY` MUST equal this constant; `query_first_matches_page_size`
+/// pins that invariant at test time (the query keeps a literal because `format!`-ing
+/// the brace-heavy GraphQL body would be error-prone).
 const ARWEAVE_PAGE_SIZE: usize = 100;
+
+/// Paginated discovery query: manifests tagged for this repo, newest first, with
+/// `pageInfo` for cursor pagination and `block{height}` for the recency tie-break.
+const ARWEAVE_DISCOVERY_QUERY: &str = r#"query($repo:String!,$cursor:String){transactions(tags:[{name:"App-Name",values:["gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100,after:$cursor){pageInfo{hasNextPage endCursor}edges{cursor node{id block{height}}}}}"#;
 
 /// A parsed page of an Arweave GraphQL `transactions` response: the edge refs
 /// plus pagination state. `has_next` is `None` when the response omitted
@@ -395,8 +401,11 @@ struct TxPage {
 ///
 /// At most `ARWEAVE_PAGE_SIZE` edges are taken from a single page: the query asks
 /// for `first:100`, so a response with more edges is a misbehaving (or hostile)
-/// gateway. Bounding here caps per-page allocation and the downstream per-id fetch
-/// loop so the `MAX_TX_IDS` budget can't be defeated by one oversized page.
+/// gateway. Bounding here caps the per-page `TxRef` vec and the downstream per-id
+/// fetch loop so the `MAX_TX_IDS` budget can't be defeated by one oversized page.
+/// (It does not bound the response body itself: `reqwest` buffers and deserializes
+/// the whole body before this runs — an unbounded-body concern shared by every
+/// gateway read in this file, addressed separately if it ever matters.)
 fn parse_tx_page(v: &serde_json::Value) -> TxPage {
     let txns = v.get("data").and_then(|d| d.get("transactions"));
     let refs: Vec<TxRef> = txns
@@ -541,10 +550,7 @@ async fn recover_from_arweave(
     //    is then knowingly partial.
     const MAX_PAGES: usize = 1000;
     const MAX_TX_IDS: usize = 10_000;
-    // `first:100` below must equal ARWEAVE_PAGE_SIZE (the per-page bound enforced
-    // in `parse_tx_page`); the query string keeps the literal because formatting
-    // it would mean escaping the brace-heavy GraphQL body.
-    let query = r#"query($repo:String!,$cursor:String){transactions(tags:[{name:"App-Name",values:["gitlawb"]},{name:"Schema",values:["gitlawb/encrypted-manifest/v1"]},{name:"Repo",values:[$repo]}],first:100,after:$cursor){pageInfo{hasNextPage endCursor}edges{cursor node{id block{height}}}}}"#;
+    let query = ARWEAVE_DISCOVERY_QUERY;
     let mut after: Option<String> = None;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut refs: Vec<TxRef> = Vec::new();
@@ -1081,6 +1087,16 @@ mod tests {
     }
 
     #[test]
+    fn query_first_matches_page_size() {
+        // The `first:N` the discovery query requests must equal the per-page bound
+        // enforced in parse_tx_page, or full-page detection and the cap drift.
+        assert!(
+            ARWEAVE_DISCOVERY_QUERY.contains(&format!("first:{ARWEAVE_PAGE_SIZE}")),
+            "discovery query `first:` must equal ARWEAVE_PAGE_SIZE ({ARWEAVE_PAGE_SIZE})"
+        );
+    }
+
+    #[test]
     fn manifest_parses_and_ignores_recipients() {
         let m: Manifest = serde_json::from_str(
             r#"{"timestamp":"2026-06-11T00:00:00Z","blobs":[{"oid":"o1","cid":"c1","recipients":["did:key:zA"]}]}"#,
@@ -1575,16 +1591,20 @@ mod tests {
 
         let mut server = mockito::Server::new_async().await;
         // Every GraphQL POST returns hasNextPage=true with the SAME endCursor.
-        // Without the guard this would request pages until MAX_PAGES; with it the
-        // loop breaks after the first non-advancing cursor.
+        // The guard fires on the second page (cursor repeats prev_cursor) and
+        // breaks, so discovery makes exactly two POSTs: page 1 (cursor null) records
+        // STUCK, page 2 (cursor STUCK) sees the repeat and stops. We assert that
+        // exact count below — a regression in the advance logic that loops extra
+        // times in the happy path fails the expect(2). (MAX_PAGES is the hard
+        // infinite-loop backstop independent of this guard.)
         let manifest_body = serde_json::json!({
             "timestamp": "2026-06-11T00:00:00Z",
             "blobs": [{ "oid": oid, "cid": cid, "recipients": [] }],
         })
         .to_string();
-        let _gql = server
+        let gql = server
             .mock("POST", "/graphql")
-            .expect_at_most(3) // a couple at most; certainly not MAX_PAGES
+            .expect(2)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -1617,6 +1637,7 @@ mod tests {
         .await
         .expect("non-advancing cursor must terminate, not hang or error");
         assert_eq!(paths, vec!["secret/b.txt".to_string()]);
+        gql.assert_async().await; // exactly two discovery POSTs, then the guard breaks
     }
 
     /// A tx id repeated across pages must be fetched only once: the cross-page
