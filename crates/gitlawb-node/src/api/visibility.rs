@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::auth::AuthenticatedDid;
+use crate::auth::{is_repo_owner, AuthenticatedDid};
 use crate::db::VisibilityMode;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
@@ -26,12 +26,7 @@ pub struct RemoveVisibilityRequest {
 }
 
 fn require_owner(record: &crate::db::RepoRecord, caller: &str) -> Result<()> {
-    let owner_short = record
-        .owner_did
-        .split(':')
-        .next_back()
-        .unwrap_or(&record.owner_did);
-    if caller != record.owner_did && caller != owner_short {
+    if !is_repo_owner(record, caller) {
         return Err(AppError::BadRequest(
             "only the repo owner can manage visibility".into(),
         ));

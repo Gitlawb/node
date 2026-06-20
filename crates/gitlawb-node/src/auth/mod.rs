@@ -17,6 +17,31 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// Whether `caller` is the owner of `record`.
+///
+/// Owners are compared in both forms the rest of the codebase accepts: the full
+/// `did:key:z6Mk…` string and its bare multibase suffix (`z6Mk…`). This is the
+/// single source of truth for the owner-match logic that previously lived inline
+/// in the receive-pack, branch-protection, and visibility paths.
+pub fn is_repo_owner(record: &crate::db::RepoRecord, caller: &str) -> bool {
+    let owner_short = record
+        .owner_did
+        .split(':')
+        .next_back()
+        .unwrap_or(&record.owner_did);
+    caller == record.owner_did || caller == owner_short
+}
+
+/// Whether `caller` is authorized to push to `record`.
+///
+/// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only. This is intentionally a
+/// distinct, intent-named gate rather than a bare owner check so that Phase 2 can
+/// extend it to honor a verified UCAN `git/push` capability as a pure addition
+/// (`is_repo_owner(..) || ucan_grants_push(..)`) without rewriting call sites.
+pub fn caller_authorized_to_push(record: &crate::db::RepoRecord, caller: &str) -> bool {
+    is_repo_owner(record, caller)
+}
+
 use gitlawb_core::http_sig::{
     build_signing_string, compute_content_digest, HttpSignature, COVERED_COMPONENTS,
 };

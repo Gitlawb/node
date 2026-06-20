@@ -141,6 +141,30 @@ During the cooldown your node still earns rewards if it keeps heartbeating.
 
 ---
 
+## Hardening: owner-only push
+
+By default the node authenticates every `git-receive-pack` push (a valid RFC 9421
+`did:key` signature) but does **not** check that the pusher owns the repo, except
+on branches that are explicitly protected. Because `did:key` is self-certifying,
+any party can generate a key, derive its DID, sign, and push to an unprotected
+branch — authentication is not authorization.
+
+To require the authenticated pusher to be the repo owner on **every** branch, set:
+
+```bash
+GITLAWB_ENFORCE_OWNER_PUSH=true
+```
+
+- **Default `false`** — preserves current behavior so live nodes are unaffected by
+  an upgrade. Turn it on once you're ready for owner-only writes.
+- **When `true`** — a push whose authenticated DID is not the repo owner is
+  rejected before any ref update is applied. The owner is matched in both the full
+  `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
+- Collaborator and UCAN-delegated push rights are a separate, planned follow-up;
+  today this is strictly owner-only.
+
+---
+
 ## Operational checklist
 
 | Concern | Recommendation |

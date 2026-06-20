@@ -7,7 +7,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 
-use crate::auth::AuthenticatedDid;
+use crate::auth::{is_repo_owner, AuthenticatedDid};
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
@@ -25,12 +25,7 @@ pub async fn protect_branch(
 
     // Only the repo owner can protect branches
     let caller = &auth.0;
-    let owner_short = record
-        .owner_did
-        .split(':')
-        .next_back()
-        .unwrap_or(&record.owner_did);
-    if caller != &record.owner_did && caller != owner_short {
+    if !is_repo_owner(&record, caller) {
         return Err(AppError::BadRequest(
             "only the repo owner can protect branches".into(),
         ));
@@ -63,12 +58,7 @@ pub async fn unprotect_branch(
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let caller = &auth.0;
-    let owner_short = record
-        .owner_did
-        .split(':')
-        .next_back()
-        .unwrap_or(&record.owner_did);
-    if caller != &record.owner_did && caller != owner_short {
+    if !is_repo_owner(&record, caller) {
         return Err(AppError::BadRequest(
             "only the repo owner can unprotect branches".into(),
         ));
