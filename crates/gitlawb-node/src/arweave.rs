@@ -286,6 +286,44 @@ mod tests {
         _mock.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn test_anchor_body_carries_real_old_sha() {
+        // The anchored body must serialize the real old→new transition the
+        // node was handed, never a zero placeholder. Regression guard for the
+        // push handler that used to hardcode `old_sha` to 64 zeros (#26).
+        let mut server = mockito::Server::new_async().await;
+        let real_old = "1111111111111111111111111111111111111111";
+        let real_new = "2222222222222222222222222222222222222222";
+        let _mock = server
+            .mock("POST", "/upload")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{real_old}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{real_new}"}}"#)),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"TX_REAL_OLD_SHA","timestamp":1710000000000,"version":"1.0.0"}"#)
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let anchor = RefAnchor {
+            repo: "alice/myrepo".into(),
+            owner_did: "did:key:z6Mk...".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: real_old.into(),
+            new_sha: real_new.into(),
+            cid: None,
+            timestamp: "2026-03-14T00:00:00Z".into(),
+            node_did: "did:key:z6Mknnd...".into(),
+        };
+
+        let result = anchor_ref_update(&client, &server.url(), &anchor).await;
+        assert_eq!(result.unwrap(), "TX_REAL_OLD_SHA");
+        // The mock only matches when the posted JSON carries both real SHAs.
+        _mock.assert_async().await;
+    }
+
     #[test]
     fn test_arweave_url() {
         let url = arweave_url("7xGpIoHUQ8j9GhD3Y2mKzP1NsVtXwRcFe4bEaLnMuOk");

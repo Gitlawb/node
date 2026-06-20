@@ -693,23 +693,27 @@ pub async fn git_receive_pack(
             let _ = state.db.update_trust_score(did, new_score).await;
         }
 
-        let ref_name = ref_updates
-            .first()
-            .map(|u| u.ref_name.as_str())
-            .unwrap_or("refs/heads/main");
-        let old_sha = ref_updates
-            .first()
-            .map(|u| u.old_sha.as_str())
-            .unwrap_or("0000000000000000000000000000000000000000");
-
-        // Issue a signed ref-update certificate
-        match cert::issue_ref_certificate(&state, &record.id, ref_name, old_sha, &commit_hash, did)
+        // Issue a signed certificate for every ref this push advanced, each
+        // carrying that ref's real old→new transition. A multi-ref push must
+        // not collapse to a single cert covering only the first ref.
+        for update in &ref_updates {
+            match cert::issue_ref_certificate(
+                &state,
+                &record.id,
+                &update.ref_name,
+                &update.old_sha,
+                &update.new_sha,
+                did,
+            )
             .await
-        {
-            Ok(c) => {
-                tracing::info!(cert_id = %c.id, repo = %record.name, pusher = %did, "issued ref certificate")
+            {
+                Ok(c) => {
+                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
+                }
             }
-            Err(e) => tracing::warn!(err = %e, "failed to issue ref certificate"),
         }
     }
 
@@ -905,7 +909,7 @@ pub async fn git_receive_pack(
         );
         let ref_updates_clone = ref_updates
             .iter()
-            .map(|u| (u.ref_name.clone(), u.new_sha.clone()))
+            .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
             .collect::<Vec<_>>();
         let p2p_handle = state.p2p.clone();
         let pusher_did_clone = did.to_string();
@@ -942,7 +946,7 @@ pub async fn git_receive_pack(
             let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
 
             // Record branch→CID for each ref update and publish gossip
-            for (ref_name, new_sha) in &ref_updates_clone {
+            for (ref_name, _old_sha, new_sha) in &ref_updates_clone {
                 let cid = cid_map.get(new_sha).map(|s| s.as_str());
 
                 if let Some(cid_str) = cid {
@@ -988,8 +992,8 @@ pub async fn git_receive_pack(
                         let notify_url = format!("{peer_url}{path}");
                         let body = serde_json::json!({
                             "repo": repo_slug.clone(),
-                            "ref_name": ref_updates_clone.first().map(|(r, _)| r).unwrap_or(&String::new()),
-                            "new_sha": ref_updates_clone.first().map(|(_, s)| s).unwrap_or(&String::new()),
+                            "ref_name": ref_updates_clone.first().map(|(r, _, _)| r).unwrap_or(&String::new()),
+                            "new_sha": ref_updates_clone.first().map(|(_, _, s)| s).unwrap_or(&String::new()),
                             "node_did": node_did_str.clone(),
                             "pusher_did": pusher_did_clone.clone(),
                             "old_sha": "0000000000000000000000000000000000000000",
@@ -1038,12 +1042,12 @@ pub async fn git_receive_pack(
                 repo: repo_slug.clone(),
                 ref_name: ref_updates_clone
                     .first()
-                    .map(|(r, _)| r.clone())
+                    .map(|(r, _, _)| r.clone())
                     .unwrap_or_default(),
                 old_sha: "0000000000000000000000000000000000000000".to_string(),
                 new_sha: ref_updates_clone
                     .first()
-                    .map(|(_, s)| s.clone())
+                    .map(|(_, _, s)| s.clone())
                     .unwrap_or_default(),
                 pusher_did: pusher_did_clone.clone(),
                 node_did: node_did_str.clone(),
@@ -1053,13 +1057,13 @@ pub async fn git_receive_pack(
             // Arweave permanent anchoring — fire for each ref update.
             // Suppressed for repos the public cannot read (public permanent ledger).
             if announce && !irys_url.is_empty() {
-                for (ref_name, new_sha) in &ref_updates_clone {
+                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
                     let cid = cid_map.get(new_sha).cloned();
                     let anchor = crate::arweave::RefAnchor {
                         repo: repo_slug.clone(),
                         owner_did: owner_did_for_arweave.clone(),
                         ref_name: ref_name.clone(),
-                        old_sha: "0".repeat(64),
+                        old_sha: old_sha.clone(),
                         new_sha: new_sha.clone(),
                         cid: cid.clone(),
                         timestamp: now_ts.clone(),
@@ -1074,7 +1078,7 @@ pub async fn git_receive_pack(
                                     repo: &repo_slug,
                                     owner_did: &owner_did_for_arweave,
                                     ref_name,
-                                    old_sha: "0".repeat(64).as_str(),
+                                    old_sha,
                                     new_sha,
                                     cid: cid.as_deref(),
                                     irys_tx_id: &tx_id,
