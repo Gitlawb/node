@@ -52,13 +52,9 @@ impl Keypair {
         URL_SAFE_NO_PAD.encode(sig.to_bytes())
     }
 
-    /// The raw 32-byte Ed25519 seed. Used to derive the X25519 secret for
-    /// envelope decryption (see `crate::encrypt`).
-    pub fn seed_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
-    }
-
-    /// Export the signing key as raw 32-byte seed (wrapped in Zeroizing).
+    /// The raw 32-byte Ed25519 seed, wrapped in `Zeroizing` so the copy is
+    /// scrubbed on drop. This is the only seed accessor; it is used to derive
+    /// the X25519 secret for envelope decryption (see `crate::encrypt`).
     pub fn to_seed(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.signing_key.to_bytes())
     }
@@ -170,6 +166,17 @@ mod tests {
         let seed = kp.to_seed();
         let kp2 = Keypair::from_seed(&seed).unwrap();
         assert_eq!(kp.verifying_key(), kp2.verifying_key());
+    }
+
+    // `to_seed()` is the only seed accessor on `Keypair` (the raw, unzeroized
+    // `seed_bytes()` was removed in #41). It must hand out the seed
+    // deterministically, so the same seed reconstructs the same DID.
+    #[test]
+    fn to_seed_is_sole_seed_accessor() {
+        let kp = Keypair::generate();
+        let seed = kp.to_seed();
+        assert_eq!(*kp.to_seed(), *seed); // stable across calls
+        assert_eq!(Keypair::from_seed(&seed).unwrap().did(), kp.did());
     }
 
     #[test]
