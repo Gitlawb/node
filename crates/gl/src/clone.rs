@@ -234,6 +234,22 @@ struct WithheldPathsResponse {
     reinclude: Vec<String>,
 }
 
+/// The node's `/encrypted-blobs` 200 body. Same rationale as `WithheldPathsResponse`:
+/// deserializing into a typed struct makes a missing or mistyped `blobs` field (or a
+/// blob entry missing its `oid`) a hard error instead of silently becoming "nothing
+/// to recover", which would mask a server schema regression behind a clone that
+/// quietly omits authorized files. Unknown server fields (e.g. `size`) are ignored
+/// by serde, so the response may carry extra keys without breaking.
+#[derive(Deserialize)]
+struct EncryptedBlobsResponse {
+    blobs: Vec<EncryptedBlobEntry>,
+}
+
+#[derive(Deserialize)]
+struct EncryptedBlobEntry {
+    oid: String,
+}
+
 /// After the base clone, recover encrypted blobs the caller is authorized for
 /// that are missing locally: fetch the envelope, decrypt with the caller's key,
 /// install as a loose object. Returns the repo-relative paths recovered.
@@ -259,13 +275,8 @@ async fn recover_encrypted_blobs(
         Ok(r) if r.status().is_success() => r,
         _ => return Ok(vec![]),
     };
-    let body: serde_json::Value = resp.json().await.context("parsing encrypted-blobs")?;
-    let blobs = body
-        .get("blobs")
-        .and_then(|b| b.as_array())
-        .cloned()
-        .unwrap_or_default();
-    if blobs.is_empty() {
+    let body: EncryptedBlobsResponse = resp.json().await.context("parsing encrypted-blobs")?;
+    if body.blobs.is_empty() {
         return Ok(vec![]);
     }
 
@@ -283,10 +294,8 @@ async fn recover_encrypted_blobs(
     }
 
     let mut recovered = Vec::new();
-    for entry in blobs {
-        let Some(oid) = entry.get("oid").and_then(|o| o.as_str()) else {
-            continue;
-        };
+    for entry in body.blobs {
+        let oid = entry.oid.as_str();
         // Skip if already present locally.
         let present = Command::new("git")
             .args(["-C", dest_str, "cat-file", "-e", oid])
@@ -547,7 +556,14 @@ pub async fn run(args: CloneArgs) -> Result<()> {
         // fallback for any authorized blobs the node could not supply.
         let mut paths = recover_encrypted_blobs(&args.node, &owner, &name, &dest, &keypair)
             .await
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                // A node-recovery error must not abort the clone (the Arweave
+                // fallback still runs), but the strict /encrypted-blobs parse now
+                // fails closed on schema drift, so surface it rather than letting
+                // `.unwrap_or_default()` silently swallow it into "no paths".
+                eprintln!("warning: encrypted-blobs recovery failed: {e}");
+                Vec::new()
+            });
         let from_arweave = recover_from_arweave(
             &args.arweave_gateway,
             &args.ipfs_gateway,
@@ -785,6 +801,30 @@ mod tests {
             r#"{"withheld":"nope","reinclude":[]}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn encrypted_blobs_response_is_schema_strict() {
+        // Happy path: a well-formed body parses and exposes the oids.
+        let ok: EncryptedBlobsResponse =
+            serde_json::from_str(r#"{"blobs":[{"oid":"abc"}]}"#).unwrap();
+        assert_eq!(ok.blobs.len(), 1);
+        assert_eq!(ok.blobs[0].oid, "abc");
+
+        // Unknown server fields on an entry are tolerated (no deny_unknown_fields).
+        let extra: EncryptedBlobsResponse =
+            serde_json::from_str(r#"{"blobs":[{"oid":"abc","size":42}]}"#).unwrap();
+        assert_eq!(extra.blobs[0].oid, "abc");
+
+        // Empty list is valid and distinct from a missing field.
+        let empty: EncryptedBlobsResponse = serde_json::from_str(r#"{"blobs":[]}"#).unwrap();
+        assert!(empty.blobs.is_empty());
+
+        // Schema drift is a hard error, not a silent "nothing to recover":
+        // missing `blobs`, wrong-typed `blobs`, and an entry missing `oid`.
+        assert!(serde_json::from_str::<EncryptedBlobsResponse>(r#"{"items":[]}"#).is_err());
+        assert!(serde_json::from_str::<EncryptedBlobsResponse>(r#"{"blobs":"nope"}"#).is_err());
+        assert!(serde_json::from_str::<EncryptedBlobsResponse>(r#"{"blobs":[{"size":1}]}"#).is_err());
     }
 
     #[test]
