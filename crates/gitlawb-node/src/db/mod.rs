@@ -1091,15 +1091,18 @@ impl Db {
 
     /// Mark an agent `revoked` (terminal self-deregistration, issue #29).
     /// Returns `false` when no such agent exists so the caller can surface a
-    /// 404. Revoking an already-revoked agent is idempotent.
+    /// 404. Revoking an already-revoked agent is idempotent, and a retry keeps
+    /// the original `deactivated_at` (COALESCE) rather than overwriting it.
     pub async fn revoke_agent(&self, did: &str) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
-        let result =
-            sqlx::query("UPDATE agents SET status = 'revoked', deactivated_at = $2 WHERE did = $1")
-                .bind(did)
-                .bind(&now)
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE agents SET status = 'revoked', \
+             deactivated_at = COALESCE(deactivated_at, $2) WHERE did = $1",
+        )
+        .bind(did)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
