@@ -119,6 +119,19 @@ jobs:
       - name: Install cargo-audit
         run: cargo install --locked cargo-audit
 
+      # Hard-fail gate. Suppressions live in .cargo/audit.toml (read automatically
+      # from the repo root), each with no available upstream fix. A green check
+      # here means "no NEW advisories", not "advisory-clean": surface the active
+      # ignore list so a reviewer sees exactly what is being accepted.
+      - name: Show active audit ignores
+        run: |
+          {
+            echo '### cargo audit: accepted advisories (.cargo/audit.toml)'
+            echo '```toml'
+            sed -n '/^\[advisories\]/,$p' .cargo/audit.toml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: cargo audit
         run: cargo audit
 
