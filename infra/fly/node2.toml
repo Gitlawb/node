@@ -1,0 +1,64 @@
+# Fly config for node2.gitlawb.com — deploys the public Gitlawb/node source.
+# Migrated after node3 (see node3.toml). Deploy from the repo root:
+#   fly deploy -a gitlawb-node-2 -c infra/fly/node2.toml
+#
+# Reuses the existing sjc volume `gitlawb_data` (identity key + repos) and the
+# attached Postgres `gitlawb-node-2-db` (DATABASE_URL secret). Extra app
+# secrets (contract registries, Irys URL) persist across deploys.
+#
+# IMPORTANT: the volume was created by the old root image, so /data is
+# root-owned. chown it to uid 1000 (the public image's `gitlawb` user) BEFORE
+# this deploy or it crash-loops on "failed to read key … Permission denied":
+#   fly ssh console -a gitlawb-node-2 -C "chown -R 1000:1000 /data"
+app = "gitlawb-node-2"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "../../Dockerfile"
+
+[env]
+  GITLAWB_HOST = "0.0.0.0"
+  GITLAWB_PORT = "7545"
+  GITLAWB_P2P_PORT = "7546"
+  GITLAWB_REPOS_DIR = "/data/repos"
+  GITLAWB_KEY = "/data/keys/identity.pem"
+  GITLAWB_PUBLIC_URL = "https://node2.gitlawb.com"
+  # Bootstrap to the other two production nodes (not self).
+  GITLAWB_BOOTSTRAP_PEERS = "https://node.gitlawb.com,https://node3.gitlawb.com"
+  GITLAWB_AUTO_SYNC = "true"
+  GITLAWB_MAX_PACK_BYTES = "524288000"
+
+[http_service]
+  internal_port = 7545
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 500
+    soft_limit = 400
+
+  [http_service.http_options]
+    idle_timeout = 120
+
+[[services]]
+  protocol = "udp"
+  internal_port = 7546
+
+  [[services.ports]]
+    port = 7546
+
+[[vm]]
+  size = "shared-cpu-1x"
+  # 1024MB: node2 mirrors the whole network. Prior 256MB was too small for v0.3.9.
+  memory = 1024
+
+[[mounts]]
+  source = "gitlawb_data"
+  destination = "/data"
+
+[metrics]
+  port = 9091
+  path = "/metrics"

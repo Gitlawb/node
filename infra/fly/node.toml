@@ -1,0 +1,63 @@
+# Fly config for node.gitlawb.com — deploys the public Gitlawb/node source.
+# The primary/busiest bootstrap node: 2-machine HA in sjc, each with its own
+# 250GB volume and DISTINCT identity. Deploy from the repo root:
+#   fly deploy -a gitlawb-node -c infra/fly/node.toml
+#
+# Reuses both sjc volumes `gitlawb_data` (identity key + repos), the attached
+# Postgres (DATABASE_URL), and Tigris S3 + Pinata + contract secrets — all
+# app-level, preserved across deploys.
+#
+# IMPORTANT: both volumes were created by the old root image, so /data is
+# root-owned. chown BOTH to uid 1000 BEFORE deploy or that machine crash-loops:
+#   fly ssh console -a gitlawb-node --machine <id> -C "chown -R 1000:1000 /data"
+app = "gitlawb-node"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "../../Dockerfile"
+
+[env]
+  GITLAWB_HOST = "0.0.0.0"
+  GITLAWB_PORT = "7545"
+  GITLAWB_P2P_PORT = "7546"
+  GITLAWB_REPOS_DIR = "/data/repos"
+  GITLAWB_KEY = "/data/keys/identity.pem"
+  GITLAWB_PUBLIC_URL = "https://node.gitlawb.com"
+  GITLAWB_BOOTSTRAP_PEERS = "https://node2.gitlawb.com,https://node3.gitlawb.com"
+  GITLAWB_AUTO_SYNC = "true"
+  GITLAWB_MAX_PACK_BYTES = "524288000"
+
+[http_service]
+  internal_port = 7545
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  # Keep both HA machines up; Fly rolls them one at a time (zero-downtime).
+  min_machines_running = 2
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 500
+    soft_limit = 400
+
+  [http_service.http_options]
+    idle_timeout = 120
+
+[[services]]
+  protocol = "udp"
+  internal_port = 7546
+
+  [[services.ports]]
+    port = 7546
+
+[[vm]]
+  size = "shared-cpu-4x"
+  memory = 8192
+
+[[mounts]]
+  source = "gitlawb_data"
+  destination = "/data"
+
+[metrics]
+  port = 9091
+  path = "/metrics"
