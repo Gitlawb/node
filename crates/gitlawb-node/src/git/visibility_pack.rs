@@ -23,7 +23,19 @@ use std::path::Path;
 /// Fails closed: if a ref cannot be traversed, returns an error so the caller
 /// aborts the serve/pin rather than producing a partial (under-withheld) set.
 fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    let refs = store::list_refs(repo_path).context("list_refs failed")?;
+    let mut refs = store::list_refs(repo_path).context("list_refs failed")?;
+    // `for-each-ref` omits HEAD, but the pin set (`git rev-list --objects --all`)
+    // and `git upload-pack` both expose objects reachable from HEAD. If HEAD is
+    // ever detached (or otherwise points outside the ref-covered set), those
+    // objects must still be classified here, or a withheld blob could escape into
+    // a pin/serve path that this walk never saw. HEAD is normally symbolic to a
+    // branch already in `refs`, so this just adds a duplicate the downstream set
+    // arithmetic collapses; in the detached case it is the safety net. `None`
+    // means HEAD does not resolve to a commit (e.g. an unborn branch on an empty
+    // repo) — nothing to walk.
+    if let Some(head_oid) = store::head_commit(repo_path).context("resolve HEAD failed")? {
+        refs.push(("HEAD".to_string(), head_oid));
+    }
     let mut out = Vec::new();
     for (refname, _oid) in refs {
         let listing = std::process::Command::new("git")
@@ -336,6 +348,51 @@ mod tests {
         assert!(
             withheld.contains(&secret_oid),
             "blob reachable only via refs/custom/* must still be withheld"
+        );
+    }
+
+    #[test]
+    fn withholds_blob_reachable_only_via_detached_head() {
+        let (_td, bare, secret_oid, _public) = fixture();
+        // Detach HEAD onto the only commit, then delete the branch it pointed to,
+        // so the secret blob is reachable ONLY through HEAD. `for-each-ref` omits
+        // HEAD, but `rev-list --all` (pin) and upload-pack (serve) reach it, so it
+        // must still be withheld.
+        let head_ref = {
+            let out = Command::new("git")
+                .args(["symbolic-ref", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let head_oid = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["update-ref", "--no-deref", "HEAD", &head_oid]);
+        run(&["update-ref", "-d", &head_ref]);
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "blob reachable only via detached HEAD must still be withheld"
         );
     }
 
