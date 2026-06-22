@@ -110,8 +110,7 @@ impl TigrisClient {
             .collect()
             .await
             .context("reading tigris response body")?
-            .into_bytes()
-            .to_vec();
+            .into_bytes();
 
         // Extract tar.zst to local path
         tokio::task::spawn_blocking({

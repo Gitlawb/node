@@ -152,17 +152,19 @@ async fn process_batch(
         }
     };
 
-    for item in items {
-        // Resolve origin node HTTP URL from peer table
-        let peers = match db.list_peers().await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(err = %e, "failed to list peers for sync");
+    // Resolve the peer table once per batch — every item only needs a lookup.
+    let peers = match db.list_peers().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(err = %e, "failed to list peers for sync");
+            for item in &items {
                 let _ = db.mark_sync_failed(&item.id).await;
-                continue;
             }
-        };
+            return;
+        }
+    };
 
+    for item in items {
         let origin_url = match peers.iter().find(|p| p.did == item.node_did) {
             Some(p) => p.http_url.trim_end_matches('/').to_string(),
             None => {
