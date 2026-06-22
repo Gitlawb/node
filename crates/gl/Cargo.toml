@@ -3,6 +3,7 @@ name = "gl"
 description = "The gitlawb CLI — identity management, node control, MCP server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
