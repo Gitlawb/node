@@ -121,10 +121,44 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_HEARTBEAT_INTERVAL_HOURS", default_value_t = 20)]
     pub heartbeat_interval_hours: u64,
 
-    /// Tigris (S3-compatible) bucket for repo storage.
+    /// Tigris (S3-compatible) bucket for repo storage. Legacy alias for
+    /// `s3_bucket` — still honoured so existing deployments keep working.
     /// Leave empty to disable Tigris and use local-only storage.
     #[arg(long, env = "GITLAWB_TIGRIS_BUCKET", default_value = "")]
     pub tigris_bucket: String,
+
+    /// Object-storage backend: `s3` (any S3-compatible service), `fs` (local
+    /// directory), or `ipfs` (Kubo MFS). Empty = auto-detect: `s3` when a bucket
+    /// is set, else `fs` when a storage dir is set, else `ipfs` when an IPFS API
+    /// is set, else local-only.
+    #[arg(long, env = "GITLAWB_STORAGE_BACKEND", default_value = "")]
+    pub storage_backend: String,
+
+    /// Bucket for the `s3` backend (Tigris, R2, AWS S3, MinIO, B2). Falls back to
+    /// `tigris_bucket` when empty.
+    #[arg(long, env = "GITLAWB_S3_BUCKET", default_value = "")]
+    pub s3_bucket: String,
+
+    /// Endpoint URL override for the `s3` backend (e.g. R2/MinIO). On Tigris/Fly
+    /// the endpoint is auto-provided via `AWS_ENDPOINT_URL_S3`, so leave empty.
+    #[arg(long, env = "GITLAWB_S3_ENDPOINT", default_value = "")]
+    pub s3_endpoint: String,
+
+    /// Force path-style S3 addressing (required by MinIO and some S3-compatibles).
+    #[arg(long, env = "GITLAWB_S3_FORCE_PATH_STYLE", default_value_t = false)]
+    pub s3_force_path_style: bool,
+
+    /// Directory for the `fs` (local filesystem) storage backend.
+    #[arg(long, env = "GITLAWB_STORAGE_FS_DIR", default_value = "")]
+    pub storage_fs_dir: String,
+
+    /// Acknowledge a push to the client before the durable upload to object
+    /// storage finishes (write-back). Greatly lowers push latency; the local
+    /// copy and the advisory lock keep cross-node consistency, at the cost of a
+    /// small durability window if the node crashes mid-upload. Set false for
+    /// strict upload-before-ack durability.
+    #[arg(long, env = "GITLAWB_ASYNC_UPLOAD", default_value_t = true)]
+    pub async_upload: bool,
 
     /// Maximum pack body size for git-receive-pack and git-upload-pack, in bytes.
     /// Applies only to git smart-HTTP routes — all other API routes keep the 2 MB default.
