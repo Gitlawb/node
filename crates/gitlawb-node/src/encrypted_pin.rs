@@ -63,6 +63,42 @@ fn resolve_all_recipients(dids: &BTreeSet<String>) -> Result<Vec<VerifyingKey>, 
     }
 }
 
+/// What to do with a single withheld blob, decided without any DB or IO so the
+/// fail-closed invariant (#47) is unit-testable in isolation.
+#[derive(Debug)]
+enum SealPlan {
+    /// An existing envelope already covers exactly this recipient set; nothing to do.
+    SkipUnchanged,
+    /// No recipient DID resolved to a key, so there is nothing to seal to.
+    SkipNoRecipients,
+    /// At least one recipient DID is unresolvable. Fail closed: never seal to a
+    /// partial set. Carries the unresolvable DIDs for logging.
+    SkipUnresolvable(Vec<String>),
+    /// Seal to `keys` and record coverage under `tag`.
+    Seal { keys: Vec<VerifyingKey>, tag: String },
+}
+
+/// Decide what to do with one blob given its desired recipient set and the tag
+/// already stored for it (if any). Pure: no DB, no IO.
+///
+/// This is the #47 fail-closed gate in isolation: it returns `Seal` only when
+/// EVERY recipient DID resolves, so no caller can seal to a partial set. A
+/// changed recipient set (different tag) re-seals so a newly added reader can
+/// recover the blob; reader removal is not retroactive (the old envelope is
+/// already public). The comparison is on the opaque node-keyed tag, never the
+/// DID list.
+fn plan_seal(node_seed: &[u8; 32], dids: &BTreeSet<String>, stored_tag: Option<&str>) -> SealPlan {
+    let tag = recipients_tag(node_seed, dids);
+    if stored_tag == Some(tag.as_str()) {
+        return SealPlan::SkipUnchanged;
+    }
+    match resolve_all_recipients(dids) {
+        Ok(keys) if keys.is_empty() => SealPlan::SkipNoRecipients,
+        Ok(keys) => SealPlan::Seal { keys, tag },
+        Err(unresolved) => SealPlan::SkipUnresolvable(unresolved),
+    }
+}
+
 /// Encrypt and pin every withheld blob. `recipients` maps blob oid -> DID set;
 /// `node_seed` keys the opaque recipients tag. Returns `(oid, cid)` for each blob
 /// actually sealed and recorded this call (the per-push delta), used by Option B3
@@ -78,33 +114,25 @@ pub async fn encrypt_and_pin(
     let mut sealed = Vec::new();
     let mut skipped_unresolvable = 0usize;
     for (oid, dids) in recipients {
-        // Skip only if an existing envelope already covers exactly these
-        // recipients. If the recipient set changed (e.g. a reader was added to
-        // the rule), re-seal so the new reader can recover the blob. Reader
-        // removal is not retroactive: the old envelope is already public. The
-        // comparison is on the opaque node-keyed tag, never the DID list.
-        let tag = recipients_tag(node_seed, dids);
-        match db.encrypted_blob_recipients_tag(repo_id, oid).await {
-            Ok(Some(stored_tag)) if stored_tag == tag => continue,
-            Ok(_) => {}
+        // A DB read failure is not a cache miss: re-sealing here would do an
+        // avoidable IPFS write during a partial outage. Skip and retry next push.
+        let stored_tag = match db.encrypted_blob_recipients_tag(repo_id, oid).await {
+            Ok(t) => t,
             Err(e) => {
-                // A DB read failure is not a cache miss: re-sealing here would do
-                // an avoidable IPFS write during a partial outage. Skip and retry
-                // on the next push.
                 tracing::warn!(oid = %oid, err = %e, "recipients_tag lookup failed; skipping reseal");
                 continue;
             }
-        }
-        // Fail closed: seal only when every recipient DID resolves. Sealing to a
-        // partial set while recording the full set as covered would permanently
-        // lock out the dropped readers (#47).
-        let keys = match resolve_all_recipients(dids) {
-            Ok(keys) if keys.is_empty() => {
+        };
+        // Fail closed: plan_seal returns Seal only when every recipient DID
+        // resolves, so we never seal to a partial set and record the full set as
+        // covered (which would permanently lock out the dropped readers, #47).
+        let (keys, tag) = match plan_seal(node_seed, dids, stored_tag.as_deref()) {
+            SealPlan::SkipUnchanged => continue,
+            SealPlan::SkipNoRecipients => {
                 tracing::warn!(oid = %oid, "no resolvable recipient keys; skipping encrypted pin");
                 continue;
             }
-            Ok(keys) => keys,
-            Err(unresolved) => {
+            SealPlan::SkipUnresolvable(unresolved) => {
                 skipped_unresolvable += 1;
                 // DIDs are user-controlled (rule reader_dids); log a bounded
                 // sample, not an unbounded dump. Wording stays neutral about the
@@ -119,6 +147,7 @@ pub async fn encrypt_and_pin(
                 );
                 continue;
             }
+            SealPlan::Seal { keys, tag } => (keys, tag),
         };
         let data = match crate::git::store::read_object(repo_path, oid) {
             Ok(Some((_t, bytes))) => bytes,
@@ -261,5 +290,66 @@ mod tests {
             a, b,
             "tag must depend on the node seed, not be a plain hash"
         );
+    }
+
+    // plan_seal is the seal/skip decision `encrypt_and_pin` acts on. Testing it
+    // directly pins the #47 fail-closed invariant at the function that owns it,
+    // which a unit test of `resolve_all_recipients` alone cannot do (it can't
+    // catch the caller falling through to a partial seal).
+    const SEED: [u8; 32] = [9u8; 32];
+
+    #[test]
+    fn plan_seal_seals_when_all_recipients_resolve() {
+        let dids = set(&[did_key(1), did_key(2)]);
+        match plan_seal(&SEED, &dids, None) {
+            SealPlan::Seal { keys, tag } => {
+                assert_eq!(keys.len(), 2, "must seal to the full recipient set");
+                assert_eq!(tag, recipients_tag(&SEED, &dids), "records the full-set tag");
+            }
+            other => panic!("expected Seal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_seal_fails_closed_on_any_unresolvable_recipient() {
+        // The #47 invariant at the decision boundary: one unresolvable DID among
+        // resolvable ones must NOT yield a Seal (which would seal a partial set).
+        let gitlawb = Did::gitlawb("zPending").to_string();
+        let dids = set(&[did_key(1), did_key(2), gitlawb.clone()]);
+        match plan_seal(&SEED, &dids, None) {
+            SealPlan::SkipUnresolvable(unresolved) => assert_eq!(unresolved, vec![gitlawb]),
+            other => panic!("must fail closed, never seal a partial set; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_seal_skips_empty_recipient_set() {
+        let dids = BTreeSet::new();
+        assert!(matches!(
+            plan_seal(&SEED, &dids, None),
+            SealPlan::SkipNoRecipients
+        ));
+    }
+
+    #[test]
+    fn plan_seal_skips_when_tag_unchanged() {
+        let dids = set(&[did_key(1)]);
+        let stored = recipients_tag(&SEED, &dids);
+        assert!(matches!(
+            plan_seal(&SEED, &dids, Some(&stored)),
+            SealPlan::SkipUnchanged
+        ));
+    }
+
+    #[test]
+    fn plan_seal_reseals_when_recipient_set_changed() {
+        // A stored tag for a DIFFERENT set is a miss: a newly added reader must
+        // trigger a re-seal, not be skipped as unchanged.
+        let dids = set(&[did_key(1), did_key(2)]);
+        let stale = recipients_tag(&SEED, &set(&[did_key(1)]));
+        match plan_seal(&SEED, &dids, Some(&stale)) {
+            SealPlan::Seal { keys, .. } => assert_eq!(keys.len(), 2),
+            other => panic!("changed recipient set must re-seal; got {other:?}"),
+        }
     }
 }
