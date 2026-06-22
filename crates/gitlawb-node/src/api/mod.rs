@@ -54,3 +54,139 @@ pub(crate) async fn authorize_repo_read(
     }
     Ok((record, rules))
 }
+
+/// Match a presented DID against a stored DID that may be the full `did:key:<id>`
+/// form or the bare `<id>` short form (mirror rows store the bare key). Collapse
+/// representation only within `did:key`; never let a bare id match across methods —
+/// `did:web` / `did:gitlawb` share the base58 space with `did:key`, so a
+/// trailing-segment compare would treat `did:key:X` and `did:gitlawb:X` as equal.
+pub(crate) fn did_matches(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    fn key_id(d: &str) -> &str {
+        d.strip_prefix("did:key:").unwrap_or(d)
+    }
+    let (ka, kb) = (key_id(a), key_id(b));
+    // After stripping `did:key:`, a value still containing ':' is a non-key full
+    // DID — do not let it match a bare `did:key` id.
+    !ka.contains(':') && !kb.contains(':') && ka == kb
+}
+
+/// 403 unless `caller` is the repo owner. Uses [`did_matches`] so the owner check
+/// and the author check (close policy) share one normalization.
+pub(crate) fn require_repo_owner(record: &RepoRecord, caller: &str) -> Result<()> {
+    if did_matches(caller, &record.owner_did) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
+            "only the repo owner can perform this action".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod did_tests {
+    use super::did_matches;
+
+    #[test]
+    fn full_matches_bare_same_key() {
+        assert!(did_matches("did:key:zABC", "zABC"));
+        assert!(did_matches("zABC", "did:key:zABC"));
+    }
+
+    #[test]
+    fn rejects_cross_method_collision() {
+        assert!(!did_matches("did:key:zABC", "did:gitlawb:zABC"));
+        assert!(!did_matches("did:key:zABC", "did:web:zABC"));
+    }
+
+    #[test]
+    fn exact_match_and_distinct_keys() {
+        assert!(did_matches("did:key:zABC", "did:key:zABC"));
+        assert!(!did_matches("did:key:zABC", "did:key:zXYZ"));
+        assert!(!did_matches("zABC", "zXYZ"));
+    }
+}
+
+/// Drift guard (plan 002 §Gate-type table, Step 5). Every in-scope mutation
+/// handler must contain its expected gate marker in its own body; removing a
+/// gate fails this test. Source-level (no DB), so it runs everywhere. When a new
+/// route is added to an in-scope group, add its row here with a deliberate gate
+/// type — that forced decision is the point.
+#[cfg(test)]
+mod authz_guard {
+    fn fn_body<'a>(src: &'a str, func: &'a str) -> &'a str {
+        let needle = format!("fn {func}(");
+        let start = src
+            .find(&needle)
+            .unwrap_or_else(|| panic!("handler `{func}` not found (renamed or removed?)"));
+        let rest = &src[start..];
+        // End at the next top-level handler so a marker in a later fn can't leak in.
+        let end = rest[1..]
+            .find("\npub async fn ")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn every_in_scope_mutation_has_its_gate() {
+        let pulls = include_str!("pulls.rs");
+        let webhooks = include_str!("webhooks.rs");
+        let labels = include_str!("labels.rs");
+        let issues = include_str!("issues.rs");
+        let bounties = include_str!("bounties.rs");
+        let replicas = include_str!("replicas.rs");
+        let tasks = include_str!("tasks.rs");
+        let stars = include_str!("stars.rs");
+        let protect = include_str!("protect.rs");
+        let visibility = include_str!("visibility.rs");
+
+        // (source, handler, expected gate marker)
+        let rows: &[(&str, &str, &str)] = &[
+            // Bucket A — owner-gate
+            (pulls, "merge_pr", "require_repo_owner"),
+            (webhooks, "create_webhook", "require_repo_owner"),
+            (webhooks, "delete_webhook", "require_repo_owner"),
+            (labels, "add_label", "require_repo_owner"),
+            (labels, "remove_label", "require_repo_owner"),
+            // Bucket A' — owner OR author
+            (pulls, "close_pr", "did_matches"),
+            (issues, "close_issue", "did_matches"),
+            // Bucket B — read-gate
+            (pulls, "create_review", "authorize_repo_read"),
+            (pulls, "create_comment", "authorize_repo_read"),
+            (issues, "create_issue_comment", "authorize_repo_read"),
+            (bounties, "create_bounty", "authorize_repo_read"),
+            // Bucket C — signer-self (acting DID bound to auth.0)
+            (tasks, "create_task", "auth.0"),
+            (tasks, "claim_task", "auth.0"),
+            (tasks, "complete_task", "auth.0"),
+            (tasks, "fail_task", "auth.0"),
+            // Bucket D — non-owner-by-design, positive per-route marker
+            (bounties, "submit_bounty", "did_matches"),
+            (bounties, "approve_bounty", "did_matches"),
+            (bounties, "cancel_bounty", "did_matches"),
+            (bounties, "dispute_bounty", "did_matches"),
+            (replicas, "register_replica", "did_matches"),
+            (replicas, "unregister_replica", "auth.0"),
+            (stars, "star_repo", "auth.0"),
+            (stars, "unstar_repo", "auth.0"),
+            // PRE-GATED — already owner-gated, in-scope group; guarded against regression
+            (protect, "protect_branch", "owner_did"),
+            (protect, "unprotect_branch", "owner_did"),
+            (visibility, "set_visibility", "require_owner"),
+            (visibility, "remove_visibility", "require_owner"),
+            (visibility, "list_visibility", "require_owner"),
+        ];
+
+        for (src, func, marker) in rows {
+            let body = fn_body(src, func);
+            assert!(
+                body.contains(marker),
+                "handler `{func}` is missing its gate marker `{marker}` — gate removed or route reclassified"
+            );
+        }
+    }
+}

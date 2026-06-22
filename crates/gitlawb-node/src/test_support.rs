@@ -181,4 +181,73 @@ mod tests {
             resp.status()
         );
     }
+
+    /// N7: merge_pr is owner-only. A non-owner is rejected by require_repo_owner
+    /// before any git work (so no on-disk repo is needed for the rejection).
+    #[sqlx::test]
+    async fn merge_pr_rejects_non_owner(pool: PgPool) {
+        let owner = "did:key:zMERGEOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zMERGESTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "merge-repo"))
+            .await
+            .expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+                axum::routing::post(crate::api::pulls::merge_pr),
+            )
+            .with_state(state);
+        let uri = format!("/api/v1/repos/{owner}/merge-repo/pulls/1/merge");
+        let resp = router
+            .oneshot(signed_request_as(
+                stranger,
+                Method::POST,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner must not be able to merge"
+        );
+    }
+
+    /// N13: the task handlers bind the acting DID to the signer. A caller signed
+    /// as B claiming delegator_did A is rejected before any DB write (DB-free).
+    #[sqlx::test]
+    async fn create_task_binds_delegator_to_signer(pool: PgPool) {
+        let signer = "did:key:zSIGNERBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let claimed = "did:key:zCLAIMEDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let router = Router::new()
+            .route(
+                "/api/v1/tasks",
+                axum::routing::post(crate::api::tasks::create_task),
+            )
+            .with_state(state);
+        let body = Body::from(format!(
+            r#"{{"kind":"build","capability":"repo:write","delegator_did":"{claimed}"}}"#
+        ));
+        let resp = router
+            .oneshot(signed_request_as(
+                signer,
+                Method::POST,
+                "/api/v1/tasks",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "delegator_did must be bound to the signer"
+        );
+    }
 }

@@ -79,12 +79,9 @@ pub async fn create_bounty(
         return Err(AppError::BadRequest("amount must be positive".into()));
     }
 
-    // Verify repo exists
-    let _ = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Read-gate: anyone who can read the repo may fund a bounty on it (this closes
+    // the private-repo bounty leak); ownership is not required.
+    crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let now = Utc::now().to_rfc3339();
     let bounty = BountyRecord {
@@ -213,7 +210,11 @@ pub async fn submit_bounty(
             bounty.status
         )));
     }
-    if bounty.claimant_did.as_deref() != Some(&auth.0) {
+    let is_claimant = bounty
+        .claimant_did
+        .as_deref()
+        .is_some_and(|c| crate::api::did_matches(&auth.0, c));
+    if !is_claimant {
         return Err(AppError::BadRequest("only the claimant can submit".into()));
     }
 
@@ -249,7 +250,7 @@ pub async fn approve_bounty(
             bounty.status
         )));
     }
-    if bounty.creator_did != auth.0 {
+    if !crate::api::did_matches(&auth.0, &bounty.creator_did) {
         return Err(AppError::BadRequest(
             "only the bounty creator can approve".into(),
         ));
@@ -296,7 +297,7 @@ pub async fn cancel_bounty(
             bounty.status
         )));
     }
-    if bounty.creator_did != auth.0 {
+    if !crate::api::did_matches(&auth.0, &bounty.creator_did) {
         return Err(AppError::BadRequest(
             "only the bounty creator can cancel".into(),
         ));
@@ -330,6 +331,19 @@ pub async fn dispute_bounty(
             "can only dispute claimed/submitted bounties, status is {}",
             bounty.status
         )));
+    }
+
+    // Only the bounty creator or the current claimant may dispute (N19 — this
+    // endpoint had no identity check at all).
+    let is_creator = crate::api::did_matches(&auth.0, &bounty.creator_did);
+    let is_claimant = bounty
+        .claimant_did
+        .as_deref()
+        .is_some_and(|c| crate::api::did_matches(&auth.0, c));
+    if !is_creator && !is_claimant {
+        return Err(AppError::Forbidden(
+            "only the bounty creator or claimant can dispute this bounty".into(),
+        ));
     }
 
     // Check if deadline exceeded

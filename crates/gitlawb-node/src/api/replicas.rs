@@ -47,8 +47,9 @@ pub async fn register_replica(
 
     let replica_did = &auth.0;
 
-    // Don't let an owner register themselves as a replica of their own repo.
-    if replica_did == &record.owner_did {
+    // Don't let an owner register themselves as a replica of their own repo
+    // (did_matches handles the full vs bare did:key owner form).
+    if crate::api::did_matches(replica_did, &record.owner_did) {
         return Err(AppError::BadRequest(
             "the repo owner is not a replica of their own repo".into(),
         ));
