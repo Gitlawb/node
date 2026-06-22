@@ -26,7 +26,7 @@ pub async fn protect_branch(
     // Only the repo owner can protect branches
     let caller = &auth.0;
     if !is_repo_owner(&record, caller) {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Forbidden(
             "only the repo owner can protect branches".into(),
         ));
     }
@@ -59,7 +59,7 @@ pub async fn unprotect_branch(
 
     let caller = &auth.0;
     if !is_repo_owner(&record, caller) {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Forbidden(
             "only the repo owner can unprotect branches".into(),
         ));
     }

@@ -158,10 +158,14 @@ GITLAWB_ENFORCE_OWNER_PUSH=true
 - **Default `false`** — preserves current behavior so live nodes are unaffected by
   an upgrade. Turn it on once you're ready for owner-only writes.
 - **When `true`** — a push whose authenticated DID is not the repo owner is
-  rejected before any ref update is applied. The owner is matched in both the full
-  `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
-- Collaborator and UCAN-delegated push rights are a separate, planned follow-up;
-  today this is strictly owner-only.
+  rejected (HTTP 403) before any ref update is applied. The owner is matched in
+  both the full `did:key:z6Mk…` form and its bare `z6Mk…` suffix.
+- **Caution: this blocks every non-owner pusher, including your own delegated and
+  CI agents.** Push authorization is owner-only today — a UCAN `git/push`
+  capability is verified but not yet honored for authorization, so delegated keys
+  cannot push while this is on. Don't enable it until every identity that pushes
+  to your repos is the owner, or you'll lock out your own automation. Scoped
+  collaborator / UCAN-delegated push rights are a planned follow-up.
 
 ---
 

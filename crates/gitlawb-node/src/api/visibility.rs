@@ -27,7 +27,7 @@ pub struct RemoveVisibilityRequest {
 
 fn require_owner(record: &crate::db::RepoRecord, caller: &str) -> Result<()> {
     if !is_repo_owner(record, caller) {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Forbidden(
             "only the repo owner can manage visibility".into(),
         ));
     }
