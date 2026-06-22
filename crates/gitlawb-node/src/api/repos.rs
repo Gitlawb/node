@@ -943,9 +943,20 @@ pub async fn git_receive_pack(
     let receive_result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes. Only upload to Tigris when the push
+    // from blocking subsequent pushes. Only upload to storage when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
-    guard.release(receive_result.is_ok()).await;
+    let push_ok = receive_result.is_ok();
+    if push_ok && state.config.async_upload {
+        // Write-back: ack the client now; the durable upload to object storage
+        // and the advisory-lock release run in the background. The lock is held
+        // until the upload finishes, so a concurrent writer on another machine
+        // can't observe a stale archive. Trades a small crash-durability window
+        // (local copy survives; lazy migration re-syncs) for much lower latency.
+        tokio::spawn(guard.release(true));
+    } else {
+        // Strict path (or failed push): upload-before-ack / prompt lock release.
+        guard.release(push_ok).await;
+    }
 
     let result = receive_result.map_err(|e| {
         let app = git_service_app_error(&e);

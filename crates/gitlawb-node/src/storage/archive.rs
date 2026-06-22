@@ -1,69 +1,61 @@
-//! Tigris (S3-compatible) storage client for git bare repos.
-//!
-//! Repos are stored as `repos/v1/{owner_slug}/{repo_name}.tar.zst` — a
-//! zstd-compressed tar archive of the bare repo directory.
+//! Repo-archive layer: stores a bare git repo as a single
+//! `repos/v1/{owner_slug}/{repo_name}.tar.zst` object on top of any
+//! [`BlobStore`] backend. Backend-agnostic replacement for the old
+//! Tigris-specific client.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
-use aws_sdk_s3::Client as S3Client;
+use bytes::Bytes;
 use tracing::{debug, info};
 
-/// Wrapper around the S3 client with the configured bucket.
+use super::BlobStore;
+
 #[derive(Clone)]
-pub struct TigrisClient {
-    s3: S3Client,
-    bucket: String,
+pub struct RepoArchive {
+    store: Arc<dyn BlobStore>,
 }
 
-impl TigrisClient {
-    /// Create a new client. Uses AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and
-    /// AWS_ENDPOINT_URL_S3 env vars — all set automatically by Fly for Tigris buckets.
-    pub async fn new(bucket: &str) -> Result<Self> {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let s3 = S3Client::new(&config);
-        info!(bucket = %bucket, "tigris storage client initialized");
-        Ok(Self {
-            s3,
-            bucket: bucket.to_string(),
-        })
+impl RepoArchive {
+    pub fn new(store: Arc<dyn BlobStore>) -> Self {
+        Self { store }
     }
 
-    /// S3 key for a given repo: `repos/v1/{owner_slug}/{repo_name}.tar.zst`
-    fn repo_key(owner_slug: &str, repo_name: &str) -> String {
+    /// Object key for a repo archive.
+    fn key(owner_slug: &str, repo_name: &str) -> String {
         format!("repos/v1/{owner_slug}/{repo_name}.tar.zst")
     }
 
-    /// Check if a repo archive exists in Tigris.
-    pub async fn exists(&self, owner_slug: &str, repo_name: &str) -> Result<bool> {
-        let key = Self::repo_key(owner_slug, repo_name);
-        match self
-            .s3
-            .head_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if e.as_service_error().is_some_and(|e| e.is_not_found()) {
-                    Ok(false)
-                } else {
-                    Err(anyhow::anyhow!("tigris HEAD {key}: {e}"))
-                }
-            }
-        }
+    /// Current archive etag, or `None` if the repo isn't in storage yet.
+    pub async fn head_etag(&self, owner_slug: &str, repo_name: &str) -> Result<Option<String>> {
+        let key = Self::key(owner_slug, repo_name);
+        Ok(self
+            .store
+            .head(&key)
+            .await?
+            .map(|m| m.etag.unwrap_or_else(|| format!("size:{}", m.size))))
     }
 
-    /// Upload a local bare repo directory to Tigris as a tar.zst archive.
-    pub async fn upload(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()> {
-        let key = Self::repo_key(owner_slug, repo_name);
-        debug!(key = %key, path = %local_path.display(), "uploading repo to tigris");
+    /// Whether the repo archive exists in storage.
+    pub async fn exists(&self, owner_slug: &str, repo_name: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .head(&Self::key(owner_slug, repo_name))
+            .await?
+            .is_some())
+    }
 
-        // Create tar.zst in memory
+    /// Compress the bare repo and upload it. Returns the new etag (for the
+    /// skip-redundant-download cache).
+    pub async fn upload(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+    ) -> Result<Option<String>> {
+        let key = Self::key(owner_slug, repo_name);
         let archive_bytes = tokio::task::spawn_blocking({
             let local_path = local_path.to_path_buf();
             move || compress_repo(&local_path)
@@ -72,49 +64,31 @@ impl TigrisClient {
         .context("tar task panicked")?
         .context("compressing repo")?;
 
-        let body = aws_sdk_s3::primitives::ByteStream::from(archive_bytes);
-
-        self.s3
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(body)
-            .content_type("application/zstd")
-            .send()
+        let meta = self
+            .store
+            .put(&key, Bytes::from(archive_bytes))
             .await
-            .context(format!("tigris PUT {key}"))?;
-
-        info!(key = %key, "uploaded repo to tigris");
-        Ok(())
+            .context("uploading repo archive")?;
+        info!(key = %key, backend = self.store.backend_name(), "uploaded repo archive");
+        Ok(meta.etag.or_else(|| Some(format!("size:{}", meta.size))))
     }
 
-    /// Download a repo archive from Tigris and extract to local disk.
+    /// Download the repo archive and extract it to `local_path` (atomic swap).
     pub async fn download(
         &self,
         owner_slug: &str,
         repo_name: &str,
         local_path: &Path,
     ) -> Result<()> {
-        let key = Self::repo_key(owner_slug, repo_name);
-        debug!(key = %key, path = %local_path.display(), "downloading repo from tigris");
-
-        let resp = self
-            .s3
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
+        let key = Self::key(owner_slug, repo_name);
+        debug!(key = %key, "downloading repo archive");
+        let data = self
+            .store
+            .get(&key)
             .await
-            .context(format!("tigris GET {key}"))?;
+            .context("fetching repo archive")?
+            .ok_or_else(|| anyhow::anyhow!("repo archive missing: {key}"))?;
 
-        let data = resp
-            .body
-            .collect()
-            .await
-            .context("reading tigris response body")?
-            .into_bytes();
-
-        // Extract tar.zst to local path
         tokio::task::spawn_blocking({
             let local_path = local_path.to_path_buf();
             move || decompress_repo(&data, &local_path)
@@ -122,23 +96,14 @@ impl TigrisClient {
         .await
         .context("extract task panicked")?
         .context("extracting repo")?;
-
-        info!(key = %key, path = %local_path.display(), "downloaded repo from tigris");
+        info!(key = %key, path = %local_path.display(), "downloaded repo archive");
         Ok(())
     }
 
-    /// Delete a repo archive from Tigris.
+    /// Delete a repo archive.
     #[allow(dead_code)]
     pub async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
-        let key = Self::repo_key(owner_slug, repo_name);
-        self.s3
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .send()
-            .await
-            .context(format!("tigris DELETE {key}"))?;
-        Ok(())
+        self.store.delete(&Self::key(owner_slug, repo_name)).await
     }
 }
 
@@ -147,11 +112,8 @@ fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
     let buf = Vec::new();
     let encoder = zstd::stream::Encoder::new(buf, 3)?; // level 3 = fast + decent ratio
     let mut tar = tar::Builder::new(encoder);
-
-    // Append the bare repo directory contents (not the directory itself)
     tar.append_dir_all(".", repo_path)
         .context("building tar archive")?;
-
     let encoder = tar.into_inner().context("finishing tar")?;
     let compressed = encoder.finish().context("finishing zstd")?;
     Ok(compressed)
@@ -197,8 +159,6 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
 
     std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
 
-    // Unpack into the temp dir; on any failure, clean up and bail without
-    // touching local_path.
     let unpack = (|| -> Result<()> {
         let decoder = zstd::stream::Decoder::new(data)?;
         let mut archive = tar::Archive::new(decoder);
@@ -221,6 +181,5 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
         std::fs::remove_dir_all(local_path).context("removing stale repo dir")?;
     }
     std::fs::rename(&tmp_dir, local_path).context("swapping extracted repo into place")?;
-
     Ok(())
 }
