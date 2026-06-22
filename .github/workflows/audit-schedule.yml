@@ -1,0 +1,77 @@
+name: Scheduled Audit
+
+# Self-expiring suppression check (companion to the PR-blocking audit gate in
+# pr-checks.yml). Runs weekly. It re-runs cargo audit WITHOUT the .cargo/audit.toml
+# ignore list to surface the full advisory set for visibility, and it hard-fails
+# if the lockfile has moved off the pinned vulnerable versions while the ignores
+# are still present, i.e. the upstream fix landed but the ignore was not dropped.
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scheduled-audit:
+    name: scheduled audit (no ignores)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          key: audit-schedule
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      # Full advisory report with NO suppressions. Run from a scratch dir that
+      # has no .cargo/audit.toml so the ignore list does not apply; never fail
+      # the build on this step, it is visibility only.
+      - name: Full audit report (ignores not applied)
+        run: |
+          mkdir -p "$RUNNER_TEMP/full-audit"
+          cp Cargo.lock "$RUNNER_TEMP/full-audit/Cargo.lock"
+          cd "$RUNNER_TEMP/full-audit"
+          {
+            echo '### Full cargo audit (no ignores applied)'
+            echo '```'
+            cargo audit -f Cargo.lock || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Drift guard: the hickory ignores are only valid while hickory-proto is
+      # pinned at 0.25.x. If the lockfile has moved past that, the upstream fix
+      # is in and the ignores in .cargo/audit.toml must be removed. Fail loudly.
+      - name: Fail if hickory moved past 0.25.x while ignores remain
+        run: |
+          set -euo pipefail
+          version="$(grep -A1 'name = "hickory-proto"' Cargo.lock | grep '^version' | head -1 | cut -d'"' -f2)"
+          echo "hickory-proto in Cargo.lock: ${version:-not present}"
+          ignores_present=false
+          if grep -q 'RUSTSEC-2026-011' .cargo/audit.toml; then
+            ignores_present=true
+          fi
+          # Drift = the lockfile no longer matches what the ignores assume:
+          # hickory moved off 0.25.x (fix shipped) OR was removed entirely
+          # (dead ignore entries left behind). Both must fail.
+          if [ "$ignores_present" = true ] && { [ -z "${version}" ] || [[ "${version}" != 0.25.* ]]; }; then
+            echo "::error::hickory-proto is ${version:-absent from Cargo.lock} but the RUSTSEC-2026-0118/0119 ignores are still in .cargo/audit.toml. The upstream fix appears to be available or the dependency is gone; remove the ignores."
+            exit 1
+          fi
+          echo "No drift: ignore list is consistent with the pinned hickory-proto version."

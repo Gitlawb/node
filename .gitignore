@@ -23,6 +23,3 @@ keys/
 # Logs
 *.log
 .openclaude-profile.json
-
-# Local planning / scratch docs (never commit)
-docs/superpowers/
