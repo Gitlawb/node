@@ -3,6 +3,7 @@ name = "gitlawb-node"
 description = "The gitlawb node daemon — git hosting over HTTP with DID auth"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
