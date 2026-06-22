@@ -22,6 +22,7 @@ ignore = [
     # crates.io is 0.44 and pins hickory 0.25; the fix requires hickory >=0.26.1.
     # REMOVE both once libp2p-dns ships a release using hickory 0.26 (verified
     # 2026-06-21: cargo update -p hickory-proto locks 0 packages; still 0.25.2).
+    # Tracking: https://github.com/Gitlawb/node/issues/76
     "RUSTSEC-2026-0118", # hickory NSEC3 closest-encloser unbounded loop
     "RUSTSEC-2026-0119", # hickory O(n^2) name-compression CPU exhaustion
 
