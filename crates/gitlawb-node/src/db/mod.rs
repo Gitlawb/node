@@ -254,6 +254,15 @@ impl Db {
         Self { pool }
     }
 
+    /// Test-only: apply the full schema to a fresh pool. `#[sqlx::test]`
+    /// provisions an empty per-test database, so DB-backed tests must run this
+    /// before seeding. Reuses the production `migrate()` path (the advisory lock
+    /// is harmless on an isolated test DB and migrations are idempotent).
+    #[cfg(test)]
+    pub(crate) async fn run_migrations(&self) -> Result<()> {
+        self.migrate().await
+    }
+
     pub async fn connect(database_url: &str) -> Result<Self> {
         let pool = PgPool::connect(database_url).await?;
         let db = Self { pool };

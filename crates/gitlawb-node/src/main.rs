@@ -18,6 +18,8 @@ mod rate_limit;
 mod server;
 mod state;
 mod sync;
+#[cfg(test)]
+mod test_support;
 mod visibility;
 mod webhooks;
 
