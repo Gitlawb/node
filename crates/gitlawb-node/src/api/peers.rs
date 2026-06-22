@@ -40,6 +40,54 @@ pub struct PeerResponse {
     pub reachable: bool,
 }
 
+/// Whether a peer `http_url` is a public http(s) endpoint safe to register.
+/// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
+/// and `localhost` / `.local` / `.internal` hostnames. Used at announce time
+/// and by the boot-time prune of already-poisoned rows.
+pub fn is_public_http_url(raw: &str) -> bool {
+    let url = match reqwest::Url::parse(raw) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let host = match url.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return false,
+    };
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return false;
+    }
+    // host_str() keeps brackets on IPv6 literals (e.g. "[::1]"); strip them
+    // before parsing as an IP.
+    let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = ip_candidate.parse::<std::net::IpAddr>() {
+        if ip.is_loopback() || ip.is_unspecified() {
+            return false;
+        }
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_private() || v4.is_link_local() {
+                    return false;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                let s = v6.segments();
+                // fc00::/7 (unique-local) or fe80::/10 (link-local)
+                if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// GET /api/v1/peers
 pub async fn list_peers(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let peers = state.db.list_peers().await?;
@@ -83,10 +131,14 @@ pub async fn announce(
         );
     }
 
-    // Validate the URL is HTTP/HTTPS
-    if !req.http_url.starts_with("http://") && !req.http_url.starts_with("https://") {
+    // Validate the URL is a public http(s) endpoint. The announce route is
+    // reachable unauthenticated (until all peers sign), so without this an
+    // attacker can register loopback/private "peers" (localhost:5432, etc.)
+    // and turn our outbound sync-notify fan-out into an SSRF probe — and bury
+    // the real peers under junk so node-origin repos stop replicating.
+    if !is_public_http_url(&req.http_url) {
         return Err(AppError::BadRequest(
-            "http_url must start with http:// or https://".into(),
+            "http_url must be a public http(s) URL (no loopback, private, or .internal/.local hosts)".into(),
         ));
     }
 
@@ -323,4 +375,38 @@ pub async fn ping_peer(
         "http_url": peer.http_url,
         "reachable": ok,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public_http_url;
+
+    #[test]
+    fn accepts_public_https_and_http() {
+        assert!(is_public_http_url("https://node.gitlawb.com"));
+        assert!(is_public_http_url("https://manila.gitlawb.com/"));
+        assert!(is_public_http_url("http://203.0.113.10:7545"));
+    }
+
+    #[test]
+    fn rejects_loopback_private_and_internal() {
+        for bad in [
+            "http://localhost:7545",
+            "http://127.0.0.1:5432/",
+            "http://localhost:22/",
+            "http://0.0.0.0:7545",
+            "http://10.0.0.5:7545",
+            "http://192.168.1.10/",
+            "http://172.16.0.1:7545",
+            "http://169.254.1.1/",
+            "http://[::1]:7545",
+            "http://gitlawb-node.internal:7545",
+            "http://my-node.local/",
+            "ftp://node.gitlawb.com",
+            "not-a-url",
+            "",
+        ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
 }

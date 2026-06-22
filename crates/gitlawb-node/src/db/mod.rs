@@ -1601,6 +1601,26 @@ impl Db {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// Remove peer rows whose `http_url` is not a public http(s) endpoint
+    /// (loopback/private/internal hosts injected via the open announce route).
+    /// Runs at boot to clean tables poisoned before announce-time validation
+    /// existed. Filtering is done in Rust to share one definition of "public"
+    /// with the announce handler.
+    pub async fn prune_non_public_peers(&self) -> Result<u64> {
+        let peers = self.list_peers().await?;
+        let mut removed = 0u64;
+        for p in peers {
+            if !crate::api::peers::is_public_http_url(&p.http_url) {
+                sqlx::query("DELETE FROM peers WHERE did = $1")
+                    .bind(&p.did)
+                    .execute(&self.pool)
+                    .await?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
 }
 
 // ── Pinned CIDs ───────────────────────────────────────────────────────────────
