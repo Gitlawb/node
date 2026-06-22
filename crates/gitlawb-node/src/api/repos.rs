@@ -305,8 +305,19 @@ pub async fn get_tree(
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    // Gate on the REQUESTED subtree, not the repo root (N3) — otherwise a caller
+    // denied a withheld subtree can still enumerate its names/SHAs. Mirrors get_blob.
+    let normalized = tree_path.trim_matches('/');
+    if normalized.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(AppError::BadRequest("invalid tree path".into()));
+    }
+    let gate_path = if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{normalized}")
+    };
     let (record, _rules) =
-        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
 
     let disk_path = state
         .repo_store

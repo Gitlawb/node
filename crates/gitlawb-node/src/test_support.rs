@@ -250,4 +250,65 @@ mod tests {
             "delegator_did must be bound to the signer"
         );
     }
+
+    /// N3: get_tree gates on the REQUESTED subtree, not the repo root. A caller
+    /// denied a withheld subtree is rejected there (404) but passes the gate on a
+    /// non-withheld path (so the rejection is path-scoped, not repo-wide).
+    #[sqlx::test]
+    async fn get_tree_gate_is_path_scoped(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zTREEOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zTREESTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "tree-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // Withhold /secret/** from everyone but the owner.
+        state
+            .db
+            .set_visibility_rule(&repo.id, "/secret/**", VisibilityMode::B, &[], owner)
+            .await
+            .expect("set rule");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/tree/{*path}",
+                    axum::routing::get(crate::api::repos::get_tree),
+                )
+                .with_state(state.clone())
+        };
+
+        // Withheld subtree → denied at the gate (opaque 404), before any disk access.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/tree-repo/tree/secret"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "withheld subtree must be denied"
+        );
+
+        // Non-withheld path → passes the gate (whatever the disk layer then returns,
+        // it is NOT the gate's 404). Proves the gate keyed off the path, not the repo.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/tree-repo/tree/public"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-withheld path must pass the path-scoped gate"
+        );
+    }
 }
