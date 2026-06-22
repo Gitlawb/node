@@ -169,14 +169,17 @@ mod tests {
     }
 
     // `to_seed()` is the only seed accessor on `Keypair` (the raw, unzeroized
-    // `seed_bytes()` was removed in #41). It must hand out the seed
-    // deterministically, so the same seed reconstructs the same DID.
+    // `seed_bytes()` was removed in #41). Pin its return type so a bare-array
+    // accessor can't slip back in, and confirm it is deterministic. The
+    // from_seed -> verifying_key round-trip is already covered by
+    // `from_seed_round_trip`.
     #[test]
-    fn to_seed_is_sole_seed_accessor() {
+    fn to_seed_returns_zeroizing_and_is_deterministic() {
         let kp = Keypair::generate();
-        let seed = kp.to_seed();
+        // The type annotation is the regression guard: the seed must be handed
+        // out wrapped in `Zeroizing`, never as a bare `[u8; 32]`.
+        let seed: Zeroizing<[u8; 32]> = kp.to_seed();
         assert_eq!(*kp.to_seed(), *seed); // stable across calls
-        assert_eq!(Keypair::from_seed(&seed).unwrap().did(), kp.did());
     }
 
     #[test]
