@@ -114,20 +114,41 @@ mod did_tests {
 /// gate fails this test. Source-level (no DB), so it runs everywhere. When a new
 /// route is added to an in-scope group, add its row here with a deliberate gate
 /// type — that forced decision is the point.
+///
+/// Markers are gate-SHAPED — a call (`require_repo_owner(`, `did_matches(`) or a
+/// binding/comparison expression (`caller != &record.owner_did`,
+/// `let owner_did = auth.0`) — never a bare identifier that could also appear in
+/// a log line. Full-line comments are stripped before matching, so a marker that
+/// survives only as a comment above a deleted gate does NOT satisfy a row.
 #[cfg(test)]
 mod authz_guard {
-    fn fn_body<'a>(src: &'a str, func: &'a str) -> &'a str {
+    /// The body of `func` with full-line comments removed. Bounds the slice at the
+    /// next top-level fn item so a marker in a later handler can't leak in,
+    /// tolerating `pub async`, `pub(crate) async`, `async`, `pub`, and bare `fn`
+    /// declarations (the old single-`pub async fn` delimiter over-ran on any other
+    /// form).
+    fn fn_body(src: &str, func: &str) -> String {
         let needle = format!("fn {func}(");
         let start = src
             .find(&needle)
             .unwrap_or_else(|| panic!("handler `{func}` not found (renamed or removed?)"));
         let rest = &src[start..];
-        // End at the next top-level handler so a marker in a later fn can't leak in.
-        let end = rest[1..]
-            .find("\npub async fn ")
-            .map(|i| i + 1)
-            .unwrap_or(rest.len());
-        &rest[..end]
+        let end = [
+            "\npub async fn ",
+            "\npub(crate) async fn ",
+            "\nasync fn ",
+            "\npub fn ",
+            "\nfn ",
+        ]
+        .iter()
+        .filter_map(|p| rest[1..].find(p).map(|i| i + 1))
+        .min()
+        .unwrap_or(rest.len());
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -142,43 +163,54 @@ mod authz_guard {
         let stars = include_str!("stars.rs");
         let protect = include_str!("protect.rs");
         let visibility = include_str!("visibility.rs");
+        let profiles = include_str!("profiles.rs");
+        let repos = include_str!("repos.rs");
 
         // (source, handler, expected gate marker)
         let rows: &[(&str, &str, &str)] = &[
-            // Bucket A — owner-gate
-            (pulls, "merge_pr", "require_repo_owner"),
-            (webhooks, "create_webhook", "require_repo_owner"),
-            (webhooks, "delete_webhook", "require_repo_owner"),
-            (labels, "add_label", "require_repo_owner"),
-            (labels, "remove_label", "require_repo_owner"),
-            // Bucket A' — owner OR author
-            (pulls, "close_pr", "did_matches"),
-            (issues, "close_issue", "did_matches"),
-            // Bucket B — read-gate
-            (pulls, "create_review", "authorize_repo_read"),
-            (pulls, "create_comment", "authorize_repo_read"),
-            (issues, "create_issue_comment", "authorize_repo_read"),
-            (bounties, "create_bounty", "authorize_repo_read"),
-            // Bucket C — signer-self (acting DID bound to auth.0)
-            (tasks, "create_task", "auth.0"),
-            (tasks, "claim_task", "auth.0"),
-            (tasks, "complete_task", "auth.0"),
-            (tasks, "fail_task", "auth.0"),
+            // Bucket A — owner-gate (require_repo_owner -> 403)
+            (pulls, "merge_pr", "require_repo_owner("),
+            (webhooks, "create_webhook", "require_repo_owner("),
+            (webhooks, "delete_webhook", "require_repo_owner("),
+            (labels, "add_label", "require_repo_owner("),
+            (labels, "remove_label", "require_repo_owner("),
+            // Bucket A' — owner OR author (did_matches against the author)
+            (pulls, "close_pr", "did_matches("),
+            (issues, "close_issue", "did_matches("),
+            // Bucket B — read-gate (authorize_repo_read)
+            (pulls, "create_review", "authorize_repo_read("),
+            (pulls, "create_comment", "authorize_repo_read("),
+            (pulls, "create_pr", "authorize_repo_read("),
+            (issues, "create_issue_comment", "authorize_repo_read("),
+            (issues, "create_issue", "authorize_repo_read("),
+            (bounties, "create_bounty", "authorize_repo_read("),
+            (repos, "fork_repo", "authorize_repo_read("),
+            // Bucket C — signer-self: the acting DID is matched/bound to auth.0
+            (tasks, "create_task", "did_matches("),
+            (tasks, "claim_task", "did_matches("),
+            (tasks, "complete_task", "did_matches("),
+            (tasks, "fail_task", "did_matches("),
+            (repos, "create_repo", "let owner_did = auth.0"),
+            (profiles, "set_profile", "let did = auth.0"),
+            (stars, "star_repo", "caller = &auth.0"),
+            (stars, "unstar_repo", "caller = &auth.0"),
             // Bucket D — non-owner-by-design, positive per-route marker
-            (bounties, "submit_bounty", "did_matches"),
-            (bounties, "approve_bounty", "did_matches"),
-            (bounties, "cancel_bounty", "did_matches"),
-            (bounties, "dispute_bounty", "did_matches"),
-            (replicas, "register_replica", "did_matches"),
-            (replicas, "unregister_replica", "auth.0"),
-            (stars, "star_repo", "auth.0"),
-            (stars, "unstar_repo", "auth.0"),
-            // PRE-GATED — already owner-gated, in-scope group; guarded against regression
-            (protect, "protect_branch", "owner_did"),
-            (protect, "unprotect_branch", "owner_did"),
-            (visibility, "set_visibility", "require_owner"),
-            (visibility, "remove_visibility", "require_owner"),
-            (visibility, "list_visibility", "require_owner"),
+            (bounties, "claim_bounty", "claim_bounty(&id, &auth.0"),
+            (bounties, "submit_bounty", "did_matches("),
+            (bounties, "approve_bounty", "did_matches("),
+            (bounties, "cancel_bounty", "did_matches("),
+            (bounties, "dispute_bounty", "did_matches("),
+            (replicas, "register_replica", "did_matches("),
+            (replicas, "unregister_replica", "replica_did = &auth.0"),
+            // PRE-GATED — already owner-gated, in-scope group; guard the gate itself
+            (protect, "protect_branch", "caller != &record.owner_did"),
+            (protect, "unprotect_branch", "caller != &record.owner_did"),
+            (visibility, "set_visibility", "require_owner("),
+            (visibility, "remove_visibility", "require_owner("),
+            (visibility, "list_visibility", "require_owner("),
+            // NOT GATED, tracked separately: register (register.rs) trusts the body
+            // `did` instead of binding to the signer (audit D3-1, P3). Excluded
+            // until fixed — adding a row would assert a gate that does not exist.
         ];
 
         for (src, func, marker) in rows {
@@ -188,5 +220,17 @@ mod authz_guard {
                 "handler `{func}` is missing its gate marker `{marker}` — gate removed or route reclassified"
             );
         }
+    }
+
+    /// Proves the comment-stripping that GUARD-1 added: a marker that appears only
+    /// in a full-line comment (the real `replicas.rs` false-pass shape) must NOT
+    /// satisfy a row.
+    #[test]
+    fn comment_only_marker_does_not_satisfy_a_row() {
+        let src = "pub async fn demo() {\n    // did_matches( handles the owner form\n    do_thing();\n}\n";
+        assert!(
+            !fn_body(src, "demo").contains("did_matches("),
+            "a marker present only in a comment must not count as an enforced gate"
+        );
     }
 }
