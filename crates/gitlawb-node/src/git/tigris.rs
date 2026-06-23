@@ -170,10 +170,12 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
         .file_name()
         .context("repo path has no file name")?
         .to_string_lossy();
-    let tmp_dir = parent.join(format!(".{file_name}.tmp-extract"));
+    // Unique per-extraction temp dir: a fixed name would let two concurrent
+    // extractions of the same repo share one dir and clobber each other's
+    // in-progress unpack. A fresh UUID also means it can't collide with a
+    // leftover dir from a previously-interrupted run.
+    let tmp_dir = parent.join(format!(".{file_name}.tmp-extract.{}", uuid::Uuid::new_v4()));
 
-    // Clear any leftover temp dir from a previously-interrupted extraction.
-    let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
 
     // Unpack into the temp dir; on any failure, clean up and bail without
