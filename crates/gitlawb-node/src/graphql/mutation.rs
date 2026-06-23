@@ -103,6 +103,18 @@ impl MutationRoot {
         let by_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
         let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
+        // Authorize the actor: binding by_did to the signer is necessary but not
+        // sufficient — only the task's assignee may finish it.
+        let existing = db
+            .get_task(&id)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .ok_or_else(|| async_graphql::Error::new("task not found"))?;
+        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+            return Err(async_graphql::Error::new(
+                "only the task assignee can complete it",
+            ));
+        }
         let task = db
             .finish_task(&id, "completed", input.result.as_deref())
             .await
@@ -133,6 +145,17 @@ impl MutationRoot {
         let by_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
         let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
+        // Authorize the actor: only the task's assignee may fail it.
+        let existing = db
+            .get_task(&id)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .ok_or_else(|| async_graphql::Error::new("task not found"))?;
+        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+            return Err(async_graphql::Error::new(
+                "only the task assignee can fail it",
+            ));
+        }
         let reason = input.reason.unwrap_or_default();
         let task = db
             .finish_task(&id, "failed", Some(&reason))
@@ -204,6 +227,67 @@ mod tests {
         assert!(
             !errs.contains("authentication required") && !errs.contains("authenticated signer"),
             "matching signer must pass the auth gate: {errs}"
+        );
+    }
+
+    /// Adversarial-review GATE-1 (GraphQL): completing a task requires being its
+    /// assignee, not merely signing as the by_did you pass. A signer who is not
+    /// the assignee is rejected even though the by_did binding passes; the
+    /// assignee completes.
+    #[sqlx::test]
+    async fn complete_task_requires_assignee(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let assignee = "did:key:zGQLASSIGNEEAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zGQLSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::db::AgentTask {
+            id: "task-g".into(),
+            repo_id: None,
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:zGQLDELEGATORCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+            assignee_did: None,
+            capability: "repo:write".into(),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        };
+        state.db.create_task(&task).await.expect("seed task");
+        state
+            .db
+            .claim_task("task-g", assignee)
+            .await
+            .expect("claim");
+        let schema = state.graphql_schema.as_ref();
+
+        let q = |actor: &str| {
+            format!(
+                r#"mutation {{ completeTask(id: "task-g", byDid: "{actor}", input: {{}}) {{ id status }} }}"#
+            )
+        };
+
+        // Stranger signs as themselves and passes byDid=self (so the signer
+        // binding passes), but is not the assignee → rejected by authorization.
+        let resp = schema
+            .execute(Request::new(q(stranger)).data(AuthenticatedDid(stranger.into())))
+            .await;
+        assert!(
+            errors(&resp).contains("assignee"),
+            "a non-assignee signer must be rejected: {}",
+            errors(&resp)
+        );
+
+        // The assignee completes with no error.
+        let resp = schema
+            .execute(Request::new(q(assignee)).data(AuthenticatedDid(assignee.into())))
+            .await;
+        assert!(
+            errors(&resp).is_empty(),
+            "the assignee should complete the task: {}",
+            errors(&resp)
         );
     }
 }

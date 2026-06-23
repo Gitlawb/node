@@ -64,13 +64,11 @@ pub struct ClaimTaskBody {
 #[derive(Deserialize)]
 pub struct CompleteTaskBody {
     pub result: Option<String>,
-    pub by_did: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct FailTaskBody {
     pub reason: Option<String>,
-    pub by_did: Option<String>,
 }
 
 fn task_to_json(t: &AgentTask) -> Value {
@@ -199,12 +197,31 @@ pub async fn complete_task(
     Path(id): Path<String>,
     Json(body): Json<CompleteTaskBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Bind the actor to the authenticated signer (N13); ignore any body by_did
-    // that doesn't match.
-    if let Some(by) = &body.by_did {
-        if !crate::api::did_matches(&auth.0, by) {
-            return Err(forbidden("by_did must be the authenticated signer"));
-        }
+    // Authorize the actor, not just bind their identity: the N13 signer-binding
+    // proved the caller was whoever they claimed, but never that they were the
+    // task's assignee. Load the task and require the caller to be its assignee;
+    // finish_task then transitions only a claimed task.
+    let existing = state
+        .db
+        .get_task(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "task not found" })),
+            )
+        })?;
+    if !crate::api::did_matches(
+        &auth.0,
+        existing.assignee_did.as_deref().unwrap_or_default(),
+    ) {
+        return Err(forbidden("only the task assignee can complete it"));
     }
     let by_did = auth.0;
     let task = state
@@ -213,7 +230,7 @@ pub async fn complete_task(
         .await
         .map_err(|e| {
             (
-                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::CONFLICT,
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
@@ -234,11 +251,30 @@ pub async fn fail_task(
     Path(id): Path<String>,
     Json(body): Json<FailTaskBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Bind the actor to the authenticated signer (N13).
-    if let Some(by) = &body.by_did {
-        if !crate::api::did_matches(&auth.0, by) {
-            return Err(forbidden("by_did must be the authenticated signer"));
-        }
+    // Authorize the actor, not just bind their identity (see complete_task): only
+    // the task's assignee may fail it, and finish_task transitions only a claimed
+    // task.
+    let existing = state
+        .db
+        .get_task(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "task not found" })),
+            )
+        })?;
+    if !crate::api::did_matches(
+        &auth.0,
+        existing.assignee_did.as_deref().unwrap_or_default(),
+    ) {
+        return Err(forbidden("only the task assignee can fail it"));
     }
     let by_did = auth.0;
     let reason = body.reason.unwrap_or_default();
@@ -248,7 +284,7 @@ pub async fn fail_task(
         .await
         .map_err(|e| {
             (
-                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::CONFLICT,
                 Json(json!({ "error": e.to_string() })),
             )
         })?;

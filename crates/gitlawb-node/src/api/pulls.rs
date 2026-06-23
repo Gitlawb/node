@@ -40,11 +40,11 @@ pub async fn create_pr(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<CreatePrRequest>,
 ) -> Result<(StatusCode, Json<PullRequest>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // Authorize the caller as a reader before accepting a PR: a non-reader must
+    // not be able to open a PR (and fire its webhooks) against a private repo
+    // they cannot read. Mirrors create_review / create_comment / create_bounty.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let author_did = auth.0;
     let target_branch = req

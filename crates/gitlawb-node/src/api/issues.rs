@@ -39,11 +39,11 @@ pub async fn create_issue(
     Path((owner, repo)): Path<(String, String)>,
     Json(req): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueRecord>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Authorize the caller as a reader before accepting an issue: a non-reader
+    // must not be able to file an issue against a private repo they cannot read.
+    // Mirrors create_issue_comment / create_review / create_bounty.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let issue_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();

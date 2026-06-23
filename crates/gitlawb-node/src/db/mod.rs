@@ -1971,7 +1971,7 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
-             WHERE id=$1
+             WHERE id=$1 AND status='claimed'
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
@@ -1981,7 +1981,7 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
-            .ok_or_else(|| anyhow::anyhow!("task not found"))
+            .ok_or_else(|| anyhow::anyhow!("task not found or not in claimed state"))
     }
 }
 

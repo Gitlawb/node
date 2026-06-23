@@ -107,7 +107,7 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::RepoRecord;
+    use crate::db::{AgentTask, RepoRecord};
     use axum::http::StatusCode;
     use chrono::Utc;
     use tower::ServiceExt;
@@ -309,6 +309,174 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "a non-withheld path must pass the path-scoped gate"
+        );
+    }
+
+    fn seed_task(id: &str, delegator: &str) -> AgentTask {
+        let now = Utc::now().to_rfc3339();
+        AgentTask {
+            id: id.to_string(),
+            repo_id: None,
+            kind: "build".to_string(),
+            status: "pending".to_string(),
+            delegator_did: delegator.to_string(),
+            assignee_did: None,
+            capability: "repo:write".to_string(),
+            ucan_token: None,
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        }
+    }
+
+    /// Adversarial-review GATE-1: complete_task authorizes the assignee, not just
+    /// the claimed identity. A stranger (even with an empty body, which used to
+    /// skip the signer binding entirely) is rejected; the assignee succeeds; and a
+    /// task that is no longer `claimed` cannot transition again.
+    #[sqlx::test]
+    async fn complete_task_authorizes_assignee_only(pool: PgPool) {
+        let delegator = "did:key:zTASKDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let assignee = "did:key:zTASKASSIGNEEBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zTASKSTRANGERCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_task(&seed_task("task-1", delegator))
+            .await
+            .expect("seed task");
+        // Assignee claims it: pending -> claimed, assignee_did = assignee.
+        state
+            .db
+            .claim_task("task-1", assignee)
+            .await
+            .expect("claim");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks/{id}/complete",
+                    axum::routing::post(crate::api::tasks::complete_task),
+                )
+                .with_state(state.clone())
+        };
+        let uri = "/api/v1/tasks/task-1/complete";
+        let body = || Body::from("{}");
+
+        // Stranger (not the assignee) is rejected by the authorization gate, even
+        // with the empty body that previously bypassed the binding. Exact 403.
+        let resp = router()
+            .oneshot(signed_request_as(stranger, Method::POST, uri, body()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-assignee must not complete the task"
+        );
+
+        // The assignee completes successfully.
+        let resp = router()
+            .oneshot(signed_request_as(assignee, Method::POST, uri, body()))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "the assignee should complete the task, got {}",
+            resp.status()
+        );
+
+        // The task is now `completed`, not `claimed`; the status predicate in
+        // finish_task rejects a second transition (proves only a claimed task moves).
+        let resp = router()
+            .oneshot(signed_request_as(assignee, Method::POST, uri, body()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "a task that is no longer claimed must not transition again"
+        );
+    }
+
+    /// Adversarial-review GATE-2 (create_pr): opening a PR requires read access.
+    /// A non-reader is denied on a private repo before any PR is created; the
+    /// owner is allowed.
+    #[sqlx::test]
+    async fn create_pr_denies_non_reader_on_private_repo(pool: PgPool) {
+        let owner = "did:key:zPROWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zPRSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let mut repo = seed_repo(owner, "priv-pr-repo");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/pulls",
+                    axum::routing::post(crate::api::pulls::create_pr),
+                )
+                .with_state(state.clone())
+        };
+        let uri = format!("/api/v1/repos/{owner}/priv-pr-repo/pulls");
+        let body = || Body::from(r#"{"title":"x","source_branch":"feature"}"#);
+
+        // Non-reader on a private repo: opaque 404 (RepoNotFound), no PR created.
+        let resp = router()
+            .oneshot(signed_request_as(stranger, Method::POST, &uri, body()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must not open a PR against a private repo"
+        );
+
+        // Owner is a reader, so the gate admits them (create_pr does no disk I/O).
+        let resp = router()
+            .oneshot(signed_request_as(owner, Method::POST, &uri, body()))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "the owner should be able to open a PR, got {}",
+            resp.status()
+        );
+    }
+
+    /// Adversarial-review GATE-2 (create_issue): filing an issue requires read
+    /// access. A non-reader is denied on a private repo before any git work.
+    #[sqlx::test]
+    async fn create_issue_denies_non_reader_on_private_repo(pool: PgPool) {
+        let owner = "did:key:zISOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zISSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let mut repo = seed_repo(owner, "priv-issue-repo");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/issues",
+                axum::routing::post(crate::api::issues::create_issue),
+            )
+            .with_state(state);
+        let uri = format!("/api/v1/repos/{owner}/priv-issue-repo/issues");
+        let resp = router
+            .oneshot(signed_request_as(
+                stranger,
+                Method::POST,
+                &uri,
+                Body::from(r#"{"title":"x","body":"y"}"#),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader must not file an issue against a private repo"
         );
     }
 }
