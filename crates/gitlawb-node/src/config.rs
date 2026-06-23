@@ -153,11 +153,12 @@ pub struct Config {
     pub storage_fs_dir: String,
 
     /// Acknowledge a push to the client before the durable upload to object
-    /// storage finishes (write-back). Greatly lowers push latency; the local
-    /// copy and the advisory lock keep cross-node consistency, at the cost of a
-    /// small durability window if the node crashes mid-upload. Set false for
-    /// strict upload-before-ack durability.
-    #[arg(long, env = "GITLAWB_ASYNC_UPLOAD", default_value_t = true)]
+    /// storage finishes (write-back). Lowers push latency, but opens a
+    /// durability window: if the node stops between the ack and the upload, on
+    /// restart a stale remote archive can overwrite the newer local copy. Off
+    /// by default (strict upload-before-ack); opt in only where the latency win
+    /// is worth that risk.
+    #[arg(long, env = "GITLAWB_ASYNC_UPLOAD", default_value_t = false)]
     pub async_upload: bool,
 
     /// Maximum pack body size for git-receive-pack and git-upload-pack, in bytes.

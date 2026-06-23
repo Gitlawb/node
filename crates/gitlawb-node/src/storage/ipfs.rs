@@ -100,8 +100,16 @@ impl BlobStore for IpfsBlobStore {
             let b = resp.text().await.unwrap_or_default();
             anyhow::bail!("IPFS files/write {key} returned {status}: {b}");
         }
-        // etag = CID from stat
-        let etag = self.head(key).await?.and_then(|m| m.etag);
+        // etag = CID from stat. The write already succeeded, so a failed stat
+        // must not fail the put — just return without an etag (callers treat a
+        // missing etag as "always re-check", never as a lost write).
+        let etag = match self.head(key).await {
+            Ok(m) => m.and_then(|m| m.etag),
+            Err(e) => {
+                tracing::warn!(key = %key, err = %e, "IPFS stat after write failed — returning no etag");
+                None
+            }
+        };
         Ok(ObjectMeta { size, etag })
     }
 
@@ -157,6 +165,11 @@ impl BlobStore for IpfsBlobStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        // Reject traversal in the prefix before it's spliced into an MFS path
+        // (matches get/put/head/delete, which validate via validate_key).
+        if prefix.split('/').any(|seg| seg == ".." || seg == ".") {
+            anyhow::bail!("list prefix contains traversal segment: {prefix}");
+        }
         // Best-effort recursive walk of the MFS subtree under `prefix`.
         let mut keys = Vec::new();
         let mut stack = vec![prefix.trim_end_matches('/').to_string()];

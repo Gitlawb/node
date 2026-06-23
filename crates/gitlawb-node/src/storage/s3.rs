@@ -36,6 +36,16 @@ impl S3BlobStore {
         if force_path_style {
             builder = builder.force_path_style(true);
         }
+        // Bound requests so a hung endpoint can't block the calling task forever
+        // (under async_upload it would hold the advisory lock and stall every
+        // later push). attempt_timeout bounds a single try; operation_timeout
+        // bounds the whole call incl. retries — generous enough for large
+        // archive transfers.
+        let timeouts = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+            .operation_attempt_timeout(std::time::Duration::from_secs(60))
+            .operation_timeout(std::time::Duration::from_secs(300))
+            .build();
+        builder = builder.timeout_config(timeouts);
         let s3 = S3Client::from_conf(builder.build());
         Ok(Self {
             s3,

@@ -376,7 +376,7 @@ pub async fn git_info_refs(
         }
     }
 
-    // For receive-pack (push), download the latest from Tigris so the client
+    // For receive-pack (push), download the latest from storage so the client
     // sees the same refs that acquire_write() will operate on.
     let disk_path = if service == "git-receive-pack" {
         state
@@ -1141,7 +1141,7 @@ pub async fn fork_repo(
         )));
     }
 
-    // Ensure source repo is on local disk (downloads from Tigris on cache miss)
+    // Ensure source repo is on local disk (downloads from storage on cache miss)
     let source_path = state
         .repo_store
         .acquire(&source.owner_did, &source.name)
@@ -1168,7 +1168,7 @@ pub async fn fork_repo(
         )));
     }
 
-    // Upload fork to Tigris
+    // Upload fork to storage
     state
         .repo_store
         .release_after_write(&forker_did, &fork_name)

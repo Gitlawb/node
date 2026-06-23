@@ -70,7 +70,7 @@ pub async fn create_issue(
 
     let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
+    // Always release the advisory lock — even on error; upload to storage only on success.
     guard.release(create_result.is_ok()).await;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;
@@ -250,7 +250,7 @@ pub async fn close_issue(
 
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
+    // Always release the advisory lock — even on error; upload to storage only on success.
     guard.release(close_result.is_ok()).await;
 
     let updated = close_result

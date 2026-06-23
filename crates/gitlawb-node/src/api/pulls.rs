@@ -224,7 +224,7 @@ pub async fn merge_pr(
         &pr.title,
     );
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
+    // Always release the advisory lock — even on error; upload to storage only on success.
     guard.release(merge_result.is_ok()).await;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
