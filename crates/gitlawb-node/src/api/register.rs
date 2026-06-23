@@ -35,6 +35,7 @@ pub struct RegisterResponse {
 /// Accepts only requests with a valid HTTP Signature (enforced by middleware).
 pub async fn register(
     State(state): State<AppState>,
+    axum::Extension(auth): axum::Extension<crate::auth::AuthenticatedDid>,
     Json(req): Json<RegisterRequest>,
 ) -> Result<(StatusCode, Json<RegisterResponse>)> {
     // Parse and validate the DID
@@ -42,6 +43,14 @@ pub async fn register(
         .did
         .parse()
         .map_err(|e: gitlawb_core::Error| AppError::BadRequest(e.to_string()))?;
+
+    // Bind registration to the authenticated signer: an agent may only register
+    // itself, not create or refresh a trust row for a DID it does not control.
+    if !crate::api::did_matches(&auth.0, agent_did.as_str()) {
+        return Err(AppError::Forbidden(
+            "did must be the authenticated signer".into(),
+        ));
+    }
 
     // Store the agent in the local index
     state

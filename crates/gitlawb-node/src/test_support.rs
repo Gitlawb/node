@@ -157,16 +157,16 @@ mod tests {
         let uri = format!("/api/v1/repos/{owner}/harness-repo/visibility");
         let body = || Body::from(r#"{"path_glob":"/","reader_dids":[]}"#);
 
-        // Non-owner → rejected by require_owner. Current code returns 400
-        // (AppError::BadRequest). Asserting the exact code proves the rejection
-        // came from the owner gate, not an incidental 404/415.
+        // Non-owner → rejected by require_owner with 403 Forbidden. Asserting the
+        // exact code proves the rejection came from the owner gate, not an
+        // incidental 404/415.
         let resp = router()
             .oneshot(signed_request_as(stranger, Method::PUT, &uri, body()))
             .await
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
             "non-owner must be rejected by the owner gate"
         );
 
@@ -305,10 +305,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_ne!(
+        assert_eq!(
             resp.status(),
-            StatusCode::NOT_FOUND,
-            "a non-withheld path must pass the path-scoped gate"
+            StatusCode::OK,
+            "a non-withheld path must pass the path-scoped gate (exact 200, so a \
+             future upstream 4xx/5xx cannot masquerade as gate-pass)"
         );
     }
 
@@ -477,6 +478,36 @@ mod tests {
             resp.status(),
             StatusCode::NOT_FOUND,
             "a non-reader must not file an issue against a private repo"
+        );
+    }
+
+    /// Adversarial-review D3-1: register binds the registered DID to the signer.
+    /// A caller signed as A cannot register a different DID B (no spoofed
+    /// registration or trust row under a victim DID). Rejected before any write.
+    #[sqlx::test]
+    async fn register_binds_did_to_signer(pool: PgPool) {
+        let signer = "did:key:zREGSIGNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let other = "did:key:zREGOTHERBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let router = Router::new()
+            .route(
+                "/api/register",
+                axum::routing::post(crate::api::register::register),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(signed_request_as(
+                signer,
+                Method::POST,
+                "/api/register",
+                Body::from(format!(r#"{{"did":"{other}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "register must reject a DID other than the signer"
         );
     }
 }

@@ -32,7 +32,7 @@ fn require_owner(record: &crate::db::RepoRecord, caller: &str) -> Result<()> {
         .next_back()
         .unwrap_or(&record.owner_did);
     if caller != record.owner_did && caller != owner_short {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Forbidden(
             "only the repo owner can manage visibility".into(),
         ));
     }

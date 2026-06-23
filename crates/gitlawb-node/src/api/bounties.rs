@@ -215,7 +215,7 @@ pub async fn submit_bounty(
         .as_deref()
         .is_some_and(|c| crate::api::did_matches(&auth.0, c));
     if !is_claimant {
-        return Err(AppError::BadRequest("only the claimant can submit".into()));
+        return Err(AppError::Forbidden("only the claimant can submit".into()));
     }
 
     let now = Utc::now().to_rfc3339();
@@ -251,7 +251,7 @@ pub async fn approve_bounty(
         )));
     }
     if !crate::api::did_matches(&auth.0, &bounty.creator_did) {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Forbidden(
             "only the bounty creator can approve".into(),
         ));
     }
@@ -298,7 +298,7 @@ pub async fn cancel_bounty(
         )));
     }
     if !crate::api::did_matches(&auth.0, &bounty.creator_did) {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Forbidden(
             "only the bounty creator can cancel".into(),
         ));
     }

@@ -31,7 +31,7 @@ pub async fn protect_branch(
         .next_back()
         .unwrap_or(&record.owner_did);
     if caller != &record.owner_did && caller != owner_short {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Forbidden(
             "only the repo owner can protect branches".into(),
         ));
     }
@@ -69,7 +69,7 @@ pub async fn unprotect_branch(
         .next_back()
         .unwrap_or(&record.owner_did);
     if caller != &record.owner_did && caller != owner_short {
-        return Err(AppError::BadRequest(
+        return Err(AppError::Forbidden(
             "only the repo owner can unprotect branches".into(),
         ));
     }

@@ -165,6 +165,7 @@ mod authz_guard {
         let visibility = include_str!("visibility.rs");
         let profiles = include_str!("profiles.rs");
         let repos = include_str!("repos.rs");
+        let register = include_str!("register.rs");
 
         // (source, handler, expected gate marker)
         let rows: &[(&str, &str, &str)] = &[
@@ -192,6 +193,7 @@ mod authz_guard {
             (tasks, "fail_task", "did_matches("),
             (repos, "create_repo", "let owner_did = auth.0"),
             (profiles, "set_profile", "let did = auth.0"),
+            (register, "register", "did_matches("),
             (stars, "star_repo", "caller = &auth.0"),
             (stars, "unstar_repo", "caller = &auth.0"),
             // Bucket D — non-owner-by-design, positive per-route marker
@@ -208,9 +210,6 @@ mod authz_guard {
             (visibility, "set_visibility", "require_owner("),
             (visibility, "remove_visibility", "require_owner("),
             (visibility, "list_visibility", "require_owner("),
-            // NOT GATED, tracked separately: register (register.rs) trusts the body
-            // `did` instead of binding to the signer (audit D3-1, P3). Excluded
-            // until fixed — adding a row would assert a gate that does not exist.
         ];
 
         for (src, func, marker) in rows {
