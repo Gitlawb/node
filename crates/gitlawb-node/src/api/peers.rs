@@ -52,10 +52,15 @@ pub fn is_public_http_url(raw: &str) -> bool {
     if !matches!(url.scheme(), "http" | "https") {
         return false;
     }
-    let host = match url.host_str() {
+    let mut host = match url.host_str() {
         Some(h) => h.to_ascii_lowercase(),
         None => return false,
     };
+    // Drop a single trailing dot (FQDN root): `localhost.` resolves the same as
+    // `localhost`, so normalize before the suffix/equality checks below.
+    if let Some(stripped) = host.strip_suffix('.') {
+        host = stripped.to_string();
+    }
     if host.is_empty()
         || host == "localhost"
         || host.ends_with(".local")
@@ -67,12 +72,34 @@ pub fn is_public_http_url(raw: &str) -> bool {
     // before parsing as an IP.
     let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = ip_candidate.parse::<std::net::IpAddr>() {
+        // Reject loopback/unspecified on the literal as given — catches `::1`
+        // and `::` before the IPv4-folding below (`::1`.to_ipv4() would
+        // otherwise map to a non-loopback `0.0.0.1`).
+        if ip.is_loopback() || ip.is_unspecified() {
+            return false;
+        }
+        // Fold IPv4-mapped/compatible IPv6 (`::ffff:127.0.0.1`, `::127.0.0.1`)
+        // down to IPv4 so the v4 range checks catch loopback/private addresses
+        // smuggled in via an IPv6 literal, then re-check loopback/unspecified.
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .or_else(|| v6.to_ipv4())
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(ip),
+            v4 => v4,
+        };
         if ip.is_loopback() || ip.is_unspecified() {
             return false;
         }
         match ip {
             std::net::IpAddr::V4(v4) => {
-                if v4.is_private() || v4.is_link_local() {
+                let o = v4.octets();
+                // RFC1918 private, link-local, or CGNAT (100.64.0.0/10).
+                if v4.is_private()
+                    || v4.is_link_local()
+                    || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                {
                     return false;
                 }
             }
@@ -363,7 +390,13 @@ pub async fn ping_peer(
 
     // Async ping
     let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-    let ok = reqwest::get(&url)
+    // Use the shared no-redirect client: bare `reqwest::get` follows redirects,
+    // so a peer could answer with `302 -> http://127.0.0.1/` and turn the ping
+    // into an SSRF probe.
+    let ok = state
+        .http_client
+        .get(&url)
+        .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
@@ -405,8 +438,25 @@ mod tests {
             "ftp://node.gitlawb.com",
             "not-a-url",
             "",
+            // Trailing-dot FQDN of an internal host.
+            "http://localhost./",
+            // CGNAT (100.64.0.0/10).
+            "http://100.64.0.1:7545",
+            "http://100.127.255.255/",
+            // IPv4-mapped / IPv4-compatible IPv6 smuggling private/loopback v4.
+            "http://[::ffff:127.0.0.1]:7545",
+            "http://[::ffff:10.0.0.1]/",
+            "http://[::ffff:192.168.1.1]:7545",
+            "http://[::127.0.0.1]/",
         ] {
             assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn accepts_public_outside_cgnat_range() {
+        // 100.0.0.0/10 boundary: .63 and .128 are public, only 100.64-127 is CGNAT.
+        assert!(is_public_http_url("http://100.63.255.255:7545"));
+        assert!(is_public_http_url("http://100.128.0.1/"));
     }
 }

@@ -16,7 +16,6 @@ mod pinata;
 mod rate_limit;
 mod server;
 mod state;
-mod storage;
 mod sync;
 mod visibility;
 mod webhooks;
@@ -142,9 +141,14 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Do not follow redirects: this client fans out to peer-supplied URLs
+    // (sync trigger, profile/repo fetches). A peer answering `302 Location:
+    // http://127.0.0.1/` would otherwise bypass the announce-time public-URL
+    // check and turn the redirect into an SSRF.
     let http_client = Arc::new(
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
     );
 
@@ -162,13 +166,25 @@ async fn main() -> Result<()> {
         info!("  fly machine: {mid}");
     }
 
-    // Initialize the storage-agnostic blob backend (S3-compatible / filesystem /
-    // IPFS), then wrap it in the repo-archive layer. `None` = local-only mode.
-    let blob_store = storage::build(&config).await;
-    let archive = blob_store.map(storage::archive::RepoArchive::new);
+    // Initialize Tigris S3 client if bucket is configured
+    let tigris = if !config.tigris_bucket.is_empty() {
+        match git::tigris::TigrisClient::new(&config.tigris_bucket).await {
+            Ok(client) => {
+                info!(bucket = %config.tigris_bucket, "tigris storage enabled");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "failed to initialize Tigris client — using local-only storage");
+                None
+            }
+        }
+    } else {
+        info!("tigris storage disabled (no bucket configured)");
+        None
+    };
 
     let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), archive, db.pool().clone());
+        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
 
     let rate_limiter = rate_limit::RateLimiter::new(10, std::time::Duration::from_secs(3600));
 

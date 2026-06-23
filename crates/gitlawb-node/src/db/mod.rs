@@ -1548,6 +1548,14 @@ impl Db {
 
 impl Db {
     pub async fn upsert_peer(&self, did: &str, http_url: &str) -> Result<()> {
+        // Defense-in-depth at the DB boundary: both writers funnel through here
+        // — the announce handler and the bootstrap announce-back in main.rs.
+        // The latter has no announce-time check, so validating here is what
+        // stops a malicious bootstrap response from re-poisoning the table
+        // right after prune_non_public_peers cleaned it.
+        if !crate::api::peers::is_public_http_url(http_url) {
+            anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
+        }
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
@@ -1606,20 +1614,23 @@ impl Db {
     /// (loopback/private/internal hosts injected via the open announce route).
     /// Runs at boot to clean tables poisoned before announce-time validation
     /// existed. Filtering is done in Rust to share one definition of "public"
-    /// with the announce handler.
+    /// with the announce handler, then deleted in a single statement so one
+    /// transient error can't abandon the remaining poisoned rows mid-loop.
     pub async fn prune_non_public_peers(&self) -> Result<u64> {
         let peers = self.list_peers().await?;
-        let mut removed = 0u64;
-        for p in peers {
-            if !crate::api::peers::is_public_http_url(&p.http_url) {
-                sqlx::query("DELETE FROM peers WHERE did = $1")
-                    .bind(&p.did)
-                    .execute(&self.pool)
-                    .await?;
-                removed += 1;
-            }
+        let bad_dids: Vec<String> = peers
+            .into_iter()
+            .filter(|p| !crate::api::peers::is_public_http_url(&p.http_url))
+            .map(|p| p.did)
+            .collect();
+        if bad_dids.is_empty() {
+            return Ok(0);
         }
-        Ok(removed)
+        let result = sqlx::query("DELETE FROM peers WHERE did = ANY($1)")
+            .bind(&bad_dids)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 

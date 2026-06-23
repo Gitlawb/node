@@ -70,8 +70,12 @@ async fn run(
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
     // Bound each peer HTTP call (withheld-paths lookup + replica registration)
     // so a stalled peer cannot hang the worker.
+    // No redirects: peer URLs are attacker-influenceable, so a 3xx to a
+    // loopback/private address must not be followed (SSRF guard, matching the
+    // shared http_client and announce-time validation).
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
     info!("sync worker started (auto_sync=true)");
