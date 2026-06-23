@@ -152,6 +152,12 @@ async fn process_batch(
         }
     };
 
+    // Nothing queued — the common case on the 30s idle poll. Bail before the
+    // peer lookup so an empty batch costs zero extra DB round-trips.
+    if items.is_empty() {
+        return;
+    }
+
     // Resolve the peer table once per batch — every item only needs a lookup.
     let peers = match db.list_peers().await {
         Ok(p) => p,
