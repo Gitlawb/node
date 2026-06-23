@@ -63,13 +63,22 @@ impl RepoStore {
     }
 
     /// Ensure the local copy matches storage, skipping the download when our
-    /// cached etag already equals the current archive etag. Used by the
-    /// read-before-write (`acquire_fresh`) and write (`acquire_write`) paths.
+    /// cached etag already equals the current archive etag.
+    ///
+    /// `require_fresh` selects the failure policy:
+    /// - `false` (read path, `acquire_fresh`): self-heal — if a storage HEAD or
+    ///   download fails but a valid local copy exists, use it; a later upload
+    ///   re-syncs storage.
+    /// - `true` (write path, `acquire_write`): fail closed — never fall back to
+    ///   a possibly-stale local copy. The remote etag differs (remote is newer),
+    ///   so uploading our stale copy after the write would clobber it (lost
+    ///   update). Propagate the error so the write is rejected instead.
     async fn sync_down_if_stale(
         &self,
         owner_slug: &str,
         repo_name: &str,
         local_path: &Path,
+        require_fresh: bool,
     ) -> Result<()> {
         let Some(ref archive) = self.archive else {
             return Ok(());
@@ -80,8 +89,9 @@ impl RepoStore {
             Ok(Some(etag)) => etag,
             Ok(None) => return Ok(()), // not in storage yet — local is authoritative
             Err(e) => {
-                // HEAD failed — fall back to a valid local copy if we have one.
-                if local_path.exists() {
+                // HEAD failed. Read path: fall back to a valid local copy if we
+                // have one. Write path: fail closed (see `require_fresh`).
+                if !require_fresh && local_path.exists() {
                     warn!(repo = %repo_name, err = %e, "storage head failed — using local copy");
                     return Ok(());
                 }
@@ -103,9 +113,11 @@ impl RepoStore {
                 Ok(())
             }
             Err(e) => {
-                // Self-heal: a corrupt/unreadable archive must not block access
-                // when a valid local copy exists; a later upload re-syncs storage.
-                if local_path.exists() {
+                // Read path self-heal only: a corrupt/unreadable archive must not
+                // block access when a valid local copy exists. On the write path
+                // the remote etag differs (remote is newer), so falling back and
+                // later uploading our stale copy would clobber it — fail closed.
+                if !require_fresh && local_path.exists() {
                     warn!(repo = %repo_name, err = %e,
                         "archive download failed — falling back to local copy");
                     Ok(())
@@ -178,7 +190,7 @@ impl RepoStore {
             if let Some(remote_etag) = archive
                 .head_etag(&owner_slug, repo_name)
                 .await
-                .unwrap_or(None)
+                .context("checking storage for repo")?
             {
                 debug!(repo = %repo_name, "cache miss — downloading from storage");
                 archive
@@ -203,7 +215,7 @@ impl RepoStore {
     /// will operate on.
     pub async fn acquire_fresh(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
-        self.sync_down_if_stale(&owner_slug, repo_name, &local_path)
+        self.sync_down_if_stale(&owner_slug, repo_name, &local_path, false)
             .await?;
         Ok(local_path)
     }
@@ -241,14 +253,18 @@ impl RepoStore {
         // machine pushed since) still triggers a download. The advisory lock above
         // serializes this so the post-write upload can't race a concurrent writer.
         if let Err(e) = self
-            .sync_down_if_stale(&owner_slug, repo_name, &local_path)
+            .sync_down_if_stale(&owner_slug, repo_name, &local_path, true)
             .await
         {
             // Release the lock we acquired before bailing, to avoid a stale lock.
-            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            if let Err(unlock_err) = sqlx::query("SELECT pg_advisory_unlock($1)")
                 .bind(lock_key)
                 .execute(&self.pool)
-                .await;
+                .await
+            {
+                warn!(repo = %repo_name, err = %unlock_err,
+                    "failed to release advisory lock after sync error");
+            }
             return Err(e);
         }
 
@@ -475,10 +491,13 @@ impl RepoWriteGuard {
         }
 
         // Release advisory lock
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.lock_key)
             .execute(&self.pool)
-            .await;
+            .await
+        {
+            warn!(repo = %self.repo_name, err = %e, "failed to release advisory lock");
+        }
     }
 }
 

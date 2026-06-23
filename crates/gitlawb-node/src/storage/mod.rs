@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::Config;
 
@@ -62,13 +62,21 @@ pub trait BlobStore: Send + Sync {
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
-/// Build the configured blob store, or `None` for local-only (passthrough) mode.
+/// Build the configured blob store.
+///
+/// Returns `Ok(None)` only when no backend is configured at all (local-only
+/// passthrough mode). A configured-but-unavailable or misconfigured backend
+/// returns `Err`: we fail closed rather than silently degrading to local-only,
+/// which would accept writes without the intended durable backend and risk
+/// cross-node persistence drift.
 ///
 /// Selection order:
 ///   1. Explicit `GITLAWB_STORAGE_BACKEND` (`s3` | `fs` | `ipfs`).
 ///   2. Auto: `s3` if a bucket is configured (incl. legacy `GITLAWB_TIGRIS_BUCKET`),
-///      else `fs` if a storage dir is set, else local-only.
-pub async fn build(config: &Config) -> Option<Arc<dyn BlobStore>> {
+///      else `fs` if `GITLAWB_STORAGE_FS_DIR` is set,
+///      else `ipfs` if `GITLAWB_IPFS_API` is set,
+///      else local-only.
+pub async fn build(config: &Config) -> Result<Option<Arc<dyn BlobStore>>> {
     let bucket = if !config.s3_bucket.is_empty() {
         config.s3_bucket.clone()
     } else {
@@ -85,62 +93,45 @@ pub async fn build(config: &Config) -> Option<Arc<dyn BlobStore>> {
         "ipfs".to_string()
     } else {
         info!("object storage disabled (no backend configured) — local-only mode");
-        return None;
+        return Ok(None);
     };
 
+    // A backend was selected (explicitly or by auto-detection); fail closed from
+    // here — a missing required setting or an init failure is a hard error.
     match backend.as_str() {
         "s3" => {
             if bucket.is_empty() {
-                warn!("storage backend=s3 but no bucket configured — local-only mode");
-                return None;
+                anyhow::bail!(
+                    "storage backend=s3 but no bucket configured (set GITLAWB_S3_BUCKET)"
+                );
             }
             let endpoint = (!config.s3_endpoint.is_empty()).then(|| config.s3_endpoint.clone());
-            match s3::S3BlobStore::new(&bucket, endpoint, config.s3_force_path_style).await {
-                Ok(s) => {
-                    info!(bucket = %bucket, backend = "s3", "object storage enabled");
-                    Some(Arc::new(s) as Arc<dyn BlobStore>)
-                }
-                Err(e) => {
-                    warn!(err = %e, "failed to init S3 storage — local-only mode");
-                    None
-                }
-            }
+            let s = s3::S3BlobStore::new(&bucket, endpoint, config.s3_force_path_style)
+                .await
+                .context("initializing S3 storage")?;
+            info!(bucket = %bucket, backend = "s3", "object storage enabled");
+            Ok(Some(Arc::new(s) as Arc<dyn BlobStore>))
         }
         "fs" => {
             if config.storage_fs_dir.is_empty() {
-                warn!("storage backend=fs but GITLAWB_STORAGE_FS_DIR is empty — local-only mode");
-                return None;
+                anyhow::bail!("storage backend=fs but GITLAWB_STORAGE_FS_DIR is empty");
             }
-            match fs::FsBlobStore::new(&config.storage_fs_dir) {
-                Ok(s) => {
-                    info!(dir = %config.storage_fs_dir, backend = "fs", "object storage enabled");
-                    Some(Arc::new(s) as Arc<dyn BlobStore>)
-                }
-                Err(e) => {
-                    warn!(err = %e, "failed to init filesystem storage — local-only mode");
-                    None
-                }
-            }
+            let s = fs::FsBlobStore::new(&config.storage_fs_dir)
+                .context("initializing filesystem storage")?;
+            info!(dir = %config.storage_fs_dir, backend = "fs", "object storage enabled");
+            Ok(Some(Arc::new(s) as Arc<dyn BlobStore>))
         }
         "ipfs" => {
             if config.ipfs_api.is_empty() {
-                warn!("storage backend=ipfs but GITLAWB_IPFS_API is empty — local-only mode");
-                return None;
+                anyhow::bail!("storage backend=ipfs but GITLAWB_IPFS_API is empty");
             }
-            match ipfs::IpfsBlobStore::new(&config.ipfs_api) {
-                Ok(s) => {
-                    info!(api = %config.ipfs_api, backend = "ipfs", "object storage enabled");
-                    Some(Arc::new(s) as Arc<dyn BlobStore>)
-                }
-                Err(e) => {
-                    warn!(err = %e, "failed to init IPFS storage — local-only mode");
-                    None
-                }
-            }
+            let s =
+                ipfs::IpfsBlobStore::new(&config.ipfs_api).context("initializing IPFS storage")?;
+            info!(api = %config.ipfs_api, backend = "ipfs", "object storage enabled");
+            Ok(Some(Arc::new(s) as Arc<dyn BlobStore>))
         }
         other => {
-            warn!(backend = %other, "unknown GITLAWB_STORAGE_BACKEND — local-only mode");
-            None
+            anyhow::bail!("unknown GITLAWB_STORAGE_BACKEND: {other}");
         }
     }
 }

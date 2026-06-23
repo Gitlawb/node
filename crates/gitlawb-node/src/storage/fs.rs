@@ -72,14 +72,23 @@ impl BlobStore for FsBlobStore {
             .parent()
             .context("blob path has no parent")?
             .to_path_buf();
-        let tmp = path.with_extension("tmp-put");
+        // Unique temp name per write: a fixed suffix would let concurrent puts
+        // to the same key overwrite each other's temp file and corrupt the blob.
+        let tmp = path.with_extension(format!("{}.tmp-put", uuid::Uuid::new_v4()));
         let path2 = path.clone();
-        // Atomic write: temp file in the same dir, then rename into place.
+        // Atomic write: temp file in the same dir, then rename into place. On any
+        // failure, remove the temp file so a failed write can't leak it.
         tokio::task::spawn_blocking(move || -> Result<()> {
             std::fs::create_dir_all(&parent).context("creating blob parent dir")?;
-            std::fs::write(&tmp, &body).context("writing temp blob")?;
-            std::fs::rename(&tmp, &path2).context("renaming blob into place")?;
-            Ok(())
+            let write_and_swap = (|| -> Result<()> {
+                std::fs::write(&tmp, &body).context("writing temp blob")?;
+                std::fs::rename(&tmp, &path2).context("renaming blob into place")?;
+                Ok(())
+            })();
+            if write_and_swap.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            write_and_swap
         })
         .await
         .context("fs put task panicked")??;
@@ -111,10 +120,10 @@ impl BlobStore for FsBlobStore {
             let mut keys = Vec::new();
             let mut stack = vec![root.clone()];
             while let Some(dir) = stack.pop() {
-                let rd = match std::fs::read_dir(&dir) {
-                    Ok(rd) => rd,
-                    Err(_) => continue,
-                };
+                // Propagate read errors rather than skipping: a partial listing
+                // reported as success would mislead GC/admin/migration callers.
+                let rd = std::fs::read_dir(&dir)
+                    .with_context(|| format!("listing {}", dir.display()))?;
                 for entry in rd.flatten() {
                     let path = entry.path();
                     if path.is_dir() {
@@ -183,5 +192,37 @@ mod tests {
         let store = FsBlobStore::new(dir.path()).unwrap();
         assert!(store.get("../escape").await.is_err());
         assert!(store.put("a/../../etc/passwd", Bytes::new()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_same_key_do_not_corrupt_or_leak_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).unwrap();
+        let key = "repos/v1/a/x.tar.zst";
+        let body = Bytes::from_static(b"the-one-true-blob");
+
+        // Many concurrent writers of the same key: with a fixed temp name they
+        // would clobber each other's temp file mid-write and corrupt the result.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            let body = body.clone();
+            handles.push(tokio::spawn(async move { store.put(key, body).await }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // Final content is intact...
+        assert_eq!(store.get(key).await.unwrap().unwrap(), body);
+        // ...and no unique-suffixed temp files were left behind.
+        let leftovers: Vec<String> = store
+            .list("repos/v1/")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|k| k.contains("tmp-put"))
+            .collect();
+        assert!(leftovers.is_empty(), "leaked temp files: {leftovers:?}");
     }
 }

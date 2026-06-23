@@ -23,9 +23,17 @@ pub struct IpfsBlobStore {
 
 impl IpfsBlobStore {
     pub fn new(api: &str) -> Result<Self> {
+        // Bound requests so an unresponsive Kubo API can't hang push/write flows
+        // indefinitely. connect_timeout guards the dial; the generous total
+        // timeout still allows large repo-archive transfers.
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .context("building IPFS HTTP client")?;
         Ok(Self {
             api: api.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client,
         })
     }
 
@@ -69,7 +77,10 @@ impl BlobStore for IpfsBlobStore {
         validate_key(key)?;
         let size = body.len() as u64;
         let url = format!("{}/api/v0/files/write", self.api);
-        let part = reqwest::multipart::Part::bytes(body.to_vec()).file_name("blob");
+        // Stream the body instead of copying it via to_vec — avoids doubling
+        // peak memory for large archives. Length is known, so set it explicitly.
+        let part = reqwest::multipart::Part::stream_with_length(reqwest::Body::from(body), size)
+            .file_name("blob");
         let form = reqwest::multipart::Form::new().part("data", part);
         let resp = self
             .client
@@ -164,7 +175,14 @@ impl BlobStore for IpfsBlobStore {
                 .await
                 .context("IPFS files/ls")?;
             if !resp.status().is_success() {
-                continue;
+                // Distinguish "this subtree doesn't exist" (fine — nothing to
+                // list) from real auth/network/server errors, which must surface
+                // rather than masquerade as an empty listing.
+                let body = resp.text().await.unwrap_or_default();
+                if body.contains("does not exist") || body.contains("no link named") {
+                    continue;
+                }
+                anyhow::bail!("IPFS files/ls {mfs}: {body}");
             }
             let v: serde_json::Value = resp.json().await.context("parsing files/ls")?;
             if let Some(entries) = v.get("Entries").and_then(|e| e.as_array()) {
