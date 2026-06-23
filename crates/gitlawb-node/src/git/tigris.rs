@@ -162,6 +162,10 @@ fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
 /// parallel, but the final `remove_dir_all` + `rename` must not interleave for
 /// the same `local_path`, or they race to a nondeterministic overwrite/failure.
 fn publish_lock(local_path: &Path) -> Arc<Mutex<()>> {
+    // KNOWN LIMITATION: this map is never evicted — one (PathBuf, Arc<Mutex>)
+    // entry accrues per distinct repo path for the process lifetime. Bounded by
+    // the number of repos a node hosts, so it's negligible for normal use, but
+    // high-volume/churning deployments may want LRU or weak-ref eviction here.
     static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut map = locks.lock().expect("publish lock map poisoned");
