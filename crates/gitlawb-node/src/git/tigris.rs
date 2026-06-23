@@ -157,13 +157,6 @@ fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
     Ok(compressed)
 }
 
-/// Decompress a tar.zst byte vector into a local directory.
-///
-/// Extraction is atomic with respect to `local_path`: the archive is unpacked
-/// into a sibling temp directory first, and only swapped into place once it
-/// fully succeeds. A corrupt or truncated archive therefore can never clobber a
-/// good existing copy at `local_path` — on failure we discard the temp dir and
-/// leave `local_path` exactly as it was.
 /// Per-repo-path lock serializing the publish (swap-into-place) step of
 /// `decompress_repo`. Concurrent extractions unpack into isolated temp dirs in
 /// parallel, but the final `remove_dir_all` + `rename` must not interleave for
@@ -177,6 +170,13 @@ fn publish_lock(local_path: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
+/// Decompress a tar.zst byte vector into a local directory.
+///
+/// Extraction is atomic with respect to `local_path`: the archive is unpacked
+/// into a sibling temp directory first, and only swapped into place once it
+/// fully succeeds. A corrupt or truncated archive therefore can never clobber a
+/// good existing copy at `local_path` — on failure we discard the temp dir and
+/// leave `local_path` exactly as it was.
 fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
     let parent = local_path.parent().context("repo path has no parent")?;
     std::fs::create_dir_all(parent).context("creating parent dir")?;
