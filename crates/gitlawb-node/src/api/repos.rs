@@ -17,6 +17,66 @@ use crate::state::AppState;
 use crate::visibility::{visibility_check, Decision};
 use crate::webhooks;
 
+/// The git all-zeros object id — the create/delete sentinel in a ref update.
+const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+/// The set of blob OIDs withheld from **anonymous** replication for a repo, or
+/// `None` when the repo must not replicate at all (private / mode A /
+/// undetermined — fail closed). This is the anonymous replication gate:
+/// `caller` is hard-coded to `None` and there is intentionally no caller
+/// parameter, which distinguishes it from the per-caller read-serve projection
+/// in `git_upload_pack` (which passes the real caller). Both the push pin path
+/// and the reconciliation sweep call this helper so the two cannot drift on
+/// what is withheld. `rules` is the already-fetched visibility-rule snapshot
+/// (callers fetch once and may reuse it, e.g. for encrypt-then-pin).
+///
+/// Returns `(announce, withheld)`: `announce` is whether the repo may be
+/// announced/replicated to the anonymous public at all (also gates gossip and
+/// Arweave anchoring downstream), and `withheld` is the anonymous withheld blob
+/// set when announceable (`None` when not announceable, or when the withheld
+/// walk failed — fail closed). Returning both keeps the gate's announce
+/// decision a single source rather than recomputing it at each call site.
+async fn replication_withheld_set(
+    rules: Option<Vec<crate::db::VisibilityRule>>,
+    owner_did: &str,
+    is_public: bool,
+    disk_path: std::path::PathBuf,
+) -> (bool, Option<std::collections::HashSet<String>>) {
+    let announce = match &rules {
+        Some(rules) => visibility_check(rules, is_public, owner_did, None, "/") == Decision::Allow,
+        None => false,
+    };
+    if !announce {
+        return (false, None);
+    }
+    let withheld = match rules {
+        Some(rules) if rules.is_empty() => Some(std::collections::HashSet::new()),
+        // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
+        // that off the async worker thread.
+        Some(rules) => {
+            let owner_did = owner_did.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::git::visibility_pack::withheld_blob_oids(
+                    &disk_path, &rules, is_public, &owner_did, None,
+                )
+            })
+            .await
+            .map_err(|e| {
+                tracing::warn!(err = %e, "withheld_blob_oids task panicked; skipping replication")
+            })
+            .ok()
+            .and_then(|r| {
+                r.map_err(|e| {
+                    tracing::warn!(err = %e, "withheld_blob_oids failed; skipping replication")
+                })
+                .ok()
+            })
+        }
+        None => None,
+    };
+    (announce, withheld)
+}
+
 // ── Request / Response types ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -653,49 +713,54 @@ pub async fn git_receive_pack(
     // network-facing announcements. Fail closed: a private or undetermined repo
     // never leaks.
     let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
-    let announce = match &rules_opt {
-        Some(rules) => {
-            visibility_check(rules, record.is_public, &record.owner_did, None, "/")
-                == Decision::Allow
-        }
-        None => false,
-    };
-    let withheld: Option<std::collections::HashSet<String>> = if !announce {
-        None
-    } else {
-        match &rules_opt {
-            Some(rules) if rules.is_empty() => Some(std::collections::HashSet::new()),
-            // withheld_blob_oids walks every ref with blocking `git ls-tree`;
-            // keep that off the async worker thread.
-            Some(rules) => {
-                let path = disk_path.clone();
-                let rules = rules.clone();
-                let owner_did = record.owner_did.clone();
-                let is_public = record.is_public;
-                tokio::task::spawn_blocking(move || {
-                    crate::git::visibility_pack::withheld_blob_oids(
-                        &path, &rules, is_public, &owner_did, None,
-                    )
-                })
-                .await
-                .map_err(|e| {
-                    tracing::warn!(err = %e, "withheld_blob_oids task panicked; skipping replication for this push")
-                })
-                .ok()
-                .and_then(|r| {
-                    r.map_err(|e| {
-                        tracing::warn!(err = %e, "withheld_blob_oids failed; skipping replication for this push")
-                    })
-                    .ok()
-                })
+    let (announce, withheld) = replication_withheld_set(
+        rules_opt.clone(),
+        &record.owner_did,
+        record.is_public,
+        disk_path.clone(),
+    )
+    .await;
+
+    // Compute the per-push pin candidate set once, off the async worker (git
+    // subprocess). On the happy path this is the push delta (objects this push
+    // introduced); on any non-commit tip or git error it fails closed to a full
+    // repo scan. Only needed when something will actually replicate.
+    let candidates: Vec<String> = if withheld.is_some() {
+        let path = disk_path.clone();
+        let new_tips: Vec<String> = ref_updates
+            .iter()
+            .map(|u| u.new_sha.clone())
+            .filter(|s| s != ZERO_SHA)
+            .collect();
+        let old_tips: Vec<String> = ref_updates
+            .iter()
+            .map(|u| u.old_sha.clone())
+            .filter(|s| s != ZERO_SHA)
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let new_refs: Vec<&str> = new_tips.iter().map(String::as_str).collect();
+            let old_refs: Vec<&str> = old_tips.iter().map(String::as_str).collect();
+            match crate::git::push_delta::resolve_push_delta(&path, &new_refs, &old_refs) {
+                crate::git::push_delta::PinCandidates::Delta(objs) => {
+                    tracing::info!(delta = objs.len(), repo = %path.display(), "pin candidate set from push delta");
+                    objs
+                }
+                crate::git::push_delta::PinCandidates::FullScanRequired => {
+                    tracing::warn!(repo = %path.display(), "pin delta unavailable (non-commit tip, git error, or force-full-scan) — full-scan fallback");
+                    crate::git::push_delta::list_all_objects(&path).unwrap_or_default()
+                }
             }
-            None => None,
-        }
+        })
+        .await
+        .unwrap_or_default()
+    } else {
+        Vec::new()
     };
 
     // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
     // Skipped entirely when the public cannot read the repo (withheld == None).
     if let Some(withheld_ipfs) = withheld.clone() {
+        let candidates_ipfs = candidates.clone();
         let ipfs_api = state.config.ipfs_api.clone();
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
@@ -712,6 +777,7 @@ pub async fn git_receive_pack(
             let pinned = crate::ipfs_pin::pin_new_objects(
                 &ipfs_api,
                 &repo_path_clone,
+                candidates_ipfs,
                 &db_clone,
                 &withheld_ipfs,
             )
@@ -814,6 +880,7 @@ pub async fn git_receive_pack(
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
         let withheld_pinata = withheld;
+        let candidates_pinata = candidates;
         tokio::spawn(async move {
             let pinned = match &withheld_pinata {
                 Some(withheld) => {
@@ -822,6 +889,7 @@ pub async fn git_receive_pack(
                         &pinata_upload_url,
                         &pinata_jwt,
                         &repo_path_clone,
+                        candidates_pinata,
                         &db_clone,
                         withheld,
                     )
