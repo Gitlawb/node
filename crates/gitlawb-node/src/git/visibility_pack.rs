@@ -10,42 +10,105 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-/// List every (blob_oid, "/repo/relative/path") pair reachable from any ref in
-/// `repo_path`. Walks every ref, not just `refs/heads/*` and `refs/tags/*`, so
-/// the withheld set covers the same object graph the pack and pin paths expose;
-/// a blob reachable only through another namespace (e.g. `refs/notes/*`) must not
-/// escape withholding. Uses `git ls-tree -r` per ref so each path a blob lives
-/// at is represented (the same blob content can appear at several paths). This is
-/// why it is not `git rev-list --objects`, which reports only one path per object.
-/// Paths carry a leading "/" to match the glob form used by visibility rules
-/// ("/secret/**").
+/// List every (blob_oid, "/repo/relative/path") pair reachable from any commit in
+/// `repo_path` — every ref *and* every historical commit those refs reach, not just
+/// the ref tips. The pin set (`git rev-list --objects --all`) and `git upload-pack`
+/// expose the full reachable object graph, including a blob that only ever existed
+/// in an older commit (a since-deleted file, a rotated secret whose previous version
+/// is still in history). Classifying only ref-tip trees would leave those blobs
+/// unwithheld while pin/serve still hand them out in cleartext, so we enumerate all
+/// reachable commits and walk each commit's tree.
 ///
-/// Fails closed: if a ref cannot be traversed, returns an error so the caller
-/// aborts the serve/pin rather than producing a partial (under-withheld) set.
+/// `--all` covers every ref namespace (a blob reachable only through `refs/notes/*`
+/// must not escape withholding); HEAD is added explicitly for the detached case,
+/// where HEAD reaches commits that no ref does. `git ls-tree -r <commit>` per commit
+/// keeps every path a blob lives at (the same blob content can appear at several
+/// paths, and the per-path visibility check needs all of them). This is why it is
+/// not `git rev-list --objects`, which reports only one path per object. Pairs are
+/// de-duplicated across commits. Paths carry a leading "/" to match the glob form
+/// used by visibility rules ("/secret/**").
+///
+/// Fails closed: if commit enumeration or any tree walk fails, returns an error so
+/// the caller aborts the serve/pin rather than producing a partial (under-withheld)
+/// set.
 fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    let mut refs = store::list_refs(repo_path).context("list_refs failed")?;
-    // `for-each-ref` omits HEAD, but the pin set (`git rev-list --objects --all`)
-    // and `git upload-pack` both expose objects reachable from HEAD. If HEAD is
-    // ever detached (or otherwise points outside the ref-covered set), those
-    // objects must still be classified here, or a withheld blob could escape into
-    // a pin/serve path that this walk never saw. HEAD is normally symbolic to a
-    // branch already in `refs`, so this just adds a duplicate the downstream set
-    // arithmetic collapses; in the detached case it is the safety net. `None`
-    // means HEAD does not resolve to a commit (e.g. an unborn branch on an empty
-    // repo) — nothing to walk.
-    if let Some(head_oid) = store::head_commit(repo_path).context("resolve HEAD failed")? {
-        refs.push(("HEAD".to_string(), head_oid));
+    // Fail closed on any ref that does not resolve to a commit (a ref pointing
+    // directly at a blob or tree, or an annotated tag of one). `git rev-list --all`
+    // silently *skips* such refs, but the pin set (`git rev-list --objects --all`)
+    // still exposes their target object, so a tolerant walk would under-withhold.
+    // Refuse rather than leak — this is the same guarantee the per-ref `ls-tree`
+    // walk gave before, which errored on a non-tree-ish ref.
+    let refs = std::process::Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(objecttype) %(*objecttype) %(refname)",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .context("git for-each-ref failed")?;
+    if !refs.status.success() {
+        anyhow::bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&refs.stderr)
+        );
     }
-    let mut out = Vec::new();
-    for (refname, _oid) in refs {
+    for line in String::from_utf8_lossy(&refs.stdout).lines() {
+        // "<objecttype> [<peeled objecttype>] <refname>"; an annotated tag carries
+        // the peeled type, a lightweight ref does not. Refnames cannot contain
+        // whitespace, so split_whitespace is unambiguous.
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        let Some(&objtype) = toks.first() else {
+            continue;
+        };
+        let effective = if objtype == "tag" && toks.len() >= 3 {
+            toks[1]
+        } else {
+            objtype
+        };
+        if effective != "commit" {
+            let refname = toks.last().copied().unwrap_or("<unknown>");
+            anyhow::bail!(
+                "ref {refname} resolves to a {effective}, not a commit; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        }
+    }
+
+    // Enumerate every reachable commit, not just ref tips. `--all` walks all refs;
+    // append HEAD so a detached HEAD (reachable by rev-list/upload-pack but in no
+    // ref) is still classified. When HEAD does not resolve (unborn branch on an
+    // empty repo) `--all` alone yields nothing, which is correct — no objects exist.
+    let head = store::head_commit(repo_path).context("resolve HEAD failed")?;
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head.is_some() {
+        rev_args.push("HEAD");
+    }
+    let commits = std::process::Command::new("git")
+        .args(&rev_args)
+        .current_dir(repo_path)
+        .output()
+        .context("git rev-list --all failed")?;
+    if !commits.status.success() {
+        anyhow::bail!(
+            "git rev-list --all failed: {}",
+            String::from_utf8_lossy(&commits.stderr)
+        );
+    }
+    let commits_stdout = String::from_utf8_lossy(&commits.stdout);
+    let mut out: HashSet<(String, String)> = HashSet::new();
+    for commit in commits_stdout.lines() {
+        let commit = commit.trim();
+        if commit.is_empty() {
+            continue;
+        }
         let listing = std::process::Command::new("git")
-            .args(["ls-tree", "-r", &refname])
+            .args(["ls-tree", "-r", commit])
             .current_dir(repo_path)
             .output()
             .context("git ls-tree -r failed")?;
         if !listing.status.success() {
             anyhow::bail!(
-                "git ls-tree -r {refname} failed: {}",
+                "git ls-tree -r {commit} failed: {}",
                 String::from_utf8_lossy(&listing.stderr)
             );
         }
@@ -60,12 +123,12 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
             let oid = parts.next();
             if kind == Some("blob") {
                 if let Some(oid) = oid {
-                    out.push((oid.to_string(), format!("/{path}")));
+                    out.insert((oid.to_string(), format!("/{path}")));
                 }
             }
         }
     }
-    Ok(out)
+    Ok(out.into_iter().collect())
 }
 
 /// Blob OIDs the caller may not read. A blob is withheld only if visibility
@@ -393,6 +456,73 @@ mod tests {
         assert!(
             withheld.contains(&secret_oid),
             "blob reachable only via detached HEAD must still be withheld"
+        );
+    }
+
+    #[test]
+    fn withholds_secret_blob_deleted_at_tip_but_reachable_in_history() {
+        // commit 1 adds secret/b.txt; commit 2 deletes it. The secret blob is no
+        // longer in any ref-tip tree, but `rev-list --objects --all` (pin) and
+        // upload-pack (serve) still expose it from history, so it must be withheld.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        std::fs::write(work.join("secret/b.txt"), b"TOP SECRET\n").unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "c1"], &work);
+        let secret_oid = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD:secret/b.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["rm", "-q", "secret/b.txt"], &work);
+        run(&["commit", "-qm", "c2 delete secret"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // Sanity: the blob is gone from the tip tree but still in the pin set.
+        let tip = Command::new("git")
+            .args(["ls-tree", "-r", "HEAD"])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&tip.stdout).contains(&secret_oid),
+            "precondition: secret blob is absent from the tip tree"
+        );
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob deleted at the tip but reachable in history must be withheld"
         );
     }
 
