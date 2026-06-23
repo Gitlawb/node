@@ -75,7 +75,10 @@ enum SealPlan {
     /// partial set. Carries the unresolvable DIDs for logging.
     SkipUnresolvable(Vec<String>),
     /// Seal to `keys` and record coverage under `tag`.
-    Seal { keys: Vec<VerifyingKey>, tag: String },
+    Seal {
+        keys: Vec<VerifyingKey>,
+        tag: String,
+    },
 }
 
 /// Decide what to do with one blob given its desired recipient set and the tag
@@ -304,7 +307,11 @@ mod tests {
         match plan_seal(&SEED, &dids, None) {
             SealPlan::Seal { keys, tag } => {
                 assert_eq!(keys.len(), 2, "must seal to the full recipient set");
-                assert_eq!(tag, recipients_tag(&SEED, &dids), "records the full-set tag");
+                assert_eq!(
+                    tag,
+                    recipients_tag(&SEED, &dids),
+                    "records the full-set tag"
+                );
             }
             other => panic!("expected Seal, got {other:?}"),
         }
