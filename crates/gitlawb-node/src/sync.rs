@@ -137,6 +137,17 @@ async fn run(
     }
 }
 
+/// Find the origin node's base HTTP URL for a sync item, trimming any trailing
+/// slash so callers can append `/{path}` cleanly. Returns `None` when no peer
+/// row matches the item's origin DID. Kept pure (no DB) so the per-batch peer
+/// resolution can be unit-tested without a database.
+fn resolve_origin_url(peers: &[crate::db::PeerRecord], node_did: &str) -> Option<String> {
+    peers
+        .iter()
+        .find(|p| p.did == node_did)
+        .map(|p| p.http_url.trim_end_matches('/').to_string())
+}
+
 async fn process_batch(
     db: &Db,
     config: &Config,
@@ -152,19 +163,27 @@ async fn process_batch(
         }
     };
 
-    for item in items {
-        // Resolve origin node HTTP URL from peer table
-        let peers = match db.list_peers().await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(err = %e, "failed to list peers for sync");
-                let _ = db.mark_sync_failed(&item.id).await;
-                continue;
-            }
-        };
+    // Nothing queued — the common case on the 30s idle poll. Bail before the
+    // peer lookup so an empty batch costs zero extra DB round-trips.
+    if items.is_empty() {
+        return;
+    }
 
-        let origin_url = match peers.iter().find(|p| p.did == item.node_did) {
-            Some(p) => p.http_url.trim_end_matches('/').to_string(),
+    // Resolve the peer table once per batch — every item only needs a lookup.
+    let peers = match db.list_peers().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(err = %e, "failed to list peers for sync");
+            for item in &items {
+                let _ = db.mark_sync_failed(&item.id).await;
+            }
+            return;
+        }
+    };
+
+    for item in items {
+        let origin_url = match resolve_origin_url(&peers, &item.node_did) {
+            Some(url) => url,
             None => {
                 warn!(node_did = %item.node_did, repo = %item.repo, "no peer URL found for sync origin — skipping");
                 let _ = db.mark_sync_failed(&item.id).await;
@@ -761,5 +780,44 @@ mod tests {
         .await;
         register_replica_with_origin(&client, &keypair, Some(""), "http://127.0.0.1:1", "o", "r")
             .await;
+    }
+
+    fn peer(did: &str, http_url: &str) -> crate::db::PeerRecord {
+        crate::db::PeerRecord {
+            did: did.to_string(),
+            http_url: http_url.to_string(),
+            last_seen: None,
+            last_ping_ok: false,
+            announced_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_origin_url_matches_and_trims_trailing_slash() {
+        let peers = vec![
+            peer("did:key:a", "https://a.example/"),
+            peer("did:key:b", "https://b.example"),
+        ];
+        // Trailing slash is trimmed so callers can append `/{path}` cleanly.
+        assert_eq!(
+            resolve_origin_url(&peers, "did:key:a").as_deref(),
+            Some("https://a.example")
+        );
+        // Already-trimmed URLs pass through unchanged.
+        assert_eq!(
+            resolve_origin_url(&peers, "did:key:b").as_deref(),
+            Some("https://b.example")
+        );
+    }
+
+    #[test]
+    fn resolve_origin_url_returns_none_for_unknown_did() {
+        let peers = vec![peer("did:key:a", "https://a.example")];
+        assert_eq!(resolve_origin_url(&peers, "did:key:unknown"), None);
+    }
+
+    #[test]
+    fn resolve_origin_url_returns_none_for_empty_peer_list() {
+        assert_eq!(resolve_origin_url(&[], "did:key:a"), None);
     }
 }
