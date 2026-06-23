@@ -26,17 +26,16 @@ pub struct RemoveVisibilityRequest {
 }
 
 fn require_owner(record: &crate::db::RepoRecord, caller: &str) -> Result<()> {
-    let owner_short = record
-        .owner_did
-        .split(':')
-        .next_back()
-        .unwrap_or(&record.owner_did);
-    if caller != record.owner_did && caller != owner_short {
-        return Err(AppError::Forbidden(
+    // DID-safe owner match (collapses did:key full vs bare on both sides, never
+    // across methods), shared with require_repo_owner — not a trailing-segment
+    // compare that only normalized the owner side.
+    if crate::api::did_matches(caller, &record.owner_did) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
             "only the repo owner can manage visibility".into(),
-        ));
+        ))
     }
-    Ok(())
 }
 
 /// Reject malformed globs before they reach the store, where they would

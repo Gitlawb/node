@@ -205,12 +205,19 @@ mod authz_guard {
             (replicas, "register_replica", "did_matches("),
             (replicas, "unregister_replica", "replica_did = &auth.0"),
             // PRE-GATED — already owner-gated, in-scope group; guard the gate itself
-            (protect, "protect_branch", "caller != &record.owner_did"),
-            (protect, "unprotect_branch", "caller != &record.owner_did"),
+            (protect, "protect_branch", "did_matches("),
+            (protect, "unprotect_branch", "did_matches("),
             (visibility, "set_visibility", "require_owner("),
             (visibility, "remove_visibility", "require_owner("),
             (visibility, "list_visibility", "require_owner("),
         ];
+
+        // The visibility rows prove require_owner is CALLED; this proves the helper
+        // itself does DID-safe matching, not a raw/trailing-segment compare.
+        assert!(
+            fn_body(visibility, "require_owner").contains("did_matches("),
+            "visibility::require_owner must use did_matches for DID-safe owner matching"
+        );
 
         for (src, func, marker) in rows {
             let body = fn_body(src, func);
