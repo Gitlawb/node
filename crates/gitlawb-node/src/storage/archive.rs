@@ -177,9 +177,16 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
     // must not interleave or they race to a nondeterministic overwrite/failure.
     let lock = publish_lock(local_path);
     let _publish = lock.lock().expect("publish lock poisoned");
-    if local_path.exists() {
-        std::fs::remove_dir_all(local_path).context("removing stale repo dir")?;
+    let swap = (|| -> Result<()> {
+        if local_path.exists() {
+            std::fs::remove_dir_all(local_path).context("removing stale repo dir")?;
+        }
+        std::fs::rename(&tmp_dir, local_path).context("swapping extracted repo into place")?;
+        Ok(())
+    })();
+    if swap.is_err() {
+        // Don't leak the extracted temp dir if the swap failed.
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
-    std::fs::rename(&tmp_dir, local_path).context("swapping extracted repo into place")?;
-    Ok(())
+    swap
 }

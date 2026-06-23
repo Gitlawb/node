@@ -172,7 +172,11 @@ async fn main() -> Result<()> {
 
     // Initialize the storage-agnostic blob backend (S3-compatible / filesystem /
     // IPFS), then wrap it in the repo-archive layer. `None` = local-only mode.
-    let blob_store = storage::build(&config).await;
+    // Fail closed: a configured-but-unreachable backend aborts boot rather than
+    // silently running local-only and dropping durability.
+    let blob_store = storage::build(&config)
+        .await
+        .context("initializing object storage backend")?;
     let archive = blob_store.map(storage::archive::RepoArchive::new);
 
     let repo_store =
