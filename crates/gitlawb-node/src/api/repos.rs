@@ -33,9 +33,11 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// Returns `(announce, withheld)`: `announce` is whether the repo may be
 /// announced/replicated to the anonymous public at all (also gates gossip and
 /// Arweave anchoring downstream), and `withheld` is the anonymous withheld blob
-/// set when announceable (`None` when not announceable, or when the withheld
-/// walk failed — fail closed). Returning both keeps the gate's announce
-/// decision a single source rather than recomputing it at each call site.
+/// set when announceable (`None` when not announceable). A failed/panicked
+/// withheld walk fails closed on both axes: `announce` is forced false and
+/// `withheld` is `None`, so an unvetted push neither replicates blobs nor
+/// announces. Returning both keeps the gate's announce decision a single
+/// source rather than recomputing it at each call site.
 async fn replication_withheld_set(
     rules: Option<Vec<crate::db::VisibilityRule>>,
     owner_did: &str,
@@ -74,7 +76,14 @@ async fn replication_withheld_set(
         }
         None => None,
     };
-    (announce, withheld)
+    // Fail closed on a failed/panicked withheld walk: with `announce` already
+    // true here, a `None` withheld can only mean the walk errored (rules are
+    // necessarily `Some`, else we returned above). Suppress the announce too so
+    // a push we couldn't vet does not gossip, notify peers, or anchor to Arweave.
+    match withheld {
+        Some(withheld) => (announce, Some(withheld)),
+        None => (false, None),
+    }
 }
 
 // ── Request / Response types ───────────────────────────────────────────────
