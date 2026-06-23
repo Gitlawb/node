@@ -73,11 +73,14 @@ async fn run(
     // No redirects: peer URLs are attacker-influenceable, so a 3xx to a
     // loopback/private address must not be followed (SSRF guard, matching the
     // shared http_client and announce-time validation).
+    // Panic rather than fall back to reqwest::Client::new(): the default
+    // builder follows redirects, which would silently reintroduce the SSRF
+    // vector Policy::none() is here to close.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("failed to build no-redirect sync HTTP client");
     info!("sync worker started (auto_sync=true)");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {

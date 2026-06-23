@@ -96,10 +96,7 @@ pub fn is_public_http_url(raw: &str) -> bool {
             std::net::IpAddr::V4(v4) => {
                 let o = v4.octets();
                 // RFC1918 private, link-local, or CGNAT (100.64.0.0/10).
-                if v4.is_private()
-                    || v4.is_link_local()
-                    || (o[0] == 100 && (o[1] & 0xc0) == 64)
-                {
+                if v4.is_private() || v4.is_link_local() || (o[0] == 100 && (o[1] & 0xc0) == 64) {
                     return false;
                 }
             }
