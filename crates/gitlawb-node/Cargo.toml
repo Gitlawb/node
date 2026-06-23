@@ -28,9 +28,10 @@ async-graphql-axum = "7"
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "limit"] }
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "macros", "migrate"] }
 clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
+libc = "0.2"
 cid = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }

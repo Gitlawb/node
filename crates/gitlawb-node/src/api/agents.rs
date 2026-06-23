@@ -2,9 +2,10 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
+use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
@@ -18,6 +19,14 @@ fn normalize_agent_did(did: &str) -> String {
 
 fn agent_key_segment(did: &str) -> &str {
     did.split(':').next_back().unwrap_or(did)
+}
+
+/// Whether `caller` (the verified `AuthenticatedDid`) is the same identity as
+/// `target` (the DID being acted on), tolerant of full `did:key:...` vs short
+/// key-only forms on either side. Used to gate self-deregistration so a DID
+/// can only retire itself.
+fn caller_matches_did(caller: &str, target: &str) -> bool {
+    agent_key_segment(caller) == agent_key_segment(target)
 }
 
 async fn resolve_agent_did(state: &AppState, did: &str) -> Result<String> {
@@ -71,6 +80,8 @@ pub struct AgentResponse {
     pub capabilities: Vec<String>,
     pub registered_at: String,
     pub last_seen: Option<String>,
+    /// Lifecycle status: `active` or `revoked`.
+    pub status: String,
 }
 
 /// GET /api/v1/agents
@@ -87,6 +98,7 @@ pub async fn list_agents(
             capabilities: a.capabilities,
             registered_at: a.registered_at,
             last_seen: a.last_seen,
+            status: a.status,
         })
         .collect();
     Ok(Json(serde_json::json!({ "agents": list })))
@@ -111,6 +123,7 @@ pub async fn show_agent(
             capabilities: agent.capabilities,
             registered_at: agent.registered_at,
             last_seen: agent.last_seen,
+            status: agent.status,
         }),
     ))
 }
@@ -133,9 +146,97 @@ pub async fn get_trust(
     }))
 }
 
+/// DELETE /api/v1/agents/{did}
+///
+/// Self-deregistration: the holder of a DID's key marks their own agent
+/// `revoked`, removing it from discovery (issue #29). Authenticated by the
+/// rfc9421 signature middleware; a caller may only retire its own DID.
+pub async fn deregister_agent(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
+    Path(did): Path<String>,
+) -> Result<StatusCode> {
+    // Authorize on the verified identity, and act on it too. The path DID is
+    // only an intent check (it must name the caller); the row we revoke is the
+    // authenticated DID itself, never a value derived from the untrusted path.
+    // Revoking `resolve_agent_did(did)` instead would let the fuzzy prefix
+    // resolver act on a different identity than the one just authorized.
+    if !caller_matches_did(&auth.0, &did) {
+        return Err(AppError::BadRequest(
+            "an agent can only deregister itself".into(),
+        ));
+    }
+
+    if state.db.revoke_agent(&auth.0).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::NotFound(format!("agent {} not found", auth.0)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{agent_key_segment, normalize_agent_did};
+    use super::{agent_key_segment, caller_matches_did, normalize_agent_did, AgentResponse};
+
+    #[test]
+    fn caller_matches_own_did_full_form() {
+        assert!(caller_matches_did(
+            "did:key:z6MkExample",
+            "did:key:z6MkExample"
+        ));
+    }
+
+    #[test]
+    fn caller_matches_own_did_short_form() {
+        // Authenticated full DID vs short path form, and vice versa.
+        assert!(caller_matches_did("did:key:z6MkExample", "z6MkExample"));
+        assert!(caller_matches_did("z6MkExample", "did:key:z6MkExample"));
+    }
+
+    #[test]
+    fn caller_cannot_revoke_a_different_did() {
+        // The core authorization property for issue #29.
+        assert!(!caller_matches_did(
+            "did:key:z6MkAttacker",
+            "did:key:z6MkVictim"
+        ));
+        assert!(!caller_matches_did("did:key:z6MkAttacker", "z6MkVictim"));
+    }
+
+    #[test]
+    fn agent_response_surfaces_status() {
+        // A revoked DID's response must carry its status so callers can see it
+        // is retired (issue #29).
+        let resp = AgentResponse {
+            did: "did:key:orphan".to_string(),
+            trust_score: 0.1,
+            capabilities: vec!["reputation:score".to_string()],
+            registered_at: "2026-06-19T00:00:00Z".to_string(),
+            last_seen: None,
+            status: "revoked".to_string(),
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(json["status"], "revoked");
+        assert!(json.get("replaced_by").is_none());
+    }
+
+    #[test]
+    fn agent_response_active_status() {
+        let resp = AgentResponse {
+            did: "did:key:active".to_string(),
+            trust_score: 0.5,
+            capabilities: vec![],
+            registered_at: "2026-06-19T00:00:00Z".to_string(),
+            last_seen: None,
+            status: "active".to_string(),
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(json["status"], "active");
+    }
 
     #[test]
     fn normalize_agent_did_preserves_full_did() {

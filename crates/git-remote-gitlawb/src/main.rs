@@ -272,8 +272,7 @@ fn handle_connect(
     let mut req = client
         .post(&post_url)
         .header("Content-Type", format!("application/x-{}-request", service))
-        .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0")
-        .body(request_body.clone());
+        .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0");
 
     // Add RFC 9421 HTTP Signature auth on push operations
     if service == "git-receive-pack" {
@@ -291,7 +290,12 @@ fn handle_connect(
         }
     }
 
-    let pack_resp = req.send().with_context(|| format!("POST {post_url}"))?;
+    // Attach the body after signing so the pack bytes are moved, not cloned —
+    // packs can be large and the clone doubled peak memory on push.
+    let pack_resp = req
+        .body(request_body)
+        .send()
+        .with_context(|| format!("POST {post_url}"))?;
 
     if !pack_resp.status().is_success() {
         bail!("POST /{} returned {}", service, pack_resp.status());

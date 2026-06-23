@@ -129,7 +129,7 @@ impl HttpSignature {
     pub fn missing_components(&self) -> Vec<&str> {
         COVERED_COMPONENTS
             .iter()
-            .filter(|c| !self.components.contains(&c.to_string()))
+            .filter(|c| !self.components.iter().any(|s| s.as_str() == **c))
             .copied()
             .collect()
     }

@@ -54,6 +54,23 @@ jobs:
         toolchain: [stable, beta]
     # Beta is informational: an upstream beta regression should warn, not block merges.
     continue-on-error: ${{ matrix.toolchain == 'beta' }}
+    # Postgres for the DB-backed integration tests (#[sqlx::test] provisions an
+    # isolated database per test off this connection). The health-check gate keeps
+    # `cargo test` from racing a not-yet-ready server.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gitlawb_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -71,6 +88,8 @@ jobs:
           key: ${{ matrix.toolchain }}
 
       - name: cargo test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/gitlawb_test
         run: cargo test --workspace
 
   build-release:

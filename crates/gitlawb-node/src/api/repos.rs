@@ -305,8 +305,25 @@ pub async fn get_tree(
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    // Gate on the REQUESTED subtree, not the repo root (N3) — otherwise a caller
+    // denied a withheld subtree can still enumerate its names/SHAs. Reject
+    // traversal and empty interior segments as get_blob does, so the gate path and
+    // the path git resolves cannot diverge; an empty path here is the root listing.
+    let normalized = tree_path.trim_matches('/');
+    if !normalized.is_empty()
+        && normalized
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(AppError::BadRequest("invalid tree path".into()));
+    }
+    let gate_path = if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{normalized}")
+    };
     let (record, _rules) =
-        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
 
     let disk_path = state
         .repo_store
@@ -689,7 +706,7 @@ pub async fn git_receive_pack(
         let irys_url = state.config.irys_url.clone();
         let http_client = std::sync::Arc::clone(&state.http_client);
         let node_did_str = state.node_did.to_string();
-        let node_seed = state.node_keypair.seed_bytes();
+        let node_seed = state.node_keypair.to_seed();
         let repo_name = record.name.clone();
         tokio::spawn(async move {
             let pinned = crate::ipfs_pin::pin_new_objects(

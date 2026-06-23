@@ -123,7 +123,7 @@ pub fn open_blob(envelope: &[u8], keypair: &Keypair) -> Result<Vec<u8>> {
             .context("decode header")?;
     let body = &envelope[p + hlen..];
 
-    let my_x = XSecret::from(x25519_secret_from_seed(&keypair.seed_bytes()));
+    let my_x = XSecret::from(x25519_secret_from_seed(&keypair.to_seed()));
 
     // Identities are blinded: no entry says which recipient it belongs to, so
     // try each one. The ChaChaBox AEAD tag authenticates, so exactly the
@@ -185,7 +185,7 @@ mod tests {
         // The X25519 public derived from the Ed25519 public must equal the
         // X25519 public of the X25519 secret derived from the same seed.
         let kp = Keypair::generate();
-        let seed = kp.seed_bytes();
+        let seed = kp.to_seed();
         let xpub_from_public = x25519_public(&kp.verifying_key()).unwrap();
         let xsec = x25519_secret_from_seed(&seed);
         let xpub_from_secret = crypto_box::SecretKey::from(xsec).public_key().to_bytes();

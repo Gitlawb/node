@@ -39,11 +39,11 @@ pub async fn create_issue(
     Path((owner, repo)): Path<(String, String)>,
     Json(req): Json<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<IssueRecord>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Authorize the caller as a reader before accepting an issue: a non-reader
+    // must not be able to file an issue against a private repo they cannot read.
+    // Mirrors create_issue_comment / create_review / create_bounty.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let issue_id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
@@ -161,11 +161,9 @@ pub async fn create_issue_comment(
         ));
     }
 
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Read-gate: a commenter must be able to read the repo, but need not own it.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let disk_path = state
         .repo_store
@@ -207,7 +205,7 @@ pub async fn list_issue_comments(
 /// POST /api/v1/repos/{owner}/{repo}/issues/{id}/close
 pub async fn close_issue(
     State(state): State<AppState>,
-    Extension(_auth): Extension<AuthenticatedDid>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
     let record = state
@@ -222,6 +220,33 @@ pub async fn close_issue(
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
     let disk_path = guard.path().to_path_buf();
+
+    // Owner OR issue author may close. The author lives in the issue's git-JSON
+    // blob (not a DB column); a None author (legacy issues) falls back to
+    // owner-only. Read it under the write guard, before mutating.
+    let author_did: Option<String> = match git_issues::get_issue(&disk_path, &issue_id) {
+        Ok(Some(raw)) => serde_json::from_str::<IssueRecord>(&raw)
+            .ok()
+            .and_then(|i| i.author),
+        Ok(None) => {
+            guard.release(false).await;
+            return Err(AppError::NotFound(format!("issue {issue_id} not found")));
+        }
+        Err(e) => {
+            guard.release(false).await;
+            return Err(AppError::Git(e.to_string()));
+        }
+    };
+    let is_owner = crate::api::require_repo_owner(&record, &auth.0).is_ok();
+    let is_author = author_did
+        .as_deref()
+        .is_some_and(|a| crate::api::did_matches(&auth.0, a));
+    if !is_owner && !is_author {
+        guard.release(false).await;
+        return Err(AppError::Forbidden(
+            "only the repo owner or the issue author can close this issue".into(),
+        ));
+    }
 
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
