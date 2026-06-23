@@ -547,10 +547,10 @@ pub async fn git_info_refs(
     }
 
     // Push flood brake on the advertisement phase. A push always hits this
-    // GET first, and for receive-pack it forces a fresh Tigris download below;
+    // GET first, and for receive-pack it forces a fresh storage download below;
     // throttling only the receive-pack POST would leave the expensive
     // fresh-acquire reachable unauthenticated and unlimited. Applied before the
-    // acquire so a rejected request does no Tigris work. Same per-IP limiter and
+    // acquire so a rejected request does no storage work. Same per-IP limiter and
     // trusted-proxy policy as the POST middleware (shared buckets).
     if service == "git-receive-pack" {
         if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
@@ -563,7 +563,7 @@ pub async fn git_info_refs(
         }
     }
 
-    // For receive-pack (push), download the latest from Tigris so the client
+    // For receive-pack (push), download the latest from storage so the client
     // sees the same refs that acquire_write() will operate on.
     let disk_path = if service == "git-receive-pack" {
         state
@@ -1572,7 +1572,7 @@ pub async fn fork_repo(
     // Request is admissible — spend the proof now, immediately before the write.
     let verified_proof = proof.consume(&state.db).await?;
 
-    // Ensure source repo is on local disk (downloads from Tigris on cache miss)
+    // Ensure source repo is on local disk (downloads from storage on cache miss)
     let source_path = state
         .repo_store
         .acquire(&source.owner_did, &source.name)
@@ -1599,7 +1599,7 @@ pub async fn fork_repo(
         )));
     }
 
-    // Upload fork to Tigris
+    // Upload fork to storage
     state
         .repo_store
         .release_after_write(&forker_did, &fork_name)

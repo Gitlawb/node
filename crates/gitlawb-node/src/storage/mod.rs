@@ -65,10 +65,14 @@ pub trait BlobStore: Send + Sync {
 /// Build the configured blob store.
 ///
 /// Returns `Ok(None)` only when no backend is configured at all (local-only
-/// passthrough mode). A configured-but-unavailable or misconfigured backend
-/// returns `Err`: we fail closed rather than silently degrading to local-only,
-/// which would accept writes without the intended durable backend and risk
-/// cross-node persistence drift.
+/// passthrough mode). A misconfigured backend (missing required setting, or a
+/// client that fails to construct) returns `Err`: we fail closed rather than
+/// silently degrading to local-only, which would accept writes without the
+/// intended durable backend and risk cross-node persistence drift.
+///
+/// Note: this validates configuration and client construction, not live
+/// connectivity — e.g. the S3 client builds successfully against an unreachable
+/// or wrong bucket, and that surfaces as an error on the first real request.
 ///
 /// Selection order:
 ///   1. Explicit `GITLAWB_STORAGE_BACKEND` (`s3` | `fs` | `ipfs`).

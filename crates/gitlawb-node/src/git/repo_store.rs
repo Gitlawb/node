@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::{PgPool, Postgres};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -128,9 +129,9 @@ impl RepoStore {
         }
     }
 
-    /// Ensure a repo is available on local disk, downloading from Tigris if needed.
-    /// If the repo exists locally but not yet in Tigris, a background upload is
-    /// spawned to lazily migrate it (on-demand migration for pre-Tigris repos).
+    /// Ensure a repo is available on local disk, downloading from storage if needed.
+    /// If the repo exists locally but not yet in storage, a background upload is
+    /// spawned to lazily migrate it (on-demand migration for pre-storage repos).
     /// Returns the local path to the bare repo.
     pub async fn acquire(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
@@ -209,7 +210,7 @@ impl RepoStore {
         Ok(local_path)
     }
 
-    /// Ensure a repo is available on local disk with the **latest** Tigris state.
+    /// Ensure a repo is available on local disk with the **latest** storage state.
     /// Use this for operations that precede a write (e.g. `info/refs` for
     /// `git-receive-pack`) so the client sees the same refs that `acquire_write()`
     /// will operate on.
@@ -226,13 +227,25 @@ impl RepoStore {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
-        // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
-        // to avoid blocking indefinitely on stale locks from crashed connections.
+        // Postgres advisory locks are SESSION-scoped: they bind to one backend
+        // connection and only release on that same connection. With a pool,
+        // acquiring and releasing on different checked-out connections means the
+        // unlock silently no-ops while the lock lingers on the original. So we
+        // pin ONE connection for the whole lock lifetime — acquire, release on
+        // sync error, and the final release in the guard all run on it.
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquiring db connection for advisory lock")?;
+
+        // Acquire with retry using pg_try_advisory_lock to avoid blocking
+        // indefinitely on stale locks from crashed connections.
         let mut acquired = false;
         for attempt in 0..60 {
             let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_key)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *conn)
                 .await
                 .context("trying advisory lock")?;
             if row.0 {
@@ -256,10 +269,10 @@ impl RepoStore {
             .sync_down_if_stale(&owner_slug, repo_name, &local_path, true)
             .await
         {
-            // Release the lock we acquired before bailing, to avoid a stale lock.
+            // Release the lock on the SAME connection before bailing.
             if let Err(unlock_err) = sqlx::query("SELECT pg_advisory_unlock($1)")
                 .bind(lock_key)
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await
             {
                 warn!(repo = %repo_name, err = %unlock_err,
@@ -273,13 +286,13 @@ impl RepoStore {
             repo_name: repo_name.to_string(),
             local_path,
             lock_key,
-            pool: self.pool.clone(),
+            conn,
             archive: self.archive.clone(),
             versions: Arc::clone(&self.versions),
         })
     }
 
-    /// Initialize a new bare repo on local disk and upload to Tigris.
+    /// Initialize a new bare repo on local disk and upload to storage.
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
@@ -445,7 +458,10 @@ pub struct RepoWriteGuard {
     repo_name: String,
     pub local_path: PathBuf,
     lock_key: i64,
-    pool: PgPool,
+    /// The connection the session-scoped advisory lock was taken on. The lock
+    /// must be released on this same connection, so it's held for the guard's
+    /// lifetime and dropped (returned to the pool) only after `release()`.
+    conn: PoolConnection<Postgres>,
     archive: Option<RepoArchive>,
     versions: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -466,7 +482,7 @@ impl RepoWriteGuard {
     /// concurrent writer on another machine cannot read a stale archive. When
     /// callers want a fast client ack, they spawn this future as a background
     /// task (write-back) — the lock + etag-cache update still complete in order.
-    pub async fn release(self, success: bool) {
+    pub async fn release(mut self, success: bool) {
         // Upload to storage only on success.
         if success {
             if let Some(ref archive) = self.archive {
@@ -490,10 +506,11 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping storage upload to avoid propagating an inconsistent repo");
         }
 
-        // Release advisory lock
+        // Release the advisory lock on the same connection it was taken on, then
+        // drop the connection (returns it to the pool).
         if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.lock_key)
-            .execute(&self.pool)
+            .execute(&mut *self.conn)
             .await
         {
             warn!(repo = %self.repo_name, err = %e, "failed to release advisory lock");
@@ -670,5 +687,103 @@ mod tests {
                 "owner_did={bad:?} must be rejected"
             );
         }
+    }
+
+    // ── sync_down_if_stale (fs-backed archive, lazy pool) ──────────────────
+
+    /// A RepoStore over an fs-backed archive. `sync_down_if_stale` never touches
+    /// the pool, so a lazy (never-connected) pool is fine.
+    fn store_with_fs_archive(repos_dir: PathBuf, store_root: &Path) -> RepoStore {
+        let blob: Arc<dyn crate::storage::BlobStore> =
+            Arc::new(crate::storage::fs::FsBlobStore::new(store_root).unwrap());
+        let archive = crate::storage::archive::RepoArchive::new(blob);
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").unwrap();
+        RepoStore::new(repos_dir, Some(archive), pool)
+    }
+
+    #[tokio::test]
+    async fn sync_down_if_stale_downloads_then_skips_on_etag_match() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        // Seed the archive with a repo.
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+
+        // First call downloads.
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
+
+        // Locally mutate, then sync again: the cached etag still matches the
+        // remote, so the download is skipped and our local edit survives.
+        std::fs::write(local.join("HEAD"), b"LOCAL-EDIT\n").unwrap();
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(local.join("HEAD")).unwrap(),
+            b"LOCAL-EDIT\n",
+            "etag match must skip the download (local copy preserved)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_down_if_stale_require_fresh_fails_closed_on_bad_remote() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+
+        // Corrupt the stored archive: HEAD now succeeds with a *new* etag (so the
+        // cache no longer matches and a download is forced), but the download
+        // decompresses garbage and fails.
+        let blob_path = store_root.path().join("repos/v1/owner/repo.tar.zst");
+        std::fs::write(&blob_path, b"corrupted not-a-tar-zst").unwrap();
+
+        // Write path: must fail closed rather than fall back to the stale local
+        // copy (which a later upload would use to clobber the newer remote).
+        assert!(
+            store
+                .sync_down_if_stale("owner", "repo", &local, true)
+                .await
+                .is_err(),
+            "require_fresh=true must propagate the download error"
+        );
+
+        // Read path: self-heals — falls back to the valid local copy.
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .expect("require_fresh=false must fall back to the local copy");
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
     }
 }

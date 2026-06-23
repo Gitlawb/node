@@ -1,7 +1,7 @@
 //! Repo-archive layer: stores a bare git repo as a single
 //! `repos/v1/{owner_slug}/{repo_name}.tar.zst` object on top of any
 //! [`BlobStore`] backend. Backend-agnostic replacement for the old
-//! Tigris-specific client.
+//! single-backend (Tigris-only) client.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -189,4 +189,98 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
     swap
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn seed_repo(dir: &std::path::Path) {
+        fs::create_dir_all(dir.join("refs/heads")).unwrap();
+        fs::write(dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(dir.join("refs/heads/main"), b"abc123\n").unwrap();
+        fs::write(dir.join("config"), b"[core]\n\tbare = true\n").unwrap();
+    }
+
+    #[test]
+    fn compress_decompress_round_trip_preserves_files() {
+        let src = tempfile::tempdir().unwrap();
+        seed_repo(src.path());
+
+        let bytes = compress_repo(src.path()).unwrap();
+        assert!(!bytes.is_empty());
+
+        let out_parent = tempfile::tempdir().unwrap();
+        let out = out_parent.path().join("restored.git");
+        decompress_repo(&bytes, &out).unwrap();
+
+        assert_eq!(
+            fs::read(out.join("HEAD")).unwrap(),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(fs::read(out.join("refs/heads/main")).unwrap(), b"abc123\n");
+        assert_eq!(
+            fs::read(out.join("config")).unwrap(),
+            b"[core]\n\tbare = true\n"
+        );
+    }
+
+    #[test]
+    fn decompress_swap_replaces_existing_dir_atomically() {
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("HEAD"), b"new\n").unwrap();
+        let bytes = compress_repo(src.path()).unwrap();
+
+        // Pre-existing copy with stale junk that the swap must fully replace.
+        let out_parent = tempfile::tempdir().unwrap();
+        let out = out_parent.path().join("repo.git");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("STALE"), b"old\n").unwrap();
+
+        decompress_repo(&bytes, &out).unwrap();
+        assert_eq!(fs::read(out.join("HEAD")).unwrap(), b"new\n");
+        assert!(
+            !out.join("STALE").exists(),
+            "stale content must be gone after the swap"
+        );
+    }
+
+    #[test]
+    fn decompress_corrupt_archive_leaves_existing_copy_untouched() {
+        let out_parent = tempfile::tempdir().unwrap();
+        let out = out_parent.path().join("repo.git");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("HEAD"), b"good\n").unwrap();
+
+        // Garbage is not a valid tar.zst: unpack fails before the swap, so the
+        // existing copy is preserved (atomicity claim).
+        assert!(decompress_repo(b"not a real archive", &out).is_err());
+        assert_eq!(fs::read(out.join("HEAD")).unwrap(), b"good\n");
+    }
+
+    #[tokio::test]
+    async fn upload_download_round_trip_over_fs_backend() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn BlobStore> =
+            Arc::new(crate::storage::fs::FsBlobStore::new(store_dir.path()).unwrap());
+        let archive = RepoArchive::new(store);
+
+        let src = tempfile::tempdir().unwrap();
+        seed_repo(src.path());
+
+        assert!(!archive.exists("owner", "repo").await.unwrap());
+        let etag = archive.upload("owner", "repo", src.path()).await.unwrap();
+        assert!(etag.is_some());
+        assert!(archive.exists("owner", "repo").await.unwrap());
+
+        let out_parent = tempfile::tempdir().unwrap();
+        let out = out_parent.path().join("repo.git");
+        archive.download("owner", "repo", &out).await.unwrap();
+        assert_eq!(
+            fs::read(out.join("HEAD")).unwrap(),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(fs::read(out.join("refs/heads/main")).unwrap(), b"abc123\n");
+    }
 }
