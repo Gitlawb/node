@@ -724,9 +724,9 @@ pub async fn git_receive_pack(
     // Compute the per-push pin candidate set once, off the async worker (git
     // subprocess). On the happy path this is the push delta (objects this push
     // introduced); on any non-commit tip or git error it fails closed to a full
-    // repo scan. Only needed when something will actually replicate.
+    // repo scan. Only needed when something will actually replicate. All
+    // degraded paths log inside the helper rather than failing silently.
     let candidates: Vec<String> = if withheld.is_some() {
-        let path = disk_path.clone();
         let new_tips: Vec<String> = ref_updates
             .iter()
             .map(|u| u.new_sha.clone())
@@ -737,22 +737,8 @@ pub async fn git_receive_pack(
             .map(|u| u.old_sha.clone())
             .filter(|s| s != ZERO_SHA)
             .collect();
-        tokio::task::spawn_blocking(move || {
-            let new_refs: Vec<&str> = new_tips.iter().map(String::as_str).collect();
-            let old_refs: Vec<&str> = old_tips.iter().map(String::as_str).collect();
-            match crate::git::push_delta::resolve_push_delta(&path, &new_refs, &old_refs) {
-                crate::git::push_delta::PinCandidates::Delta(objs) => {
-                    tracing::info!(delta = objs.len(), repo = %path.display(), "pin candidate set from push delta");
-                    objs
-                }
-                crate::git::push_delta::PinCandidates::FullScanRequired => {
-                    tracing::warn!(repo = %path.display(), "pin delta unavailable (non-commit tip, git error, or force-full-scan) — full-scan fallback");
-                    crate::git::push_delta::list_all_objects(&path).unwrap_or_default()
-                }
-            }
-        })
-        .await
-        .unwrap_or_default()
+        crate::git::push_delta::resolve_candidates_for_push(disk_path.clone(), new_tips, old_tips)
+            .await
     } else {
         Vec::new()
     };

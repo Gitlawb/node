@@ -20,7 +20,7 @@
 //! --no-object-names` is safe here. The "rev-list reports one path per object"
 //! trap from #84 applies only to `visibility_pack`'s per-path `ls-tree` walk.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -68,6 +68,8 @@ fn force_full_scan() -> bool {
     std::env::var_os(FORCE_FULL_SCAN_ENV).is_some()
 }
 
+// Intentionally private but reachable from the test module (via `use super::*`)
+// so the kill-switch can be exercised without mutating process-global env.
 fn resolve_push_delta_inner(
     repo_path: &Path,
     new_tips: &[&str],
@@ -187,6 +189,51 @@ pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
         .collect())
+}
+
+/// Resolve the pin candidate OID set for a push, off the async worker.
+///
+/// Runs [`resolve_push_delta`] in `spawn_blocking` (git subprocess) and applies
+/// the full-scan fallback for [`PinCandidates::FullScanRequired`]. Owns the
+/// dispatch so the push call site stays thin and this wiring is unit-testable
+/// without the HTTP layer.
+///
+/// Every degraded path is **logged**, not silent: a full-scan fallback, a
+/// failed full scan, and a panicked blocking task each emit a warning. On a
+/// failed full scan or a task panic the candidate set is empty (pin nothing
+/// this push); that is a durability gap the reconciliation sweep backstops, and
+/// it can never leak because the withheld filter still runs on whatever set is
+/// returned.
+pub async fn resolve_candidates_for_push(
+    repo_path: PathBuf,
+    new_tips: Vec<String>,
+    old_tips: Vec<String>,
+) -> Vec<String> {
+    tokio::task::spawn_blocking(move || {
+        let new_refs: Vec<&str> = new_tips.iter().map(String::as_str).collect();
+        let old_refs: Vec<&str> = old_tips.iter().map(String::as_str).collect();
+        match resolve_push_delta(&repo_path, &new_refs, &old_refs) {
+            PinCandidates::Delta(objs) => {
+                tracing::info!(delta = objs.len(), repo = %repo_path.display(), "pin candidate set from push delta");
+                objs
+            }
+            PinCandidates::FullScanRequired => {
+                tracing::warn!(repo = %repo_path.display(), "pin delta unavailable (non-commit tip, git error, or force-full-scan) — full-scan fallback");
+                match list_all_objects(&repo_path) {
+                    Ok(objs) => objs,
+                    Err(e) => {
+                        tracing::warn!(repo = %repo_path.display(), err = %e, "full-scan fallback failed; pinning nothing this push (reconciliation sweep backstops)");
+                        Vec::new()
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(err = %e, "pin candidate computation task panicked; pinning nothing this push (reconciliation sweep backstops)");
+        Vec::new()
+    })
 }
 
 #[cfg(test)]
@@ -372,7 +419,66 @@ mod tests {
         let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&tag], &[]))
             .into_iter()
             .collect();
-        assert!(got.contains(&c1), "peeled commit's objects are in the delta");
+        assert!(
+            got.contains(&c1),
+            "peeled commit's objects are in the delta"
+        );
+    }
+
+    #[test]
+    fn tag_of_tag_of_commit_proceeds_as_delta() {
+        // Deep-peel positive path: tag -> tag -> commit must recurse to `commit`
+        // via `^{}` and return Delta. Complements tag_of_tag_of_noncommit (which
+        // forces full scan) — guards against a regression in peel depth that
+        // would silently downgrade a legitimate nested-tag push to full scan.
+        let repo = Repo::new();
+        let c1 = repo.commit_file("a.txt", "one\n");
+        repo.git(&["tag", "-a", "t1", "-m", "x", &c1]);
+        let t1 = repo.rev("t1");
+        repo.git(&["tag", "-a", "t2", "-m", "x", &t1]);
+        let t2 = repo.rev("t2");
+        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&t2], &[]))
+            .into_iter()
+            .collect();
+        assert!(
+            got.contains(&c1),
+            "peeled commit's objects are in the delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_candidates_for_push_returns_delta() {
+        // The extracted wiring returns the per-push delta on the happy path.
+        let repo = Repo::new();
+        let c1 = repo.commit_file("a.txt", "one\n");
+        let c2 = repo.commit_file("b.txt", "two\n");
+        let got: HashSet<String> =
+            resolve_candidates_for_push(repo.path.clone(), vec![c2.clone()], vec![c1.clone()])
+                .await
+                .into_iter()
+                .collect();
+        let new_blob = repo.rev("HEAD:b.txt");
+        assert!(
+            got.contains(&c2) && got.contains(&new_blob),
+            "new objects pinned"
+        );
+        assert!(!got.contains(&c1), "old commit excluded from delta");
+    }
+
+    #[tokio::test]
+    async fn resolve_candidates_for_push_falls_back_to_full_scan_on_noncommit_tip() {
+        // A non-commit tip forces FullScanRequired, and the wiring resolves that
+        // to the whole-repo list (a superset), never an empty set.
+        let repo = Repo::new();
+        repo.commit_file("a.txt", "one\n");
+        let blob = repo.rev("HEAD:a.txt");
+        let all: HashSet<String> = list_all_objects(&repo.path).unwrap().into_iter().collect();
+        let got: HashSet<String> =
+            resolve_candidates_for_push(repo.path.clone(), vec![blob], vec![])
+                .await
+                .into_iter()
+                .collect();
+        assert_eq!(got, all, "non-commit tip falls back to full repo scan");
     }
 
     #[test]
