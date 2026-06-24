@@ -831,7 +831,7 @@ pub async fn git_receive_pack(
                 "ref": update.ref_name,
                 "before": update.old_sha,
                 "after": update.new_sha,
-                "created": update.old_sha == "0000000000000000000000000000000000000000",
+                "created": update.old_sha == ZERO_SHA,
                 "forced": false,
                 "pusher": {
                     "did": did,
@@ -1537,9 +1537,9 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gitlawb_core::identity::Keypair;
     use crate::auth::caller_authorized_to_push;
     use crate::error::AppError;
+    use gitlawb_core::identity::Keypair;
 
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
