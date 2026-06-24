@@ -855,6 +855,11 @@ impl Db {
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
+    /// Raw list of every repo row — NOT deduped (a mirror row and its canonical
+    /// row both appear) and without stars. For enumeration callers that must see
+    /// every physical row (e.g. the IPFS object scan in `api::ipfs`), not for
+    /// listing surfaces. Listing surfaces dedupe via `list_all_repos_deduped` or
+    /// `list_all_repos_with_stars` + `dedupe_canonical_repos`.
     pub async fn list_all_repos(&self) -> Result<Vec<RepoRecord>> {
         let rows = sqlx::query(
             "SELECT id, name, owner_did, description, is_public, default_branch,
@@ -3275,5 +3280,65 @@ mod dedup_db_tests {
             out[0].id, "uuid-canonical",
             "canonical wins by structural id marker despite carrying the mirror description"
         );
+    }
+
+    /// A mirror row with no canonical twin survives dedup as the sole entry for its
+    /// group (it is not dropped just because it is the mirror).
+    #[sqlx::test]
+    async fn deduped_mirror_only_group_survives(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6Lonely", "orphan", "/srv/m", None)
+            .await
+            .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "a mirror-only group still yields one logical repo");
+        assert_eq!(out[0].id, "z6Lonely/orphan");
+        assert_eq!(db.count_repos_deduped().await.unwrap(), 1);
+    }
+
+    /// Degenerate empty table: deduped list is empty and the count is 0, no error.
+    #[sqlx::test]
+    async fn deduped_empty_table(pool: PgPool) {
+        let db = db(pool).await;
+        assert!(db.list_all_repos_deduped().await.unwrap().is_empty());
+        assert_eq!(db.count_repos_deduped().await.unwrap(), 0);
+    }
+
+    /// count_repos_deduped and list_all_repos_deduped must agree: the count is the
+    /// number of logical repos the list returns. Guards the two independent SQL
+    /// queries against drifting on the grouping key.
+    #[sqlx::test]
+    async fn deduped_count_matches_list_len(pool: PgPool) {
+        let db = db(pool).await;
+        // Two logical repos: one canonical+mirror pair, one standalone canonical.
+        db.create_repo(&rec(
+            "uuid-1",
+            "did:key:z6Pair",
+            "shared",
+            "real",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.upsert_mirror_repo("z6Pair", "shared", "/srv/m", None)
+            .await
+            .unwrap();
+        db.create_repo(&rec(
+            "uuid-2",
+            "did:key:z6Solo",
+            "solo",
+            "real",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let list_len = db.list_all_repos_deduped().await.unwrap().len() as i64;
+        let count = db.count_repos_deduped().await.unwrap();
+        assert_eq!(list_len, 2);
+        assert_eq!(count, list_len, "count must equal the deduped list length");
     }
 }
