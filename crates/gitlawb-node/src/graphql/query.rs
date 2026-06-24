@@ -12,7 +12,7 @@ impl QueryRoot {
     async fn repos(&self, ctx: &Context<'_>) -> Result<Vec<RepoType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
         let repos = db
-            .list_all_repos()
+            .list_all_repos_deduped()
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(repos

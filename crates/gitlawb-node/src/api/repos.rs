@@ -1381,9 +1381,6 @@ fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64
     }
 }
 
-/// Description marker that `upsert_mirror_repo` stamps on short-owner peer mirror rows.
-const MIRROR_DESCRIPTION: &str = "mirrored from peer";
-
 /// Collapse short-owner mirror rows and canonical `did:key:` rows that point at the
 /// same logical repo into a single entry, so profile/list surfaces don't render the
 /// same repo twice (issue #6).
@@ -1391,25 +1388,31 @@ const MIRROR_DESCRIPTION: &str = "mirrored from peer";
 /// Rows are grouped by `(normalized owner, name)`, where the normalized owner is the
 /// key segment after the last `:` (so `did:key:z6Mk…` and the bare `z6Mk…` mirror row
 /// collapse together). Within a group the canonical row wins: a non-mirror row is
-/// preferred over a `"mirrored from peer"` row, ties broken by earliest `created_at`.
+/// preferred over a mirror, ties broken by earliest `created_at` then `id`. A mirror
+/// row is identified structurally by its slash-form `id` (`{owner_short}/{name}`,
+/// written only by `Db::upsert_mirror_repo`), not by its user-settable description.
 /// The survivor inherits the group's most recent `updated_at` so a gossip push that
 /// only touches the mirror row still floats the repo to the top.
 ///
-/// This mirrors the SQL dedup already applied on the paged path in
-/// `Db::list_all_repos_paged`; the two must stay in sync.
+/// This mirrors the SQL dedup applied on the paged/unfiltered paths via
+/// `Db::DEDUP_CTE`; the marker and the `id` tiebreak must stay in sync with it.
 fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)> {
     use std::collections::HashMap;
 
+    // Mirror rows carry a slash-form id, written only by Db::upsert_mirror_repo;
+    // canonical rows use a UUID id (no slash). Structural, not user-settable.
     fn is_mirror(r: &RepoRecord) -> bool {
-        r.description.as_deref() == Some(MIRROR_DESCRIPTION)
+        r.id.contains('/')
     }
 
-    // Strictly more canonical: non-mirror beats mirror; on a tie the earlier row wins.
+    // Strictly more canonical: non-mirror beats mirror; on equal mirror-status the
+    // earlier created_at wins, and a full tie falls back to id ASC so the survivor
+    // matches SQL's DISTINCT ON (… created_at ASC, id ASC).
     fn outranks(candidate: &RepoRecord, current: &RepoRecord) -> bool {
         match (is_mirror(candidate), is_mirror(current)) {
             (false, true) => true,
             (true, false) => false,
-            _ => candidate.created_at < current.created_at,
+            _ => (candidate.created_at, &candidate.id) < (current.created_at, &current.id),
         }
     }
 
@@ -1621,8 +1624,9 @@ mod tests {
 
     #[test]
     fn same_short_owner_different_repo_does_not_collapse() {
+        // `one` is a real mirror row: slash-form id is the structural marker.
         let one = record(
-            "id-1",
+            "z6Mkwbud/nipmod",
             "z6Mkwbud",
             "nipmod",
             "mirrored from peer",
@@ -1647,8 +1651,9 @@ mod tests {
 
     #[test]
     fn two_mirror_rows_break_tie_by_earliest_created_at() {
+        // Both are mirror rows (slash-form ids); earliest created_at wins.
         let mut older = record(
-            "id-old",
+            "z6X/r",
             "z6X",
             "r",
             "mirrored from peer",
@@ -1656,7 +1661,7 @@ mod tests {
         );
         older.created_at = ts("2026-01-01T00:00:00Z");
         let mut newer = record(
-            "id-new",
+            "z6X/r-dup",
             "z6X",
             "r",
             "mirrored from peer",
@@ -1667,6 +1672,49 @@ mod tests {
         let out = dedupe_canonical_repos(vec![(newer, 0), (older, 0)]);
 
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0].0.id, "id-old", "earliest created_at wins the tie");
+        assert_eq!(out[0].0.id, "z6X/r", "earliest created_at wins the tie");
+    }
+
+    #[test]
+    fn canonical_with_mirror_description_is_treated_as_canonical() {
+        // Marker robustness: the canonical row carries the literal mirror
+        // description (user-settable) but a UUID id; the true mirror has the
+        // slash id and was created earlier. The canonical must still win — dedup
+        // keys on the structural id, not the description.
+        let canonical = record(
+            "9d92186a-uuid",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "mirrored from peer",
+            "2026-02-01T00:00:00Z",
+        );
+        let mirror = record(
+            "z6Mkwbud/nipmod",
+            "z6Mkwbud",
+            "nipmod",
+            "a normal description",
+            "2026-01-01T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(canonical, 5), (mirror, 1)]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].0.id, "9d92186a-uuid",
+            "canonical wins by structural id marker despite the mirror description"
+        );
+    }
+
+    #[test]
+    fn full_tie_resolves_by_id_asc() {
+        // Two canonical rows in one group, identical created_at; only id differs.
+        // Survivor is id ASC, matching SQL's DISTINCT ON (… created_at ASC, id ASC).
+        let bbb = record("bbb", "did:key:z6Same", "repo", "real", "2026-01-01T00:00:00Z");
+        let aaa = record("aaa", "z6Same", "repo", "real", "2026-01-01T00:00:00Z");
+
+        let out = dedupe_canonical_repos(vec![(bbb, 0), (aaa, 0)]);
+
+        assert_eq!(out.len(), 1, "same group collapses");
+        assert_eq!(out[0].0.id, "aaa", "id ASC breaks a full tie deterministically");
     }
 }

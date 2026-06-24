@@ -889,14 +889,15 @@ impl Db {
             .collect())
     }
 
-    pub async fn list_all_repos_paged(
-        &self,
-        owner_filter: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<(RepoRecord, i64)>, i64)> {
-        let rows = sqlx::query(
-            "WITH deduped AS (
+    /// Shared dedup CTE: collapses the mirror row and the canonical row of one
+    /// logical repo into a single survivor. `$1` is an optional owner filter
+    /// (NULL = all rows). Grouping is `(split_part(owner_did,':',-1), name)`; the
+    /// canonical row wins (mirror rows carry a slash-form `id` written only by
+    /// `upsert_mirror_repo`), ties broken by earliest `created_at` then `id` so a
+    /// full tie still picks a deterministic survivor. `list_all_repos_paged`,
+    /// `list_all_repos_deduped`, and the marker logic in
+    /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
+    const DEDUP_CTE: &'static str = "WITH deduped AS (
                  SELECT DISTINCT ON (split_part(owner_did, ':', -1), name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
@@ -910,9 +911,22 @@ impl Db {
                  FROM repos
                  WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)
                  ORDER BY split_part(owner_did, ':', -1), name,
-                     CASE WHEN description = 'mirrored from peer' THEN 1 ELSE 0 END,
-                     created_at ASC
-             )
+                     -- mirror rows carry a slash-form id (\"{owner_short}/{name}\"),
+                     -- written only by upsert_mirror_repo; canonical ids are UUIDs.
+                     -- Rank canonical (no slash) ahead of the mirror in each group,
+                     -- keyed on the structural id, not the user-settable description.
+                     CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
+                     created_at ASC, id ASC
+             )";
+
+    pub async fn list_all_repos_paged(
+        &self,
+        owner_filter: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<(RepoRecord, i64)>, i64)> {
+        let sql = format!(
+            "{}
              SELECT
                  d.id, d.name, d.owner_did, d.description, d.is_public,
                  d.default_branch, d.created_at, d.updated_at, d.disk_path,
@@ -925,12 +939,14 @@ impl Db {
              ) s ON s.repo_id = d.id
              ORDER BY d.updated_at DESC
              LIMIT $2 OFFSET $3",
-        )
-        .bind(owner_filter)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            Self::DEDUP_CTE
+        );
+        let rows = sqlx::query(&sql)
+            .bind(owner_filter)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         let total = rows
             .first()
@@ -959,6 +975,41 @@ impl Db {
         };
 
         Ok((out, total))
+    }
+
+    /// Deduped repo list (no stars, no paging) for the unfiltered read surfaces
+    /// (GraphQL `repos`). One logical repo per mirror+canonical group, ordered by
+    /// the group's most recent activity. Shares `DEDUP_CTE` with the paged path so
+    /// the dedup rule cannot drift; binds a NULL owner filter (all rows).
+    pub async fn list_all_repos_deduped(&self) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             ORDER BY d.updated_at DESC",
+            Self::DEDUP_CTE
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Count of distinct logical repos (mirror + canonical collapsed), for
+    /// `/api/v1/stats`. Uses the same `(split_part(owner_did,':',-1), name)`
+    /// grouping as `DEDUP_CTE`; the marker/tiebreak only decide which row would
+    /// survive, not the group count, so they are not needed here.
+    pub async fn count_repos_deduped(&self) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(DISTINCT (split_part(owner_did, ':', -1), name)) AS cnt FROM repos",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt"))
     }
 
     pub async fn touch_repo(&self, id: &str) -> Result<()> {
@@ -2999,5 +3050,230 @@ mod agent_discovery_tests {
     fn empty_input_returns_empty() {
         assert!(filter_discoverable(vec![], None).is_empty());
         assert!(filter_discoverable(vec![], Some("reputation:score")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dedup_db_tests {
+    use super::{Db, RepoRecord};
+    use chrono::{DateTime, Utc};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// Build a repo row with explicit timestamps. A slash in `id` marks a mirror
+    /// row (the format `upsert_mirror_repo` writes); a UUID-shaped `id` is canonical.
+    fn rec(id: &str, owner_did: &str, name: &str, desc: &str, created: &str, updated: &str) -> RepoRecord {
+        RepoRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: Some(desc.to_string()),
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: ts(created),
+            updated_at: ts(updated),
+            disk_path: format!("/srv/{id}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// The canonical `did:key:` row and the short-owner mirror row of one logical
+    /// repo collapse to a single deduped entry: the canonical row wins and inherits
+    /// the group's most recent `updated_at`.
+    #[sqlx::test]
+    async fn deduped_collapses_mirror_and_canonical(pool: PgPool) {
+        let db = db(pool).await;
+        let canonical = rec(
+            "9d92186a-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "Decentralized npm for agents",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        // Mirror row in the shape upsert_mirror_repo writes: slash id, bare owner.
+        let mirror = rec(
+            "z6Mkwbud/nipmod",
+            "z6Mkwbud",
+            "nipmod",
+            "mirrored from peer",
+            "2026-02-01T00:00:00Z",
+            "2026-03-01T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.create_repo(&mirror).await.unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "the pair collapses to one logical repo");
+        assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+        assert_eq!(
+            out[0].updated_at,
+            ts("2026-03-01T00:00:00Z"),
+            "survivor inherits the group's MAX(updated_at)"
+        );
+    }
+
+    /// upsert_mirror_repo's own rows dedupe against a canonical twin (proves the
+    /// real mirror writer's row shape is classified correctly).
+    #[sqlx::test]
+    async fn deduped_collapses_real_upsert_mirror_row(pool: PgPool) {
+        let db = db(pool).await;
+        let canonical = rec(
+            "uuid-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/mirror", None)
+            .await
+            .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "real mirror row collapses with its canonical twin");
+        assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+    }
+
+    /// Distinct repos are preserved and ordered by most recent activity.
+    #[sqlx::test]
+    async fn deduped_preserves_distinct_repos_ordered_by_updated(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-a",
+            "did:key:z6Aaa",
+            "alpha",
+            "first",
+            "2026-03-01T00:00:00Z",
+            "2026-03-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-b",
+            "did:key:z6Bbb",
+            "beta",
+            "second",
+            "2026-03-02T00:00:00Z",
+            "2026-03-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "beta", "most recently updated first");
+        assert_eq!(out[1].name, "alpha");
+    }
+
+    /// count_repos_deduped counts logical repos, not raw rows.
+    #[sqlx::test]
+    async fn count_repos_deduped_counts_logical_repos(pool: PgPool) {
+        let db = db(pool).await;
+        // One logical repo (canonical + mirror) plus one standalone.
+        db.create_repo(&rec(
+            "uuid-c",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/m", None)
+            .await
+            .unwrap();
+        db.create_repo(&rec(
+            "uuid-d",
+            "did:key:z6Other",
+            "solo",
+            "real",
+            "2026-01-16T00:00:00Z",
+            "2026-01-16T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(db.count_repos_deduped().await.unwrap(), 2);
+    }
+
+    /// Full tie (same mirror-status and created_at within a group) resolves to a
+    /// deterministic survivor by `id ASC`, matching the Rust helper's tiebreak.
+    #[sqlx::test]
+    async fn deduped_full_tie_resolves_by_id_asc(pool: PgPool) {
+        let db = db(pool).await;
+        // Two canonical rows in the same (normalized owner, name) group, identical
+        // created_at; only the id differs. Different owner_did strings avoid any
+        // (owner, name) collision while still normalizing to the same group key.
+        db.create_repo(&rec(
+            "bbb",
+            "did:key:z6Same",
+            "repo",
+            "real",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "aaa",
+            "z6Same",
+            "repo",
+            "real",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "same group collapses");
+        assert_eq!(out[0].id, "aaa", "id ASC breaks a full tie deterministically");
+    }
+
+    /// Marker robustness: a canonical row whose `description` is literally
+    /// "mirrored from peer" but whose `id` is a UUID is still ranked canonical and
+    /// wins over a true slash-id mirror in its group — even though the mirror was
+    /// created earlier. Proves dedup keys on the structural id, not the description.
+    #[sqlx::test]
+    async fn deduped_marker_uses_id_not_description(pool: PgPool) {
+        let db = db(pool).await;
+        let canonical = rec(
+            "uuid-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "mirrored from peer", // user-settable description = the old marker string
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        let mirror = rec(
+            "z6Mkwbud/nipmod",                 // slash id = the real structural marker
+            "z6Mkwbud",
+            "nipmod",
+            "a normal description, not the marker",
+            "2026-01-01T00:00:00Z", // earlier: would win on created_at if marker ignored
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.create_repo(&mirror).await.unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].id, "uuid-canonical",
+            "canonical wins by structural id marker despite carrying the mirror description"
+        );
     }
 }
