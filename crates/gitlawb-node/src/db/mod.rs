@@ -3076,7 +3076,14 @@ mod dedup_db_tests {
 
     /// Build a repo row with explicit timestamps. A slash in `id` marks a mirror
     /// row (the format `upsert_mirror_repo` writes); a UUID-shaped `id` is canonical.
-    fn rec(id: &str, owner_did: &str, name: &str, desc: &str, created: &str, updated: &str) -> RepoRecord {
+    fn rec(
+        id: &str,
+        owner_did: &str,
+        name: &str,
+        desc: &str,
+        created: &str,
+        updated: &str,
+    ) -> RepoRecord {
         RepoRecord {
             id: id.to_string(),
             name: name.to_string(),
@@ -3147,7 +3154,11 @@ mod dedup_db_tests {
             .unwrap();
 
         let out = db.list_all_repos_deduped().await.unwrap();
-        assert_eq!(out.len(), 1, "real mirror row collapses with its canonical twin");
+        assert_eq!(
+            out.len(),
+            1,
+            "real mirror row collapses with its canonical twin"
+        );
         assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
     }
 
@@ -3245,7 +3256,10 @@ mod dedup_db_tests {
 
         let out = db.list_all_repos_deduped().await.unwrap();
         assert_eq!(out.len(), 1, "same group collapses");
-        assert_eq!(out[0].id, "aaa", "id ASC breaks a full tie deterministically");
+        assert_eq!(
+            out[0].id, "aaa",
+            "id ASC breaks a full tie deterministically"
+        );
     }
 
     /// Marker robustness: a canonical row whose `description` is literally
@@ -3264,7 +3278,7 @@ mod dedup_db_tests {
             "2026-01-15T00:00:00Z",
         );
         let mirror = rec(
-            "z6Mkwbud/nipmod",                 // slash id = the real structural marker
+            "z6Mkwbud/nipmod", // slash id = the real structural marker
             "z6Mkwbud",
             "nipmod",
             "a normal description, not the marker",
@@ -3292,7 +3306,11 @@ mod dedup_db_tests {
             .unwrap();
 
         let out = db.list_all_repos_deduped().await.unwrap();
-        assert_eq!(out.len(), 1, "a mirror-only group still yields one logical repo");
+        assert_eq!(
+            out.len(),
+            1,
+            "a mirror-only group still yields one logical repo"
+        );
         assert_eq!(out[0].id, "z6Lonely/orphan");
         assert_eq!(db.count_repos_deduped().await.unwrap(), 1);
     }

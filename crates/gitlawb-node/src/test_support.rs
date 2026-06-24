@@ -532,7 +532,10 @@ mod tests {
             .expect("seed mirror");
         state
             .db
-            .create_repo(&seed_repo("did:key:zGQLOTHERBBBBBBBBBBBBBBBBBBBBBBBBBBBBB", "solo"))
+            .create_repo(&seed_repo(
+                "did:key:zGQLOTHERBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "solo",
+            ))
             .await
             .expect("seed standalone");
 
@@ -576,7 +579,10 @@ mod tests {
             .expect("seed mirror");
         state
             .db
-            .create_repo(&seed_repo("did:key:zSTATSOTHERBBBBBBBBBBBBBBBBBBBBBBBBBB", "solo"))
+            .create_repo(&seed_repo(
+                "did:key:zSTATSOTHERBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "solo",
+            ))
             .await
             .expect("seed standalone");
 

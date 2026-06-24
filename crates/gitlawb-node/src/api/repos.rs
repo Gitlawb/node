@@ -1709,12 +1709,21 @@ mod tests {
     fn full_tie_resolves_by_id_asc() {
         // Two canonical rows in one group, identical created_at; only id differs.
         // Survivor is id ASC, matching SQL's DISTINCT ON (… created_at ASC, id ASC).
-        let bbb = record("bbb", "did:key:z6Same", "repo", "real", "2026-01-01T00:00:00Z");
+        let bbb = record(
+            "bbb",
+            "did:key:z6Same",
+            "repo",
+            "real",
+            "2026-01-01T00:00:00Z",
+        );
         let aaa = record("aaa", "z6Same", "repo", "real", "2026-01-01T00:00:00Z");
 
         let out = dedupe_canonical_repos(vec![(bbb, 0), (aaa, 0)]);
 
         assert_eq!(out.len(), 1, "same group collapses");
-        assert_eq!(out[0].0.id, "aaa", "id ASC breaks a full tie deterministically");
+        assert_eq!(
+            out[0].0.id, "aaa",
+            "id ASC breaks a full tie deterministically"
+        );
     }
 }
