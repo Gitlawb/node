@@ -1123,8 +1123,8 @@ pub async fn git_receive_pack(
             // HTTP peer notification — notify all known peers to pull from us.
             // This is the reliable fallback when Gossipsub p2p is not yet connected.
             // Suppressed for repos the public cannot read. Runs last so a slow or
-            // unreachable peer cannot delay local GraphQL broadcast or Arweave
-            // anchoring above; peers already learned via the gossip publish.
+            // unreachable peer cannot delay the local GraphQL broadcast or Arweave
+            // anchoring above; this is the lowest-priority best-effort step.
             if announce {
                 if let Ok(peers) = db_for_peers.list_peers().await {
                     for peer in peers {
@@ -2010,7 +2010,7 @@ mod tests {
         let keypair = Keypair::generate();
         let http_client = reqwest::Client::new();
 
-        let zero = "0000000000000000000000000000000000000000";
+        let zero = ZERO_SHA;
         let new_sha = "5555555555555555555555555555555555555555";
         let _mock = server
             .mock("POST", SYNC_NOTIFY_PATH)
