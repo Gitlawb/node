@@ -571,6 +571,100 @@ fn owner_push_rejection(
     }
 }
 
+/// Path of the peer sync-notify endpoint. Used both to build the target URL
+/// and as the signing path, so they can never drift apart.
+const SYNC_NOTIFY_PATH: &str = "/api/v1/sync/notify";
+
+/// Send one signed `/sync/notify` request for a single ref update.
+///
+/// The receiver is single-ref, so a multi-ref push fans out one request per
+/// ref — each signed over its own body — carrying that ref's real `old_sha`.
+#[allow(clippy::too_many_arguments)]
+async fn notify_peer_of_ref(
+    http_client: &reqwest::Client,
+    node_keypair: &gitlawb_core::identity::Keypair,
+    peer_did: &str,
+    notify_url: &str,
+    repo_slug: &str,
+    ref_name: &str,
+    old_sha: &str,
+    new_sha: &str,
+    node_did: &str,
+    pusher_did: &str,
+) {
+    let body = serde_json::json!({
+        "repo": repo_slug,
+        "ref_name": ref_name,
+        "new_sha": new_sha,
+        "node_did": node_did,
+        "pusher_did": pusher_did,
+        "old_sha": old_sha,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    let body_bytes = match serde_json::to_vec(&body) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(peer = %peer_did, ref_name = %ref_name, err = %e, "failed to serialize peer sync notify");
+            return;
+        }
+    };
+    let signed =
+        gitlawb_core::http_sig::sign_request(node_keypair, "POST", SYNC_NOTIFY_PATH, &body_bytes);
+    match http_client
+        .post(notify_url)
+        .header("Content-Type", "application/json")
+        .header("Content-Digest", signed.content_digest)
+        .header("Signature-Input", signed.signature_input)
+        .header("Signature", signed.signature)
+        .body(body_bytes)
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            tracing::info!(peer = %peer_did, repo = %repo_slug, ref_name = %ref_name, "notified peer to sync")
+        }
+        Ok(r) => {
+            tracing::warn!(peer = %peer_did, ref_name = %ref_name, status = %r.status(), "peer sync notify returned error")
+        }
+        Err(e) => {
+            tracing::warn!(peer = %peer_did, ref_name = %ref_name, err = %e, "failed to notify peer")
+        }
+    }
+}
+
+/// Notify a single peer of every ref in a push — one request per ref.
+///
+/// Looping here (rather than sending one flattened request) is what keeps a
+/// multi-ref push from collapsing to its first ref; each ref carries its real
+/// `old_sha`.
+#[allow(clippy::too_many_arguments)]
+async fn notify_peer_of_refs(
+    http_client: &reqwest::Client,
+    node_keypair: &gitlawb_core::identity::Keypair,
+    peer_did: &str,
+    notify_url: &str,
+    repo_slug: &str,
+    ref_updates: &[(String, String, String)],
+    node_did: &str,
+    pusher_did: &str,
+) {
+    for (ref_name, old_sha, new_sha) in ref_updates {
+        notify_peer_of_ref(
+            http_client,
+            node_keypair,
+            peer_did,
+            notify_url,
+            repo_slug,
+            ref_name,
+            old_sha,
+            new_sha,
+            node_did,
+            pusher_did,
+        )
+        .await;
+    }
+}
+
 /// POST /:owner/:repo.git/git-receive-pack  (AUTH REQUIRED — enforced by middleware)
 pub async fn git_receive_pack(
     State(state): State<AppState>,
@@ -988,55 +1082,18 @@ pub async fn git_receive_pack(
                                 continue;
                             }
                         }
-                        let path = "/api/v1/sync/notify";
-                        let notify_url = format!("{peer_url}{path}");
-                        // One signed notify per ref — the receiver is single-ref,
-                        // so a multi-ref push must fan out one request per ref with
-                        // its real old_sha (matching the gossip/Arweave paths).
-                        for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                            let body = serde_json::json!({
-                                "repo": repo_slug.clone(),
-                                "ref_name": ref_name.clone(),
-                                "new_sha": new_sha.clone(),
-                                "node_did": node_did_str.clone(),
-                                "pusher_did": pusher_did_clone.clone(),
-                                "old_sha": old_sha.clone(),
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                            });
-                            let body_bytes = match serde_json::to_vec(&body) {
-                                Ok(bytes) => bytes,
-                                Err(e) => {
-                                    tracing::warn!(peer = %peer.did, err = %e, "failed to serialize peer sync notify");
-                                    continue;
-                                }
-                            };
-                            let signed = gitlawb_core::http_sig::sign_request(
-                                node_keypair.as_ref(),
-                                "POST",
-                                path,
-                                &body_bytes,
-                            );
-                            match http_client
-                                .post(&notify_url)
-                                .header("Content-Type", "application/json")
-                                .header("Content-Digest", signed.content_digest)
-                                .header("Signature-Input", signed.signature_input)
-                                .header("Signature", signed.signature)
-                                .body(body_bytes)
-                                .send()
-                                .await
-                            {
-                                Ok(r) if r.status().is_success() => {
-                                    tracing::info!(peer = %peer.did, repo = %repo_slug, ref_name = %ref_name, "notified peer to sync")
-                                }
-                                Ok(r) => {
-                                    tracing::warn!(peer = %peer.did, status = %r.status(), "peer sync notify returned error")
-                                }
-                                Err(e) => {
-                                    tracing::warn!(peer = %peer.did, err = %e, "failed to notify peer")
-                                }
-                            }
-                        }
+                        let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
+                        notify_peer_of_refs(
+                            &http_client,
+                            node_keypair.as_ref(),
+                            &peer.did,
+                            &notify_url,
+                            &repo_slug,
+                            &ref_updates_clone,
+                            &node_did_str,
+                            &pusher_did_clone,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1480,6 +1537,9 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitlawb_core::identity::Keypair;
+    use crate::auth::caller_authorized_to_push;
+    use crate::error::AppError;
 
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
@@ -1868,5 +1928,118 @@ mod tests {
             out[0].0.id, "aaa",
             "id ASC breaks a full tie deterministically"
         );
+    }
+
+    // A multi-ref push must fan out one /sync/notify request per ref, each
+    // carrying that ref's real old_sha. Regression guard for the handler that
+    // used to flatten the push to ref_updates_clone.first() with a hardcoded
+    // zero old_sha (#26 / PR #72) — drops every ref after the first and the
+    // wrong previous SHA.
+    #[tokio::test]
+    async fn notify_peer_of_refs_sends_one_request_per_ref_with_real_old_sha() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let (ref_a, old_a, new_a) = (
+            "refs/heads/main",
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+        );
+        let (ref_b, old_b, new_b) = (
+            "refs/heads/feature",
+            "3333333333333333333333333333333333333333",
+            "4444444444444444444444444444444444444444",
+        );
+
+        // Two distinct mocks, each requiring one ref's real per-ref values.
+        // The old flattening bug (one request, first ref, zero old_sha) would
+        // satisfy neither: ref A's request would carry zeros, ref B none at all.
+        let mock_a = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(format!(r#"{{"ref_name":"{ref_a}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{old_a}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_a}"}}"#)),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+        let mock_b = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(format!(r#"{{"ref_name":"{ref_b}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{old_b}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_b}"}}"#)),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+        let ref_updates = vec![
+            (ref_a.to_string(), old_a.to_string(), new_a.to_string()),
+            (ref_b.to_string(), old_b.to_string(), new_b.to_string()),
+        ];
+
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &ref_updates,
+            "did:key:zNode",
+            "did:key:zPusher",
+        )
+        .await;
+
+        mock_a.assert_async().await;
+        mock_b.assert_async().await;
+    }
+
+    // A newly created ref carries the all-zeros hash as its real old_sha — the
+    // helper must forward it verbatim, not substitute a different placeholder.
+    #[tokio::test]
+    async fn notify_peer_of_refs_forwards_all_zeros_for_created_ref() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let zero = "0000000000000000000000000000000000000000";
+        let new_sha = "5555555555555555555555555555555555555555";
+        let mock = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{zero}"}}"#)),
+                mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_sha}"}}"#)),
+            ]))
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+        let ref_updates = vec![(
+            "refs/heads/new".to_string(),
+            zero.to_string(),
+            new_sha.to_string(),
+        )];
+
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &ref_updates,
+            "did:key:zNode",
+            "did:key:zPusher",
+        )
+        .await;
+
+        mock.assert_async().await;
     }
 }
