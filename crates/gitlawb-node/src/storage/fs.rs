@@ -97,10 +97,12 @@ impl BlobStore for FsBlobStore {
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         let path = self.path_for(key)?;
-        match Self::meta_of(&path) {
-            Ok(m) => Ok(Some(m)),
-            Err(_) if !path.exists() => Ok(None),
-            Err(e) => Err(e),
+        // Probe existence by io error kind, not path.exists(): a permission/IO
+        // error must surface, not be silently reported as "not found".
+        match std::fs::metadata(&path) {
+            Ok(_) => Self::meta_of(&path).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).context(format!("stat {}", path.display())),
         }
     }
 
@@ -124,7 +126,11 @@ impl BlobStore for FsBlobStore {
                 // reported as success would mislead GC/admin/migration callers.
                 let rd = std::fs::read_dir(&dir)
                     .with_context(|| format!("listing {}", dir.display()))?;
-                for entry in rd.flatten() {
+                for entry in rd {
+                    // Propagate per-entry errors rather than dropping them via
+                    // flatten(): a partial listing must not look like success.
+                    let entry =
+                        entry.with_context(|| format!("reading entry under {}", dir.display()))?;
                     let path = entry.path();
                     if path.is_dir() {
                         stack.push(path);

@@ -556,12 +556,28 @@ pub async fn git_receive_pack(
         // Write-back: ack the client now; the durable upload to object storage
         // and the advisory-lock release run in the background. The lock is held
         // until the upload finishes, so a concurrent writer on another machine
-        // can't observe a stale archive. Trades a small crash-durability window
-        // (local copy survives; lazy migration re-syncs) for much lower latency.
-        tokio::spawn(guard.release(true));
+        // can't observe a stale archive. Durability tradeoff: if the node stops
+        // after this ack but before the upload, the local copy survives but
+        // STORAGE stays stale until this repo's next successful push re-uploads
+        // — it is not automatically reconciled. Hence async_upload is opt-in.
+        let repo_label = name.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = guard.release(true).await {
+                tracing::error!(repo = %repo_label, err = %e,
+                    "write-back durable upload failed after push was acked");
+            }
+        });
     } else {
-        // Strict path (or failed push): upload-before-ack / prompt lock release.
-        guard.release(push_ok).await;
+        // Strict path (or failed push): upload-before-ack. On a successful push
+        // whose durable upload then fails, surface an error so the client knows
+        // the push is not durably stored (a failed push returns Ok from release
+        // and the push error is reported below).
+        if let Err(e) = guard.release(push_ok).await {
+            tracing::error!(repo = %name, err = %e, "durable upload failed after push");
+            return Err(AppError::Git(format!(
+                "push applied locally but durable upload to storage failed: {e}"
+            )));
+        }
     }
 
     let result = receive_result.map_err(|e| {
@@ -1168,11 +1184,17 @@ pub async fn fork_repo(
         )));
     }
 
-    // Upload fork to storage
+    // Upload fork to storage — fail closed if the durable upload fails rather
+    // than reporting a fork that only exists on this node's local disk.
     state
         .repo_store
         .release_after_write(&forker_did, &fork_name)
-        .await;
+        .await
+        .map_err(|e| {
+            AppError::Git(format!(
+                "fork created locally but durable upload failed: {e}"
+            ))
+        })?;
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {

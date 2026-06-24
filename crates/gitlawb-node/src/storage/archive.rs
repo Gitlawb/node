@@ -178,11 +178,32 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
     let lock = publish_lock(local_path);
     let _publish = lock.lock().expect("publish lock poisoned");
     let swap = (|| -> Result<()> {
-        if local_path.exists() {
-            std::fs::remove_dir_all(local_path).context("removing stale repo dir")?;
+        // Move any existing repo aside to a backup first, rather than deleting
+        // it up front: if the rename of the new copy then fails, we restore the
+        // backup so `local_path` is never left without a valid repo. (Most
+        // platforms refuse to rename onto a non-empty dir, hence the move-aside.)
+        let backup = if local_path.exists() {
+            let b = parent.join(format!(".{file_name}.bak-{}", uuid::Uuid::new_v4()));
+            std::fs::rename(local_path, &b).context("moving existing repo to backup")?;
+            Some(b)
+        } else {
+            None
+        };
+        match std::fs::rename(&tmp_dir, local_path).context("swapping extracted repo into place") {
+            Ok(()) => {
+                if let Some(b) = backup {
+                    let _ = std::fs::remove_dir_all(&b);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Restore the previous copy so the repo isn't left missing.
+                if let Some(b) = backup {
+                    let _ = std::fs::rename(&b, local_path);
+                }
+                Err(e)
+            }
         }
-        std::fs::rename(&tmp_dir, local_path).context("swapping extracted repo into place")?;
-        Ok(())
     })();
     if swap.is_err() {
         // Don't leak the extracted temp dir if the swap failed.
