@@ -1067,37 +1067,6 @@ pub async fn git_receive_pack(
                 }
             }
 
-            // HTTP peer notification — notify all known peers to pull from us.
-            // This is the reliable fallback when Gossipsub p2p is not yet connected.
-            // Suppressed for repos the public cannot read.
-            if announce {
-                if let Ok(peers) = db_for_peers.list_peers().await {
-                    for peer in peers {
-                        if peer.http_url.is_empty() {
-                            continue;
-                        }
-                        let peer_url = peer.http_url.trim_end_matches('/');
-                        if let Some(self_url) = self_public_url.as_deref() {
-                            if peer_url == self_url.trim_end_matches('/') {
-                                continue;
-                            }
-                        }
-                        let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
-                        notify_peer_of_refs(
-                            &http_client,
-                            node_keypair.as_ref(),
-                            &peer.did,
-                            &notify_url,
-                            &repo_slug,
-                            &ref_updates_clone,
-                            &node_did_str,
-                            &pusher_did_clone,
-                        )
-                        .await;
-                    }
-                }
-            }
-
             // Broadcast ref update to GraphQL subscription listeners — one per ref.
             let now_ts = chrono::Utc::now().to_rfc3339();
             for (ref_name, old_sha, new_sha) in &ref_updates_clone {
@@ -1147,6 +1116,39 @@ pub async fn git_receive_pack(
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed"),
+                    }
+                }
+            }
+
+            // HTTP peer notification — notify all known peers to pull from us.
+            // This is the reliable fallback when Gossipsub p2p is not yet connected.
+            // Suppressed for repos the public cannot read. Runs last so a slow or
+            // unreachable peer cannot delay local GraphQL broadcast or Arweave
+            // anchoring above; peers already learned via the gossip publish.
+            if announce {
+                if let Ok(peers) = db_for_peers.list_peers().await {
+                    for peer in peers {
+                        if peer.http_url.is_empty() {
+                            continue;
+                        }
+                        let peer_url = peer.http_url.trim_end_matches('/');
+                        if let Some(self_url) = self_public_url.as_deref() {
+                            if peer_url == self_url.trim_end_matches('/') {
+                                continue;
+                            }
+                        }
+                        let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
+                        notify_peer_of_refs(
+                            &http_client,
+                            node_keypair.as_ref(),
+                            &peer.did,
+                            &notify_url,
+                            &repo_slug,
+                            &ref_updates_clone,
+                            &node_did_str,
+                            &pusher_did_clone,
+                        )
+                        .await;
                     }
                 }
             }
