@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use super::store;
 use crate::storage::archive::RepoArchive;
@@ -148,46 +148,28 @@ impl RepoStore {
         if local_path.exists() {
             // Lazy migration: if storage is enabled and we haven't confirmed this
             // repo is in storage yet, check and upload in the background.
-            if let Some(ref archive) = self.archive {
+            if self.archive.is_some() {
                 let key = format!("{owner_slug}/{repo_name}");
                 let already_migrated = self.migrated.lock().await.contains(&key);
                 if !already_migrated {
-                    let archive = archive.clone();
+                    let this = self.clone();
                     let slug = owner_slug.clone();
                     let name = repo_name.to_string();
                     let path = local_path.clone();
-                    let migrated = Arc::clone(&self.migrated);
-                    let versions = Arc::clone(&self.versions);
+                    let key = key.clone();
                     tokio::spawn(async move {
-                        // Check if already in storage before uploading
-                        match archive.exists(&slug, &name).await {
-                            Ok(true) => {
-                                debug!(repo = %name, "repo already in storage — skipping migration");
-                            }
-                            Ok(false) => {
-                                info!(repo = %name, "migrating local repo to storage");
-                                match archive.upload(&slug, &name, &path).await {
-                                    Ok(etag) => {
-                                        if let Some(etag) = etag {
-                                            versions
-                                                .lock()
-                                                .await
-                                                .insert(format!("{slug}/{name}"), etag);
-                                        }
-                                        info!(repo = %name, "lazy migration to storage complete");
-                                    }
-                                    Err(e) => {
-                                        warn!(repo = %name, err = %e, "lazy migration to storage failed");
-                                        return;
-                                    }
-                                }
+                        // Upload under the advisory lock (skip if already present)
+                        // so this opportunistic migration can't clobber a
+                        // concurrent locked push by landing a stale snapshot.
+                        match this.upload_under_lock(&slug, &name, &path, true).await {
+                            Ok(()) => {
+                                this.migrated.lock().await.insert(key);
+                                debug!(repo = %name, "lazy migration to storage complete (or already present)");
                             }
                             Err(e) => {
-                                warn!(repo = %name, err = %e, "storage existence check failed");
-                                return;
+                                warn!(repo = %name, err = %e, "lazy migration to storage failed");
                             }
                         }
-                        migrated.lock().await.insert(format!("{slug}/{name}"));
                     });
                 }
             }
@@ -306,55 +288,110 @@ impl RepoStore {
 
         store::init_bare(&local_path).context("initializing bare repo")?;
 
-        // Upload to storage in background
-        if let Some(ref archive) = self.archive {
-            let archive = archive.clone();
-            let owner_slug = owner_slug.clone();
-            let repo_name = repo_name.to_string();
-            let path = local_path.clone();
-            let versions = Arc::clone(&self.versions);
-            tokio::spawn(async move {
-                match archive.upload(&owner_slug, &repo_name, &path).await {
-                    Ok(Some(etag)) => {
-                        versions
-                            .lock()
-                            .await
-                            .insert(format!("{owner_slug}/{repo_name}"), etag);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!(repo = %repo_name, err = %e, "failed to upload new repo to storage");
-                    }
-                }
-            });
-        }
+        // Upload the new repo synchronously under the advisory lock: a background
+        // upload could land the empty repo *after* a racing first push and clobber
+        // it, and a silent failure would leave the repo absent from storage. Fail
+        // closed instead — surface upload errors to the caller.
+        self.upload_under_lock(&owner_slug, repo_name, &local_path, false)
+            .await
+            .context("uploading new repo to storage")?;
 
         Ok(local_path)
     }
 
     /// Upload a repo to storage after a write operation (merge, fork, etc.).
-    /// Call this after any operation that modifies the git repo on disk.
-    pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) {
-        if let Some(ref archive) = self.archive {
-            let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(repo = %repo_name, err = %e, "rejected unsafe path in release_after_write");
-                    return;
-                }
-            };
-            match archive.upload(&owner_slug, repo_name, &local_path).await {
-                Ok(Some(etag)) => {
-                    self.versions
-                        .lock()
-                        .await
-                        .insert(format!("{owner_slug}/{repo_name}"), etag);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(repo = %repo_name, err = %e, "failed to upload repo to storage after write");
-                }
+    /// Call this after any operation that modifies the git repo on disk. Returns
+    /// `Err` if the durable upload fails so the caller can surface it rather than
+    /// acking a write that never reached storage.
+    pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) -> Result<()> {
+        let Some(ref archive) = self.archive else {
+            return Ok(());
+        };
+        let (owner_slug, local_path) = self
+            .local_path(owner_did, repo_name)
+            .context("rejected unsafe path in release_after_write")?;
+        let key = format!("{owner_slug}/{repo_name}");
+        match archive.upload(&owner_slug, repo_name, &local_path).await {
+            Ok(Some(etag)) => {
+                self.versions.lock().await.insert(key, etag);
+                Ok(())
             }
+            Ok(None) => Ok(()),
+            Err(e) => {
+                // Invalidate so the next access re-downloads rather than trusting
+                // a local copy we failed to persist.
+                self.versions.lock().await.remove(&key);
+                Err(e).context("uploading repo to storage after write")
+            }
+        }
+    }
+
+    /// Upload `local_path` to storage while holding the per-repo advisory lock,
+    /// so a background or init-time upload can't clobber a concurrent locked
+    /// write by landing an older snapshot after it. With `skip_if_exists`, skips
+    /// the upload when the archive is already present (used by lazy migration).
+    async fn upload_under_lock(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        skip_if_exists: bool,
+    ) -> Result<()> {
+        let Some(ref archive) = self.archive else {
+            return Ok(());
+        };
+        let lock_key = advisory_lock_key(owner_slug, repo_name);
+        let mut conn = self
+            .lock_pool
+            .acquire()
+            .await
+            .context("acquiring db connection for upload lock")?;
+
+        let mut acquired = false;
+        for attempt in 0..30 {
+            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_key)
+                .fetch_one(&mut *conn)
+                .await
+                .context("trying advisory lock")?;
+            if row.0 {
+                acquired = true;
+                break;
+            }
+            if attempt < 29 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        if !acquired {
+            anyhow::bail!("could not acquire advisory lock for upload of {owner_slug}/{repo_name}");
+        }
+
+        let outcome: Result<Option<String>> =
+            if skip_if_exists && archive.exists(owner_slug, repo_name).await.unwrap_or(false) {
+                Ok(None) // already present — nothing to upload
+            } else {
+                archive.upload(owner_slug, repo_name, local_path).await
+            };
+
+        // Release the lock on the same connection regardless of outcome.
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *conn)
+            .await
+        {
+            warn!(repo = %repo_name, err = %e, "failed to release upload lock");
+        }
+
+        match outcome {
+            Ok(Some(etag)) => {
+                self.versions
+                    .lock()
+                    .await
+                    .insert(format!("{owner_slug}/{repo_name}"), etag);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e).context("uploading repo to storage under lock"),
         }
     }
 
@@ -496,32 +533,47 @@ impl RepoWriteGuard {
     /// concurrent writer on another machine cannot read a stale archive. When
     /// callers want a fast client ack, they spawn this future as a background
     /// task (write-back) — the lock + etag-cache update still complete in order.
-    pub async fn release(mut self, success: bool) {
-        // Upload to storage only on success.
-        if success {
+    pub async fn release(mut self, success: bool) -> Result<()> {
+        let key = format!("{}/{}", self.owner_slug, self.repo_name);
+
+        // Upload to storage only on success. Capture the outcome so we can both
+        // release the lock unconditionally and propagate a durable-upload
+        // failure to the caller (a synchronous caller turns it into a client
+        // error; a write-back caller logs it).
+        let upload_result: Result<()> = if success {
             if let Some(ref archive) = self.archive {
                 match archive
                     .upload(&self.owner_slug, &self.repo_name, &self.local_path)
                     .await
                 {
                     Ok(Some(etag)) => {
-                        self.versions
-                            .lock()
-                            .await
-                            .insert(format!("{}/{}", self.owner_slug, self.repo_name), etag);
+                        self.versions.lock().await.insert(key.clone(), etag);
+                        Ok(())
                     }
-                    Ok(None) => {}
+                    Ok(None) => Ok(()),
                     Err(e) => {
-                        warn!(repo = %self.repo_name, err = %e, "failed to upload repo to storage after write");
+                        // The durable copy is now stale. Drop the cached etag so
+                        // the next write re-downloads and reconciles rather than
+                        // trusting a local copy we failed to persist.
+                        self.versions.lock().await.remove(&key);
+                        Err(e).context("uploading repo to storage after write")
                     }
                 }
+            } else {
+                Ok(())
             }
         } else {
-            warn!(repo = %self.repo_name, "write failed — skipping storage upload to avoid propagating an inconsistent repo");
-        }
+            // Write failed: skip the upload (a half-applied repo must not reach
+            // storage) and invalidate the cached etag — the local copy may be
+            // dirty, so the next write must re-download instead of skipping on a
+            // now-misleading etag match.
+            warn!(repo = %self.repo_name, "write failed — skipping storage upload and invalidating etag cache");
+            self.versions.lock().await.remove(&key);
+            Ok(())
+        };
 
-        // Release the advisory lock on the same connection it was taken on, then
-        // drop the connection (returns it to the pool).
+        // Release the advisory lock on the same connection it was taken on
+        // regardless of the upload outcome, then drop the connection.
         if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.lock_key)
             .execute(&mut *self.conn)
@@ -529,6 +581,8 @@ impl RepoWriteGuard {
         {
             warn!(repo = %self.repo_name, err = %e, "failed to release advisory lock");
         }
+
+        upload_result
     }
 }
 

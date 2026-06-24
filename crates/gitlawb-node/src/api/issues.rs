@@ -71,9 +71,16 @@ pub async fn create_issue(
     let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
 
     // Always release the advisory lock — even on error; upload to storage only on success.
-    guard.release(create_result.is_ok()).await;
+    let release_result = guard.release(create_result.is_ok()).await;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;
+    // The write succeeded locally; surface a durable-upload failure rather than
+    // acking an issue that never reached storage.
+    release_result.map_err(|e| {
+        AppError::Git(format!(
+            "issue stored locally but durable upload failed: {e}"
+        ))
+    })?;
 
     // Bump trust score for the issue author — increment current score by 0.05
     // (avoids the push_count=0 stuck-at-0.05 bug for agents who only file issues)
@@ -244,11 +251,11 @@ pub async fn close_issue(
             .ok()
             .and_then(|i| i.author),
         Ok(None) => {
-            guard.release(false).await;
+            let _ = guard.release(false).await;
             return Err(AppError::NotFound(format!("issue {issue_id} not found")));
         }
         Err(e) => {
-            guard.release(false).await;
+            let _ = guard.release(false).await;
             return Err(AppError::Git(e.to_string()));
         }
     };
@@ -257,7 +264,7 @@ pub async fn close_issue(
         .as_deref()
         .is_some_and(|a| crate::api::did_matches(&auth.0, a));
     if !is_owner && !is_author {
-        guard.release(false).await;
+        let _ = guard.release(false).await;
         return Err(AppError::Forbidden(
             "only the repo owner or the issue author can close this issue".into(),
         ));
@@ -266,11 +273,16 @@ pub async fn close_issue(
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
     // Always release the advisory lock — even on error; upload to storage only on success.
-    guard.release(close_result.is_ok()).await;
+    let release_result = guard.release(close_result.is_ok()).await;
 
     let updated = close_result
         .map_err(|e| AppError::Git(e.to_string()))?
         .ok_or_else(|| AppError::RepoNotFound(format!("issue {issue_id} not found")))?;
+    release_result.map_err(|e| {
+        AppError::Git(format!(
+            "issue stored locally but durable upload failed: {e}"
+        ))
+    })?;
 
     let issue: serde_json::Value = serde_json::from_str(&updated)
         .map_err(|e| AppError::BadRequest(format!("invalid issue data: {e}")))?;
