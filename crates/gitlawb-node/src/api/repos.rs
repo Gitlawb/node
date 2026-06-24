@@ -56,7 +56,7 @@ async fn replication_withheld_set(
         // root-only-rules cases), so skip the full withheld_blob_oids walk and
         // withhold nothing. The predicate's safety-invariant test guards that
         // this short-circuit matches what the walk would have returned.
-        Some(rules) if !crate::git::visibility_pack::has_path_scoped_rule(&rules) => {
+        Some(rules) if !visibility_pack::has_path_scoped_rule(&rules) => {
             Some(std::collections::HashSet::new())
         }
         // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
@@ -838,7 +838,11 @@ pub async fn git_receive_pack(
 
             // Option B1: encrypt-then-pin the withheld blobs so authorized
             // readers can recover them when the origin cannot serve them.
-            if let Some(rules) = rules_for_enc.filter(|r| !r.is_empty()) {
+            // No path-scoped rule can withhold a blob, so withheld_blob_recipients
+            // would return an empty map after a full per-ref walk; skip it. Mirrors
+            // the has_path_scoped_rule gate on the other two withheld-walk sites.
+            if let Some(rules) = rules_for_enc.filter(|r| visibility_pack::has_path_scoped_rule(r))
+            {
                 let p = repo_path_clone.clone();
                 let owner = owner_did.clone();
                 let recip = tokio::task::spawn_blocking(move || {
