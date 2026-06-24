@@ -1936,7 +1936,7 @@ mod tests {
     // zero old_sha (#26 / PR #72) — drops every ref after the first and the
     // wrong previous SHA.
     #[tokio::test]
-    async fn notify_peer_of_refs_sends_one_request_per_ref_with_real_old_sha() {
+    async fn test_notify_peer_of_refs_sends_one_request_per_ref_with_real_old_sha() {
         let mut server = mockito::Server::new_async().await;
         let keypair = Keypair::generate();
         let http_client = reqwest::Client::new();
@@ -1955,7 +1955,7 @@ mod tests {
         // Two distinct mocks, each requiring one ref's real per-ref values.
         // The old flattening bug (one request, first ref, zero old_sha) would
         // satisfy neither: ref A's request would carry zeros, ref B none at all.
-        let mock_a = server
+        let _mock_a = server
             .mock("POST", SYNC_NOTIFY_PATH)
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::PartialJsonString(format!(r#"{{"ref_name":"{ref_a}"}}"#)),
@@ -1966,7 +1966,7 @@ mod tests {
             .expect(1)
             .create_async()
             .await;
-        let mock_b = server
+        let _mock_b = server
             .mock("POST", SYNC_NOTIFY_PATH)
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::PartialJsonString(format!(r#"{{"ref_name":"{ref_b}"}}"#)),
@@ -1996,21 +1996,21 @@ mod tests {
         )
         .await;
 
-        mock_a.assert_async().await;
-        mock_b.assert_async().await;
+        _mock_a.assert_async().await;
+        _mock_b.assert_async().await;
     }
 
     // A newly created ref carries the all-zeros hash as its real old_sha — the
     // helper must forward it verbatim, not substitute a different placeholder.
     #[tokio::test]
-    async fn notify_peer_of_refs_forwards_all_zeros_for_created_ref() {
+    async fn test_notify_peer_of_refs_forwards_all_zeros_for_created_ref() {
         let mut server = mockito::Server::new_async().await;
         let keypair = Keypair::generate();
         let http_client = reqwest::Client::new();
 
         let zero = "0000000000000000000000000000000000000000";
         let new_sha = "5555555555555555555555555555555555555555";
-        let mock = server
+        let _mock = server
             .mock("POST", SYNC_NOTIFY_PATH)
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{zero}"}}"#)),
@@ -2040,6 +2040,6 @@ mod tests {
         )
         .await;
 
-        mock.assert_async().await;
+        _mock.assert_async().await;
     }
 }
