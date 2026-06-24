@@ -85,13 +85,20 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
     Ok(resp.bytes().await?.to_vec())
 }
 
-/// List all git objects in the given bare repo and pin any that are not yet
-/// recorded in `pinned_cids`.
+/// Pin any of the given candidate git objects that are not yet recorded in
+/// `pinned_cids`.
+///
+/// `candidates` is the OID set to consider — the per-push delta on the push
+/// path, or the whole-repo list on the reconciliation sweep / full-scan
+/// fallback (see `git::push_delta`). `repo_path` is still needed to read each
+/// object's bytes. The twin in `pinata.rs` mirrors this shape — change both in
+/// lockstep.
 ///
 /// Returns a list of `(sha256_hex, cid)` pairs for objects pinned this call.
 pub async fn pin_new_objects(
     ipfs_api: &str,
     repo_path: &std::path::Path,
+    candidates: Vec<String>,
     db: &crate::db::Db,
     withheld: &HashSet<String>,
 ) -> Vec<(String, String)> {
@@ -99,16 +106,7 @@ pub async fn pin_new_objects(
         return vec![];
     }
 
-    // Enumerate all objects in the repo
-    let object_list = match list_all_objects(repo_path) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(repo = %repo_path.display(), err = %e, "failed to list git objects for IPFS pinning");
-            return vec![];
-        }
-    };
-
-    let object_list = crate::git::visibility_pack::replicable_objects(object_list, withheld);
+    let object_list = crate::git::visibility_pack::replicable_objects(candidates, withheld);
 
     let mut pinned = Vec::new();
 
@@ -149,96 +147,4 @@ pub async fn pin_new_objects(
     }
 
     pinned
-}
-
-/// Names of every object reachable from any ref, via `git rev-list --objects --all`.
-/// Reachable-only on purpose (not `cat-file --batch-all-objects`): an unreachable
-/// or dangling object has no ref and no path, so visibility rules cannot classify
-/// it for withholding, so it must not be pinned in cleartext. This keeps the pin set
-/// aligned with what `blob_paths` can evaluate.
-fn list_all_objects(repo_path: &std::path::Path) -> Result<Vec<String>> {
-    let output = std::process::Command::new("git")
-        .args(["rev-list", "--objects", "--all"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to run git rev-list: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("git rev-list failed: {stderr}"));
-    }
-
-    // `rev-list --objects` lines are "<oid>" or "<oid> <path>"; keep the oid.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let hashes = stdout
-        .lines()
-        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
-        .filter(|l| !l.is_empty())
-        .collect();
-
-    Ok(hashes)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::list_all_objects;
-    use std::process::Command;
-    use tempfile::TempDir;
-
-    #[test]
-    fn list_all_objects_excludes_unreachable_blobs() {
-        let td = TempDir::new().unwrap();
-        let work = td.path();
-        let run = |args: &[&str]| {
-            assert!(
-                Command::new("git")
-                    .args(args)
-                    .current_dir(work)
-                    .status()
-                    .unwrap()
-                    .success(),
-                "git {args:?} failed"
-            );
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(work.join("a.txt"), b"reachable\n").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-
-        let reachable = String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["rev-parse", "HEAD:a.txt"])
-                .current_dir(work)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
-
-        // Write a loose blob that no ref reaches (dangling).
-        std::fs::write(work.join("dangling.txt"), b"DANGLING SECRET\n").unwrap();
-        let dangling = String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["hash-object", "-w", "dangling.txt"])
-                .current_dir(work)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
-
-        let objs = list_all_objects(work).unwrap();
-        assert!(
-            objs.contains(&reachable),
-            "the committed (reachable) blob must be listed"
-        );
-        assert!(
-            !objs.contains(&dangling),
-            "an unreachable/dangling blob must NOT be listed"
-        );
-    }
 }

@@ -67,15 +67,21 @@ pub async fn pin_object(
     Ok(cid)
 }
 
-/// Pin all git objects in a repo that haven't yet been sent to Pinata.
+/// Pin any of the given candidate git objects that haven't yet been sent to
+/// Pinata.
 ///
-/// Objects already recorded with a `pinata_cid` in the DB are skipped.
+/// `candidates` is the OID set to consider — the per-push delta on the push
+/// path, or the whole-repo list on the reconciliation sweep / full-scan
+/// fallback (see `git::push_delta`). `repo_path` is still needed to read each
+/// object's bytes. The twin in `ipfs_pin.rs` mirrors this shape — change both
+/// in lockstep. Objects already recorded with a `pinata_cid` are skipped.
 /// Returns `(sha_hex, cid)` pairs for each newly pinned object.
 pub async fn pin_new_objects(
     client: &reqwest::Client,
     upload_url: &str,
     jwt: &str,
     repo_path: &std::path::Path,
+    candidates: Vec<String>,
     db: &crate::db::Db,
     withheld: &HashSet<String>,
 ) -> Vec<(String, String)> {
@@ -83,18 +89,7 @@ pub async fn pin_new_objects(
         return vec![];
     }
 
-    let object_list = match list_all_objects(repo_path) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                repo = %repo_path.display(),
-                err = %e,
-                "failed to list git objects for Pinata upload"
-            );
-            return vec![];
-        }
-    };
-    let object_list = crate::git::visibility_pack::replicable_objects(object_list, withheld);
+    let object_list = crate::git::visibility_pack::replicable_objects(candidates, withheld);
 
     let mut pinned = Vec::new();
 
@@ -134,91 +129,11 @@ pub async fn pin_new_objects(
     pinned
 }
 
-/// Names of every object reachable from any ref, via `git rev-list --objects --all`.
-/// Reachable-only on purpose (not `cat-file --batch-all-objects`): an unreachable
-/// or dangling object has no path, cannot be classified for withholding, and must
-/// not be pinned in cleartext.
-fn list_all_objects(repo_path: &std::path::Path) -> Result<Vec<String>> {
-    let out = std::process::Command::new("git")
-        .args(["rev-list", "--objects", "--all"])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to run git rev-list: {e}"))?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(anyhow::anyhow!("git rev-list failed: {stderr}"));
-    }
-
-    // `rev-list --objects` lines are "<oid>" or "<oid> <path>"; keep the oid.
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().next().map(str::to_string))
-        .filter(|l| !l.is_empty())
-        .collect())
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn list_all_objects_excludes_unreachable_blobs() {
-        use std::process::Command;
-        use tempfile::TempDir;
-
-        let td = TempDir::new().unwrap();
-        let work = td.path();
-        let run = |args: &[&str]| {
-            assert!(
-                Command::new("git")
-                    .args(args)
-                    .current_dir(work)
-                    .status()
-                    .unwrap()
-                    .success(),
-                "git {args:?} failed"
-            );
-        };
-        run(&["init", "-q"]);
-        run(&["config", "user.email", "t@t"]);
-        run(&["config", "user.name", "t"]);
-        std::fs::write(work.join("a.txt"), b"reachable\n").unwrap();
-        run(&["add", "."]);
-        run(&["commit", "-qm", "init"]);
-
-        let reachable = String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["rev-parse", "HEAD:a.txt"])
-                .current_dir(work)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
-
-        std::fs::write(work.join("dangling.txt"), b"DANGLING SECRET\n").unwrap();
-        let dangling = String::from_utf8_lossy(
-            &Command::new("git")
-                .args(["hash-object", "-w", "dangling.txt"])
-                .current_dir(work)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .trim()
-        .to_string();
-
-        let objs = list_all_objects(work).unwrap();
-        assert!(objs.contains(&reachable), "reachable blob must be listed");
-        assert!(
-            !objs.contains(&dangling),
-            "unreachable/dangling blob must NOT be listed"
-        );
-    }
 
     #[tokio::test]
     async fn test_pin_skipped_when_jwt_empty() {

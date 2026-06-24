@@ -12,8 +12,9 @@ use std::path::Path;
 
 /// List every (blob_oid, "/repo/relative/path") pair reachable from any commit in
 /// `repo_path` — every ref *and* every historical commit those refs reach, not just
-/// the ref tips. The pin set (`git rev-list --objects --all`) and `git upload-pack`
-/// expose the full reachable object graph, including a blob that only ever existed
+/// the ref tips. `git upload-pack` (serve) and the whole-repo pin fallback
+/// (`git cat-file --batch-all-objects`) expose the full reachable object graph,
+/// including a blob that only ever existed
 /// in an older commit (a since-deleted file, a rotated secret whose previous version
 /// is still in history). Classifying only ref-tip trees would leave those blobs
 /// unwithheld while pin/serve still hand them out in cleartext, so we enumerate all
@@ -34,8 +35,9 @@ use std::path::Path;
 fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
     // Fail closed on any ref that does not resolve to a commit (a ref pointing
     // directly at a blob or tree, or an annotated tag of one). `git rev-list --all`
-    // silently *skips* such refs, but the pin set (`git rev-list --objects --all`)
-    // still exposes their target object, so a tolerant walk would under-withhold.
+    // silently *skips* such refs, but `git upload-pack` (serve) and the whole-repo
+    // pin fallback (`git cat-file --batch-all-objects`) still expose their target
+    // object, so a tolerant walk would under-withhold.
     // Refuse rather than leak — this is the same guarantee the per-ref `ls-tree`
     // walk gave before, which errored on a non-tree-ish ref.
     let refs = std::process::Command::new("git")
