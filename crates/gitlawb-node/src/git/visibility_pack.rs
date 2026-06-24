@@ -10,6 +10,121 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+/// Fail closed unless every ref ultimately resolves to a commit (a ref pointing
+/// directly at a blob or tree, or an annotated tag — even a nested one — of such
+/// an object is refused). `git rev-list --all` silently *skips* such refs, but
+/// `git upload-pack` (serve) and the whole-repo pin fallback
+/// (`git cat-file --batch-all-objects`) still expose their target object, so a
+/// tolerant walk would under-withhold. Refuse rather than leak.
+///
+/// Each ref is peeled fully with `<ref>^{}` through `git cat-file --batch-check`.
+/// Full peeling is why this is not `for-each-ref %(*objecttype)`, which
+/// dereferences only one tag level and so misclassifies a tag-of-a-tag-of-a-
+/// commit as a non-commit.
+fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
+    let refs = std::process::Command::new("git")
+        .args(["for-each-ref", "--format=%(refname)"])
+        .current_dir(repo_path)
+        .output()
+        .context("git for-each-ref failed")?;
+    if !refs.status.success() {
+        anyhow::bail!(
+            "git for-each-ref failed: {}",
+            String::from_utf8_lossy(&refs.stderr)
+        );
+    }
+    let refs_stdout = String::from_utf8_lossy(&refs.stdout);
+    let refnames: Vec<&str> = refs_stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if refnames.is_empty() {
+        return Ok(());
+    }
+
+    // Peel every ref in one `git cat-file --batch-check` pass: one
+    // `<refname>^{}` query per line, one output line per input line, in order.
+    // The stdin write runs on a separate thread so this thread can drain stdout
+    // concurrently. cat-file echoes the full query on a `<query> missing` line,
+    // so output scales with refname length (not a fixed size per ref); writing
+    // all of stdin before reading any stdout would deadlock both pipes once the
+    // child's stdout buffer fills. Dropping `stdin` at the end of the closure
+    // sends EOF.
+    let queries = refnames
+        .iter()
+        .map(|r| format!("{r}^{{}}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    use std::io::Write;
+    let mut child = std::process::Command::new("git")
+        .args(["cat-file", "--batch-check=%(objecttype)"])
+        .current_dir(repo_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn git cat-file")?;
+    // Feed stdin on a writer thread so this thread can drain stdout via
+    // wait_with_output concurrently; a None handle (the pipe vanished) becomes a
+    // broken-pipe write error. wait_with_output reaps the child unconditionally
+    // before any error is surfaced, so no path drops it unwaited (#53), and the
+    // writer is joined only after the drain so the join cannot deadlock.
+    let writer = child
+        .stdin
+        .take()
+        .map(|mut stdin| std::thread::spawn(move || stdin.write_all(queries.as_bytes())));
+    let peel_result = child.wait_with_output();
+    let write_result = match writer {
+        Some(handle) => handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("git cat-file stdin writer thread panicked"))?,
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "git cat-file stdin unavailable",
+        )),
+    };
+    // Surface a write error only if the process didn't already fail with a
+    // clearer status.
+    let peel = peel_result.context("git cat-file failed")?;
+    if !peel.status.success() {
+        anyhow::bail!(
+            "git cat-file --batch-check failed: {}",
+            String::from_utf8_lossy(&peel.stderr)
+        );
+    }
+    write_result.context("failed to write to git cat-file stdin")?;
+
+    let peel_stdout = String::from_utf8_lossy(&peel.stdout);
+    let types: Vec<&str> = peel_stdout.lines().map(str::trim).collect();
+    // A short read means at least one ref went unclassified — fail closed.
+    if types.len() != refnames.len() {
+        anyhow::bail!(
+            "git cat-file returned {} lines for {} refs; \
+             refusing to produce a partial (under-withheld) set",
+            types.len(),
+            refnames.len()
+        );
+    }
+    for (refname, kind) in refnames.iter().zip(types.iter()) {
+        // git emits `<query> missing` (not the objecttype) when the peel target
+        // is absent; the status word is the last token.
+        if kind.split_ascii_whitespace().last() == Some("missing") {
+            anyhow::bail!(
+                "ref {refname} does not resolve to an object; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        }
+        if *kind != "commit" {
+            anyhow::bail!(
+                "ref {refname} resolves to a {kind}, not a commit; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// List every (blob_oid, "/repo/relative/path") pair reachable from any commit in
 /// `repo_path` — every ref *and* every historical commit those refs reach, not just
 /// the ref tips. `git upload-pack` (serve) and the whole-repo pin fallback
@@ -33,97 +148,7 @@ use std::path::Path;
 /// the caller aborts the serve/pin rather than producing a partial (under-withheld)
 /// set.
 fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    // Fail closed on any ref that does not resolve to a commit (a ref pointing
-    // directly at a blob or tree, or an annotated tag — even a nested one — of
-    // such an object). `git rev-list --all` silently *skips* such refs, but
-    // `git upload-pack` (serve) and the whole-repo pin fallback
-    // (`git cat-file --batch-all-objects`) still expose their target object, so
-    // a tolerant walk would under-withhold. Refuse rather than leak — this is
-    // the same guarantee the per-ref `ls-tree` walk gave before.
-    //
-    // We list refnames (which never contain whitespace or newlines) and peel
-    // each one fully with `<ref>^{}` through a single `git cat-file
-    // --batch-check`. Full peeling is why this is not `for-each-ref
-    // %(*objecttype)`, which dereferences only one tag level and so misclassifies
-    // a tag-of-a-tag-of-a-commit as a non-commit.
-    let refs = std::process::Command::new("git")
-        .args(["for-each-ref", "--format=%(refname)"])
-        .current_dir(repo_path)
-        .output()
-        .context("git for-each-ref failed")?;
-    if !refs.status.success() {
-        anyhow::bail!(
-            "git for-each-ref failed: {}",
-            String::from_utf8_lossy(&refs.stderr)
-        );
-    }
-    let refs_stdout = String::from_utf8_lossy(&refs.stdout);
-    let refnames: Vec<&str> = refs_stdout
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    if !refnames.is_empty() {
-        // One `<refname>^{}` peel query per line; `cat-file` emits one output
-        // line per input line, in order.
-        let queries = refnames
-            .iter()
-            .map(|r| format!("{r}^{{}}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        use std::io::Write;
-        let mut child = std::process::Command::new("git")
-            .args(["cat-file", "--batch-check=%(objecttype)"])
-            .current_dir(repo_path)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("failed to spawn git cat-file")?;
-        // Always reap the child even if the stdin write fails, so a write error
-        // can't drop the Child unwaited and leak a zombie (#53).
-        let write_result = match child.stdin.take() {
-            Some(mut stdin) => stdin.write_all(queries.as_bytes()),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "git cat-file stdin unavailable",
-            )),
-        };
-        let peel = child.wait_with_output().context("git cat-file failed")?;
-        write_result.context("failed to write to git cat-file stdin")?;
-        if !peel.status.success() {
-            anyhow::bail!(
-                "git cat-file --batch-check failed: {}",
-                String::from_utf8_lossy(&peel.stderr)
-            );
-        }
-        let peel_stdout = String::from_utf8_lossy(&peel.stdout);
-        let types: Vec<&str> = peel_stdout.lines().map(str::trim).collect();
-        // A short read means at least one ref went unclassified — fail closed.
-        if types.len() != refnames.len() {
-            anyhow::bail!(
-                "git cat-file returned {} lines for {} refs; \
-                 refusing to produce a partial (under-withheld) set",
-                types.len(),
-                refnames.len()
-            );
-        }
-        for (refname, kind) in refnames.iter().zip(types.iter()) {
-            // An unresolvable query prints `<input> missing`.
-            if kind.ends_with("missing") {
-                anyhow::bail!(
-                    "ref {refname} does not resolve to an object; \
-                     refusing to produce a partial (under-withheld) set"
-                );
-            }
-            if *kind != "commit" {
-                anyhow::bail!(
-                    "ref {refname} resolves to a {kind}, not a commit; \
-                     refusing to produce a partial (under-withheld) set"
-                );
-            }
-        }
-    }
+    assert_all_refs_are_commits(repo_path)?;
 
     // Enumerate every reachable commit, not just ref tips. `--all` walks all refs;
     // append HEAD so a detached HEAD (reachable by rev-list/upload-pack but in no
@@ -669,6 +694,55 @@ mod tests {
             result.is_err(),
             "an annotated tag of a blob must fail closed (Err)"
         );
+    }
+
+    #[test]
+    fn fails_closed_when_a_ref_points_at_a_missing_object() {
+        let (_td, bare, _secret, _public) = fixture();
+        // A ref whose target object does not exist (pruned object, corrupt ref)
+        // peels to `<query> missing`. for-each-ref still lists it, so the guard
+        // must fail closed rather than skip the unclassifiable ref.
+        std::fs::write(
+            bare.join("refs/heads/dangling"),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+        let rules = [rule("/secret/**", &[])];
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            result.is_err(),
+            "a ref pointing at a missing object must fail closed (Err)"
+        );
+    }
+
+    #[test]
+    fn many_long_named_unresolvable_refs_do_not_deadlock() {
+        // Regression guard for the cat-file stdin/stdout deadlock. cat-file
+        // echoes the full query on a `<query> missing` line, so a few hundred
+        // long-named dangling refs emit >64 KiB of stdout — enough to fill the
+        // pipe buffer and hang a write-all-before-drain implementation. The
+        // concurrent stdin writer must keep it live and fail closed. Bounded by
+        // a timeout so a regression fails the test instead of hanging the suite.
+        let (_td, bare, _secret, _public) = fixture();
+        let longname = "z".repeat(200);
+        let mut packed = String::new();
+        for i in 0..500 {
+            packed.push_str(&format!(
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef refs/heads/{longname}-{i}\n"
+            ));
+        }
+        std::fs::write(bare.join("packed-refs"), packed).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rules = [rule("/secret/**", &[])];
+            let is_err = withheld_blob_oids(&bare, &rules, true, OWNER, None).is_err();
+            let _ = tx.send(is_err);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(is_err) => assert!(is_err, "refs pointing at missing objects must fail closed"),
+            Err(_) => panic!("withheld_blob_oids did not return within 10s (deadlock?)"),
+        }
     }
 
     #[test]
