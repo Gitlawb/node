@@ -946,7 +946,7 @@ pub async fn git_receive_pack(
             let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
 
             // Record branch→CID for each ref update and publish gossip
-            for (ref_name, _old_sha, new_sha) in &ref_updates_clone {
+            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
                 let cid = cid_map.get(new_sha).map(|s| s.as_str());
 
                 if let Some(cid_str) = cid {
@@ -962,7 +962,7 @@ pub async fn git_receive_pack(
                             pusher_did: pusher_did_clone.clone(),
                             repo: repo_slug.clone(),
                             ref_name: ref_name.clone(),
-                            old_sha: "".to_string(),
+                            old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
                             timestamp: chrono::Utc::now().to_rfc3339(),
                             cert_id: None,
@@ -990,69 +990,70 @@ pub async fn git_receive_pack(
                         }
                         let path = "/api/v1/sync/notify";
                         let notify_url = format!("{peer_url}{path}");
-                        let body = serde_json::json!({
-                            "repo": repo_slug.clone(),
-                            "ref_name": ref_updates_clone.first().map(|(r, _, _)| r).unwrap_or(&String::new()),
-                            "new_sha": ref_updates_clone.first().map(|(_, _, s)| s).unwrap_or(&String::new()),
-                            "node_did": node_did_str.clone(),
-                            "pusher_did": pusher_did_clone.clone(),
-                            "old_sha": "0000000000000000000000000000000000000000",
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        });
-                        let body_bytes = match serde_json::to_vec(&body) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                tracing::warn!(peer = %peer.did, err = %e, "failed to serialize peer sync notify");
-                                continue;
-                            }
-                        };
-                        let signed = gitlawb_core::http_sig::sign_request(
-                            node_keypair.as_ref(),
-                            "POST",
-                            path,
-                            &body_bytes,
-                        );
-                        match http_client
-                            .post(&notify_url)
-                            .header("Content-Type", "application/json")
-                            .header("Content-Digest", signed.content_digest)
-                            .header("Signature-Input", signed.signature_input)
-                            .header("Signature", signed.signature)
-                            .body(body_bytes)
-                            .send()
-                            .await
-                        {
-                            Ok(r) if r.status().is_success() => {
-                                tracing::info!(peer = %peer.did, repo = %repo_slug, "notified peer to sync")
-                            }
-                            Ok(r) => {
-                                tracing::warn!(peer = %peer.did, status = %r.status(), "peer sync notify returned error")
-                            }
-                            Err(e) => {
-                                tracing::warn!(peer = %peer.did, err = %e, "failed to notify peer")
+                        // One signed notify per ref — the receiver is single-ref,
+                        // so a multi-ref push must fan out one request per ref with
+                        // its real old_sha (matching the gossip/Arweave paths).
+                        for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                            let body = serde_json::json!({
+                                "repo": repo_slug.clone(),
+                                "ref_name": ref_name.clone(),
+                                "new_sha": new_sha.clone(),
+                                "node_did": node_did_str.clone(),
+                                "pusher_did": pusher_did_clone.clone(),
+                                "old_sha": old_sha.clone(),
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                            });
+                            let body_bytes = match serde_json::to_vec(&body) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    tracing::warn!(peer = %peer.did, err = %e, "failed to serialize peer sync notify");
+                                    continue;
+                                }
+                            };
+                            let signed = gitlawb_core::http_sig::sign_request(
+                                node_keypair.as_ref(),
+                                "POST",
+                                path,
+                                &body_bytes,
+                            );
+                            match http_client
+                                .post(&notify_url)
+                                .header("Content-Type", "application/json")
+                                .header("Content-Digest", signed.content_digest)
+                                .header("Signature-Input", signed.signature_input)
+                                .header("Signature", signed.signature)
+                                .body(body_bytes)
+                                .send()
+                                .await
+                            {
+                                Ok(r) if r.status().is_success() => {
+                                    tracing::info!(peer = %peer.did, repo = %repo_slug, ref_name = %ref_name, "notified peer to sync")
+                                }
+                                Ok(r) => {
+                                    tracing::warn!(peer = %peer.did, status = %r.status(), "peer sync notify returned error")
+                                }
+                                Err(e) => {
+                                    tracing::warn!(peer = %peer.did, err = %e, "failed to notify peer")
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // Broadcast ref update to GraphQL subscription listeners
+            // Broadcast ref update to GraphQL subscription listeners — one per ref.
             let now_ts = chrono::Utc::now().to_rfc3339();
-            let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
-                repo: repo_slug.clone(),
-                ref_name: ref_updates_clone
-                    .first()
-                    .map(|(r, _, _)| r.clone())
-                    .unwrap_or_default(),
-                old_sha: "0000000000000000000000000000000000000000".to_string(),
-                new_sha: ref_updates_clone
-                    .first()
-                    .map(|(_, _, s)| s.clone())
-                    .unwrap_or_default(),
-                pusher_did: pusher_did_clone.clone(),
-                node_did: node_did_str.clone(),
-                timestamp: now_ts.clone(),
-            });
+            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
+                    repo: repo_slug.clone(),
+                    ref_name: ref_name.clone(),
+                    old_sha: old_sha.clone(),
+                    new_sha: new_sha.clone(),
+                    pusher_did: pusher_did_clone.clone(),
+                    node_did: node_did_str.clone(),
+                    timestamp: now_ts.clone(),
+                });
+            }
 
             // Arweave permanent anchoring — fire for each ref update.
             // Suppressed for repos the public cannot read (public permanent ledger).
