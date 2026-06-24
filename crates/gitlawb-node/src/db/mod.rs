@@ -767,6 +767,20 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE agents ADD COLUMN IF NOT EXISTS deactivated_at TEXT",
         ],
     },
+    Migration {
+        version: 7,
+        name: "repo_owner_dedup_key_didkey_aware",
+        stmts: &[
+            // The dedup grouping key moved from the last `:` segment to a
+            // did:key-aware key (strip `did:key:`, leave any other DID method
+            // whole) so `did:key:X` and `did:gitlawb:X` no longer collapse. Swap
+            // the index that backs it: drop the last-segment one from v1 and build
+            // the matching expression index. The CASE must stay byte-for-byte in
+            // sync with DEDUP_CTE / count_repos_deduped or Postgres won't use it.
+            "DROP INDEX IF EXISTS idx_repos_owner_short_name",
+            "CREATE INDEX IF NOT EXISTS idx_repos_owner_key_name ON repos ((CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END), name)",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -896,26 +910,32 @@ impl Db {
 
     /// Shared dedup CTE: collapses the mirror row and the canonical row of one
     /// logical repo into a single survivor. `$1` is an optional owner filter
-    /// (NULL = all rows). Grouping is `(split_part(owner_did,':',-1), name)`; the
-    /// canonical row wins (mirror rows carry a slash-form `id` written only by
+    /// (NULL = all rows). Grouping collapses on a did:key-aware owner key: strip a
+    /// `did:key:` prefix (8 chars, so `substr(owner_did, 9)`) only when the
+    /// remainder is a bare id with no `:`, otherwise keep the full DID. That is the
+    /// exact normalization in `crate::api::did_matches`, so `did:key:X` and a bare
+    /// `X` collapse while distinct DID methods (`did:gitlawb:X`) never merge. The
+    /// CASE is repeated verbatim in `count_repos_deduped` and the v7 index and must
+    /// stay byte-identical or Postgres stops using the index.
+    /// The canonical row wins (mirror rows carry a slash-form `id` written only by
     /// `upsert_mirror_repo`), ties broken by earliest `created_at` then `id` so a
     /// full tie still picks a deterministic survivor. `list_all_repos_paged`,
     /// `list_all_repos_deduped`, and the marker logic in
     /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
     const DEDUP_CTE: &'static str = "WITH deduped AS (
-                 SELECT DISTINCT ON (split_part(owner_did, ':', -1), name)
+                 SELECT DISTINCT ON (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
                      -- group MAX, not the canonical row's own value: pushes that
                      -- arrive via gossip touch only the mirror row, so the
                      -- canonical updated_at goes stale
                      MAX(updated_at) OVER (
-                         PARTITION BY split_part(owner_did, ':', -1), name
+                         PARTITION BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name
                      ) AS updated_at,
                      disk_path, forked_from, machine_id
                  FROM repos
                  WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)
-                 ORDER BY split_part(owner_did, ':', -1), name,
+                 ORDER BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name,
                      -- mirror rows carry a slash-form id (\"{owner_short}/{name}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
                      -- Rank canonical (no slash) ahead of the mirror in each group,
@@ -967,7 +987,7 @@ impl Db {
 
         let total = if out.is_empty() {
             let row = sqlx::query(
-                "SELECT COUNT(DISTINCT (split_part(owner_did, ':', -1), name)) AS cnt
+                "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt
                  FROM repos
                  WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)",
             )
@@ -1005,12 +1025,12 @@ impl Db {
     }
 
     /// Count of distinct logical repos (mirror + canonical collapsed), for
-    /// `/api/v1/stats`. Uses the same `(split_part(owner_did,':',-1), name)`
-    /// grouping as `DEDUP_CTE`; the marker/tiebreak only decide which row would
-    /// survive, not the group count, so they are not needed here.
+    /// `/api/v1/stats`. Uses the same did:key-aware owner-key grouping as
+    /// `DEDUP_CTE` (the CASE must stay byte-identical); the marker/tiebreak only
+    /// decide which row would survive, not the group count, so they are not needed here.
     pub async fn count_repos_deduped(&self) -> Result<i64> {
         let row = sqlx::query(
-            "SELECT COUNT(DISTINCT (split_part(owner_did, ':', -1), name)) AS cnt FROM repos",
+            "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt FROM repos",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -3160,6 +3180,136 @@ mod dedup_db_tests {
             "real mirror row collapses with its canonical twin"
         );
         assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+    }
+
+    /// Same name and base58 id but different DID methods (`did:key` vs
+    /// `did:gitlawb`) must NOT collapse: the grouping key strips only `did:key:`
+    /// and leaves other methods whole, matching crate::api::did_matches. Both the
+    /// list (DEDUP_CTE) and count (count_repos_deduped) paths must agree.
+    #[sqlx::test]
+    async fn deduped_keeps_distinct_did_methods_apart(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-keyed",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "via did:key",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-gitlawb",
+            "did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "via did:gitlawb",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 2, "distinct DID methods are distinct owners");
+        assert_eq!(
+            db.count_repos_deduped().await.unwrap(),
+            2,
+            "count path agrees with the list path",
+        );
+    }
+
+    /// SQL residual-colon guard: a malformed `did:key:did:gitlawb:X` strips to a
+    /// value that still holds a `:`, so the CASE keeps it whole and it does NOT
+    /// collapse with a real `did:gitlawb:X`. Proves the SQL key matches the Rust
+    /// `strip_prefix(...).filter(|r| !r.contains(':'))` and did_matches.
+    #[sqlx::test]
+    async fn deduped_did_key_wrapping_a_full_did_stays_distinct(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-wrapped",
+            "did:key:did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "malformed nested DID",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-method",
+            "did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "real method DID",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(
+            out.len(),
+            2,
+            "wrapped full DID stays distinct from the method DID"
+        );
+        assert_eq!(
+            db.count_repos_deduped().await.unwrap(),
+            2,
+            "count path agrees with the list path",
+        );
+    }
+
+    /// Empty-residual boundary: `did:key:` matches `LIKE 'did:key:%'`,
+    /// `substr(owner_did, 9)` is '', and `position(':' in '')` is 0, so the CASE
+    /// keys it to '' just like a bare empty owner, while a real `did:key:z…` keys
+    /// separately. Pins that the SQL empty-residual handling matches the Rust
+    /// `strip_prefix(...).filter(...)` path (mirrored in the api-level test).
+    #[sqlx::test]
+    async fn deduped_empty_did_key_residual_keys_to_empty_string(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-empty-didkey",
+            "did:key:",
+            "nipmod",
+            "empty residual",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-empty-bare",
+            "",
+            "nipmod",
+            "empty owner",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-real",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real id",
+            "2026-01-03T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(
+            out.len(),
+            2,
+            "`did:key:` and the empty owner collapse on the empty key; the real id is separate"
+        );
+        assert_eq!(
+            db.count_repos_deduped().await.unwrap(),
+            2,
+            "count path agrees with the list path",
+        );
     }
 
     /// Distinct repos are preserved and ordered by most recent activity.

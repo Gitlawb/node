@@ -1422,13 +1422,20 @@ fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)
     let mut latest: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
 
     for (rec, stars) in rows {
-        let short = rec
+        // did:key-aware owner key: strip a `did:key:` prefix so the bare mirror id
+        // and its `did:key:` canonical collapse, but leave any other DID method
+        // whole so `did:key:X` and `did:gitlawb:X` never merge. The `!contains(':')`
+        // guard mirrors did_matches' `key_id` check: a stripped value that still
+        // holds a `:` is a non-key full DID (e.g. malformed `did:key:did:gitlawb:X`)
+        // and must keep its full form, not collapse onto the bare method DID. Stays
+        // byte-equivalent to the SQL CASE in Db::DEDUP_CTE / count_repos_deduped.
+        let owner_key = rec
             .owner_did
-            .rsplit(':')
-            .next()
+            .strip_prefix("did:key:")
+            .filter(|rest| !rest.contains(':'))
             .unwrap_or(&rec.owner_did)
             .to_string();
-        let key = (short, rec.name.clone());
+        let key = (owner_key, rec.name.clone());
 
         latest
             .entry(key.clone())
@@ -1646,6 +1653,137 @@ mod tests {
             out.len(),
             2,
             "different repo names stay separate under one owner"
+        );
+    }
+
+    #[test]
+    fn distinct_did_methods_sharing_a_base58_id_do_not_collapse() {
+        // `did:key` and `did:gitlawb` share the base58 id space, so a trailing
+        // segment key would treat these as one repo. The did:key-aware key keeps
+        // them apart, matching crate::api::did_matches.
+        let keyed = record(
+            "id-keyed",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "owned via did:key",
+            "2026-01-01T00:00:00Z",
+        );
+        let gitlawb = record(
+            "id-gitlawb",
+            "did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "owned via did:gitlawb",
+            "2026-01-01T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(keyed, 1), (gitlawb, 2)]);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "same name and base58 id under different DID methods are distinct repos"
+        );
+    }
+
+    #[test]
+    fn bare_id_and_did_key_form_of_same_owner_collapse() {
+        // A bare mirror id and its did:key canonical are the same owner and must
+        // collapse, the mirror-vs-canonical case stated in owner-key terms.
+        let mirror = record(
+            "z6Mkwbud/nipmod",
+            "z6Mkwbud",
+            "nipmod",
+            "mirrored from peer",
+            "2026-02-01T00:00:00Z",
+        );
+        let canonical = record(
+            "canon-id",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real",
+            "2026-01-15T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(mirror, 0), (canonical, 5)]);
+
+        assert_eq!(out.len(), 1, "bare id and its did:key form are one owner");
+        assert_eq!(out[0].0.owner_did, "did:key:z6Mkwbud", "canonical row wins");
+    }
+
+    #[test]
+    fn did_key_wrapping_a_full_did_does_not_collapse_onto_the_bare_method_did() {
+        // Residual-colon guard, mirroring did_matches' `!key_id().contains(':')`:
+        // a malformed `did:key:did:gitlawb:X` strips to `did:gitlawb:X`, which still
+        // holds a `:`, so it must keep its full form and NOT collapse with a real
+        // `did:gitlawb:X` repo of the same name.
+        let wrapped = record(
+            "id-wrapped",
+            "did:key:did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "malformed nested DID",
+            "2026-01-01T00:00:00Z",
+        );
+        let method = record(
+            "id-method",
+            "did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "real method DID",
+            "2026-01-02T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(wrapped, 1), (method, 2)]);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "a did:key-wrapped full DID stays distinct from the bare method DID"
+        );
+        // Assert identity, not just count: each owner survives unmerged, so a
+        // regression that kept two rows but mis-keyed the survivor is also caught.
+        let mut owners: Vec<&str> = out.iter().map(|(r, _)| r.owner_did.as_str()).collect();
+        owners.sort_unstable();
+        assert_eq!(
+            owners,
+            vec!["did:gitlawb:z6Mkwbud", "did:key:did:gitlawb:z6Mkwbud"],
+            "both owner DIDs survive in their full form"
+        );
+    }
+
+    #[test]
+    fn empty_did_key_residual_keys_to_empty_string_consistently() {
+        // Degenerate boundary the reviewers flagged: `did:key:` with no id strips to
+        // an empty residual (no colon), so the key is "". A bare empty owner also
+        // keys to "", so the two collapse — proving the Rust strip path maps the
+        // empty residual exactly like the SQL `substr(owner_did, 9)` / `position`
+        // path (mirrored in the db-level test). A real did:key id keys separately.
+        let empty_did_key = record(
+            "id-empty-didkey",
+            "did:key:",
+            "nipmod",
+            "empty residual",
+            "2026-01-01T00:00:00Z",
+        );
+        let empty_bare = record(
+            "id-empty-bare",
+            "",
+            "nipmod",
+            "empty owner",
+            "2026-01-02T00:00:00Z",
+        );
+        let real = record(
+            "id-real",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real id",
+            "2026-01-03T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(empty_did_key, 0), (empty_bare, 0), (real, 0)]);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "`did:key:` and the empty owner share the empty key and collapse; the real id stays separate"
         );
     }
 
