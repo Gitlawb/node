@@ -179,8 +179,19 @@ async fn main() -> Result<()> {
         .context("initializing object storage backend")?;
     let archive = blob_store.map(storage::archive::RepoArchive::new);
 
-    let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), archive, db.pool().clone());
+    // Dedicated, bounded pool for advisory-lock connections. A push pins one
+    // connection for its whole lifetime (lock held across receive-pack +
+    // upload), so giving locks their own budget keeps a burst of concurrent or
+    // slow pushes from draining the main pool and stalling every other DB
+    // handler node-wide. Sized independently of the handler pool.
+    const ADVISORY_LOCK_POOL_SIZE: u32 = 16;
+    let lock_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(ADVISORY_LOCK_POOL_SIZE)
+        .connect(&config.database_url)
+        .await
+        .context("creating advisory-lock connection pool")?;
+
+    let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), archive, lock_pool);
 
     let rate_limiter = rate_limit::RateLimiter::new(10, std::time::Duration::from_secs(3600));
 
