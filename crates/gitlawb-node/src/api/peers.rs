@@ -40,6 +40,38 @@ pub struct PeerResponse {
     pub reachable: bool,
 }
 
+/// Extract an IPv4 address embedded in an IPv6 literal across the transition
+/// formats that carry one: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
+/// (`::a.b.c.d`), 6to4 (`2002:WWXX:YYZZ::/16`), and the NAT64 well-known prefix
+/// (`64:ff9b::/96`). Returns `None` for native IPv6. Callers fold the result
+/// back through the v4 range checks so loopback/private addresses smuggled in
+/// via any of these encodings are rejected, not just the mapped/compatible pair.
+///
+/// INCOMPLETE-NAT64 CONTRACT: non-well-known NAT64 prefixes (e.g. the RFC 8215
+/// local-use `64:ff9b:1::/48`) are deliberately **not** decoded here — their v4
+/// sits at a prefix-length-dependent offset (RFC 6052 §2.2) — so they return
+/// `None`. Any caller that needs them blocked must reject the wider
+/// `64:ff9b::/32` itself; `is_public_http_url` does this in its native-v6 arm.
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    // 6to4 (2002::/16) embeds W.X.Y.Z in the next two segments.
+    if s[0] == 0x2002 {
+        let [a, b] = s[1].to_be_bytes();
+        let [c, d] = s[2].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    // NAT64 well-known prefix (64:ff9b::/96) embeds the IPv4 in the low 32 bits.
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
+        let [a, b] = s[6].to_be_bytes();
+        let [c, d] = s[7].to_be_bytes();
+        return Some(std::net::Ipv4Addr::new(a, b, c, d));
+    }
+    None
+}
+
 /// Whether a peer `http_url` is a public http(s) endpoint safe to register.
 /// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
 /// and `localhost` / `.local` / `.internal` hostnames. Used at announce time
@@ -78,15 +110,12 @@ pub fn is_public_http_url(raw: &str) -> bool {
         if ip.is_loopback() || ip.is_unspecified() {
             return false;
         }
-        // Fold IPv4-mapped/compatible IPv6 (`::ffff:127.0.0.1`, `::127.0.0.1`)
-        // down to IPv4 so the v4 range checks catch loopback/private addresses
-        // smuggled in via an IPv6 literal, then re-check loopback/unspecified.
+        // Fold any IPv6 literal that embeds an IPv4 address (mapped, compatible,
+        // 6to4, NAT64) down to that IPv4 so the v4 range checks catch
+        // loopback/private addresses smuggled in via an IPv6 encoding, then
+        // re-check loopback/unspecified.
         let ip = match ip {
-            std::net::IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .or_else(|| v6.to_ipv4())
-                .map(std::net::IpAddr::V4)
-                .unwrap_or(ip),
+            std::net::IpAddr::V6(v6) => embedded_ipv4(v6).map(std::net::IpAddr::V4).unwrap_or(ip),
             v4 => v4,
         };
         if ip.is_loopback() || ip.is_unspecified() {
@@ -95,8 +124,14 @@ pub fn is_public_http_url(raw: &str) -> bool {
         match ip {
             std::net::IpAddr::V4(v4) => {
                 let o = v4.octets();
-                // RFC1918 private, link-local, or CGNAT (100.64.0.0/10).
-                if v4.is_private() || v4.is_link_local() || (o[0] == 100 && (o[1] & 0xc0) == 64) {
+                // RFC1918 private, link-local, CGNAT (100.64.0.0/10), or the
+                // RFC1122 "this host" block 0.0.0.0/8 (never a valid destination;
+                // 0.0.0.0 itself is already caught by the is_unspecified check).
+                if v4.is_private()
+                    || v4.is_link_local()
+                    || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                    || o[0] == 0
+                {
                     return false;
                 }
             }
@@ -104,6 +139,16 @@ pub fn is_public_http_url(raw: &str) -> bool {
                 let s = v6.segments();
                 // fc00::/7 (unique-local) or fe80::/10 (link-local)
                 if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                    return false;
+                }
+                // Any NAT64 address (64:ff9b::/32) that is not the cleanly
+                // decodable well-known /96 — e.g. the RFC 8215 local-use
+                // 64:ff9b:1::/48 — carries a translated target whose embedded v4
+                // sits at a prefix-length-dependent offset (RFC 6052 §2.2).
+                // Rather than risk a wrong decode across every prefix length we
+                // reject the whole NAT64 space here. The well-known /96 was
+                // already folded to its v4 above and never reaches this arm.
+                if s[0] == 0x0064 && s[1] == 0xff9b {
                     return false;
                 }
             }
@@ -425,6 +470,11 @@ mod tests {
             "http://127.0.0.1:5432/",
             "http://localhost:22/",
             "http://0.0.0.0:7545",
+            // RFC1122 "this host" block 0.0.0.0/8 beyond 0.0.0.0 itself,
+            // including the upper boundary (1.0.0.0 is public, tested below).
+            "http://0.0.0.1:7545",
+            "http://0.1.2.3/",
+            "http://0.255.255.255/",
             "http://10.0.0.5:7545",
             "http://192.168.1.10/",
             "http://172.16.0.1:7545",
@@ -445,9 +495,33 @@ mod tests {
             "http://[::ffff:10.0.0.1]/",
             "http://[::ffff:192.168.1.1]:7545",
             "http://[::127.0.0.1]/",
+            // 6to4 (2002::/16) embedding loopback/private v4.
+            "http://[2002:7f00:1::]:7545",
+            "http://[2002:a00:1::]/",
+            "http://[2002:c0a8:101::]/",
+            // NAT64 well-known prefix (64:ff9b::/96) embedding loopback/private v4.
+            "http://[64:ff9b::7f00:1]/",
+            "http://[64:ff9b::a00:1]:7545",
+            // NAT64 local-use prefix (64:ff9b:1::/48, RFC 8215) — rejected
+            // outright rather than decoded, so the whole NAT64 space is closed.
+            "http://[64:ff9b:1::7f00:1]/",
+            "http://[64:ff9b:1::a00:1]:7545",
+            "http://[64:ff9b:1:a00::]/",
+            // Local-use NAT64 wrapping a *public* v4 (203.0.113.10) is still
+            // rejected: the block is prefix-based, not payload-based.
+            "http://[64:ff9b:1::cb00:710a]/",
         ] {
             assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn accepts_6to4_and_nat64_wrapping_public_v4() {
+        // Fold-and-recheck stays consistent with the mapped/compatible handling:
+        // a transition address that wraps a public v4 is allowed, only the
+        // private/loopback-wrapping forms above are rejected. 203.0.113.10.
+        assert!(is_public_http_url("http://[2002:cb00:710a::]/"));
+        assert!(is_public_http_url("http://[64:ff9b::cb00:710a]/"));
     }
 
     #[test]
@@ -455,5 +529,12 @@ mod tests {
         // 100.0.0.0/10 boundary: .63 and .128 are public, only 100.64-127 is CGNAT.
         assert!(is_public_http_url("http://100.63.255.255:7545"));
         assert!(is_public_http_url("http://100.128.0.1/"));
+    }
+
+    #[test]
+    fn accepts_first_address_above_this_host_block() {
+        // 1.0.0.0 is the first address above the rejected 0.0.0.0/8 block;
+        // pins the `o[0] == 0` check against an off-by-one into 1.x.
+        assert!(is_public_http_url("http://1.0.0.0/"));
     }
 }
