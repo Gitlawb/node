@@ -7,7 +7,7 @@ use crate::db::VisibilityRule;
 use crate::git::store;
 use crate::visibility::{visibility_check, Decision};
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 /// List every (blob_oid, "/repo/relative/path") pair reachable from any branch
@@ -85,6 +85,42 @@ pub fn replicable_objects(all: Vec<String>, withheld: &HashSet<String>) -> Vec<S
     all.into_iter()
         .filter(|oid| !withheld.contains(oid))
         .collect()
+}
+
+/// For every blob withheld from anonymous, the DIDs allowed to read it: the
+/// owner plus any reader DID that `visibility_check` Allows at some path the
+/// blob appears at. Least-privilege: a reader of one private subtree is not a
+/// recipient of a blob that only lives in another.
+pub fn withheld_blob_recipients(
+    repo_path: &Path,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+) -> Result<HashMap<String, BTreeSet<String>>> {
+    let withheld = withheld_blob_oids(repo_path, rules, is_public, owner_did, None)?;
+    if withheld.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut candidates: BTreeSet<String> = BTreeSet::new();
+    for r in rules {
+        for d in &r.reader_dids {
+            candidates.insert(d.clone());
+        }
+    }
+    let mut out: HashMap<String, BTreeSet<String>> = HashMap::new();
+    for (oid, path) in blob_paths(repo_path)? {
+        if !withheld.contains(&oid) {
+            continue;
+        }
+        let entry = out.entry(oid).or_default();
+        entry.insert(owner_did.to_string());
+        for did in &candidates {
+            if visibility_check(rules, is_public, owner_did, Some(did), &path) == Decision::Allow {
+                entry.insert(did.clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -229,5 +265,34 @@ mod tests {
         let withheld: HashSet<String> = HashSet::new();
         let got = replicable_objects(all.clone(), &withheld);
         assert_eq!(got, all);
+    }
+
+    #[test]
+    fn recipients_are_owner_plus_allowed_readers_only() {
+        let (_td, repo, secret_oid, public_oid) = fixture();
+        let reader = "did:key:zReader";
+        let rules = vec![rule("/secret/**", &[reader])];
+        let map = withheld_blob_recipients(&repo, &rules, true, OWNER).unwrap();
+
+        let recips = map.get(&secret_oid).expect("secret blob has recipients");
+        assert!(recips.contains(OWNER));
+        assert!(recips.contains(reader));
+        assert!(
+            !map.contains_key(&public_oid),
+            "public blob is not encrypted"
+        );
+    }
+
+    #[test]
+    fn node_seal_open_round_trip() {
+        use gitlawb_core::encrypt::{open_blob, seal_blob};
+        use gitlawb_core::identity::Keypair;
+        let (_td, repo, secret_oid, _public) = fixture();
+        let (_t, bytes) = crate::git::store::read_object(&repo, &secret_oid)
+            .unwrap()
+            .unwrap();
+        let reader = Keypair::generate();
+        let env = seal_blob(&bytes, &[reader.verifying_key()]).unwrap();
+        assert_eq!(open_blob(&env, &reader).unwrap(), bytes);
     }
 }

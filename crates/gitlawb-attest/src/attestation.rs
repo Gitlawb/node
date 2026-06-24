@@ -127,7 +127,7 @@ impl Attestation {
                 self.type_
             )));
         }
-        Ok(serde_json::from_value(self.payload.clone())?)
+        Ok(P::deserialize(&self.payload)?)
     }
 }
 

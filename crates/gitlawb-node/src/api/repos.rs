@@ -5,7 +5,7 @@ use axum::Json;
 use bytes::Bytes;
 use std::sync::Arc;
 
-use crate::auth::{caller_authorized_to_push, is_repo_owner, AuthenticatedDid};
+use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -162,7 +162,7 @@ pub async fn list_repos(
         .iter()
         .filter(|(r, _)| {
             if let Some(owner) = &query.owner {
-                is_repo_owner(r, owner.as_str())
+                crate::api::did_matches(owner.as_str(), &r.owner_did)
             } else {
                 true
             }
@@ -185,12 +185,11 @@ pub async fn list_repos(
 pub async fn get_repo(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<RepoResponse>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
     let count = state.db.count_stars(&record.id).await.unwrap_or(0);
     Ok(Json(to_response(&record, &state, count)))
 }
@@ -199,12 +198,11 @@ pub async fn get_repo(
 pub async fn list_commits(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let disk_path = state
         .repo_store
@@ -221,6 +219,7 @@ pub async fn list_commits(
 pub async fn get_blob(
     State(state): State<AppState>,
     Path((owner, name, file_path)): Path<(String, String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     use axum::http::header;
     use axum::response::IntoResponse;
@@ -237,11 +236,10 @@ pub async fn get_blob(
         return Err(AppError::BadRequest("invalid file path".into()));
     }
 
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let gate_path = format!("/{file_path}");
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
 
     let disk_path = state
         .repo_store
@@ -282,12 +280,11 @@ pub async fn get_blob(
 pub async fn get_tree_root(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let disk_path = state
         .repo_store
@@ -304,12 +301,28 @@ pub async fn get_tree_root(
 pub async fn get_tree(
     State(state): State<AppState>,
     Path((owner, name, tree_path)): Path<(String, String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    // Gate on the REQUESTED subtree, not the repo root (N3) — otherwise a caller
+    // denied a withheld subtree can still enumerate its names/SHAs. Reject
+    // traversal and empty interior segments as get_blob does, so the gate path and
+    // the path git resolves cannot diverge; an empty path here is the root listing.
+    let normalized = tree_path.trim_matches('/');
+    if !normalized.is_empty()
+        && normalized
+            .split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(AppError::BadRequest("invalid tree path".into()));
+    }
+    let gate_path = if normalized.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{normalized}")
+    };
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, &gate_path).await?;
 
     let disk_path = state
         .repo_store
@@ -544,7 +557,7 @@ pub async fn git_receive_pack(
             .is_branch_protected(&record.id, branch)
             .await
             .unwrap_or(false)
-            && !is_repo_owner(&record, &auth.0)
+            && !crate::api::did_matches(&auth.0, &record.owner_did)
         {
             tracing::warn!(
                 branch = %branch,
@@ -725,6 +738,15 @@ pub async fn git_receive_pack(
         let ipfs_api = state.config.ipfs_api.clone();
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
+        let rules_for_enc = rules_opt.clone();
+        let repo_id = record.id.clone();
+        let owner_did = record.owner_did.clone();
+        let is_public = record.is_public;
+        let irys_url = state.config.irys_url.clone();
+        let http_client = std::sync::Arc::clone(&state.http_client);
+        let node_did_str = state.node_did.to_string();
+        let node_seed = state.node_keypair.to_seed();
+        let repo_name = record.name.clone();
         tokio::spawn(async move {
             let pinned = crate::ipfs_pin::pin_new_objects(
                 &ipfs_api,
@@ -737,6 +759,65 @@ pub async fn git_receive_pack(
                 tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
                 for (sha, cid) in &pinned {
                     tracing::info!(sha = %sha, %cid, "pinned");
+                }
+            }
+
+            // Option B1: encrypt-then-pin the withheld blobs so authorized
+            // readers can recover them when the origin cannot serve them.
+            if let Some(rules) = rules_for_enc.filter(|r| !r.is_empty()) {
+                let p = repo_path_clone.clone();
+                let owner = owner_did.clone();
+                let recip = tokio::task::spawn_blocking(move || {
+                    crate::git::visibility_pack::withheld_blob_recipients(
+                        &p, &rules, is_public, &owner,
+                    )
+                })
+                .await;
+                if let Ok(Ok(recipients)) = recip {
+                    let delta = crate::encrypted_pin::encrypt_and_pin(
+                        &ipfs_api,
+                        &repo_path_clone,
+                        &db_clone,
+                        &repo_id,
+                        &node_seed,
+                        &recipients,
+                    )
+                    .await;
+
+                    // Option B3: anchor a per-push manifest of the blobs sealed
+                    // this push to Arweave, so the oid->cid index survives total
+                    // node loss. Best-effort; never fails the push.
+                    if !delta.is_empty() && !irys_url.is_empty() {
+                        let owner_short = owner_did.split(':').next_back().unwrap_or(&owner_did);
+                        let repo_slug = format!("{owner_short}/{repo_name}");
+                        let ts = chrono::Utc::now().to_rfc3339();
+                        let manifest = crate::arweave::EncryptedManifest {
+                            repo: &repo_slug,
+                            owner_did: &owner_did,
+                            node_did: &node_did_str,
+                            timestamp: &ts,
+                            blobs: &delta,
+                        };
+                        match crate::arweave::anchor_encrypted_manifest(
+                            &http_client,
+                            &irys_url,
+                            &manifest,
+                        )
+                        .await
+                        {
+                            Ok(tx) if !tx.is_empty() => tracing::info!(
+                                repo = %repo_slug,
+                                tx_id = %tx,
+                                "anchored encrypted manifest to Arweave"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                repo = %repo_slug,
+                                err = %e,
+                                "encrypted manifest anchor failed"
+                            ),
+                        }
+                    }
                 }
             }
         });
@@ -955,12 +1036,11 @@ pub async fn git_receive_pack(
 pub async fn list_refs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let _record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (_record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let repo_slug = format!("{owner}/{repo}");
     let refs = state.db.list_branch_cids(&repo_slug).await?;
@@ -1063,11 +1143,10 @@ pub async fn fork_repo(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<ForkRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
-    let source = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // Enforce read visibility on the source before cloning: an unauthorized
+    // caller must not be able to fork (full mirror) a repo they cannot read.
+    let (source, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let fork_name = req.name.unwrap_or_else(|| source.name.clone());
     let forker_did = auth.0;
@@ -1240,7 +1319,7 @@ fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64
 #[cfg(test)]
 mod tests {
     use super::owner_push_rejection;
-    use crate::auth::{caller_authorized_to_push, is_repo_owner};
+    use crate::auth::caller_authorized_to_push;
     use crate::error::AppError;
 
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
@@ -1306,14 +1385,6 @@ mod tests {
         let repo = repo_owned_by(OWNER_DID);
         assert!(owner_push_rejection(false, &repo, Some(STRANGER_DID)).is_none());
         assert!(owner_push_rejection(false, &repo, None).is_none());
-    }
-
-    #[test]
-    fn is_repo_owner_matches_full_and_short_did_only() {
-        let repo = repo_owned_by(OWNER_DID);
-        assert!(is_repo_owner(&repo, OWNER_DID));
-        assert!(is_repo_owner(&repo, OWNER_SHORT));
-        assert!(!is_repo_owner(&repo, STRANGER_DID));
     }
 
     #[test]

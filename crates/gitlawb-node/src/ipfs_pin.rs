@@ -72,6 +72,19 @@ pub async fn pin_git_object(ipfs_api: &str, sha256_hex: &str, data: &[u8]) -> Re
     Ok(cid)
 }
 
+/// Fetch raw bytes for a CID from the local Kubo node (`/api/v0/cat`).
+pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
+    if ipfs_api.is_empty() {
+        return Err(anyhow::anyhow!("IPFS not configured"));
+    }
+    let url = format!("{}/api/v0/cat?arg={}", ipfs_api.trim_end_matches('/'), cid);
+    let resp = reqwest::Client::new().post(&url).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!("ipfs cat {cid}: {}", resp.status()));
+    }
+    Ok(resp.bytes().await?.to_vec())
+}
+
 /// List all git objects in the given bare repo and pin any that are not yet
 /// recorded in `pinned_cids`.
 ///

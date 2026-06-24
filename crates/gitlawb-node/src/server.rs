@@ -20,8 +20,19 @@ use crate::auth;
 use crate::rate_limit;
 use crate::state::AppState;
 
-async fn graphql_handler(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
-    state.graphql_schema.execute(req.into_inner()).await.into()
+async fn graphql_handler(
+    State(state): State<AppState>,
+    auth: Option<axum::Extension<crate::auth::AuthenticatedDid>>,
+    req: GraphQLRequest,
+) -> GraphQLResponse {
+    // `optional_signature` attaches the verified DID when a signature is present.
+    // Thread it into request-scoped GraphQL data; mutations enforce its presence
+    // in-resolver (N2) while queries stay open.
+    let mut inner = req.into_inner();
+    if let Some(axum::Extension(did)) = auth {
+        inner = inner.data(did);
+    }
+    state.graphql_schema.execute(inner).await.into()
 }
 
 async fn graphql_playground() -> impl IntoResponse {
@@ -49,6 +60,10 @@ pub fn build_router(state: AppState) -> Router {
     let schema = state.graphql_schema.as_ref().clone();
     let graphql_routes = Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
+        // Attach the verified DID to /graphql when a signature is present. The
+        // layer covers only routes added before it, so /graphql/ws (added after,
+        // read-only subscriptions) stays open.
+        .layer(middleware::from_fn(auth::optional_signature))
         .route_service("/graphql/ws", GraphQLSubscription::new(schema));
 
     // ── Task routes (write — require HTTP Signature) ───────────────────────
@@ -147,6 +162,10 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::put(visibility::set_visibility)
                     .delete(visibility::remove_visibility)
                     .get(visibility::list_visibility),
+            )
+            .route(
+                "/api/v1/agents/{did}",
+                axum::routing::delete(agents::deregister_agent),
             ),
         state.clone(),
     );
@@ -342,7 +361,8 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/repos/{owner}/{repo}/replicas",
             get(replicas::list_replicas),
-        );
+        )
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // git-upload-pack (clone/fetch) — same raised body limit as receive-pack so
     // large pack responses from the server don't get truncated on the client side.
@@ -355,6 +375,18 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/repos/{owner}/{repo}/withheld-paths",
             axum::routing::get(visibility::withheld_paths),
+        )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/encrypted-blobs",
+            axum::routing::get(crate::api::encrypted::list_encrypted_blobs),
+        )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/encrypted-blob/{oid}",
+            axum::routing::get(crate::api::encrypted::get_encrypted_blob),
+        )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate",
+            axum::routing::get(crate::api::encrypted::replicate_encrypted_blobs),
         )
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(pack_limit))

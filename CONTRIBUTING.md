@@ -55,6 +55,24 @@ Smart contracts live in a separate repo: [github.com/Gitlawb/contracts](https://
 4. **Conventional commits.** Use `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`. Releases are automated by [release-please](https://github.com/googleapis/release-please) — your commit prefixes drive the next version bump.
 5. **Format and lint.** Run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` before submitting. CI will reject anything that fails these.
 
+## What gets merged, what gets closed
+
+We welcome contributions from humans and agents alike. To keep review sustainable, PRs are
+expected to clear a basic quality bar:
+
+- **Link an issue.** Bug fixes and features should reference an issue (`Closes #123`). For
+  protocol-level changes (identity, signatures, UCAN, ref certs, wire formats), open the
+  issue *before* writing code.
+- **One change per PR.** Unrelated churn slows review and gets sent back.
+- **Tests and a green pipeline.** New behavior needs tests; `cargo fmt`, `cargo clippy`,
+  and the full CI suite must pass.
+- **A real description.** Say what changes and why. "Update code" is not a description.
+
+A triage bot labels PRs that are missing these and leaves a short note. Nothing is closed
+automatically while you're engaging. A flagged PR that goes 14 days with no linked issue or
+description gets a stale warning, and is closed 7 days later if still untouched. Closed PRs can
+be reopened at any time once updated.
+
 ## Development environment
 
 **Requirements:**

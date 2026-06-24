@@ -5,6 +5,7 @@ mod bootstrap;
 mod cert;
 mod config;
 mod db;
+mod encrypted_pin;
 mod error;
 mod git;
 mod graphql;
@@ -17,6 +18,8 @@ mod rate_limit;
 mod server;
 mod state;
 mod sync;
+#[cfg(test)]
+mod test_support;
 mod visibility;
 mod webhooks;
 
@@ -97,6 +100,15 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Prune peer rows with non-public hosts (loopback/private/internal) that
+    // were injected via the unauthenticated announce route — they poison the
+    // sync-notify fan-out (SSRF + crowding out real peers).
+    match db.prune_non_public_peers().await {
+        Ok(0) => {}
+        Ok(n) => info!(removed = n, "pruned non-public (poisoned) peer rows"),
+        Err(e) => warn!(err = %e, "prune_non_public_peers failed (non-fatal)"),
+    }
+
     // Ensure repos directory exists
     std::fs::create_dir_all(&config.repos_dir).context("failed to create repos directory")?;
 
@@ -132,9 +144,14 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Do not follow redirects: this client fans out to peer-supplied URLs
+    // (sync trigger, profile/repo fetches). A peer answering `302 Location:
+    // http://127.0.0.1/` would otherwise bypass the announce-time public-URL
+    // check and turn the redirect into an SSRF.
     let http_client = Arc::new(
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
     );
 

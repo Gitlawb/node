@@ -40,6 +40,78 @@ pub struct PeerResponse {
     pub reachable: bool,
 }
 
+/// Whether a peer `http_url` is a public http(s) endpoint safe to register.
+/// Rejects non-http(s) schemes, loopback/unspecified/private/link-local IPs,
+/// and `localhost` / `.local` / `.internal` hostnames. Used at announce time
+/// and by the boot-time prune of already-poisoned rows.
+pub fn is_public_http_url(raw: &str) -> bool {
+    let url = match reqwest::Url::parse(raw) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let mut host = match url.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return false,
+    };
+    // Drop a single trailing dot (FQDN root): `localhost.` resolves the same as
+    // `localhost`, so normalize before the suffix/equality checks below.
+    if let Some(stripped) = host.strip_suffix('.') {
+        host = stripped.to_string();
+    }
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return false;
+    }
+    // host_str() keeps brackets on IPv6 literals (e.g. "[::1]"); strip them
+    // before parsing as an IP.
+    let ip_candidate = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = ip_candidate.parse::<std::net::IpAddr>() {
+        // Reject loopback/unspecified on the literal as given — catches `::1`
+        // and `::` before the IPv4-folding below (`::1`.to_ipv4() would
+        // otherwise map to a non-loopback `0.0.0.1`).
+        if ip.is_loopback() || ip.is_unspecified() {
+            return false;
+        }
+        // Fold IPv4-mapped/compatible IPv6 (`::ffff:127.0.0.1`, `::127.0.0.1`)
+        // down to IPv4 so the v4 range checks catch loopback/private addresses
+        // smuggled in via an IPv6 literal, then re-check loopback/unspecified.
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .or_else(|| v6.to_ipv4())
+                .map(std::net::IpAddr::V4)
+                .unwrap_or(ip),
+            v4 => v4,
+        };
+        if ip.is_loopback() || ip.is_unspecified() {
+            return false;
+        }
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                // RFC1918 private, link-local, or CGNAT (100.64.0.0/10).
+                if v4.is_private() || v4.is_link_local() || (o[0] == 100 && (o[1] & 0xc0) == 64) {
+                    return false;
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                let s = v6.segments();
+                // fc00::/7 (unique-local) or fe80::/10 (link-local)
+                if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// GET /api/v1/peers
 pub async fn list_peers(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let peers = state.db.list_peers().await?;
@@ -83,10 +155,14 @@ pub async fn announce(
         );
     }
 
-    // Validate the URL is HTTP/HTTPS
-    if !req.http_url.starts_with("http://") && !req.http_url.starts_with("https://") {
+    // Validate the URL is a public http(s) endpoint. The announce route is
+    // reachable unauthenticated (until all peers sign), so without this an
+    // attacker can register loopback/private "peers" (localhost:5432, etc.)
+    // and turn our outbound sync-notify fan-out into an SSRF probe — and bury
+    // the real peers under junk so node-origin repos stop replicating.
+    if !is_public_http_url(&req.http_url) {
         return Err(AppError::BadRequest(
-            "http_url must start with http:// or https://".into(),
+            "http_url must be a public http(s) URL (no loopback, private, or .internal/.local hosts)".into(),
         ));
     }
 
@@ -311,7 +387,13 @@ pub async fn ping_peer(
 
     // Async ping
     let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-    let ok = reqwest::get(&url)
+    // Use the shared no-redirect client: bare `reqwest::get` follows redirects,
+    // so a peer could answer with `302 -> http://127.0.0.1/` and turn the ping
+    // into an SSRF probe.
+    let ok = state
+        .http_client
+        .get(&url)
+        .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false);
@@ -323,4 +405,55 @@ pub async fn ping_peer(
         "http_url": peer.http_url,
         "reachable": ok,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_public_http_url;
+
+    #[test]
+    fn accepts_public_https_and_http() {
+        assert!(is_public_http_url("https://node.gitlawb.com"));
+        assert!(is_public_http_url("https://manila.gitlawb.com/"));
+        assert!(is_public_http_url("http://203.0.113.10:7545"));
+    }
+
+    #[test]
+    fn rejects_loopback_private_and_internal() {
+        for bad in [
+            "http://localhost:7545",
+            "http://127.0.0.1:5432/",
+            "http://localhost:22/",
+            "http://0.0.0.0:7545",
+            "http://10.0.0.5:7545",
+            "http://192.168.1.10/",
+            "http://172.16.0.1:7545",
+            "http://169.254.1.1/",
+            "http://[::1]:7545",
+            "http://gitlawb-node.internal:7545",
+            "http://my-node.local/",
+            "ftp://node.gitlawb.com",
+            "not-a-url",
+            "",
+            // Trailing-dot FQDN of an internal host.
+            "http://localhost./",
+            // CGNAT (100.64.0.0/10).
+            "http://100.64.0.1:7545",
+            "http://100.127.255.255/",
+            // IPv4-mapped / IPv4-compatible IPv6 smuggling private/loopback v4.
+            "http://[::ffff:127.0.0.1]:7545",
+            "http://[::ffff:10.0.0.1]/",
+            "http://[::ffff:192.168.1.1]:7545",
+            "http://[::127.0.0.1]/",
+        ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn accepts_public_outside_cgnat_range() {
+        // 100.0.0.0/10 boundary: .63 and .128 are public, only 100.64-127 is CGNAT.
+        assert!(is_public_http_url("http://100.63.255.255:7545"));
+        assert!(is_public_http_url("http://100.128.0.1/"));
+    }
 }

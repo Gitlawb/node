@@ -40,11 +40,11 @@ pub async fn create_pr(
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<CreatePrRequest>,
 ) -> Result<(StatusCode, Json<PullRequest>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // Authorize the caller as a reader before accepting a PR: a non-reader must
+    // not be able to open a PR (and fire its webhooks) against a private repo
+    // they cannot read. Mirrors create_review / create_comment / create_bounty.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let author_did = auth.0;
     let target_branch = req
@@ -101,12 +101,11 @@ pub async fn create_pr(
 pub async fn list_prs(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let prs = state.db.list_prs(&record.id).await?;
     Ok(Json(
@@ -118,12 +117,11 @@ pub async fn list_prs(
 pub async fn get_pr(
     State(state): State<AppState>,
     Path((owner, name, number)): Path<(String, String, i64)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<PullRequest>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let pr = state
         .db
@@ -138,12 +136,11 @@ pub async fn get_pr(
 pub async fn get_pr_diff(
     State(state): State<AppState>,
     Path((owner, name, number)): Path<(String, String, i64)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let pr = state
         .db
@@ -156,6 +153,25 @@ pub async fn get_pr_diff(
         .acquire(&record.owner_did, &record.name)
         .await
         .map_err(|e| AppError::Git(e.to_string()))?;
+
+    // Withhold the entire diff if it touches a path the caller cannot read, so a
+    // PR diff cannot leak private-subtree content of an otherwise-public repo.
+    let touched = store::branch_diff_names(&disk_path, &pr.target_branch, &pr.source_branch)
+        .map_err(|e| AppError::Git(e.to_string()))?;
+    for p in &touched {
+        let gate = format!("/{}", p.trim_start_matches('/'));
+        if crate::visibility::visibility_check(
+            &rules,
+            record.is_public,
+            &record.owner_did,
+            caller,
+            &gate,
+        ) == crate::visibility::Decision::Deny
+        {
+            return Err(AppError::NotFound(format!("PR #{number} not found")));
+        }
+    }
+
     let diff = store::branch_diff(&disk_path, &pr.target_branch, &pr.source_branch)
         .map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -177,6 +193,11 @@ pub async fn merge_pr(
         .get_repo(&owner, &name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+
+    // Owner-only merge (N7). Merging writes the served tree, so this is the same
+    // trust boundary as owner-only push; it subsumes branch protection (a
+    // non-owner cannot merge to any branch, protected or not).
+    crate::api::require_repo_owner(&record, &auth.0)?;
 
     let pr = state
         .db
@@ -236,6 +257,7 @@ pub async fn merge_pr(
 /// POST /api/v1/repos/:owner/:repo/pulls/:number/close
 pub async fn close_pr(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, number)): Path<(String, String, i64)>,
 ) -> Result<Json<serde_json::Value>> {
     let record = state
@@ -249,6 +271,15 @@ pub async fn close_pr(
         .get_pr(&record.id, number)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("PR #{number} not found")))?;
+
+    // Owner OR author may close (forge norm).
+    let is_owner = crate::api::require_repo_owner(&record, &auth.0).is_ok();
+    let is_author = crate::api::did_matches(&auth.0, &pr.author_did);
+    if !is_owner && !is_author {
+        return Err(AppError::Forbidden(
+            "only the repo owner or the PR author can close this PR".into(),
+        ));
+    }
 
     state.db.close_pr(&pr.id).await?;
 
@@ -274,11 +305,9 @@ pub async fn create_review(
     Path((owner, name, number)): Path<(String, String, i64)>,
     Json(req): Json<CreateReviewRequest>,
 ) -> Result<(StatusCode, Json<PrReview>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // Read-gate: a reviewer must be able to read the repo, but need not own it.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let pr = state
         .db
@@ -324,12 +353,11 @@ pub async fn create_review(
 pub async fn list_reviews(
     State(state): State<AppState>,
     Path((owner, name, number)): Path<(String, String, i64)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let pr = state
         .db
@@ -354,11 +382,9 @@ pub async fn create_comment(
         ));
     }
 
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // Read-gate: a commenter must be able to read the repo, but need not own it.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
 
     let pr = state
         .db
@@ -383,12 +409,11 @@ pub async fn create_comment(
 pub async fn list_comments(
     State(state): State<AppState>,
     Path((owner, name, number)): Path<(String, String, i64)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let pr = state
         .db

@@ -12,6 +12,7 @@
 //!   5. On success, register ourselves as a replica with the origin node so
 //!      its `replica_count` reflects reality (best-effort, idempotent).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,20 +32,89 @@ enum MirrorMode {
     Promisor,
 }
 
-/// Decide the mirror mode from the origin's `withheld-paths` response.
+/// The on-disk promisor state of an existing mirror, read from
+/// `remote.origin.promisor`. Three-valued so a git error is not mistaken for a
+/// definitive "not a promisor": `git config --get` collapses "key absent" and
+/// "git failed" into the same non-zero exit otherwise, and treating an errored
+/// probe as `NotPromisor` would let a transient failure downgrade a still-withheld
+/// mirror (issue #48).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromisorProbe {
+    /// `remote.origin.promisor` is `"true"`.
+    Promisor,
+    /// The key is absent (git exit 1) or set to a non-`true` value.
+    NotPromisor,
+    /// The probe itself failed (git spawn error or other non-zero exit).
+    Unknown,
+}
+
+/// Decide the mirror mode from the origin's `withheld-paths` response plus, when
+/// the response is unknown, the existing mirror's on-disk promisor state.
 ///
 /// `Some(non-empty)` → the repo has a private subtree → `Promisor`.
 /// `Some(empty)`     → fully public → `Plain`.
-/// `None`            → the lookup 404'd or failed. Attempt a `Plain` mirror; a
-///                     mode-A repo also 404s the git read endpoint, so the clone
-///                     fails and nothing is mirrored (fail-closed at the git
-///                     layer), while a public repo on a peer that predates the
-///                     `withheld-paths` route still gets mirrored.
-fn classify_mirror(withheld: Option<Vec<String>>) -> MirrorMode {
+/// `None`            → the lookup 404'd or failed; the answer is *unknown*, which
+///                     is not the same as "public". For a fresh clone this stays
+///                     `Plain` (a mode-A repo also 404s the git read endpoint, so
+///                     the clone fails and nothing is mirrored — fail-closed at the
+///                     git layer — while a public repo on a peer that predates the
+///                     `withheld-paths` route still gets mirrored). For an existing
+///                     mirror it *biases toward preserving* the promisor state: a
+///                     genuine public transition returns `Some(empty)`, so on
+///                     `None` we cannot distinguish "still withheld, unreachable"
+///                     from "newly public, unreachable" and prefer the recoverable
+///                     choice over destroying the partial-clone config. An
+///                     indeterminate probe (`Unknown`) preserves for the same
+///                     reason (defense-in-depth, #48).
+fn resolve_mirror_mode(
+    withheld: Option<Vec<String>>,
+    exists: bool,
+    promisor: PromisorProbe,
+) -> MirrorMode {
     match withheld {
         Some(globs) if !globs.is_empty() => MirrorMode::Promisor,
-        _ => MirrorMode::Plain,
+        Some(_) => MirrorMode::Plain,
+        None if exists && promisor != PromisorProbe::NotPromisor => MirrorMode::Promisor,
+        None => MirrorMode::Plain,
     }
+}
+
+/// One encrypted blob as advertised by an origin's `encrypted-blobs/replicate`
+/// endpoint (Option B2). Ciphertext metadata only; recipient identities are
+/// withheld from peers, so a re-seal is detected by the CID changing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct ReplicaBlob {
+    oid: String,
+    cid: String,
+}
+
+/// The shape of the `encrypted-blobs/replicate` JSON response.
+#[derive(Debug, serde::Deserialize)]
+struct ReplicateResponse {
+    #[serde(default)]
+    blobs: Vec<ReplicaBlob>,
+}
+
+/// Decide which of the origin's encrypted blobs this mirror must (re)replicate.
+///
+/// `have` maps each already-stored blob's oid to the CID the mirror pinned. A
+/// remote blob is returned when the mirror has no row for that oid, or when the
+/// stored CID differs from the advertised one. A re-seal regenerates the
+/// envelope (new content key, nonce, and per-recipient wraps), so the CID
+/// changes while the OID stays stable; comparing CIDs detects a re-seal without
+/// the mirror ever holding recipient identities.
+fn blobs_needing_replication(
+    remote: &[ReplicaBlob],
+    have: &HashMap<String, String>,
+) -> Vec<ReplicaBlob> {
+    remote
+        .iter()
+        .filter(|b| match have.get(&b.oid) {
+            None => true,
+            Some(stored_cid) => stored_cid != &b.cid,
+        })
+        .cloned()
+        .collect()
 }
 
 /// Start the background sync worker. Returns immediately; the worker runs
@@ -70,10 +140,17 @@ async fn run(
     let machine_id = std::env::var("FLY_MACHINE_ID").ok();
     // Bound each peer HTTP call (withheld-paths lookup + replica registration)
     // so a stalled peer cannot hang the worker.
+    // No redirects: peer URLs are attacker-influenceable, so a 3xx to a
+    // loopback/private address must not be followed (SSRF guard, matching the
+    // shared http_client and announce-time validation).
+    // Panic rather than fall back to reqwest::Client::new(): the default
+    // builder follows redirects, which would silently reintroduce the SSRF
+    // vector Policy::none() is here to close.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("failed to build no-redirect sync HTTP client");
     info!("sync worker started (auto_sync=true)");
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
@@ -91,6 +168,17 @@ async fn run(
     }
 }
 
+/// Find the origin node's base HTTP URL for a sync item, trimming any trailing
+/// slash so callers can append `/{path}` cleanly. Returns `None` when no peer
+/// row matches the item's origin DID. Kept pure (no DB) so the per-batch peer
+/// resolution can be unit-tested without a database.
+fn resolve_origin_url(peers: &[crate::db::PeerRecord], node_did: &str) -> Option<String> {
+    peers
+        .iter()
+        .find(|p| p.did == node_did)
+        .map(|p| p.http_url.trim_end_matches('/').to_string())
+}
+
 async fn process_batch(
     db: &Db,
     config: &Config,
@@ -106,19 +194,27 @@ async fn process_batch(
         }
     };
 
-    for item in items {
-        // Resolve origin node HTTP URL from peer table
-        let peers = match db.list_peers().await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(err = %e, "failed to list peers for sync");
-                let _ = db.mark_sync_failed(&item.id).await;
-                continue;
-            }
-        };
+    // Nothing queued — the common case on the 30s idle poll. Bail before the
+    // peer lookup so an empty batch costs zero extra DB round-trips.
+    if items.is_empty() {
+        return;
+    }
 
-        let origin_url = match peers.iter().find(|p| p.did == item.node_did) {
-            Some(p) => p.http_url.trim_end_matches('/').to_string(),
+    // Resolve the peer table once per batch — every item only needs a lookup.
+    let peers = match db.list_peers().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(err = %e, "failed to list peers for sync");
+            for item in &items {
+                let _ = db.mark_sync_failed(&item.id).await;
+            }
+            return;
+        }
+    };
+
+    for item in items {
+        let origin_url = match resolve_origin_url(&peers, &item.node_did) {
+            Some(url) => url,
             None => {
                 warn!(node_did = %item.node_did, repo = %item.repo, "no peer URL found for sync origin — skipping");
                 let _ = db.mark_sync_failed(&item.id).await;
@@ -147,9 +243,30 @@ async fn process_batch(
         let remote_url = format!("{}/{}", origin_url, item.repo);
 
         let withheld = fetch_withheld(client, &origin_url, owner_short, repo_name).await;
-        let mode = classify_mirror(withheld);
+        let exists = local_path.exists();
+        let lookup_unknown = withheld.is_none();
+        // Only probe the on-disk promisor state when the lookup is unknown and the
+        // repo already exists — the sole case where it changes the resolved mode.
+        let promisor = if lookup_unknown && exists {
+            let local_str = local_path.to_str().unwrap_or(".");
+            existing_promisor_state(local_str).await
+        } else {
+            PromisorProbe::NotPromisor
+        };
+        let mode = resolve_mirror_mode(withheld, exists, promisor);
+        // Surface the case where an unknown withheld-paths lookup kept (or, on an
+        // indeterminate probe, defensively applied) promisor mode instead of
+        // downgrading to a full clone. Derived from the resolved mode so it cannot
+        // drift from resolve_mirror_mode's preserve branch.
+        if lookup_unknown && mode == MirrorMode::Promisor {
+            warn!(
+                repo = %item.repo,
+                origin = %origin_url,
+                "withheld-paths lookup unavailable; using promisor mirror mode to avoid an unsafe full-clone downgrade"
+            );
+        }
 
-        let result = if local_path.exists() {
+        let result = if exists {
             fetch_repo(&local_path, &remote_url, mode).await
         } else {
             clone_repo(&remote_url, &local_path, mode).await
@@ -167,6 +284,20 @@ async fn process_batch(
                         machine_id,
                     )
                     .await;
+                // Option B2: carry the encrypted withheld-blob envelopes too, so an
+                // authorized reader can recover private content from this mirror if
+                // the origin dies. `item.repo` is the slug "{owner_short}/{name}",
+                // which is the id upsert_mirror_repo wrote (the local repo_id).
+                replicate_encrypted_blobs(
+                    client,
+                    &origin_url,
+                    owner_short,
+                    repo_name,
+                    db,
+                    &item.repo,
+                    &config.ipfs_api,
+                )
+                .await;
                 let _ = db.mark_sync_done(&item.id).await;
                 crate::metrics::record_sync_processed("done");
 
@@ -194,7 +325,7 @@ async fn process_batch(
 
 /// Query the origin's anonymous `withheld-paths` endpoint. Returns the withheld
 /// glob list on a 2xx, or `None` on any non-success / network / parse error
-/// (treated as "unknown" by `classify_mirror`).
+/// (treated as "unknown" by `resolve_mirror_mode`).
 async fn fetch_withheld(
     client: &reqwest::Client,
     origin_url: &str,
@@ -277,6 +408,81 @@ async fn register_replica_with_origin(
     }
 }
 
+/// Replicate the origin's encrypted withheld blobs onto this mirror (Option B2).
+///
+/// After the git objects are mirrored, fetch the origin's replication listing,
+/// then for each blob the mirror does not already hold (or whose CID changed,
+/// i.e. the origin re-sealed) pull the ciphertext envelope over IPFS, pin it
+/// locally, and record the `encrypted_blobs` row keyed by this mirror's local
+/// `repo_id`. The mirror stores no recipient identities.
+///
+/// Best-effort and idempotent: any per-blob failure is logged and skipped, to be
+/// retried on the next sync. Confidentiality is never at risk; the mirror only
+/// ever handles ciphertext and never decrypts. Cleanly a no-op when IPFS is
+/// unconfigured, the origin reports no encrypted blobs, or the replicate endpoint
+/// is absent (older peer) or unreachable.
+async fn replicate_encrypted_blobs(
+    client: &reqwest::Client,
+    origin_url: &str,
+    owner: &str,
+    repo: &str,
+    db: &Db,
+    repo_id: &str,
+    ipfs_api: &str,
+) {
+    if ipfs_api.is_empty() {
+        return;
+    }
+
+    let url = format!("{origin_url}/api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate");
+    let resp = match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return,
+    };
+    let parsed: ReplicateResponse = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(repo = %repo, err = %e, "failed to parse encrypted-blobs/replicate response");
+            return;
+        }
+    };
+    if parsed.blobs.is_empty() {
+        return;
+    }
+
+    let have: HashMap<String, String> = match db.list_all_encrypted_blobs(repo_id).await {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(e) => {
+            warn!(repo = %repo, err = %e, "failed to list local encrypted blobs for replication");
+            return;
+        }
+    };
+
+    for blob in blobs_needing_replication(&parsed.blobs, &have) {
+        let envelope = match crate::ipfs_pin::cat(ipfs_api, &blob.cid).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(oid = %blob.oid, cid = %blob.cid, err = %e, "failed to fetch encrypted envelope over IPFS; will retry next sync");
+                continue;
+            }
+        };
+        match crate::ipfs_pin::pin_git_object(ipfs_api, &blob.oid, &envelope).await {
+            Ok(cid) if !cid.is_empty() => {
+                if cid != blob.cid {
+                    warn!(oid = %blob.oid, expected = %blob.cid, got = %cid, "replicated envelope CID mismatch; skipping record");
+                    continue;
+                }
+                if let Err(e) = db.record_encrypted_blob(repo_id, &blob.oid, &cid, "").await {
+                    warn!(oid = %blob.oid, err = %e, "failed to record replicated encrypted blob");
+                }
+            }
+            _ => {
+                warn!(oid = %blob.oid, "failed to pin replicated encrypted envelope; will retry next sync");
+            }
+        }
+    }
+}
+
 /// Run a git subprocess, returning an error with stderr on non-zero exit.
 async fn git_run(args: &[&str]) -> anyhow::Result<()> {
     let out = tokio::process::Command::new("git")
@@ -312,6 +518,38 @@ async fn git_config_get(repo: &str, key: &str) -> Option<String> {
     }
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!value.is_empty()).then_some(value)
+}
+
+/// Probe an existing mirror's `remote.origin.promisor` config as a three-valued
+/// state. Unlike [`git_config_get`], this distinguishes a definitively-absent key
+/// from a probe failure so a transient git error cannot be read as "not a
+/// promisor" and trigger a downgrade (issue #48).
+///
+/// `git config --get` exits 0 when the key is set, 1 when it is absent (or the
+/// directory is not a git repo) — both definitive `NotPromisor` — and other
+/// non-zero codes (e.g. 128 for a bad path or unreadable config) on error. A spawn
+/// failure or any non-{0,1} exit is `Unknown`.
+async fn existing_promisor_state(repo: &str) -> PromisorProbe {
+    let out = match tokio::process::Command::new("git")
+        .args(["-C", repo, "config", "--get", "remote.origin.promisor"])
+        .output()
+        .await
+    {
+        Ok(out) => out,
+        Err(_) => return PromisorProbe::Unknown,
+    };
+    match out.status.code() {
+        Some(0) => {
+            let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if value == "true" {
+                PromisorProbe::Promisor
+            } else {
+                PromisorProbe::NotPromisor
+            }
+        }
+        Some(1) => PromisorProbe::NotPromisor,
+        _ => PromisorProbe::Unknown,
+    }
 }
 
 /// Mirror-clone a repo from a remote URL into a local bare repo.
@@ -404,23 +642,118 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn classify_promisor_when_withheld_nonempty() {
-        let mode = classify_mirror(Some(vec!["/secret/**".to_string()]));
+    fn resolve_promisor_when_withheld_nonempty() {
+        let mode = resolve_mirror_mode(
+            Some(vec!["/secret/**".to_string()]),
+            true,
+            PromisorProbe::NotPromisor,
+        );
         assert!(matches!(mode, MirrorMode::Promisor));
     }
 
     #[test]
-    fn classify_plain_when_withheld_empty() {
-        let mode = classify_mirror(Some(vec![]));
+    fn resolve_plain_when_withheld_empty() {
+        // A genuine public transition returns Some(empty) and still downgrades,
+        // regardless of whether the mirror exists or was a promisor.
+        for exists in [true, false] {
+            for probe in [
+                PromisorProbe::Promisor,
+                PromisorProbe::NotPromisor,
+                PromisorProbe::Unknown,
+            ] {
+                let mode = resolve_mirror_mode(Some(vec![]), exists, probe);
+                assert!(matches!(mode, MirrorMode::Plain));
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_preserves_promisor_on_unknown_lookup_for_existing_mirror() {
+        // Regression for #48: a transient withheld-paths outage (None) must NOT
+        // downgrade a still-withheld promisor mirror to a full clone.
+        let mode = resolve_mirror_mode(None, true, PromisorProbe::Promisor);
+        assert!(matches!(mode, MirrorMode::Promisor));
+    }
+
+    #[test]
+    fn resolve_preserves_promisor_on_indeterminate_probe() {
+        // Defense-in-depth (#48): if the config probe itself fails (Unknown) in the
+        // same cycle as a withheld-paths outage, bias toward preserving rather than
+        // firing the destructive downgrade.
+        let mode = resolve_mirror_mode(None, true, PromisorProbe::Unknown);
+        assert!(matches!(mode, MirrorMode::Promisor));
+    }
+
+    #[test]
+    fn resolve_plain_when_unknown_lookup_for_non_promisor_mirror() {
+        // An existing non-promisor mirror is unaffected by the preserve branch.
+        let mode = resolve_mirror_mode(None, true, PromisorProbe::NotPromisor);
         assert!(matches!(mode, MirrorMode::Plain));
     }
 
     #[test]
-    fn classify_plain_when_lookup_failed() {
-        // None == 404 / network error / parse failure: attempt a plain mirror
-        // and let the git read endpoint fail-close a mode-A repo.
-        let mode = classify_mirror(None);
-        assert!(matches!(mode, MirrorMode::Plain));
+    fn resolve_plain_when_unknown_lookup_for_fresh_clone() {
+        // No local mirror yet: None stays Plain (fail-closed at the git layer).
+        for probe in [
+            PromisorProbe::Promisor,
+            PromisorProbe::NotPromisor,
+            PromisorProbe::Unknown,
+        ] {
+            let mode = resolve_mirror_mode(None, false, probe);
+            assert!(matches!(mode, MirrorMode::Plain));
+        }
+    }
+
+    fn rb(oid: &str, cid: &str) -> ReplicaBlob {
+        ReplicaBlob {
+            oid: oid.to_string(),
+            cid: cid.to_string(),
+        }
+    }
+
+    #[test]
+    fn replicate_stores_new_blob() {
+        let remote = vec![rb("oid1", "cidA")];
+        let have = HashMap::new();
+        assert_eq!(blobs_needing_replication(&remote, &have), remote);
+    }
+
+    #[test]
+    fn replicate_skips_already_present_same_cid() {
+        let remote = vec![rb("oid1", "cidA")];
+        let mut have = HashMap::new();
+        have.insert("oid1".to_string(), "cidA".to_string());
+        assert!(blobs_needing_replication(&remote, &have).is_empty());
+    }
+
+    #[test]
+    fn replicate_restores_on_cid_change() {
+        // The origin re-sealed: same oid, new envelope, new cid.
+        let remote = vec![rb("oid1", "cidB")];
+        let mut have = HashMap::new();
+        have.insert("oid1".to_string(), "cidA".to_string());
+        assert_eq!(blobs_needing_replication(&remote, &have), remote);
+    }
+
+    #[test]
+    fn replicate_empty_remote_is_noop() {
+        assert!(blobs_needing_replication(&[], &HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn replicate_response_parses() {
+        // An older origin may still send a recipients field; it must be ignored.
+        let json = r#"{"blobs":[{"oid":"o1","cid":"c1","recipients":["did:key:zA"]}]}"#;
+        let parsed: ReplicateResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.blobs.len(), 1);
+        assert_eq!(parsed.blobs[0].oid, "o1");
+        assert_eq!(parsed.blobs[0].cid, "c1");
+    }
+
+    #[test]
+    fn replicate_response_empty_blobs_parses() {
+        let parsed: ReplicateResponse = serde_json::from_str(r#"{"blobs":[]}"#).unwrap();
+        assert!(parsed.blobs.is_empty());
     }
 
     fn g(args: &[&str], dir: &Path) {
@@ -511,6 +844,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_reports_promisor_for_promisor_mirror() {
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Promisor).await.unwrap();
+
+        let probe = existing_promisor_state(dest.to_str().unwrap()).await;
+        assert_eq!(probe, PromisorProbe::Promisor);
+    }
+
+    #[tokio::test]
+    async fn probe_reports_not_promisor_when_key_absent() {
+        // A plain mirror never sets remote.origin.promisor, so `git config --get`
+        // exits 1 (key absent) — the probe must read that as NotPromisor, never
+        // Unknown (which would wrongly preserve and upgrade a plain mirror).
+        let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
+        let dest = td.path().join("mirror.git");
+        clone_repo(&url, &dest, MirrorMode::Plain).await.unwrap();
+
+        let probe = existing_promisor_state(dest.to_str().unwrap()).await;
+        assert_eq!(probe, PromisorProbe::NotPromisor);
+    }
+
+    #[tokio::test]
+    async fn probe_reports_unknown_on_git_error() {
+        // A path git cannot resolve as a repo at all (exit 128) is an indeterminate
+        // probe, not a definitive "not a promisor" — it must map to Unknown so the
+        // caller preserves rather than downgrades (#48 defense-in-depth).
+        let probe = existing_promisor_state("/nonexistent/gitlawb-probe-xyz").await;
+        assert_eq!(probe, PromisorProbe::Unknown);
+    }
+
+    #[tokio::test]
     async fn promisor_fetch_updates_existing_mirror() {
         let (td, url) = bare_remote(&[("public/a.txt", b"pub\n")]);
         let dest = td.path().join("mirror.git");
@@ -574,5 +939,44 @@ mod tests {
         .await;
         register_replica_with_origin(&client, &keypair, Some(""), "http://127.0.0.1:1", "o", "r")
             .await;
+    }
+
+    fn peer(did: &str, http_url: &str) -> crate::db::PeerRecord {
+        crate::db::PeerRecord {
+            did: did.to_string(),
+            http_url: http_url.to_string(),
+            last_seen: None,
+            last_ping_ok: false,
+            announced_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_origin_url_matches_and_trims_trailing_slash() {
+        let peers = vec![
+            peer("did:key:a", "https://a.example/"),
+            peer("did:key:b", "https://b.example"),
+        ];
+        // Trailing slash is trimmed so callers can append `/{path}` cleanly.
+        assert_eq!(
+            resolve_origin_url(&peers, "did:key:a").as_deref(),
+            Some("https://a.example")
+        );
+        // Already-trimmed URLs pass through unchanged.
+        assert_eq!(
+            resolve_origin_url(&peers, "did:key:b").as_deref(),
+            Some("https://b.example")
+        );
+    }
+
+    #[test]
+    fn resolve_origin_url_returns_none_for_unknown_did() {
+        let peers = vec![peer("did:key:a", "https://a.example")];
+        assert_eq!(resolve_origin_url(&peers, "did:key:unknown"), None);
+    }
+
+    #[test]
+    fn resolve_origin_url_returns_none_for_empty_peer_list() {
+        assert_eq!(resolve_origin_url(&[], "did:key:a"), None);
     }
 }

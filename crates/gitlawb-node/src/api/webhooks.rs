@@ -38,6 +38,7 @@ pub async fn create_webhook(
         .get_repo(&owner, &name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    crate::api::require_repo_owner(&record, &auth.0)?;
 
     // Validate URL is http/https
     if !req.url.starts_with("http://") && !req.url.starts_with("https://") {
@@ -95,6 +96,7 @@ pub async fn list_webhooks(
 /// DELETE /api/v1/repos/:owner/:repo/hooks/:id
 pub async fn delete_webhook(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
     let record = state
@@ -102,6 +104,7 @@ pub async fn delete_webhook(
         .get_repo(&owner, &name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    crate::api::require_repo_owner(&record, &auth.0)?;
 
     // Verify the webhook belongs to this repo
     let hook = state

@@ -1,0 +1,11 @@
+# Ownership for CI, release, and security-sensitive infrastructure.
+# A PR that edits these paths requires review from a code owner once
+# branch protection's "Require review from Code Owners" is enabled.
+
+/.github/                      @beardthelion
+/Dockerfile                    @beardthelion
+/Dockerfile.bins               @beardthelion
+/docker-compose.yml            @beardthelion
+/release-please-config.json    @beardthelion
+/.release-please-manifest.json @beardthelion
+/SECURITY.md                   @beardthelion

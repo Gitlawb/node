@@ -1,0 +1,38 @@
+# cargo-audit configuration.
+#
+# cargo-audit reads its config from .cargo/audit.toml (relative to the working
+# directory) or ~/.cargo/audit.toml. It does NOT read a repo-root audit.toml,
+# and there is no CLI flag to point at a config file (`-f` is the lockfile path).
+# This file lives at .cargo/audit.toml for that reason.
+#
+# The audit job stays hard-fail: only the advisories explicitly listed below are
+# suppressed, so any NEW advisory still breaks CI. Each entry below has no
+# available upstream fix; everything fixable is fixed in Cargo.lock instead.
+#
+# Tracking: the hickory ignores are reachable accepted risk. A scheduled re-check
+# (.github/workflows/audit-schedule.yml) runs without these ignores and fails if
+# the lockfile moves off the pinned vulnerable versions while the ignores remain.
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2 (pulled by libp2p-dns 0.44 -> hickory-resolver 0.25).
+    # REACHABLE: the node wraps its QUIC transport in the system DNS resolver
+    # (crates/gitlawb-node/src/p2p/mod.rs:238), so a malicious DNS response can
+    # trigger these DoS paths. No fix is available: the latest libp2p-dns on
+    # crates.io is 0.44 and pins hickory 0.25; the fix requires hickory >=0.26.1.
+    # REMOVE both once libp2p-dns ships a release using hickory 0.26 (verified
+    # 2026-06-21: cargo update -p hickory-proto locks 0 packages; still 0.25.2).
+    # Tracking: https://github.com/Gitlawb/node/issues/76
+    "RUSTSEC-2026-0118", # hickory NSEC3 closest-encloser unbounded loop
+    "RUSTSEC-2026-0119", # hickory O(n^2) name-compression CPU exhaustion
+
+    # rsa 0.9.10 (Marvin timing sidechannel). Present in Cargo.lock because sqlx
+    # resolves sqlx-mysql unconditionally, and sqlx-mysql depends on rsa. cargo
+    # audit scans the lockfile, so it flags rsa even though it is NOT linked into
+    # our binary: sqlx is built postgres-only (crates/gitlawb-node/Cargo.toml),
+    # so the MySQL RSA auth path is never compiled and there is no RSA oracle to
+    # attack. No upstream fix exists regardless. REMOVE this ignore if sqlx is
+    # ever built with the `mysql` feature, or any other consumer of rsa enters
+    # the build, at which point it becomes a real reachable advisory.
+    "RUSTSEC-2023-0071", # rsa Marvin attack (no fix; not linked in our build)
+]

@@ -221,6 +221,8 @@ pub struct AgentRow {
     pub capabilities: Vec<String>,
     pub registered_at: String,
     pub last_seen: Option<String>,
+    /// Lifecycle status: `active` (default) or `revoked` (self-deregistered).
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +254,15 @@ impl Db {
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Test-only: apply the full schema to a fresh pool. `#[sqlx::test]`
+    /// provisions an empty per-test database, so DB-backed tests must run this
+    /// before seeding. Reuses the production `migrate()` path (the advisory lock
+    /// is harmless on an isolated test DB and migrations are idempotent).
+    #[cfg(test)]
+    pub(crate) async fn run_migrations(&self) -> Result<()> {
+        self.migrate().await
     }
 
     pub async fn connect(database_url: &str) -> Result<Self> {
@@ -720,6 +731,42 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_visibility_rules_repo ON visibility_rules(repo_id)",
         ],
     },
+    Migration {
+        version: 4,
+        name: "encrypted_blobs",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS encrypted_blobs (
+                repo_id    TEXT NOT NULL,
+                oid        TEXT NOT NULL,
+                cid        TEXT NOT NULL,
+                recipients TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (repo_id, oid)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_encrypted_blobs_repo ON encrypted_blobs(repo_id)",
+        ],
+    },
+    Migration {
+        version: 5,
+        name: "encrypted_blobs_blind_recipients",
+        stmts: &[
+            // Replace the cleartext recipient DID list with an opaque, node-keyed
+            // tag used only to detect a recipient-set change. Existing rows get an
+            // empty tag and are re-sealed on the next push.
+            "ALTER TABLE encrypted_blobs DROP COLUMN IF EXISTS recipients",
+            "ALTER TABLE encrypted_blobs ADD COLUMN IF NOT EXISTS recipients_tag TEXT NOT NULL DEFAULT ''",
+        ],
+    },
+    Migration {
+        version: 6,
+        name: "agent_retirement",
+        stmts: &[
+            // Agent lifecycle status for issue #29. `active` is the default;
+            // the key holder can self-deregister to `revoked` (terminal).
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS deactivated_at TEXT",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -926,10 +973,41 @@ impl Db {
 
 // ── Agents / Trust ────────────────────────────────────────────────────────────
 
+/// Map an `agents` row (selected with the status columns) into an `AgentRow`.
+fn row_to_agent(r: &sqlx::postgres::PgRow) -> AgentRow {
+    AgentRow {
+        did: r.get("did"),
+        trust_score: r.get("trust_score"),
+        capabilities: serde_json::from_str(r.get::<&str, _>("capabilities")).unwrap_or_default(),
+        registered_at: r.get("registered_at"),
+        last_seen: r.get("last_seen"),
+        status: r.get("status"),
+    }
+}
+
+/// Reduce a trust-ranked agent list to what discovery should surface: only
+/// `active` agents, optionally narrowed to those advertising `capability`.
+/// Revoked agents are dropped so an orphaned DID can never win capability
+/// routing. Input order is preserved, so an already trust-sorted list stays
+/// active-first.
+fn filter_discoverable(agents: Vec<AgentRow>, capability: Option<&str>) -> Vec<AgentRow> {
+    agents
+        .into_iter()
+        .filter(|a| a.status == "active")
+        .filter(|a| match capability {
+            Some(cap) => a.capabilities.iter().any(|c| c == cap),
+            None => true,
+        })
+        .collect()
+}
+
 impl Db {
     pub async fn register_agent(&self, did: &str, capabilities: &[String]) -> Result<()> {
         let caps = serde_json::to_string(capabilities)?;
         let now = Utc::now().to_rfc3339();
+        // The ON CONFLICT clause deliberately updates only `last_seen` and
+        // never touches `status`. That makes revocation terminal: re-registering
+        // a `revoked` DID does not bring it back to `active` (issue #29).
         sqlx::query(
             "INSERT INTO agents (did, trust_score, capabilities, registered_at)
              VALUES ($1, 0.0, $2, $3)
@@ -1006,46 +1084,46 @@ impl Db {
 
     pub async fn list_agents(&self, capability: Option<&str>) -> Result<Vec<AgentRow>> {
         let rows = sqlx::query(
-            "SELECT did, trust_score, capabilities, registered_at, last_seen FROM agents ORDER BY trust_score DESC",
+            "SELECT did, trust_score, capabilities, registered_at, last_seen, status \
+             FROM agents ORDER BY trust_score DESC",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let mut agents: Vec<AgentRow> = rows
-            .iter()
-            .map(|r| AgentRow {
-                did: r.get("did"),
-                trust_score: r.get("trust_score"),
-                capabilities: serde_json::from_str(r.get::<&str, _>("capabilities"))
-                    .unwrap_or_default(),
-                registered_at: r.get("registered_at"),
-                last_seen: r.get("last_seen"),
-            })
-            .collect();
+        let agents: Vec<AgentRow> = rows.iter().map(row_to_agent).collect();
 
-        if let Some(cap) = capability {
-            agents.retain(|a| a.capabilities.iter().any(|c| c == cap));
-        }
-
-        Ok(agents)
+        Ok(filter_discoverable(agents, capability))
     }
 
     pub async fn get_agent(&self, did: &str) -> Result<Option<AgentRow>> {
         let row = sqlx::query(
-            "SELECT did, trust_score, capabilities, registered_at, last_seen FROM agents WHERE did = $1",
+            "SELECT did, trust_score, capabilities, registered_at, last_seen, status \
+             FROM agents WHERE did = $1",
         )
         .bind(did)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| AgentRow {
-            did: r.get("did"),
-            trust_score: r.get("trust_score"),
-            capabilities: serde_json::from_str(r.get::<&str, _>("capabilities"))
-                .unwrap_or_default(),
-            registered_at: r.get("registered_at"),
-            last_seen: r.get("last_seen"),
-        }))
+        // Unfiltered by design: a revoked DID must still resolve so callers
+        // can read its `status` and see it is retired.
+        Ok(row.as_ref().map(row_to_agent))
+    }
+
+    /// Mark an agent `revoked` (terminal self-deregistration, issue #29).
+    /// Returns `false` when no such agent exists so the caller can surface a
+    /// 404. Revoking an already-revoked agent is idempotent, and a retry keeps
+    /// the original `deactivated_at` (COALESCE) rather than overwriting it.
+    pub async fn revoke_agent(&self, did: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE agents SET status = 'revoked', \
+             deactivated_at = COALESCE(deactivated_at, $2) WHERE did = $1",
+        )
+        .bind(did)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn count_pushes(&self) -> Result<i64> {
@@ -1548,6 +1626,14 @@ impl Db {
 
 impl Db {
     pub async fn upsert_peer(&self, did: &str, http_url: &str) -> Result<()> {
+        // Defense-in-depth at the DB boundary: both writers funnel through here
+        // — the announce handler and the bootstrap announce-back in main.rs.
+        // The latter has no announce-time check, so validating here is what
+        // stops a malicious bootstrap response from re-poisoning the table
+        // right after prune_non_public_peers cleaned it.
+        if !crate::api::peers::is_public_http_url(http_url) {
+            anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
+        }
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
@@ -1601,6 +1687,29 @@ impl Db {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// Remove peer rows whose `http_url` is not a public http(s) endpoint
+    /// (loopback/private/internal hosts injected via the open announce route).
+    /// Runs at boot to clean tables poisoned before announce-time validation
+    /// existed. Filtering is done in Rust to share one definition of "public"
+    /// with the announce handler, then deleted in a single statement so one
+    /// transient error can't abandon the remaining poisoned rows mid-loop.
+    pub async fn prune_non_public_peers(&self) -> Result<u64> {
+        let peers = self.list_peers().await?;
+        let bad_dids: Vec<String> = peers
+            .into_iter()
+            .filter(|p| !crate::api::peers::is_public_http_url(&p.http_url))
+            .map(|p| p.did)
+            .collect();
+        if bad_dids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query("DELETE FROM peers WHERE did = ANY($1)")
+            .bind(&bad_dids)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ── Pinned CIDs ───────────────────────────────────────────────────────────────
@@ -1626,6 +1735,76 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn record_encrypted_blob(
+        &self,
+        repo_id: &str,
+        oid: &str,
+        cid: &str,
+        recipients_tag: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO encrypted_blobs (repo_id, oid, cid, recipients_tag, created_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (repo_id, oid) DO UPDATE SET cid = EXCLUDED.cid, recipients_tag = EXCLUDED.recipients_tag",
+        )
+        .bind(repo_id)
+        .bind(oid)
+        .bind(cid)
+        .bind(recipients_tag)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// (oid, cid) for every encrypted blob in the repo, unscoped by caller. Used
+    /// by both the B2 replication view and B1 discovery. Recipient identities are
+    /// not stored, so authorization is the caller's repo readability, not a per
+    /// recipient check. Ciphertext metadata only.
+    pub async fn list_all_encrypted_blobs(&self, repo_id: &str) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT oid, cid FROM encrypted_blobs WHERE repo_id = $1")
+            .bind(repo_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::new();
+        for row in rows {
+            let oid: String = row.get("oid");
+            let cid: String = row.get("cid");
+            out.push((oid, cid));
+        }
+        Ok(out)
+    }
+
+    /// The CID of one encrypted blob, or None if there is no such row. Recipient
+    /// authorization is not enforced here: the handler checks repo readability and
+    /// the envelope crypto gates decryption.
+    pub async fn encrypted_blob_cid(&self, repo_id: &str, oid: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2")
+            .bind(repo_id)
+            .bind(oid)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("cid")))
+    }
+
+    /// The opaque recipients tag stored for an encrypted blob, or None if there is
+    /// no row. Used only to decide whether a re-seal is needed (the recipient set
+    /// changed); the tag is a node-keyed fingerprint, not the DID list.
+    pub async fn encrypted_blob_recipients_tag(
+        &self,
+        repo_id: &str,
+        oid: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT recipients_tag FROM encrypted_blobs WHERE repo_id = $1 AND oid = $2",
+        )
+        .bind(repo_id)
+        .bind(oid)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("recipients_tag")))
     }
 
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
@@ -1866,7 +2045,7 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
-             WHERE id=$1
+             WHERE id=$1 AND status='claimed'
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
@@ -1876,7 +2055,7 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
-            .ok_or_else(|| anyhow::anyhow!("task not found"))
+            .ok_or_else(|| anyhow::anyhow!("task not found or not in claimed state"))
     }
 }
 
@@ -2732,5 +2911,93 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+}
+
+#[cfg(test)]
+mod agent_discovery_tests {
+    use super::{filter_discoverable, AgentRow};
+
+    fn agent(did: &str, trust: f64, status: &str, caps: &[&str]) -> AgentRow {
+        AgentRow {
+            did: did.to_string(),
+            trust_score: trust,
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            registered_at: "2026-06-19T00:00:00Z".to_string(),
+            last_seen: None,
+            status: status.to_string(),
+        }
+    }
+
+    fn dids(rows: &[AgentRow]) -> Vec<&str> {
+        rows.iter().map(|a| a.did.as_str()).collect()
+    }
+
+    #[test]
+    fn only_active_agents_are_returned() {
+        let rows = vec![
+            agent("did:key:active1", 0.5, "active", &["reputation:score"]),
+            agent("did:key:revoked1", 0.4, "revoked", &["reputation:score"]),
+            agent("did:key:revoked2", 0.3, "revoked", &["reputation:score"]),
+        ];
+
+        let out = filter_discoverable(rows, None);
+
+        assert_eq!(dids(&out), vec!["did:key:active1"]);
+    }
+
+    #[test]
+    fn revoked_orphan_never_wins_capability_routing() {
+        // Reproduces issue #29: a self-deregistered orphan sharing the
+        // canonical agent's capability and equal trust must be excluded so the
+        // active replacement is the only capability match.
+        let rows = vec![
+            agent("did:key:orphan", 0.1, "revoked", &["reputation:score"]),
+            agent("did:key:canonical", 0.1, "active", &["reputation:score"]),
+        ];
+
+        let out = filter_discoverable(rows, Some("reputation:score"));
+
+        assert_eq!(dids(&out), vec!["did:key:canonical"]);
+    }
+
+    #[test]
+    fn capability_and_status_filters_compose() {
+        let rows = vec![
+            // matches capability but retired -> excluded
+            agent("did:key:revoked", 0.9, "revoked", &["attestation:verify"]),
+            // active but wrong capability -> excluded
+            agent("did:key:other", 0.8, "active", &["oracle:agent-trust"]),
+            // active and matches -> kept
+            agent("did:key:match", 0.7, "active", &["attestation:verify"]),
+        ];
+
+        let out = filter_discoverable(rows, Some("attestation:verify"));
+
+        assert_eq!(dids(&out), vec!["did:key:match"]);
+    }
+
+    #[test]
+    fn input_order_is_preserved_so_active_stays_trust_ranked() {
+        // Input arrives pre-sorted by trust desc; filtering must not reorder.
+        let rows = vec![
+            agent("did:key:high", 0.9, "active", &[]),
+            agent("did:key:retired", 0.8, "revoked", &[]),
+            agent("did:key:mid", 0.5, "active", &[]),
+            agent("did:key:low", 0.2, "active", &[]),
+        ];
+
+        let out = filter_discoverable(rows, None);
+
+        assert_eq!(
+            dids(&out),
+            vec!["did:key:high", "did:key:mid", "did:key:low"]
+        );
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert!(filter_discoverable(vec![], None).is_empty());
+        assert!(filter_discoverable(vec![], Some("reputation:score")).is_empty());
     }
 }
