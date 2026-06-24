@@ -331,6 +331,62 @@ mod tests {
     }
 
     #[test]
+    fn serve_decision_skips_walk_for_root_only_and_withholds_for_path_scoped() {
+        // Drive the git_upload_pack serve decision over a real bare repo, both
+        // branches the has_path_scoped_rule gate selects, for the INV-2 caller:
+        // a reader allowed at whole-repo "/" but denied a path-scoped subtree.
+        // `replicable_objects` is the seam the serve path filters through, so the
+        // returned set models exactly what the served pack would carry.
+        let (_td, bare, secret, public) = fixture();
+        let reader = Some("did:key:zReader");
+        let all = vec![secret.clone(), public.clone()];
+
+        // Branch A — predicate false: skip the walk and serve the full pack. The
+        // skip is only sound if the walk would have withheld nothing, so assert
+        // the walk is empty and the served set is complete.
+        let root_only = vec![rule("/", &["did:key:zReader"])];
+        assert!(!has_path_scoped_rule(&root_only));
+        let withheld_a = withheld_blob_oids(&bare, &root_only, true, OWNER, reader).unwrap();
+        assert!(
+            withheld_a.is_empty(),
+            "root-only rules withhold nothing for a gate-passing reader; the skip is safe"
+        );
+        let served_a = replicable_objects(all.clone(), &withheld_a);
+        assert!(
+            served_a.contains(&secret) && served_a.contains(&public),
+            "the full pack is served when no rule is path-scoped"
+        );
+
+        // Branch B — predicate true: run the walk and serve the filtered pack.
+        // /secret/** is scoped to a different DID, so the reader (allowed at "/")
+        // is denied /secret and the secret blob must be excluded.
+        let scoped = vec![
+            rule("/", &["did:key:zReader"]),
+            rule("/secret/**", &["did:key:zOther"]),
+        ];
+        assert!(has_path_scoped_rule(&scoped));
+        let withheld_b = withheld_blob_oids(&bare, &scoped, true, OWNER, reader).unwrap();
+        let served_b = replicable_objects(all, &withheld_b);
+        assert!(
+            !served_b.contains(&secret),
+            "a reader denied /secret must not be served the secret blob"
+        );
+        assert!(
+            served_b.contains(&public),
+            "the public blob the reader may see stays in the served pack"
+        );
+
+        // Branch C — same path-scoped rules, but the caller is the owner. The
+        // owner bypasses every rule, so the walk withholds nothing and the full
+        // pack (secret included) is served even though a path-scoped rule exists.
+        let withheld_c = withheld_blob_oids(&bare, &scoped, true, OWNER, Some(OWNER)).unwrap();
+        assert!(
+            withheld_c.is_empty(),
+            "the owner bypasses path-scoped rules and is served everything"
+        );
+    }
+
+    #[test]
     fn replicable_objects_drops_withheld_keeps_rest() {
         let all = vec!["aaa".to_string(), "bbb".to_string(), "ccc".to_string()];
         let withheld: HashSet<String> = ["bbb".to_string()].into_iter().collect();
