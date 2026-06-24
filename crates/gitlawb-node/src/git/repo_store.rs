@@ -30,8 +30,13 @@ use crate::storage::archive::RepoArchive;
 pub struct RepoStore {
     repos_dir: PathBuf,
     archive: Option<RepoArchive>,
-    /// Shared Postgres pool for advisory locks.
-    pool: PgPool,
+    /// Bounded pool dedicated to advisory-lock connections — the only DB pool
+    /// RepoStore needs, as it touches Postgres solely for advisory locks. A push
+    /// pins one connection for its whole lifetime (the lock is held across both
+    /// receive-pack and the upload), so a separate budget keeps a burst of
+    /// concurrent/slow pushes from draining the handler pool and starving every
+    /// other DB handler.
+    lock_pool: PgPool,
     /// Tracks repos already confirmed to exist in storage — avoids redundant
     /// HEAD checks and background uploads for repos we've already migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
@@ -47,17 +52,20 @@ impl RepoStore {
         Self {
             repos_dir,
             archive: None,
-            pool,
+            lock_pool: pool,
             migrated: Arc::new(Mutex::new(HashSet::new())),
             versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn new(repos_dir: PathBuf, archive: Option<RepoArchive>, pool: PgPool) -> Self {
+    /// `lock_pool` is a bounded pool that advisory-lock connections are pinned
+    /// from, kept separate from the handler pool so push concurrency can't
+    /// drain it.
+    pub fn new(repos_dir: PathBuf, archive: Option<RepoArchive>, lock_pool: PgPool) -> Self {
         Self {
             repos_dir,
             archive,
-            pool,
+            lock_pool,
             migrated: Arc::new(Mutex::new(HashSet::new())),
             versions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -234,7 +242,7 @@ impl RepoStore {
         // pin ONE connection for the whole lock lifetime — acquire, release on
         // sync error, and the final release in the guard all run on it.
         let mut conn = self
-            .pool
+            .lock_pool
             .acquire()
             .await
             .context("acquiring db connection for advisory lock")?;
@@ -453,6 +461,12 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 
 /// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
 /// uploads to storage + releases the lock on `release()`.
+///
+/// `#[must_use]`: dropping the guard without calling `release()` returns its
+/// connection to the pool with the *session* advisory lock still held, which
+/// then lingers until that backend connection is evicted — so the lock must be
+/// released explicitly.
+#[must_use = "call release() — dropping the guard leaks the advisory lock onto the pooled connection"]
 pub struct RepoWriteGuard {
     owner_slug: String,
     repo_name: String,
