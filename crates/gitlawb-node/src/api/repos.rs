@@ -207,50 +207,61 @@ pub struct ListReposQuery {
 /// present, returns one page and the `X-Total-Count` response header carries the
 /// total matching row count. Without `limit`, falls back to returning every row
 /// (kept for backwards compat with peer sync and existing CLI tooling).
+///
+/// Every returned row passes the per-caller `"/"` visibility gate
+/// (`crate::visibility::listable_at_root`), the same decision the per-repo
+/// content endpoints make, so neither the page nor `X-Total-Count` leaks a repo
+/// (or its mere count) the caller may not read (#97).
 pub async fn list_repos(
     State(state): State<AppState>,
     Query(query): Query<ListReposQuery>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;
 
-    if let Some(raw_limit) = query.limit {
-        let limit = raw_limit.clamp(1, 200);
-        let offset = query.offset.unwrap_or(0).max(0);
-        let (rows, total) = state
-            .db
-            .list_all_repos_paged(query.owner.as_deref(), limit, offset)
-            .await?;
-        let body: Vec<RepoResponse> = rows
-            .into_iter()
-            .map(|(r, stars)| to_response(&r, &state, stars))
-            .collect();
-        let mut response = Json(body).into_response();
-        response.headers_mut().insert(
-            "X-Total-Count",
-            HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
-        );
-        return Ok(response);
-    }
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
 
-    let repos = state.db.list_all_repos_with_stars().await?;
-    let filtered: Vec<(RepoRecord, i64)> = repos
+    // Over-fetch the deduped set (did:key-aware DEDUP_CTE collapses mirror rows),
+    // then apply the per-repo "/" visibility gate in Rust BEFORE pagination so
+    // neither the page nor X-Total-Count leaks a repo the caller may not read —
+    // including its mere count. The "/" decision depends on owner short/full-DID
+    // matching and JSON reader-DID membership, so it cannot be a clean SQL
+    // predicate without drifting from visibility_check; the count is derived from
+    // the visible set (#97).
+    let owner_filtered = state
+        .db
+        .list_all_repos_deduped_with_stars(query.owner.as_deref())
+        .await?;
+
+    let ids: Vec<String> = owner_filtered.iter().map(|(r, _)| r.id.clone()).collect();
+    let rules_by_repo = state.db.list_visibility_rules_for_repos(&ids).await?;
+    let visible: Vec<(crate::db::RepoRecord, i64)> = owner_filtered
         .into_iter()
         .filter(|(r, _)| {
-            if let Some(owner) = &query.owner {
-                crate::api::did_matches(owner.as_str(), &r.owner_did)
-            } else {
-                true
-            }
+            let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
+            crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, caller)
         })
         .collect();
-    let deduped = dedupe_canonical_repos(filtered);
-    let total = deduped.len() as i64;
-    let resp: Vec<_> = deduped
+
+    let total = visible.len() as i64;
+
+    // Paginate in Rust when a limit is set: SQL LIMIT/OFFSET cannot run before
+    // the visibility filter without returning short pages and a leaked count.
+    let page: Vec<(crate::db::RepoRecord, i64)> = match query.limit {
+        Some(raw_limit) => {
+            let limit = raw_limit.clamp(1, 200) as usize;
+            let offset = query.offset.unwrap_or(0).max(0) as usize;
+            visible.into_iter().skip(offset).take(limit).collect()
+        }
+        None => visible,
+    };
+
+    let body: Vec<RepoResponse> = page
         .into_iter()
         .map(|(r, stars)| to_response(&r, &state, stars))
         .collect();
-    let mut response = Json(resp).into_response();
+    let mut response = Json(body).into_response();
     response.headers_mut().insert(
         "X-Total-Count",
         HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
@@ -1245,8 +1256,24 @@ pub async fn list_refs(
 /// which node hosts it. Results from unreachable peers are silently omitted.
 pub async fn list_federated_repos(
     State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let local_repos = dedupe_canonical_repos(state.db.list_all_repos_with_stars().await?);
+
+    // Hide local repos the caller may not read at "/" before federating them, so
+    // the federated surface does not enumerate private repos (#97). Peer repos
+    // arrive already filtered by each peer's own /api/v1/repos (anonymous view).
+    let ids: Vec<String> = local_repos.iter().map(|(r, _)| r.id.clone()).collect();
+    let rules_by_repo = state.db.list_visibility_rules_for_repos(&ids).await?;
+    let local_repos: Vec<(crate::db::RepoRecord, i64)> = local_repos
+        .into_iter()
+        .filter(|(r, _)| {
+            let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
+            crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, caller)
+        })
+        .collect();
+
     let local_node_url = state
         .config
         .public_url

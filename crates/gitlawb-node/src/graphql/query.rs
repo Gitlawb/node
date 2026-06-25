@@ -15,8 +15,26 @@ impl QueryRoot {
             .list_all_repos_deduped()
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        // Apply the same "/" visibility gate the REST/per-repo endpoints use so
+        // this surface does not enumerate private repos (#97). The caller DID is
+        // threaded onto the context by optional_signature; absent = anonymous.
+        let caller = ctx
+            .data::<crate::auth::AuthenticatedDid>()
+            .ok()
+            .map(|d| d.0.as_str());
+        let ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
+        let rules_by_repo = db
+            .list_visibility_rules_for_repos(&ids)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
         Ok(repos
             .into_iter()
+            .filter(|r| {
+                let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
+                crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, caller)
+            })
             .map(|r| RepoType {
                 name: r.name,
                 owner_did: r.owner_did,

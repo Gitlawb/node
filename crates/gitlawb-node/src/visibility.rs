@@ -113,6 +113,20 @@ pub fn visibility_check(
     }
 }
 
+/// Whether `caller` (None = anonymous) may see a repo in a listing — the `"/"`
+/// visibility decision, shared by every repo-listing surface (REST list,
+/// federated list, GraphQL `repos`) so they enforce one rule, not three drifting
+/// copies. Not a bare `is_public` test: a repo can be `is_public=false` with a
+/// root rule granting readers, or `is_public=true` with a root deny (#97).
+pub fn listable_at_root(
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> bool {
+    visibility_check(rules, is_public, owner_did, caller, "/") == Decision::Allow
+}
+
 /// The subtree path globs that `caller` (None = anonymous) may NOT read, given
 /// the repo's rules. Whole-repo ("/") rules are excluded: a denied whole-repo
 /// read is handled by the 404 gate before a clone ever starts. Each remaining

@@ -919,7 +919,7 @@ impl Db {
     /// stay byte-identical or Postgres stops using the index.
     /// The canonical row wins (mirror rows carry a slash-form `id` written only by
     /// `upsert_mirror_repo`), ties broken by earliest `created_at` then `id` so a
-    /// full tie still picks a deterministic survivor. `list_all_repos_paged`,
+    /// full tie still picks a deterministic survivor. `list_all_repos_deduped_with_stars`,
     /// `list_all_repos_deduped`, and the marker logic in
     /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
     const DEDUP_CTE: &'static str = "WITH deduped AS (
@@ -944,62 +944,41 @@ impl Db {
                      created_at ASC, id ASC
              )";
 
-    pub async fn list_all_repos_paged(
+    /// All repos with star counts, mirror-deduplicated via `DEDUP_CTE` and
+    /// ordered newest-first, optionally filtered to one owner. Returns the full
+    /// set (no SQL pagination): the listing surface filters by per-caller `"/"`
+    /// visibility in Rust and paginates after, so neither the page nor the count
+    /// leaks a repo the caller may not read (#97).
+    pub async fn list_all_repos_deduped_with_stars(
         &self,
         owner_filter: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<(RepoRecord, i64)>, i64)> {
+    ) -> Result<Vec<(RepoRecord, i64)>> {
         let sql = format!(
             "{}
              SELECT
                  d.id, d.name, d.owner_did, d.description, d.is_public,
                  d.default_branch, d.created_at, d.updated_at, d.disk_path,
                  d.forked_from, d.machine_id,
-                 COALESCE(s.cnt, 0) AS star_count,
-                 COUNT(*) OVER () AS total_count
+                 COALESCE(s.cnt, 0) AS star_count
              FROM deduped d
              LEFT JOIN (
                  SELECT repo_id, COUNT(*) AS cnt FROM repo_stars GROUP BY repo_id
              ) s ON s.repo_id = d.id
-             ORDER BY d.updated_at DESC
-             LIMIT $2 OFFSET $3",
+             ORDER BY d.updated_at DESC",
             Self::DEDUP_CTE
         );
         let rows = sqlx::query(&sql)
             .bind(owner_filter)
-            .bind(limit)
-            .bind(offset)
             .fetch_all(&self.pool)
             .await?;
 
-        let total = rows
-            .first()
-            .map(|r| r.get::<i64, _>("total_count"))
-            .unwrap_or(0);
-        let out: Vec<(RepoRecord, i64)> = rows
+        Ok(rows
             .into_iter()
             .map(|r| {
                 let stars: i64 = r.get("star_count");
                 (row_to_repo(r), stars)
             })
-            .collect();
-
-        let total = if out.is_empty() {
-            let row = sqlx::query(
-                "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt
-                 FROM repos
-                 WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)",
-            )
-            .bind(owner_filter)
-            .fetch_one(&self.pool)
-            .await?;
-            row.get::<i64, _>("cnt")
-        } else {
-            total
-        };
-
-        Ok((out, total))
+            .collect())
     }
 
     /// Deduped repo list (no stars, no paging) for the unfiltered read surfaces
@@ -2467,6 +2446,45 @@ impl Db {
                 }
             })
             .collect())
+    }
+
+    /// All visibility rules for a set of repos, grouped by `repo_id`, in one
+    /// query. The listing surfaces use this to apply the same `"/"` visibility
+    /// decision the per-repo endpoints make without an N+1 per-repo rule fetch
+    /// (#97). Repos with no rules are simply absent from the map.
+    pub async fn list_visibility_rules_for_repos(
+        &self,
+        repo_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<VisibilityRule>>> {
+        use std::collections::HashMap;
+        if repo_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, repo_id, path_glob, mode, reader_dids, created_by, created_at
+             FROM visibility_rules WHERE repo_id = ANY($1) ORDER BY path_glob",
+        )
+        .bind(repo_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: HashMap<String, Vec<VisibilityRule>> = HashMap::new();
+        for r in rows {
+            let readers: String = r.get("reader_dids");
+            let created_at: String = r.get("created_at");
+            let rule = VisibilityRule {
+                id: r.get("id"),
+                repo_id: r.get("repo_id"),
+                path_glob: r.get("path_glob"),
+                mode: VisibilityMode::from_db(&r.get::<String, _>("mode")),
+                reader_dids: serde_json::from_str(&readers).unwrap_or_default(),
+                created_by: r.get("created_by"),
+                created_at: created_at
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
+            };
+            out.entry(rule.repo_id.clone()).or_default().push(rule);
+        }
+        Ok(out)
     }
 }
 

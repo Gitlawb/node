@@ -607,4 +607,204 @@ mod tests {
             "stats must count logical repos (mirror+canonical collapsed)"
         );
     }
+
+    // ── #97: repo-listing surfaces are visibility-gated ──────────────────────
+
+    fn seed_private_repo(owner_did: &str, name: &str) -> RepoRecord {
+        RepoRecord {
+            is_public: false,
+            ..seed_repo(owner_did, name)
+        }
+    }
+
+    fn anon_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("request builder")
+    }
+
+    async fn json_body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    fn names_in(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .expect("array body")
+            .iter()
+            .filter_map(|r| r["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn list_repos_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/repos",
+                axum::routing::get(crate::api::repos::list_repos),
+            )
+            .with_state(state)
+    }
+
+    #[sqlx::test]
+    async fn list_repos_hides_private_repo_and_count_from_anonymous(pool: PgPool) {
+        let owner = "did:key:zLISTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"pub-repo".to_string()),
+            "public repo listed"
+        );
+        assert!(
+            !names.contains(&"priv-repo".to_string()),
+            "private repo must not be enumerable anonymously (#97)"
+        );
+        assert_eq!(
+            total.as_deref(),
+            Some("1"),
+            "X-Total-Count must not leak the private repo's existence"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_shows_owner_their_private_repo(pool: PgPool) {
+        let owner = "did:key:zLISTOWNER2BBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                "/api/v1/repos",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"priv-repo".to_string()) && names.contains(&"pub-repo".to_string()),
+            "owner sees their own private repo, got {names:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_shows_private_repo_to_authorized_root_reader(pool: PgPool) {
+        // Proves the gate is visibility_check, not a bare is_public filter: an
+        // is_public=false repo with a root rule granting a reader DID is listable
+        // to that reader (and not to a stranger).
+        let owner = "did:key:zLISTOWNER3CCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let reader = "did:key:zLISTREADERDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+        let stranger = "did:key:zLISTSTRANGEREEEEEEEEEEEEEEEEEEEEEEEEEE";
+        let state = test_state(pool).await;
+        let rec = seed_private_repo(owner, "priv-repo");
+        state.db.create_repo(&rec).await.expect("seed private");
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/",
+                crate::db::VisibilityMode::A,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("grant root reader");
+
+        let names_for = |did: &'static str, st: AppState| async move {
+            let resp = list_repos_router(st)
+                .oneshot(signed_request_as(
+                    did,
+                    Method::GET,
+                    "/api/v1/repos",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            names_in(&json_body(resp).await)
+        };
+
+        assert!(
+            names_for(reader, state.clone())
+                .await
+                .contains(&"priv-repo".to_string()),
+            "authorized root reader must see the private repo"
+        );
+        assert!(
+            !names_for(stranger, state)
+                .await
+                .contains(&"priv-repo".to_string()),
+            "an unlisted stranger must not see it"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_federated_repos_hides_private_from_anonymous(pool: PgPool) {
+        let owner = "did:key:zFEDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/federated",
+                axum::routing::get(crate::api::repos::list_federated_repos),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/repos/federated"))
+            .await
+            .unwrap();
+        let body = json_body(resp).await;
+        let names = names_in(&body["repos"]);
+        assert!(
+            names.contains(&"pub-repo".to_string()),
+            "public repo federated"
+        );
+        assert!(
+            !names.contains(&"priv-repo".to_string()),
+            "private repo must not be federated to anonymous callers (#97)"
+        );
+    }
 }
