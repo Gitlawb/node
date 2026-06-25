@@ -93,6 +93,43 @@ async fn replication_withheld_set(
     }
 }
 
+/// The replicable object set for a full-scan pin fallback, failing closed (#99).
+/// The full-scan candidate set includes dangling objects the reachable-only
+/// withheld set never classified, so compute the reachable visibility-allowed
+/// blob set and the all-blob universe off the async worker and keep only
+/// non-blobs plus allowed blobs. Any error in either walk — or a task panic —
+/// pins nothing this push, mirroring the degraded-path shape of
+/// `replication_withheld_set`.
+async fn fail_closed_full_scan_objects(
+    disk_path: std::path::PathBuf,
+    rules: Vec<crate::db::VisibilityRule>,
+    is_public: bool,
+    owner_did: String,
+    candidates: Vec<String>,
+) -> Vec<String> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+        let allowed = crate::git::visibility_pack::replicable_blob_set(
+            &disk_path, &rules, is_public, &owner_did,
+        )?;
+        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path)?;
+        Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
+            candidates, &allowed, &all_blobs,
+        ))
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(err = %e, "fail-closed blob walk task panicked; pinning nothing this push")
+    })
+    .ok()
+    .and_then(|r| {
+        r.map_err(|e| {
+            tracing::warn!(err = %e, "fail-closed blob walk failed; pinning nothing this push")
+        })
+        .ok()
+    })
+    .unwrap_or_default()
+}
+
 // ── Request / Response types ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -893,17 +930,13 @@ pub async fn git_receive_pack(
     )
     .await;
 
-    // Compute the per-push pin candidate set once, off the async worker (git
-    // subprocess). On the happy path this is the push delta (objects this push
-    // introduced); on any non-commit tip or git error it fails closed to a full
-    // repo scan. Only needed when something will actually replicate. All
-    // degraded paths log inside the helper rather than failing silently.
-    // Resolve the pin candidate set, then filter to what may actually
-    // replicate. Delta path: the reachable-only `withheld` set suffices (delta
-    // objects are reachable). Full-scan path: the candidate set can include
-    // dangling blobs the withheld set never classified, so fail closed —
-    // replicate a blob only if it is reachable AND visibility-allowed (#99). On
-    // any error in the fail-closed walks, pin nothing this push.
+    // Resolve the per-push pin candidate set once, off the async worker, then
+    // filter to what may actually replicate. Delta path: the reachable-only
+    // `withheld` set suffices (delta objects are reachable). Full-scan path: the
+    // candidate set can include dangling blobs the withheld set never classified,
+    // so fail closed — replicate a blob only if it is reachable AND
+    // visibility-allowed (#99). Only computed when something will actually
+    // replicate; every degraded path logs rather than failing silently.
     let object_list: Vec<String> = if let Some(withheld_set) = withheld.clone() {
         let new_tips: Vec<String> = ref_updates
             .iter()
@@ -922,37 +955,14 @@ pub async fn git_receive_pack(
         )
         .await;
         if pin_set.full_scan {
-            let p = disk_path.clone();
-            let rules_for_blobs = rules_opt.clone().unwrap_or_default();
-            let owner = record.owner_did.clone();
-            let is_pub = record.is_public;
-            let candidates = pin_set.candidates;
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-                let allowed = crate::git::visibility_pack::replicable_blob_set(
-                    &p,
-                    &rules_for_blobs,
-                    is_pub,
-                    &owner,
-                )?;
-                let all_blobs = crate::git::push_delta::all_blob_oids(&p)?;
-                Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
-                    candidates,
-                    &allowed,
-                    &all_blobs,
-                ))
-            })
+            fail_closed_full_scan_objects(
+                disk_path.clone(),
+                rules_opt.clone().unwrap_or_default(),
+                record.is_public,
+                record.owner_did.clone(),
+                pin_set.candidates,
+            )
             .await
-            .map_err(|e| {
-                tracing::warn!(err = %e, "fail-closed blob walk task panicked; pinning nothing this push")
-            })
-            .ok()
-            .and_then(|r| {
-                r.map_err(|e| {
-                    tracing::warn!(err = %e, "fail-closed blob walk failed; pinning nothing this push")
-                })
-                .ok()
-            })
-            .unwrap_or_default()
         } else {
             crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
         }

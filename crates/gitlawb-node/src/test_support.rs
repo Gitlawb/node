@@ -807,4 +807,119 @@ mod tests {
             "private repo must not be federated to anonymous callers (#97)"
         );
     }
+
+    #[sqlx::test]
+    async fn graphql_repos_hides_private_from_anonymous(pool: PgPool) {
+        // The GraphQL repos query is the third listing surface; an anonymous
+        // query must not enumerate a private repo (#97).
+        let owner = "did:key:zGQLOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = state
+            .graphql_schema
+            .execute(async_graphql::Request::new("{ repos { name } }"))
+            .await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let names = names_in(&resp.data.into_json().expect("graphql json")["repos"]);
+        assert!(
+            names.contains(&"pub-repo".to_string()),
+            "public repo listed"
+        );
+        assert!(
+            !names.contains(&"priv-repo".to_string()),
+            "private repo must not be enumerable via anonymous GraphQL (#97)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_paged_count_excludes_private(pool: PgPool) {
+        // The paged path (limit set) is the KTD2 exploit shape: a pre-cut page +
+        // SQL total would leak the private-repo count. Assert X-Total-Count is the
+        // visible count and the page is not short (#97).
+        let owner = "did:key:zPAGEOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-a"))
+            .await
+            .expect("seed public a");
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-b"))
+            .await
+            .expect("seed public b");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos?limit=10"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert_eq!(
+            total.as_deref(),
+            Some("2"),
+            "paged X-Total-Count must reflect only the 2 visible repos, not leak the private count"
+        );
+        assert_eq!(
+            names.len(),
+            2,
+            "page must not be short: both public repos present"
+        );
+        assert!(!names.contains(&"priv-repo".to_string()));
+    }
+
+    #[sqlx::test]
+    async fn list_repos_hides_public_repo_under_root_deny(pool: PgPool) {
+        // Proves the gate is visibility_check, not a bare is_public filter, in the
+        // negative direction: an is_public=true repo with a root deny rule (mode B,
+        // no readers) is NOT listable to anonymous, while a plain public repo is.
+        let owner = "did:key:zDENYOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "open-repo"))
+            .await
+            .expect("seed open");
+        let denied = seed_repo(owner, "deny-repo"); // is_public = true
+        state.db.create_repo(&denied).await.expect("seed denied");
+        state
+            .db
+            .set_visibility_rule(&denied.id, "/", crate::db::VisibilityMode::B, &[], owner)
+            .await
+            .expect("root deny rule");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos"))
+            .await
+            .unwrap();
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"open-repo".to_string()),
+            "plain public repo listed"
+        );
+        assert!(
+            !names.contains(&"deny-repo".to_string()),
+            "is_public=true repo with a root deny must NOT be listed (proves visibility_check, not is_public)"
+        );
+    }
 }
