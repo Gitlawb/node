@@ -52,13 +52,9 @@ impl Keypair {
         URL_SAFE_NO_PAD.encode(sig.to_bytes())
     }
 
-    /// The raw 32-byte Ed25519 seed. Used to derive the X25519 secret for
-    /// envelope decryption (see `crate::encrypt`).
-    pub fn seed_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
-    }
-
-    /// Export the signing key as raw 32-byte seed (wrapped in Zeroizing).
+    /// The raw 32-byte Ed25519 seed, wrapped in `Zeroizing` so the copy is
+    /// scrubbed on drop. This is the only seed accessor; it is used to derive
+    /// the X25519 secret for envelope decryption (see `crate::encrypt`).
     pub fn to_seed(&self) -> Zeroizing<[u8; 32]> {
         Zeroizing::new(self.signing_key.to_bytes())
     }
@@ -170,6 +166,20 @@ mod tests {
         let seed = kp.to_seed();
         let kp2 = Keypair::from_seed(&seed).unwrap();
         assert_eq!(kp.verifying_key(), kp2.verifying_key());
+    }
+
+    // `to_seed()` is the only seed accessor on `Keypair` (the raw, unzeroized
+    // `seed_bytes()` was removed in #41). Pin its return type so a bare-array
+    // accessor can't slip back in, and confirm it is deterministic. The
+    // from_seed -> verifying_key round-trip is already covered by
+    // `from_seed_round_trip`.
+    #[test]
+    fn to_seed_returns_zeroizing_and_is_deterministic() {
+        let kp = Keypair::generate();
+        // The type annotation is the regression guard: the seed must be handed
+        // out wrapped in `Zeroizing`, never as a bare `[u8; 32]`.
+        let seed: Zeroizing<[u8; 32]> = kp.to_seed();
+        assert_eq!(*kp.to_seed(), *seed); // stable across calls
     }
 
     #[test]

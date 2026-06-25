@@ -49,6 +49,14 @@ pub struct Config {
     )]
     pub require_signed_peer_writes: bool,
 
+    /// Require the authenticated pusher to be the repo owner on `git-receive-pack`.
+    /// Authentication (a valid did:key signature) is not authorization on its own:
+    /// any party can sign as their own DID. When true, pushes whose authenticated
+    /// DID is not the repo owner are rejected. Keep false during rolling upgrades;
+    /// flip it on once owners are ready for owner-only writes.
+    #[arg(long, env = "GITLAWB_ENFORCE_OWNER_PUSH", default_value_t = false)]
+    pub enforce_owner_push: bool,
+
     /// URL of local IPFS/Kubo node HTTP API (e.g. http://127.0.0.1:5001)
     #[arg(long, env = "GITLAWB_IPFS_API", default_value = "")]
     pub ipfs_api: String,

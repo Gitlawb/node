@@ -17,7 +17,7 @@ pub struct LabelRequest {
 /// POST /api/v1/repos/:owner/:repo/labels
 pub async fn add_label(
     State(state): State<AppState>,
-    Extension(_auth): Extension<AuthenticatedDid>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name)): Path<(String, String)>,
     Json(req): Json<LabelRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
@@ -39,6 +39,7 @@ pub async fn add_label(
         .get_repo(&owner, &name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    crate::api::require_repo_owner(&record, &auth.0)?;
 
     let added = state.db.add_label(&record.id, &label).await?;
     let status = if added {
@@ -55,7 +56,7 @@ pub async fn add_label(
 /// DELETE /api/v1/repos/:owner/:repo/labels/:label
 pub async fn remove_label(
     State(state): State<AppState>,
-    Extension(_auth): Extension<AuthenticatedDid>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, label)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
     let record = state
@@ -63,6 +64,7 @@ pub async fn remove_label(
         .get_repo(&owner, &name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    crate::api::require_repo_owner(&record, &auth.0)?;
 
     state.db.remove_label(&record.id, &label).await?;
     Ok(Json(serde_json::json!({ "label": label, "removed": true })))

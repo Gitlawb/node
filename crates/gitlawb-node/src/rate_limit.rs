@@ -34,9 +34,17 @@ impl RateLimiter {
     async fn check(&self, key: &str) -> bool {
         let now = Instant::now();
         let mut state = self.state.lock().await;
-        let window = state.entry(key.to_string()).or_insert_with(|| Window {
-            timestamps: Vec::new(),
-        });
+        // Look up before inserting so the common case (key already tracked)
+        // doesn't allocate a String per request.
+        if !state.contains_key(key) {
+            state.insert(
+                key.to_string(),
+                Window {
+                    timestamps: Vec::new(),
+                },
+            );
+        }
+        let window = state.get_mut(key).expect("window just ensured");
         window
             .timestamps
             .retain(|t| now.duration_since(*t) < self.window);

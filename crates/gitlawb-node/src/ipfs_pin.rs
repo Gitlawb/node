@@ -85,13 +85,20 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
     Ok(resp.bytes().await?.to_vec())
 }
 
-/// List all git objects in the given bare repo and pin any that are not yet
-/// recorded in `pinned_cids`.
+/// Pin any of the given candidate git objects that are not yet recorded in
+/// `pinned_cids`.
+///
+/// `candidates` is the OID set to consider — the per-push delta on the push
+/// path, or the whole-repo list on the reconciliation sweep / full-scan
+/// fallback (see `git::push_delta`). `repo_path` is still needed to read each
+/// object's bytes. The twin in `pinata.rs` mirrors this shape — change both in
+/// lockstep.
 ///
 /// Returns a list of `(sha256_hex, cid)` pairs for objects pinned this call.
 pub async fn pin_new_objects(
     ipfs_api: &str,
     repo_path: &std::path::Path,
+    candidates: Vec<String>,
     db: &crate::db::Db,
     withheld: &HashSet<String>,
 ) -> Vec<(String, String)> {
@@ -99,16 +106,7 @@ pub async fn pin_new_objects(
         return vec![];
     }
 
-    // Enumerate all objects in the repo
-    let object_list = match list_all_objects(repo_path) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(repo = %repo_path.display(), err = %e, "failed to list git objects for IPFS pinning");
-            return vec![];
-        }
-    };
-
-    let object_list = crate::git::visibility_pack::replicable_objects(object_list, withheld);
+    let object_list = crate::git::visibility_pack::replicable_objects(candidates, withheld);
 
     let mut pinned = Vec::new();
 
@@ -149,32 +147,4 @@ pub async fn pin_new_objects(
     }
 
     pinned
-}
-
-/// Run `git cat-file --batch-all-objects --batch-check='%(objectname)'`
-/// to get all object SHA-256 hashes in the repository.
-fn list_all_objects(repo_path: &std::path::Path) -> Result<Vec<String>> {
-    let output = std::process::Command::new("git")
-        .args([
-            "cat-file",
-            "--batch-all-objects",
-            "--batch-check=%(objectname)",
-        ])
-        .current_dir(repo_path)
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to run git cat-file: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("git cat-file failed: {stderr}"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let hashes = stdout
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-
-    Ok(hashes)
 }

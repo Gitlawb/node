@@ -17,6 +17,18 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// Whether `caller` is authorized to push to `record`.
+///
+/// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only, via the canonical
+/// [`crate::api::did_matches`] owner comparison (DID-safe on both sides). This is
+/// intentionally a distinct, intent-named gate rather than a bare owner check so
+/// that Phase 2 can extend it to honor a verified UCAN `git/push` capability as a
+/// pure addition (`did_matches(..) || ucan_grants_push(..)`) without rewriting
+/// call sites.
+pub fn caller_authorized_to_push(record: &crate::db::RepoRecord, caller: &str) -> bool {
+    crate::api::did_matches(caller, &record.owner_did)
+}
+
 use gitlawb_core::http_sig::{
     build_signing_string, compute_content_digest, HttpSignature, COVERED_COMPONENTS,
 };

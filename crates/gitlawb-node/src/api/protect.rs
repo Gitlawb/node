@@ -23,15 +23,10 @@ pub async fn protect_branch(
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
-    // Only the repo owner can protect branches
+    // Only the repo owner can protect branches (DID-safe match, shared idiom).
     let caller = &auth.0;
-    let owner_short = record
-        .owner_did
-        .split(':')
-        .next_back()
-        .unwrap_or(&record.owner_did);
-    if caller != &record.owner_did && caller != owner_short {
-        return Err(AppError::BadRequest(
+    if !crate::api::did_matches(caller, &record.owner_did) {
+        return Err(AppError::Forbidden(
             "only the repo owner can protect branches".into(),
         ));
     }
@@ -63,13 +58,8 @@ pub async fn unprotect_branch(
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
 
     let caller = &auth.0;
-    let owner_short = record
-        .owner_did
-        .split(':')
-        .next_back()
-        .unwrap_or(&record.owner_did);
-    if caller != &record.owner_did && caller != owner_short {
-        return Err(AppError::BadRequest(
+    if !crate::api::did_matches(caller, &record.owner_did) {
+        return Err(AppError::Forbidden(
             "only the repo owner can unprotect branches".into(),
         ));
     }

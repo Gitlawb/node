@@ -9,7 +9,7 @@
 //!   POST   /api/v1/tasks/{id}/fail          — fail task
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -18,8 +18,17 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::auth::AuthenticatedDid;
 use crate::db::AgentTask;
 use crate::state::{AppState, TaskEventBroadcast};
+
+/// 403 in this module's error shape (`(StatusCode, Json<Value>)`, not `AppError`).
+fn forbidden(msg: &str) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "forbidden", "message": msg })),
+    )
+}
 
 // ── Request / response types ──────────────────────────────────────────────────
 
@@ -55,13 +64,11 @@ pub struct ClaimTaskBody {
 #[derive(Deserialize)]
 pub struct CompleteTaskBody {
     pub result: Option<String>,
-    pub by_did: Option<String>,
 }
 
 #[derive(Deserialize)]
 pub struct FailTaskBody {
     pub reason: Option<String>,
-    pub by_did: Option<String>,
 }
 
 fn task_to_json(t: &AgentTask) -> Value {
@@ -87,15 +94,20 @@ fn task_to_json(t: &AgentTask) -> Value {
 /// POST /api/v1/tasks
 pub async fn create_task(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Json(body): Json<CreateTaskBody>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    // Bind the delegator to the authenticated signer (N13).
+    if !crate::api::did_matches(&auth.0, &body.delegator_did) {
+        return Err(forbidden("delegator_did must be the authenticated signer"));
+    }
     let now = Utc::now().to_rfc3339();
     let task = AgentTask {
         id: Uuid::new_v4().to_string(),
         repo_id: body.repo_id,
         kind: body.kind,
         status: "pending".to_string(),
-        delegator_did: body.delegator_did,
+        delegator_did: auth.0,
         assignee_did: body.assignee_did,
         capability: body.capability,
         ucan_token: body.ucan_token,
@@ -154,24 +166,25 @@ pub async fn get_task(
 /// POST /api/v1/tasks/{id}/claim
 pub async fn claim_task(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path(id): Path<String>,
     Json(body): Json<ClaimTaskBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let task = state
-        .db
-        .claim_task(&id, &body.assignee_did)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::CONFLICT,
-                Json(json!({ "error": e.to_string() })),
-            )
-        })?;
+    // Bind the assignee to the authenticated signer (N13).
+    if !crate::api::did_matches(&auth.0, &body.assignee_did) {
+        return Err(forbidden("assignee_did must be the authenticated signer"));
+    }
+    let task = state.db.claim_task(&id, &auth.0).await.map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": e.to_string() })),
+        )
+    })?;
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "pending".to_string(),
         new_status: "claimed".to_string(),
-        by_did: body.assignee_did,
+        by_did: auth.0,
         at: Utc::now().to_rfc3339(),
     });
     Ok(Json(task_to_json(&task)))
@@ -180,17 +193,44 @@ pub async fn claim_task(
 /// POST /api/v1/tasks/{id}/complete
 pub async fn complete_task(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path(id): Path<String>,
     Json(body): Json<CompleteTaskBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let by_did = body.by_did.unwrap_or_default();
+    // Authorize the actor, not just bind their identity: the N13 signer-binding
+    // proved the caller was whoever they claimed, but never that they were the
+    // task's assignee. Load the task and require the caller to be its assignee;
+    // finish_task then transitions only a claimed task.
+    let existing = state
+        .db
+        .get_task(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "task not found" })),
+            )
+        })?;
+    if !crate::api::did_matches(
+        &auth.0,
+        existing.assignee_did.as_deref().unwrap_or_default(),
+    ) {
+        return Err(forbidden("only the task assignee can complete it"));
+    }
+    let by_did = auth.0;
     let task = state
         .db
         .finish_task(&id, "completed", body.result.as_deref())
         .await
         .map_err(|e| {
             (
-                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::CONFLICT,
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
@@ -207,10 +247,36 @@ pub async fn complete_task(
 /// POST /api/v1/tasks/{id}/fail
 pub async fn fail_task(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path(id): Path<String>,
     Json(body): Json<FailTaskBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let by_did = body.by_did.unwrap_or_default();
+    // Authorize the actor, not just bind their identity (see complete_task): only
+    // the task's assignee may fail it, and finish_task transitions only a claimed
+    // task.
+    let existing = state
+        .db
+        .get_task(&id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "task not found" })),
+            )
+        })?;
+    if !crate::api::did_matches(
+        &auth.0,
+        existing.assignee_did.as_deref().unwrap_or_default(),
+    ) {
+        return Err(forbidden("only the task assignee can fail it"));
+    }
+    let by_did = auth.0;
     let reason = body.reason.unwrap_or_default();
     let task = state
         .db
@@ -218,7 +284,7 @@ pub async fn fail_task(
         .await
         .map_err(|e| {
             (
-                StatusCode::UNPROCESSABLE_ENTITY,
+                StatusCode::CONFLICT,
                 Json(json!({ "error": e.to_string() })),
             )
         })?;

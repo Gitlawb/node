@@ -3,7 +3,9 @@
 //! Repos are stored as `repos/v1/{owner_slug}/{repo_name}.tar.zst` — a
 //! zstd-compressed tar archive of the bare repo directory.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use aws_sdk_s3::Client as S3Client;
@@ -110,8 +112,7 @@ impl TigrisClient {
             .collect()
             .await
             .context("reading tigris response body")?
-            .into_bytes()
-            .to_vec();
+            .into_bytes();
 
         // Extract tar.zst to local path
         tokio::task::spawn_blocking({
@@ -156,6 +157,23 @@ fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
     Ok(compressed)
 }
 
+/// Per-repo-path lock serializing the publish (swap-into-place) step of
+/// `decompress_repo`. Concurrent extractions unpack into isolated temp dirs in
+/// parallel, but the final `remove_dir_all` + `rename` must not interleave for
+/// the same `local_path`, or they race to a nondeterministic overwrite/failure.
+fn publish_lock(local_path: &Path) -> Arc<Mutex<()>> {
+    // KNOWN LIMITATION: this map is never evicted — one (PathBuf, Arc<Mutex>)
+    // entry accrues per distinct repo path for the process lifetime. Bounded by
+    // the number of repos a node hosts, so it's negligible for normal use, but
+    // high-volume/churning deployments may want LRU or weak-ref eviction here.
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = locks.lock().expect("publish lock map poisoned");
+    map.entry(local_path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 /// Decompress a tar.zst byte vector into a local directory.
 ///
 /// Extraction is atomic with respect to `local_path`: the archive is unpacked
@@ -171,10 +189,12 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
         .file_name()
         .context("repo path has no file name")?
         .to_string_lossy();
-    let tmp_dir = parent.join(format!(".{file_name}.tmp-extract"));
+    // Unique per-extraction temp dir: a fixed name would let two concurrent
+    // extractions of the same repo share one dir and clobber each other's
+    // in-progress unpack. A fresh UUID also means it can't collide with a
+    // leftover dir from a previously-interrupted run.
+    let tmp_dir = parent.join(format!(".{file_name}.tmp-extract.{}", uuid::Uuid::new_v4()));
 
-    // Clear any leftover temp dir from a previously-interrupted extraction.
-    let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).context("creating temp extract dir")?;
 
     // Unpack into the temp dir; on any failure, clean up and bail without
@@ -192,7 +212,11 @@ fn decompress_repo(data: &[u8], local_path: &Path) -> Result<()> {
 
     // Swap the freshly-extracted repo into place. rename within the same parent
     // is effectively atomic, but most platforms refuse to rename onto a
-    // non-empty dir, so remove the old copy first.
+    // non-empty dir, so remove the old copy first. Serialize this per repo path:
+    // concurrent extractions unpack into isolated temp dirs, but their swaps
+    // must not interleave or they race to a nondeterministic overwrite/failure.
+    let lock = publish_lock(local_path);
+    let _publish = lock.lock().expect("publish lock poisoned");
     if local_path.exists() {
         std::fs::remove_dir_all(local_path).context("removing stale repo dir")?;
     }

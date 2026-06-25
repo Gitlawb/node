@@ -19,6 +19,14 @@ services:
 
   node:
     build: .
+    # Reap reparented orphan processes so git's grandchildren (e.g. pack-objects
+    # left behind when a served clone disconnects) can't accumulate as zombies
+    # and exhaust the PID table (#53). The image also runs under tini, so this is
+    # belt-and-suspenders for the quickstart.
+    init: true
+    # Cap the process table so a regression fails loudly instead of taking the
+    # host down. Sits well above normal concurrent git fan-out.
+    pids_limit: 1024
     depends_on:
       postgres:
         condition: service_healthy

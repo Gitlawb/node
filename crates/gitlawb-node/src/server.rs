@@ -20,8 +20,19 @@ use crate::auth;
 use crate::rate_limit;
 use crate::state::AppState;
 
-async fn graphql_handler(State(state): State<AppState>, req: GraphQLRequest) -> GraphQLResponse {
-    state.graphql_schema.execute(req.into_inner()).await.into()
+async fn graphql_handler(
+    State(state): State<AppState>,
+    auth: Option<axum::Extension<crate::auth::AuthenticatedDid>>,
+    req: GraphQLRequest,
+) -> GraphQLResponse {
+    // `optional_signature` attaches the verified DID when a signature is present.
+    // Thread it into request-scoped GraphQL data; mutations enforce its presence
+    // in-resolver (N2) while queries stay open.
+    let mut inner = req.into_inner();
+    if let Some(axum::Extension(did)) = auth {
+        inner = inner.data(did);
+    }
+    state.graphql_schema.execute(inner).await.into()
 }
 
 async fn graphql_playground() -> impl IntoResponse {
@@ -49,6 +60,10 @@ pub fn build_router(state: AppState) -> Router {
     let schema = state.graphql_schema.as_ref().clone();
     let graphql_routes = Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
+        // Attach the verified DID to /graphql when a signature is present. The
+        // layer covers only routes added before it, so /graphql/ws (added after,
+        // read-only subscriptions) stays open.
+        .layer(middleware::from_fn(auth::optional_signature))
         .route_service("/graphql/ws", GraphQLSubscription::new(schema));
 
     // ── Task routes (write — require HTTP Signature) ───────────────────────
@@ -147,6 +162,10 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::put(visibility::set_visibility)
                     .delete(visibility::remove_visibility)
                     .get(visibility::list_visibility),
+            )
+            .route(
+                "/api/v1/agents/{did}",
+                axum::routing::delete(agents::deregister_agent),
             ),
         state.clone(),
     );
@@ -433,12 +452,7 @@ async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let repos = state
-        .db
-        .list_all_repos()
-        .await
-        .map(|r| r.len() as i64)
-        .unwrap_or(0);
+    let repos = state.db.count_repos_deduped().await.unwrap_or(0);
     let agents = state.db.count_agents().await.unwrap_or(0);
     let pushes = state.db.count_pushes().await.unwrap_or(0);
     Json(json!({

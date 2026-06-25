@@ -38,11 +38,16 @@ pub async fn create_webhook(
         .get_repo(&owner, &name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    crate::api::require_repo_owner(&record, &auth.0)?;
 
-    // Validate URL is http/https
-    if !req.url.starts_with("http://") && !req.url.starts_with("https://") {
+    // Gate the target through the same hardened public-host validator the peer
+    // announce path uses, so an authenticated owner cannot register a webhook
+    // that makes the node POST to loopback/private/link-local/metadata
+    // endpoints (SSRF). Delivery runs on the shared no-redirect client
+    // (main.rs), which closes the 3xx-to-internal bounce.
+    if !crate::api::peers::is_public_http_url(&req.url) {
         return Err(AppError::BadRequest(
-            "webhook URL must be http:// or https://".into(),
+            "webhook URL must be a public http(s) URL (no loopback, private, or .internal/.local hosts)".into(),
         ));
     }
 
@@ -95,6 +100,7 @@ pub async fn list_webhooks(
 /// DELETE /api/v1/repos/:owner/:repo/hooks/:id
 pub async fn delete_webhook(
     State(state): State<AppState>,
+    Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name, id)): Path<(String, String, String)>,
 ) -> Result<Json<serde_json::Value>> {
     let record = state
@@ -102,6 +108,7 @@ pub async fn delete_webhook(
         .get_repo(&owner, &name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    crate::api::require_repo_owner(&record, &auth.0)?;
 
     // Verify the webhook belongs to this repo
     let hook = state
@@ -116,4 +123,36 @@ pub async fn delete_webhook(
 
     state.db.delete_webhook(&id).await?;
     Ok(Json(serde_json::json!({ "deleted": true, "id": id })))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::api::peers::is_public_http_url;
+
+    // create_webhook gates req.url through is_public_http_url. Pin the exact
+    // SSRF targets from issue #81 so the webhook path can never regress to the
+    // old scheme-only check, independent of the validator's own peer tests.
+    #[test]
+    fn webhook_url_gate_rejects_ssrf_targets() {
+        for bad in [
+            "http://127.0.0.1:5432/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost/",
+            "http://10.0.0.5/",
+            "http://[::1]/",
+            // IPv6 transition encodings smuggling loopback v4 (6to4 / NAT64).
+            "http://[2002:7f00:1::]/",
+            "http://[64:ff9b::7f00:1]/",
+            "ftp://example.com/",
+            "not-a-url",
+        ] {
+            assert!(!is_public_http_url(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn webhook_url_gate_allows_public_targets() {
+        assert!(is_public_http_url("https://hooks.example.com/gitlawb"));
+        assert!(is_public_http_url("http://203.0.113.10:7545/"));
+    }
 }

@@ -23,13 +23,18 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
 
     use std::io::Write;
     let mut child = hash_output;
-    if let Some(stdin) = child.stdin.take() {
-        let mut stdin = stdin;
-        stdin
-            .write_all(json.as_bytes())
-            .context("failed to write to git hash-object stdin")?;
-    }
+    // Write the blob to stdin, but always reap the child afterward even if the
+    // write fails, so a stdin-write error can't drop the Child unwaited and leak
+    // a zombie (#53).
+    let write_result = match child.stdin.take() {
+        Some(mut stdin) => stdin.write_all(json.as_bytes()),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "git hash-object stdin unavailable",
+        )),
+    };
     let output = child.wait_with_output().context("git hash-object failed")?;
+    write_result.context("failed to write to git hash-object stdin")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

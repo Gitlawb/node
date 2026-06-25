@@ -26,17 +26,16 @@ pub struct RemoveVisibilityRequest {
 }
 
 fn require_owner(record: &crate::db::RepoRecord, caller: &str) -> Result<()> {
-    let owner_short = record
-        .owner_did
-        .split(':')
-        .next_back()
-        .unwrap_or(&record.owner_did);
-    if caller != record.owner_did && caller != owner_short {
-        return Err(AppError::BadRequest(
+    // DID-safe owner match (collapses did:key full vs bare on both sides, never
+    // across methods), shared with require_repo_owner — not a trailing-segment
+    // compare that only normalized the owner side.
+    if crate::api::did_matches(caller, &record.owner_did) {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(
             "only the repo owner can manage visibility".into(),
-        ));
+        ))
     }
-    Ok(())
 }
 
 /// Reject malformed globs before they reach the store, where they would
@@ -57,9 +56,23 @@ fn validate_path_glob(path_glob: &str) -> Result<()> {
             "path_glob must not end with '/'".into(),
         ));
     }
-    if path_glob.contains('*') && !path_glob.ends_with("/**") {
+    // Reject empty path segments. `glob_prefix` collapses "//**" to "/" (whole
+    // repo), so without this an operator could bypass the "/**" guard above and
+    // grant repo-wide read with "//**", or set a dead rule like "//secret/**"
+    // whose prefix never matches a real single-slash path and silently leaves
+    // the subtree readable.
+    if path_glob.contains("//") {
         return Err(AppError::BadRequest(
-            "the only supported wildcard is a trailing '/**'".into(),
+            "path_glob must not contain empty path segments".into(),
+        ));
+    }
+    // Strip the one permitted trailing "/**" before checking for stray
+    // wildcards, otherwise a "*" elsewhere in the prefix (e.g. "/a*b/**" or
+    // "/a/**/**") slips through because the string still ends with "/**".
+    let prefix = path_glob.strip_suffix("/**").unwrap_or(path_glob);
+    if prefix.contains('*') {
+        return Err(AppError::BadRequest(
+            "the only supported wildcard is a single trailing '/**'".into(),
         ));
     }
     Ok(())
@@ -240,9 +253,22 @@ mod tests {
 
     #[test]
     fn rejects_malformed_globs() {
-        // empty, no leading slash, whole-repo via "/**", trailing slash, and
-        // non-trailing wildcards are all rejected.
-        for g in ["", "secret/**", "/**", "/secret/", "/a*b", "/*/x"] {
+        // empty, no leading slash, whole-repo via "/**", trailing slash,
+        // non-trailing wildcards, double wildcards, and empty path segments
+        // (which would collapse to whole-repo or a dead rule) are all rejected.
+        for g in [
+            "",
+            "secret/**",
+            "/**",
+            "/**/**",
+            "/secret/",
+            "/a*b",
+            "/*/x",
+            "/a*b/**",
+            "/a/**/**",
+            "//**",
+            "//secret/**",
+        ] {
             assert!(validate_path_glob(g).is_err(), "{g} should be rejected");
         }
     }

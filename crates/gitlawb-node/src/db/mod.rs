@@ -221,6 +221,8 @@ pub struct AgentRow {
     pub capabilities: Vec<String>,
     pub registered_at: String,
     pub last_seen: Option<String>,
+    /// Lifecycle status: `active` (default) or `revoked` (self-deregistered).
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,6 +254,15 @@ impl Db {
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    /// Test-only: apply the full schema to a fresh pool. `#[sqlx::test]`
+    /// provisions an empty per-test database, so DB-backed tests must run this
+    /// before seeding. Reuses the production `migrate()` path (the advisory lock
+    /// is harmless on an isolated test DB and migrations are idempotent).
+    #[cfg(test)]
+    pub(crate) async fn run_migrations(&self) -> Result<()> {
+        self.migrate().await
     }
 
     pub async fn connect(database_url: &str) -> Result<Self> {
@@ -746,6 +757,30 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE encrypted_blobs ADD COLUMN IF NOT EXISTS recipients_tag TEXT NOT NULL DEFAULT ''",
         ],
     },
+    Migration {
+        version: 6,
+        name: "agent_retirement",
+        stmts: &[
+            // Agent lifecycle status for issue #29. `active` is the default;
+            // the key holder can self-deregister to `revoked` (terminal).
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
+            "ALTER TABLE agents ADD COLUMN IF NOT EXISTS deactivated_at TEXT",
+        ],
+    },
+    Migration {
+        version: 7,
+        name: "repo_owner_dedup_key_didkey_aware",
+        stmts: &[
+            // The dedup grouping key moved from the last `:` segment to a
+            // did:key-aware key (strip `did:key:`, leave any other DID method
+            // whole) so `did:key:X` and `did:gitlawb:X` no longer collapse. Swap
+            // the index that backs it: drop the last-segment one from v1 and build
+            // the matching expression index. The CASE must stay byte-for-byte in
+            // sync with DEDUP_CTE / count_repos_deduped or Postgres won't use it.
+            "DROP INDEX IF EXISTS idx_repos_owner_short_name",
+            "CREATE INDEX IF NOT EXISTS idx_repos_owner_key_name ON repos ((CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END), name)",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -834,6 +869,11 @@ impl Db {
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
+    /// Raw list of every repo row — NOT deduped (a mirror row and its canonical
+    /// row both appear) and without stars. For enumeration callers that must see
+    /// every physical row (e.g. the IPFS object scan in `api::ipfs`), not for
+    /// listing surfaces. Listing surfaces dedupe via `list_all_repos_deduped` or
+    /// `list_all_repos_with_stars` + `dedupe_canonical_repos`.
     pub async fn list_all_repos(&self) -> Result<Vec<RepoRecord>> {
         let rows = sqlx::query(
             "SELECT id, name, owner_did, description, is_public, default_branch,
@@ -868,30 +908,50 @@ impl Db {
             .collect())
     }
 
-    pub async fn list_all_repos_paged(
-        &self,
-        owner_filter: Option<&str>,
-        limit: i64,
-        offset: i64,
-    ) -> Result<(Vec<(RepoRecord, i64)>, i64)> {
-        let rows = sqlx::query(
-            "WITH deduped AS (
-                 SELECT DISTINCT ON (split_part(owner_did, ':', -1), name)
+    /// Shared dedup CTE: collapses the mirror row and the canonical row of one
+    /// logical repo into a single survivor. `$1` is an optional owner filter
+    /// (NULL = all rows). Grouping collapses on a did:key-aware owner key: strip a
+    /// `did:key:` prefix (8 chars, so `substr(owner_did, 9)`) only when the
+    /// remainder is a bare id with no `:`, otherwise keep the full DID. That is the
+    /// exact normalization in `crate::api::did_matches`, so `did:key:X` and a bare
+    /// `X` collapse while distinct DID methods (`did:gitlawb:X`) never merge. The
+    /// CASE is repeated verbatim in `count_repos_deduped` and the v7 index and must
+    /// stay byte-identical or Postgres stops using the index.
+    /// The canonical row wins (mirror rows carry a slash-form `id` written only by
+    /// `upsert_mirror_repo`), ties broken by earliest `created_at` then `id` so a
+    /// full tie still picks a deterministic survivor. `list_all_repos_paged`,
+    /// `list_all_repos_deduped`, and the marker logic in
+    /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
+    const DEDUP_CTE: &'static str = "WITH deduped AS (
+                 SELECT DISTINCT ON (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
                      -- group MAX, not the canonical row's own value: pushes that
                      -- arrive via gossip touch only the mirror row, so the
                      -- canonical updated_at goes stale
                      MAX(updated_at) OVER (
-                         PARTITION BY split_part(owner_did, ':', -1), name
+                         PARTITION BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name
                      ) AS updated_at,
                      disk_path, forked_from, machine_id
                  FROM repos
                  WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)
-                 ORDER BY split_part(owner_did, ':', -1), name,
-                     CASE WHEN description = 'mirrored from peer' THEN 1 ELSE 0 END,
-                     created_at ASC
-             )
+                 ORDER BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name,
+                     -- mirror rows carry a slash-form id (\"{owner_short}/{name}\"),
+                     -- written only by upsert_mirror_repo; canonical ids are UUIDs.
+                     -- Rank canonical (no slash) ahead of the mirror in each group,
+                     -- keyed on the structural id, not the user-settable description.
+                     CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
+                     created_at ASC, id ASC
+             )";
+
+    pub async fn list_all_repos_paged(
+        &self,
+        owner_filter: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<(RepoRecord, i64)>, i64)> {
+        let sql = format!(
+            "{}
              SELECT
                  d.id, d.name, d.owner_did, d.description, d.is_public,
                  d.default_branch, d.created_at, d.updated_at, d.disk_path,
@@ -904,12 +964,14 @@ impl Db {
              ) s ON s.repo_id = d.id
              ORDER BY d.updated_at DESC
              LIMIT $2 OFFSET $3",
-        )
-        .bind(owner_filter)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await?;
+            Self::DEDUP_CTE
+        );
+        let rows = sqlx::query(&sql)
+            .bind(owner_filter)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await?;
 
         let total = rows
             .first()
@@ -925,7 +987,7 @@ impl Db {
 
         let total = if out.is_empty() {
             let row = sqlx::query(
-                "SELECT COUNT(DISTINCT (split_part(owner_did, ':', -1), name)) AS cnt
+                "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt
                  FROM repos
                  WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)",
             )
@@ -940,6 +1002,41 @@ impl Db {
         Ok((out, total))
     }
 
+    /// Deduped repo list (no stars, no paging) for the unfiltered read surfaces
+    /// (GraphQL `repos`). One logical repo per mirror+canonical group, ordered by
+    /// the group's most recent activity. Shares `DEDUP_CTE` with the paged path so
+    /// the dedup rule cannot drift; binds a NULL owner filter (all rows).
+    pub async fn list_all_repos_deduped(&self) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             ORDER BY d.updated_at DESC",
+            Self::DEDUP_CTE
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Count of distinct logical repos (mirror + canonical collapsed), for
+    /// `/api/v1/stats`. Uses the same did:key-aware owner-key grouping as
+    /// `DEDUP_CTE` (the CASE must stay byte-identical); the marker/tiebreak only
+    /// decide which row would survive, not the group count, so they are not needed here.
+    pub async fn count_repos_deduped(&self) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt FROM repos",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt"))
+    }
+
     pub async fn touch_repo(&self, id: &str) -> Result<()> {
         sqlx::query("UPDATE repos SET updated_at = $1 WHERE id = $2")
             .bind(Utc::now().to_rfc3339())
@@ -952,10 +1049,41 @@ impl Db {
 
 // ── Agents / Trust ────────────────────────────────────────────────────────────
 
+/// Map an `agents` row (selected with the status columns) into an `AgentRow`.
+fn row_to_agent(r: &sqlx::postgres::PgRow) -> AgentRow {
+    AgentRow {
+        did: r.get("did"),
+        trust_score: r.get("trust_score"),
+        capabilities: serde_json::from_str(r.get::<&str, _>("capabilities")).unwrap_or_default(),
+        registered_at: r.get("registered_at"),
+        last_seen: r.get("last_seen"),
+        status: r.get("status"),
+    }
+}
+
+/// Reduce a trust-ranked agent list to what discovery should surface: only
+/// `active` agents, optionally narrowed to those advertising `capability`.
+/// Revoked agents are dropped so an orphaned DID can never win capability
+/// routing. Input order is preserved, so an already trust-sorted list stays
+/// active-first.
+fn filter_discoverable(agents: Vec<AgentRow>, capability: Option<&str>) -> Vec<AgentRow> {
+    agents
+        .into_iter()
+        .filter(|a| a.status == "active")
+        .filter(|a| match capability {
+            Some(cap) => a.capabilities.iter().any(|c| c == cap),
+            None => true,
+        })
+        .collect()
+}
+
 impl Db {
     pub async fn register_agent(&self, did: &str, capabilities: &[String]) -> Result<()> {
         let caps = serde_json::to_string(capabilities)?;
         let now = Utc::now().to_rfc3339();
+        // The ON CONFLICT clause deliberately updates only `last_seen` and
+        // never touches `status`. That makes revocation terminal: re-registering
+        // a `revoked` DID does not bring it back to `active` (issue #29).
         sqlx::query(
             "INSERT INTO agents (did, trust_score, capabilities, registered_at)
              VALUES ($1, 0.0, $2, $3)
@@ -1032,46 +1160,46 @@ impl Db {
 
     pub async fn list_agents(&self, capability: Option<&str>) -> Result<Vec<AgentRow>> {
         let rows = sqlx::query(
-            "SELECT did, trust_score, capabilities, registered_at, last_seen FROM agents ORDER BY trust_score DESC",
+            "SELECT did, trust_score, capabilities, registered_at, last_seen, status \
+             FROM agents ORDER BY trust_score DESC",
         )
         .fetch_all(&self.pool)
         .await?;
 
-        let mut agents: Vec<AgentRow> = rows
-            .iter()
-            .map(|r| AgentRow {
-                did: r.get("did"),
-                trust_score: r.get("trust_score"),
-                capabilities: serde_json::from_str(r.get::<&str, _>("capabilities"))
-                    .unwrap_or_default(),
-                registered_at: r.get("registered_at"),
-                last_seen: r.get("last_seen"),
-            })
-            .collect();
+        let agents: Vec<AgentRow> = rows.iter().map(row_to_agent).collect();
 
-        if let Some(cap) = capability {
-            agents.retain(|a| a.capabilities.iter().any(|c| c == cap));
-        }
-
-        Ok(agents)
+        Ok(filter_discoverable(agents, capability))
     }
 
     pub async fn get_agent(&self, did: &str) -> Result<Option<AgentRow>> {
         let row = sqlx::query(
-            "SELECT did, trust_score, capabilities, registered_at, last_seen FROM agents WHERE did = $1",
+            "SELECT did, trust_score, capabilities, registered_at, last_seen, status \
+             FROM agents WHERE did = $1",
         )
         .bind(did)
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| AgentRow {
-            did: r.get("did"),
-            trust_score: r.get("trust_score"),
-            capabilities: serde_json::from_str(r.get::<&str, _>("capabilities"))
-                .unwrap_or_default(),
-            registered_at: r.get("registered_at"),
-            last_seen: r.get("last_seen"),
-        }))
+        // Unfiltered by design: a revoked DID must still resolve so callers
+        // can read its `status` and see it is retired.
+        Ok(row.as_ref().map(row_to_agent))
+    }
+
+    /// Mark an agent `revoked` (terminal self-deregistration, issue #29).
+    /// Returns `false` when no such agent exists so the caller can surface a
+    /// 404. Revoking an already-revoked agent is idempotent, and a retry keeps
+    /// the original `deactivated_at` (COALESCE) rather than overwriting it.
+    pub async fn revoke_agent(&self, did: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            "UPDATE agents SET status = 'revoked', \
+             deactivated_at = COALESCE(deactivated_at, $2) WHERE did = $1",
+        )
+        .bind(did)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn count_pushes(&self) -> Result<i64> {
@@ -1574,6 +1702,14 @@ impl Db {
 
 impl Db {
     pub async fn upsert_peer(&self, did: &str, http_url: &str) -> Result<()> {
+        // Defense-in-depth at the DB boundary: both writers funnel through here
+        // — the announce handler and the bootstrap announce-back in main.rs.
+        // The latter has no announce-time check, so validating here is what
+        // stops a malicious bootstrap response from re-poisoning the table
+        // right after prune_non_public_peers cleaned it.
+        if !crate::api::peers::is_public_http_url(http_url) {
+            anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
+        }
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
@@ -1623,6 +1759,29 @@ impl Db {
         let result = sqlx::query("DELETE FROM peers WHERE http_url = $1 OR http_url = $2")
             .bind(trimmed)
             .bind(&with_slash)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Remove peer rows whose `http_url` is not a public http(s) endpoint
+    /// (loopback/private/internal hosts injected via the open announce route).
+    /// Runs at boot to clean tables poisoned before announce-time validation
+    /// existed. Filtering is done in Rust to share one definition of "public"
+    /// with the announce handler, then deleted in a single statement so one
+    /// transient error can't abandon the remaining poisoned rows mid-loop.
+    pub async fn prune_non_public_peers(&self) -> Result<u64> {
+        let peers = self.list_peers().await?;
+        let bad_dids: Vec<String> = peers
+            .into_iter()
+            .filter(|p| !crate::api::peers::is_public_http_url(&p.http_url))
+            .map(|p| p.did)
+            .collect();
+        if bad_dids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query("DELETE FROM peers WHERE did = ANY($1)")
+            .bind(&bad_dids)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
@@ -1962,7 +2121,7 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
-             WHERE id=$1
+             WHERE id=$1 AND status='claimed'
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
@@ -1972,7 +2131,7 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
-            .ok_or_else(|| anyhow::anyhow!("task not found"))
+            .ok_or_else(|| anyhow::anyhow!("task not found or not in claimed state"))
     }
 }
 
@@ -2828,5 +2987,526 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+}
+
+#[cfg(test)]
+mod agent_discovery_tests {
+    use super::{filter_discoverable, AgentRow};
+
+    fn agent(did: &str, trust: f64, status: &str, caps: &[&str]) -> AgentRow {
+        AgentRow {
+            did: did.to_string(),
+            trust_score: trust,
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+            registered_at: "2026-06-19T00:00:00Z".to_string(),
+            last_seen: None,
+            status: status.to_string(),
+        }
+    }
+
+    fn dids(rows: &[AgentRow]) -> Vec<&str> {
+        rows.iter().map(|a| a.did.as_str()).collect()
+    }
+
+    #[test]
+    fn only_active_agents_are_returned() {
+        let rows = vec![
+            agent("did:key:active1", 0.5, "active", &["reputation:score"]),
+            agent("did:key:revoked1", 0.4, "revoked", &["reputation:score"]),
+            agent("did:key:revoked2", 0.3, "revoked", &["reputation:score"]),
+        ];
+
+        let out = filter_discoverable(rows, None);
+
+        assert_eq!(dids(&out), vec!["did:key:active1"]);
+    }
+
+    #[test]
+    fn revoked_orphan_never_wins_capability_routing() {
+        // Reproduces issue #29: a self-deregistered orphan sharing the
+        // canonical agent's capability and equal trust must be excluded so the
+        // active replacement is the only capability match.
+        let rows = vec![
+            agent("did:key:orphan", 0.1, "revoked", &["reputation:score"]),
+            agent("did:key:canonical", 0.1, "active", &["reputation:score"]),
+        ];
+
+        let out = filter_discoverable(rows, Some("reputation:score"));
+
+        assert_eq!(dids(&out), vec!["did:key:canonical"]);
+    }
+
+    #[test]
+    fn capability_and_status_filters_compose() {
+        let rows = vec![
+            // matches capability but retired -> excluded
+            agent("did:key:revoked", 0.9, "revoked", &["attestation:verify"]),
+            // active but wrong capability -> excluded
+            agent("did:key:other", 0.8, "active", &["oracle:agent-trust"]),
+            // active and matches -> kept
+            agent("did:key:match", 0.7, "active", &["attestation:verify"]),
+        ];
+
+        let out = filter_discoverable(rows, Some("attestation:verify"));
+
+        assert_eq!(dids(&out), vec!["did:key:match"]);
+    }
+
+    #[test]
+    fn input_order_is_preserved_so_active_stays_trust_ranked() {
+        // Input arrives pre-sorted by trust desc; filtering must not reorder.
+        let rows = vec![
+            agent("did:key:high", 0.9, "active", &[]),
+            agent("did:key:retired", 0.8, "revoked", &[]),
+            agent("did:key:mid", 0.5, "active", &[]),
+            agent("did:key:low", 0.2, "active", &[]),
+        ];
+
+        let out = filter_discoverable(rows, None);
+
+        assert_eq!(
+            dids(&out),
+            vec!["did:key:high", "did:key:mid", "did:key:low"]
+        );
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        assert!(filter_discoverable(vec![], None).is_empty());
+        assert!(filter_discoverable(vec![], Some("reputation:score")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dedup_db_tests {
+    use super::{Db, RepoRecord};
+    use chrono::{DateTime, Utc};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// Build a repo row with explicit timestamps. A slash in `id` marks a mirror
+    /// row (the format `upsert_mirror_repo` writes); a UUID-shaped `id` is canonical.
+    fn rec(
+        id: &str,
+        owner_did: &str,
+        name: &str,
+        desc: &str,
+        created: &str,
+        updated: &str,
+    ) -> RepoRecord {
+        RepoRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: Some(desc.to_string()),
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: ts(created),
+            updated_at: ts(updated),
+            disk_path: format!("/srv/{id}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    /// The canonical `did:key:` row and the short-owner mirror row of one logical
+    /// repo collapse to a single deduped entry: the canonical row wins and inherits
+    /// the group's most recent `updated_at`.
+    #[sqlx::test]
+    async fn deduped_collapses_mirror_and_canonical(pool: PgPool) {
+        let db = db(pool).await;
+        let canonical = rec(
+            "9d92186a-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "Decentralized npm for agents",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        // Mirror row in the shape upsert_mirror_repo writes: slash id, bare owner.
+        let mirror = rec(
+            "z6Mkwbud/nipmod",
+            "z6Mkwbud",
+            "nipmod",
+            "mirrored from peer",
+            "2026-02-01T00:00:00Z",
+            "2026-03-01T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.create_repo(&mirror).await.unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "the pair collapses to one logical repo");
+        assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+        assert_eq!(
+            out[0].updated_at,
+            ts("2026-03-01T00:00:00Z"),
+            "survivor inherits the group's MAX(updated_at)"
+        );
+    }
+
+    /// upsert_mirror_repo's own rows dedupe against a canonical twin (proves the
+    /// real mirror writer's row shape is classified correctly).
+    #[sqlx::test]
+    async fn deduped_collapses_real_upsert_mirror_row(pool: PgPool) {
+        let db = db(pool).await;
+        let canonical = rec(
+            "uuid-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/mirror", None)
+            .await
+            .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "real mirror row collapses with its canonical twin"
+        );
+        assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+    }
+
+    /// Same name and base58 id but different DID methods (`did:key` vs
+    /// `did:gitlawb`) must NOT collapse: the grouping key strips only `did:key:`
+    /// and leaves other methods whole, matching crate::api::did_matches. Both the
+    /// list (DEDUP_CTE) and count (count_repos_deduped) paths must agree.
+    #[sqlx::test]
+    async fn deduped_keeps_distinct_did_methods_apart(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-keyed",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "via did:key",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-gitlawb",
+            "did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "via did:gitlawb",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 2, "distinct DID methods are distinct owners");
+        assert_eq!(
+            db.count_repos_deduped().await.unwrap(),
+            2,
+            "count path agrees with the list path",
+        );
+    }
+
+    /// SQL residual-colon guard: a malformed `did:key:did:gitlawb:X` strips to a
+    /// value that still holds a `:`, so the CASE keeps it whole and it does NOT
+    /// collapse with a real `did:gitlawb:X`. Proves the SQL key matches the Rust
+    /// `strip_prefix(...).filter(|r| !r.contains(':'))` and did_matches.
+    #[sqlx::test]
+    async fn deduped_did_key_wrapping_a_full_did_stays_distinct(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-wrapped",
+            "did:key:did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "malformed nested DID",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-method",
+            "did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "real method DID",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(
+            out.len(),
+            2,
+            "wrapped full DID stays distinct from the method DID"
+        );
+        assert_eq!(
+            db.count_repos_deduped().await.unwrap(),
+            2,
+            "count path agrees with the list path",
+        );
+    }
+
+    /// Empty-residual boundary: `did:key:` matches `LIKE 'did:key:%'`,
+    /// `substr(owner_did, 9)` is '', and `position(':' in '')` is 0, so the CASE
+    /// keys it to '' just like a bare empty owner, while a real `did:key:z…` keys
+    /// separately. Pins that the SQL empty-residual handling matches the Rust
+    /// `strip_prefix(...).filter(...)` path (mirrored in the api-level test).
+    #[sqlx::test]
+    async fn deduped_empty_did_key_residual_keys_to_empty_string(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-empty-didkey",
+            "did:key:",
+            "nipmod",
+            "empty residual",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-empty-bare",
+            "",
+            "nipmod",
+            "empty owner",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-real",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real id",
+            "2026-01-03T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(
+            out.len(),
+            2,
+            "`did:key:` and the empty owner collapse on the empty key; the real id is separate"
+        );
+        assert_eq!(
+            db.count_repos_deduped().await.unwrap(),
+            2,
+            "count path agrees with the list path",
+        );
+    }
+
+    /// Distinct repos are preserved and ordered by most recent activity.
+    #[sqlx::test]
+    async fn deduped_preserves_distinct_repos_ordered_by_updated(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-a",
+            "did:key:z6Aaa",
+            "alpha",
+            "first",
+            "2026-03-01T00:00:00Z",
+            "2026-03-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "id-b",
+            "did:key:z6Bbb",
+            "beta",
+            "second",
+            "2026-03-02T00:00:00Z",
+            "2026-03-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "beta", "most recently updated first");
+        assert_eq!(out[1].name, "alpha");
+    }
+
+    /// count_repos_deduped counts logical repos, not raw rows.
+    #[sqlx::test]
+    async fn count_repos_deduped_counts_logical_repos(pool: PgPool) {
+        let db = db(pool).await;
+        // One logical repo (canonical + mirror) plus one standalone.
+        db.create_repo(&rec(
+            "uuid-c",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/m", None)
+            .await
+            .unwrap();
+        db.create_repo(&rec(
+            "uuid-d",
+            "did:key:z6Other",
+            "solo",
+            "real",
+            "2026-01-16T00:00:00Z",
+            "2026-01-16T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(db.count_repos_deduped().await.unwrap(), 2);
+    }
+
+    /// Full tie (same mirror-status and created_at within a group) resolves to a
+    /// deterministic survivor by `id ASC`, matching the Rust helper's tiebreak.
+    #[sqlx::test]
+    async fn deduped_full_tie_resolves_by_id_asc(pool: PgPool) {
+        let db = db(pool).await;
+        // Two canonical rows in the same (normalized owner, name) group, identical
+        // created_at; only the id differs. Different owner_did strings avoid any
+        // (owner, name) collision while still normalizing to the same group key.
+        db.create_repo(&rec(
+            "bbb",
+            "did:key:z6Same",
+            "repo",
+            "real",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec(
+            "aaa",
+            "z6Same",
+            "repo",
+            "real",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "same group collapses");
+        assert_eq!(
+            out[0].id, "aaa",
+            "id ASC breaks a full tie deterministically"
+        );
+    }
+
+    /// Marker robustness: a canonical row whose `description` is literally
+    /// "mirrored from peer" but whose `id` is a UUID is still ranked canonical and
+    /// wins over a true slash-id mirror in its group — even though the mirror was
+    /// created earlier. Proves dedup keys on the structural id, not the description.
+    #[sqlx::test]
+    async fn deduped_marker_uses_id_not_description(pool: PgPool) {
+        let db = db(pool).await;
+        let canonical = rec(
+            "uuid-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "mirrored from peer", // user-settable description = the old marker string
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        let mirror = rec(
+            "z6Mkwbud/nipmod", // slash id = the real structural marker
+            "z6Mkwbud",
+            "nipmod",
+            "a normal description, not the marker",
+            "2026-01-01T00:00:00Z", // earlier: would win on created_at if marker ignored
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.create_repo(&mirror).await.unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].id, "uuid-canonical",
+            "canonical wins by structural id marker despite carrying the mirror description"
+        );
+    }
+
+    /// A mirror row with no canonical twin survives dedup as the sole entry for its
+    /// group (it is not dropped just because it is the mirror).
+    #[sqlx::test]
+    async fn deduped_mirror_only_group_survives(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6Lonely", "orphan", "/srv/m", None)
+            .await
+            .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(
+            out.len(),
+            1,
+            "a mirror-only group still yields one logical repo"
+        );
+        assert_eq!(out[0].id, "z6Lonely/orphan");
+        assert_eq!(db.count_repos_deduped().await.unwrap(), 1);
+    }
+
+    /// Degenerate empty table: deduped list is empty and the count is 0, no error.
+    #[sqlx::test]
+    async fn deduped_empty_table(pool: PgPool) {
+        let db = db(pool).await;
+        assert!(db.list_all_repos_deduped().await.unwrap().is_empty());
+        assert_eq!(db.count_repos_deduped().await.unwrap(), 0);
+    }
+
+    /// count_repos_deduped and list_all_repos_deduped must agree: the count is the
+    /// number of logical repos the list returns. Guards the two independent SQL
+    /// queries against drifting on the grouping key.
+    #[sqlx::test]
+    async fn deduped_count_matches_list_len(pool: PgPool) {
+        let db = db(pool).await;
+        // Two logical repos: one canonical+mirror pair, one standalone canonical.
+        db.create_repo(&rec(
+            "uuid-1",
+            "did:key:z6Pair",
+            "shared",
+            "real",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.upsert_mirror_repo("z6Pair", "shared", "/srv/m", None)
+            .await
+            .unwrap();
+        db.create_repo(&rec(
+            "uuid-2",
+            "did:key:z6Solo",
+            "solo",
+            "real",
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        let list_len = db.list_all_repos_deduped().await.unwrap().len() as i64;
+        let count = db.count_repos_deduped().await.unwrap();
+        assert_eq!(list_len, 2);
+        assert_eq!(count, list_len, "count must equal the deduped list length");
     }
 }
