@@ -137,7 +137,7 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
 ///
 /// `--all` covers every ref namespace (a blob reachable only through `refs/notes/*`
 /// must not escape withholding); HEAD is added explicitly for the detached case,
-/// where HEAD reaches commits that no ref does. `git ls-tree -r <commit>` per commit
+/// where HEAD reaches commits that no ref does. `git ls-tree -rz <commit>` per commit
 /// keeps every path a blob lives at (the same blob content can appear at several
 /// paths, and the per-path visibility check needs all of them). This is why it is
 /// not `git rev-list --objects`, which reports only one path per object. Pairs are
@@ -178,19 +178,35 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
             continue;
         }
         let listing = std::process::Command::new("git")
-            .args(["ls-tree", "-r", commit])
+            .args(["ls-tree", "-rz", commit])
             .current_dir(repo_path)
             .output()
-            .context("git ls-tree -r failed")?;
+            .context("git ls-tree -rz failed")?;
         if !listing.status.success() {
             anyhow::bail!(
-                "git ls-tree -r {commit} failed: {}",
+                "git ls-tree -rz {commit} failed: {}",
                 String::from_utf8_lossy(&listing.stderr)
             );
         }
-        for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        // `-z` NUL-delimits records and emits paths raw; plain `git ls-tree -r`
+        // C-quotes any path with non-ASCII or special bytes (e.g. café.txt becomes
+        // "secret/caf\303\251.txt"), and that quoted literal would not match a
+        // visibility rule like "/secret/**", under-withholding the blob. The TAB
+        // field separator survives `-z`, so the per-record parse is unchanged.
+        //
+        // Parse strictly: a lossy decode would replace an invalid byte in a denied
+        // path (e.g. a non-UTF-8 directory name) with U+FFFD, and the mangled string
+        // would no longer match its deny rule — the same under-withholding class, one
+        // layer down. Fail closed instead so the caller aborts rather than leaks.
+        let Ok(listing_stdout) = std::str::from_utf8(&listing.stdout) else {
+            anyhow::bail!(
+                "git ls-tree -rz {commit} returned a non-UTF-8 path; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        };
+        for record in listing_stdout.split('\0') {
             // "<mode> blob <oid>\t<path>"
-            let Some((meta, path)) = line.split_once('\t') else {
+            let Some((meta, path)) = record.split_once('\t') else {
                 continue;
             };
             let mut parts = meta.split_whitespace();
@@ -619,6 +635,228 @@ mod tests {
         assert!(
             withheld.contains(&secret_oid),
             "secret blob deleted at the tip but reachable in history must be withheld"
+        );
+    }
+
+    #[test]
+    fn withholds_secret_blob_at_non_ascii_path() {
+        // A secret blob under a non-ASCII path inside a denied subtree must be
+        // withheld. Plain `git ls-tree -r` C-quotes the path (café.txt becomes
+        // "secret/caf\303\251.txt"), which would not match "/secret/**" and would
+        // leak the blob in cleartext; `-rz` emits the raw path so the rule matches.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        std::fs::write(work.join("secret/café.txt"), b"TOP SECRET\n").unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let oid = |path: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{path}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_oid = oid("secret/café.txt");
+        let public_oid = oid("public.txt");
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob at a non-ASCII path must be withheld"
+        );
+        // Guard against an over-withholding (deny-all) regression: the public blob
+        // must still replicate.
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must NOT be withheld"
+        );
+    }
+
+    // TAB/newline are legal filename bytes on unix but rejected by the Windows
+    // filesystem, so building the fixture only makes sense (and only compiles the
+    // OsStr handling) under cfg(unix), matching fails_closed_on_non_utf8_path.
+    #[cfg(unix)]
+    #[test]
+    fn withholds_secret_blob_at_path_with_tab_and_newline() {
+        // A path containing literal TAB and newline bytes must still be withheld.
+        // This pins two parse choices: `-rz` emits the path raw (plain `-r` would
+        // C-quote the TAB/newline and break the "/secret/**" match), and splitting
+        // records on NUL rather than newline keeps the embedded newline from
+        // splitting one record into two and truncating the path. A revert to
+        // `git ls-tree -r` or to `.lines()` would regress this case.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(work.join("secret")).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        let weird = "secret/a\tb\nc.txt";
+        std::fs::write(work.join(weird), b"TOP SECRET\n").unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let oid = |path: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{path}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_oid = oid(weird);
+        let public_oid = oid("public.txt");
+        // Guard against a vacuous pass: if git ever failed to store the oddly-named
+        // file, rev-parse would yield an empty/garbage string and the withholding
+        // assert could trivially hold. A real blob OID is a 40-char (SHA-1) or
+        // 64-char (SHA-256) hex id.
+        assert!(
+            matches!(secret_oid.len(), 40 | 64),
+            "fixture did not store the TAB/newline path (got oid {secret_oid:?})"
+        );
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let rules = [rule("/secret/**", &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "secret blob at a path with TAB/newline must be withheld"
+        );
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must NOT be withheld"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fails_closed_on_non_utf8_path() {
+        // A path with a non-UTF-8 byte (here an invalid 0xFF in the denied
+        // directory name) must not be lossy-decoded: U+FFFD substitution would stop
+        // the path matching its deny rule and leak the blob. blob_paths must fail
+        // closed (Err) instead. git stores raw path bytes, so we write the tree by
+        // hand via `git update-index --cacheinfo` to embed the invalid byte.
+        use std::os::unix::ffi::OsStrExt;
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        // Hash a blob, then index it at a path whose directory byte is invalid UTF-8.
+        let blob_oid = {
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(&work)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    c.stdin.take().unwrap().write_all(b"TOP SECRET\n")?;
+                    c.wait_with_output()
+                })
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let mut bad_path = std::ffi::OsString::from("s");
+        bad_path.push(std::ffi::OsStr::from_bytes(&[0xFF]));
+        bad_path.push("cret/b.txt");
+        let cacheinfo = {
+            let mut s = std::ffi::OsString::from(format!("100644,{blob_oid},"));
+            s.push(&bad_path);
+            s
+        };
+        assert!(
+            Command::new("git")
+                .arg("update-index")
+                .arg("--add")
+                .arg("--cacheinfo")
+                .arg(&cacheinfo)
+                .current_dir(&work)
+                .status()
+                .unwrap()
+                .success(),
+            "git update-index failed"
+        );
+        run(&["commit", "-qm", "init"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let rules = [rule("/s\u{fffd}cret/**", &[])];
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        assert!(
+            result.is_err(),
+            "a non-UTF-8 path must fail closed (Err), not be lossy-decoded and leaked"
         );
     }
 
