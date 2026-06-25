@@ -452,12 +452,7 @@ async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {
 }
 
 async fn stats(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let repos = state
-        .db
-        .list_all_repos()
-        .await
-        .map(|r| r.len() as i64)
-        .unwrap_or(0);
+    let repos = state.db.count_repos_deduped().await.unwrap_or(0);
     let agents = state.db.count_agents().await.unwrap_or(0);
     let pushes = state.db.count_pushes().await.unwrap_or(0);
     Json(json!({

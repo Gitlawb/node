@@ -510,4 +510,101 @@ mod tests {
             "register must reject a DID other than the signer"
         );
     }
+
+    /// Issue #6 / jatmn finding 1: the GraphQL `repos` query renders one logical
+    /// repo per mirror+canonical pair. Seeds a canonical `did:key:` repo plus its
+    /// short-owner mirror row and a distinct standalone repo, then asserts the
+    /// query returns two entries (not three) and the shared repo appears once as
+    /// the canonical owner.
+    #[sqlx::test]
+    async fn graphql_repos_is_deduped(pool: PgPool) {
+        let short = "zGRAPHQLDEDUPAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(&format!("did:key:{short}"), "shared"))
+            .await
+            .expect("seed canonical");
+        state
+            .db
+            .upsert_mirror_repo(short, "shared", "/tmp/mirror", None)
+            .await
+            .expect("seed mirror");
+        state
+            .db
+            .create_repo(&seed_repo(
+                "did:key:zGQLOTHERBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "solo",
+            ))
+            .await
+            .expect("seed standalone");
+
+        let resp = state
+            .graphql_schema
+            .execute(async_graphql::Request::new("{ repos { name ownerDid } }"))
+            .await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let data = resp.data.into_json().expect("graphql data to json");
+        let repos = data["repos"].as_array().expect("repos array");
+        assert_eq!(
+            repos.len(),
+            2,
+            "mirror+canonical collapse to one logical repo, plus the standalone"
+        );
+        let shared: Vec<_> = repos.iter().filter(|r| r["name"] == "shared").collect();
+        assert_eq!(shared.len(), 1, "the shared repo must not be double-listed");
+        assert_eq!(
+            shared[0]["ownerDid"],
+            serde_json::json!(format!("did:key:{short}")),
+            "the canonical did:key row is the survivor"
+        );
+    }
+
+    /// Issue #6 / jatmn finding 2: `/api/v1/stats` counts logical repos, not raw
+    /// rows. With a mirror+canonical pair and a standalone repo present, the
+    /// `repos` count is 2.
+    #[sqlx::test]
+    async fn stats_repo_count_is_deduped(pool: PgPool) {
+        let short = "zSTATSDEDUPAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(&format!("did:key:{short}"), "shared"))
+            .await
+            .expect("seed canonical");
+        state
+            .db
+            .upsert_mirror_repo(short, "shared", "/tmp/mirror", None)
+            .await
+            .expect("seed mirror");
+        state
+            .db
+            .create_repo(&seed_repo(
+                "did:key:zSTATSOTHERBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "solo",
+            ))
+            .await
+            .expect("seed standalone");
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["repos"], 2,
+            "stats must count logical repos (mirror+canonical collapsed)"
+        );
+    }
 }

@@ -6,7 +6,8 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
-use chrono::Utc;
+use crate::db::RepoRecord;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -227,8 +228,8 @@ pub async fn list_repos(
     }
 
     let repos = state.db.list_all_repos_with_stars().await?;
-    let filtered: Vec<_> = repos
-        .iter()
+    let filtered: Vec<(RepoRecord, i64)> = repos
+        .into_iter()
         .filter(|(r, _)| {
             if let Some(owner) = &query.owner {
                 crate::api::did_matches(owner.as_str(), &r.owner_did)
@@ -237,10 +238,11 @@ pub async fn list_repos(
             }
         })
         .collect();
-    let total = filtered.len() as i64;
-    let resp: Vec<_> = filtered
+    let deduped = dedupe_canonical_repos(filtered);
+    let total = deduped.len() as i64;
+    let resp: Vec<_> = deduped
         .into_iter()
-        .map(|(r, stars)| to_response(r, &state, *stars))
+        .map(|(r, stars)| to_response(&r, &state, stars))
         .collect();
     let mut response = Json(resp).into_response();
     response.headers_mut().insert(
@@ -1121,7 +1123,7 @@ pub async fn list_refs(
 pub async fn list_federated_repos(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>> {
-    let local_repos = state.db.list_all_repos_with_stars().await?;
+    let local_repos = dedupe_canonical_repos(state.db.list_all_repos_with_stars().await?);
     let local_node_url = state
         .config
         .public_url
@@ -1379,11 +1381,100 @@ fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64
     }
 }
 
+/// Collapse short-owner mirror rows and canonical `did:key:` rows that point at the
+/// same logical repo into a single entry, so profile/list surfaces don't render the
+/// same repo twice (issue #6).
+///
+/// Rows are grouped by `(normalized owner, name)`, where the normalized owner is the
+/// key segment after the last `:` (so `did:key:z6Mk…` and the bare `z6Mk…` mirror row
+/// collapse together). Within a group the canonical row wins: a non-mirror row is
+/// preferred over a mirror, ties broken by earliest `created_at` then `id`. A mirror
+/// row is identified structurally by its slash-form `id` (`{owner_short}/{name}`,
+/// written only by `Db::upsert_mirror_repo`), not by its user-settable description.
+/// The survivor inherits the group's most recent `updated_at` so a gossip push that
+/// only touches the mirror row still floats the repo to the top.
+///
+/// This mirrors the SQL dedup applied on the paged/unfiltered paths via
+/// `Db::DEDUP_CTE`; the marker and the `id` tiebreak must stay in sync with it.
+fn dedupe_canonical_repos(rows: Vec<(RepoRecord, i64)>) -> Vec<(RepoRecord, i64)> {
+    use std::collections::HashMap;
+
+    // Mirror rows carry a slash-form id, written only by Db::upsert_mirror_repo;
+    // canonical rows use a UUID id (no slash). Structural, not user-settable.
+    fn is_mirror(r: &RepoRecord) -> bool {
+        r.id.contains('/')
+    }
+
+    // Strictly more canonical: non-mirror beats mirror; on equal mirror-status the
+    // earlier created_at wins, and a full tie falls back to id ASC so the survivor
+    // matches SQL's DISTINCT ON (… created_at ASC, id ASC).
+    fn outranks(candidate: &RepoRecord, current: &RepoRecord) -> bool {
+        match (is_mirror(candidate), is_mirror(current)) {
+            (false, true) => true,
+            (true, false) => false,
+            _ => (candidate.created_at, &candidate.id) < (current.created_at, &current.id),
+        }
+    }
+
+    // Preserve first-seen group order so output ordering stays deterministic.
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut winners: HashMap<(String, String), (RepoRecord, i64)> = HashMap::new();
+    let mut latest: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
+
+    for (rec, stars) in rows {
+        // did:key-aware owner key: strip a `did:key:` prefix so the bare mirror id
+        // and its `did:key:` canonical collapse, but leave any other DID method
+        // whole so `did:key:X` and `did:gitlawb:X` never merge. The `!contains(':')`
+        // guard mirrors did_matches' `key_id` check: a stripped value that still
+        // holds a `:` is a non-key full DID (e.g. malformed `did:key:did:gitlawb:X`)
+        // and must keep its full form, not collapse onto the bare method DID. Stays
+        // byte-equivalent to the SQL CASE in Db::DEDUP_CTE / count_repos_deduped.
+        let owner_key = rec
+            .owner_did
+            .strip_prefix("did:key:")
+            .filter(|rest| !rest.contains(':'))
+            .unwrap_or(&rec.owner_did)
+            .to_string();
+        let key = (owner_key, rec.name.clone());
+
+        latest
+            .entry(key.clone())
+            .and_modify(|u| {
+                if rec.updated_at > *u {
+                    *u = rec.updated_at;
+                }
+            })
+            .or_insert(rec.updated_at);
+
+        match winners.get(&key) {
+            None => {
+                order.push(key.clone());
+                winners.insert(key, (rec, stars));
+            }
+            Some((current, _)) if outranks(&rec, current) => {
+                winners.insert(key, (rec, stars));
+            }
+            Some(_) => {}
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|key| {
+            let max_updated = latest.get(&key).copied();
+            winners.remove(&key).map(|(mut rec, stars)| {
+                if let Some(u) = max_updated {
+                    rec.updated_at = u;
+                }
+                (rec, stars)
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::owner_push_rejection;
-    use crate::auth::caller_authorized_to_push;
-    use crate::error::AppError;
+    use super::*;
 
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
@@ -1456,5 +1547,321 @@ mod tests {
         assert!(caller_authorized_to_push(&repo, OWNER_DID));
         assert!(caller_authorized_to_push(&repo, OWNER_SHORT));
         assert!(!caller_authorized_to_push(&repo, STRANGER_DID));
+    }
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    fn record(id: &str, owner_did: &str, name: &str, desc: &str, updated: &str) -> RepoRecord {
+        RepoRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: Some(desc.to_string()),
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts(updated),
+            disk_path: format!("/srv/{id}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    #[test]
+    fn canonical_row_wins_over_short_owner_mirror() {
+        // Order deliberately puts the mirror row first to prove ranking, not input order, decides.
+        let mirror = record(
+            "z6Mkwbud/nipmod",
+            "z6Mkwbud",
+            "nipmod",
+            "mirrored from peer",
+            "2026-02-01T00:00:00Z",
+        );
+        let canonical = record(
+            "9d92186a",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "Decentralized npm for agents on Gitlawb",
+            "2026-01-15T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(mirror, 3), (canonical, 7)]);
+
+        assert_eq!(out.len(), 1, "the two rows collapse into one logical repo");
+        let (rec, stars) = &out[0];
+        assert_eq!(
+            rec.owner_did, "did:key:z6Mkwbud",
+            "canonical did:key row wins"
+        );
+        assert_eq!(
+            rec.description.as_deref(),
+            Some("Decentralized npm for agents on Gitlawb"),
+            "canonical description and metadata survive, not the mirror placeholder",
+        );
+        assert_eq!(*stars, 7, "star count follows the canonical row");
+        // Survivor inherits the group's most recent updated_at (here the mirror's).
+        assert_eq!(rec.updated_at, ts("2026-02-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn distinct_repos_are_preserved_in_order() {
+        let a = record(
+            "id-a",
+            "did:key:z6Aaa",
+            "alpha",
+            "first",
+            "2026-03-01T00:00:00Z",
+        );
+        let b = record(
+            "id-b",
+            "did:key:z6Bbb",
+            "beta",
+            "second",
+            "2026-03-02T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(a, 1), (b, 2)]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0.name, "alpha");
+        assert_eq!(out[1].0.name, "beta");
+    }
+
+    #[test]
+    fn same_short_owner_different_repo_does_not_collapse() {
+        // `one` is a real mirror row: slash-form id is the structural marker.
+        let one = record(
+            "z6Mkwbud/nipmod",
+            "z6Mkwbud",
+            "nipmod",
+            "mirrored from peer",
+            "2026-01-01T00:00:00Z",
+        );
+        let two = record(
+            "id-2",
+            "did:key:z6Mkwbud",
+            "other",
+            "real",
+            "2026-01-01T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(one, 0), (two, 0)]);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "different repo names stay separate under one owner"
+        );
+    }
+
+    #[test]
+    fn distinct_did_methods_sharing_a_base58_id_do_not_collapse() {
+        // `did:key` and `did:gitlawb` share the base58 id space, so a trailing
+        // segment key would treat these as one repo. The did:key-aware key keeps
+        // them apart, matching crate::api::did_matches.
+        let keyed = record(
+            "id-keyed",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "owned via did:key",
+            "2026-01-01T00:00:00Z",
+        );
+        let gitlawb = record(
+            "id-gitlawb",
+            "did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "owned via did:gitlawb",
+            "2026-01-01T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(keyed, 1), (gitlawb, 2)]);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "same name and base58 id under different DID methods are distinct repos"
+        );
+    }
+
+    #[test]
+    fn bare_id_and_did_key_form_of_same_owner_collapse() {
+        // A bare mirror id and its did:key canonical are the same owner and must
+        // collapse, the mirror-vs-canonical case stated in owner-key terms.
+        let mirror = record(
+            "z6Mkwbud/nipmod",
+            "z6Mkwbud",
+            "nipmod",
+            "mirrored from peer",
+            "2026-02-01T00:00:00Z",
+        );
+        let canonical = record(
+            "canon-id",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real",
+            "2026-01-15T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(mirror, 0), (canonical, 5)]);
+
+        assert_eq!(out.len(), 1, "bare id and its did:key form are one owner");
+        assert_eq!(out[0].0.owner_did, "did:key:z6Mkwbud", "canonical row wins");
+    }
+
+    #[test]
+    fn did_key_wrapping_a_full_did_does_not_collapse_onto_the_bare_method_did() {
+        // Residual-colon guard, mirroring did_matches' `!key_id().contains(':')`:
+        // a malformed `did:key:did:gitlawb:X` strips to `did:gitlawb:X`, which still
+        // holds a `:`, so it must keep its full form and NOT collapse with a real
+        // `did:gitlawb:X` repo of the same name.
+        let wrapped = record(
+            "id-wrapped",
+            "did:key:did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "malformed nested DID",
+            "2026-01-01T00:00:00Z",
+        );
+        let method = record(
+            "id-method",
+            "did:gitlawb:z6Mkwbud",
+            "nipmod",
+            "real method DID",
+            "2026-01-02T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(wrapped, 1), (method, 2)]);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "a did:key-wrapped full DID stays distinct from the bare method DID"
+        );
+        // Assert identity, not just count: each owner survives unmerged, so a
+        // regression that kept two rows but mis-keyed the survivor is also caught.
+        let mut owners: Vec<&str> = out.iter().map(|(r, _)| r.owner_did.as_str()).collect();
+        owners.sort_unstable();
+        assert_eq!(
+            owners,
+            vec!["did:gitlawb:z6Mkwbud", "did:key:did:gitlawb:z6Mkwbud"],
+            "both owner DIDs survive in their full form"
+        );
+    }
+
+    #[test]
+    fn empty_did_key_residual_keys_to_empty_string_consistently() {
+        // Degenerate boundary the reviewers flagged: `did:key:` with no id strips to
+        // an empty residual (no colon), so the key is "". A bare empty owner also
+        // keys to "", so the two collapse — proving the Rust strip path maps the
+        // empty residual exactly like the SQL `substr(owner_did, 9)` / `position`
+        // path (mirrored in the db-level test). A real did:key id keys separately.
+        let empty_did_key = record(
+            "id-empty-didkey",
+            "did:key:",
+            "nipmod",
+            "empty residual",
+            "2026-01-01T00:00:00Z",
+        );
+        let empty_bare = record(
+            "id-empty-bare",
+            "",
+            "nipmod",
+            "empty owner",
+            "2026-01-02T00:00:00Z",
+        );
+        let real = record(
+            "id-real",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "real id",
+            "2026-01-03T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(empty_did_key, 0), (empty_bare, 0), (real, 0)]);
+
+        assert_eq!(
+            out.len(),
+            2,
+            "`did:key:` and the empty owner share the empty key and collapse; the real id stays separate"
+        );
+    }
+
+    #[test]
+    fn two_mirror_rows_break_tie_by_earliest_created_at() {
+        // Both are mirror rows (slash-form ids); earliest created_at wins.
+        let mut older = record(
+            "z6X/r",
+            "z6X",
+            "r",
+            "mirrored from peer",
+            "2026-02-01T00:00:00Z",
+        );
+        older.created_at = ts("2026-01-01T00:00:00Z");
+        let mut newer = record(
+            "z6X/r-dup",
+            "z6X",
+            "r",
+            "mirrored from peer",
+            "2026-03-01T00:00:00Z",
+        );
+        newer.created_at = ts("2026-01-10T00:00:00Z");
+
+        let out = dedupe_canonical_repos(vec![(newer, 0), (older, 0)]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0.id, "z6X/r", "earliest created_at wins the tie");
+    }
+
+    #[test]
+    fn canonical_with_mirror_description_is_treated_as_canonical() {
+        // Marker robustness: the canonical row carries the literal mirror
+        // description (user-settable) but a UUID id; the true mirror has the
+        // slash id and was created earlier. The canonical must still win — dedup
+        // keys on the structural id, not the description.
+        let canonical = record(
+            "9d92186a-uuid",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "mirrored from peer",
+            "2026-02-01T00:00:00Z",
+        );
+        let mirror = record(
+            "z6Mkwbud/nipmod",
+            "z6Mkwbud",
+            "nipmod",
+            "a normal description",
+            "2026-01-01T00:00:00Z",
+        );
+
+        let out = dedupe_canonical_repos(vec![(canonical, 5), (mirror, 1)]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].0.id, "9d92186a-uuid",
+            "canonical wins by structural id marker despite the mirror description"
+        );
+    }
+
+    #[test]
+    fn full_tie_resolves_by_id_asc() {
+        // Two canonical rows in one group, identical created_at; only id differs.
+        // Survivor is id ASC, matching SQL's DISTINCT ON (… created_at ASC, id ASC).
+        let bbb = record(
+            "bbb",
+            "did:key:z6Same",
+            "repo",
+            "real",
+            "2026-01-01T00:00:00Z",
+        );
+        let aaa = record("aaa", "z6Same", "repo", "real", "2026-01-01T00:00:00Z");
+
+        let out = dedupe_canonical_repos(vec![(bbb, 0), (aaa, 0)]);
+
+        assert_eq!(out.len(), 1, "same group collapses");
+        assert_eq!(
+            out[0].0.id, "aaa",
+            "id ASC breaks a full tie deterministically"
+        );
     }
 }
