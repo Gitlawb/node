@@ -46,7 +46,7 @@ async fn replication_withheld_set(
     disk_path: std::path::PathBuf,
 ) -> (bool, Option<std::collections::HashSet<String>>) {
     let announce = match &rules {
-        Some(rules) => visibility_check(rules, is_public, owner_did, None, "/") == Decision::Allow,
+        Some(rules) => crate::visibility::listable_at_root(rules, is_public, owner_did, None),
         None => false,
     };
     if !announce {
@@ -97,7 +97,7 @@ async fn replication_withheld_set(
 /// The full-scan candidate set includes dangling objects the reachable-only
 /// withheld set never classified, so compute the reachable visibility-allowed
 /// blob set and the all-blob universe off the async worker and keep only
-/// non-blobs plus allowed blobs. Any error in either walk — or a task panic —
+/// non-blobs plus allowed blobs. Any error in either walk (or a task panic)
 /// pins nothing this push, mirroring the degraded-path shape of
 /// `replication_withheld_set`.
 async fn fail_closed_full_scan_objects(
