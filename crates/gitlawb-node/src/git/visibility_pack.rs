@@ -836,6 +836,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn withholds_secret_blob_across_nfc_nfd_normalization_skew() {
+        // #101: the secret lives under a directory whose name is committed in NFD
+        // ("se" + combining acute U+0301), while the deny rule is authored in NFC
+        // ("é" = U+00E9). The variant byte sits INSIDE the rule-covered directory
+        // name, so a byte-exact matcher under-withholds and leaks the blob on the
+        // replication path. NFC normalization at the matcher seam closes it. (The
+        // sibling café.txt test does not exercise this: there the rule prefix
+        // "/secret" is pure ASCII and byte-identical regardless of how é is encoded
+        // in the filename, so it passes for the wrong reason.)
+        let nfd_dir = "se\u{0301}cret"; // decomposed
+        let nfc_rule = "/s\u{00e9}cret/**"; // composed
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(work.join(nfd_dir)).unwrap();
+        std::fs::write(work.join("public.txt"), b"public\n").unwrap();
+        std::fs::write(work.join(nfd_dir).join("key.pem"), b"TOP SECRET\n").unwrap();
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["config", "core.precomposeunicode", "false"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let oid = |path: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", &format!("HEAD:{path}")])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_oid = oid(&format!("{nfd_dir}/key.pem"));
+        let public_oid = oid("public.txt");
+        // Guard against a vacuous pass: the NFD-named blob must actually exist.
+        assert_eq!(secret_oid.len(), 40, "secret blob was not stored under the NFD path");
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        let rules = [rule(nfc_rule, &[])];
+        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            withheld.contains(&secret_oid),
+            "NFC-authored deny rule must withhold the secret blob under the NFD-named directory"
+        );
+        assert!(
+            !withheld.contains(&public_oid),
+            "public blob must NOT be withheld"
+        );
+    }
+
     // TAB/newline are legal filename bytes on unix but rejected by the Windows
     // filesystem, so building the fixture only makes sense (and only compiles the
     // OsStr handling) under cfg(unix), matching fails_closed_on_non_utf8_path.
