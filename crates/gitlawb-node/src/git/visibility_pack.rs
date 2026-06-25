@@ -298,6 +298,47 @@ pub fn replicable_objects(all: Vec<String>, withheld: &HashSet<String>) -> Vec<S
         .collect()
 }
 
+/// The reachable blob OIDs that visibility ALLOWS the anonymous replication
+/// audience at some path — the only blobs the fail-closed pin filter treats as
+/// safe. Mirrors the `allowed` side of `withheld_from_pairs`: a blob reachable
+/// at an allowed path is included even when also denied elsewhere (its content
+/// is public elsewhere). A dangling blob is absent from the reachable walk, so
+/// it is never in this set and the fail-closed filter drops it (#99).
+pub fn replicable_blob_set(
+    repo_path: &Path,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+) -> Result<HashSet<String>> {
+    let pairs = blob_paths(repo_path)?;
+    let mut allowed = HashSet::new();
+    for (oid, path) in &pairs {
+        if visibility_check(rules, is_public, owner_did, None, path) == Decision::Allow {
+            allowed.insert(oid.clone());
+        }
+    }
+    Ok(allowed)
+}
+
+/// Objects safe to replicate, failing closed on blobs (#99). A candidate
+/// replicates iff it is NOT a blob (`all_blob_oids` — commits and trees are
+/// structural, never content-withheld) OR it is in `allowed_blobs` (reachable
+/// and visibility-allowed). This drops both withheld reachable blobs and
+/// dangling/unreachable blobs the reachable walk never classified, without
+/// tagging the candidate list with per-object types. Used on the full-scan pin
+/// path, where the candidate set can contain dangling objects the reachable-only
+/// withheld set cannot cover; the delta path keeps `replicable_objects`.
+pub fn replicable_objects_fail_closed(
+    candidates: Vec<String>,
+    allowed_blobs: &HashSet<String>,
+    all_blob_oids: &HashSet<String>,
+) -> Vec<String> {
+    candidates
+        .into_iter()
+        .filter(|oid| !all_blob_oids.contains(oid) || allowed_blobs.contains(oid))
+        .collect()
+}
+
 /// For every blob withheld from anonymous, the DIDs allowed to read it: the
 /// owner plus any reader DID that `visibility_check` Allows at some path the
 /// blob appears at. Least-privilege: a reader of one private subtree is not a
@@ -597,6 +638,112 @@ mod tests {
     }
 
     #[test]
+    fn fail_closed_keeps_nonblobs_and_allowed_blobs_only() {
+        // Non-blob objects (commit/tree) always pass; a blob passes only if it
+        // is in the allowed set. A withheld blob and a dangling blob (both in
+        // all_blob_oids, neither in allowed) are dropped.
+        let allowed: HashSet<String> = ["b_pub".to_string()].into_iter().collect();
+        let all_blobs: HashSet<String> = ["b_pub", "b_secret", "b_dangling"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let candidates = vec![
+            "commit1".to_string(),
+            "tree1".to_string(),
+            "b_pub".to_string(),
+            "b_secret".to_string(),
+            "b_dangling".to_string(),
+        ];
+        let got = replicable_objects_fail_closed(candidates, &allowed, &all_blobs);
+        assert_eq!(
+            got,
+            vec![
+                "commit1".to_string(),
+                "tree1".to_string(),
+                "b_pub".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn fail_closed_drops_dangling_private_blob() {
+        // #99: a private blob orphaned by a force-push/amend is unreachable but
+        // still present in the object DB. The full-scan candidate set includes
+        // it; the reachable-only allowed walk never classifies it. The
+        // fail-closed filter must drop it — it is a blob not in the allowed set.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"public bytes\n").unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        let oid_of = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let public_oid = oid_of("HEAD:public/a.txt");
+
+        // Write a blob straight into the object DB, referenced by no tree or
+        // commit — exactly the dangling state #99 is about.
+        std::fs::write(work.join("orphan.bin"), b"DANGLING SECRET\n").unwrap();
+        let dangling_oid = {
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "orphan.bin"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let all_blobs = crate::git::push_delta::all_blob_oids(&work).unwrap();
+        assert!(
+            all_blobs.contains(&dangling_oid),
+            "precondition: the dangling blob is in the all-objects universe"
+        );
+
+        let rules: Vec<VisibilityRule> = vec![];
+        let allowed = replicable_blob_set(&work, &rules, true, OWNER).unwrap();
+        assert!(
+            !allowed.contains(&dangling_oid),
+            "dangling blob is unreachable, so never in the allowed set"
+        );
+        assert!(
+            allowed.contains(&public_oid),
+            "reachable public blob is in the allowed set"
+        );
+
+        // Full-scan candidate set includes the dangling blob; fail-closed drops it.
+        let candidates = vec![dangling_oid.clone(), public_oid.clone()];
+        let replicable = replicable_objects_fail_closed(candidates, &allowed, &all_blobs);
+        assert!(
+            !replicable.contains(&dangling_oid),
+            "#99: a dangling private blob must not replicate"
+        );
+        assert!(
+            replicable.contains(&public_oid),
+            "the public blob still replicates"
+        );
+    }
+
+    #[test]
     fn recipients_are_owner_plus_allowed_readers_only() {
         let (_td, repo, secret_oid, public_oid) = fixture();
         let reader = "did:key:zReader";
@@ -882,7 +1029,11 @@ mod tests {
         let secret_oid = oid(&format!("{nfd_dir}/key.pem"));
         let public_oid = oid("public.txt");
         // Guard against a vacuous pass: the NFD-named blob must actually exist.
-        assert_eq!(secret_oid.len(), 40, "secret blob was not stored under the NFD path");
+        assert_eq!(
+            secret_oid.len(),
+            40,
+            "secret blob was not stored under the NFD path"
+        );
         run(
             &[
                 "clone",

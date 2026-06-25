@@ -10,16 +10,24 @@
 //! ## Correctness framing (do not confuse with the #84 withholding direction)
 //!
 //! The pin enumeration is part of the *exposure* set, not the withheld filter.
-//! Narrowing it per push only *shrinks* what is pinned, so it cannot create an
-//! under-withholding leak — the withheld filter (`visibility_pack`) still
-//! subtracts from whatever, smaller, set we feed it. The only risk here is
-//! *under-pinning* (a durability gap), which the reconciliation sweep backstops.
+//! On the *delta* path, narrowing per push only *shrinks* what is pinned, so it
+//! cannot create an under-withholding leak — the reachable-only withheld filter
+//! (`visibility_pack`) still subtracts from the smaller set we feed it. The only
+//! risk there is *under-pinning* (a durability gap) the sweep backstops.
+//!
+//! The *full-scan* path is different: `list_all_objects` includes dangling
+//! objects the reachable withheld set never classified, so subtracting that set
+//! is not enough — a dangling private blob would slip through (#99). The caller
+//! signals a full scan via [`PinCandidateSet::full_scan`] and must then apply
+//! the fail-closed blob filter (`visibility_pack::replicable_objects_fail_closed`)
+//! instead of the plain reachable-only subtraction.
 //!
 //! Because the pin candidate set needs only the OID *set* (never the per-path
 //! information the withheld classifier needs), `git rev-list --objects
 //! --no-object-names` is safe here. The "rev-list reports one path per object"
 //! trap from #84 applies only to `visibility_pack`'s per-path `ls-tree` walk.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -191,6 +199,61 @@ pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Like [`list_all_objects`] but pairs each OID with its object type, via
+/// `--batch-check='%(objectname) %(objecttype)'`. The pin path's fail-closed
+/// filter needs to tell blobs (content, withholdable) from commits/trees
+/// (structural, never withheld) without typing the candidate list itself.
+pub fn list_all_objects_with_type(repo_path: &Path) -> Result<Vec<(String, String)>> {
+    let output = Command::new("git")
+        .args([
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname) %(objecttype)",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git cat-file")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git cat-file failed: {stderr}");
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let oid = it.next()?;
+            let ty = it.next()?;
+            Some((oid.to_string(), ty.to_string()))
+        })
+        .collect())
+}
+
+/// Every blob OID in the repo, including unreachable/dangling ones. The
+/// fail-closed pin filter drops any candidate blob absent from the reachable,
+/// visibility-allowed set; a dangling private blob is in this set but not the
+/// allowed set, so it never replicates (#99).
+pub fn all_blob_oids(repo_path: &Path) -> Result<HashSet<String>> {
+    Ok(list_all_objects_with_type(repo_path)?
+        .into_iter()
+        .filter(|(_, ty)| ty == "blob")
+        .map(|(oid, _)| oid)
+        .collect())
+}
+
+/// The pin candidate OIDs for a push plus whether they came from a full-repo
+/// scan. `full_scan` is true when the delta could not be used and the whole
+/// object DB (including dangling objects) was enumerated — the caller must then
+/// apply the fail-closed blob filter, because the reachable-only withheld set
+/// cannot classify dangling blobs (#99).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinCandidateSet {
+    pub candidates: Vec<String>,
+    pub full_scan: bool,
+}
+
 /// Resolve the pin candidate OID set for a push, off the async worker.
 ///
 /// Runs [`resolve_push_delta`] in `spawn_blocking` (git subprocess) and applies
@@ -202,28 +265,29 @@ pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
 /// failed full scan, and a panicked blocking task each emit a warning. On a
 /// failed full scan or a task panic the candidate set is empty (pin nothing
 /// this push); that is a durability gap the reconciliation sweep backstops, and
-/// it can never leak because the withheld filter still runs on whatever set is
-/// returned.
+/// it can never leak because the withheld/fail-closed filter still runs on
+/// whatever set is returned. `full_scan` rides on the returned set so the caller
+/// knows when the dangling-inclusive filter is required.
 pub async fn resolve_candidates_for_push(
     repo_path: PathBuf,
     new_tips: Vec<String>,
     old_tips: Vec<String>,
-) -> Vec<String> {
+) -> PinCandidateSet {
     tokio::task::spawn_blocking(move || {
         let new_refs: Vec<&str> = new_tips.iter().map(String::as_str).collect();
         let old_refs: Vec<&str> = old_tips.iter().map(String::as_str).collect();
         match resolve_push_delta(&repo_path, &new_refs, &old_refs) {
             PinCandidates::Delta(objs) => {
                 tracing::info!(delta = objs.len(), repo = %repo_path.display(), "pin candidate set from push delta");
-                objs
+                PinCandidateSet { candidates: objs, full_scan: false }
             }
             PinCandidates::FullScanRequired => {
                 tracing::warn!(repo = %repo_path.display(), "pin delta unavailable (non-commit tip, git error, or force-full-scan) — full-scan fallback");
                 match list_all_objects(&repo_path) {
-                    Ok(objs) => objs,
+                    Ok(objs) => PinCandidateSet { candidates: objs, full_scan: true },
                     Err(e) => {
                         tracing::warn!(repo = %repo_path.display(), err = %e, "full-scan fallback failed; pinning nothing this push (reconciliation sweep backstops)");
-                        Vec::new()
+                        PinCandidateSet { candidates: Vec::new(), full_scan: false }
                     }
                 }
             }
@@ -232,7 +296,7 @@ pub async fn resolve_candidates_for_push(
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(err = %e, "pin candidate computation task panicked; pinning nothing this push (reconciliation sweep backstops)");
-        Vec::new()
+        PinCandidateSet { candidates: Vec::new(), full_scan: false }
     })
 }
 
@@ -452,11 +516,11 @@ mod tests {
         let repo = Repo::new();
         let c1 = repo.commit_file("a.txt", "one\n");
         let c2 = repo.commit_file("b.txt", "two\n");
-        let got: HashSet<String> =
+        let set =
             resolve_candidates_for_push(repo.path.clone(), vec![c2.clone()], vec![c1.clone()])
-                .await
-                .into_iter()
-                .collect();
+                .await;
+        assert!(!set.full_scan, "happy-path delta is not a full scan");
+        let got: HashSet<String> = set.candidates.into_iter().collect();
         let new_blob = repo.rev("HEAD:b.txt");
         assert!(
             got.contains(&c2) && got.contains(&new_blob),
@@ -473,11 +537,9 @@ mod tests {
         repo.commit_file("a.txt", "one\n");
         let blob = repo.rev("HEAD:a.txt");
         let all: HashSet<String> = list_all_objects(&repo.path).unwrap().into_iter().collect();
-        let got: HashSet<String> =
-            resolve_candidates_for_push(repo.path.clone(), vec![blob], vec![])
-                .await
-                .into_iter()
-                .collect();
+        let set = resolve_candidates_for_push(repo.path.clone(), vec![blob], vec![]).await;
+        assert!(set.full_scan, "non-commit tip is signalled as a full scan");
+        let got: HashSet<String> = set.candidates.into_iter().collect();
         assert_eq!(got, all, "non-commit tip falls back to full repo scan");
     }
 
@@ -565,5 +627,37 @@ mod tests {
         let all = list_all_objects(&repo.path).unwrap();
         // 2 commits + 2 trees + 2 blobs = 6 objects.
         assert_eq!(all.len(), 6, "got: {all:?}");
+    }
+
+    #[test]
+    fn all_blob_oids_includes_dangling_and_excludes_nonblobs() {
+        // The all-blob universe must include a dangling blob (the #99 hazard) and
+        // exclude commits/trees, so the fail-closed filter can tell a blob from a
+        // structural object without typing the candidate list.
+        let repo = Repo::new();
+        let c1 = repo.commit_file("a.txt", "one\n");
+        let reachable_blob = repo.rev("HEAD:a.txt");
+        let tree = repo.rev("HEAD^{tree}");
+        // Write a blob referenced by no tree/commit — dangling.
+        std::fs::write(repo.path.join("orphan.bin"), b"dangling\n").unwrap();
+        let dangling = repo.git(&["hash-object", "-w", "orphan.bin"]);
+
+        let blobs = all_blob_oids(&repo.path).unwrap();
+        assert!(blobs.contains(&reachable_blob), "reachable blob present");
+        assert!(
+            blobs.contains(&dangling),
+            "dangling blob present in the all-blob universe"
+        );
+        assert!(!blobs.contains(&c1), "commit is not a blob");
+        assert!(!blobs.contains(&tree), "tree is not a blob");
+
+        // The typed lister tags each object; spot-check the dangling blob's type.
+        let typed = list_all_objects_with_type(&repo.path).unwrap();
+        assert!(
+            typed
+                .iter()
+                .any(|(oid, ty)| oid == &dangling && ty == "blob"),
+            "dangling object is typed as a blob"
+        );
     }
 }

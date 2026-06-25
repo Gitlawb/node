@@ -7,8 +7,6 @@
 //! If `ipfs_api` is empty the functions are no-ops, so the node works fine
 //! without a local IPFS daemon.
 
-use std::collections::HashSet;
-
 use anyhow::Result;
 use gitlawb_core::cid::Cid;
 
@@ -88,9 +86,10 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
 /// Pin any of the given candidate git objects that are not yet recorded in
 /// `pinned_cids`.
 ///
-/// `candidates` is the OID set to consider — the per-push delta on the push
-/// path, or the whole-repo list on the reconciliation sweep / full-scan
-/// fallback (see `git::push_delta`). `repo_path` is still needed to read each
+/// `object_list` is the already-withheld-filtered OID set to pin: the caller
+/// applies `visibility_pack::replicable_objects` on the delta path or the
+/// `..._fail_closed` filter on the full-scan path before calling, so this
+/// function never sees a withheld blob. `repo_path` is still needed to read each
 /// object's bytes. The twin in `pinata.rs` mirrors this shape — change both in
 /// lockstep.
 ///
@@ -98,15 +97,12 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
 pub async fn pin_new_objects(
     ipfs_api: &str,
     repo_path: &std::path::Path,
-    candidates: Vec<String>,
+    object_list: Vec<String>,
     db: &crate::db::Db,
-    withheld: &HashSet<String>,
 ) -> Vec<(String, String)> {
     if ipfs_api.is_empty() {
         return vec![];
     }
-
-    let object_list = crate::git::visibility_pack::replicable_objects(candidates, withheld);
 
     let mut pinned = Vec::new();
 

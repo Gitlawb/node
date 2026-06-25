@@ -7,7 +7,6 @@
 //! no-op, so nodes without Pinata backing work fine.
 
 use anyhow::Result;
-use std::collections::HashSet;
 
 /// Pin a single git object's raw bytes on Pinata (v3 API).
 ///
@@ -70,26 +69,24 @@ pub async fn pin_object(
 /// Pin any of the given candidate git objects that haven't yet been sent to
 /// Pinata.
 ///
-/// `candidates` is the OID set to consider — the per-push delta on the push
-/// path, or the whole-repo list on the reconciliation sweep / full-scan
-/// fallback (see `git::push_delta`). `repo_path` is still needed to read each
-/// object's bytes. The twin in `ipfs_pin.rs` mirrors this shape — change both
-/// in lockstep. Objects already recorded with a `pinata_cid` are skipped.
-/// Returns `(sha_hex, cid)` pairs for each newly pinned object.
+/// `object_list` is the already-withheld-filtered OID set to pin: the caller
+/// applies `visibility_pack::replicable_objects` on the delta path or the
+/// `..._fail_closed` filter on the full-scan path before calling. `repo_path` is
+/// still needed to read each object's bytes. The twin in `ipfs_pin.rs` mirrors
+/// this shape — change both in lockstep. Objects already recorded with a
+/// `pinata_cid` are skipped. Returns `(sha_hex, cid)` pairs for each newly
+/// pinned object.
 pub async fn pin_new_objects(
     client: &reqwest::Client,
     upload_url: &str,
     jwt: &str,
     repo_path: &std::path::Path,
-    candidates: Vec<String>,
+    object_list: Vec<String>,
     db: &crate::db::Db,
-    withheld: &HashSet<String>,
 ) -> Vec<(String, String)> {
     if jwt.is_empty() {
         return vec![];
     }
-
-    let object_list = crate::git::visibility_pack::replicable_objects(candidates, withheld);
 
     let mut pinned = Vec::new();
 

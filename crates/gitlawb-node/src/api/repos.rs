@@ -887,7 +887,13 @@ pub async fn git_receive_pack(
     // introduced); on any non-commit tip or git error it fails closed to a full
     // repo scan. Only needed when something will actually replicate. All
     // degraded paths log inside the helper rather than failing silently.
-    let candidates: Vec<String> = if withheld.is_some() {
+    // Resolve the pin candidate set, then filter to what may actually
+    // replicate. Delta path: the reachable-only `withheld` set suffices (delta
+    // objects are reachable). Full-scan path: the candidate set can include
+    // dangling blobs the withheld set never classified, so fail closed —
+    // replicate a blob only if it is reachable AND visibility-allowed (#99). On
+    // any error in the fail-closed walks, pin nothing this push.
+    let object_list: Vec<String> = if let Some(withheld_set) = withheld.clone() {
         let new_tips: Vec<String> = ref_updates
             .iter()
             .map(|u| u.new_sha.clone())
@@ -898,16 +904,55 @@ pub async fn git_receive_pack(
             .map(|u| u.old_sha.clone())
             .filter(|s| s != ZERO_SHA)
             .collect();
-        crate::git::push_delta::resolve_candidates_for_push(disk_path.clone(), new_tips, old_tips)
+        let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+            disk_path.clone(),
+            new_tips,
+            old_tips,
+        )
+        .await;
+        if pin_set.full_scan {
+            let p = disk_path.clone();
+            let rules_for_blobs = rules_opt.clone().unwrap_or_default();
+            let owner = record.owner_did.clone();
+            let is_pub = record.is_public;
+            let candidates = pin_set.candidates;
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                let allowed = crate::git::visibility_pack::replicable_blob_set(
+                    &p,
+                    &rules_for_blobs,
+                    is_pub,
+                    &owner,
+                )?;
+                let all_blobs = crate::git::push_delta::all_blob_oids(&p)?;
+                Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
+                    candidates,
+                    &allowed,
+                    &all_blobs,
+                ))
+            })
             .await
+            .map_err(|e| {
+                tracing::warn!(err = %e, "fail-closed blob walk task panicked; pinning nothing this push")
+            })
+            .ok()
+            .and_then(|r| {
+                r.map_err(|e| {
+                    tracing::warn!(err = %e, "fail-closed blob walk failed; pinning nothing this push")
+                })
+                .ok()
+            })
+            .unwrap_or_default()
+        } else {
+            crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
+        }
     } else {
         Vec::new()
     };
 
     // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
     // Skipped entirely when the public cannot read the repo (withheld == None).
-    if let Some(withheld_ipfs) = withheld.clone() {
-        let candidates_ipfs = candidates.clone();
+    if withheld.is_some() {
+        let object_list_ipfs = object_list.clone();
         let ipfs_api = state.config.ipfs_api.clone();
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
@@ -924,9 +969,8 @@ pub async fn git_receive_pack(
             let pinned = crate::ipfs_pin::pin_new_objects(
                 &ipfs_api,
                 &repo_path_clone,
-                candidates_ipfs,
+                object_list_ipfs,
                 &db_clone,
-                &withheld_ipfs,
             )
             .await;
             if !pinned.is_empty() {
@@ -1030,23 +1074,21 @@ pub async fn git_receive_pack(
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
-        let withheld_pinata = withheld;
-        let candidates_pinata = candidates;
+        let object_list_pinata = object_list;
+        let do_pinata_replication = withheld.is_some();
         tokio::spawn(async move {
-            let pinned = match &withheld_pinata {
-                Some(withheld) => {
-                    crate::pinata::pin_new_objects(
-                        &http_client,
-                        &pinata_upload_url,
-                        &pinata_jwt,
-                        &repo_path_clone,
-                        candidates_pinata,
-                        &db_clone,
-                        withheld,
-                    )
-                    .await
-                }
-                None => Vec::new(),
+            let pinned = if do_pinata_replication {
+                crate::pinata::pin_new_objects(
+                    &http_client,
+                    &pinata_upload_url,
+                    &pinata_jwt,
+                    &repo_path_clone,
+                    object_list_pinata,
+                    &db_clone,
+                )
+                .await
+            } else {
+                Vec::new()
             };
 
             if !pinned.is_empty() {
