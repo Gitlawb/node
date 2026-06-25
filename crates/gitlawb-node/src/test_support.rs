@@ -922,4 +922,165 @@ mod tests {
             "is_public=true repo with a root deny must NOT be listed (proves visibility_check, not is_public)"
         );
     }
+
+    // ── /api/v1/stats count oracle (#104) ──────────────────────────────────
+    // The stats endpoint lives in meta_routes (no auth layer), so the caller is
+    // always anonymous (None). Its `repos` count must withhold private/mode-A
+    // repos exactly as the listing surfaces do, or it is a count oracle.
+
+    fn stats_router(state: AppState) -> Router {
+        Router::new()
+            .route("/api/v1/stats", axum::routing::get(crate::server::stats))
+            .with_state(state)
+    }
+
+    async fn stats_repos_count(state: AppState) -> i64 {
+        let resp = stats_router(state)
+            .oneshot(anon_get("/api/v1/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        json_body(resp).await["repos"]
+            .as_i64()
+            .expect("stats.repos is an integer")
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_excludes_bare_private(pool: PgPool) {
+        // No-rule branch: an is_public=false repo with no visibility rule is
+        // denied to anonymous, so stats.repos counts only the public repo.
+        let owner = "did:key:zSTATSPRIVAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        assert_eq!(
+            stats_repos_count(state).await,
+            1,
+            "stats.repos must not count the private repo (#104 count oracle)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_excludes_hide_existence_repo(pool: PgPool) {
+        // Some(rule) branch — the #104 subject. Both repos are is_public=true, so
+        // the only reason the second is withheld is its root rule with empty
+        // reader_dids (anonymous excluded). Proves the count goes through
+        // listable_at_root, not a bare is_public predicate.
+        let owner = "did:key:zSTATSHIDEAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "open-repo"))
+            .await
+            .expect("seed open");
+        let hidden = seed_repo(owner, "hidden-repo"); // is_public = true
+        state.db.create_repo(&hidden).await.expect("seed hidden");
+        state
+            .db
+            .set_visibility_rule(&hidden.id, "/", crate::db::VisibilityMode::A, &[], owner)
+            .await
+            .expect("root hide-existence rule");
+
+        assert_eq!(
+            stats_repos_count(state).await,
+            1,
+            "stats.repos must not count a hide-existence (mode-A, empty readers) repo (#104)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_excludes_public_under_root_deny(pool: PgPool) {
+        // Inverse the seam was built for: an is_public=true repo with a root deny
+        // (mode B, no readers) must not be counted — is_public alone would count it.
+        let owner = "did:key:zSTATSDENYAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "open-repo"))
+            .await
+            .expect("seed open");
+        let denied = seed_repo(owner, "deny-repo"); // is_public = true
+        state.db.create_repo(&denied).await.expect("seed denied");
+        state
+            .db
+            .set_visibility_rule(&denied.id, "/", crate::db::VisibilityMode::B, &[], owner)
+            .await
+            .expect("root deny rule");
+
+        assert_eq!(
+            stats_repos_count(state).await,
+            1,
+            "stats.repos must not count an is_public=true repo under a root deny (#104)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_matches_list_total(pool: PgPool) {
+        // R2 parity: stats.repos == anonymous GET /api/v1/repos X-Total-Count.
+        let owner = "did:key:zSTATSPARITYAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let list_total = {
+            let resp = list_repos_router(state.clone())
+                .oneshot(anon_get("/api/v1/repos"))
+                .await
+                .unwrap();
+            resp.headers()
+                .get("X-Total-Count")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<i64>().ok())
+                .expect("X-Total-Count header")
+        };
+
+        assert_eq!(
+            stats_repos_count(state).await,
+            list_total,
+            "stats.repos must equal the anonymous list X-Total-Count (R2 parity)"
+        );
+        assert_eq!(list_total, 1, "sanity: only the public repo is visible");
+    }
+
+    #[sqlx::test]
+    async fn stats_preserves_sibling_fields(pool: PgPool) {
+        // R4: the rewrite must not drop agents/pushes/version.
+        let state = test_state(pool).await;
+        let resp = stats_router(state)
+            .oneshot(anon_get("/api/v1/stats"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        for key in ["repos", "agents", "pushes", "version"] {
+            assert!(body.get(key).is_some(), "stats must still carry `{key}`");
+        }
+    }
+
+    #[sqlx::test]
+    async fn stats_repos_count_empty_db_is_zero(pool: PgPool) {
+        let state = test_state(pool).await;
+        assert_eq!(
+            stats_repos_count(state).await,
+            0,
+            "empty DB yields repos == 0 without error"
+        );
+    }
 }

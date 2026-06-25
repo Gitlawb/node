@@ -1003,10 +1003,16 @@ impl Db {
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
-    /// Count of distinct logical repos (mirror + canonical collapsed), for
-    /// `/api/v1/stats`. Uses the same did:key-aware owner-key grouping as
-    /// `DEDUP_CTE` (the CASE must stay byte-identical); the marker/tiebreak only
-    /// decide which row would survive, not the group count, so they are not needed here.
+    /// Count of distinct logical repos (mirror + canonical collapsed). Uses the
+    /// same did:key-aware owner-key grouping as `DEDUP_CTE` (the CASE must stay
+    /// byte-identical); the marker/tiebreak only decide which row would survive,
+    /// not the group count, so they are not needed here.
+    ///
+    /// `/api/v1/stats` no longer calls this — it counts only anonymously-listable
+    /// repos to avoid a count oracle (#104). Retained as the tested reference
+    /// implementation of the unfiltered dedup count: its tests pin the `DEDUP_CTE`
+    /// CASE that the live list paths depend on. Allowed dead outside tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn count_repos_deduped(&self) -> Result<i64> {
         let row = sqlx::query(
             "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt FROM repos",
