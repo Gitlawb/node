@@ -23,8 +23,10 @@ jobs:
           # Act on PRs only; never on issues.
           days-before-issue-stale: -1
           days-before-issue-close: -1
-          # Only PRs the triage step flagged as needing an author response.
-          only-pr-labels: "needs-issue,needs-description"
+          # Only PRs the triage step flagged as missing a real description.
+          # needs-issue is advisory-only (linking an issue is a SHOULD, and many
+          # legitimate small PRs have none) so it does not drive auto-close.
+          only-pr-labels: "needs-description"
           stale-pr-label: "stale"
           exempt-pr-labels: "workflow-change,security,pinned"
           remove-stale-when-updated: true
