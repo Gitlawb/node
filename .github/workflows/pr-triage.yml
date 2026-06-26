@@ -68,8 +68,8 @@ jobs:
             if (isFork && touchesWorkflows) want.add("workflow-change");
 
             const changedRust = names.some(n => n.startsWith("crates/") && n.endsWith(".rs"));
-            // A test can live in a tests/ dir, a *_test.rs file, or — the common Rust
-            // pattern — an inline #[test] / #[cfg(test)] block added inside the source file.
+            // A test can live in a tests/ dir, a *_test.rs file, or (the common Rust
+            // pattern) an inline #[test] / #[cfg(test)] block added inside the source file.
             const addsInlineTest = files.some(f =>
               f.filename.endsWith(".rs") && f.patch &&
               /^\+.*#\[(test\]|cfg\(test\))/m.test(f.patch));
@@ -108,7 +108,7 @@ jobs:
 
             const reasons = {
               "needs-issue": "Link the issue this addresses (`Closes #123`). For protocol changes, open an issue first.",
-              "needs-description": "Add a short summary of what changes and why — the template's Summary and Motivation sections.",
+              "needs-description": "Add a short summary of what changes and why: the template's Summary and Motivation sections.",
               "needs-tests": "This changes Rust source but no tests changed. Tests are required for fixes and strongly encouraged for features.",
             };
             const lines = advisory.map(l => `- ${reasons[l]}`).join("\n");
