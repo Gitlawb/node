@@ -31,10 +31,9 @@ jobs:
           exempt-pr-labels: "workflow-change,security,pinned"
           remove-stale-when-updated: true
           stale-pr-message: >
-            This PR has been inactive for 14 days and is still missing a linked issue
-            or a description. It will be closed in 7 days if there's no update. Push a
-            change or leave a comment to keep it open — no hard feelings, you can reopen
-            anytime.
+            This PR has been inactive for 14 days and is still missing a description.
+            It will be closed in 7 days if there's no update. Push a change or leave a
+            comment to keep it open — no hard feelings, you can reopen anytime.
           close-pr-message: >
             Closing due to inactivity. Reopen whenever you're ready to update it — see
             CONTRIBUTING.md for what helps us review quickly.
