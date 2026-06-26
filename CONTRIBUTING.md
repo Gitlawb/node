@@ -69,9 +69,10 @@ expected to clear a basic quality bar:
 - **A real description.** Say what changes and why. "Update code" is not a description.
 
 A triage bot labels PRs that are missing these and leaves a short note. Nothing is closed
-automatically while you're engaging. A flagged PR that goes 14 days with no linked issue or
-description gets a stale warning, and is closed 7 days later if still untouched. Closed PRs can
-be reopened at any time once updated.
+automatically while you're engaging. A flagged PR still missing a description after 14 days of
+inactivity gets a stale warning, and is closed 7 days later if still untouched. A missing issue
+link alone never triggers closure; that label stays advisory. Closed PRs can be reopened at any
+time once updated.
 
 ## Development environment
 
