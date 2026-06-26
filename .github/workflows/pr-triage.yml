@@ -1,7 +1,11 @@
 name: PR Triage
 
+# Runs on pull_request_target, not pull_request: fork PRs get a read-only
+# GITHUB_TOKEN under pull_request regardless of the permissions below, so the
+# label/comment writes 403. This job never checks out or runs PR head code (it
+# only reads context.payload and the files API), so pull_request_target is safe.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, edited, synchronize, reopened]
 
 permissions:
