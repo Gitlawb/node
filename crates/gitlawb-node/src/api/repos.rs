@@ -584,6 +584,30 @@ fn owner_push_rejection(
     }
 }
 
+/// Decide whether the fork gate refuses a `fork_repo` request (#98).
+///
+/// Returns `true` when the fork must be refused: the source carries at least one
+/// path-scoped subtree that `caller` may not read, so a full `git clone --mirror`
+/// would copy out content the filtered read path (`git_upload_pack`) withholds.
+/// Pure function so the policy is unit-testable without a database or git backend.
+///
+/// Delegates the per-caller decision to [`withheld_globs`](crate::visibility::withheld_globs)
+/// / `visibility_check`, so the owner bypass (full and short DID) and `reader_dids`
+/// grants are inherited from the read path and the two cannot drift on who may read
+/// what. The predicate is a conservative (fail-closed) over-approximation of the
+/// read path's object-level withholding: never weaker (so the fork cannot leak
+/// content the read path withholds), and stricter only in the narrow
+/// duplicate/co-located-blob case. Only called after `authorize_repo_read("/")`
+/// has already granted the caller root read.
+fn fork_withheld_blocks(
+    rules: &[crate::db::VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: &str,
+) -> bool {
+    !crate::visibility::withheld_globs(rules, is_public, owner_did, Some(caller)).is_empty()
+}
+
 /// Path of the peer sync-notify endpoint. Used both to build the target URL
 /// and as the signing path, so they can never drift apart.
 const SYNC_NOTIFY_PATH: &str = "/api/v1/sync/notify";
@@ -1291,8 +1315,22 @@ pub async fn fork_repo(
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
     // Enforce read visibility on the source before cloning: an unauthorized
     // caller must not be able to fork (full mirror) a repo they cannot read.
-    let (source, _rules) =
+    let (source, rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, Some(auth.0.as_str()), "/").await?;
+
+    // #98: the "/" check above only proves root read. A full `git clone --mirror`
+    // would still copy out any path-scoped subtree withheld from this caller, so
+    // refuse the fork when the caller has any withheld glob. Fail closed with a
+    // not-found response (mirrors authorize_repo_read's Deny) so the existence of
+    // a subtree the caller cannot see is not leaked. Runs before repo_store.acquire
+    // so no withheld object is ever materialized on disk.
+    if fork_withheld_blocks(&rules, source.is_public, &source.owner_did, auth.0.as_str()) {
+        tracing::warn!(
+            owner = %owner, repo = %name, forker = %auth.0,
+            "fork rejected — source has a path-scoped subtree withheld from the caller"
+        );
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
 
     let fork_name = req.name.unwrap_or_else(|| source.name.clone());
     let forker_did = auth.0;
@@ -1631,6 +1669,87 @@ mod tests {
         assert!(caller_authorized_to_push(&repo, OWNER_DID));
         assert!(caller_authorized_to_push(&repo, OWNER_SHORT));
         assert!(!caller_authorized_to_push(&repo, STRANGER_DID));
+    }
+
+    // ── fork_withheld_blocks (#98 path-scoped fork gate) ──
+    // A path-scoped visibility rule is an allow-list keyed by `reader_dids`, so
+    // the fork gate must ask the per-caller question "is anything withheld from
+    // this caller?" (`withheld_globs` non-empty), not the structural "does any
+    // non-`/` rule exist?". `READER_DID` is a non-owner who is granted a subtree.
+    const READER_DID: &str = "did:key:z6Mkreader000000000000000000000000000000000000000";
+
+    fn vis_rule(path_glob: &str, readers: &[&str]) -> crate::db::VisibilityRule {
+        crate::db::VisibilityRule {
+            id: "rule-id".into(),
+            repo_id: "repo-id".into(),
+            path_glob: path_glob.into(),
+            mode: crate::db::VisibilityMode::B,
+            reader_dids: readers.iter().map(|s| s.to_string()).collect(),
+            created_by: OWNER_DID.into(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn fork_owner_full_did_with_path_rule_allowed() {
+        // Owner reads everything (implicit reader), so nothing is withheld.
+        let rules = [vis_rule("/secret/**", &[])];
+        assert!(!fork_withheld_blocks(&rules, true, OWNER_DID, OWNER_DID));
+    }
+
+    #[test]
+    fn fork_owner_short_did_with_path_rule_allowed() {
+        // Owner recognized in bare short-form via visibility_check's is_owner.
+        let rules = [vis_rule("/secret/**", &[])];
+        assert!(!fork_withheld_blocks(&rules, true, OWNER_DID, OWNER_SHORT));
+    }
+
+    #[test]
+    fn fork_non_owner_denied_subtree_refused() {
+        // Core #98 regression: caller is not a reader of /secret, so it is
+        // withheld and the full-mirror fork must be refused.
+        let rules = [vis_rule("/secret/**", &[])];
+        assert!(fork_withheld_blocks(&rules, true, OWNER_DID, STRANGER_DID));
+    }
+
+    #[test]
+    fn fork_non_owner_granted_subtree_allowed() {
+        // The case the structural predicate got wrong: a listed reader of
+        // /secret can read it on the read path, so the fork must be allowed.
+        let rules = [vis_rule("/secret/**", &[READER_DID])];
+        assert!(!fork_withheld_blocks(&rules, true, OWNER_DID, READER_DID));
+    }
+
+    #[test]
+    fn fork_non_owner_root_rule_only_allowed() {
+        // Whole-repo "/" rules are excluded by withheld_globs; nothing withheld.
+        // is_public=true models the caller having passed authorize_repo_read("/").
+        let rules = [vis_rule("/", &[])];
+        assert!(!fork_withheld_blocks(&rules, true, OWNER_DID, STRANGER_DID));
+    }
+
+    #[test]
+    fn fork_non_owner_no_rules_public_allowed() {
+        assert!(!fork_withheld_blocks(&[], true, OWNER_DID, STRANGER_DID));
+    }
+
+    #[test]
+    fn fork_non_owner_mixed_root_and_denied_subtree_refused() {
+        // A permissive root rule does not rescue a denied path-scoped subtree.
+        let rules = [vis_rule("/", &[]), vis_rule("/secret/**", &[])];
+        assert!(fork_withheld_blocks(&rules, true, OWNER_DID, STRANGER_DID));
+    }
+
+    #[test]
+    fn fork_partial_reader_still_refused() {
+        // Caller granted /secret/public but denied the rest of /secret still
+        // cannot read all of /secret, so the full mirror is refused (a filtered
+        // fork is Option 2 / deferred).
+        let rules = [
+            vis_rule("/secret/**", &[]),
+            vis_rule("/secret/public/**", &[READER_DID]),
+        ];
+        assert!(fork_withheld_blocks(&rules, true, OWNER_DID, READER_DID));
     }
 
     fn ts(s: &str) -> DateTime<Utc> {

@@ -218,6 +218,67 @@ mod tests {
         );
     }
 
+    /// #98: forking a repo with a path-scoped subtree the caller cannot read is
+    /// refused with 404, before any clone. A public repo with a `/secret/**` rule
+    /// that excludes the stranger lets the stranger pass the `/` read gate but not
+    /// fork the full mirror. Pins the wiring (rules bound, gate before the clone);
+    /// a regression to `_rules` or moving the gate past `repo_store.acquire` fails
+    /// here. No on-disk source repo is needed — the refusal precedes acquire.
+    #[sqlx::test]
+    async fn fork_rejects_non_owner_with_withheld_subtree(pool: PgPool) {
+        let owner = "did:key:zFORKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zFORKSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let repo = seed_repo(owner, "fork-repo");
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo_id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[],
+                owner,
+            )
+            .await
+            .expect("seed visibility rule");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/fork",
+                axum::routing::post(crate::api::repos::fork_repo),
+            )
+            .with_state(state.clone());
+        let uri = format!("/api/v1/repos/{owner}/fork-repo/fork");
+        let resp = router
+            .oneshot(signed_request_as(
+                stranger,
+                Method::POST,
+                &uri,
+                Body::from("{}"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "fork of a repo with a withheld subtree must be refused with 404"
+        );
+
+        // The fork must not have been created under the stranger's ownership.
+        let stranger_short = stranger.split(':').next_back().unwrap();
+        assert!(
+            state
+                .db
+                .get_repo(stranger_short, "fork-repo")
+                .await
+                .expect("get_repo")
+                .is_none(),
+            "no fork row may be created for a refused fork"
+        );
+    }
+
     /// N13: the task handlers bind the acting DID to the signer. A caller signed
     /// as B claiming delegator_did A is rejected before any DB write (DB-free).
     #[sqlx::test]
