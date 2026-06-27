@@ -176,8 +176,12 @@ pub struct InfoRefsQuery {
 pub async fn create_repo(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedDid>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
+    // iCaptcha proof-of-intelligence gate (inert unless ICAPTCHA_MODE is set).
+    crate::icaptcha::check(&headers, &auth.0)?;
+
     // Sanitize name: alphanumeric, hyphens, underscores only
     if !req
         .name

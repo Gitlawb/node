@@ -9,6 +9,7 @@ mod encrypted_pin;
 mod error;
 mod git;
 mod graphql;
+mod icaptcha;
 mod ipfs_pin;
 mod metrics;
 mod operator;
@@ -190,6 +191,9 @@ async fn main() -> Result<()> {
         git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
 
     let rate_limiter = rate_limit::RateLimiter::new(10, std::time::Duration::from_secs(3600));
+
+    // Initialize the iCaptcha proof gate (inert unless ICAPTCHA_MODE is set).
+    icaptcha::init().await;
 
     let state = AppState {
         config: Arc::new(config.clone()),
