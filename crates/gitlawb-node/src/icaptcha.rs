@@ -19,7 +19,7 @@
 //!   ICAPTCHA_REQUIRED_LEVEL  minimum proof level             (default 3)
 
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -48,11 +48,31 @@ impl Mode {
     }
 }
 
-fn parse_mode(s: &str) -> Mode {
+/// Parse `ICAPTCHA_MODE`. Returns `None` for unrecognized values so the caller
+/// can surface the typo instead of silently disabling the gate.
+fn parse_mode(s: &str) -> Option<Mode> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "enforce" => Mode::Enforce,
-        "shadow" => Mode::Shadow,
-        _ => Mode::Off,
+        "" | "off" => Some(Mode::Off),
+        "shadow" => Some(Mode::Shadow),
+        "enforce" => Some(Mode::Enforce),
+        _ => None,
+    }
+}
+
+/// Parse `ICAPTCHA_REQUIRED_LEVEL`. Defaults to 3; warns (rather than silently
+/// lowering the threshold) when a non-empty value fails to parse.
+fn parse_required_level() -> u32 {
+    const DEFAULT: u32 = 3;
+    match std::env::var("ICAPTCHA_REQUIRED_LEVEL") {
+        Ok(v) if !v.trim().is_empty() => v.trim().parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %v,
+                default = DEFAULT,
+                "invalid ICAPTCHA_REQUIRED_LEVEL; using default"
+            );
+            DEFAULT
+        }),
+        _ => DEFAULT,
     }
 }
 
@@ -97,20 +117,27 @@ fn decode_key(b64url: &str) -> Option<VerifyingKey> {
 
 async fn fetch_key(url: &str) -> Option<VerifyingKey> {
     let endpoint = format!("{}/v1/pubkey", url.trim_end_matches('/'));
-    let jwks: Jwks = reqwest::get(&endpoint).await.ok()?.json().await.ok()?;
+    // Bounded request: a hung /v1/pubkey must never block node startup. On
+    // timeout/error we return None and the gate stays inert (fail safe).
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let jwks: Jwks = client.get(&endpoint).send().await.ok()?.json().await.ok()?;
     decode_key(&jwks.keys.first()?.x)
 }
 
 /// Initialize the gate from the environment. Call once at startup. Never panics;
 /// if the gate is active but no key can be loaded, it stays inert and warns.
 pub async fn init() {
-    let mode = parse_mode(&std::env::var("ICAPTCHA_MODE").unwrap_or_default());
+    let raw_mode = std::env::var("ICAPTCHA_MODE").unwrap_or_default();
+    let mode = parse_mode(&raw_mode).unwrap_or_else(|| {
+        tracing::warn!(value = %raw_mode, "invalid ICAPTCHA_MODE; disabling iCaptcha gate");
+        Mode::Off
+    });
     let url = std::env::var("ICAPTCHA_URL")
         .unwrap_or_else(|_| "https://icaptcha.gitlawb.com".to_string());
-    let required_level = std::env::var("ICAPTCHA_REQUIRED_LEVEL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(3);
+    let required_level = parse_required_level();
 
     let key = if mode == Mode::Off {
         None
@@ -285,6 +312,17 @@ mod tests {
         let v = verifier(3);
         let err = verify(&v, &HeaderMap::new(), SUB, IAT).unwrap_err();
         assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn parse_mode_accepts_documented_values_and_rejects_junk() {
+        assert_eq!(parse_mode(""), Some(Mode::Off));
+        assert_eq!(parse_mode("off"), Some(Mode::Off));
+        assert_eq!(parse_mode("  Shadow "), Some(Mode::Shadow));
+        assert_eq!(parse_mode("ENFORCE"), Some(Mode::Enforce));
+        // Typos must NOT silently disable the gate.
+        assert_eq!(parse_mode("enforced"), None);
+        assert_eq!(parse_mode("on"), None);
     }
 
     #[test]
