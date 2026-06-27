@@ -15,7 +15,7 @@ use crate::cert;
 use crate::error::{AppError, Result};
 use crate::git::{smart_http, store, visibility_pack};
 use crate::state::AppState;
-use crate::visibility::{visibility_check, Decision};
+use crate::visibility::{visibility_check, withheld_globs, Decision};
 use crate::webhooks;
 
 /// The git all-zeros object id — the create/delete sentinel in a ref update.
@@ -599,13 +599,19 @@ fn owner_push_rejection(
 /// content the read path withholds), and stricter only in the narrow
 /// duplicate/co-located-blob case. Only called after `authorize_repo_read("/")`
 /// has already granted the caller root read.
+///
+/// The gate evaluates rules at each glob's representative prefix while the serve
+/// path withholds per blob path; their "is anything withheld" results agree only
+/// because `validate_path_glob` keeps `/` the lone whole-repo scope (no glob can
+/// collapse a non-`/` rule's prefix to `/`). If the glob grammar is ever extended,
+/// revisit this equivalence — same caveat as `visibility_pack::has_path_scoped_rule`.
 fn fork_withheld_blocks(
     rules: &[crate::db::VisibilityRule],
     is_public: bool,
     owner_did: &str,
     caller: &str,
 ) -> bool {
-    !crate::visibility::withheld_globs(rules, is_public, owner_did, Some(caller)).is_empty()
+    !withheld_globs(rules, is_public, owner_did, Some(caller)).is_empty()
 }
 
 /// Path of the peer sync-notify endpoint. Used both to build the target URL
