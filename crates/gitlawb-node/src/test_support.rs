@@ -810,6 +810,219 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
     }
 
+    /// #94: a visibility READER who is not the owner passes the read gate but is
+    /// still refused the webhook list (the require_repo_owner half), and the
+    /// headerless 401 fires before any lookup so it cannot be an existence oracle
+    /// (headerless on an existing private repo and on an absent repo both 401).
+    #[sqlx::test]
+    async fn list_webhooks_reader_403_and_no_existence_oracle(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zHKRDROWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zHKRDRREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "hook-reader");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // Root allow-list rule: `reader` may read the repo at "/", but is not the owner.
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        let secret_url = "https://hooks.example.com/reader-case";
+        state
+            .db
+            .create_webhook(&crate::db::Webhook {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                url: secret_url.to_string(),
+                secret: None,
+                events: vec!["*".to_string()],
+                created_by_did: owner.to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                active: true,
+            })
+            .await
+            .expect("seed webhook");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/hooks",
+                    axum::routing::get(crate::api::webhooks::list_webhooks),
+                )
+                .with_state(state.clone())
+        };
+
+        // A listed reader passes authorize_repo_read but is not the owner → 403,
+        // and the webhook url does not leak.
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-reader/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner reader passes the read gate but is refused the webhook list"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(secret_url),
+            "403 must not leak the url to a reader"
+        );
+
+        // Existence-oracle check: headerless on the existing private repo → 401,
+        // headerless on an absent repo → 401. Indistinguishable ⇒ no oracle.
+        let headerless = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router()
+            .oneshot(headerless(format!(
+                "/api/v1/repos/{owner}/hook-reader/hooks"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "headerless on an existing private repo → 401 (before any lookup)"
+        );
+        let resp = router()
+            .oneshot(headerless(format!(
+                "/api/v1/repos/{owner}/no-such-repo/hooks"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "headerless on an absent repo → 401 too, so existence does not leak"
+        );
+    }
+
+    /// #94: the read-visibility surfaces admit a listed reader who is NOT the
+    /// owner (the allow-list branch of visibility_check). Pins that a private
+    /// repo's reader — not just its owner — can read replicas and protected
+    /// branches, while a non-reader stranger still 404s.
+    #[sqlx::test]
+    async fn read_visibility_admits_listed_reader(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zRDRDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zRDRDREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zRDRDSTRGRCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "rdr-repo");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .register_replica(&repo.id, stranger, "https://replica.example.com/x")
+            .await
+            .expect("seed replica");
+        state
+            .db
+            .protect_branch(&repo.id, "main", owner)
+            .await
+            .expect("seed protected branch");
+
+        let call = |handler_router: Router, did: Option<&str>, uri: String| {
+            let req = match did {
+                Some(d) => signed_request_as(d, Method::GET, &uri, Body::empty()),
+                None => Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            };
+            handler_router.oneshot(req)
+        };
+
+        let replicas_router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::get(crate::api::replicas::list_replicas),
+                )
+                .with_state(state.clone())
+        };
+        let protect_router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/branches/protected",
+                    axum::routing::get(crate::api::protect::list_protected_branches),
+                )
+                .with_state(state.clone())
+        };
+
+        // Listed reader (non-owner) → 200 on both surfaces.
+        for (router, path) in [
+            (replicas_router(), "replicas"),
+            (protect_router(), "branches/protected"),
+        ] {
+            let resp = call(
+                router,
+                Some(reader),
+                format!("/api/v1/repos/{owner}/rdr-repo/{path}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a listed reader must read {path}"
+            );
+        }
+
+        // A non-reader stranger → 404 on both (deny path).
+        for (router, path) in [
+            (replicas_router(), "replicas"),
+            (protect_router(), "branches/protected"),
+        ] {
+            let resp = call(
+                router,
+                Some(stranger),
+                format!("/api/v1/repos/{owner}/rdr-repo/{path}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "a non-reader stranger must be denied {path}"
+            );
+        }
+    }
+
     /// #94 sibling: list_replicas is read-visibility-gated. Replica lists are a
     /// documented public mirror-discovery surface, so a PUBLIC repo stays
     /// anonymously listable, but a PRIVATE repo must not leak its replica URLs.

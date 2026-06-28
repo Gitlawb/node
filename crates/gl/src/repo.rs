@@ -1325,6 +1325,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cmd_replicas_anonymous_when_no_identity() {
+        // Empty dir → no identity → get_maybe_signed must fall back to an
+        // anonymous GET (the public-repo path). Assert NO signature header.
+        let dir = TempDir::new().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/replicas$".to_string()))
+            .match_header("signature", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"repo":"owner/pubrepo","replica_count":0,"replicas":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_replicas(
+            "owner/pubrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn test_cmd_info_signs_repo_and_replica_fetches() {
         let dir = TempDir::new().unwrap();
         write_identity(&dir);
