@@ -621,6 +621,165 @@ mod tests {
         );
     }
 
+    /// #94: list_webhooks is gated read-visibility THEN owner. Webhook callback
+    /// URLs are owner-secret, so the listing must hide a private repo's existence
+    /// (404, uniform with the read-visibility siblings) and 403 a non-owner of a
+    /// public repo, while a headerless caller gets 401 (no anonymous form). Mounts
+    /// the handler directly (it sits on `optional_signature`, so the handler does
+    /// its own check) and seeds a real webhook so a leak would surface in the body.
+    #[sqlx::test]
+    async fn list_webhooks_is_owner_gated(pool: PgPool) {
+        let owner = "did:key:zHOOKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zHOOKSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "hook-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "hook-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let secret_url = "https://hooks.example.com/sekret-endpoint";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .create_webhook(&crate::db::Webhook {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    repo_id: repo.id.clone(),
+                    url: secret_url.to_string(),
+                    secret: Some("topsecret".to_string()),
+                    events: vec!["*".to_string()],
+                    created_by_did: owner.to_string(),
+                    created_at: Utc::now().to_rfc3339(),
+                    active: true,
+                })
+                .await
+                .expect("seed webhook");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/hooks",
+                    axum::routing::get(crate::api::webhooks::list_webhooks),
+                )
+                .with_state(state.clone())
+        };
+        let body_text = |resp_body: &[u8]| String::from_utf8_lossy(resp_body).to_string();
+
+        // Owner on the public repo → 200, hook listed, secret redacted, url present.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-pub/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner must read its own hooks"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let txt = body_text(&bytes);
+        assert!(
+            txt.contains(secret_url),
+            "owner response must include the url"
+        );
+        assert!(txt.contains("***"), "secret must stay redacted");
+        assert!(
+            !txt.contains("topsecret"),
+            "the real secret must never appear"
+        );
+
+        // Non-owner of a PUBLIC repo → 403 (repo is public, existence not secret).
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-pub/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner of a public repo must be forbidden, not served"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body_text(&bytes).contains(secret_url),
+            "403 must not leak the url"
+        );
+
+        // Non-owner of a PRIVATE repo → 404 (existence hidden, uniform with siblings).
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-priv/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader of a private repo must get 404, not 403/200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body_text(&bytes).contains(secret_url),
+            "404 must not leak the url"
+        );
+
+        // Headerless (no AuthenticatedDid) → 401: a webhook listing has no anon form.
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/hook-pub/hooks"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a headerless caller must get 401"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/does-not-exist/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
     /// Issue #6 / jatmn finding 2: `/api/v1/stats` counts logical repos, not raw
     /// rows. With a mirror+canonical pair and a standalone repo present, the
     /// `repos` count is 2.

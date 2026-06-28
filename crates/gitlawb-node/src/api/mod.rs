@@ -181,6 +181,9 @@ mod authz_guard {
             (pulls, "merge_pr", "require_repo_owner("),
             (webhooks, "create_webhook", "require_repo_owner("),
             (webhooks, "delete_webhook", "require_repo_owner("),
+            // list_webhooks layers authorize_repo_read (404 hides a private repo)
+            // before the owner gate; the require_repo_owner marker guards the 403.
+            (webhooks, "list_webhooks", "require_repo_owner("),
             (labels, "add_label", "require_repo_owner("),
             (labels, "remove_label", "require_repo_owner("),
             // Bucket A' — owner OR author (did_matches against the author)
