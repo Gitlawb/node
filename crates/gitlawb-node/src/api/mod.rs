@@ -200,6 +200,9 @@ mod authz_guard {
             // get_by_cid gates each iterated repo row directly via visibility_check
             // (KTD2a: it must NOT route through authorize_repo_read's fuzzy re-resolve).
             (ipfs, "get_by_cid", "visibility_check("),
+            // #94 sibling read surfaces: gate private-repo metadata on read
+            // visibility (public repos stay anonymous; private repos 404).
+            (replicas, "list_replicas", "authorize_repo_read("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),

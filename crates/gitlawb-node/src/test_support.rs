@@ -780,6 +780,132 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
     }
 
+    /// #94 sibling: list_replicas is read-visibility-gated. Replica lists are a
+    /// documented public mirror-discovery surface, so a PUBLIC repo stays
+    /// anonymously listable, but a PRIVATE repo must not leak its replica URLs.
+    /// register_replica registers NON-owner DIDs (it rejects the owner), and a
+    /// replica operator is not a visibility reader, so a non-owner replica
+    /// operator of a private repo gets 404 — the intended contract, pinned here.
+    #[sqlx::test]
+    async fn list_replicas_is_read_visibility_gated(pool: PgPool) {
+        let owner = "did:key:zREPLOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let replica_op = "did:key:zREPLOPERATORBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "repl-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "repl-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let replica_url = "https://replica.example.com/mirror-endpoint";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .register_replica(&repo.id, replica_op, replica_url)
+                .await
+                .expect("seed replica");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::get(crate::api::replicas::list_replicas),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains(replica_url);
+        let anon = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Public repo, anonymous → 200, replicas listed (mirror-discovery preserved).
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/repl-pub/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public replica list stays anonymous"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "public response must include the replica url"
+        );
+
+        // Private repo, anonymous → 404, no replica URL leaked.
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/repl-priv/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "private replica list is hidden from anon"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the replica url");
+
+        // Private repo, owner → 200.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/repl-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private replica list"
+        );
+
+        // Private repo, the non-owner replica operator → 404 (intended contract:
+        // a replica operator is not a visibility reader).
+        let resp = router()
+            .oneshot(signed_request_as(
+                replica_op,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/repl-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-owner replica operator of a private repo is not a reader"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/no-such-repo/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
     /// Issue #6 / jatmn finding 2: `/api/v1/stats` counts logical repos, not raw
     /// rows. With a mirror+canonical pair and a standalone repo present, the
     /// `repos` count is 2.
