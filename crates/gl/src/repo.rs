@@ -346,7 +346,7 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     };
 
     let r: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{name}"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
         .await?
         .json()
         .await
@@ -685,9 +685,10 @@ async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: b
     // fetch below works on the owner's own private repos.
     let client = NodeClient::new(&node, Some(keypair));
 
-    // Fetch repo info
+    // Fetch repo info (get_repo is read-visibility-gated; sign so the owner can
+    // inspect their own private repo).
     let resp = client
-        .get(&format!("/api/v1/repos/{owner}/{name}"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
         .await
         .context("failed to connect to node")?;
     if !resp.status().is_success() {
@@ -1146,11 +1147,15 @@ mod tests {
         let short = did.split(':').next_back().unwrap().to_string();
 
         let mut server = mockito::Server::new_async().await;
+        // Both fetches are read-visibility-gated; with an identity loaded they
+        // must be signed. Requiring the header guards a regression to get().
         let _repo = server
             .mock(
                 "GET",
                 mockito::Matcher::Regex(format!(r"^/api/v1/repos/{short}/myrepo$")),
             )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
@@ -1165,6 +1170,8 @@ mod tests {
                     r"^/api/v1/repos/{short}/myrepo/branches/protected$"
                 )),
             )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"["main"]"#)
@@ -1289,5 +1296,72 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_cmd_replicas_signs_when_identity_present() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        // Read-visibility-gated: with an identity the request must be signed.
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/replicas$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"repo":"owner/myrepo","replica_count":0,"replicas":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_replicas(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_info_signs_repo_and_replica_fetches() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        // Both the primary repo fetch and the replica sub-fetch are
+        // read-visibility-gated; with an identity loaded both must be signed.
+        let _repo = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/myrepo$".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"r1","name":"myrepo","owner_did":"did:key:zOwner","is_public":false,"default_branch":"main"}"#,
+            )
+            .create_async()
+            .await;
+        let _replicas = server
+            .mock("GET", mockito::Matcher::Regex(r"/replicas$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"replica_count":0,"replicas":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_info(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 }
