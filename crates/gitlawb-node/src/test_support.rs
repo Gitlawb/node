@@ -906,6 +906,118 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
     }
 
+    /// #94 sibling: list_protected_branches is read-visibility-gated. A public
+    /// repo's protected-branch listing stays anonymous; a private repo must not
+    /// leak its branch names to a non-reader (404, uniform no-existence-oracle).
+    #[sqlx::test]
+    async fn list_protected_branches_is_read_visibility_gated(pool: PgPool) {
+        let owner = "did:key:zPROTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zPROTSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "prot-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "prot-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let secret_branch = "release-embargoed";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .protect_branch(&repo.id, secret_branch, owner)
+                .await
+                .expect("seed protected branch");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/branches/protected",
+                    axum::routing::get(crate::api::protect::list_protected_branches),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains(secret_branch);
+        let anon = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Public repo, anonymous → 200, branch listed.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/prot-pub/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public protected-branch list stays anonymous"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "public response must include the branch name"
+        );
+
+        // Private repo, anonymous → 404, no branch name leaked.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/prot-priv/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "private branch list hidden from anon"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the branch name");
+
+        // Private repo, owner → 200, branch listed.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/prot-priv/branches/protected"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private protected branches"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/no-such-repo/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
     /// Issue #6 / jatmn finding 2: `/api/v1/stats` counts logical repos, not raw
     /// rows. With a mirror+canonical pair and a standalone repo present, the
     /// `repos` count is 2.

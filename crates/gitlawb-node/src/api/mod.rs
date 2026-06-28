@@ -203,6 +203,7 @@ mod authz_guard {
             // #94 sibling read surfaces: gate private-repo metadata on read
             // visibility (public repos stay anonymous; private repos 404).
             (replicas, "list_replicas", "authorize_repo_read("),
+            (protect, "list_protected_branches", "authorize_repo_read("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),
