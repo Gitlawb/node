@@ -181,26 +181,47 @@ enum Decision {
     Consume { jti: String, exp: i64 },
 }
 
-/// Gate an authenticated request. `did` is the authenticated agent DID the proof
-/// must belong to. In enforce mode a valid proof is consumed once (its `jti` is
-/// recorded in the DB) so it cannot be replayed across gated actions. Returns
-/// `Ok(())` to allow, `Err(Unauthorized)` to reject. Off/Shadow never reject.
-pub async fn check(db: &crate::db::Db, headers: &HeaderMap, did: &str) -> Result<(), AppError> {
-    let v = match VERIFIER.get() {
-        Some(v) => v,
-        None => return Ok(()), // not initialized -> inert
-    };
-    match decide(v, headers, did, now_secs()) {
-        Decision::Allow => Ok(()),
-        Decision::Reject(reason) => Err(reject_error(v, &reason)),
-        Decision::Consume { jti, exp } => {
-            // First use records the jti; a replay finds it already present.
-            if db.consume_proof_jti(&jti, exp).await? {
-                Ok(())
-            } else {
-                Err(reject_error(v, "proof already used (replay)"))
+/// A verified proof awaiting consumption. Verification (which rejects invalid or
+/// missing proofs) is separated from consumption (which spends the single-use
+/// `jti`) so a request rejected by later validation never burns a valid proof.
+/// The caller must `consume()` this guard immediately before the gated write.
+/// For off/shadow/inert there is nothing to consume.
+#[must_use = "a verified iCaptcha proof must be consumed before the gated action"]
+pub struct ProofGuard(Option<ConsumeJob>);
+
+struct ConsumeJob {
+    jti: String,
+    exp: i64,
+}
+
+impl ProofGuard {
+    /// Spend the proof's `jti` (single-use). A replay is rejected. No-op when
+    /// there is nothing to consume (off/shadow/inert).
+    pub async fn consume(self, db: &crate::db::Db) -> Result<(), AppError> {
+        if let Some(job) = self.0 {
+            if !db.consume_proof_jti(&job.jti, job.exp).await? {
+                return Err(AppError::Unauthorized(
+                    "iCaptcha proof already used (replay); solve a fresh challenge".to_string(),
+                ));
             }
         }
+        Ok(())
+    }
+}
+
+/// Verify the proof in `headers` belongs to `did`. Rejects missing/invalid
+/// proofs early (enforce mode); off/shadow never reject. Returns a [`ProofGuard`]
+/// the caller must `consume()` right before the gated write. Off/shadow/inert
+/// yield a no-op guard that consumes nothing.
+pub fn verify_request(headers: &HeaderMap, did: &str) -> Result<ProofGuard, AppError> {
+    let v = match VERIFIER.get() {
+        Some(v) => v,
+        None => return Ok(ProofGuard(None)), // not initialized -> inert
+    };
+    match decide(v, headers, did, now_secs()) {
+        Decision::Allow => Ok(ProofGuard(None)),
+        Decision::Reject(reason) => Err(reject_error(v, &reason)),
+        Decision::Consume { jti, exp } => Ok(ProofGuard(Some(ConsumeJob { jti, exp }))),
     }
 }
 

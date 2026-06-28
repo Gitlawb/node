@@ -179,8 +179,11 @@ pub async fn create_repo(
     headers: axum::http::HeaderMap,
     Json(req): Json<CreateRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
-    // iCaptcha proof-of-intelligence gate (inert unless ICAPTCHA_MODE is set).
-    crate::icaptcha::check(&state.db, &headers, &auth.0).await?;
+    // iCaptcha gate (inert unless ICAPTCHA_MODE is set). Verify the proof up
+    // front so an invalid/missing proof is rejected early; the proof is only
+    // spent once the request is admissible, just before the first write — so a
+    // rejected request (bad name, already exists) never burns a valid proof.
+    let proof = crate::icaptcha::verify_request(&headers, &auth.0)?;
 
     // Sanitize name: alphanumeric, hyphens, underscores only
     if !req
@@ -200,6 +203,9 @@ pub async fn create_repo(
     if state.db.get_repo(&owner_did, &req.name).await?.is_some() {
         return Err(AppError::RepoExists(req.name));
     }
+
+    // Request is admissible — spend the proof now, immediately before the write.
+    proof.consume(&state.db).await?;
 
     let disk_path = state
         .repo_store
