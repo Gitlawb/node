@@ -200,7 +200,7 @@ impl ProofGuard {
     pub async fn consume(self, db: &crate::db::Db) -> Result<(), AppError> {
         if let Some(job) = self.0 {
             if !db.consume_proof_jti(&job.jti, job.exp).await? {
-                return Err(AppError::Unauthorized(
+                return Err(AppError::IcaptchaProofRequired(
                     "iCaptcha proof already used (replay); solve a fresh challenge".to_string(),
                 ));
             }
@@ -226,7 +226,7 @@ pub fn verify_request(headers: &HeaderMap, did: &str) -> Result<ProofGuard, AppE
 }
 
 fn reject_error(v: &Verifier, reason: &str) -> AppError {
-    AppError::Unauthorized(format!(
+    AppError::IcaptchaProofRequired(format!(
         "iCaptcha proof required ({reason}). Solve a challenge at {} for level >= {} and resend with the {} header.",
         v.url, v.required_level, PROOF_HEADER
     ))
