@@ -798,6 +798,11 @@ mod tests {
             .unwrap();
         let body = json_body(resp).await;
         let names = names_in(&body["repos"]);
+        assert_eq!(
+            body["count"].as_u64(),
+            Some(1),
+            "federated count must reflect only the visible repos, not the pre-filter total (#97)"
+        );
         assert!(
             names.contains(&"pub-repo".to_string()),
             "public repo federated"
@@ -838,6 +843,35 @@ mod tests {
         assert!(
             !names.contains(&"priv-repo".to_string()),
             "private repo must not be enumerable via anonymous GraphQL (#97)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn graphql_repos_shows_authorized_caller_their_private_repo(pool: PgPool) {
+        // Positive path: the resolver pulls the caller DID from GraphQL request
+        // data, so the authenticated context must still surface a private repo its
+        // owner may read. Guards an auth-context regression on the GraphQL surface
+        // that the anonymous-only test would miss (#97).
+        let owner = "did:key:zGQLAUTHOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = state
+            .graphql_schema
+            .execute(
+                async_graphql::Request::new("{ repos { name } }")
+                    .data(AuthenticatedDid(owner.to_string())),
+            )
+            .await;
+        assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
+        let names = names_in(&resp.data.into_json().expect("graphql json")["repos"]);
+        assert!(
+            names.contains(&"priv-repo".to_string()),
+            "owner must see their own private repo via authenticated GraphQL (#97)"
         );
     }
 

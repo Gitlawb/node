@@ -460,12 +460,14 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Json<serde_json::Val
     // file). Fail closed: any DB error collapses the whole count to 0 (an
     // under-count never leaks existence), preserving the prior `.unwrap_or(0)`.
     let repos = async {
-        let rows = state.db.list_all_repos_deduped_with_stars(None).await?;
-        let ids: Vec<String> = rows.iter().map(|(r, _)| r.id.clone()).collect();
+        // stats only needs the count, so use the no-stars deduped list (same
+        // DEDUP_CTE) and skip the repo_stars aggregation the listing path needs.
+        let rows = state.db.list_all_repos_deduped().await?;
+        let ids: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
         let rules_by_repo = state.db.list_visibility_rules_for_repos(&ids).await?;
         let count = rows
             .iter()
-            .filter(|(r, _)| {
+            .filter(|r| {
                 let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
                 crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, None)
             })

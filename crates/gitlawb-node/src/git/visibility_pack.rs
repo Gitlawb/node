@@ -1029,9 +1029,10 @@ mod tests {
         let secret_oid = oid(&format!("{nfd_dir}/key.pem"));
         let public_oid = oid("public.txt");
         // Guard against a vacuous pass: the NFD-named blob must actually exist.
-        assert_eq!(
-            secret_oid.len(),
-            40,
+        // Accept SHA-1 (40) or SHA-256 (64) object ids so the test is
+        // hash-format agnostic, matching the fixture guard later in this file.
+        assert!(
+            matches!(secret_oid.len(), 40 | 64),
             "secret blob was not stored under the NFD path"
         );
         run(
