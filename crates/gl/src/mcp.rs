@@ -1826,6 +1826,41 @@ mod tests {
         assert_eq!(parsed["body"], "looks good");
     }
 
+    #[tokio::test]
+    async fn test_webhook_list_via_mcp_signs_the_request() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        // /hooks is owner-gated, so the MCP webhook_list tool must send a SIGNED
+        // request (get_signed). Requiring the header catches a regression to get().
+        // Passing `owner` in args makes resolve_owner skip the node-root lookup.
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"webhooks":[],"count":0}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("webhooks"), "got: {result}");
+    }
+
     #[test]
     fn test_tool_count_is_42() {
         let tools = tool_definitions();

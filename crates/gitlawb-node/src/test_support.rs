@@ -1462,6 +1462,79 @@ mod tests {
         );
     }
 
+    /// #94 end-to-end seam: a REAL RFC-9421 signature produced exactly as the gl
+    /// client's get_signed does (gitlawb_core::http_sig::sign_request over GET +
+    /// empty body) is accepted by the node's actual optional_signature middleware,
+    /// which verifies it and injects AuthenticatedDid, so the owner's signed
+    /// `gl webhook list` resolves to 200. This stitches the gl signing side and
+    /// the node verifying side in one test (not mockito on one end and a unit
+    /// verify on the other).
+    #[sqlx::test]
+    async fn list_webhooks_accepts_a_real_gl_signature_e2e(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        // Short owner form in the URL path: no colons (so the signed @path and the
+        // node's path_and_query() match byte-for-byte), and get_repo's owner LIKE
+        // match + did_matches still authorize the full-DID signer as the owner.
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+        let repo = seed_repo(&owner_did, "real-sig-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let url = "https://hooks.example.com/e2e";
+        state
+            .db
+            .create_webhook(&crate::db::Webhook {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                url: url.to_string(),
+                secret: None,
+                events: vec!["*".to_string()],
+                created_by_did: owner_did.clone(),
+                created_at: Utc::now().to_rfc3339(),
+                active: true,
+            })
+            .await
+            .expect("seed webhook");
+
+        let path = format!("/api/v1/repos/{short}/real-sig-repo/hooks");
+        let signed = sign_request(&kp, "GET", &path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        // Mount the handler UNDER the production optional_signature middleware so
+        // the node actually verifies the signature (not the injected-DID shortcut).
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/hooks",
+                axum::routing::get(crate::api::webhooks::list_webhooks),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state);
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the node must verify a real gl-style signature and authorize the owner"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(url),
+            "the verified owner sees the webhook list"
+        );
+    }
+
     /// Issue #6 / jatmn finding 2: `/api/v1/stats` counts logical repos, not raw
     /// rows. With a mirror+canonical pair and a standalone repo present, the
     /// `repos` count is 2.
