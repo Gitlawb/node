@@ -933,8 +933,9 @@ async fn call_tool(
         "webhook_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_owner(&args, &client).await?;
+            // Owner-gated route: must be signed (get_signed), not a plain get().
             let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+                .get_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
                 .await?
                 .json()
                 .await?;

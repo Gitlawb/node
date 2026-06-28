@@ -152,8 +152,10 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
     let client = NodeClient::new(&node, Some(keypair));
     let owner = resolve_owner(&client).await?;
 
+    // get_signed (not get) attaches the RFC 9421 signature — plain get() never
+    // signs, and the node owner-gates this route, so an unsigned GET 401s.
     let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+        .get_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
         .await?
         .json()
         .await
@@ -347,6 +349,10 @@ mod tests {
 
         let _m = server
             .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            // The route is owner-gated, so the list request must be signed.
+            // Requiring the header here is what catches a regression to plain get().
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"webhooks":[]}"#)
@@ -370,6 +376,8 @@ mod tests {
 
         let _m = server
             .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"webhooks":[{"id":"h1","url":"https://a.com","events":["push"],"active":true},{"id":"h2","url":"https://b.com","events":["*"],"active":false}]}"#)

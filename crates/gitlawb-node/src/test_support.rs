@@ -750,6 +750,36 @@ mod tests {
             "404 must not leak the url"
         );
 
+        // Owner of a PRIVATE repo → 200 (both guards pass: read-visibility admits
+        // the owner, then require_repo_owner admits the owner). Exercises the
+        // both-pass branch the public/owner case does not, and confirms redaction.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-priv/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the owner must read its own private repo's hooks"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let txt = body_text(&bytes);
+        assert!(
+            txt.contains(secret_url),
+            "owner of private repo sees the url"
+        );
+        assert!(
+            txt.contains("***"),
+            "secret stays redacted on the private repo"
+        );
+
         // Headerless (no AuthenticatedDid) → 401: a webhook listing has no anon form.
         let resp = router()
             .oneshot(

@@ -1,8 +1,8 @@
 //! Webhook CRUD API.
 //!
-//! POST   /api/v1/repos/:owner/:repo/hooks        — create (auth required)
-//! GET    /api/v1/repos/:owner/:repo/hooks        — list
-//! DELETE /api/v1/repos/:owner/:repo/hooks/:id   — delete (auth required)
+//! POST   /api/v1/repos/:owner/:repo/hooks        — create (owner only)
+//! GET    /api/v1/repos/:owner/:repo/hooks        — list (owner only; auth required)
+//! DELETE /api/v1/repos/:owner/:repo/hooks/:id   — delete (owner only)
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
