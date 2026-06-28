@@ -452,7 +452,7 @@ pub async fn git_info_refs(
         }
     }
 
-    // For receive-pack (push), download the latest from Tigris so the client
+    // For receive-pack (push), download the latest from storage so the client
     // sees the same refs that acquire_write() will operate on.
     let disk_path = if service == "git-receive-pack" {
         state
@@ -794,9 +794,36 @@ pub async fn git_receive_pack(
     let receive_result = smart_http::receive_pack(&disk_path, body).await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes. Only upload to Tigris when the push
+    // from blocking subsequent pushes. Only upload to storage when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
-    guard.release(receive_result.is_ok()).await;
+    let push_ok = receive_result.is_ok();
+    if push_ok && state.config.async_upload {
+        // Write-back: ack the client now; the durable upload to object storage
+        // and the advisory-lock release run in the background. The lock is held
+        // until the upload finishes, so a concurrent writer on another machine
+        // can't observe a stale archive. Durability tradeoff: if the node stops
+        // after this ack but before the upload, the local copy survives but
+        // STORAGE stays stale until this repo's next successful push re-uploads
+        // — it is not automatically reconciled. Hence async_upload is opt-in.
+        let repo_label = name.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = guard.release(true).await {
+                tracing::error!(repo = %repo_label, err = %e,
+                    "write-back durable upload failed after push was acked");
+            }
+        });
+    } else {
+        // Strict path (or failed push): upload-before-ack. On a successful push
+        // whose durable upload then fails, surface an error so the client knows
+        // the push is not durably stored (a failed push returns Ok from release
+        // and the push error is reported below).
+        if let Err(e) = guard.release(push_ok).await {
+            tracing::error!(repo = %name, err = %e, "durable upload failed after push");
+            return Err(AppError::Git(format!(
+                "push applied locally but durable upload to storage failed: {e}"
+            )));
+        }
+    }
 
     let result = receive_result.map_err(|e| {
         tracing::error!(repo = %name, err = %e, "git receive-pack failed");
@@ -1359,7 +1386,7 @@ pub async fn fork_repo(
         )));
     }
 
-    // Ensure source repo is on local disk (downloads from Tigris on cache miss)
+    // Ensure source repo is on local disk (downloads from storage on cache miss)
     let source_path = state
         .repo_store
         .acquire(&source.owner_did, &source.name)
@@ -1386,11 +1413,17 @@ pub async fn fork_repo(
         )));
     }
 
-    // Upload fork to Tigris
+    // Upload fork to storage — fail closed if the durable upload fails rather
+    // than reporting a fork that only exists on this node's local disk.
     state
         .repo_store
         .release_after_write(&forker_did, &fork_name)
-        .await;
+        .await
+        .map_err(|e| {
+            AppError::Git(format!(
+                "fork created locally but durable upload failed: {e}"
+            ))
+        })?;
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {

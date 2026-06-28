@@ -17,6 +17,7 @@ mod pinata;
 mod rate_limit;
 mod server;
 mod state;
+mod storage;
 mod sync;
 #[cfg(test)]
 mod test_support;
@@ -169,25 +170,28 @@ async fn main() -> Result<()> {
         info!("  fly machine: {mid}");
     }
 
-    // Initialize Tigris S3 client if bucket is configured
-    let tigris = if !config.tigris_bucket.is_empty() {
-        match git::tigris::TigrisClient::new(&config.tigris_bucket).await {
-            Ok(client) => {
-                info!(bucket = %config.tigris_bucket, "tigris storage enabled");
-                Some(client)
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "failed to initialize Tigris client — using local-only storage");
-                None
-            }
-        }
-    } else {
-        info!("tigris storage disabled (no bucket configured)");
-        None
-    };
+    // Initialize the storage-agnostic blob backend (S3-compatible / filesystem /
+    // IPFS), then wrap it in the repo-archive layer. `None` = local-only mode.
+    // Fail closed: a configured-but-unreachable backend aborts boot rather than
+    // silently running local-only and dropping durability.
+    let blob_store = storage::build(&config)
+        .await
+        .context("initializing object storage backend")?;
+    let archive = blob_store.map(storage::archive::RepoArchive::new);
 
-    let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
+    // Dedicated, bounded pool for advisory-lock connections. A push pins one
+    // connection for its whole lifetime (lock held across receive-pack +
+    // upload), so giving locks their own budget keeps a burst of concurrent or
+    // slow pushes from draining the main pool and stalling every other DB
+    // handler node-wide. Sized independently of the handler pool.
+    const ADVISORY_LOCK_POOL_SIZE: u32 = 16;
+    let lock_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(ADVISORY_LOCK_POOL_SIZE)
+        .connect(&config.database_url)
+        .await
+        .context("creating advisory-lock connection pool")?;
+
+    let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), archive, lock_pool);
 
     let rate_limiter = rate_limit::RateLimiter::new(10, std::time::Duration::from_secs(3600));
 

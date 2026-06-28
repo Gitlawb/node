@@ -1,35 +1,49 @@
-//! Centralized repo storage layer — local disk cache backed by Tigris (S3).
+//! Centralized repo storage layer — local disk cache backed by a pluggable
+//! object store (S3-compatible / filesystem / IPFS) via [`RepoArchive`].
 //!
 //! Every handler that needs access to a git repo on disk goes through `RepoStore`:
 //!
-//! - `acquire()` — ensures the repo is on local disk (downloads from Tigris on cache miss).
-//! - `release_after_write()` — uploads the updated repo to Tigris after a write operation.
-//! - `init()` — creates a new bare repo locally and uploads to Tigris.
+//! - `acquire()` — ensures the repo is on local disk (downloads on cache miss).
+//! - `acquire_write()` — write lock + ensures local matches storage (skips the
+//!   download when the cached etag already matches — the push-latency win).
+//! - `release()` / `release_after_write()` — upload the updated repo to storage.
+//! - `init()` — creates a new bare repo locally and uploads to storage.
 //!
-//! When Tigris is disabled (bucket empty), this is a simple passthrough to local disk.
+//! When no backend is configured, this is a simple passthrough to local disk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::{PgPool, Postgres};
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use super::store;
-use super::tigris::TigrisClient;
+use crate::storage::archive::RepoArchive;
 
-/// Centralized repo storage: local disk cache + optional Tigris backend.
+/// Centralized repo storage: local disk cache + optional object-storage backend
+/// (S3-compatible / filesystem / IPFS) behind the [`RepoArchive`] layer.
 #[derive(Clone)]
 pub struct RepoStore {
     repos_dir: PathBuf,
-    tigris: Option<TigrisClient>,
-    /// Shared Postgres pool for advisory locks.
-    pool: PgPool,
-    /// Tracks repos already confirmed to exist in Tigris — avoids redundant
+    archive: Option<RepoArchive>,
+    /// Bounded pool dedicated to advisory-lock connections — the only DB pool
+    /// RepoStore needs, as it touches Postgres solely for advisory locks. A push
+    /// pins one connection for its whole lifetime (the lock is held across both
+    /// receive-pack and the upload), so a separate budget keeps a burst of
+    /// concurrent/slow pushes from draining the handler pool and starving every
+    /// other DB handler.
+    lock_pool: PgPool,
+    /// Tracks repos already confirmed to exist in storage — avoids redundant
     /// HEAD checks and background uploads for repos we've already migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
+    /// Last-known archive etag per `owner_slug/repo` key. Lets a write skip the
+    /// pre-write download when our local copy already matches storage (the
+    /// common case under sticky routing) — the main push-latency win.
+    versions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RepoStore {
@@ -37,80 +51,146 @@ impl RepoStore {
     pub fn for_testing(repos_dir: PathBuf, pool: PgPool) -> Self {
         Self {
             repos_dir,
-            tigris: None,
-            pool,
-            migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            archive: None,
+            lock_pool: pool,
+            migrated: Arc::new(Mutex::new(HashSet::new())),
+            versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, pool: PgPool) -> Self {
+    /// `lock_pool` is a bounded pool that advisory-lock connections are pinned
+    /// from, kept separate from the handler pool so push concurrency can't
+    /// drain it.
+    pub fn new(repos_dir: PathBuf, archive: Option<RepoArchive>, lock_pool: PgPool) -> Self {
         Self {
             repos_dir,
-            tigris,
-            pool,
+            archive,
+            lock_pool,
             migrated: Arc::new(Mutex::new(HashSet::new())),
+            versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Ensure a repo is available on local disk, downloading from Tigris if needed.
-    /// If the repo exists locally but not yet in Tigris, a background upload is
-    /// spawned to lazily migrate it (on-demand migration for pre-Tigris repos).
+    /// Ensure the local copy matches storage, skipping the download when our
+    /// cached etag already equals the current archive etag.
+    ///
+    /// `require_fresh` selects the failure policy:
+    /// - `false` (read path, `acquire_fresh`): self-heal — if a storage HEAD or
+    ///   download fails but a valid local copy exists, use it; a later upload
+    ///   re-syncs storage.
+    /// - `true` (write path, `acquire_write`): fail closed — never fall back to
+    ///   a possibly-stale local copy. The remote etag differs (remote is newer),
+    ///   so uploading our stale copy after the write would clobber it (lost
+    ///   update). Propagate the error so the write is rejected instead.
+    async fn sync_down_if_stale(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        require_fresh: bool,
+    ) -> Result<()> {
+        let Some(ref archive) = self.archive else {
+            return Ok(());
+        };
+        let key = format!("{owner_slug}/{repo_name}");
+
+        let remote_etag = match archive.head_etag(owner_slug, repo_name).await {
+            Ok(Some(etag)) => etag,
+            Ok(None) => return Ok(()), // not in storage yet — local is authoritative
+            Err(e) => {
+                // HEAD failed. Read path: fall back to a valid local copy if we
+                // have one. Write path: fail closed (see `require_fresh`).
+                if !require_fresh && local_path.exists() {
+                    warn!(repo = %repo_name, err = %e, "storage head failed — using local copy");
+                    return Ok(());
+                }
+                return Err(e).context("storage head before access");
+            }
+        };
+
+        if local_path.exists() {
+            let known = self.versions.lock().await.get(&key).cloned();
+            if known.as_deref() == Some(remote_etag.as_str()) {
+                debug!(repo = %repo_name, "local copy current (etag match) — skipping download");
+                return Ok(());
+            }
+        }
+
+        match archive.download(owner_slug, repo_name, local_path).await {
+            Ok(()) => {
+                self.versions.lock().await.insert(key, remote_etag);
+                Ok(())
+            }
+            Err(e) => {
+                // Read path self-heal only: a corrupt/unreadable archive must not
+                // block access when a valid local copy exists. On the write path
+                // the remote etag differs (remote is newer), so falling back and
+                // later uploading our stale copy would clobber it — fail closed.
+                if !require_fresh && local_path.exists() {
+                    warn!(repo = %repo_name, err = %e,
+                        "archive download failed — falling back to local copy");
+                    Ok(())
+                } else {
+                    Err(e).context("downloading repo archive")
+                }
+            }
+        }
+    }
+
+    /// Ensure a repo is available on local disk, downloading from storage if needed.
+    /// If the repo exists locally but not yet in storage, a background upload is
+    /// spawned to lazily migrate it (on-demand migration for pre-storage repos).
     /// Returns the local path to the bare repo.
     pub async fn acquire(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         // Fast path: repo exists locally
         if local_path.exists() {
-            // Lazy migration: if Tigris is enabled and we haven't confirmed this
-            // repo is in Tigris yet, check and upload in the background.
-            if let Some(ref tigris) = self.tigris {
+            // Lazy migration: if storage is enabled and we haven't confirmed this
+            // repo is in storage yet, check and upload in the background.
+            if self.archive.is_some() {
                 let key = format!("{owner_slug}/{repo_name}");
                 let already_migrated = self.migrated.lock().await.contains(&key);
                 if !already_migrated {
-                    let tigris = tigris.clone();
+                    let this = self.clone();
                     let slug = owner_slug.clone();
                     let name = repo_name.to_string();
                     let path = local_path.clone();
-                    let migrated = Arc::clone(&self.migrated);
+                    let key = key.clone();
                     tokio::spawn(async move {
-                        // Check if already in Tigris before uploading
-                        match tigris.exists(&slug, &name).await {
-                            Ok(true) => {
-                                debug!(repo = %name, "repo already in tigris — skipping migration");
-                            }
-                            Ok(false) => {
-                                info!(repo = %name, "migrating local repo to tigris");
-                                if let Err(e) = tigris.upload(&slug, &name, &path).await {
-                                    warn!(repo = %name, err = %e, "lazy migration to tigris failed");
-                                    return;
-                                }
-                                info!(repo = %name, "lazy migration to tigris complete");
+                        // Upload under the advisory lock (skip if already present)
+                        // so this opportunistic migration can't clobber a
+                        // concurrent locked push by landing a stale snapshot.
+                        match this.upload_under_lock(&slug, &name, &path, true).await {
+                            Ok(()) => {
+                                this.migrated.lock().await.insert(key);
+                                debug!(repo = %name, "lazy migration to storage complete (or already present)");
                             }
                             Err(e) => {
-                                warn!(repo = %name, err = %e, "tigris existence check failed");
-                                return;
+                                warn!(repo = %name, err = %e, "lazy migration to storage failed");
                             }
                         }
-                        migrated.lock().await.insert(format!("{slug}/{name}"));
                     });
                 }
             }
             return Ok(local_path);
         }
 
-        // Try downloading from Tigris
-        if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "cache miss — downloading from tigris");
-                tigris
+        // Try downloading from storage
+        if let Some(ref archive) = self.archive {
+            if let Some(remote_etag) = archive
+                .head_etag(&owner_slug, repo_name)
+                .await
+                .context("checking storage for repo")?
+            {
+                debug!(repo = %repo_name, "cache miss — downloading from storage");
+                archive
                     .download(&owner_slug, repo_name, &local_path)
                     .await
-                    .context("downloading repo from tigris")?;
-                // Mark as migrated since we just downloaded it
-                self.migrated
-                    .lock()
-                    .await
-                    .insert(format!("{owner_slug}/{repo_name}"));
+                    .context("downloading repo from storage")?;
+                let key = format!("{owner_slug}/{repo_name}");
+                self.migrated.lock().await.insert(key.clone());
+                self.versions.lock().await.insert(key, remote_etag);
                 return Ok(local_path);
             }
         }
@@ -120,34 +200,14 @@ impl RepoStore {
         Ok(local_path)
     }
 
-    /// Ensure a repo is available on local disk with the **latest** Tigris state.
+    /// Ensure a repo is available on local disk with the **latest** storage state.
     /// Use this for operations that precede a write (e.g. `info/refs` for
     /// `git-receive-pack`) so the client sees the same refs that `acquire_write()`
     /// will operate on.
     pub async fn acquire_fresh(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
-
-        if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
-                    // The Tigris archive is present (HEAD ok) but unreadable — a
-                    // corrupt/partial upload, or a transient GET failure. If we have a
-                    // valid local copy, proceed with it rather than blocking the write;
-                    // the post-write upload re-syncs (self-heals) Tigris. Only hard-fail
-                    // when there is no local copy to fall back to.
-                    if local_path.exists() {
-                        warn!(repo = %repo_name, err = %e,
-                            "acquire_fresh: tigris download failed — falling back to local copy");
-                        return Ok(local_path);
-                    }
-                    return Err(e).context("downloading repo from tigris (fresh)");
-                }
-                return Ok(local_path);
-            }
-        }
-
-        // Tigris disabled or repo not in Tigris — fall back to local
+        self.sync_down_if_stale(&owner_slug, repo_name, &local_path, false)
+            .await?;
         Ok(local_path)
     }
 
@@ -157,13 +217,25 @@ impl RepoStore {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
-        // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
-        // to avoid blocking indefinitely on stale locks from crashed connections.
+        // Postgres advisory locks are SESSION-scoped: they bind to one backend
+        // connection and only release on that same connection. With a pool,
+        // acquiring and releasing on different checked-out connections means the
+        // unlock silently no-ops while the lock lingers on the original. So we
+        // pin ONE connection for the whole lock lifetime — acquire, release on
+        // sync error, and the final release in the guard all run on it.
+        let mut conn = self
+            .lock_pool
+            .acquire()
+            .await
+            .context("acquiring db connection for advisory lock")?;
+
+        // Acquire with retry using pg_try_advisory_lock to avoid blocking
+        // indefinitely on stale locks from crashed connections.
         let mut acquired = false;
         for attempt in 0..60 {
             let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_key)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *conn)
                 .await
                 .context("trying advisory lock")?;
             if row.0 {
@@ -178,23 +250,25 @@ impl RepoStore {
             anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
         }
 
-        // Always download the latest from Tigris before writing.
-        // Local disk may be stale if another machine pushed since our last access.
-        if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
-                    // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
-                    // Tigris archive must not block a write when a valid local copy
-                    // exists — release(success) will re-upload a good archive.
-                    if local_path.exists() {
-                        warn!(repo = %repo_name, err = %e,
-                            "write acquire: tigris download failed — falling back to local copy");
-                    } else {
-                        return Err(e).context("downloading repo from tigris for write");
-                    }
-                }
+        // Ensure local matches the latest in storage before writing. The etag
+        // cache skips the full download when our copy is already current (the
+        // common single-machine case under sticky routing); a stale copy (another
+        // machine pushed since) still triggers a download. The advisory lock above
+        // serializes this so the post-write upload can't race a concurrent writer.
+        if let Err(e) = self
+            .sync_down_if_stale(&owner_slug, repo_name, &local_path, true)
+            .await
+        {
+            // Release the lock on the SAME connection before bailing.
+            if let Err(unlock_err) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(lock_key)
+                .execute(&mut *conn)
+                .await
+            {
+                warn!(repo = %repo_name, err = %unlock_err,
+                    "failed to release advisory lock after sync error");
             }
+            return Err(e);
         }
 
         Ok(RepoWriteGuard {
@@ -202,47 +276,122 @@ impl RepoStore {
             repo_name: repo_name.to_string(),
             local_path,
             lock_key,
-            pool: self.pool.clone(),
-            tigris: self.tigris.clone(),
+            conn,
+            archive: self.archive.clone(),
+            versions: Arc::clone(&self.versions),
         })
     }
 
-    /// Initialize a new bare repo on local disk and upload to Tigris.
+    /// Initialize a new bare repo on local disk and upload to storage.
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         store::init_bare(&local_path).context("initializing bare repo")?;
 
-        // Upload to Tigris in background
-        if let Some(ref tigris) = self.tigris {
-            let tigris = tigris.clone();
-            let owner_slug = owner_slug.clone();
-            let repo_name = repo_name.to_string();
-            let path = local_path.clone();
-            tokio::spawn(async move {
-                if let Err(e) = tigris.upload(&owner_slug, &repo_name, &path).await {
-                    warn!(repo = %repo_name, err = %e, "failed to upload new repo to tigris");
-                }
-            });
-        }
+        // Upload the new repo synchronously under the advisory lock: a background
+        // upload could land the empty repo *after* a racing first push and clobber
+        // it, and a silent failure would leave the repo absent from storage. Fail
+        // closed instead — surface upload errors to the caller.
+        self.upload_under_lock(&owner_slug, repo_name, &local_path, false)
+            .await
+            .context("uploading new repo to storage")?;
 
         Ok(local_path)
     }
 
-    /// Upload a repo to Tigris after a write operation (push, merge, fork, etc.).
-    /// Call this after any operation that modifies the git repo on disk.
-    pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) {
-        if let Some(ref tigris) = self.tigris {
-            let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(repo = %repo_name, err = %e, "rejected unsafe path in release_after_write");
-                    return;
-                }
-            };
-            if let Err(e) = tigris.upload(&owner_slug, repo_name, &local_path).await {
-                warn!(repo = %repo_name, err = %e, "failed to upload repo to tigris after write");
+    /// Upload a repo to storage after a write operation (merge, fork, etc.).
+    /// Call this after any operation that modifies the git repo on disk. Returns
+    /// `Err` if the durable upload fails so the caller can surface it rather than
+    /// acking a write that never reached storage.
+    pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) -> Result<()> {
+        let Some(ref archive) = self.archive else {
+            return Ok(());
+        };
+        let (owner_slug, local_path) = self
+            .local_path(owner_did, repo_name)
+            .context("rejected unsafe path in release_after_write")?;
+        let key = format!("{owner_slug}/{repo_name}");
+        match archive.upload(&owner_slug, repo_name, &local_path).await {
+            Ok(Some(etag)) => {
+                self.versions.lock().await.insert(key, etag);
+                Ok(())
             }
+            Ok(None) => Ok(()),
+            Err(e) => {
+                // Invalidate so the next access re-downloads rather than trusting
+                // a local copy we failed to persist.
+                self.versions.lock().await.remove(&key);
+                Err(e).context("uploading repo to storage after write")
+            }
+        }
+    }
+
+    /// Upload `local_path` to storage while holding the per-repo advisory lock,
+    /// so a background or init-time upload can't clobber a concurrent locked
+    /// write by landing an older snapshot after it. With `skip_if_exists`, skips
+    /// the upload when the archive is already present (used by lazy migration).
+    async fn upload_under_lock(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        skip_if_exists: bool,
+    ) -> Result<()> {
+        let Some(ref archive) = self.archive else {
+            return Ok(());
+        };
+        let lock_key = advisory_lock_key(owner_slug, repo_name);
+        let mut conn = self
+            .lock_pool
+            .acquire()
+            .await
+            .context("acquiring db connection for upload lock")?;
+
+        let mut acquired = false;
+        for attempt in 0..30 {
+            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_key)
+                .fetch_one(&mut *conn)
+                .await
+                .context("trying advisory lock")?;
+            if row.0 {
+                acquired = true;
+                break;
+            }
+            if attempt < 29 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        if !acquired {
+            anyhow::bail!("could not acquire advisory lock for upload of {owner_slug}/{repo_name}");
+        }
+
+        let outcome: Result<Option<String>> =
+            if skip_if_exists && archive.exists(owner_slug, repo_name).await.unwrap_or(false) {
+                Ok(None) // already present — nothing to upload
+            } else {
+                archive.upload(owner_slug, repo_name, local_path).await
+            };
+
+        // Release the lock on the same connection regardless of outcome.
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *conn)
+            .await
+        {
+            warn!(repo = %repo_name, err = %e, "failed to release upload lock");
+        }
+
+        match outcome {
+            Ok(Some(etag)) => {
+                self.versions
+                    .lock()
+                    .await
+                    .insert(format!("{owner_slug}/{repo_name}"), etag);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e).context("uploading repo to storage under lock"),
         }
     }
 
@@ -348,14 +497,24 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 }
 
 /// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
-/// uploads to Tigris + releases the lock on `release()`.
+/// uploads to storage + releases the lock on `release()`.
+///
+/// `#[must_use]`: dropping the guard without calling `release()` returns its
+/// connection to the pool with the *session* advisory lock still held, which
+/// then lingers until that backend connection is evicted — so the lock must be
+/// released explicitly.
+#[must_use = "call release() — dropping the guard leaks the advisory lock onto the pooled connection"]
 pub struct RepoWriteGuard {
     owner_slug: String,
     repo_name: String,
     pub local_path: PathBuf,
     lock_key: i64,
-    pool: PgPool,
-    tigris: Option<TigrisClient>,
+    /// The connection the session-scoped advisory lock was taken on. The lock
+    /// must be released on this same connection, so it's held for the guard's
+    /// lifetime and dropped (returned to the pool) only after `release()`.
+    conn: PoolConnection<Postgres>,
+    archive: Option<RepoArchive>,
+    versions: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl RepoWriteGuard {
@@ -364,31 +523,66 @@ impl RepoWriteGuard {
         &self.local_path
     }
 
-    /// Upload to Tigris (only when the write succeeded) and release the advisory
+    /// Upload to storage (only when the write succeeded) and release the advisory
     /// lock. Pass `success = false` when the write operation failed — uploading a
     /// half-applied or otherwise inconsistent repo would propagate corruption to
-    /// Tigris (and to every node that later downloads it). The lock is always
+    /// storage (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(self, success: bool) {
-        // Upload to Tigris only on success.
-        if success {
-            if let Some(ref tigris) = self.tigris {
-                if let Err(e) = tigris
+    ///
+    /// IMPORTANT: the advisory lock is held until the upload finishes, so a
+    /// concurrent writer on another machine cannot read a stale archive. When
+    /// callers want a fast client ack, they spawn this future as a background
+    /// task (write-back) — the lock + etag-cache update still complete in order.
+    pub async fn release(mut self, success: bool) -> Result<()> {
+        let key = format!("{}/{}", self.owner_slug, self.repo_name);
+
+        // Upload to storage only on success. Capture the outcome so we can both
+        // release the lock unconditionally and propagate a durable-upload
+        // failure to the caller (a synchronous caller turns it into a client
+        // error; a write-back caller logs it).
+        let upload_result: Result<()> = if success {
+            if let Some(ref archive) = self.archive {
+                match archive
                     .upload(&self.owner_slug, &self.repo_name, &self.local_path)
                     .await
                 {
-                    warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+                    Ok(Some(etag)) => {
+                        self.versions.lock().await.insert(key.clone(), etag);
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(e) => {
+                        // The durable copy is now stale. Drop the cached etag so
+                        // the next write re-downloads and reconciles rather than
+                        // trusting a local copy we failed to persist.
+                        self.versions.lock().await.remove(&key);
+                        Err(e).context("uploading repo to storage after write")
+                    }
                 }
+            } else {
+                Ok(())
             }
         } else {
-            warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
+            // Write failed: skip the upload (a half-applied repo must not reach
+            // storage) and invalidate the cached etag — the local copy may be
+            // dirty, so the next write must re-download instead of skipping on a
+            // now-misleading etag match.
+            warn!(repo = %self.repo_name, "write failed — skipping storage upload and invalidating etag cache");
+            self.versions.lock().await.remove(&key);
+            Ok(())
+        };
+
+        // Release the advisory lock on the same connection it was taken on
+        // regardless of the upload outcome, then drop the connection.
+        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(self.lock_key)
+            .execute(&mut *self.conn)
+            .await
+        {
+            warn!(repo = %self.repo_name, err = %e, "failed to release advisory lock");
         }
 
-        // Release advisory lock
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(self.lock_key)
-            .execute(&self.pool)
-            .await;
+        upload_result
     }
 }
 
@@ -561,5 +755,103 @@ mod tests {
                 "owner_did={bad:?} must be rejected"
             );
         }
+    }
+
+    // ── sync_down_if_stale (fs-backed archive, lazy pool) ──────────────────
+
+    /// A RepoStore over an fs-backed archive. `sync_down_if_stale` never touches
+    /// the pool, so a lazy (never-connected) pool is fine.
+    fn store_with_fs_archive(repos_dir: PathBuf, store_root: &Path) -> RepoStore {
+        let blob: Arc<dyn crate::storage::BlobStore> =
+            Arc::new(crate::storage::fs::FsBlobStore::new(store_root).unwrap());
+        let archive = crate::storage::archive::RepoArchive::new(blob);
+        let pool = sqlx::PgPool::connect_lazy("postgres://invalid").unwrap();
+        RepoStore::new(repos_dir, Some(archive), pool)
+    }
+
+    #[tokio::test]
+    async fn sync_down_if_stale_downloads_then_skips_on_etag_match() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        // Seed the archive with a repo.
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+
+        // First call downloads.
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
+
+        // Locally mutate, then sync again: the cached etag still matches the
+        // remote, so the download is skipped and our local edit survives.
+        std::fs::write(local.join("HEAD"), b"LOCAL-EDIT\n").unwrap();
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(local.join("HEAD")).unwrap(),
+            b"LOCAL-EDIT\n",
+            "etag match must skip the download (local copy preserved)"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_down_if_stale_require_fresh_fails_closed_on_bad_remote() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+
+        let local = repos_dir.path().join("owner").join("repo.git");
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+
+        // Corrupt the stored archive: HEAD now succeeds with a *new* etag (so the
+        // cache no longer matches and a download is forced), but the download
+        // decompresses garbage and fails.
+        let blob_path = store_root.path().join("repos/v1/owner/repo.tar.zst");
+        std::fs::write(&blob_path, b"corrupted not-a-tar-zst").unwrap();
+
+        // Write path: must fail closed rather than fall back to the stale local
+        // copy (which a later upload would use to clobber the newer remote).
+        assert!(
+            store
+                .sync_down_if_stale("owner", "repo", &local, true)
+                .await
+                .is_err(),
+            "require_fresh=true must propagate the download error"
+        );
+
+        // Read path: self-heals — falls back to the valid local copy.
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .expect("require_fresh=false must fall back to the local copy");
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
     }
 }

@@ -246,11 +246,6 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }

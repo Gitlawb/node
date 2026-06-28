@@ -32,6 +32,7 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chron
 clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
 libc = "0.2"
+async-trait = "0.1"
 cid = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }

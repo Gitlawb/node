@@ -224,10 +224,17 @@ pub async fn merge_pr(
         &pr.title,
     );
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(merge_result.is_ok()).await;
+    // Always release the advisory lock — even on error; upload to storage only on success.
+    let release_result = guard.release(merge_result.is_ok()).await;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
+    // Surface a durable-upload failure rather than acking a merge that never
+    // reached storage.
+    release_result.map_err(|e| {
+        AppError::Git(format!(
+            "merge applied locally but durable upload failed: {e}"
+        ))
+    })?;
 
     state.db.merge_pr(&pr.id, &merger_did).await?;
     let _ = state.db.touch_repo(&record.id).await;
