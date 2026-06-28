@@ -42,6 +42,8 @@ pub enum WebhookCmd {
         repo: String,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Delete a webhook
     Delete {
@@ -66,7 +68,7 @@ pub async fn run(args: WebhookArgs) -> Result<()> {
             node,
             dir,
         } => cmd_create(repo, url, events, secret, node, dir).await,
-        WebhookCmd::List { repo, node } => cmd_list(repo, node).await,
+        WebhookCmd::List { repo, node, dir } => cmd_list(repo, node, dir).await,
         WebhookCmd::Delete {
             repo,
             id,
@@ -143,8 +145,11 @@ async fn cmd_create(
     Ok(())
 }
 
-async fn cmd_list(repo: String, node: String) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+    // The node owner-gates GET /hooks (callback URLs are owner-secret), so the
+    // list request must be signed — anonymous callers get 401.
+    let keypair = load_keypair_from_dir(dir.as_deref())?;
+    let client = NodeClient::new(&node, Some(keypair));
     let owner = resolve_owner(&client).await?;
 
     let resp: Value = client
@@ -337,6 +342,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_webhooks_empty() {
         let mut server = mockito::Server::new_async().await;
+        let (dir, _kp) = tmp_identity();
         let _root = mock_root(&mut server).await;
 
         let _m = server
@@ -347,12 +353,19 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list("my-repo".to_string(), server.url()).await.unwrap();
+        cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn test_list_webhooks_with_items() {
         let mut server = mockito::Server::new_async().await;
+        let (dir, _kp) = tmp_identity();
         let _root = mock_root(&mut server).await;
 
         let _m = server
@@ -363,7 +376,13 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list("my-repo".to_string(), server.url()).await.unwrap();
+        cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
     }
 
     // ── delete ───────────────────────────────────────────────────────
