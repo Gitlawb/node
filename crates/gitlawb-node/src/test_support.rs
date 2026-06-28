@@ -1004,6 +1004,45 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn list_repos_owner_filter_full_did_matches_bare_mirror(pool: PgPool) {
+        // A mirror-only repo (known via gossip, no local canonical row) stores the
+        // bare owner key `z...`. Filtering by the full `did:key:z...` form must
+        // still return it, matching crate::api::did_matches — the behavior the
+        // no-limit `gl repo list --owner` path relied on before #97 routed owner
+        // filtering through SQL (jatmn P2 on #111). Both owner forms must match.
+        let short = "zMIRRORONLYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo(short, "mirror-repo", "/tmp/mirror", None)
+            .await
+            .expect("seed mirror-only row");
+
+        // full did:key: form must match the bare-owner mirror row
+        let resp = list_repos_router(state.clone())
+            .oneshot(anon_get(&format!("/api/v1/repos?owner=did:key:{short}")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"mirror-repo".to_string()),
+            "full did:key: owner filter must match a bare-owner mirror row (jatmn #111)"
+        );
+
+        // short bare form must still match
+        let resp = list_repos_router(state)
+            .oneshot(anon_get(&format!("/api/v1/repos?owner={short}")))
+            .await
+            .unwrap();
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"mirror-repo".to_string()),
+            "short-form owner filter must still match the mirror row"
+        );
+    }
+
+    #[sqlx::test]
     async fn list_repos_pagination_offset_past_end_keeps_total(pool: PgPool) {
         // Pagination edge: an offset past the visible set returns an empty page,
         // but X-Total-Count still reflects the full visible count -- so paging can

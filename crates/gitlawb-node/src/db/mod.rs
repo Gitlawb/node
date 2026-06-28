@@ -934,7 +934,11 @@ impl Db {
                      ) AS updated_at,
                      disk_path, forked_from, machine_id
                  FROM repos
-                 WHERE ($1::text IS NULL OR owner_did = $1 OR owner_did LIKE '%:' || $1)
+                 -- Match the owner filter on the same did:key-aware owner key the
+                 -- dedup groups on, so a full did:key: form matches a bare-owner
+                 -- mirror row (and vice versa) exactly as crate::api::did_matches
+                 -- does. Callers bind the already-normalized key ($1).
+                 WHERE ($1::text IS NULL OR (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END) = $1)
                  ORDER BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name,
                      -- mirror rows carry a slash-form id (\"{owner_short}/{name}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
@@ -949,10 +953,23 @@ impl Db {
     /// set (no SQL pagination): the listing surface filters by per-caller `"/"`
     /// visibility in Rust and paginates after, so neither the page nor the count
     /// leaks a repo the caller may not read (#97).
+    ///
+    /// The owner filter is normalized to its did:key short form before binding so
+    /// the SQL predicate matches `crate::api::did_matches`: a full `did:key:z...`
+    /// query and a bare-owner mirror row (`z...`) match each other, and vice
+    /// versa. A non-key DID (still has a `:` after the prefix) is left intact and
+    /// only matches exactly.
     pub async fn list_all_repos_deduped_with_stars(
         &self,
         owner_filter: Option<&str>,
     ) -> Result<Vec<(RepoRecord, i64)>> {
+        // Mirror did_matches: strip `did:key:` only when the remainder is a bare
+        // key id (no further `:`). The DEDUP_CTE applies the identical CASE to
+        // owner_did, so the two compare on the same normalized key.
+        let owner_key = owner_filter.map(|o| match o.strip_prefix("did:key:") {
+            Some(rest) if !rest.contains(':') => rest,
+            _ => o,
+        });
         let sql = format!(
             "{}
              SELECT
@@ -968,7 +985,7 @@ impl Db {
             Self::DEDUP_CTE
         );
         let rows = sqlx::query(&sql)
-            .bind(owner_filter)
+            .bind(owner_key)
             .fetch_all(&self.pool)
             .await?;
 
