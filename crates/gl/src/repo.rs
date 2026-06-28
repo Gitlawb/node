@@ -146,6 +146,8 @@ pub enum RepoCmd {
         repo: String,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -203,7 +205,7 @@ pub async fn run(args: RepoArgs) -> Result<()> {
         RepoCmd::ReplicaUnregister { repo, node, dir } => {
             cmd_replica_unregister(repo, node, dir).await
         }
-        RepoCmd::Replicas { repo, node } => cmd_replicas(repo, node).await,
+        RepoCmd::Replicas { repo, node, dir } => cmd_replicas(repo, node, dir).await,
     }
 }
 
@@ -330,7 +332,10 @@ async fn cmd_clone(name: String, node: String, dir: Option<PathBuf>) -> Result<(
 }
 
 async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+    // Sign when an identity is available so the read-visibility-gated replica
+    // sub-fetch below resolves for a private repo's owner (public repos still
+    // work anonymously).
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
     let (owner, name) = if repo.contains('/') {
         let (o, n) = repo.split_once('/').unwrap();
@@ -368,7 +373,7 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     // Replica count — failure to fetch is non-fatal (older nodes don't expose this).
     if let Ok(resp) = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/replicas"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/replicas"))
         .await
     {
         if resp.status().is_success() {
@@ -448,15 +453,17 @@ async fn cmd_replica_unregister(repo: String, node: String, dir: Option<PathBuf>
     Ok(())
 }
 
-async fn cmd_replicas(repo: String, node: String) -> Result<()> {
+async fn cmd_replicas(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = repo
         .split_once('/')
         .map(|(o, n)| (o.to_string(), n.to_string()))
         .context("use owner/repo format")?;
 
-    let client = NodeClient::new(&node, None);
+    // Read-visibility-gated: public repos list anonymously, private repos need
+    // the owner's signature. Sign when an identity is available.
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
     let resp = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/replicas"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/replicas"))
         .await
         .context("failed to connect to node")?;
     let status = resp.status();
@@ -674,7 +681,9 @@ async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: b
     let my_short = my_did.split(':').next_back().unwrap_or(&my_did).to_string();
 
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
-    let client = NodeClient::new(&node, None);
+    // Sign with the loaded identity so the read-visibility-gated protected-branch
+    // fetch below works on the owner's own private repos.
+    let client = NodeClient::new(&node, Some(keypair));
 
     // Fetch repo info
     let resp = client
@@ -693,9 +702,9 @@ async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: b
         .to_string();
     let is_owner = my_did == owner_did || my_short == owner_short;
 
-    // Fetch protected branches
+    // Fetch protected branches (read-visibility-gated; signed via the client).
     let protected: Vec<String> = match client
-        .get(&format!("/api/v1/repos/{owner}/{name}/branches/protected"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/branches/protected"))
         .await
     {
         Ok(resp) if resp.status().is_success() => {
