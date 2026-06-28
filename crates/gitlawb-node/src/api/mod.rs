@@ -166,6 +166,7 @@ mod authz_guard {
         let issues = include_str!("issues.rs");
         let bounties = include_str!("bounties.rs");
         let replicas = include_str!("replicas.rs");
+        let events = include_str!("events.rs");
         let tasks = include_str!("tasks.rs");
         let stars = include_str!("stars.rs");
         let protect = include_str!("protect.rs");
@@ -204,6 +205,10 @@ mod authz_guard {
             // visibility (public repos stay anonymous; private repos 404).
             (replicas, "list_replicas", "authorize_repo_read("),
             (protect, "list_protected_branches", "authorize_repo_read("),
+            // list_repo_events gates only the locally-hosted branch, so it calls
+            // visibility_check directly (no second get_repo) rather than
+            // authorize_repo_read; the gossip-only None path stays ungated.
+            (events, "list_repo_events", "visibility_check("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),

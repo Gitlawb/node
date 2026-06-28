@@ -912,7 +912,6 @@ mod tests {
     #[sqlx::test]
     async fn list_protected_branches_is_read_visibility_gated(pool: PgPool) {
         let owner = "did:key:zPROTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let stranger = "did:key:zPROTSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBB";
         let state = test_state(pool).await;
 
         let pub_repo = seed_repo(owner, "prot-pub");
@@ -1016,6 +1015,208 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #94 sibling: list_repo_events gates a LOCALLY-HOSTED private repo (both its
+    /// ref certificates and its gossip ref-updates → 404) without breaking a repo
+    /// the node knows only via gossip (no local row), which legitimately 200s.
+    #[sqlx::test]
+    async fn list_repo_events_gates_local_private_but_not_gossip_only(pool: PgPool) {
+        use crate::db::{ReceivedRefUpdate, RefCertificate};
+        let owner = "did:key:zEVTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let keypart = owner.split(':').next_back().unwrap();
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "evt-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "evt-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let seed_cert = |repo_id: &str, ref_name: &str, sha: &str| RefCertificate {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: "0".repeat(40),
+            new_sha: sha.to_string(),
+            pusher_did: owner.to_string(),
+            node_did: owner.to_string(),
+            signature: "sig".to_string(),
+            issued_at: Utc::now().to_rfc3339(),
+        };
+        let seed_update = |slug: &str, ref_name: &str, sha: &str| ReceivedRefUpdate {
+            id: uuid::Uuid::new_v4().to_string(),
+            node_did: owner.to_string(),
+            pusher_did: owner.to_string(),
+            repo: slug.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: "0".repeat(40),
+            new_sha: sha.to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            cert_id: None,
+            received_at: Utc::now().to_rfc3339(),
+            from_peer: "peer".to_string(),
+        };
+
+        // Public local repo: a visible cert.
+        state
+            .db
+            .insert_ref_certificate(&seed_cert(
+                &pub_repo.id,
+                "refs/heads/public-main",
+                "pubsha00",
+            ))
+            .await
+            .expect("seed public cert");
+        // Private local repo: a secret cert AND a secret gossip update (slug uses
+        // the full owner-DID key part, as the handler computes for a local repo).
+        state
+            .db
+            .insert_ref_certificate(&seed_cert(
+                &priv_repo.id,
+                "refs/heads/embargo-cert",
+                "certSEKRET",
+            ))
+            .await
+            .expect("seed private cert");
+        state
+            .db
+            .insert_ref_update(&seed_update(
+                &format!("{keypart}/evt-priv"),
+                "refs/heads/embargo-gossip",
+                "gossipSEKRET",
+            ))
+            .await
+            .expect("seed private gossip update");
+        // Gossip-only repo: no local row; slug uses the URL owner segment.
+        state
+            .db
+            .insert_ref_update(&seed_update(
+                "zGHOSTOWNER/ghost-repo",
+                "refs/heads/ghost",
+                "ghostsha0",
+            ))
+            .await
+            .expect("seed gossip-only update");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/events",
+                    axum::routing::get(crate::api::events::list_repo_events),
+                )
+                .with_state(state.clone())
+        };
+        let anon = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).to_string();
+
+        // Characterization 1: public local repo, anonymous → 200, cert present.
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/evt-pub/events")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public events stay anonymous"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            text(&bytes).contains("public-main"),
+            "public cert must be listed"
+        );
+
+        // Characterization 2: gossip-only repo (no local row), anonymous → 200,
+        // gossip event present. This is the None path the gate must not break.
+        let resp = router()
+            .oneshot(anon(
+                "/api/v1/repos/zGHOSTOWNER/ghost-repo/events".to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "gossip-only repo still serves events"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            text(&bytes).contains("ghost"),
+            "gossip-only event must be served"
+        );
+
+        // The leak fix: locally-hosted PRIVATE repo, anonymous → 404, and neither
+        // the cert nor the gossip secret appears in the body.
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/evt-priv/events")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader of a local private repo must get 404"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = text(&bytes);
+        assert!(
+            !body.contains("embargo-cert"),
+            "404 must not leak the cert ref"
+        );
+        assert!(
+            !body.contains("certSEKRET"),
+            "404 must not leak the cert sha"
+        );
+        assert!(
+            !body.contains("embargo-gossip"),
+            "404 must not leak the gossip ref"
+        );
+        assert!(
+            !body.contains("gossipSEKRET"),
+            "404 must not leak the gossip sha"
+        );
+
+        // Owner of the private repo → 200, events present.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/evt-priv/events"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private events"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            text(&bytes).contains("embargo-cert"),
+            "owner sees the private cert"
+        );
     }
 
     /// Issue #6 / jatmn finding 2: `/api/v1/stats` counts logical repos, not raw

@@ -2,11 +2,13 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 
-use crate::error::Result;
+use crate::auth::AuthenticatedDid;
+use crate::error::{AppError, Result};
 use crate::state::AppState;
+use crate::visibility::{visibility_check, Decision};
 
 /// GET /api/v1/events/ref-updates?limit=50
 pub async fn list_ref_updates(
@@ -50,6 +52,7 @@ pub async fn list_repo_events(
     State(state): State<AppState>,
     Path((owner, repo_name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
     let limit = params
         .get("limit")
@@ -59,6 +62,24 @@ pub async fn list_repo_events(
 
     // Look up the repo record once so we can use the full owner DID
     let repo_record = state.db.get_repo(&owner, &repo_name).await.ok().flatten();
+
+    // #94: if this node hosts the repo locally, gate on read visibility BEFORE
+    // serving any events (cert OR gossip). A non-reader of a local private repo
+    // gets 404, hiding both its existence and its ref metadata. A repo the node
+    // knows only via gossip (no local row) has no local visibility rules to
+    // consult and keeps its existing public federation-feed behavior — the
+    // None branch is intentionally left ungated (tracked with the global
+    // /api/v1/events/ref-updates deferral). visibility_check on the loaded record
+    // avoids a second get_repo (mirrors api/encrypted.rs).
+    if let Some(ref record) = repo_record {
+        let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+        let rules = state.db.list_visibility_rules(&record.id).await?;
+        if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
+            == Decision::Deny
+        {
+            return Err(AppError::RepoNotFound(format!("{owner}/{repo_name}")));
+        }
+    }
 
     // Build the repo identifier using the FULL DID key part (not the 8-char URL truncation).
     // Gossip events are stored as "{full_key_part}/{repo_name}" (e.g. "z6MksXZDfullkeyhere/myrepo"),
