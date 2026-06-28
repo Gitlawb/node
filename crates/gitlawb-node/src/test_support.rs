@@ -923,6 +923,158 @@ mod tests {
         );
     }
 
+    #[sqlx::test]
+    async fn list_repos_owner_filter_excludes_private_from_anonymous(pool: PgPool) {
+        // The owner-filtered path (?owner=, SQL $1 bind) must still apply the Rust
+        // "/" visibility gate: an anonymous caller filtering by an owner sees that
+        // owner's public repos but never their private ones, and the count does
+        // not leak (#97). This is a distinct SQL branch from the unfiltered path.
+        let short = "zOWNERFILTERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let owner = format!("did:key:{short}");
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(&owner, "pub-repo"))
+            .await
+            .expect("seed public");
+        state
+            .db
+            .create_repo(&seed_private_repo(&owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get(&format!("/api/v1/repos?owner={short}&limit=10")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert!(
+            names.contains(&"pub-repo".to_string()),
+            "owner's public repo listed"
+        );
+        assert!(
+            !names.contains(&"priv-repo".to_string()),
+            "owner's private repo hidden from anonymous even when owner-filtered (#97)"
+        );
+        assert_eq!(
+            total.as_deref(),
+            Some("1"),
+            "owner-filtered X-Total-Count must exclude the private repo"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_pagination_offset_past_end_keeps_total(pool: PgPool) {
+        // Pagination edge: an offset past the visible set returns an empty page,
+        // but X-Total-Count still reflects the full visible count -- so paging can
+        // neither short the page nor leak a different total (#97). Guards against a
+        // refactor that derives the total from the cut page instead of the set.
+        let owner = "did:key:zOFFSETOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-a"))
+            .await
+            .expect("seed public a");
+        state
+            .db
+            .create_repo(&seed_repo(owner, "pub-b"))
+            .await
+            .expect("seed public b");
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "priv-repo"))
+            .await
+            .expect("seed private");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos?limit=5&offset=100"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert!(names.is_empty(), "offset past the end yields an empty page");
+        assert_eq!(
+            total.as_deref(),
+            Some("2"),
+            "X-Total-Count stays the full visible total regardless of offset"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_repos_hides_canonical_under_root_deny_even_with_mirror(pool: PgPool) {
+        // Regression guard for the dedup-survivor + visibility-rule seam. A logical
+        // repo present as BOTH a canonical row (carrying a root-deny rule) and a
+        // gossip mirror row: the DEDUP_CTE must pick the canonical survivor so the
+        // batch rule lookup (keyed by the survivor's id) finds the deny and
+        // withholds it. If dedup ever picked the mirror (slash-form id, no rule),
+        // the gate would fall back to is_public=true and leak the repo. is_public
+        // is true here, so the rule is the only thing hiding it.
+        let short = "zMIRRORDENYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let owner = format!("did:key:{short}");
+        let state = test_state(pool).await;
+        let canonical = seed_repo(&owner, "secret"); // is_public = true
+        state
+            .db
+            .create_repo(&canonical)
+            .await
+            .expect("seed canonical");
+        state
+            .db
+            .set_visibility_rule(
+                &canonical.id,
+                "/",
+                crate::db::VisibilityMode::B,
+                &[],
+                &owner,
+            )
+            .await
+            .expect("root deny rule on canonical");
+        state
+            .db
+            .upsert_mirror_repo(short, "secret", "/tmp/mirror", None)
+            .await
+            .expect("seed mirror");
+        state
+            .db
+            .create_repo(&seed_repo(&owner, "open"))
+            .await
+            .expect("seed public sibling");
+
+        let resp = list_repos_router(state)
+            .oneshot(anon_get("/api/v1/repos"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let total = resp
+            .headers()
+            .get("X-Total-Count")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_string);
+        let names = names_in(&json_body(resp).await);
+        assert!(names.contains(&"open".to_string()), "public sibling listed");
+        assert!(
+            !names.contains(&"secret".to_string()),
+            "canonical repo with a root deny must stay hidden even when a mirror row exists (#97 dedup-survivor/rule seam)"
+        );
+        assert_eq!(
+            total.as_deref(),
+            Some("1"),
+            "X-Total-Count counts only the visible sibling, not the mirror+canonical pair"
+        );
+    }
+
     // ── /api/v1/stats count oracle (#104) ──────────────────────────────────
     // The stats endpoint lives in meta_routes (no auth layer), so the caller is
     // always anonymous (None). Its `repos` count must withhold private/mode-A
