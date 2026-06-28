@@ -85,11 +85,13 @@ struct Verifier {
 
 static VERIFIER: OnceLock<Verifier> = OnceLock::new();
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct ProofClaims {
     sub: String,
     level: u32,
     exp: i64,
+    /// Unique proof id, consumed once so a proof cannot be replayed.
+    jti: String,
 }
 
 #[derive(Deserialize)]
@@ -167,21 +169,53 @@ pub async fn init() {
     });
 }
 
+/// Outcome of the synchronous, IO-free decision step.
+#[derive(Debug)]
+enum Decision {
+    /// Allow the request (off, shadow, inert/no-key, or verified non-enforcing).
+    Allow,
+    /// Enforce mode and verification failed; reject with this reason.
+    Reject(String),
+    /// Enforce mode and the proof verified; the caller must consume this `jti`
+    /// (and reject replays) before allowing.
+    Consume { jti: String, exp: i64 },
+}
+
 /// Gate an authenticated request. `did` is the authenticated agent DID the proof
-/// must belong to. Returns `Ok(())` to allow, `Err(Unauthorized)` to reject.
-/// Honors the configured mode (Off/Shadow never reject).
-pub fn check(headers: &HeaderMap, did: &str) -> Result<(), AppError> {
+/// must belong to. In enforce mode a valid proof is consumed once (its `jti` is
+/// recorded in the DB) so it cannot be replayed across gated actions. Returns
+/// `Ok(())` to allow, `Err(Unauthorized)` to reject. Off/Shadow never reject.
+pub async fn check(db: &crate::db::Db, headers: &HeaderMap, did: &str) -> Result<(), AppError> {
     let v = match VERIFIER.get() {
         Some(v) => v,
         None => return Ok(()), // not initialized -> inert
     };
-    decide(v, headers, did, now_secs())
+    match decide(v, headers, did, now_secs()) {
+        Decision::Allow => Ok(()),
+        Decision::Reject(reason) => Err(reject_error(v, &reason)),
+        Decision::Consume { jti, exp } => {
+            // First use records the jti; a replay finds it already present.
+            if db.consume_proof_jti(&jti, exp).await? {
+                Ok(())
+            } else {
+                Err(reject_error(v, "proof already used (replay)"))
+            }
+        }
+    }
 }
 
-/// Mode-aware decision, separated from the global state for testability.
-fn decide(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Result<(), AppError> {
+fn reject_error(v: &Verifier, reason: &str) -> AppError {
+    AppError::Unauthorized(format!(
+        "iCaptcha proof required ({reason}). Solve a challenge at {} for level >= {} and resend with the {} header.",
+        v.url, v.required_level, PROOF_HEADER
+    ))
+}
+
+/// Mode-aware decision. Pure and IO-free (no DB; clock injected via `now`) so it
+/// is fully unit-testable. The caller performs jti consumption for `Consume`.
+fn decide(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Decision {
     if v.mode == Mode::Off {
-        return Ok(());
+        return Decision::Allow;
     }
 
     // Fail safe: if no public key could be loaded (e.g. iCaptcha was unreachable
@@ -189,27 +223,32 @@ fn decide(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Result<(), 
     // already saw a startup warning. An iCaptcha hiccup must never break repo
     // creation or registration.
     if v.key.is_none() {
-        return Ok(());
+        return Decision::Allow;
     }
 
     match verify(v, headers, did, now) {
-        Ok(()) => Ok(()),
+        Ok(claims) => match v.mode {
+            Mode::Enforce => Decision::Consume {
+                jti: claims.jti,
+                exp: claims.exp,
+            },
+            // Shadow/Off: never reject, and do not consume (observational only).
+            _ => Decision::Allow,
+        },
         Err(reason) => match v.mode {
             Mode::Shadow => {
                 tracing::warn!(did = %did, reason, "iCaptcha (shadow) would reject");
-                Ok(())
+                Decision::Allow
             }
-            Mode::Enforce => Err(AppError::Unauthorized(format!(
-                "iCaptcha proof required ({reason}). Solve a challenge at {} for level >= {} and resend with the {} header.",
-                v.url, v.required_level, PROOF_HEADER
-            ))),
-            Mode::Off => Ok(()),
+            Mode::Enforce => Decision::Reject(reason),
+            Mode::Off => Decision::Allow,
         },
     }
 }
 
-/// Core verification, separated for testability. `now` is unix seconds.
-fn verify(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Result<(), String> {
+/// Core verification, separated for testability. Returns the validated claims.
+/// `now` is unix seconds.
+fn verify(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Result<ProofClaims, String> {
     let key = v.key.as_ref().ok_or("verifier has no public key")?;
     let proof = headers
         .get(PROOF_HEADER)
@@ -241,7 +280,7 @@ fn verify(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Result<(), 
     if !crate::api::did_matches(did, &claims.sub) {
         return Err("proof subject does not match authenticated DID".to_string());
     }
-    Ok(())
+    Ok(claims)
 }
 
 #[cfg(test)]
@@ -329,7 +368,10 @@ mod tests {
     fn off_mode_allows_everything() {
         let mut v = verifier(3);
         v.mode = Mode::Off;
-        assert!(decide(&v, &HeaderMap::new(), SUB, IAT).is_ok());
+        assert!(matches!(
+            decide(&v, &HeaderMap::new(), SUB, IAT),
+            Decision::Allow
+        ));
     }
 
     #[test]
@@ -341,25 +383,42 @@ mod tests {
             required_level: 3,
             key: None,
         };
-        assert!(decide(&v, &HeaderMap::new(), SUB, IAT).is_ok());
+        assert!(matches!(
+            decide(&v, &HeaderMap::new(), SUB, IAT),
+            Decision::Allow
+        ));
     }
 
     #[test]
     fn enforce_with_key_rejects_missing_proof() {
         let v = verifier(3);
-        assert!(decide(&v, &HeaderMap::new(), SUB, IAT).is_err());
+        assert!(matches!(
+            decide(&v, &HeaderMap::new(), SUB, IAT),
+            Decision::Reject(_)
+        ));
     }
 
     #[test]
     fn shadow_allows_despite_bad_proof() {
         let mut v = verifier(3);
         v.mode = Mode::Shadow;
-        assert!(decide(&v, &HeaderMap::new(), SUB, IAT).is_ok());
+        assert!(matches!(
+            decide(&v, &HeaderMap::new(), SUB, IAT),
+            Decision::Allow
+        ));
     }
 
     #[test]
-    fn enforce_accepts_valid_proof_via_decide() {
+    fn enforce_valid_proof_requires_consuming_its_jti() {
+        // A verified proof under enforce must yield Consume carrying the jti, so
+        // the caller can spend it once and reject replays.
         let v = verifier(3);
-        assert!(decide(&v, &headers_with(PROOF), SUB, IAT).is_ok());
+        match decide(&v, &headers_with(PROOF), SUB, IAT) {
+            Decision::Consume { jti, exp } => {
+                assert_eq!(jti, "4b5228a5bed7122dee9f47ff");
+                assert_eq!(exp, 1782573151);
+            }
+            other => panic!("expected Consume, got {other:?}"),
+        }
     }
 }

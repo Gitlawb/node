@@ -180,7 +180,7 @@ pub async fn create_repo(
     Json(req): Json<CreateRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
     // iCaptcha proof-of-intelligence gate (inert unless ICAPTCHA_MODE is set).
-    crate::icaptcha::check(&headers, &auth.0)?;
+    crate::icaptcha::check(&state.db, &headers, &auth.0).await?;
 
     // Sanitize name: alphanumeric, hyphens, underscores only
     if !req

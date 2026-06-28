@@ -781,6 +781,21 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_repos_owner_key_name ON repos ((CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END), name)",
         ],
     },
+    Migration {
+        version: 8,
+        name: "icaptcha_consumed_proofs",
+        stmts: &[
+            // Single-use ledger for iCaptcha proof ids (jti). A proof may be
+            // spent once per gated action; replays are rejected until the row
+            // is swept after the proof's own expiry. `expires_at` is the
+            // proof's unix-seconds exp, used for cleanup.
+            r#"CREATE TABLE IF NOT EXISTS icaptcha_consumed_proofs (
+                jti        TEXT   NOT NULL PRIMARY KEY,
+                expires_at BIGINT NOT NULL
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_icaptcha_consumed_expires ON icaptcha_consumed_proofs(expires_at)",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1097,6 +1112,32 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomically consume an iCaptcha proof id (`jti`). Returns `Ok(true)` if it
+    /// was newly recorded (the proof may be used), `Ok(false)` if it was already
+    /// spent (a replay). `expires_at` is the proof's unix-seconds `exp`, kept so
+    /// the ledger row can be swept once the proof can no longer be valid.
+    pub async fn consume_proof_jti(&self, jti: &str, expires_at: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "INSERT INTO icaptcha_consumed_proofs (jti, expires_at)
+             VALUES ($1, $2)
+             ON CONFLICT (jti) DO NOTHING",
+        )
+        .bind(jti)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete consumed-proof rows whose proof has expired. Returns rows removed.
+    pub async fn sweep_expired_proofs(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM icaptcha_consumed_proofs WHERE expires_at < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn get_trust_score(&self, agent_did: &str) -> Result<f64> {

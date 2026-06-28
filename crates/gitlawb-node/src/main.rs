@@ -265,15 +265,23 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Periodic cleanup of expired rate limit entries
+    // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
         let rl = state.rate_limiter.clone();
+        let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
                         rl.cleanup().await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        if let Err(e) = db.sweep_expired_proofs(now).await {
+                            tracing::warn!(err = %e, "failed to sweep expired iCaptcha proofs");
+                        }
                     }
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
