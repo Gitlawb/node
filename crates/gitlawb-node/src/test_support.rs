@@ -1559,6 +1559,10 @@ mod tests {
             !text(&bytes).contains("embargo-rdr"),
             "404 must not leak the cert ref"
         );
+        assert!(
+            !text(&bytes).contains("rdrsha00"),
+            "404 must not leak the cert sha"
+        );
     }
 
     /// #113 fail-closed: when the repo lookup ERRORS (not a clean Ok(None)), the

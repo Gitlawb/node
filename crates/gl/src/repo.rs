@@ -1099,6 +1099,10 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels$".to_string()),
             )
+            // Identity is loaded, so get_maybe_signed must sign — requiring the
+            // header guards against a regression back to bare get().
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"labels":[]}"#)
@@ -1125,6 +1129,10 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels$".to_string()),
             )
+            // Identity is loaded, so get_maybe_signed must sign — requiring the
+            // header guards against a regression back to bare get().
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"labels":["language:rust","topic:defi"]}"#)
@@ -1133,6 +1141,31 @@ mod tests {
 
         cmd_label_list(
             "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_label_list_anonymous_when_no_identity() {
+        // Empty dir → no identity → get_maybe_signed must fall back to an
+        // anonymous GET (the public-repo path). Assert NO signature header.
+        let dir = TempDir::new().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/labels$".to_string()))
+            .match_header("signature", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"labels":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_label_list(
+            "owner/pubrepo".to_string(),
             server.url(),
             Some(dir.path().to_path_buf()),
         )
