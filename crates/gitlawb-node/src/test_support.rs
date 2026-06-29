@@ -1462,6 +1462,105 @@ mod tests {
         );
     }
 
+    /// #113: the events read-gate admits a listed reader (the allow-list branch
+    /// of visibility_check), not just the owner — parity with the replica and
+    /// protected-branch surfaces covered by `read_visibility_admits_listed_reader`.
+    /// A non-reader stranger still 404s with no leak.
+    #[sqlx::test]
+    async fn list_repo_events_admits_listed_reader(pool: PgPool) {
+        use crate::db::{RefCertificate, VisibilityMode};
+        let owner = "did:key:zEVTRDROWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zEVTRDRREADERBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zEVTRDRSTRGRCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "evt-rdr");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .insert_ref_certificate(&RefCertificate {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                ref_name: "refs/heads/embargo-rdr".to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: "rdrsha00".to_string(),
+                pusher_did: owner.to_string(),
+                node_did: owner.to_string(),
+                signature: "sig".to_string(),
+                issued_at: Utc::now().to_rfc3339(),
+            })
+            .await
+            .expect("seed private cert");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/events",
+                    axum::routing::get(crate::api::events::list_repo_events),
+                )
+                .with_state(state.clone())
+        };
+        let uri = format!("/api/v1/repos/{owner}/evt-rdr/events");
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).to_string();
+
+        // Listed reader (non-owner) → 200, the private cert is served.
+        let resp = router()
+            .oneshot(signed_request_as(reader, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader (non-owner) must read events"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            text(&bytes).contains("embargo-rdr"),
+            "listed reader sees the private cert"
+        );
+
+        // A non-reader stranger → 404, and the cert ref does not leak.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader stranger must 404"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !text(&bytes).contains("embargo-rdr"),
+            "404 must not leak the cert ref"
+        );
+    }
+
     /// #113 fail-closed: when the repo lookup ERRORS (not a clean Ok(None)), the
     /// visibility gate must not be skipped. The buggy `.ok().flatten()` collapsed an
     /// Err into None, so a transient DB failure during the lookup dropped the gate

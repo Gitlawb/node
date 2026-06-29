@@ -654,10 +654,13 @@ async fn cmd_label_remove(
 
 async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
-    let client = NodeClient::new(&node, None);
+    // Read-visibility-gated like the sibling read surfaces (replicas, protected
+    // branches): sign when an identity is available so a private-repo owner can
+    // read their own labels, while public repos stay anonymously listable.
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
     let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/labels"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/labels"))
         .await?
         .json()
         .await
