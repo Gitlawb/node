@@ -482,7 +482,7 @@ pub async fn get_tree(
 
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
 
-/// GET /:owner/:repo.git/info/refs?service=git-upload-pack
+/// GET /:owner/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
 pub async fn git_info_refs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
@@ -508,10 +508,14 @@ pub async fn git_info_refs(
         .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
     tracing::debug!(service = %service, repo = %name, "info/refs service");
 
-    // Enforce read (clone/fetch) visibility. The push advertisement
-    // (service=git-receive-pack) is authorized separately on the
-    // git-receive-pack POST, so leave it untouched here.
-    if service == "git-upload-pack" {
+    // Enforce read visibility on the ref advertisement, for BOTH services. The
+    // upload-pack (clone/fetch) and receive-pack (push) advertisements expose the
+    // same ref metadata — branch/tag names and commit tips — so a private repo's
+    // advertisement must be withheld from a non-reader regardless of which service
+    // is requested. The push itself stays separately owner-gated on the
+    // git-receive-pack POST; read access is a strict subset of push access, so a
+    // legitimate pusher (the owner) always clears this gate.
+    {
         let rules = state.db.list_visibility_rules(&record.id).await?;
         let caller = auth.as_ref().map(|e| e.0 .0.as_str());
         // Subtree (mode B) rules do not gate the advertisement: refs expose commit
@@ -519,7 +523,7 @@ pub async fn git_info_refs(
         if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
             == Decision::Deny
         {
-            tracing::debug!(repo = %name, caller = ?caller, "info/refs read denied by visibility");
+            tracing::debug!(repo = %name, caller = ?caller, service = %service, "info/refs read denied by visibility");
             return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
         }
     }
