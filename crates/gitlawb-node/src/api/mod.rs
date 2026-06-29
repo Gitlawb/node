@@ -266,6 +266,48 @@ mod authz_guard {
         header.contains("Path<(String, String")
     }
 
+    /// True when at least one gate marker runs for EVERY service — i.e. some
+    /// marker sits outside any `if service == ...` discriminator block. A gate
+    /// that appears ONLY inside such a block (as the info/refs advertisement gate
+    /// did before #119: `visibility_check` ran under `if service ==
+    /// "git-upload-pack"`, leaving `git-receive-pack` ungated) covers a subset of
+    /// services and must NOT count as a full gate. Other handlers carry no
+    /// `service ==` discriminator, so for them this matches the plain
+    /// substring check.
+    fn gate_runs_unconditionally(body: &str, markers: &[&str]) -> bool {
+        // Brace-matched spans of each `if service == ...` block.
+        let mut cond_spans: Vec<(usize, usize)> = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = body[search..].find("if service ==") {
+            let cond_start = search + rel;
+            let Some(brace_rel) = body[cond_start..].find('{') else {
+                break;
+            };
+            let open = cond_start + brace_rel;
+            let mut depth = 0i32;
+            let mut end = body.len();
+            for (i, c) in body[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cond_spans.push((open, end));
+            search = end + 1;
+        }
+        markers.iter().any(|m| {
+            body.match_indices(m)
+                .any(|(pos, _)| !cond_spans.iter().any(|(s, e)| pos >= *s && pos <= *e))
+        })
+    }
+
     /// Egress gate guard: every repo-scoped handler (`Path<(String, String..)>`)
     /// must carry an authz marker — a read gate (`authorize_repo_read` /
     /// `visibility_check`), or a write gate (`require_repo_owner` / `require_owner`
@@ -338,6 +380,9 @@ mod authz_guard {
         // Repo-scoped reads known to be ungated today, each tracked by an issue.
         // Remove an entry the moment its gate lands (the staleness assert enforces it).
         let known_ungated: &[(&str, &str)] = &[
+            // info/refs gates only git-upload-pack today; git-receive-pack
+            // advertisement is ungated until #119 makes the gate unconditional.
+            ("git_info_refs", "#119"),
             ("list_certs", "#120"),
             ("get_cert", "#120"),
             ("list_issues", "#120"),
@@ -385,7 +430,7 @@ mod authz_guard {
                     continue; // node-wide aggregate, not a repo-scoped surface
                 }
                 checked += 1;
-                let gated = markers.iter().any(|m| body.contains(m));
+                let gated = gate_runs_unconditionally(&body, &markers);
                 assert!(
                     gated || is_known(&name),
                     "repo-scoped handler `{name}` ({file}) has no authz gate and is \
@@ -447,5 +492,36 @@ mod authz_guard {
             !is_repo_scoped(single),
             "single-segment Path is not repo-scoped"
         );
+    }
+
+    /// Pins `gate_runs_unconditionally`: a gate nested only inside an
+    /// `if service == ...` block is conditional (does NOT count), while the same
+    /// gate at the top level — or an additional unconditional one — does.
+    #[test]
+    fn conditional_service_gate_is_not_a_full_gate() {
+        let markers = ["visibility_check("];
+        // Gate runs only for one service: not a full gate.
+        let conditional = "fn f() {\n  \
+            if service == \"git-upload-pack\" {\n    \
+                visibility_check(rules, caller);\n  \
+            }\n  \
+            if service == \"git-receive-pack\" { acquire_fresh(); }\n}";
+        assert!(
+            !gate_runs_unconditionally(conditional, &markers),
+            "a gate only inside `if service ==` covers a subset of services"
+        );
+        // Same gate at top level: full gate.
+        let unconditional = "fn f() {\n  \
+            visibility_check(rules, caller);\n  \
+            if service == \"git-receive-pack\" { acquire_fresh(); }\n}";
+        assert!(
+            gate_runs_unconditionally(unconditional, &markers),
+            "an unconditional gate runs for every service"
+        );
+        // No marker at all: not gated.
+        assert!(!gate_runs_unconditionally(
+            "fn f() { do_thing(); }",
+            &markers
+        ));
     }
 }
