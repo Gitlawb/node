@@ -14,7 +14,10 @@
 //! # Protocol flow (connect capability)
 //!   capabilities → "connect\n\n"
 //!   connect git-upload-pack  → GET /info/refs | POST /git-upload-pack
-//!   connect git-receive-pack → GET /info/refs | POST /git-receive-pack (+ auth header)
+//!   connect git-receive-pack → GET /info/refs | POST /git-receive-pack
+//! When an identity keypair is present, both the advertisement GET and the pack
+//! POST are RFC-9421 signed for BOTH services, so the node authorizes the owner on
+//! visibility-gated private repos (fetch and push); public repos work anonymously.
 
 use anyhow::{bail, Context, Result};
 use gitlawb_core::http_sig::sign_request;
@@ -63,7 +66,9 @@ fn main() -> Result<()> {
     let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
     tracing::debug!("repo_base: {repo_base}");
 
-    // Load keypair for signing push requests (optional — push still works unsigned in v0.1)
+    // Load keypair for signing requests (optional). When present, the helper signs
+    // both fetch and push so a private repo's owner is authorized; absent, public
+    // repos still work and push falls back to unsigned (v0.1 local alpha only).
     let keypair = load_keypair();
 
     run_helper(&repo_base, keypair.as_ref())
@@ -115,7 +120,7 @@ fn help_text() -> String {
          \n\
          ENVIRONMENT:\n\
          \x20   GITLAWB_NODE   Node base URL (default: http://127.0.0.1:7545)\n\
-         \x20   GITLAWB_KEY    Identity PEM path for signed pushes (default: ~/.gitlawb/identity.pem)\n\
+         \x20   GITLAWB_KEY    Identity PEM path for signed fetch/push (default: ~/.gitlawb/identity.pem)\n\
          \x20   GITLAWB_LOG    Log filter (default: warn)\n\
          \n\
          FLAGS:\n\
@@ -201,9 +206,7 @@ fn handle_connect(
     let refs_url = format!("{}/info/refs?service={}", repo_base, service);
     tracing::debug!("GET {refs_url}");
 
-    let refs_resp = client
-        .get(&refs_url)
-        .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0")
+    let refs_resp = build_advertisement_request(&client, &refs_url, keypair)
         .send()
         .with_context(|| format!("GET {refs_url}"))?;
 
@@ -266,29 +269,7 @@ fn handle_connect(
     let post_url = format!("{}/{}", repo_base, service);
     tracing::debug!("POST {post_url} ({} bytes)", request_body.len());
 
-    // Extract the URL path for signing (e.g., "/z6Mk.../my-repo/git-receive-pack")
-    let path_for_sig = url_path(&post_url);
-
-    let mut req = client
-        .post(&post_url)
-        .header("Content-Type", format!("application/x-{}-request", service))
-        .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0");
-
-    // Add RFC 9421 HTTP Signature auth on push operations
-    if service == "git-receive-pack" {
-        if let Some(kp) = keypair {
-            let signed = sign_request(kp, "POST", &path_for_sig, &request_body);
-            req = req
-                .header("Content-Digest", signed.content_digest)
-                .header("Signature-Input", signed.signature_input)
-                .header("Signature", signed.signature);
-            tracing::debug!("attached RFC 9421 HTTP Signature (DID: {})", kp.did());
-        } else {
-            tracing::warn!(
-                "no identity keypair found — push will be unsigned (v0.1 local alpha only)"
-            );
-        }
-    }
+    let req = build_pack_post_request(&client, &post_url, service, &request_body, keypair);
 
     // Attach the body after signing so the pack bytes are moved, not cloned —
     // packs can be large and the clone doubled peak memory on push.
@@ -308,6 +289,67 @@ fn handle_connect(
     stdout.flush()?;
 
     Ok(())
+}
+
+// ── Smart-protocol request builders ───────────────────────────────────────────
+
+const USER_AGENT: &str = "git/2.0 git-remote-gitlawb/0.1.0";
+
+/// Build the Phase-1 ref-advertisement GET, signing it when an identity is
+/// present. The node gates the ref advertisement on read visibility for BOTH
+/// services, so a private repo's advertisement is denied (404) to an
+/// unauthenticated caller — without this signature the repo's own owner can
+/// neither fetch (upload-pack) nor push (receive-pack) it. Public repos still
+/// work anonymously (no keypair present, or the gate admits anonymous). Sign over
+/// the path *and* query (?service=...) because the node verifies the signature
+/// over its path_and_query.
+fn build_advertisement_request(
+    client: &reqwest::blocking::Client,
+    refs_url: &str,
+    keypair: Option<&Keypair>,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = client.get(refs_url).header("User-Agent", USER_AGENT);
+    if let Some(kp) = keypair {
+        let signed = sign_request(kp, "GET", &url_path(refs_url), b"");
+        req = req
+            .header("Content-Digest", signed.content_digest)
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature);
+        tracing::debug!("signed info/refs advertisement (DID: {})", kp.did());
+    }
+    req
+}
+
+/// Build the Phase-2 pack POST, signing it when an identity is present, for BOTH
+/// services. The node read-gates the git-upload-pack POST as well as the
+/// git-receive-pack POST (each runs visibility_check at "/"), and the Phase-1
+/// advertisement signature does not carry to this separate request — so a private
+/// repo's owner must authenticate here too or their fetch/push is denied.
+/// Public-repo fetch still works anonymously when no keypair is present. The body
+/// is signed (content-digest) but NOT attached here, so the caller can move the
+/// (possibly large) pack bytes into `.body()` rather than clone them.
+fn build_pack_post_request(
+    client: &reqwest::blocking::Client,
+    post_url: &str,
+    service: &str,
+    body: &[u8],
+    keypair: Option<&Keypair>,
+) -> reqwest::blocking::RequestBuilder {
+    let mut req = client
+        .post(post_url)
+        .header("Content-Type", format!("application/x-{}-request", service))
+        .header("User-Agent", USER_AGENT);
+    if let Some(kp) = keypair {
+        let signed = sign_request(kp, "POST", &url_path(post_url), body);
+        req = req
+            .header("Content-Digest", signed.content_digest)
+            .header("Signature-Input", signed.signature_input)
+            .header("Signature", signed.signature);
+        tracing::debug!("signed {service} POST (DID: {})", kp.did());
+    } else if service == "git-receive-pack" {
+        tracing::warn!("no identity keypair found — push will be unsigned (v0.1 local alpha only)");
+    }
+    req
 }
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
@@ -477,6 +519,227 @@ fn resolve_key_path() -> std::path::PathBuf {
 mod tests {
     use super::*;
 
+    /// The regression that round-1 missed: the Phase-2 `git-upload-pack` POST was
+    /// left unsigned, so an owner's fetch of a private repo cleared the (now signed)
+    /// advertisement and then 404'd on the pack POST. Drive BOTH request builders
+    /// against a mock node and assert the RFC-9421 headers actually go out on the
+    /// wire for BOTH services when a keypair is present (the mock only matches when
+    /// the headers exist, so `.assert()` fails if any are dropped).
+    #[test]
+    fn advertisement_and_pack_post_are_signed_for_both_services_with_keypair() {
+        let kp = Keypair::generate();
+        let client = reqwest::blocking::Client::new();
+        let body = b"0009done\n".to_vec();
+
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let mut server = mockito::Server::new();
+            let repo_base = format!("{}/zOwner/myrepo", server.url());
+
+            let get_mock = server
+                .mock("GET", mockito::Matcher::Regex(r"/info/refs".to_string()))
+                .match_header("signature", mockito::Matcher::Any)
+                .match_header("signature-input", mockito::Matcher::Any)
+                .match_header("content-digest", mockito::Matcher::Any)
+                .with_status(200)
+                .create();
+            let refs_url = format!("{repo_base}/info/refs?service={service}");
+            let resp = build_advertisement_request(&client, &refs_url, Some(&kp))
+                .send()
+                .unwrap();
+            assert!(resp.status().is_success());
+            get_mock.assert();
+
+            let post_mock = server
+                .mock("POST", mockito::Matcher::Regex(format!("/{service}$")))
+                .match_header("signature", mockito::Matcher::Any)
+                .match_header("signature-input", mockito::Matcher::Any)
+                .match_header("content-digest", mockito::Matcher::Any)
+                .with_status(200)
+                .create();
+            let post_url = format!("{repo_base}/{service}");
+            let resp = build_pack_post_request(&client, &post_url, service, &body, Some(&kp))
+                .body(body.clone())
+                .send()
+                .unwrap();
+            assert!(resp.status().is_success());
+            post_mock.assert();
+        }
+    }
+
+    /// Without an identity, the pack POST must go out UNSIGNED so public fetch (and
+    /// alpha unsigned push) still work. `Matcher::Missing` matches only when the
+    /// header is absent, so the mock is hit only if NO signature was attached — for
+    /// BOTH services (the receive-pack iteration also exercises the no-keypair warn
+    /// branch and confirms it does not block the request).
+    #[test]
+    fn pack_post_is_unsigned_without_keypair_for_both_services() {
+        let client = reqwest::blocking::Client::new();
+        let body = b"0009done\n".to_vec();
+
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let mut server = mockito::Server::new();
+            let post_url = format!("{}/zOwner/myrepo/{service}", server.url());
+
+            let post_mock = server
+                .mock("POST", mockito::Matcher::Regex(format!("/{service}$")))
+                .match_header("signature", mockito::Matcher::Missing)
+                .match_header("signature-input", mockito::Matcher::Missing)
+                .match_header("content-digest", mockito::Matcher::Missing)
+                .with_status(200)
+                .create();
+            let resp = build_pack_post_request(&client, &post_url, service, &body, None)
+                .body(body.clone())
+                .send()
+                .unwrap();
+            assert!(resp.status().is_success());
+            post_mock.assert();
+        }
+    }
+
+    /// Symmetric negative case for Phase 1: with no identity the advertisement GET
+    /// carries no signature, so public clones stay anonymous.
+    #[test]
+    fn advertisement_get_is_unsigned_without_keypair() {
+        let client = reqwest::blocking::Client::new();
+        let mut server = mockito::Server::new();
+        let refs_url = format!(
+            "{}/zOwner/myrepo/info/refs?service=git-upload-pack",
+            server.url()
+        );
+
+        let get_mock = server
+            .mock("GET", mockito::Matcher::Regex(r"/info/refs".to_string()))
+            .match_header("signature", mockito::Matcher::Missing)
+            .match_header("signature-input", mockito::Matcher::Missing)
+            .match_header("content-digest", mockito::Matcher::Missing)
+            .with_status(200)
+            .create();
+        let resp = build_advertisement_request(&client, &refs_url, None)
+            .send()
+            .unwrap();
+        assert!(resp.status().is_success());
+        get_mock.assert();
+    }
+
+    /// Cross-crate seam: the signature the CLIENT actually emits (via the real
+    /// request builders) verifies under the SAME `gitlawb_core::http_sig`
+    /// primitives the node's `require_signature` uses, over the `@path` the client
+    /// genuinely transmits (derived from the built reqwest request, exactly as the
+    /// node derives it from `uri.path_and_query()`). A tampered `@path` must fail —
+    /// this is the byte-match the whole A1 client fix depends on, now executed end
+    /// to end (sign here, verify with the node's verifier), not reasoned.
+    #[test]
+    fn client_signature_verifies_under_node_verification_for_both_services() {
+        use gitlawb_core::http_sig::{
+            build_signing_string, compute_content_digest, HttpSignature, COVERED_COMPONENTS,
+        };
+        use gitlawb_core::identity::verify;
+        use std::collections::HashMap;
+
+        let kp = Keypair::generate();
+        let client = reqwest::blocking::Client::new();
+        let body = b"0009done\n".to_vec();
+
+        // Re-implements the node's require_signature verification (auth/mod.rs):
+        // parse headers, recompute content-digest from the body, rebuild the signing
+        // string over @method/@path/content-digest, Ed25519-verify. Ok iff the node
+        // would accept it.
+        let node_verifies = |method: &str,
+                             path_and_query: &str,
+                             body: &[u8],
+                             sig_input: &str,
+                             sig_header: &str,
+                             content_digest: &str|
+         -> anyhow::Result<()> {
+            let sig = HttpSignature::parse(sig_input, sig_header)?;
+            sig.check_created()?;
+            assert!(
+                sig.missing_components().is_empty(),
+                "signature must cover all required components"
+            );
+            assert_eq!(sig.alg, "ed25519");
+            assert_eq!(
+                content_digest,
+                compute_content_digest(body),
+                "content-digest must match the body"
+            );
+            let vk = sig.key_id.to_verifying_key()?;
+            let mut values = HashMap::new();
+            values.insert("@method".to_string(), method.to_uppercase());
+            values.insert("@path".to_string(), path_and_query.to_string());
+            values.insert("content-digest".to_string(), content_digest.to_string());
+            let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
+            let components: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+            let signing_string = build_signing_string(&components, sig_params_value, &values)?;
+            let sig_array: [u8; 64] = sig.signature_bytes.as_slice().try_into()?;
+            verify(&vk, signing_string.as_bytes(), &sig_array)?;
+            let _ = COVERED_COMPONENTS;
+            Ok(())
+        };
+        // @path exactly as the node reconstructs it from the request it receives.
+        let path_and_query = |req: &reqwest::blocking::Request| match req.url().query() {
+            Some(q) => format!("{}?{}", req.url().path(), q),
+            None => req.url().path().to_string(),
+        };
+        let header = |req: &reqwest::blocking::Request, name: &str| {
+            req.headers()
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            // Phase-1 advertisement GET (empty body).
+            let refs_url = format!("http://node.example/zOwner/myrepo/info/refs?service={service}");
+            let req = build_advertisement_request(&client, &refs_url, Some(&kp))
+                .build()
+                .unwrap();
+            node_verifies(
+                "GET",
+                &path_and_query(&req),
+                b"",
+                &header(&req, "signature-input"),
+                &header(&req, "signature"),
+                &header(&req, "content-digest"),
+            )
+            .expect("client GET signature must verify under the node's verifier");
+
+            // Phase-2 pack POST (real body).
+            let post_url = format!("http://node.example/zOwner/myrepo/{service}");
+            let req = build_pack_post_request(&client, &post_url, service, &body, Some(&kp))
+                .body(body.clone())
+                .build()
+                .unwrap();
+            let pq = path_and_query(&req);
+            node_verifies(
+                "POST",
+                &pq,
+                &body,
+                &header(&req, "signature-input"),
+                &header(&req, "signature"),
+                &header(&req, "content-digest"),
+            )
+            .expect("client POST signature must verify under the node's verifier");
+
+            // Negative: a tampered @path (the A1 attack surface) must NOT verify.
+            let tampered = pq.replace(service, "git-evil");
+            assert!(
+                node_verifies(
+                    "POST",
+                    &tampered,
+                    &body,
+                    &header(&req, "signature-input"),
+                    &header(&req, "signature"),
+                    &header(&req, "content-digest"),
+                )
+                .is_err(),
+                "a tampered @path must fail verification"
+            );
+        }
+    }
+
     #[test]
     fn parse_standard_url() {
         let (did, owner, repo) = parse_gitlawb_url("gitlawb://did:key:z6MkFoo123/my-repo").unwrap();
@@ -521,6 +784,21 @@ mod tests {
         assert_eq!(
             url_path("http://127.0.0.1:7545/z6Mk/myrepo/git-receive-pack"),
             "/z6Mk/myrepo/git-receive-pack"
+        );
+    }
+
+    #[test]
+    fn url_path_preserves_query_for_signed_advertisement() {
+        // The Phase-1 advertisement GET is signed over url_path(refs_url), and the
+        // node verifies the signature over its path_and_query — so the ?service=
+        // query MUST survive verbatim or the signatures will not byte-match.
+        assert_eq!(
+            url_path("http://127.0.0.1:7545/z6Mk/myrepo/info/refs?service=git-upload-pack"),
+            "/z6Mk/myrepo/info/refs?service=git-upload-pack"
+        );
+        assert_eq!(
+            url_path("http://127.0.0.1:7545/z6Mk/myrepo/info/refs?service=git-receive-pack"),
+            "/z6Mk/myrepo/info/refs?service=git-receive-pack"
         );
     }
 
