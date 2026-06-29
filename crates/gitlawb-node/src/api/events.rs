@@ -60,8 +60,13 @@ pub async fn list_repo_events(
         .unwrap_or(50)
         .min(200);
 
-    // Look up the repo record once so we can use the full owner DID
-    let repo_record = state.db.get_repo(&owner, &repo_name).await.ok().flatten();
+    // Look up the repo record once so we can use the full owner DID.
+    // #113: propagate a lookup error (fail closed) instead of swallowing it with
+    // `.ok().flatten()`. Collapsing Err into None would skip the visibility gate
+    // below and serve a private repo's events. get_repo returns anyhow::Result, so
+    // `?` maps an error to AppError::Internal (500). Only a genuine Ok(None) (the
+    // repo is not hosted locally) is the intentional ungated pass-through.
+    let repo_record = state.db.get_repo(&owner, &repo_name).await?;
 
     // #94: if this node hosts the repo locally, gate on read visibility BEFORE
     // serving any events (cert OR gossip). A non-reader of a local private repo

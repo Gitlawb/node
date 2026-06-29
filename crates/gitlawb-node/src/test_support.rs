@@ -1462,6 +1462,106 @@ mod tests {
         );
     }
 
+    /// #113 fail-closed: when the repo lookup ERRORS (not a clean Ok(None)), the
+    /// visibility gate must not be skipped. The buggy `.ok().flatten()` collapsed an
+    /// Err into None, so a transient DB failure during the lookup dropped the gate
+    /// and the handler served the private repo's gossip ref-updates via the
+    /// ungated None branch (slug taken from the URL owner segment). We force a
+    /// deterministic get_repo error by dropping the column its SELECT reads, then
+    /// require the handler to fail closed (500, no secret) instead of 200-with-secret.
+    #[sqlx::test]
+    async fn list_repo_events_fails_closed_when_repo_lookup_errors(pool: PgPool) {
+        use crate::db::ReceivedRefUpdate;
+        let owner = "did:key:zEVTERRAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // Caller addresses the repo by the full key part (the slug gossip rows use),
+        // so the buggy None-branch fallback slug matches the seeded private update.
+        let keypart = owner.split(':').next_back().unwrap();
+        let state = test_state(pool.clone()).await;
+
+        let mut priv_repo = seed_repo(owner, "evt-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        state
+            .db
+            .insert_ref_update(&ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: owner.to_string(),
+                pusher_did: owner.to_string(),
+                repo: format!("{keypart}/evt-priv"),
+                ref_name: "refs/heads/embargo-gossip".to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: "gossipSEKRET".to_string(),
+                timestamp: Utc::now().to_rfc3339(),
+                cert_id: None,
+                received_at: Utc::now().to_rfc3339(),
+                from_peer: "peer".to_string(),
+            })
+            .await
+            .expect("seed private gossip update");
+
+        // Force get_repo's SELECT (which reads machine_id, db/mod.rs) to error,
+        // simulating a transient DB failure during the visibility lookup. The repo
+        // row and the gossip update both remain present.
+        // Precondition: the lookup must succeed before we break it, otherwise the
+        // injection proves nothing.
+        state
+            .db
+            .get_repo(keypart, "evt-priv")
+            .await
+            .expect("pre-drop lookup must succeed")
+            .expect("private repo row must be present pre-drop");
+        sqlx::query("ALTER TABLE repos DROP COLUMN machine_id")
+            .execute(&pool)
+            .await
+            .expect("drop column to force a get_repo error");
+        // Guard the injection: if a future refactor drops machine_id from get_repo's
+        // SELECT, this assertion fails loudly instead of letting the test pass
+        // vacuously (get_repo would return Ok and the gate, not the error path,
+        // would drive the response).
+        assert!(
+            state.db.get_repo(keypart, "evt-priv").await.is_err(),
+            "dropping machine_id must make get_repo error, else this test no longer exercises the Err path"
+        );
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/events",
+                axum::routing::get(crate::api::events::list_repo_events),
+            )
+            .with_state(state.clone());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{keypart}/evt-priv/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Fail closed: a lookup error must surface as 500, never a 200 that serves
+        // the private repo's ref metadata through the ungated branch.
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a repo-lookup error must fail closed, not skip the gate"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(
+            !body.contains("gossipSEKRET"),
+            "fail-closed response must not leak the gossip secret"
+        );
+    }
+
     /// #94 end-to-end seam: a REAL RFC-9421 signature produced exactly as the gl
     /// client's get_signed does (gitlawb_core::http_sig::sign_request over GET +
     /// empty body) is accepted by the node's actual optional_signature middleware,
