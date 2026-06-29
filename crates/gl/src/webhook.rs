@@ -156,7 +156,11 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         anyhow::bail!("list webhooks failed ({status}): {msg}");
     }
 
-    let hooks = body["webhooks"].as_array().cloned().unwrap_or_default();
+    let hooks = body
+        .get("webhooks")
+        .and_then(Value::as_array)
+        .cloned()
+        .context("node response missing webhooks array")?;
     if hooks.is_empty() {
         println!("No webhooks for {repo}");
         return Ok(());
@@ -475,6 +479,34 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("not the owner"));
+    }
+
+    #[tokio::test]
+    async fn test_list_webhooks_2xx_missing_array_errors() {
+        // A 2xx body without a `webhooks` array signals a node/API contract
+        // regression. cmd_list must error rather than print "No webhooks".
+        let mut server = mockito::Server::new_async().await;
+        let (dir, _kp) = tmp_identity();
+        let _root = mock_root(&mut server).await;
+
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ok":true}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("missing webhooks array"));
     }
 
     // ── delete ───────────────────────────────────────────────────────
