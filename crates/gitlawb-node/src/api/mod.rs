@@ -273,7 +273,9 @@ mod authz_guard {
     /// "git-upload-pack"`, leaving `git-receive-pack` ungated) covers a subset of
     /// services and must NOT count as a full gate. Other handlers carry no
     /// `service ==` discriminator, so for them this matches the plain
-    /// substring check.
+    /// substring check. NOTE: only `if service ==` is detected — a
+    /// `match service { .. }` discriminator is NOT tracked and a gate inside one
+    /// arm would pass as full; avoid that shape, or extend the span loop below.
     fn gate_runs_unconditionally(body: &str, markers: &[&str]) -> bool {
         // Brace-matched spans of each `if service == ...` block.
         let mut cond_spans: Vec<(usize, usize)> = Vec::new();
@@ -300,7 +302,10 @@ mod authz_guard {
                 }
             }
             cond_spans.push((open, end));
-            search = end + 1;
+            // On an unclosed block `end` stays at body.len() (the fail-safe
+            // direction: treat the rest as conditional rather than mask a gate);
+            // clamp so the next slice can't index past the end and panic.
+            search = (end + 1).min(body.len());
         }
         markers.iter().any(|m| {
             body.match_indices(m)
@@ -518,10 +523,38 @@ mod authz_guard {
             gate_runs_unconditionally(unconditional, &markers),
             "an unconditional gate runs for every service"
         );
+        // A gate inside EACH of two service blocks, none outside: still a
+        // subset (no service clears it unconditionally), so not a full gate.
+        let both_conditional = "fn f() {\n  \
+            if service == \"git-upload-pack\" { visibility_check(a); }\n  \
+            if service == \"git-receive-pack\" { visibility_check(b); }\n}";
+        assert!(
+            !gate_runs_unconditionally(both_conditional, &markers),
+            "a gate inside every service block is still conditional"
+        );
+        // A marker inside one block AND again unconditionally: the
+        // unconditional occurrence makes it a full gate (exercises the
+        // match_indices scan past the in-block hit).
+        let inside_and_outside = "fn f() {\n  \
+            if service == \"git-upload-pack\" { visibility_check(a); }\n  \
+            visibility_check(b);\n}";
+        assert!(
+            gate_runs_unconditionally(inside_and_outside, &markers),
+            "an unconditional occurrence counts even when another is conditional"
+        );
         // No marker at all: not gated.
         assert!(!gate_runs_unconditionally(
             "fn f() { do_thing(); }",
             &markers
         ));
+        // An unclosed `if service ==` block (e.g. phantom brace from a string
+        // literal) must not panic on the slice advance; the span runs to EOF, so
+        // the in-block marker reads as conditional. Real Rust source is balanced,
+        // so this only guards the scraper against a future pathological body.
+        let unclosed = "fn f() { if service == \"x\" { visibility_check(a);";
+        assert!(
+            !gate_runs_unconditionally(unclosed, &markers),
+            "an unclosed service block must not panic and stays conditional"
+        );
     }
 }
