@@ -209,6 +209,7 @@ mod authz_guard {
             // visibility (public repos stay anonymous; private repos 404).
             (replicas, "list_replicas", "authorize_repo_read("),
             (protect, "list_protected_branches", "authorize_repo_read("),
+            (labels, "list_labels", "authorize_repo_read("),
             // list_repo_events gates only the locally-hosted branch, so it calls
             // visibility_check directly (no second get_repo) rather than
             // authorize_repo_read; the gossip-only None path stays ungated.

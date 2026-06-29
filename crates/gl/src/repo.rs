@@ -659,14 +659,18 @@ async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Res
     // read their own labels, while public repos stay anonymously listable.
     let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
-    let resp: Value = client
+    let resp = client
         .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/labels"))
-        .await?
-        .json()
         .await
-        .context("invalid JSON")?;
+        .context("failed to connect to node")?;
+    let status = resp.status();
+    let body: Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = body["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("list labels failed ({status}): {msg}");
+    }
 
-    let labels = resp["labels"].as_array().cloned().unwrap_or_default();
+    let labels = body["labels"].as_array().cloned().unwrap_or_default();
     if labels.is_empty() {
         println!("No labels on {owner}/{name}");
     } else {
@@ -1171,6 +1175,72 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_label_list_404_errors() {
+        // A non-reader of a private repo gets 404 from the now-gated endpoint.
+        // The client must surface that as an error, not print "No labels" and
+        // exit 0 (the error body has no `labels` key).
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repo not found"}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_label_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("list labels failed (404")
+                && err.to_string().contains("repo not found"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cmd_label_list_non_json_error_surfaces_status() {
+        // A non-2xx response with a non-JSON body (e.g. a proxy 502) must still
+        // surface the HTTP status, not collapse to a bare JSON-parse error.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/[^/]+/myrepo/labels$".to_string()),
+            )
+            .with_status(502)
+            .with_header("content-type", "text/html")
+            .with_body("<html>502 Bad Gateway</html>")
+            .create_async()
+            .await;
+
+        let err = cmd_label_list(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("list labels failed (502"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]

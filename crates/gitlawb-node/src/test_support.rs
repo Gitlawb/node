@@ -1149,6 +1149,173 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
     }
 
+    /// #94 sibling: list_labels is read-visibility-gated. A public repo's labels
+    /// stay anonymously listable; a private repo's label names must not leak to a
+    /// non-reader (404). A listed reader of the private repo reads the label; the
+    /// owner reads it; a non-reader stranger 404s.
+    #[sqlx::test]
+    async fn list_labels_is_read_visibility_gated(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zLBLOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zLBLREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zLBLSTRGRCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "lbl-priv");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .add_label(&repo.id, "bug")
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels",
+                    axum::routing::get(crate::api::labels::list_labels),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains("bug");
+        let uri = format!("/api/v1/repos/{owner}/lbl-priv/labels");
+
+        // Owner (signed) → 200, sees the label.
+        let resp = router()
+            .oneshot(signed_request_as(owner, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(leaks(&bytes), "owner response must include the label");
+
+        // Listed reader (signed, non-owner) → 200, sees the label.
+        let resp = router()
+            .oneshot(signed_request_as(reader, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader reads the labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "listed reader response must include the label"
+        );
+
+        // Non-reader stranger (signed) → 404, no label leaked.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader stranger is denied the private labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the label name");
+
+        // Anonymous on the private repo → 404.
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "anon is denied the private labels"
+        );
+
+        // Public repo, anonymous → 200, label visible. The gate must not break
+        // the existing anonymous read path for public repos.
+        let pub_repo = seed_repo(owner, "lbl-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        state
+            .db
+            .add_label(&pub_repo.id, "pubtag")
+            .await
+            .expect("seed public label");
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/lbl-pub/labels"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a public repo's labels stay anonymously listable"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("pubtag"),
+            "public anon response must include the label"
+        );
+
+        // Absent repo → 404 (uniform with the non-reader denial; no 500).
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/no-such-repo/labels"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
     /// #94 sibling: list_protected_branches is read-visibility-gated. A public
     /// repo's protected-branch listing stays anonymous; a private repo must not
     /// leak its branch names to a non-reader (404, uniform no-existence-oracle).
