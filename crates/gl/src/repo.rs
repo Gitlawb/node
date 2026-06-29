@@ -210,7 +210,7 @@ pub async fn run(args: RepoArgs) -> Result<()> {
 }
 
 /// Derive the short DID key segment from a keypair, or fall back to the node's DID.
-async fn resolve_owner_did(node: &str, dir: Option<&std::path::Path>) -> Result<String> {
+pub(crate) async fn resolve_owner_did(node: &str, dir: Option<&std::path::Path>) -> Result<String> {
     if let Ok(kp) = load_keypair_from_dir(dir) {
         let did = kp.did().to_string();
         return Ok(did.split(':').next_back().unwrap_or(&did).to_string());
@@ -581,7 +581,7 @@ async fn cmd_fork(
 }
 
 /// Returns (owner, repo_name) — if repo contains '/', splits on it; otherwise uses caller's DID.
-async fn resolve_owner_repo_pair(
+pub(crate) async fn resolve_owner_repo_pair(
     repo: &str,
     node: &str,
     dir: Option<&std::path::Path>,

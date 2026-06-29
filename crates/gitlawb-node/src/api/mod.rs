@@ -184,8 +184,10 @@ mod authz_guard {
             (webhooks, "delete_webhook", "require_repo_owner("),
             // Bucket A/B hybrid — list_webhooks is read-visibility THEN owner:
             // authorize_repo_read 404s a non-reader of a private repo, then
-            // require_repo_owner 403s a non-owner of a public one. The
-            // require_repo_owner marker guards the owner half.
+            // require_repo_owner 403s a non-owner of a public one. Both halves
+            // are pinned: the authorize_repo_read marker guards the read half
+            // (existence hiding) and require_repo_owner guards the owner half.
+            (webhooks, "list_webhooks", "authorize_repo_read("),
             (webhooks, "list_webhooks", "require_repo_owner("),
             (labels, "add_label", "require_repo_owner("),
             (labels, "remove_label", "require_repo_owner("),
