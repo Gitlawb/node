@@ -799,6 +799,45 @@ mod tests {
         }
     }
 
+    /// Push is signature-gated, not merely owner-gated: an UNSIGNED
+    /// git-receive-pack POST is rejected by `require_signature` (401) before
+    /// reaching `git_receive_pack`. 401 (not the handler's 404/500) is the
+    /// discriminator that proves the request never reached the handler.
+    #[sqlx::test]
+    async fn unsigned_receive_pack_post_is_rejected(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner_did = Keypair::generate().did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "rp-repo"))
+            .await
+            .expect("seed repo");
+
+        // Production wiring: the receive-pack POST sits behind require_signature
+        // (server.rs add_auth_layers); apply that same layer here.
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{short}/rp-repo.git/git-receive-pack"))
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unsigned receive-pack POST must be rejected by require_signature, \
+             not reach the handler"
+        );
+    }
+
     /// A1 Phase-2 contract: the `git-upload-pack` POST (the actual fetch, after
     /// the advertisement) is itself read-visibility gated. An ANONYMOUS upload-pack
     /// POST against a private repo is denied (404) — so signing only the Phase-1
