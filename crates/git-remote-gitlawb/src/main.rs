@@ -321,10 +321,11 @@ fn build_advertisement_request(
 }
 
 /// Build the Phase-2 pack POST, signing it when an identity is present, for BOTH
-/// services. The node read-gates the git-upload-pack POST as well as the
-/// git-receive-pack POST (each runs visibility_check at "/"), and the Phase-1
-/// advertisement signature does not carry to this separate request — so a private
-/// repo's owner must authenticate here too or their fetch/push is denied.
+/// services. The node read-gates the git-upload-pack POST with visibility_check
+/// at "/", and separately owner-gates the git-receive-pack POST (signature
+/// required, enforced by middleware). The Phase-1 advertisement signature does
+/// not carry to this separate request, so a private repo's owner must
+/// authenticate here too or their fetch/push is denied.
 /// Public-repo fetch still works anonymously when no keypair is present. The body
 /// is signed (content-digest) but NOT attached here, so the caller can move the
 /// (possibly large) pack bytes into `.body()` rather than clone them.

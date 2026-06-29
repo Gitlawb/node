@@ -513,7 +513,7 @@ pub async fn git_info_refs(
     // same ref metadata — branch/tag names and commit tips — so a private repo's
     // advertisement must be withheld from a non-reader regardless of which service
     // is requested. The push itself stays separately owner-gated on the
-    // git-receive-pack POST; read access is a strict subset of push access, so a
+    // git-receive-pack POST; push access implies read access here, so a
     // legitimate pusher (the owner) always clears this gate.
     {
         let rules = state.db.list_visibility_rules(&record.id).await?;
