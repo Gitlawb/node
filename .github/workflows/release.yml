@@ -105,6 +105,9 @@ jobs:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ${{ matrix.os }}
+    # Windows is best-effort: a failure there must not fail the job or block the
+    # downstream npm/Homebrew jobs that only consume the unix artifacts.
+    continue-on-error: ${{ startsWith(matrix.target, 'x86_64-pc-windows') }}
     permissions:
       contents: write
     strategy:
@@ -351,6 +354,7 @@ jobs:
           repository: Gitlawb/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_PAT }}
           path: tap
+          persist-credentials: false
 
       - name: Regenerate formula
         if: ${{ steps.guard.outputs.enabled == 'true' }}
@@ -415,6 +419,7 @@ jobs:
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         working-directory: tap
         env:
+          HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
           VERSION: ${{ needs.release-please.outputs.version }}
         run: |
           set -euo pipefail
@@ -426,7 +431,8 @@ jobs:
           fi
           git add Formula/gl.rb
           git commit -m "gl ${VERSION}"
-          git push
+          # Credentials are not persisted in .git/config; supply the token only for the push.
+          git push "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Gitlawb/homebrew-tap.git" HEAD:main
 
   web-sync:
     name: Sync web (install scripts + version)
@@ -463,6 +469,7 @@ jobs:
           repository: Gitlawb/web
           token: ${{ secrets.WEB_SYNC_PAT }}
           path: web
+          persist-credentials: false
 
       - name: Sync and open PR
         if: ${{ steps.guard.outputs.enabled == 'true' }}
@@ -494,7 +501,8 @@ jobs:
           git checkout -b "$branch"
           git add -A
           git commit -m "chore: sync gitlawb ${TAG} (install scripts + version)"
-          git push -u origin "$branch" --force
+          # Credentials are not persisted in .git/config; supply the token only for the push.
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/Gitlawb/web.git" "HEAD:$branch"
           gh pr create --repo Gitlawb/web --head "$branch" \
             --title "Sync gitlawb ${TAG}" \
             --body "Automated sync from Gitlawb/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
