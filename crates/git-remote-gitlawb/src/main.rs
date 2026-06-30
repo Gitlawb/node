@@ -298,7 +298,7 @@ const USER_AGENT: &str = "git/2.0 git-remote-gitlawb/0.1.0";
 /// Build the Phase-1 ref-advertisement GET, signing it when an identity is
 /// present. The node gates the ref advertisement on read visibility for BOTH
 /// services, so a private repo's advertisement is denied (404) to an
-/// unauthenticated caller — without this signature the repo's own owner can
+/// unauthenticated caller; without this signature the repo's own owner can
 /// neither fetch (upload-pack) nor push (receive-pack) it. Public repos still
 /// work anonymously (no keypair present, or the gate admits anonymous). Sign over
 /// the path *and* query (?service=...) because the node verifies the signature
@@ -348,7 +348,7 @@ fn build_pack_post_request(
             .header("Signature", signed.signature);
         tracing::debug!("signed {service} POST (DID: {})", kp.did());
     } else if service == "git-receive-pack" {
-        tracing::warn!("no identity keypair found — push will be unsigned (v0.1 local alpha only)");
+        tracing::warn!("no identity keypair found, push will be unsigned (v0.1 local alpha only)");
     }
     req
 }
@@ -569,7 +569,7 @@ mod tests {
 
     /// Without an identity, the pack POST must go out UNSIGNED so public fetch (and
     /// alpha unsigned push) still work. `Matcher::Missing` matches only when the
-    /// header is absent, so the mock is hit only if NO signature was attached — for
+    /// header is absent, so the mock is hit only if NO signature was attached, for
     /// BOTH services (the receive-pack iteration also exercises the no-keypair warn
     /// branch and confirms it does not block the request).
     #[test]
@@ -626,14 +626,12 @@ mod tests {
     /// request builders) verifies under the SAME `gitlawb_core::http_sig`
     /// primitives the node's `require_signature` uses, over the `@path` the client
     /// genuinely transmits (derived from the built reqwest request, exactly as the
-    /// node derives it from `uri.path_and_query()`). A tampered `@path` must fail —
+    /// node derives it from `uri.path_and_query()`). A tampered `@path` must fail:
     /// this is the byte-match the whole A1 client fix depends on, now executed end
     /// to end (sign here, verify with the node's verifier), not reasoned.
     #[test]
     fn client_signature_verifies_under_node_verification_for_both_services() {
-        use gitlawb_core::http_sig::{
-            build_signing_string, compute_content_digest, HttpSignature, COVERED_COMPONENTS,
-        };
+        use gitlawb_core::http_sig::{build_signing_string, compute_content_digest, HttpSignature};
         use gitlawb_core::identity::verify;
         use std::collections::HashMap;
 
@@ -674,7 +672,6 @@ mod tests {
             let signing_string = build_signing_string(&components, sig_params_value, &values)?;
             let sig_array: [u8; 64] = sig.signature_bytes.as_slice().try_into()?;
             verify(&vk, signing_string.as_bytes(), &sig_array)?;
-            let _ = COVERED_COMPONENTS;
             Ok(())
         };
         // @path exactly as the node reconstructs it from the request it receives.
@@ -791,7 +788,7 @@ mod tests {
     #[test]
     fn url_path_preserves_query_for_signed_advertisement() {
         // The Phase-1 advertisement GET is signed over url_path(refs_url), and the
-        // node verifies the signature over its path_and_query — so the ?service=
+        // node verifies the signature over its path_and_query, so the ?service=
         // query MUST survive verbatim or the signatures will not byte-match.
         assert_eq!(
             url_path("http://127.0.0.1:7545/z6Mk/myrepo/info/refs?service=git-upload-pack"),
