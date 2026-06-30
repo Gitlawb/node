@@ -303,3 +303,105 @@ jobs:
             echo "==> npm publish @gitlawb/$pkg"
             npm publish "npm/packages/$pkg" --provenance --access public
           done
+
+  homebrew-bump:
+    name: Bump Homebrew tap
+    needs: [release-please, release-binaries]
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Guard on secret
+        id: guard
+        env:
+          HOMEBREW_TAP_PAT: ${{ secrets.HOMEBREW_TAP_PAT }}
+        run: |
+          if [ -z "${HOMEBREW_TAP_PAT:-}" ]; then
+            echo "::warning::HOMEBREW_TAP_PAT is not set — skipping Homebrew bump."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout tap repo
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: Gitlawb/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_PAT }}
+          path: tap
+
+      - name: Regenerate formula
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
+          mkdir -p _sums
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.tar.gz.sha256' --dir _sums --clobber
+          sha() { awk '{print $1}' "_sums/gitlawb-node-${VERSION}-$1.tar.gz.sha256"; }
+          SHA_MAC_ARM="$(sha aarch64-apple-darwin)"
+          SHA_MAC_X64="$(sha x86_64-apple-darwin)"
+          SHA_LNX_ARM="$(sha aarch64-unknown-linux-musl)"
+          SHA_LNX_X64="$(sha x86_64-unknown-linux-musl)"
+
+          mkdir -p tap/Formula
+          cat > tap/Formula/gl.rb <<EOF
+          class Gl < Formula
+            desc "Gitlawb CLI — decentralized git for AI agents and developers"
+            homepage "https://gitlawb.com"
+            version "${VERSION}"
+            license "MIT OR Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "${base}/gitlawb-node-${VERSION}-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+              end
+              on_intel do
+                url "${base}/gitlawb-node-${VERSION}-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_MAC_X64}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "${base}/gitlawb-node-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LNX_ARM}"
+              end
+              on_intel do
+                url "${base}/gitlawb-node-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "${SHA_LNX_X64}"
+              end
+            end
+
+            def install
+              bin.install "gl"
+              bin.install "git-remote-gitlawb"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/gl --version")
+            end
+          end
+          EOF
+
+      - name: Commit and push
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        working-directory: tap
+        env:
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git add Formula/gl.rb
+          git commit -m "gl ${VERSION}"
+          git push
