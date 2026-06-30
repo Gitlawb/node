@@ -686,6 +686,25 @@ async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Res
     Ok(())
 }
 
+/// Parse the protected-branch list from the node's `GET /branches/protected`
+/// response. The endpoint returns `{"protected_branches": [...], "count": N}`
+/// (see `crates/gitlawb-node/src/api/protect.rs`); each entry may be a plain
+/// branch-name string or an object carrying a `name` field.
+fn parse_protected_branches(val: &Value) -> Vec<String> {
+    val["protected_branches"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| {
+                    b.as_str()
+                        .map(String::from)
+                        .or_else(|| b["name"].as_str().map(String::from))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: bool) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let my_did = keypair.did().to_string();
@@ -721,18 +740,7 @@ async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: b
     {
         Ok(resp) if resp.status().is_success() => {
             let val: Value = resp.json().await.unwrap_or_default();
-            val.as_array()
-                .or_else(|| val["branches"].as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|b| {
-                            b.as_str()
-                                .map(String::from)
-                                .or_else(|| b["name"].as_str().map(String::from))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
+            parse_protected_branches(&val)
         }
         _ => Vec::new(),
     };
@@ -769,6 +777,20 @@ async fn cmd_owner(repo: String, node: String, dir: Option<PathBuf>, json_out: b
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn parse_protected_branches_reads_node_shape() {
+        use serde_json::json;
+        assert_eq!(
+            parse_protected_branches(&json!({"protected_branches":["main","release"],"count":2})),
+            vec!["main".to_string(), "release".to_string()]
+        );
+        assert!(parse_protected_branches(&json!({"count":0})).is_empty());
+        assert_eq!(
+            parse_protected_branches(&json!({"protected_branches":[{"name":"main"}]})),
+            vec!["main".to_string()]
+        );
+    }
 
     fn write_identity(dir: &TempDir) {
         let kp = gitlawb_core::identity::Keypair::generate();
@@ -1284,7 +1306,7 @@ mod tests {
             .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"["main"]"#)
+            .with_body(r#"{"protected_branches":["main"],"count":1}"#)
             .create_async()
             .await;
 
@@ -1325,7 +1347,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"["main","release"]"#)
+            .with_body(r#"{"protected_branches":["main","release"],"count":2}"#)
             .create_async()
             .await;
 
@@ -1366,7 +1388,7 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"["main"]"#)
+            .with_body(r#"{"protected_branches":["main"],"count":1}"#)
             .create_async()
             .await;
 
