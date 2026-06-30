@@ -314,6 +314,7 @@ jobs:
       - name: Publish
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.release-please.outputs.version }}
         run: |
           set -euo pipefail
           if [ -z "${NPM_TOKEN:-}" ]; then
@@ -322,8 +323,15 @@ jobs:
           fi
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
           # Platform packages first, then the wrapper (so its optionalDependencies resolve).
+          # Skip versions already on the registry so a rerun after a partial publish
+          # is idempotent instead of erroring on the first existing package.
           for pkg in gl-darwin-arm64 gl-darwin-x64 gl-linux-arm64 gl-linux-x64 gl; do
-            echo "==> npm publish @gitlawb/$pkg"
+            name="@gitlawb/$pkg"
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "==> $name@$VERSION already published, skipping"
+              continue
+            fi
+            echo "==> npm publish $name@$VERSION"
             npm publish "npm/packages/$pkg" --provenance --access public
           done
 
