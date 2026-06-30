@@ -551,8 +551,10 @@ jobs:
             --title "Sync gitlawb ${TAG}" \
             --body "Automated sync from Gitlawb/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
             || {
-              # Only swallow the "PR already exists" case; surface auth/API failures.
-              if [ "$(gh pr list --repo Gitlawb/web --head "$branch" --state open --json number --jq 'length')" != "0" ]; then
+              # Only swallow the "PR already exists" case; surface auth/API failures
+              # (a failed gh pr list must not be misread as "PR exists").
+              pr_count="$(gh pr list --repo Gitlawb/web --head "$branch" --state open --json number --jq 'length')" || exit 1
+              if [ "$pr_count" != "0" ]; then
                 echo "PR for $branch already exists; branch was updated."
               else
                 exit 1
