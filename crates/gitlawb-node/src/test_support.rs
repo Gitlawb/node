@@ -2012,7 +2012,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = json_body(resp).await;
         assert_eq!(body["count"], 1);
-        assert_eq!(body["pins"][0]["sha256_hex"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            body["pins"][0]["sha256_hex"],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
     }
 
     // ---- #121: GET /api/v1/arweave/anchors auth and visibility gate ----

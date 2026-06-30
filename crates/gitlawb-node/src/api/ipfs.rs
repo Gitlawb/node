@@ -26,6 +26,7 @@ use std::str::FromStr;
 
 use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
+use crate::git::push_delta;
 use crate::git::store;
 use crate::git::visibility_pack::{allowed_blob_set_for_caller, has_path_scoped_rule};
 use crate::state::AppState;
@@ -217,23 +218,97 @@ pub async fn get_by_cid(
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
 ///
-/// Authentication is required to prevent anonymous CID enumeration (#121).
-/// Any authenticated caller may list pins — the node-wide index is gated on
-/// the caller identity so it is not available anonymously.
+/// The global listing filters each pinned object on current repo visibility
+/// to prevent metadata disclosure when repos are made private after push (#136).
+/// Only pins from repos the caller can currently read are returned.
 pub async fn list_pins(
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    if caller.is_none() {
-        return Err(AppError::Unauthorized("authentication required".into()));
-    }
+    let caller_owned = caller.map(|c| c.to_string());
 
-    let pins = state
+    let raw_pins = state
         .db
         .list_pinned_cids()
         .await
         .map_err(AppError::Internal)?;
+
+    // Build a set of sha256_hex values from repos the caller can read.
+    let repos = state
+        .db
+        .list_all_repos()
+        .await
+        .map_err(AppError::Internal)?;
+
+    let repo_ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
+    let rules_by_repo = state
+        .db
+        .list_visibility_rules_for_repos(&repo_ids)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let mut allowed_sha256s = std::collections::HashSet::new();
+
+    for repo in &repos {
+        let rules: &[crate::db::VisibilityRule] = rules_by_repo
+            .get(&repo.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        // Check repo-level visibility.
+        if visibility_check(rules, repo.is_public, &repo.owner_did, caller, "/") == Decision::Deny {
+            continue;
+        }
+
+        let repo_path = match state.repo_store.acquire(&repo.owner_did, &repo.name).await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // If path-scoped rules exist, we need to compute withheld blobs.
+        let withheld_set = if has_path_scoped_rule(rules) {
+            let rp = repo_path.clone();
+            let r = rules.to_vec();
+            let is_public = repo.is_public;
+            let owner = repo.owner_did.clone();
+            let caller_for_walk = caller_owned.clone();
+
+            let walk = tokio::task::spawn_blocking(move || {
+                withheld_blob_oids(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
+            })
+            .await;
+
+            match walk {
+                Ok(Ok(set)) => Some(set),
+                _ => {
+                    // Fail closed: if we can't compute withheld set, skip this repo.
+                    tracing::warn!(repo = %repo.name, "withheld walk failed; skipping repo for pins listing");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Read all objects in this repo and add non-withheld ones to allowed set.
+        if let Ok(objects) = push_delta::list_all_objects(&repo_path) {
+            for sha in objects {
+                if let Some(ref withheld) = withheld_set {
+                    if withheld.contains(&sha) {
+                        continue;
+                    }
+                }
+                allowed_sha256s.insert(sha);
+            }
+        }
+    }
+
+    // Filter pins to only those in allowed set.
+    let pins: Vec<_> = raw_pins
+        .into_iter()
+        .filter(|pin| allowed_sha256s.contains(&pin.sha256_hex))
+        .collect();
 
     Ok(Json(serde_json::json!({
         "pins": pins,
