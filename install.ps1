@@ -16,7 +16,11 @@ $ErrorActionPreference = "Stop"
 $Repo = if ($env:GITLAWB_RELEASE_REPO) { $env:GITLAWB_RELEASE_REPO } else { "Gitlawb/node" }
 $InstallDir = if ($env:GITLAWB_INSTALL_DIR) { $env:GITLAWB_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\gitlawb" }
 
-$arch = $env:PROCESSOR_ARCHITECTURE
+$arch = if ($env:PROCESSOR_ARCHITEW6432) {
+  $env:PROCESSOR_ARCHITEW6432
+} else {
+  $env:PROCESSOR_ARCHITECTURE
+}
 if ($arch -ne "AMD64") {
   throw "Unsupported architecture: $arch. Only x64 Windows binaries are published. Use WSL for arm64."
 }
