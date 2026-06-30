@@ -588,7 +588,7 @@ mod tests {
             .expect("seed canonical");
         state
             .db
-            .upsert_mirror_repo(short, "shared", "/tmp/mirror", None)
+            .upsert_mirror_repo(short, "shared", "/tmp/mirror", None, false)
             .await
             .expect("seed mirror");
         state
@@ -635,7 +635,7 @@ mod tests {
             .expect("seed canonical");
         state
             .db
-            .upsert_mirror_repo(short, "shared", "/tmp/mirror", None)
+            .upsert_mirror_repo(short, "shared", "/tmp/mirror", None, false)
             .await
             .expect("seed mirror");
         state
@@ -1075,7 +1075,7 @@ mod tests {
         let state = test_state(pool).await;
         state
             .db
-            .upsert_mirror_repo(short, "mirror-repo", "/tmp/mirror", None)
+            .upsert_mirror_repo(short, "mirror-repo", "/tmp/mirror", None, false)
             .await
             .expect("seed mirror-only row");
 
@@ -1177,7 +1177,7 @@ mod tests {
             .expect("root deny rule on canonical");
         state
             .db
-            .upsert_mirror_repo(short, "secret", "/tmp/mirror", None)
+            .upsert_mirror_repo(short, "secret", "/tmp/mirror", None, false)
             .await
             .expect("seed mirror");
         state

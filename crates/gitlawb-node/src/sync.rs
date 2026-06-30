@@ -275,6 +275,39 @@ async fn process_batch(
         match result {
             Ok(()) => {
                 info!(repo = %item.repo, origin = %origin_url, "synced repo from peer");
+                // iCaptcha propagation gate: on a first-time mirror, re-verify the
+                // proof the repo was created with (fetched from the origin) before
+                // admitting it. A node that enforces iCaptcha quarantines a mirror
+                // it cannot validate — kept on disk but hidden from serve/clone and
+                // listings until an operator releases it. Re-syncs of an already
+                // admitted repo keep their prior decision (upsert preserves it).
+                //
+                // "First-time" is keyed on DB-row absence, NOT on-disk presence: a
+                // prior attempt could have cloned to disk but crashed before the
+                // upsert, leaving no DB row. Disk-keying would skip admission on the
+                // retry and admit it unquarantined. On a DB lookup error, default to
+                // running the gate (fail toward quarantine, never silently admit).
+                let is_new_in_db = db
+                    .get_repo(owner_short, repo_name)
+                    .await
+                    .map(|r| r.is_none())
+                    .unwrap_or(true);
+                let quarantined = if is_new_in_db {
+                    let proof =
+                        fetch_icaptcha_proof(client, &origin_url, owner_short, repo_name).await;
+                    match crate::icaptcha::admit_mirror(db, proof.as_deref(), owner_short).await {
+                        crate::icaptcha::MirrorAdmission::Admit => false,
+                        crate::icaptcha::MirrorAdmission::Quarantine(reason) => {
+                            warn!(
+                                repo = %item.repo, origin = %origin_url, reason,
+                                "quarantining mirrored repo: failed iCaptcha propagation gate"
+                            );
+                            true
+                        }
+                    }
+                } else {
+                    false
+                };
                 // Register in DB so git smart HTTP can serve the mirrored repo
                 let _ = db
                     .upsert_mirror_repo(
@@ -282,6 +315,7 @@ async fn process_batch(
                         repo_name,
                         local_path.to_str().unwrap_or(""),
                         machine_id,
+                        quarantined,
                     )
                     .await;
                 // Option B2: carry the encrypted withheld-blob envelopes too, so an
@@ -345,6 +379,25 @@ async fn fetch_withheld(
         .filter_map(|v| v.as_str().map(str::to_string))
         .collect();
     Some(globs)
+}
+
+/// Fetch the iCaptcha proof token the origin recorded for this repo, used by the
+/// mirror-admission gate. Returns `None` on any non-success / network / parse
+/// error, or when the origin has no proof for the repo (treated as "no proof" by
+/// `icaptcha::admit_mirror`, which quarantines in enforce mode).
+async fn fetch_icaptcha_proof(
+    client: &reqwest::Client,
+    origin_url: &str,
+    owner: &str,
+    repo: &str,
+) -> Option<String> {
+    let url = format!("{origin_url}/api/v1/repos/{owner}/{repo}/icaptcha-proof");
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("proof")?.as_str().map(str::to_string)
 }
 
 /// Signed request path for replica registration on the origin node.

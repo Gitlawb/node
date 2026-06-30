@@ -47,6 +47,13 @@ pub(crate) async fn authorize_repo_read(
         .get_repo(owner, name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // A quarantined mirror (admitted by the iCaptcha propagation gate but not
+    // validated) is hidden from every reader — serve/clone and fork alike — as if
+    // it did not exist, until an operator releases it. Checked before the
+    // visibility gate so its existence is never disclosed.
+    if state.db.is_repo_quarantined(&record.id).await? {
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
     let rules = state.db.list_visibility_rules(&record.id).await?;
     if visibility_check(&rules, record.is_public, &record.owner_did, caller, path) == Decision::Deny
     {

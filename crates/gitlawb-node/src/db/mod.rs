@@ -796,6 +796,32 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_icaptcha_consumed_expires ON icaptcha_consumed_proofs(expires_at)",
         ],
     },
+    Migration {
+        version: 9,
+        name: "icaptcha_propagation",
+        stmts: &[
+            // The iCaptcha proof presented at repo creation, kept so it can travel
+            // with the repo when it propagates to peers. A mirroring node that
+            // enforces iCaptcha re-verifies this token offline before admitting the
+            // mirror (see `icaptcha::admit_mirror`). One row per repo (its creation
+            // proof); rows are best-effort and absent for repos created with the
+            // gate off/in shadow or before this migration.
+            r#"CREATE TABLE IF NOT EXISTS repo_icaptcha_proofs (
+                repo_id     TEXT   NOT NULL PRIMARY KEY,
+                proof_token TEXT   NOT NULL,
+                sub_did     TEXT   NOT NULL,
+                level       INTEGER NOT NULL,
+                jti         TEXT   NOT NULL,
+                exp         BIGINT NOT NULL,
+                created_at  TEXT   NOT NULL
+            )"#,
+            // A mirror admitted by a node that could not validate its proof is
+            // quarantined: kept on disk but hidden from serve/clone and listings
+            // until an operator releases it. Default false; only the mirror
+            // admission path sets it true.
+            "ALTER TABLE repos ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -831,13 +857,17 @@ impl Db {
         name: &str,
         disk_path: &str,
         machine_id: Option<&str>,
+        quarantined: bool,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
+        // `quarantined` is set only on first insert (the admission decision).
+        // A re-sync (ON CONFLICT) preserves the existing flag — admission runs
+        // once, and an operator's later release must not be silently reverted.
         sqlx::query(
             "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
-                                created_at, updated_at, disk_path, machine_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                                created_at, updated_at, disk_path, machine_id, quarantined)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
              ON CONFLICT (id) DO UPDATE SET updated_at = $8, disk_path = $9, machine_id = $10",
         )
         .bind(&id)
@@ -850,6 +880,7 @@ impl Db {
         .bind(&now)
         .bind(disk_path)
         .bind(machine_id)
+        .bind(quarantined)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -909,6 +940,7 @@ impl Db {
              FROM repos r
              LEFT JOIN (SELECT repo_id, COUNT(*) AS cnt FROM repo_stars GROUP BY repo_id) s
                ON s.repo_id = r.id
+             WHERE r.quarantined = FALSE
              ORDER BY r.updated_at DESC",
         )
         .fetch_all(&self.pool)
@@ -953,7 +985,9 @@ impl Db {
                  -- dedup groups on, so a full did:key: form matches a bare-owner
                  -- mirror row (and vice versa) exactly as crate::api::did_matches
                  -- does. Callers bind the already-normalized key ($1).
-                 WHERE ($1::text IS NULL OR (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END) = $1)
+                 -- Quarantined mirrors (admitted but unvalidated by the iCaptcha
+                 -- propagation gate) are withheld from every listing surface.
+                 WHERE quarantined = FALSE AND ($1::text IS NULL OR (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END) = $1)
                  ORDER BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name,
                      -- mirror rows carry a slash-form id (\"{owner_short}/{name}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
@@ -1138,6 +1172,81 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Persist the iCaptcha proof a repo was created with so it can travel with
+    /// the repo when it propagates (see `icaptcha::admit_mirror`). Idempotent:
+    /// re-recording the same repo's proof overwrites it.
+    pub async fn record_repo_proof(
+        &self,
+        repo_id: &str,
+        proof_token: &str,
+        sub_did: &str,
+        level: i32,
+        jti: &str,
+        exp: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO repo_icaptcha_proofs (repo_id, proof_token, sub_did, level, jti, exp, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (repo_id) DO UPDATE SET
+                 proof_token = $2, sub_did = $3, level = $4, jti = $5, exp = $6, created_at = $7",
+        )
+        .bind(repo_id)
+        .bind(proof_token)
+        .bind(sub_did)
+        .bind(level)
+        .bind(jti)
+        .bind(exp)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The raw proof token recorded for a repo, if any.
+    pub async fn get_repo_proof_token(&self, repo_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT proof_token FROM repo_icaptcha_proofs WHERE repo_id = $1")
+            .bind(repo_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("proof_token")))
+    }
+
+    /// Whether a repo row is quarantined (admitted as a mirror but withheld from
+    /// serve/clone and listings pending operator review).
+    pub async fn is_repo_quarantined(&self, repo_id: &str) -> Result<bool> {
+        let row = sqlx::query("SELECT quarantined FROM repos WHERE id = $1")
+            .bind(repo_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<bool, _>("quarantined"))
+            .unwrap_or(false))
+    }
+
+    /// Set or clear a repo's quarantine flag. Returns the number of rows touched
+    /// (0 if no such repo). Backs the (deferred) operator release surface; the
+    /// admission path writes the flag via `upsert_mirror_repo`. Allowed dead
+    /// outside tests until the operator endpoint lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn set_repo_quarantine(&self, repo_id: &str, quarantined: bool) -> Result<u64> {
+        let result = sqlx::query("UPDATE repos SET quarantined = $1 WHERE id = $2")
+            .bind(quarantined)
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Repo ids currently quarantined, for operator review. Allowed dead outside
+    /// tests until the operator endpoint lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn list_quarantined_repo_ids(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT id FROM repos WHERE quarantined = TRUE ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get::<String, _>("id")).collect())
     }
 
     pub async fn get_trust_score(&self, agent_did: &str) -> Result<f64> {
@@ -3251,7 +3360,7 @@ mod dedup_db_tests {
             "2026-01-15T00:00:00Z",
         );
         db.create_repo(&canonical).await.unwrap();
-        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/mirror", None)
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/mirror", None, false)
             .await
             .unwrap();
 
@@ -3440,7 +3549,7 @@ mod dedup_db_tests {
         ))
         .await
         .unwrap();
-        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/m", None)
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/m", None, false)
             .await
             .unwrap();
         db.create_repo(&rec(
@@ -3533,7 +3642,7 @@ mod dedup_db_tests {
     #[sqlx::test]
     async fn deduped_mirror_only_group_survives(pool: PgPool) {
         let db = db(pool).await;
-        db.upsert_mirror_repo("z6Lonely", "orphan", "/srv/m", None)
+        db.upsert_mirror_repo("z6Lonely", "orphan", "/srv/m", None, false)
             .await
             .unwrap();
 
@@ -3572,7 +3681,7 @@ mod dedup_db_tests {
         ))
         .await
         .unwrap();
-        db.upsert_mirror_repo("z6Pair", "shared", "/srv/m", None)
+        db.upsert_mirror_repo("z6Pair", "shared", "/srv/m", None, false)
             .await
             .unwrap();
         db.create_repo(&rec(
@@ -3649,5 +3758,154 @@ mod icaptcha_ledger_tests {
             !db.consume_proof_jti("fresh", 500).await.unwrap(),
             "an unexpired spent proof survives the sweep and still blocks replays"
         );
+    }
+
+    /// A repo's creation proof round-trips through the side table so it can be
+    /// served to mirroring peers; absent for an unknown repo.
+    #[sqlx::test]
+    async fn repo_proof_roundtrips(pool: PgPool) {
+        let db = db(pool).await;
+        assert_eq!(db.get_repo_proof_token("nope").await.unwrap(), None);
+
+        db.record_repo_proof("repo-1", "tok.sig", "did:key:zX", 3, "jti-1", 123)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_repo_proof_token("repo-1").await.unwrap().as_deref(),
+            Some("tok.sig")
+        );
+
+        // Idempotent: re-recording overwrites in place.
+        db.record_repo_proof("repo-1", "tok2.sig", "did:key:zX", 4, "jti-2", 456)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_repo_proof_token("repo-1").await.unwrap().as_deref(),
+            Some("tok2.sig")
+        );
+    }
+
+    /// Mirror admission spends a jti against a forward retention window, never the
+    /// proof's own (already-past) exp. A jti stored that way must survive a sweep
+    /// keyed at the proof's original exp, so the token cannot admit a second mirror
+    /// after cleanup. Pins the CR3/5 fix (`MIRROR_REPLAY_RETENTION_SECS`).
+    #[sqlx::test]
+    async fn mirror_jti_retention_survives_sweep_at_proof_exp(pool: PgPool) {
+        let db = db(pool).await;
+        let proof_exp = 1_000i64; // the proof is already expired on the mirror path
+        let retain_until = 9_000_000_000i64; // forward retention window
+
+        assert!(db
+            .consume_proof_jti("mirror-jti", retain_until)
+            .await
+            .unwrap());
+
+        // A sweep at (or just past) the proof's original exp must not free the row.
+        let removed = db.sweep_expired_proofs(proof_exp + 1).await.unwrap();
+        assert_eq!(
+            removed, 0,
+            "mirror replay record must outlive the proof's exp"
+        );
+
+        assert!(
+            !db.consume_proof_jti("mirror-jti", retain_until)
+                .await
+                .unwrap(),
+            "the token must stay spent so it can't admit a second mirror"
+        );
+    }
+}
+
+/// Exercises the iCaptcha propagation quarantine: the `quarantined` flag on
+/// repos and its interaction with `upsert_mirror_repo` and the listing surfaces.
+#[cfg(test)]
+mod icaptcha_quarantine_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// A repo defaults to not-quarantined; the flag can be set and cleared, and
+    /// reads of an unknown repo are false (not an error).
+    #[sqlx::test]
+    async fn quarantine_flag_set_and_release(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6owner", "good", "/srv/good", None, false)
+            .await
+            .unwrap();
+
+        assert!(!db.is_repo_quarantined("z6owner/good").await.unwrap());
+        assert!(!db.is_repo_quarantined("does-not-exist").await.unwrap());
+
+        assert_eq!(
+            db.set_repo_quarantine("z6owner/good", true).await.unwrap(),
+            1
+        );
+        assert!(db.is_repo_quarantined("z6owner/good").await.unwrap());
+        assert_eq!(
+            db.list_quarantined_repo_ids().await.unwrap(),
+            vec!["z6owner/good".to_string()]
+        );
+
+        // Release.
+        assert_eq!(
+            db.set_repo_quarantine("z6owner/good", false).await.unwrap(),
+            1
+        );
+        assert!(!db.is_repo_quarantined("z6owner/good").await.unwrap());
+        assert!(db.list_quarantined_repo_ids().await.unwrap().is_empty());
+    }
+
+    /// A mirror admitted quarantined stays quarantined across a re-sync — the
+    /// admission decision is made once and an operator's later release (or the
+    /// initial quarantine) must not be reverted by ON CONFLICT.
+    #[sqlx::test]
+    async fn quarantine_preserved_on_resync(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6owner", "garbage", "/srv/g", None, true)
+            .await
+            .unwrap();
+        assert!(db.is_repo_quarantined("z6owner/garbage").await.unwrap());
+
+        // A later re-sync passes quarantined=false but must not clear the flag.
+        db.upsert_mirror_repo("z6owner", "garbage", "/srv/g", None, false)
+            .await
+            .unwrap();
+        assert!(
+            db.is_repo_quarantined("z6owner/garbage").await.unwrap(),
+            "re-sync must preserve the prior quarantine decision"
+        );
+    }
+
+    /// Quarantined repos are withheld from the deduped listing surfaces.
+    #[sqlx::test]
+    async fn listings_exclude_quarantined(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6good", "ok", "/srv/ok", None, false)
+            .await
+            .unwrap();
+        db.upsert_mirror_repo("z6bad", "spam", "/srv/spam", None, true)
+            .await
+            .unwrap();
+
+        let names: Vec<String> = db
+            .list_all_repos_deduped()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert!(names.contains(&"ok".to_string()));
+        assert!(
+            !names.contains(&"spam".to_string()),
+            "quarantined mirror must not appear in listings"
+        );
+
+        let with_stars = db.list_all_repos_deduped_with_stars(None).await.unwrap();
+        assert!(with_stars.iter().all(|(r, _)| r.name != "spam"));
     }
 }
