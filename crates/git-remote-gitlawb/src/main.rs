@@ -179,11 +179,11 @@ fn run_helper(repo_base: &str, keypair: Option<&Keypair>) -> Result<()> {
 
 // ── HTTP proxy for git smart protocol ────────────────────────────────────────
 
-fn handle_connect(
+fn handle_connect<R: Read>(
     repo_base: &str,
     service: &str,
     keypair: Option<&Keypair>,
-    stdin: &mut io::BufReader<io::Stdin>,
+    stdin: &mut R,
 ) -> Result<()> {
     match service {
         "git-upload-pack" | "git-receive-pack" => {}
@@ -208,9 +208,17 @@ fn handle_connect(
         .with_context(|| format!("GET {refs_url}"))?;
 
     if !refs_resp.status().is_success() {
+        let status = refs_resp.status();
+        let body = refs_resp.text().unwrap_or_default();
         bail!(
-            "GET /info/refs returned {} — is the repo registered on this node?",
-            refs_resp.status()
+            "{}",
+            http_error_message(
+                "GET",
+                "/info/refs",
+                status,
+                &body,
+                Some("— is the repo registered on this node?")
+            )
         );
     }
 
@@ -298,7 +306,10 @@ fn handle_connect(
         .with_context(|| format!("POST {post_url}"))?;
 
     if !pack_resp.status().is_success() {
-        bail!("POST /{} returned {}", service, pack_resp.status());
+        let status = pack_resp.status();
+        let body = pack_resp.text().unwrap_or_default();
+        let path = format!("/{service}");
+        bail!("{}", http_error_message("POST", &path, status, &body, None));
     }
 
     let pack_bytes = pack_resp.bytes().context("reading pack response")?;
@@ -347,7 +358,7 @@ fn parse_gitlawb_url(url: &str) -> Result<(String, String, String)> {
 ///
 /// We also handle the flush-only case (`"0000"`) that git sends when it already
 /// has everything it needs (up-to-date clone).
-fn read_upload_pack_request(stdin: &mut io::BufReader<io::Stdin>) -> Result<Vec<u8>> {
+fn read_upload_pack_request<R: Read>(stdin: &mut R) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
 
     loop {
@@ -433,6 +444,27 @@ fn url_path(url: &str) -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
+fn http_error_message(
+    method: &str,
+    path: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    empty_body_hint: Option<&str>,
+) -> String {
+    let mut message = format!("{method} {path} returned {status}");
+    let body = body.trim();
+
+    if !body.is_empty() {
+        message.push_str(": ");
+        message.push_str(body);
+    } else if let Some(hint) = empty_body_hint {
+        message.push(' ');
+        message.push_str(hint);
+    }
+
+    message
+}
+
 // ── Keypair loading ───────────────────────────────────────────────────────────
 
 fn load_keypair() -> Option<Keypair> {
@@ -476,6 +508,81 @@ fn resolve_key_path() -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
+    use std::thread::JoinHandle;
+
+    struct TestResponse {
+        request_line: &'static str,
+        status: &'static str,
+        body: &'static str,
+    }
+
+    fn serve_http(responses: Vec<TestResponse>) -> (String, JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                assert!(
+                    request.starts_with(response.request_line),
+                    "unexpected request:\n{request}"
+                );
+
+                let response_text = format!(
+                    "HTTP/1.1 {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response.status,
+                    response.body.len(),
+                    response.body
+                );
+                stream.write_all(response_text.as_bytes()).unwrap();
+                requests.push(request);
+            }
+
+            requests
+        });
+
+        (base_url, handle)
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        let mut header_len = None;
+
+        loop {
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+
+            if header_len.is_none() {
+                header_len = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+            }
+
+            if let Some(header_len) = header_len {
+                let header = String::from_utf8_lossy(&buf[..header_len]);
+                let content_len = header
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+
+                if buf.len() >= header_len + content_len {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8_lossy(&buf).into_owned()
+    }
 
     #[test]
     fn parse_standard_url() {
@@ -522,6 +629,52 @@ mod tests {
             url_path("http://127.0.0.1:7545/z6Mk/myrepo/git-receive-pack"),
             "/z6Mk/myrepo/git-receive-pack"
         );
+    }
+
+    #[test]
+    fn connect_get_error_includes_response_body() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /z6Mk/myrepo/info/refs?service=git-upload-pack HTTP/1.1",
+            status: "404 Not Found",
+            body: r#"{"message":"repository is not registered on this node"}"#,
+        }]);
+
+        let repo_base = format!("{base_url}/z6Mk/myrepo");
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = handle_connect(&repo_base, "git-upload-pack", None, &mut stdin).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("GET /info/refs returned 404 Not Found"));
+        assert!(message.contains("repository is not registered on this node"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn connect_post_error_includes_response_body() {
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /z6Mk/myrepo/info/refs?service=git-receive-pack HTTP/1.1",
+                status: "200 OK",
+                body: "",
+            },
+            TestResponse {
+                request_line: "POST /z6Mk/myrepo/git-receive-pack HTTP/1.1",
+                status: "403 Forbidden",
+                body: r#"{"error":"forbidden","message":"push rejected: only the repo owner may push"}"#,
+            },
+        ]);
+
+        let repo_base = format!("{base_url}/z6Mk/myrepo");
+        let mut stdin = std::io::Cursor::new(b"0000".to_vec());
+        let err = handle_connect(&repo_base, "git-receive-pack", None, &mut stdin).unwrap_err();
+        let message = err.to_string();
+
+        assert!(message.contains("POST /git-receive-pack returned 403 Forbidden"));
+        assert!(message.contains("push rejected: only the repo owner may push"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("\r\n\r\n0000"));
     }
 
     fn args(items: &[&str]) -> Vec<String> {
