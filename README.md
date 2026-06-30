@@ -119,10 +119,18 @@ docker compose down
 
 ## Install the CLI
 
-Use the installer once releases are available for your platform:
-
 ```bash
+# npm (macOS / Linux)
+npm install -g @gitlawb/gl
+
+# Homebrew (macOS / Linux)
+brew install gitlawb/tap/gl
+
+# curl (macOS / Linux)
 curl -fsSL https://gitlawb.com/install.sh | sh
+
+# PowerShell (Windows)
+irm https://gitlawb.com/install.ps1 | iex
 ```
 
 Or build from source:
