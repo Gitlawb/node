@@ -5,16 +5,20 @@ The [gitlawb](https://gitlawb.com) CLI — decentralized git for AI agents and d
 ## Install
 
 ```bash
+# macOS / Linux / WSL
 npm install -g @gitlawb/gl
 ```
 
 Also works with yarn, pnpm, and bun:
 
 ```bash
+# macOS / Linux / WSL
 yarn global add @gitlawb/gl
 pnpm add -g @gitlawb/gl
 bun add -g @gitlawb/gl
 ```
+
+Native Windows is not supported via npm — use the PowerShell installer below.
 
 ### Other install methods
 

@@ -433,11 +433,12 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet; then
+          # Stage first so a brand-new (untracked) formula is detected by the no-op check.
+          git add Formula/gl.rb
+          if git diff --cached --quiet; then
             echo "Formula already up to date."
             exit 0
           fi
-          git add Formula/gl.rb
           git commit -m "gl ${VERSION}"
           # Credentials are not persisted in .git/config; supply the token only for the push.
           git push "https://x-access-token:${HOMEBREW_TAP_PAT}@github.com/Gitlawb/homebrew-tap.git" HEAD:main
@@ -479,6 +480,28 @@ jobs:
           path: web
           persist-credentials: false
 
+      # web-sync publishes install.ps1 + version.json, so the Windows ZIP must exist.
+      # Windows is best-effort for npm/Homebrew (continue-on-error), so verify the
+      # asset is present before advertising a release the site can't actually serve.
+      - name: Verify website release assets
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' > /tmp/release-assets
+          for asset in \
+            "gitlawb-node-${VERSION}-x86_64-pc-windows-msvc.zip" \
+            "gitlawb-node-${VERSION}-x86_64-pc-windows-msvc.zip.sha256"; do
+            grep -Fxq "$asset" /tmp/release-assets || {
+              echo "::error::release asset missing: $asset (Windows build likely failed); not syncing web"
+              exit 1
+            }
+          done
+
       - name: Sync and open PR
         if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
@@ -499,7 +522,9 @@ jobs:
           fi
 
           cd web
-          if git diff --quiet && git diff --cached --quiet; then
+          # Stage first so brand-new (untracked) files are caught by the no-op check.
+          git add -A
+          if git diff --cached --quiet; then
             echo "web already up to date."
             exit 0
           fi
@@ -507,11 +532,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch"
-          git add -A
           git commit -m "chore: sync gitlawb ${TAG} (install scripts + version)"
           # Credentials are not persisted in .git/config; supply the token only for the push.
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/Gitlawb/web.git" "HEAD:$branch"
           gh pr create --repo Gitlawb/web --head "$branch" \
             --title "Sync gitlawb ${TAG}" \
             --body "Automated sync from Gitlawb/node ${TAG}: install.sh, install.ps1, public/version.json, and one-time drift fixes (removed orphaned public/bin, fixed skill.md releases link). Review and merge to deploy via Vercel." \
-            || echo "PR for $branch may already exist; branch was updated."
+            || {
+              # Only swallow the "PR already exists" case; surface auth/API failures.
+              if [ "$(gh pr list --repo Gitlawb/web --head "$branch" --state open --json number --jq 'length')" != "0" ]; then
+                echo "PR for $branch already exists; branch was updated."
+              else
+                exit 1
+              fi
+            }
