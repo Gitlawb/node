@@ -1,0 +1,15 @@
+node_modules/
+
+# Platform binaries — laid in by the release workflow at publish time, not committed.
+packages/gl-darwin-arm64/gl
+packages/gl-darwin-arm64/git-remote-gitlawb
+packages/gl-darwin-x64/gl
+packages/gl-darwin-x64/git-remote-gitlawb
+packages/gl-linux-arm64/gl
+packages/gl-linux-arm64/git-remote-gitlawb
+packages/gl-linux-x64/gl
+packages/gl-linux-x64/git-remote-gitlawb
+
+# Wrapper bin placeholders are overwritten by postinstall.
+packages/gl/bin/gl
+packages/gl/bin/git-remote-gitlawb

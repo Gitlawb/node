@@ -1,0 +1,21 @@
+{
+  "name": "@gitlawb/gl-linux-arm64",
+  "version": "0.3.9",
+  "description": "Gitlawb CLI binary for Linux arm64",
+  "license": "MIT",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Gitlawb/node",
+    "directory": "npm/packages/gl-linux-arm64"
+  },
+  "files": [
+    "gl",
+    "git-remote-gitlawb"
+  ]
+}

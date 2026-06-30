@@ -1,0 +1,21 @@
+{
+  "name": "@gitlawb/gl-darwin-arm64",
+  "version": "0.3.9",
+  "description": "Gitlawb CLI binary for macOS Apple Silicon (arm64)",
+  "license": "MIT",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Gitlawb/node",
+    "directory": "npm/packages/gl-darwin-arm64"
+  },
+  "files": [
+    "gl",
+    "git-remote-gitlawb"
+  ]
+}
