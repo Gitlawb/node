@@ -9,7 +9,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.9"
+# Per-crate versions live in each crate's [package] so release-please can manage
+# them (it cannot rewrite an inherited `version.workspace = true`). They are kept
+# in lockstep by release-please's Rust workspace strategy.
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
