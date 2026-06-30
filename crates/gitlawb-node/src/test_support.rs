@@ -1756,4 +1756,90 @@ mod tests {
         );
         assert!(body.contains("public bytes"), "owner gets the content");
     }
+
+    /// Fail-closed walk-error arm: if `withheld_blob_oids` errors (here, a ref
+    /// pointing at a non-tree-ish blob, which `git ls-tree -r` cannot traverse —
+    /// the same induction as `visibility_pack::fails_closed_when_a_ref_cannot_be_traversed`),
+    /// the handler skips the whole repo rather than serving. Asserts no leak of the
+    /// withheld blob AND that even the *public* blob in that repo is withheld — the
+    /// latter distinguishes fail-closed-skip from normal per-blob withholding and
+    /// would serve 200 if the error arm wrongly proceeded.
+    #[sqlx::test]
+    async fn ipfs_cid_walk_error_fails_closed(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["withhold"]);
+        let secret_cid = cid_for_oid(&fx.secret_oid);
+        let public_cid = cid_for_oid(&fx.public_oid);
+
+        // Force the withheld walk to fail closed: a ref pointing at a blob (not
+        // tree-ish) makes `git ls-tree -r` error, which `withheld_blob_oids`
+        // propagates as Err → the handler's `Ok(Err)` arm skips the repo.
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("withhold.git");
+        std::fs::write(
+            bare.join("refs/heads/blobref"),
+            format!("{}\n", fx.secret_oid),
+        )
+        .unwrap();
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "withhold"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "withhold")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("deny rule");
+
+        // Withheld secret CID under a walk error → 404, no leak.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&secret_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "walk error must not serve the withheld blob"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "walk-error 404 must not leak the secret"
+        );
+
+        // The PUBLIC blob in the same repo is also 404: the walk error fails closed
+        // by skipping the whole repo, not by serving. Without the fail-closed arm
+        // this would serve 200, so this assertion is the load-bearing discriminator.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&public_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "walk error fails closed: repo skipped, even the public blob is not served"
+        );
+    }
 }
