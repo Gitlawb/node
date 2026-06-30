@@ -216,7 +216,19 @@ pub async fn get_by_cid(
 /// Returns all CIDs that have been pinned to the local IPFS node from git
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
-pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
+///
+/// Authentication is required to prevent anonymous CID enumeration (#121).
+/// Any authenticated caller may list pins — the node-wide index is gated on
+/// the caller identity so it is not available anonymously.
+pub async fn list_pins(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
+) -> Result<Json<serde_json::Value>> {
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    if caller.is_none() {
+        return Err(AppError::Unauthorized("authentication required".into()));
+    }
+
     let pins = state
         .db
         .list_pinned_cids()
