@@ -2,11 +2,18 @@
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "package-name": "gitlawb-node",
       "bump-minor-pre-major": true,
       "include-v-in-tag": true,
-      "include-component-in-tag": false
+      "include-component-in-tag": false,
+      "extra-files": [
+        { "type": "generic", "path": "crates/gitlawb-core/Cargo.toml" },
+        { "type": "generic", "path": "crates/gitlawb-node/Cargo.toml" },
+        { "type": "generic", "path": "crates/gl/Cargo.toml" },
+        { "type": "generic", "path": "crates/git-remote-gitlawb/Cargo.toml" },
+        { "type": "generic", "path": "crates/gitlawb-attest/Cargo.toml" }
+      ]
     }
   }
 }
