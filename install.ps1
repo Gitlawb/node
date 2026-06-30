@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  gitlawb installer for Windows — downloads pre-built binaries from GitHub Releases.
+  gitlawb installer for Windows - downloads pre-built binaries from GitHub Releases.
 .EXAMPLE
   irm https://gitlawb.com/install.ps1 | iex
 .EXAMPLE
@@ -47,19 +47,16 @@ try {
   Write-Host "Downloading..."
   Invoke-WebRequest -Uri $url -OutFile $zipPath -Headers @{ "User-Agent" = "gitlawb-installer" }
 
-  # Verify checksum if available.
-  try {
-    $sumPath = "$zipPath.sha256"
-    Invoke-WebRequest -Uri "$url.sha256" -OutFile $sumPath -Headers @{ "User-Agent" = "gitlawb-installer" }
-    $expected = ((Get-Content $sumPath -Raw).Trim() -split '\s+')[0].ToLower()
-    $actual = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
-    if ($expected -ne $actual) {
-      throw "checksum mismatch! expected $expected got $actual"
-    }
-    Write-Host "  checksum OK"
-  } catch [System.Net.WebException] {
-    Write-Host "  (no checksum published, skipping verification)"
+  # Verify checksum. Every published asset has a matching .sha256, so fail closed
+  # if it cannot be fetched rather than installing an unverified binary.
+  $sumPath = "$zipPath.sha256"
+  Invoke-WebRequest -Uri "$url.sha256" -OutFile $sumPath -Headers @{ "User-Agent" = "gitlawb-installer" }
+  $expected = ((Get-Content $sumPath -Raw).Trim() -split '\s+')[0].ToLower()
+  $actual = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+  if ($expected -ne $actual) {
+    throw "checksum mismatch! expected $expected got $actual"
   }
+  Write-Host "  checksum OK"
 
   Write-Host "Extracting..."
   $extract = Join-Path $tmp "extract"

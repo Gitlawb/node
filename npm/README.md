@@ -9,7 +9,7 @@ packages as `optionalDependencies`, each gated by `os`/`cpu`. npm installs only
 the one matching the host, and the wrapper's `postinstall` (`install.js`) copies
 the binary out of it into `bin/`. No binaries are downloaded at install time.
 
-```
+```text
 packages/
   gl/                  @gitlawb/gl            wrapper (postinstall, bin shims)
   gl-darwin-arm64/     @gitlawb/gl-darwin-arm64   aarch64-apple-darwin

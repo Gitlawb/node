@@ -53,14 +53,14 @@ function install() {
   const packageDir = findPlatformPackage(packageName);
 
   if (!packageDir) {
-    // Platform package not installed — this can happen if optional deps are skipped.
-    // Fall back to curl install suggestion.
-    console.warn(
+    // On a supported platform the matching optional dependency must be present;
+    // fail loudly rather than leave @gitlawb/gl installed without its binaries.
+    console.error(
       `@gitlawb/gl: Platform package ${packageName} not found.\n` +
         `This can happen if optional dependencies were skipped.\n` +
         `Install manually: curl -sSf https://gitlawb.com/install.sh | sh`
     );
-    process.exit(0);
+    process.exit(1);
   }
 
   const binDir = join(__dirname, "bin");
@@ -71,8 +71,7 @@ function install() {
     const dest = join(binDir, binary);
 
     if (!existsSync(src)) {
-      console.warn(`@gitlawb/gl: Binary ${binary} not found in ${packageName}, skipping`);
-      continue;
+      throw new Error(`Binary ${binary} not found in ${packageName}`);
     }
 
     copyFileSync(src, dest);

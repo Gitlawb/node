@@ -54,7 +54,7 @@ git push gitlawb main
 | Linux | arm64 | `@gitlawb/gl-linux-arm64` |
 | Linux | x64 | `@gitlawb/gl-linux-x64` |
 
-Windows is supported via the curl/PowerShell installer or WSL.
+Windows is supported via the PowerShell installer or WSL.
 
 ## Links
 
