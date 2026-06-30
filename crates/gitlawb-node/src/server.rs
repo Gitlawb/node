@@ -187,9 +187,14 @@ pub fn build_router(state: AppState) -> Router {
     );
 
     // ── IPFS content-addressed retrieval and pin listing ──────────────────
+    // `/ipfs/{cid}` carries `optional_signature` so `get_by_cid` sees the caller
+    // identity and can apply per-repo visibility (#110); anonymous callers stay
+    // anonymous and still read genuinely public content. `/api/v1/ipfs/pins`
+    // stays unsigned — gating the pin index is tracked separately (#121).
     let ipfs_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
-        .route("/api/v1/ipfs/pins", get(ipfs::list_pins));
+        .layer(middleware::from_fn(auth::optional_signature))
+        .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
     let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));

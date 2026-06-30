@@ -1369,4 +1369,339 @@ mod tests {
             "empty DB yields repos == 0 without error"
         );
     }
+
+    // ---- #110: GET /ipfs/{cid} per-caller visibility gate ----
+
+    /// Seed a SHA-256 source repo (public/a.txt + secret/b.txt), bare-clone it
+    /// into each `/tmp/<slug>/<name>.git` path, and return guards + oids.
+    /// SHA-256 object format is required: `get_by_cid` resolves a CID whose
+    /// multihash digest IS the git object id, which only matches in sha256 repos.
+    struct CidFixture {
+        _guards: Vec<std::path::PathBuf>,
+        secret_oid: String,
+        public_oid: String,
+        secret_tree_oid: String,
+    }
+    impl Drop for CidFixture {
+        fn drop(&mut self) {
+            for p in &self._guards {
+                let _ = std::fs::remove_dir_all(p);
+            }
+        }
+    }
+    fn seed_cid_repos(slug: &str, tag: &str, bare_names: &[&str]) -> CidFixture {
+        use std::process::Command;
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let src = std::env::temp_dir().join(format!("gl-cid-src-{tag}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(src.join("public")).unwrap();
+        std::fs::create_dir_all(src.join("secret")).unwrap();
+        std::fs::write(src.join("public/a.txt"), b"public bytes\n").unwrap();
+        std::fs::write(src.join("secret/b.txt"), b"TOP SECRET\n").unwrap();
+        run(&["init", "-q", "--object-format=sha256"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        run(&["add", "."], &src);
+        run(&["commit", "-qm", "seed"], &src);
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&src)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_oid = oid("HEAD:secret/b.txt");
+        let public_oid = oid("HEAD:public/a.txt");
+        let secret_tree_oid = oid("HEAD:secret");
+        let mut guards = vec![src.clone()];
+        for name in bare_names {
+            let bare = std::path::PathBuf::from("/tmp")
+                .join(slug)
+                .join(format!("{name}.git"));
+            let _ = std::fs::remove_dir_all(&bare);
+            std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+            run(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    src.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                &src,
+            );
+        }
+        // One guard for the whole /tmp/<slug> tree covers every bare clone.
+        guards.push(std::path::PathBuf::from("/tmp").join(slug));
+        CidFixture {
+            _guards: guards,
+            secret_oid,
+            public_oid,
+            secret_tree_oid,
+        }
+    }
+
+    /// CID whose sha2-256 multihash digest equals the given 64-hex git oid, so
+    /// `get_by_cid` decodes it back to that oid and `git cat-file`s it.
+    fn cid_for_oid(oid_hex: &str) -> String {
+        use gitlawb_core::cid::Cid;
+        let bytes = hex::decode(oid_hex).expect("hex oid");
+        let arr: [u8; 32] = bytes.as_slice().try_into().expect("32-byte sha256 oid");
+        Cid::from_sha256_bytes(&arr).to_string()
+    }
+
+    fn cid_router(state: &AppState) -> Router {
+        Router::new()
+            .route(
+                "/ipfs/{cid}",
+                axum::routing::get(crate::api::ipfs::get_by_cid),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state.clone())
+    }
+    async fn cid_parts(resp: axum::response::Response) -> (StatusCode, String) {
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (st, String::from_utf8_lossy(&b).to_string())
+    }
+    fn cid_anon(cid: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/ipfs/{cid}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+    fn cid_signed(kp: &gitlawb_core::identity::Keypair, cid: &str) -> Request<Body> {
+        let path = format!("/ipfs/{cid}");
+        let s = gitlawb_core::http_sig::sign_request(kp, "GET", &path, b"");
+        Request::builder()
+            .method(Method::GET)
+            .uri(&path)
+            .header("content-digest", s.content_digest)
+            .header("signature-input", s.signature_input)
+            .header("signature", s.signature)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// #110: `GET /ipfs/{cid}` must gate a withheld blob by per-caller visibility.
+    /// RED before U2 (the current handler serves the secret to anon).
+    #[sqlx::test]
+    async fn ipfs_cid_gate_withholds_blob_from_unauthorized(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let reader = Keypair::generate();
+        let reader_did = reader.did().to_string();
+        let stranger = Keypair::generate();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["withhold"]);
+        let secret_cid = cid_for_oid(&fx.secret_oid);
+        let tree_cid = cid_for_oid(&fx.secret_tree_oid);
+        let public_cid = cid_for_oid(&fx.public_oid);
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "withhold"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "withhold")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                VisibilityMode::B,
+                std::slice::from_ref(&reader_did),
+                &owner_did,
+            )
+            .await
+            .expect("deny rule");
+
+        // anon → withheld blob: must 404, must not leak content. (RED on current handler.)
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&secret_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "anon must not read the withheld blob"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "404 body must not leak the secret"
+        );
+
+        // signed non-reader → 404.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed(&stranger, &secret_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "non-reader must not read the withheld blob"
+        );
+        assert!(!body.contains("TOP SECRET"));
+
+        // owner (signed) → 200 + secret bytes.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed(&owner, &secret_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "owner reads the withheld blob");
+        assert!(body.contains("TOP SECRET"), "owner gets the content");
+
+        // listed reader (signed) → 200.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed(&reader, &secret_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "listed reader reads the blob");
+        assert!(body.contains("TOP SECRET"));
+
+        // KTD3: anon tree CID under /secret → 200 (trees/commits are not withheld).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&tree_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "tree object is served to anon (KTD3)");
+
+        // R3: public blob anon → 200 (non-withheld content not affected).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&public_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "public blob stays served");
+
+        // R5: a genuine unknown CID also 404, uniform with the withheld 404.
+        let absent_cid = cid_for_oid(&"ab".repeat(32));
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&absent_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "absent CID 404 (uniform with withheld)"
+        );
+
+        // malformed CID → 400 (unchanged).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon("not-a-cid"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "malformed CID still 400");
+    }
+
+    /// R4: the same object withheld in one repo but public in another is still
+    /// served from the public copy; the withholding repo is iterated first.
+    #[sqlx::test]
+    async fn ipfs_cid_served_from_public_copy_when_withheld_elsewhere(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use chrono::Utc;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["withhold", "pubcopy"]);
+        let secret_cid = cid_for_oid(&fx.secret_oid);
+
+        // Withholding repo, iterated FIRST (later updated_at; list_all_repos is DESC).
+        let mut withhold = seed_repo(&owner_did, "withhold");
+        withhold.updated_at = Utc::now();
+        state
+            .db
+            .create_repo(&withhold)
+            .await
+            .expect("withhold repo");
+        state
+            .db
+            .set_visibility_rule(
+                &withhold.id,
+                "/secret/**",
+                VisibilityMode::B,
+                &[],
+                &owner_did,
+            )
+            .await
+            .expect("deny rule");
+
+        // Public copy, no rules, iterated AFTER.
+        let mut pubcopy = seed_repo(&owner_did, "pubcopy");
+        pubcopy.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        state.db.create_repo(&pubcopy).await.expect("pubcopy repo");
+
+        // anon: denied at the withholding repo (continue), served from the public copy.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&secret_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "served from the public copy despite the other deny"
+        );
+        assert!(
+            body.contains("TOP SECRET"),
+            "the public copy serves the content"
+        );
+    }
 }

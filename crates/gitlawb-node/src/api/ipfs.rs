@@ -14,23 +14,38 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use cid::CidGeneric;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 
+use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::git::store;
+use crate::git::visibility_pack::{has_path_scoped_rule, withheld_blob_oids};
 use crate::state::AppState;
+use crate::visibility::{visibility_check, Decision};
 
 /// GET /ipfs/{cid}
 ///
 /// Search all repos on the node for a git object whose SHA-256 hash matches
-/// the given CIDv1. Returns the raw object content bytes with appropriate
-/// headers if found, or 404 if not found.
+/// the given CIDv1, returning its raw content if the caller may read it.
+///
+/// Visibility (#110): the object is served only from a repo row the caller
+/// passes. For each iterated row we gate against that row's OWN rules
+/// (`visibility_check` at `"/"`), never re-resolving via `authorize_repo_read`
+/// — `get_repo`'s fuzzy match could otherwise authorize a different physical
+/// row than the one read (KTD2a). When the row carries path-scoped rules, a
+/// blob withheld from the caller (`withheld_blob_oids`) is skipped. Denial and
+/// genuine not-found both fall through to an opaque 404.
+///
+/// Scope: this closes the direct unauthenticated scan. A stale-public mirror
+/// row still serves withheld content (tracked separately, #124).
 pub async fn get_by_cid(
     Path(cid_str): Path<String>,
     State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     // 1. Decode the CID and extract the SHA-256 digest
     let cid = CidGeneric::<64>::from_str(&cid_str)
@@ -46,6 +61,8 @@ pub async fn get_by_cid(
     }
 
     let sha256_hex = hex::encode(mh.digest());
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let caller_owned = caller.map(|c| c.to_string());
 
     // 2. Search all repos for an object with this SHA-256
     let repos = state
@@ -54,11 +71,64 @@ pub async fn get_by_cid(
         .await
         .map_err(AppError::Internal)?;
 
+    // Request-scoped memo of the per-repo withheld set (KTD1). The caller is
+    // constant for one request, so `repo.id` alone is a safe, sufficient key —
+    // never a coarse caller "class", which `visibility_check`'s exact full-DID
+    // reader match would make unsafe.
+    let mut withheld_memo: HashMap<String, HashSet<String>> = HashMap::new();
+
     for repo in &repos {
+        // Repo-level read gate against THIS row's own rules (KTD2a).
+        let rules = state
+            .db
+            .list_visibility_rules(&repo.id)
+            .await
+            .map_err(AppError::Internal)?;
+        if visibility_check(&rules, repo.is_public, &repo.owner_did, caller, "/") == Decision::Deny
+        {
+            continue;
+        }
+
         let repo_path = match state.repo_store.acquire(&repo.owner_did, &repo.name).await {
             Ok(p) => p,
             Err(_) => continue,
         };
+
+        // Per-blob withholding only applies when a path-scoped rule exists (KTD4).
+        if has_path_scoped_rule(&rules) {
+            if !withheld_memo.contains_key(&repo.id) {
+                let rp = repo_path.clone();
+                let r = rules.clone();
+                let is_public = repo.is_public;
+                let owner = repo.owner_did.clone();
+                let caller_for_walk = caller_owned.clone();
+                // Full-history walk shells out to git — keep it off the async runtime.
+                let computed = tokio::task::spawn_blocking(move || {
+                    withheld_blob_oids(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
+                })
+                .await
+                .map_err(|e| {
+                    AppError::Internal(anyhow::anyhow!("withheld walk task panicked: {e}"))
+                })?;
+                match computed {
+                    Ok(set) => {
+                        withheld_memo.insert(repo.id.clone(), set);
+                    }
+                    // Fail closed: a walk error means we cannot prove the caller may
+                    // read this object here, so skip the repo rather than serve.
+                    Err(e) => {
+                        tracing::warn!(repo = %repo.name, err = %e, "withheld walk failed; skipping repo");
+                        continue;
+                    }
+                }
+            }
+            if withheld_memo
+                .get(&repo.id)
+                .is_some_and(|set| set.contains(&sha256_hex))
+            {
+                continue;
+            }
+        }
 
         match store::read_object(&repo_path, &sha256_hex) {
             Ok(Some((_obj_type, content))) => {

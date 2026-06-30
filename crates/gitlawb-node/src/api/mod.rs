@@ -166,6 +166,7 @@ mod authz_guard {
         let profiles = include_str!("profiles.rs");
         let repos = include_str!("repos.rs");
         let register = include_str!("register.rs");
+        let ipfs = include_str!("ipfs.rs");
 
         // (source, handler, expected gate marker)
         let rows: &[(&str, &str, &str)] = &[
@@ -186,6 +187,9 @@ mod authz_guard {
             (issues, "create_issue", "authorize_repo_read("),
             (bounties, "create_bounty", "authorize_repo_read("),
             (repos, "fork_repo", "authorize_repo_read("),
+            // get_by_cid gates each iterated repo row directly via visibility_check
+            // (KTD2a: it must NOT route through authorize_repo_read's fuzzy re-resolve).
+            (ipfs, "get_by_cid", "visibility_check("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),
