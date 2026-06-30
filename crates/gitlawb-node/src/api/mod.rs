@@ -396,9 +396,6 @@ mod authz_guard {
         // Repo-scoped reads known to be ungated today, each tracked by an issue.
         // Remove an entry the moment its gate lands (the staleness assert enforces it).
         let known_ungated: &[(&str, &str)] = &[
-            // info/refs gates only git-upload-pack today; git-receive-pack
-            // advertisement is ungated until #119 makes the gate unconditional.
-            ("git_info_refs", "#119"),
             ("list_certs", "#120"),
             ("get_cert", "#120"),
             ("list_issues", "#120"),
