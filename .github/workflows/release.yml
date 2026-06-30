@@ -323,6 +323,8 @@ jobs:
     needs: [release-please, release-binaries]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # GITHUB_TOKEN downloads release assets; the tap push uses HOMEBREW_TAP_PAT
     steps:
       - name: Guard on secret
         id: guard
@@ -425,6 +427,8 @@ jobs:
     needs: [release-please]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # GITHUB_TOKEN checks out node; the web PR uses WEB_SYNC_PAT
     steps:
       - name: Guard on secret
         id: guard
