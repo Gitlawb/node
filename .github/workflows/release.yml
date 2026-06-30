@@ -145,8 +145,22 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # The gitlawb-node daemon is a Linux/macOS service; on Windows we ship only
+      # the two CLI binaries. A Windows-only failure must not block the release.
+      - name: Determine binaries
+        shell: bash
+        run: |
+          BINS="gl git-remote-gitlawb gitlawb-node"
+          case "${{ matrix.target }}" in *windows*) BINS="gl git-remote-gitlawb" ;; esac
+          echo "BINS=$BINS" >> "$GITHUB_ENV"
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p gl -p git-remote-gitlawb -p gitlawb-node
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=""
+          for b in $BINS; do args="$args -p $b"; done
+          cargo build --release --target ${{ matrix.target }} $args
 
       # Run each packaged binary's --version so a broken release artifact fails the
       # build instead of shipping. Skipped for cross-compiled targets that can't run
@@ -160,7 +174,7 @@ jobs:
           BIN_DIR="target/${{ matrix.target }}/release"
           EXE=""
           case "${{ matrix.target }}" in *windows*) EXE=".exe" ;; esac
-          for bin in gl git-remote-gitlawb gitlawb-node; do
+          for bin in $BINS; do
             echo "== $bin --version =="
             out="$("$BIN_DIR/$bin$EXE" --version)"
             echo "$out"
@@ -196,7 +210,7 @@ jobs:
           }
 
           mkdir -p "dist/$NAME"
-          for bin in gl git-remote-gitlawb gitlawb-node; do
+          for bin in $BINS; do
             cp "$BIN_DIR/$bin$EXE" "dist/$NAME/"
           done
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/$NAME/"
