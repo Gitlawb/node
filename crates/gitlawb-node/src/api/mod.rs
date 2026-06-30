@@ -421,13 +421,8 @@ mod authz_guard {
             ("list_issues", "#120"),
             ("get_issue", "#120"),
             ("list_issue_comments", "#120"),
-            ("list_labels", "#120"),
             ("list_repo_bounties", "#120"),
             ("get_star_status", "#120"),
-            ("list_repo_events", "#94 (PR #113)"),
-            ("list_webhooks", "#94 (PR #113)"),
-            ("list_replicas", "PR #113"),
-            ("list_protected_branches", "PR #113"),
         ];
         let is_known = |n: &str| known_ungated.iter().any(|(k, _)| *k == n);
         // Any one of these = the handler binds the caller to an authz decision: the
