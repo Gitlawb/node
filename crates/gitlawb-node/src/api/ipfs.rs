@@ -122,12 +122,11 @@ pub async fn get_by_cid(
         // Check whether the object exists in this repo before any expensive
         // reachability walk. This prevents random-CID spray from triggering
         // full-history git walks on repos that don't carry the object.
-        let object = store::read_object(&repo_path, &sha256_hex);
-        let (obj_type, content) = match object {
+        let obj_type = match store::object_type(&repo_path, &sha256_hex) {
             Ok(Some(t)) => t,
             Ok(None) => continue,
             Err(e) => {
-                tracing::warn!(repo = %repo.name, err = %e, "error reading git object");
+                tracing::warn!(repo = %repo.name, err = %e, "error checking git object type");
                 continue;
             }
         };
@@ -177,6 +176,15 @@ pub async fn get_by_cid(
                 continue;
             }
         }
+
+        // Now that we've passed the gate, read the content.
+        let content = match store::read_object_content(&repo_path, &sha256_hex, &obj_type) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(repo = %repo.name, err = %e, "error reading git object content");
+                continue;
+            }
+        };
 
         // 3. Return the content with IPFS-style headers
         let mut headers = HeaderMap::new();
