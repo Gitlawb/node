@@ -928,6 +928,17 @@ mod tests {
         use gitlawb_core::identity::Keypair;
         use std::process::Command;
 
+        // repo_store::for_testing fixes the on-disk layout (/tmp/<slug>/<name>.git
+        // and /tmp/gl-seam-src-<short>), so tempfile::TempDir's random paths don't
+        // fit. Wrap each known path in a Drop guard so the dirs are removed even if
+        // an assertion below panics.
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         let kp = Keypair::generate();
         let owner_did = kp.did().to_string();
         let short = owner_did.split(':').next_back().unwrap().to_string();
@@ -953,6 +964,7 @@ mod tests {
         let src = std::env::temp_dir().join(format!("gl-seam-src-{short}"));
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(&src).unwrap();
+        let _src_guard = DirGuard(src.clone());
         run(&["init", "-q", "-b", "topsecret-branch"], &src);
         run(&["config", "user.email", "t@t"], &src);
         run(&["config", "user.name", "t"], &src);
@@ -985,7 +997,9 @@ mod tests {
             dir
         };
         let pub_dir = bare_for("served-pub");
+        let _pub_guard = DirGuard(pub_dir.clone());
         let priv_dir = bare_for("served-priv");
+        let _priv_guard = DirGuard(priv_dir.clone());
 
         state
             .db
@@ -1080,9 +1094,7 @@ mod tests {
             "the verified owner gets the real ref name"
         );
 
-        let _ = std::fs::remove_dir_all(&src);
-        let _ = std::fs::remove_dir_all(&pub_dir);
-        let _ = std::fs::remove_dir_all(&priv_dir);
+        // Cleanup runs via the DirGuard Drop impls above, on success or panic.
     }
 
     // ── #97: repo-listing surfaces are visibility-gated ──────────────────────
