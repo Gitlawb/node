@@ -345,12 +345,16 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         (short, repo)
     };
 
-    let r: Value = client
+    let resp = client
         .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}"))
-        .await?
-        .json()
         .await
-        .context("repo not found")?;
+        .context("failed to connect to node")?;
+    let status = resp.status();
+    let r: Value = resp.json().await.unwrap_or_default();
+    if !status.is_success() {
+        let msg = r["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("repo info failed ({status}): {msg}");
+    }
 
     let owner_did = r["owner_did"].as_str().unwrap_or(&owner);
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
@@ -1494,5 +1498,72 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cmd_info_404_surfaces_error_not_fake_repo() {
+        // A non-reader of a private repo gets a JSON 404 from the now-gated
+        // GET /api/v1/repos/{owner}/{name}. The command must surface that as an
+        // error, not parse the error body and print a fabricated repo summary
+        // (owner / "?" / public=true / main) before exiting 0.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _repo = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/myrepo$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repo not found"}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_info(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("repo info failed (404")
+                && err.to_string().contains("repo not found"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cmd_info_non_json_error_surfaces_status() {
+        // A non-2xx response with a non-JSON body (e.g. a proxy 502) must still
+        // surface the HTTP status, not collapse to a bare JSON-parse error.
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+
+        let mut server = mockito::Server::new_async().await;
+        let _repo = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/myrepo$".to_string()),
+            )
+            .with_status(502)
+            .with_header("content-type", "text/html")
+            .with_body("<html>502 Bad Gateway</html>")
+            .create_async()
+            .await;
+
+        let err = cmd_info(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("repo info failed (502"),
+            "got: {err}"
+        );
     }
 }

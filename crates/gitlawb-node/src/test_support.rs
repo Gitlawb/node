@@ -1265,6 +1265,10 @@ mod tests {
             StatusCode::NOT_FOUND,
             "anon is denied the private labels"
         );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "anon 404 must not leak the label name");
 
         // Public repo, anonymous → 200, label visible. The gate must not break
         // the existing anonymous read path for public repos.
