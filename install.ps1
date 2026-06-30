@@ -64,16 +64,23 @@ try {
   $pkgDir = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
 
   New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+  # The Windows archive always ships the two CLI binaries; the daemon is optional.
+  $requiredBins = @("gl.exe", "git-remote-gitlawb.exe")
+  $optionalBins = @("gitlawb-node.exe")
+  $missing = $requiredBins | Where-Object {
+    -not (Test-Path (Join-Path $pkgDir.FullName $_))
+  }
+  if ($missing.Count -gt 0) {
+    throw "archive is missing required binaries: $($missing -join ', ')"
+  }
+
   $installed = @()
-  foreach ($bin in @("gl.exe", "git-remote-gitlawb.exe", "gitlawb-node.exe")) {
+  foreach ($bin in $requiredBins + $optionalBins) {
     $src = Join-Path $pkgDir.FullName $bin
     if (Test-Path $src) {
       Copy-Item -Path $src -Destination (Join-Path $InstallDir $bin) -Force
       $installed += $bin
     }
-  }
-  if ($installed.Count -eq 0) {
-    throw "no installable binaries found in $archive"
   }
 
   Write-Host ""
