@@ -115,6 +115,8 @@ jobs:
             os: macos-13
           - target: aarch64-apple-darwin
             os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     steps:
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -156,9 +158,11 @@ jobs:
           set -euo pipefail
           VERSION="${{ needs.release-please.outputs.version }}"
           BIN_DIR="target/${{ matrix.target }}/release"
+          EXE=""
+          case "${{ matrix.target }}" in *windows*) EXE=".exe" ;; esac
           for bin in gl git-remote-gitlawb gitlawb-node; do
             echo "== $bin --version =="
-            out="$("$BIN_DIR/$bin" --version)"
+            out="$("$BIN_DIR/$bin$EXE" --version)"
             echo "$out"
             # Each binary prints "<name> <version>"; assert the released version is present.
             grep -qF "$VERSION" <<<"$out" || {
@@ -168,26 +172,53 @@ jobs:
           done
 
       - name: Package
-        id: pkg
         shell: bash
         run: |
           set -euo pipefail
-          NAME="gitlawb-node-${{ needs.release-please.outputs.version }}-${{ matrix.target }}"
+          TARGET="${{ matrix.target }}"
+          NAME="gitlawb-node-${{ needs.release-please.outputs.version }}-${TARGET}"
+          BIN_DIR="target/${TARGET}/release"
+          EXE=""
+          case "$TARGET" in *windows*) EXE=".exe" ;; esac
+
+          # Portable sha256 → "<hash>  <file>" so install scripts and brew can parse it.
+          sha256_file() {
+            local f="$1"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$f"
+            elif command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "$f"
+            else
+              local h
+              h=$(certutil -hashfile "$f" SHA256 | sed -n 2p | tr -d ' \r')
+              printf '%s  %s\n' "$h" "$f"
+            fi
+          }
+
           mkdir -p "dist/$NAME"
-          cp "target/${{ matrix.target }}/release/gl" "dist/$NAME/"
-          cp "target/${{ matrix.target }}/release/git-remote-gitlawb" "dist/$NAME/"
-          cp "target/${{ matrix.target }}/release/gitlawb-node" "dist/$NAME/"
+          for bin in gl git-remote-gitlawb gitlawb-node; do
+            cp "$BIN_DIR/$bin$EXE" "dist/$NAME/"
+          done
           cp README.md LICENSE-MIT LICENSE-APACHE "dist/$NAME/"
+
           cd dist
-          tar czf "$NAME.tar.gz" "$NAME"
-          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
-          echo "asset=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
-          echo "checksum=dist/$NAME.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          case "$TARGET" in
+            *windows*)
+              # 7z is preinstalled on windows-latest runners.
+              7z a -tzip "$NAME.zip" "$NAME" >/dev/null
+              sha256_file "$NAME.zip" > "$NAME.zip.sha256"
+              ;;
+            *)
+              tar czf "$NAME.tar.gz" "$NAME"
+              sha256_file "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+              ;;
+          esac
 
       - name: Attach to release
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
           tag_name: ${{ needs.release-please.outputs.tag_name }}
           files: |
-            ${{ steps.pkg.outputs.asset }}
-            ${{ steps.pkg.outputs.checksum }}
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
