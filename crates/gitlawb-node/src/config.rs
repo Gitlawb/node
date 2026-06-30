@@ -28,6 +28,12 @@ pub struct PurgeSpamArgs {
     /// Skip deleting the Tigris archive (DB + on-disk only).
     #[arg(long, default_value_t = false)]
     pub skip_tigris: bool,
+
+    /// Bulk mode: delete all matching rows with set-based SQL (a handful of
+    /// statements) + remove their on-disk repos, instead of one transaction per
+    /// repo. Far faster on large match sets / small DB instances. Skips Tigris.
+    #[arg(long, default_value_t = false)]
+    pub bulk: bool,
 }
 
 #[derive(Parser, Debug, Clone)]

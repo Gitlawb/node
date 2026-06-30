@@ -30,13 +30,38 @@ pub async fn purge_spam(config: &Config, args: &PurgeSpamArgs) -> Result<()> {
     if !args.execute {
         println!(
             "\nDRY RUN — nothing deleted. Re-run with --execute to delete these {total} repos \
-             (DB rows + on-disk .git{}).",
-            if args.skip_tigris {
-                ""
+             ({}).",
+            if args.bulk {
+                "bulk set-based DB delete + on-disk .git"
+            } else if args.skip_tigris {
+                "DB rows + on-disk .git"
             } else {
-                " + Tigris archive"
+                "DB rows + on-disk .git + Tigris archive"
             }
         );
+        return Ok(());
+    }
+
+    // Bulk mode: set-based DB delete (a few statements) + on-disk removal. Far
+    // faster on large match sets / small DB instances than per-repo cascade.
+    if args.bulk {
+        let disk_paths = db.list_disk_paths_by_name_regex(&args.regex).await?;
+        println!(
+            "collected {} on-disk paths; running bulk DB delete…",
+            disk_paths.len()
+        );
+        let deleted = db.bulk_delete_by_name_regex(&args.regex).await?;
+        println!("bulk DB delete done: {deleted} repos removed; removing on-disk repos…");
+        let mut disk_removed = 0u64;
+        for p in &disk_paths {
+            if std::path::Path::new(p).exists() {
+                match std::fs::remove_dir_all(p) {
+                    Ok(()) => disk_removed += 1,
+                    Err(e) => eprintln!("warning: rm {p} failed: {e}"),
+                }
+            }
+        }
+        println!("done: {deleted} repos purged (bulk), {disk_removed} on-disk dirs removed");
         return Ok(());
     }
 

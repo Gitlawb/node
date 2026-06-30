@@ -1340,6 +1340,78 @@ impl Db {
         Ok(())
     }
 
+    /// On-disk bare-repo paths of all repos whose name matches `regex`. Collected
+    /// before a bulk delete so the dirs can be removed afterward.
+    pub async fn list_disk_paths_by_name_regex(&self, regex: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT disk_path FROM repos WHERE name ~ $1")
+            .bind(regex)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("disk_path"))
+            .filter(|p| !p.is_empty())
+            .collect())
+    }
+
+    /// Set-based bulk delete of every repo whose name matches `regex`, plus their
+    /// child rows, in one transaction (a handful of statements total, vs one
+    /// transaction per repo). Returns the number of `repos` rows deleted. Does
+    /// NOT touch on-disk repos or Tigris — the caller handles disk cleanup.
+    pub async fn bulk_delete_by_name_regex(&self, regex: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+
+        // Child tables keyed on repos.id.
+        for table in [
+            "ref_certificates",
+            "push_events",
+            "webhooks",
+            "agent_tasks",
+            "protected_branches",
+            "repo_stars",
+            "repo_replicas",
+            "repo_labels",
+            "visibility_rules",
+            "encrypted_blobs",
+            "repo_icaptcha_proofs",
+            "pull_requests",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE repo_id IN (SELECT id FROM repos WHERE name ~ $1)"
+            ))
+            .bind(regex)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Child tables keyed on the repo slug/id string. Match either the repo
+        // id or the `{owner_short}/{name}` slug (owner_short = trailing segment
+        // after the last ':'), covering both canonical and mirror rows.
+        for table in [
+            "branch_cids",
+            "sync_queue",
+            "received_ref_updates",
+            "arweave_anchors",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE repo IN (SELECT id FROM repos WHERE name ~ $1) \
+                 OR repo IN (SELECT substring(owner_did from '[^:]*$') || '/' || name \
+                             FROM repos WHERE name ~ $1)"
+            ))
+            .bind(regex)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let result = sqlx::query("DELETE FROM repos WHERE name ~ $1")
+            .bind(regex)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn get_trust_score(&self, agent_did: &str) -> Result<f64> {
         let row = sqlx::query("SELECT trust_score FROM agents WHERE did = $1")
             .bind(agent_did)
@@ -4095,5 +4167,57 @@ mod purge_spam_tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    /// Bulk delete removes all matching repos + child rows in one pass (set-based),
+    /// matching child rows keyed by both repo id and `{owner_short}/{name}` slug,
+    /// and leaves non-matching repos intact.
+    #[sqlx::test]
+    async fn bulk_delete_clears_matches_and_children(pool: PgPool) {
+        let db = db(pool).await;
+        // Canonical spam (full DID) + mirror-style spam (bare owner) + a legit repo.
+        db.create_repo(&rec("uuid-1", "did:key:z6MkSpamA", "keep1x2x3"))
+            .await
+            .unwrap();
+        db.create_repo(&rec("z6Mb/keep4x5", "z6Mb", "keep4x5"))
+            .await
+            .unwrap();
+        db.create_repo(&rec("id-legit", "did:key:z6MkReal", "keeper"))
+            .await
+            .unwrap();
+
+        // Child rows: repo_id-keyed proof + slug-keyed branch_cid for the
+        // canonical one (slug = z6MkSpamA/keep1x2x3), and an id-keyed branch_cid
+        // for the mirror one.
+        db.record_repo_proof("uuid-1", "t.s", "did:key:z6MkSpamA", 3, "j1", 1)
+            .await
+            .unwrap();
+        db.upsert_branch_cid(
+            "z6MkSpamA/keep1x2x3",
+            "refs/heads/main",
+            "sha",
+            "cid",
+            "z6N",
+        )
+        .await
+        .unwrap();
+        db.upsert_branch_cid("z6Mb/keep4x5", "refs/heads/main", "sha", "cid", "z6N")
+            .await
+            .unwrap();
+
+        let deleted = db.bulk_delete_by_name_regex("^keep[0-9]").await.unwrap();
+        assert_eq!(deleted, 2, "both keepN* repos deleted, keeper untouched");
+        assert_eq!(db.count_repos_by_name_regex("^keep[0-9]").await.unwrap(), 0);
+        assert_eq!(db.get_repo_proof_token("uuid-1").await.unwrap(), None);
+        let cids = sqlx::query("SELECT COUNT(*) AS c FROM branch_cids")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cids.get::<i64, _>("c"),
+            0,
+            "slug- and id-keyed child rows removed"
+        );
+        assert!(db.get_repo("z6MkReal", "keeper").await.unwrap().is_some());
     }
 }
