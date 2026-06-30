@@ -254,13 +254,27 @@ jobs:
       contents: read
       id-token: write # npm provenance
     steps:
+      - name: Guard on secret
+        id: guard
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "${NPM_TOKEN:-}" ]; then
+            echo "::warning::NPM_TOKEN is not set — skipping npm publish."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout release tag
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
           persist-credentials: false
 
       - name: Lay in release binaries
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.release-please.outputs.version }}
@@ -291,6 +305,7 @@ jobs:
           done
 
       - name: Set versions
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           VERSION: ${{ needs.release-please.outputs.version }}
         run: |
@@ -312,15 +327,12 @@ jobs:
           '
 
       - name: Publish
+        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.release-please.outputs.version }}
         run: |
           set -euo pipefail
-          if [ -z "${NPM_TOKEN:-}" ]; then
-            echo "::warning::NPM_TOKEN is not set — skipping npm publish."
-            exit 0
-          fi
           echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
           # Platform packages first, then the wrapper (so its optionalDependencies resolve).
           # Skip versions already on the registry so a rerun after a partial publish
