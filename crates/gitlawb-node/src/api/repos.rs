@@ -1406,8 +1406,16 @@ pub async fn fork_repo(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, name)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ForkRepoRequest>,
 ) -> Result<(StatusCode, Json<RepoResponse>)> {
+    // iCaptcha gate (inert unless ICAPTCHA_MODE is set). Fork is the third
+    // repo-creation entrypoint alongside create_repo/register, so it must be
+    // gated too. Verify up front (reject invalid/missing proofs early); the
+    // proof is only spent just before the first write, so a rejected fork (bad
+    // name, conflict, withheld subtree) never burns a valid proof.
+    let proof = crate::icaptcha::verify_request(&headers, &auth.0)?;
+
     // Enforce read visibility on the source before cloning: an unauthorized
     // caller must not be able to fork (full mirror) a repo they cannot read.
     let (source, rules) =
@@ -1447,6 +1455,9 @@ pub async fn fork_repo(
             "you already have a repo named {fork_name}"
         )));
     }
+
+    // Request is admissible — spend the proof now, immediately before the write.
+    proof.consume(&state.db).await?;
 
     // Ensure source repo is on local disk (downloads from Tigris on cache miss)
     let source_path = state

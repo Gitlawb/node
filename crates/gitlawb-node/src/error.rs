@@ -55,10 +55,12 @@ impl IntoResponse for AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "not_an_agent", msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
-            // Distinct from `not_an_agent`: the caller IS an authenticated agent
-            // but must present a valid, fresh iCaptcha proof to proceed.
+            // 403, not 401: the caller IS an authenticated agent (credentials are
+            // valid) but is forbidden from this action without a valid, fresh
+            // iCaptcha proof. The distinct `icaptcha_proof_required` code — which
+            // clients branch on — keeps it separable from a plain `forbidden`.
             AppError::IcaptchaProofRequired(msg) => (
-                StatusCode::UNAUTHORIZED,
+                StatusCode::FORBIDDEN,
                 "icaptcha_proof_required",
                 msg.clone(),
             ),

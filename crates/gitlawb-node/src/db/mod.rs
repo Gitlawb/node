@@ -3592,3 +3592,62 @@ mod dedup_db_tests {
         assert_eq!(count, list_len, "count must equal the deduped list length");
     }
 }
+
+/// Exercises the iCaptcha single-use proof ledger (`icaptcha_consumed_proofs`),
+/// which is what gives the gate its anti-replay security value.
+#[cfg(test)]
+mod icaptcha_ledger_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// First sighting of a jti is recorded (allowed); the same jti again is a
+    /// replay (rejected); a distinct jti is independently allowed.
+    #[sqlx::test]
+    async fn consume_proof_jti_single_use(pool: PgPool) {
+        let db = db(pool).await;
+        let exp = 9_000_000_000i64; // far-future expiry
+
+        assert!(
+            db.consume_proof_jti("jti-a", exp).await.unwrap(),
+            "first use of a jti is recorded and allowed"
+        );
+        assert!(
+            !db.consume_proof_jti("jti-a", exp).await.unwrap(),
+            "re-using the same jti is a replay and must be rejected"
+        );
+        assert!(
+            db.consume_proof_jti("jti-b", exp).await.unwrap(),
+            "a different jti is independent and allowed"
+        );
+    }
+
+    /// The sweep deletes only rows whose `expires_at` is strictly before the
+    /// cutoff, returns the deleted count, and leaves unexpired rows intact (so a
+    /// still-valid spent proof keeps rejecting replays).
+    #[sqlx::test]
+    async fn sweep_expired_proofs_removes_only_expired(pool: PgPool) {
+        let db = db(pool).await;
+        db.consume_proof_jti("old-1", 100).await.unwrap();
+        db.consume_proof_jti("old-2", 199).await.unwrap();
+        db.consume_proof_jti("fresh", 500).await.unwrap();
+
+        let deleted = db.sweep_expired_proofs(200).await.unwrap();
+        assert_eq!(
+            deleted, 2,
+            "only the two rows with expires_at < 200 are swept"
+        );
+
+        // Swept jtis are fresh again; the unexpired one still rejects as a replay.
+        assert!(db.consume_proof_jti("old-1", 100).await.unwrap());
+        assert!(
+            !db.consume_proof_jti("fresh", 500).await.unwrap(),
+            "an unexpired spent proof survives the sweep and still blocks replays"
+        );
+    }
+}
