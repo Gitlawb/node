@@ -1,3 +1,4 @@
+mod admin;
 mod api;
 mod arweave;
 mod auth;
@@ -49,6 +50,15 @@ async fn main() -> Result<()> {
         .init();
 
     let mut config = Config::parse();
+
+    // Admin subcommands run instead of the daemon and exit.
+    if let Some(cmd) = config.command.clone() {
+        match cmd {
+            config::Command::PurgeSpam(args) => {
+                return admin::purge_spam(&config, &args).await;
+            }
+        }
+    }
 
     // Merge the embedded seed list of public network nodes into the runtime
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.

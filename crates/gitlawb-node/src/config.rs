@@ -1,9 +1,42 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+
+/// Admin subcommands. When absent, the binary runs the node daemon as usual.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Bulk-delete repos whose name matches a Postgres regex, removing their DB
+    /// rows, on-disk bare repo, and Tigris archive. Intended for spam cleanup.
+    /// Defaults to a dry run; pass --execute to actually delete.
+    PurgeSpam(PurgeSpamArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PurgeSpamArgs {
+    /// Postgres regex matched against `repos.name` (e.g. '^keep[0-9]').
+    #[arg(long)]
+    pub regex: String,
+
+    /// Actually delete. Without this flag the command only reports what would
+    /// be removed (dry run).
+    #[arg(long, default_value_t = false)]
+    pub execute: bool,
+
+    /// Stop after processing at most this many repos (0 = no limit).
+    #[arg(long, default_value_t = 0)]
+    pub limit: i64,
+
+    /// Skip deleting the Tigris archive (DB + on-disk only).
+    #[arg(long, default_value_t = false)]
+    pub skip_tigris: bool,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gitlawb-node", about = "gitlawb node daemon", version)]
 pub struct Config {
+    /// Optional admin subcommand. When omitted, runs the node daemon.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Directory where bare git repositories are stored
     #[arg(long, env = "GITLAWB_REPOS_DIR", default_value = "./data/repos")]
     pub repos_dir: PathBuf,

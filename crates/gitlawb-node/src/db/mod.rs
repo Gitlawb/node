@@ -1249,6 +1249,97 @@ impl Db {
         Ok(rows.into_iter().map(|r| r.get::<String, _>("id")).collect())
     }
 
+    /// Count repos whose name matches a Postgres regex. Used by the admin
+    /// `purge-spam` command's dry run.
+    pub async fn count_repos_by_name_regex(&self, regex: &str) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS cnt FROM repos WHERE name ~ $1")
+            .bind(regex)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("cnt"))
+    }
+
+    /// A page of repos whose name matches a Postgres regex, ordered by id.
+    /// Returns `(id, name, owner_did, disk_path)`. `purge-spam` re-queries with
+    /// the same `limit` after each batch is deleted (deleted rows fall out, so
+    /// no offset is needed).
+    pub async fn list_repos_by_name_regex(
+        &self,
+        regex: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, name, owner_did, disk_path FROM repos WHERE name ~ $1 ORDER BY id LIMIT $2",
+        )
+        .bind(regex)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("id"),
+                    r.get::<String, _>("name"),
+                    r.get::<String, _>("owner_did"),
+                    r.get::<String, _>("disk_path"),
+                )
+            })
+            .collect())
+    }
+
+    /// Delete a repo and all of its child rows in one transaction. `id` is the
+    /// `repos.id`; `slug` is the `{owner_short}/{name}` form. The slug-keyed
+    /// tables (`branch_cids`, `sync_queue`, `received_ref_updates`,
+    /// `arweave_anchors`) store either the id or the slug depending on the write
+    /// path, so both are matched. Tables keyed on `repo_id` match the id.
+    pub async fn delete_repo_cascade(&self, id: &str, slug: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // Tables keyed on repos.id.
+        for table in [
+            "ref_certificates",
+            "push_events",
+            "webhooks",
+            "agent_tasks",
+            "protected_branches",
+            "repo_stars",
+            "repo_replicas",
+            "repo_labels",
+            "visibility_rules",
+            "encrypted_blobs",
+            "repo_icaptcha_proofs",
+            "pull_requests",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE repo_id = $1"))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // Tables keyed on the repo slug/id string (`repo` column).
+        for table in [
+            "branch_cids",
+            "sync_queue",
+            "received_ref_updates",
+            "arweave_anchors",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE repo = $1 OR repo = $2"))
+                .bind(id)
+                .bind(slug)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        sqlx::query("DELETE FROM repos WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn get_trust_score(&self, agent_did: &str) -> Result<f64> {
         let row = sqlx::query("SELECT trust_score FROM agents WHERE did = $1")
             .bind(agent_did)
@@ -3907,5 +3998,102 @@ mod icaptcha_quarantine_tests {
 
         let with_stars = db.list_all_repos_deduped_with_stars(None).await.unwrap();
         assert!(with_stars.iter().all(|(r, _)| r.name != "spam"));
+    }
+}
+
+/// Exercises the admin `purge-spam` data layer: regex matching is precise (only
+/// `^keep[0-9]` spam, not a legit "keeper-*" repo) and cascade delete removes
+/// the repo plus its child rows.
+#[cfg(test)]
+mod purge_spam_tests {
+    use super::{Db, RepoRecord};
+    use chrono::Utc;
+    use sqlx::{PgPool, Row};
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn rec(id: &str, owner: &str, name: &str) -> RepoRecord {
+        let now = Utc::now();
+        RepoRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            owner_did: owner.to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/srv/{id}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    #[sqlx::test]
+    async fn regex_is_precise_and_cascade_deletes_children(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&rec(
+            "id-keep-1",
+            "did:key:z6MkSpamA",
+            "keep27x25731x584132399",
+        ))
+        .await
+        .unwrap();
+        db.create_repo(&rec("id-keep-2", "did:key:z6MkSpamB", "keep9x1x2"))
+            .await
+            .unwrap();
+        // Must NOT match ^keep[0-9]: a real word starting with "keep" + a letter.
+        db.create_repo(&rec("id-legit", "did:key:z6MkReal", "keeper-tools"))
+            .await
+            .unwrap();
+
+        // Child rows on a spam repo: one slug/id-keyed (branch_cids), one
+        // repo_id-keyed (icaptcha proof).
+        db.upsert_branch_cid(
+            "id-keep-1",
+            "refs/heads/main",
+            "deadbeef",
+            "cidX",
+            "did:key:zNode",
+        )
+        .await
+        .unwrap();
+        db.record_repo_proof("id-keep-1", "tok.sig", "did:key:z6MkSpamA", 3, "jtiX", 123)
+            .await
+            .unwrap();
+
+        // Regex matches exactly the two keepN* repos, not keeper-tools.
+        assert_eq!(db.count_repos_by_name_regex("^keep[0-9]").await.unwrap(), 2);
+        let matched = db
+            .list_repos_by_name_regex("^keep[0-9]", 100)
+            .await
+            .unwrap();
+        assert_eq!(matched.len(), 2);
+        assert!(matched
+            .iter()
+            .all(|(_, name, _, _)| name.starts_with("keep")));
+
+        // Cascade-delete one spam repo; its child rows go with it.
+        db.delete_repo_cascade("id-keep-1", "z6MkSpamA/keep27x25731x584132399")
+            .await
+            .unwrap();
+        assert_eq!(db.count_repos_by_name_regex("^keep[0-9]").await.unwrap(), 1);
+        assert_eq!(db.get_repo_proof_token("id-keep-1").await.unwrap(), None);
+        let cids = sqlx::query("SELECT COUNT(*) AS c FROM branch_cids WHERE repo = 'id-keep-1'")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(cids.get::<i64, _>("c"), 0, "branch_cids child rows removed");
+
+        // The legit repo is untouched.
+        assert!(db
+            .get_repo("z6MkReal", "keeper-tools")
+            .await
+            .unwrap()
+            .is_some());
     }
 }
