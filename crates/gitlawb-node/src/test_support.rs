@@ -1704,4 +1704,56 @@ mod tests {
             "the public copy serves the content"
         );
     }
+
+    /// Repo-level "/" gate (KTD2a, first continue branch): a fully private repo
+    /// (is_public=false, no rules) denies anon before any per-blob check; the
+    /// owner still reads. The path-scoped tests pass the "/" gate and deny at the
+    /// per-blob stage, so this exercises the coarser repo-level deny separately.
+    #[sqlx::test]
+    async fn ipfs_cid_private_repo_denies_anon_at_repo_gate(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["priv"]);
+        let blob_cid = cid_for_oid(&fx.public_oid);
+
+        let mut rec = seed_repo(&owner_did, "priv");
+        rec.is_public = false;
+        state.db.create_repo(&rec).await.expect("private repo");
+
+        // anon → repo-level deny → 404, no content leaked.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&blob_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "anon denied at a private repo's / gate"
+        );
+        assert!(!body.contains("public bytes"), "404 must not leak content");
+
+        // owner-signed → 200.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed(&owner, &blob_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "owner reads their private repo's object"
+        );
+        assert!(body.contains("public bytes"), "owner gets the content");
+    }
 }

@@ -9,6 +9,10 @@
 //! `git cat-file <type> <sha256>` (i.e. without the git framing header).
 //! This is consistent with how `gitlawb_core::cid::Cid::from_git_object_bytes`
 //! computes CIDs when objects are pushed.
+//!
+//! Serving is access-controlled: an object is returned only from a repo row the
+//! requesting caller is permitted to read (per-caller path-scoped visibility,
+//! see `get_by_cid`).
 
 use axum::{
     extract::{Path, State},
@@ -71,6 +75,16 @@ pub async fn get_by_cid(
         .await
         .map_err(AppError::Internal)?;
 
+    // Fetch every repo's visibility rules in one query rather than one per row
+    // (the gate runs each row against its OWN rules — KTD2a). A row absent from
+    // the map has no rules.
+    let repo_ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
+    let rules_by_repo = state
+        .db
+        .list_visibility_rules_for_repos(&repo_ids)
+        .await
+        .map_err(AppError::Internal)?;
+
     // Request-scoped memo of the per-repo withheld set (KTD1). The caller is
     // constant for one request, so `repo.id` alone is a safe, sufficient key —
     // never a coarse caller "class", which `visibility_check`'s exact full-DID
@@ -79,13 +93,11 @@ pub async fn get_by_cid(
 
     for repo in &repos {
         // Repo-level read gate against THIS row's own rules (KTD2a).
-        let rules = state
-            .db
-            .list_visibility_rules(&repo.id)
-            .await
-            .map_err(AppError::Internal)?;
-        if visibility_check(&rules, repo.is_public, &repo.owner_did, caller, "/") == Decision::Deny
-        {
+        let rules: &[crate::db::VisibilityRule] = rules_by_repo
+            .get(&repo.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if visibility_check(rules, repo.is_public, &repo.owner_did, caller, "/") == Decision::Deny {
             continue;
         }
 
@@ -95,32 +107,33 @@ pub async fn get_by_cid(
         };
 
         // Per-blob withholding only applies when a path-scoped rule exists (KTD4).
-        if has_path_scoped_rule(&rules) {
+        if has_path_scoped_rule(rules) {
             if !withheld_memo.contains_key(&repo.id) {
                 let rp = repo_path.clone();
-                let r = rules.clone();
+                let r = rules.to_vec();
                 let is_public = repo.is_public;
                 let owner = repo.owner_did.clone();
                 let caller_for_walk = caller_owned.clone();
                 // Full-history walk shells out to git — keep it off the async runtime.
-                let computed = tokio::task::spawn_blocking(move || {
+                let walk = tokio::task::spawn_blocking(move || {
                     withheld_blob_oids(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
                 })
-                .await
-                .map_err(|e| {
-                    AppError::Internal(anyhow::anyhow!("withheld walk task panicked: {e}"))
-                })?;
-                match computed {
-                    Ok(set) => {
-                        withheld_memo.insert(repo.id.clone(), set);
-                    }
-                    // Fail closed: a walk error means we cannot prove the caller may
-                    // read this object here, so skip the repo rather than serve.
-                    Err(e) => {
+                .await;
+                // Fail closed on EITHER a task panic (JoinError) or a walk error:
+                // we cannot prove the caller may read here, so skip this repo and
+                // let a public copy (if any) serve. Never serve on an unproven gate.
+                let set = match walk {
+                    Ok(Ok(set)) => set,
+                    Ok(Err(e)) => {
                         tracing::warn!(repo = %repo.name, err = %e, "withheld walk failed; skipping repo");
                         continue;
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!(repo = %repo.name, err = %e, "withheld walk task panicked; skipping repo");
+                        continue;
+                    }
+                };
+                withheld_memo.insert(repo.id.clone(), set);
             }
             if withheld_memo
                 .get(&repo.id)
