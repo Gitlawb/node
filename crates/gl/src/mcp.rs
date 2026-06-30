@@ -946,12 +946,19 @@ async fn call_tool(
                 did.split(':').next_back().unwrap_or(&did).to_string()
             };
             // Owner-gated route: must be signed (get_signed), not a plain get().
-            let resp: Value = client
+            let resp = client
                 .get_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-                .await?
-                .json()
                 .await?;
-            Ok(serde_json::to_string_pretty(&resp)?)
+            // Check the HTTP status before deserializing: a 401/403/404 JSON error
+            // body (missing identity, wrong owner, private/deleted repo) must fail
+            // the tool call, not be returned as a successful result.
+            let status = resp.status();
+            let body: Value = resp.json().await?;
+            if !status.is_success() {
+                let msg = body["message"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("webhook_list failed ({status}): {msg}");
+            }
+            Ok(serde_json::to_string_pretty(&body)?)
         }
 
         "webhook_delete" => {
@@ -1960,6 +1967,45 @@ mod tests {
         .unwrap();
         assert!(result.contains("webhooks"), "got: {result}");
         _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_webhook_list_non_success_status_errors() {
+        // A 403 (or any non-2xx) JSON error body for a missing identity, wrong
+        // owner, or private/deleted repo must fail the tool call, NOT be returned
+        // as a successful result. Mirrors the `gl webhook list` status check.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"only the repo owner can perform this action"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("non-2xx must error, not return the error body as success");
+        let msg = err.to_string();
+        assert!(msg.contains("webhook_list failed (403"), "got: {msg}");
+        assert!(
+            msg.contains("only the repo owner"),
+            "must surface the node message, got: {msg}"
+        );
     }
 
     #[tokio::test]
