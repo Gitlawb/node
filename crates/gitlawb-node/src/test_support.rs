@@ -669,6 +669,8 @@ mod tests {
         );
     }
 
+    // ── #119: git-info-refs advertisement gate + client signing ──────────────
+
     /// A1 read-gate bypass + its client remedy. `git_info_refs` serves BOTH the
     /// `git-upload-pack` (clone/fetch) and `git-receive-pack` (push) ref
     /// advertisement off one route, but the visibility gate was wrapped in
@@ -761,7 +763,7 @@ mod tests {
 
         // No-regression: a PUBLIC repo's advertisement stays anonymous for BOTH
         // services. The gate admits the anonymous caller, so the handler clears it
-        // and 500s on the missing test-disk repo — anything but 404 (a gate denial)
+        // and 500s on the missing test-disk repo; anything but 404 (a gate denial)
         // proves the unconditional gate did not accidentally lock out public reads.
         for service in ["git-upload-pack", "git-receive-pack"] {
             let req = Request::builder()
@@ -783,14 +785,14 @@ mod tests {
 
         // Client remedy: the owner's SIGNED advertisement GET clears the gate for
         // BOTH services (so fetch and push of a private repo keep working). It
-        // 500s on the missing test-disk repo — anything but 404 means cleared.
+        // 500s on the missing test-disk repo; anything but 404 means cleared.
         for service in ["git-upload-pack", "git-receive-pack"] {
             let resp = router().oneshot(signed(service)).await.unwrap();
             // INTERNAL_SERVER_ERROR specifically: the signature VERIFIED (passed
             // require_signature, not 401/403) and the owner cleared the read gate
             // (not 404), so the handler proceeded to acquire + git on a repo absent
-            // from the test disk. Asserting the exact 500 — rather than merely
-            // "not 404" — proves the request got PAST auth, not rejected by it.
+            // from the test disk. Asserting the exact 500 (rather than merely
+            // "not 404") proves the request got PAST auth, not rejected by it.
             assert_eq!(
                 resp.status(),
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -840,7 +842,7 @@ mod tests {
 
     /// A1 Phase-2 contract: the `git-upload-pack` POST (the actual fetch, after
     /// the advertisement) is itself read-visibility gated. An ANONYMOUS upload-pack
-    /// POST against a private repo is denied (404) — so signing only the Phase-1
+    /// POST against a private repo is denied (404), so signing only the Phase-1
     /// advertisement GET is NOT enough; `git-remote-gitlawb` must also sign this
     /// POST, or an owner's fetch of their own private repo clears the advertisement
     /// and then dies on the pack POST. A real owner signature clears the gate
@@ -877,8 +879,8 @@ mod tests {
         let path = format!("/{short}/up-priv.git/git-upload-pack");
 
         // Anonymous Phase-2 fetch of a private repo: denied at the gate (404). This
-        // is exactly the request git-remote-gitlawb sends today for upload-pack —
-        // the unsigned POST — which is why fetch breaks for the owner.
+        // is exactly the request git-remote-gitlawb sends today for upload-pack
+        // (the unsigned POST), which is why fetch breaks for the owner.
         let anon = Request::builder()
             .method(Method::POST)
             .uri(&path)
@@ -908,7 +910,7 @@ mod tests {
         // 500 (not merely non-404): the signature VERIFIED (passed require_signature,
         // not 401/403) AND the owner cleared the read gate (not 404), so the handler
         // reached git on the missing test-disk repo. Pinning 500 proves the request
-        // got past auth — a 401 regression would slip through a bare `!= 404`.
+        // got past auth; a 401 regression would slip through a bare `!= 404`.
         assert_eq!(
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -918,7 +920,7 @@ mod tests {
 
     /// Served-content seam: with a REAL on-disk bare repo (branch
     /// `topsecret-branch`), the advertisement serves the actual ref names to
-    /// authorized callers and withholds them from denied ones — proving real
+    /// authorized callers and withholds them from denied ones, proving real
     /// content egress + withholding, not just the gate decision (the other tests
     /// land on a 500 from a missing-disk repo). Asserts the branch name appears for
     /// allowed callers and never appears in a denied 404 body.

@@ -510,7 +510,7 @@ pub async fn git_info_refs(
 
     // Enforce read visibility on the ref advertisement, for BOTH services. The
     // upload-pack (clone/fetch) and receive-pack (push) advertisements expose the
-    // same ref metadata — branch/tag names and commit tips — so a private repo's
+    // same ref metadata (branch/tag names and commit tips), so a private repo's
     // advertisement must be withheld from a non-reader regardless of which service
     // is requested. The push itself stays separately owner-gated on the
     // git-receive-pack POST; push access implies read access here, so a
