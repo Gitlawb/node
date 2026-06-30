@@ -40,14 +40,16 @@ use crate::visibility::{visibility_check, Decision};
 /// caller passes. For each iterated row we gate against that row's OWN rules
 /// (`visibility_check` at `"/"`), never re-resolving via `authorize_repo_read`
 /// — `get_repo`'s fuzzy match could otherwise authorize a different physical
-/// row than the one read (KTD2a). When the row carries path-scoped rules
-/// (KTD4) the served object must be either a non-blob (trees/commits are
-/// structural; KTD3) OR a blob in the caller's *reachable* allowed-set
-/// (`allowed_blob_set_for_caller`). The reachable allowed-set excludes
-/// dangling blobs — a blob written via `git hash-object -w` and never
-/// committed has no path to gate, so it is fail-closed 404'd under
-/// path-scoped rules (#126). Denial and genuine not-found both fall through
-/// to an opaque 404.
+/// row than the one read (KTD2a). We check object existence via
+/// `store::read_object` *before* the expensive reachability walk so random-CID
+/// spray cannot trigger full-history git walks on repos that don't carry the
+/// object. When the row carries path-scoped rules (KTD4) the served object
+/// must be either a non-blob (trees/commits are structural; KTD3) OR a blob
+/// in the caller's *reachable* allowed-set (`allowed_blob_set_for_caller`).
+/// The reachable allowed-set excludes dangling blobs — a blob written via
+/// `git hash-object -w` and never committed has no path to gate, so it is
+/// fail-closed 404'd under path-scoped rules (#126). Denial and genuine
+/// not-found both fall through to an opaque 404.
 ///
 /// Scope: this closes the direct unauthenticated scan, including the dangling
 /// case. A stale-public mirror row still serves withheld content (tracked
@@ -117,76 +119,77 @@ pub async fn get_by_cid(
             Err(_) => continue,
         };
 
-        // Per-blob gating only applies when a path-scoped rule exists (KTD4).
-        // Without any path-scoped rule, the "/" gate above is the whole story.
-        let path_scoped = has_path_scoped_rule(rules);
-        if path_scoped && !allowed_memo.contains_key(&repo.id) {
-            let rp = repo_path.clone();
-            let r = rules.to_vec();
-            let is_public = repo.is_public;
-            let owner = repo.owner_did.clone();
-            let caller_for_walk = caller_owned.clone();
-            // Full-history walk shells out to git — keep it off the async runtime.
-            let walk = tokio::task::spawn_blocking(move || {
-                allowed_blob_set_for_caller(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
-            })
-            .await;
-            // Fail closed on EITHER a task panic (JoinError) or a walk error:
-            // we cannot prove the caller may read here, so skip this repo and
-            // let a public copy (if any) serve. Never serve on an unproven gate.
-            let set = match walk {
-                Ok(Ok(set)) => set,
-                Ok(Err(e)) => {
-                    tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk failed; skipping repo");
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk task panicked; skipping repo");
-                    continue;
-                }
-            };
-            allowed_memo.insert(repo.id.clone(), set);
-        }
-
-        match store::read_object(&repo_path, &sha256_hex) {
-            Ok(Some((obj_type, content))) => {
-                // Path-scoped rules: serve trees/commits unconditionally
-                // (structural; KTD3); a blob must be in the reachable
-                // allowed-set, which excludes dangling blobs (#126).
-                if path_scoped && obj_type == "blob" {
-                    let in_allowed = allowed_memo
-                        .get(&repo.id)
-                        .is_some_and(|set| set.contains(&sha256_hex));
-                    if !in_allowed {
-                        continue;
-                    }
-                }
-
-                // 3. Return the content with IPFS-style headers
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    HeaderName::from_static("content-type"),
-                    HeaderValue::from_static("application/octet-stream"),
-                );
-                headers.insert(
-                    HeaderName::from_static("x-content-cid"),
-                    HeaderValue::from_str(&cid_str)
-                        .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-                );
-                headers.insert(
-                    HeaderName::from_static("x-git-hash"),
-                    HeaderValue::from_str(&sha256_hex)
-                        .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
-                );
-
-                return Ok((StatusCode::OK, headers, content).into_response());
-            }
+        // Check whether the object exists in this repo before any expensive
+        // reachability walk. This prevents random-CID spray from triggering
+        // full-history git walks on repos that don't carry the object.
+        let object = store::read_object(&repo_path, &sha256_hex);
+        let (obj_type, content) = match object {
+            Ok(Some(t)) => t,
             Ok(None) => continue,
             Err(e) => {
                 tracing::warn!(repo = %repo.name, err = %e, "error reading git object");
                 continue;
             }
+        };
+
+        // Per-blob gating only applies when a path-scoped rule exists (KTD4).
+        // Without any path-scoped rule, the "/" gate above is the whole story.
+        // Trees/commits are always served under path-scoped rules (KTD3).
+        let path_scoped = has_path_scoped_rule(rules);
+        if path_scoped && obj_type == "blob" {
+            if !allowed_memo.contains_key(&repo.id) {
+                let rp = repo_path.clone();
+                let r = rules.to_vec();
+                let is_public = repo.is_public;
+                let owner = repo.owner_did.clone();
+                let caller_for_walk = caller_owned.clone();
+                // Full-history walk shells out to git — keep it off the async runtime.
+                let walk = tokio::task::spawn_blocking(move || {
+                    allowed_blob_set_for_caller(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
+                })
+                .await;
+                // Fail closed on EITHER a task panic (JoinError) or a walk error:
+                // we cannot prove the caller may read here, so skip this repo and
+                // let a public copy (if any) serve. Never serve on an unproven gate.
+                let set = match walk {
+                    Ok(Ok(set)) => set,
+                    Ok(Err(e)) => {
+                        tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk failed; skipping repo");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk task panicked; skipping repo");
+                        continue;
+                    }
+                };
+                allowed_memo.insert(repo.id.clone(), set);
+            }
+            let in_allowed = allowed_memo
+                .get(&repo.id)
+                .is_some_and(|set| set.contains(&sha256_hex));
+            if !in_allowed {
+                continue;
+            }
         }
+
+        // 3. Return the content with IPFS-style headers
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-content-cid"),
+            HeaderValue::from_str(&cid_str)
+                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+        );
+        headers.insert(
+            HeaderName::from_static("x-git-hash"),
+            HeaderValue::from_str(&sha256_hex)
+                .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
+        );
+
+        return Ok((StatusCode::OK, headers, content).into_response());
     }
 
     // Not found in any repo
