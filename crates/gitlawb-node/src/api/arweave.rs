@@ -35,6 +35,16 @@ pub async fn list_anchors(
 ) -> Result<Json<serde_json::Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
 
+    // Global listings (no ?repo=) are restricted to authenticated callers: an
+    // anonymous request against the full-node index would disclose metadata for
+    // every repo ever pushed here. Per-repo requests are gated by
+    // authorize_repo_read which applies the per-repo visibility rules.
+    if q.repo.is_none() && caller.is_none() {
+        return Err(AppError::Unauthorized(
+            "authentication required for global anchor listing".into(),
+        ));
+    }
+
     let normalized_repo = if let Some(ref repo) = q.repo {
         // Gate on per-repo visibility.
         let parts: Vec<&str> = repo.splitn(2, '/').collect();

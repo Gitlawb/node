@@ -218,6 +218,9 @@ pub async fn get_by_cid(
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
 ///
+/// Requires authentication: the global pin index would otherwise disclose
+/// metadata for every object ever pushed to the node (#121).
+///
 /// The global listing filters each pinned object on current repo visibility
 /// to prevent metadata disclosure when repos are made private after push (#136).
 /// Only pins from repos the caller can currently read are returned.
@@ -226,6 +229,14 @@ pub async fn list_pins(
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+
+    // Reject anonymous callers: the pin index spans the entire node and would
+    // expose metadata for every object ever pushed here (#121).
+    if caller.is_none() {
+        return Err(AppError::Unauthorized(
+            "authentication required for pin listing".into(),
+        ));
+    }
     let caller_owned = caller.map(|c| c.to_string());
 
     let raw_pins = state
@@ -251,6 +262,18 @@ pub async fn list_pins(
     let mut allowed_sha256s = std::collections::HashSet::new();
 
     for repo in &repos {
+        // Preserve the quarantine gate from authorize_repo_read: a quarantined
+        // mirror is treated as nonexistent on every read surface, so its objects
+        // must not contribute to the allowed SHA-256 set (#P2).
+        if state
+            .db
+            .is_repo_quarantined(&repo.id)
+            .await
+            .map_err(AppError::Internal)?
+        {
+            continue;
+        }
+
         let rules: &[crate::db::VisibilityRule] = rules_by_repo
             .get(&repo.id)
             .map(Vec::as_slice)
