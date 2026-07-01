@@ -209,7 +209,7 @@ fn handle_connect<R: Read>(
 
     if !refs_resp.status().is_success() {
         let status = refs_resp.status();
-        let body = refs_resp.text().unwrap_or_default();
+        let body = read_error_body(refs_resp);
         bail!(
             "{}",
             http_error_message(
@@ -307,7 +307,7 @@ fn handle_connect<R: Read>(
 
     if !pack_resp.status().is_success() {
         let status = pack_resp.status();
-        let body = pack_resp.text().unwrap_or_default();
+        let body = read_error_body(pack_resp);
         let path = format!("/{service}");
         bail!("{}", http_error_message("POST", &path, status, &body, None));
     }
@@ -444,6 +444,20 @@ fn url_path(url: &str) -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
+const MAX_ERROR_BODY_BYTES: u64 = 4096;
+const MAX_ERROR_BODY_CHARS: usize = 2000;
+
+fn read_error_body(mut response: reqwest::blocking::Response) -> String {
+    let mut body = Vec::new();
+    let mut limited = (&mut response).take(MAX_ERROR_BODY_BYTES);
+
+    if limited.read_to_end(&mut body).is_err() {
+        return String::new();
+    }
+
+    String::from_utf8_lossy(&body).into_owned()
+}
+
 fn http_error_message(
     method: &str,
     path: &str,
@@ -452,17 +466,54 @@ fn http_error_message(
     empty_body_hint: Option<&str>,
 ) -> String {
     let mut message = format!("{method} {path} returned {status}");
-    let body = body.trim();
+    let body = safe_error_body_excerpt(body);
 
     if !body.is_empty() {
         message.push_str(": ");
-        message.push_str(body);
+        message.push_str(&body);
     } else if let Some(hint) = empty_body_hint {
         message.push(' ');
         message.push_str(hint);
     }
 
     message
+}
+
+fn safe_error_body_excerpt(body: &str) -> String {
+    let mut excerpt = String::new();
+    let mut pending_space = false;
+    let mut kept_chars = 0;
+
+    for ch in body.trim().chars() {
+        if kept_chars >= MAX_ERROR_BODY_CHARS {
+            break;
+        }
+
+        if ch.is_control() {
+            if matches!(ch, '\n' | '\r' | '\t') {
+                pending_space = true;
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+
+        if pending_space && !excerpt.is_empty() {
+            excerpt.push(' ');
+            kept_chars += 1;
+            if kept_chars >= MAX_ERROR_BODY_CHARS {
+                break;
+            }
+        }
+        excerpt.push(ch);
+        kept_chars += 1;
+        pending_space = false;
+    }
+
+    excerpt
 }
 
 // ── Keypair loading ───────────────────────────────────────────────────────────
@@ -629,6 +680,39 @@ mod tests {
             url_path("http://127.0.0.1:7545/z6Mk/myrepo/git-receive-pack"),
             "/z6Mk/myrepo/git-receive-pack"
         );
+    }
+
+    #[test]
+    fn http_error_message_sanitizes_response_body_controls() {
+        let message = http_error_message(
+            "GET",
+            "/info/refs",
+            reqwest::StatusCode::BAD_GATEWAY,
+            "\u{1b}[2Jrepository\r\nis\tblocked\u{7}",
+            None,
+        );
+
+        assert!(message.contains("repository is blocked"));
+        assert!(!message.contains('\u{1b}'));
+        assert!(!message.contains('\u{7}'));
+        assert!(!message.contains('\r'));
+        assert!(!message.contains('\n'));
+    }
+
+    #[test]
+    fn http_error_message_truncates_long_response_body() {
+        let body = "x".repeat(MAX_ERROR_BODY_CHARS + 100);
+        let message = http_error_message(
+            "POST",
+            "/git-receive-pack",
+            reqwest::StatusCode::FORBIDDEN,
+            &body,
+            None,
+        );
+        let prefix = "POST /git-receive-pack returned 403 Forbidden: ";
+
+        assert_eq!(message.len(), prefix.len() + MAX_ERROR_BODY_CHARS);
+        assert!(message.starts_with(prefix));
     }
 
     #[test]
