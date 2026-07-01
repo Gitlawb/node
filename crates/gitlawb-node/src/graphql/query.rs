@@ -52,34 +52,22 @@ impl QueryRoot {
         #[graphql(default = 20)] limit: i64,
     ) -> Result<Vec<RefUpdateType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
-        let mut updates = db
-            .list_ref_updates_filtered(repo.as_deref(), limit)
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
         // Gate each row on the same "/" visibility decision the repos resolver
         // uses, so anonymous callers get no row for a local repo they can't read
-        // (#112). Load the deduped local set + rules once; any DB error aborts
-        // (fail closed, never serve). The row slug is peer-supplied, so the pure
-        // filter treats it as untrusted input, not a lookup key. Applies to both
-        // the repo:Some and repo:None branches — the filter runs on whatever
-        // list_ref_updates_filtered returned. Remote (no local match) rows pass.
+        // (#112). The shared collector applies the fail-closed gate *before* the
+        // limit (paging past dropped private rows) so a small limit still returns
+        // the latest visible events, and keeps this surface byte-identical to the
+        // REST feed (#114). The row slug is peer-supplied, so the pure filter
+        // treats it as untrusted input; remote (no local match) rows pass.
         let caller = ctx
             .data::<crate::auth::AuthenticatedDid>()
             .ok()
             .map(|d| d.0.as_str());
-        let deduped = db
-            .list_all_repos_deduped()
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        let ids: Vec<String> = deduped.iter().map(|r| r.id.clone()).collect();
-        let rules = db
-            .list_visibility_rules_for_repos(&ids)
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        updates.retain(|u| {
-            crate::visibility::ref_update_row_visible(&deduped, &rules, caller, &u.repo)
-        });
+        let updates =
+            crate::api::events::collect_visible_ref_updates(db, repo.as_deref(), limit, caller)
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
 
         Ok(updates
             .into_iter()
@@ -318,5 +306,53 @@ mod tests {
         let schema = schema(db);
         let q = r#"{ refUpdates { repo } }"#;
         assert_eq!(count(&anon(&schema, q).await), 1);
+    }
+
+    // Scenario 7 (#114 P2) — a small limit must page past the newest rows when
+    // they are private, so the older public rows are still returned. Before the
+    // gate moved ahead of the limit this returned 0 (the newest `limit` rows were
+    // all private and got filtered after the SQL LIMIT). RED→GREEN.
+    #[sqlx::test]
+    async fn ref_updates_small_limit_pages_past_newest_private(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        db.create_repo(&repo("priv", OWNER, "secret", false))
+            .await
+            .unwrap();
+        // 3 older PUBLIC rows …
+        for i in 0..3 {
+            let mut r = ref_row(&format!("pub{i}"), "z6MkOwner/openrepo");
+            r.timestamp = format!("2026-07-01T10:00:0{i}+00:00");
+            db.insert_ref_update(&r).await.unwrap();
+        }
+        // … then 5 NEWER PRIVATE rows (the newest in the feed).
+        for i in 0..5 {
+            let mut r = ref_row(&format!("priv{i}"), "z6MkOwner/secret");
+            r.timestamp = format!("2026-07-01T10:00:1{i}+00:00");
+            db.insert_ref_update(&r).await.unwrap();
+        }
+        let schema = schema(db);
+        // limit 3 < the 5 newest (all private): anon must still get 3 public rows.
+        let q = r#"{ refUpdates(limit: 3) { repo } }"#;
+        let resp = anon(&schema, q).await;
+        assert_eq!(count(&resp), 3, "paging must reach the older public rows");
+        let async_graphql::Value::Object(obj) = &resp.data else {
+            unreachable!()
+        };
+        let async_graphql::Value::List(rows) = obj.get("refUpdates").unwrap() else {
+            unreachable!()
+        };
+        for row in rows {
+            let async_graphql::Value::Object(r) = row else {
+                unreachable!()
+            };
+            assert_eq!(
+                r.get("repo").unwrap(),
+                &async_graphql::Value::from("z6MkOwner/openrepo"),
+                "every returned row must be the public repo's"
+            );
+        }
     }
 }
