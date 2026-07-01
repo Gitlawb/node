@@ -324,6 +324,56 @@ mod authz_guard {
         })
     }
 
+    /// Collect `.rs` source files under `dir`. Recursive so the completeness scan
+    /// covers nested API modules (`api/<module>/mod.rs` and deeper), not only the
+    /// immediate `api/*.rs` children.
+    fn collect_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read api dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                out.extend(collect_rs_files(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn collect_rs_files_recurses_subdirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.rs"), "").unwrap();
+        std::fs::write(root.join("note.txt"), "").unwrap();
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::write(root.join("sub/mod.rs"), "").unwrap();
+        std::fs::write(root.join("sub/deep/c.rs"), "").unwrap();
+        let names: std::collections::HashSet<String> = collect_rs_files(root)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(names.contains("a.rs"));
+        assert!(
+            names.contains("sub/mod.rs"),
+            "nested module file must be collected"
+        );
+        assert!(
+            names.contains("sub/deep/c.rs"),
+            "deeply nested file must be collected"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with(".txt")),
+            "non-rs files excluded"
+        );
+        assert_eq!(names.len(), 3);
+    }
+
     /// Egress gate guard: every repo-scoped handler (`Path<(String, String..)>`)
     /// must carry an authz marker — a read gate (`authorize_repo_read` /
     /// `visibility_check`), or a write gate (`require_repo_owner` / `require_owner`
@@ -376,29 +426,32 @@ mod authz_guard {
                 "read-guard `sources` lists {f} but the file does not exist"
             );
         }
-        for entry in std::fs::read_dir(api_dir).expect("read src/api") {
-            let path = entry.expect("dir entry").path();
+        let api_root = std::path::Path::new(api_dir);
+        for path in collect_rs_files(api_root) {
             let fname = path.file_name().unwrap().to_string_lossy().into_owned();
-            if !fname.ends_with(".rs") || fname == "mod.rs" || listed.contains(fname.as_str()) {
+            // Skip the guard file itself (the top-level mod.rs) and files already
+            // covered by the per-handler loop. A nested module file (including a
+            // nested mod.rs) IS scanned, so a new api/<module>/ cannot smuggle in
+            // an ungated repo-scoped handler the scrape never looks at.
+            if path == api_root.join("mod.rs") || listed.contains(fname.as_str()) {
                 continue;
             }
             let src = std::fs::read_to_string(&path).expect("read api file");
             let has_repo_handler = handler_names(&src)
                 .iter()
                 .any(|n| is_repo_scoped(&fn_body(&src, n)));
+            let rel = path.strip_prefix(api_root).unwrap_or(path.as_path());
             assert!(
                 !has_repo_handler,
-                "api/{fname} declares a repo-scoped handler but is not in the egress \
-                 guard `sources` list — add it so its handlers are gate-checked"
+                "api/{} declares a repo-scoped handler but is not in the egress \
+                 guard `sources` list — add it so its handlers are gate-checked",
+                rel.display()
             );
         }
 
         // Repo-scoped reads known to be ungated today, each tracked by an issue.
         // Remove an entry the moment its gate lands (the staleness assert enforces it).
         let known_ungated: &[(&str, &str)] = &[
-            // info/refs gates only git-upload-pack today; git-receive-pack
-            // advertisement is ungated until #119 makes the gate unconditional.
-            ("git_info_refs", "#119"),
             ("list_certs", "#120"),
             ("get_cert", "#120"),
             ("list_issues", "#120"),

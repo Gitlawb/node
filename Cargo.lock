@@ -3300,10 +3300,11 @@ dependencies = [
 
 [[package]]
 name = "git-remote-gitlawb"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "gitlawb-core",
+ "mockito",
  "reqwest",
  "tracing",
  "tracing-subscriber",
@@ -3311,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-attest"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3328,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-core"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3355,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-node"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3411,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "gl"
-version = "0.3.9"
+version = "0.4.0"
 dependencies = [
  "alloy",
  "anyhow",
