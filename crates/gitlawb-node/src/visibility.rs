@@ -683,6 +683,21 @@ mod tests {
     }
 
     #[test]
+    fn feed_multi_segment_did_slug_kept_for_public() {
+        // Symmetric keep-side: a PUBLIC multi-segment-DID repo's row must still be
+        // returned to anon after the last-':'-segment normalization — guards
+        // against a regression that over-drops legitimate did:web rows.
+        let deduped = [rec("r1", "did:web:host:user", "widget", true)];
+        let rules = HashMap::new();
+        assert!(ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "did:web:host:user/widget"
+        ));
+    }
+
+    #[test]
     fn feed_malformed_slug_no_slash_kept_no_panic() {
         let deduped = [rec("r1", "did:key:z6MkOwner", "widget", false)];
         let rules = HashMap::new();
