@@ -9,6 +9,69 @@ use crate::auth::AuthenticatedDid;
 use crate::error::Result;
 use crate::state::AppState;
 
+/// Collect up to `limit` ref-update rows visible to `caller`, newest first,
+/// paging past rows the feed gate drops. Filtering after a plain SQL `LIMIT`
+/// under-serves an anonymous caller whenever the newest rows name private local
+/// repos (#114): the older, visible rows are never fetched, so a small limit can
+/// return zero. Over-fetch in bounded pages until `limit` visible rows are
+/// collected or the scan window is spent. Fail-closed: any DB error propagates
+/// rather than serving ungated rows, and the scan cap only ever returns fewer
+/// rows. Rows matching no local repo pass through (remote/gossip-only). Shared by
+/// the REST global feed (#114) and the GraphQL `ref_updates` resolver (#112) so
+/// the one gate cannot drift between the two surfaces.
+pub(crate) async fn collect_visible_ref_updates(
+    db: &crate::db::Db,
+    repo: Option<&str>,
+    limit: i64,
+    caller: Option<&str>,
+) -> Result<Vec<crate::db::ReceivedRefUpdate>> {
+    // 128 rows per DB round-trip. The page size is a parameter on the inner fn
+    // only so tests can force multi-page offset paging over a small dataset.
+    collect_visible_ref_updates_inner(db, repo, limit, caller, 128).await
+}
+
+async fn collect_visible_ref_updates_inner(
+    db: &crate::db::Db,
+    repo: Option<&str>,
+    limit: i64,
+    caller: Option<&str>,
+    page: i64,
+) -> Result<Vec<crate::db::ReceivedRefUpdate>> {
+    let want = limit.max(0) as usize;
+    let mut visible = Vec::with_capacity(want.min(200));
+    if want == 0 {
+        return Ok(visible);
+    }
+
+    // Gate inputs loaded once; DB errors abort (fail closed, never serve).
+    let deduped = db.list_all_repos_deduped().await?;
+    let ids: Vec<String> = deduped.iter().map(|r| r.id.clone()).collect();
+    let rules = db.list_visibility_rules_for_repos(&ids).await?;
+
+    // Never scan fewer rows than the caller asked for (no regression vs the old
+    // single LIMIT), but cap the walk so a feed of newest-private rows can't
+    // force an unbounded scan. The cap only fails safe (may return fewer).
+    let max_scan = limit.max(2_048);
+    let mut offset: i64 = 0;
+    while offset < max_scan {
+        let rows = db.list_ref_updates_page(repo, page, offset).await?;
+        let fetched = rows.len() as i64;
+        for u in rows {
+            if crate::visibility::ref_update_row_visible(&deduped, &rules, caller, &u.repo) {
+                visible.push(u);
+                if visible.len() == want {
+                    return Ok(visible);
+                }
+            }
+        }
+        offset += fetched;
+        if fetched < page {
+            break; // page under-filled → table exhausted
+        }
+    }
+    Ok(visible)
+}
+
 /// GET /api/v1/events/ref-updates?limit=50
 pub async fn list_ref_updates(
     State(state): State<AppState>,
@@ -21,18 +84,10 @@ pub async fn list_ref_updates(
         .unwrap_or(50)
         .min(200);
 
-    let mut updates = state.db.list_ref_updates(limit).await?;
-
-    // Fail-closed visibility gate (#114): drop any row matching a local repo the
-    // caller cannot read at root. DB errors `?`-propagate (500) rather than
-    // serving unfiltered rows. Rows matching no local repo pass through
-    // (remote/gossip-only). Mirrors the GraphQL feed gate (#112).
+    // Fail-closed visibility gate (#114), applied before the limit via paging so
+    // an anon caller still gets the latest visible events, not a short page.
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let deduped = state.db.list_all_repos_deduped().await?;
-    let ids: Vec<String> = deduped.iter().map(|r| r.id.clone()).collect();
-    let rules = state.db.list_visibility_rules_for_repos(&ids).await?;
-    updates
-        .retain(|u| crate::visibility::ref_update_row_visible(&deduped, &rules, caller, &u.repo));
+    let updates = collect_visible_ref_updates(&state.db, None, limit, caller).await?;
 
     let events: Vec<serde_json::Value> = updates
         .iter()
@@ -400,5 +455,95 @@ mod ref_updates_feed_tests {
         let body = body_json(resp).await;
         assert_eq!(slugs(&body), vec!["zZZZOTHER/gadget".to_string()]);
         assert_eq!(count(&body), 1);
+    }
+
+    // Scenario 7 (#114 P2) — a small limit must page past the newest rows when
+    // they are private, so the older public rows are still returned instead of a
+    // short/empty page. Before the gate moved ahead of the limit this returned 0.
+    // RED→GREEN.
+    #[sqlx::test]
+    async fn feed_small_limit_pages_past_newest_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_repo(&repo("priv", OWNER, "secret", false))
+            .await
+            .unwrap();
+        // 3 older PUBLIC rows …
+        for i in 0..3 {
+            let mut r = ref_row(&format!("pub{i}"), "z6MkOwner/openrepo");
+            r.timestamp = format!("2026-07-01T10:00:0{i}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+        // … then 5 NEWER PRIVATE rows (the newest in the feed).
+        for i in 0..5 {
+            let mut r = ref_row(&format!("priv{i}"), "z6MkOwner/secret");
+            r.timestamp = format!("2026-07-01T10:00:1{i}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/events/ref-updates?limit=3")
+            .body(Body::empty())
+            .expect("request builder");
+        let resp = router(state).oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        // The 3-row limit is filled from the older public rows, not left short.
+        assert_eq!(
+            count(&body),
+            3,
+            "limit must be filled from older public rows"
+        );
+        assert!(
+            slugs(&body).iter().all(|s| s == "z6MkOwner/openrepo"),
+            "returned rows must all be the public repo's, got {:?}",
+            slugs(&body)
+        );
+    }
+
+    // Scenario 8 (#114 P2) — multi-page paging: a page smaller than the dataset
+    // must still collect the requested visible rows from older pages, advancing
+    // the offset without skipping or duplicating. page=2 over 5 newest-private +
+    // 3 older-public rows spans four fetches (offset 0→2→4→6). Guards the offset
+    // paging that the single-page feed tests above can't reach.
+    #[sqlx::test]
+    async fn collect_visible_pages_across_page_boundary(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_repo(&repo("priv", OWNER, "secret", false))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            let mut r = ref_row(&format!("pub{i}"), "z6MkOwner/openrepo");
+            r.timestamp = format!("2026-07-01T10:00:0{i}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+        for i in 0..5 {
+            let mut r = ref_row(&format!("priv{i}"), "z6MkOwner/secret");
+            r.timestamp = format!("2026-07-01T10:00:1{i}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+
+        let got = super::collect_visible_ref_updates_inner(&state.db, None, 3, None, 2)
+            .await
+            .unwrap();
+        // All 3 older public rows, collected across four pages …
+        let got_slugs: Vec<&str> = got.iter().map(|u| u.repo.as_str()).collect();
+        assert_eq!(got_slugs, vec!["z6MkOwner/openrepo"; 3]);
+        // … each exactly once (no duplicate rows across page boundaries).
+        let unique: std::collections::HashSet<&str> = got.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(unique.len(), 3, "no row returned twice across pages");
     }
 }
