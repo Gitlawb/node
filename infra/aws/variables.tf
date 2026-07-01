@@ -82,6 +82,28 @@ variable "image_tag" {
 }
 
 # ---------------------------------------------------------------------------
+# iCaptcha proof-of-intelligence gate (spam protection on writes)
+# ---------------------------------------------------------------------------
+
+variable "icaptcha_mode" {
+  description = "iCaptcha gate mode: off | shadow | enforce. The live gitlawb network enforces."
+  type        = string
+  default     = "enforce"
+}
+
+variable "icaptcha_pubkey" {
+  description = "base64url Ed25519 public key of the iCaptcha service, pinned so startup doesn't depend on fetching it. This is the live icaptcha.gitlawb.com key."
+  type        = string
+  default     = "xjyPNqIbvc9U-kwXW6u9mDqRJ7E2UUMOaJdUWhpEXq8"
+}
+
+variable "icaptcha_required_level" {
+  description = "Minimum iCaptcha proof level required to pass the gate."
+  type        = number
+  default     = 3
+}
+
+# ---------------------------------------------------------------------------
 # Networking / ingress
 # ---------------------------------------------------------------------------
 

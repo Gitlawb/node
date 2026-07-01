@@ -205,7 +205,7 @@ pub async fn create_repo(
     }
 
     // Request is admissible — spend the proof now, immediately before the write.
-    proof.consume(&state.db).await?;
+    let verified_proof = proof.consume(&state.db).await?;
 
     let disk_path = state
         .repo_store
@@ -229,6 +229,14 @@ pub async fn create_repo(
     };
 
     state.db.create_repo(&record).await?;
+
+    // Persist the proof so it can travel with the repo and a mirroring peer can
+    // re-verify it (enforce-mode origins only; off/shadow yield no proof here).
+    if let Some(p) = verified_proof {
+        if let Err(e) = p.record_for_repo(&state.db, &record.id).await {
+            tracing::warn!(repo = %req.name, err = %e, "failed to record iCaptcha proof for repo");
+        }
+    }
 
     tracing::info!(repo = %req.name, owner = %owner_did, "created repository");
 
@@ -489,6 +497,12 @@ pub async fn git_info_refs(
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
 
+    // A quarantined mirror is served to no one (clone or push advertisement) —
+    // hidden as repo-not-found until an operator releases it.
+    if state.db.is_repo_quarantined(&record.id).await? {
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
+
     let service = query
         .service
         .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
@@ -549,6 +563,11 @@ pub async fn git_upload_pack(
         .get_repo(&owner, name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+
+    // A quarantined mirror is never served for clone/fetch.
+    if state.db.is_repo_quarantined(&record.id).await? {
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
 
     let rules = state.db.list_visibility_rules(&record.id).await?;
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
@@ -780,6 +799,12 @@ pub async fn git_receive_pack(
         .get_repo(&owner, name)
         .await?
         .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+
+    // A quarantined mirror is hidden from every git endpoint, push included —
+    // it must not accept writes while withheld from clone/fetch.
+    if state.db.is_repo_quarantined(&record.id).await? {
+        return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+    }
 
     // Parse ref updates from pkt-line body before handing to git
     let ref_updates = parse_ref_updates(&body);
@@ -1457,7 +1482,7 @@ pub async fn fork_repo(
     }
 
     // Request is admissible — spend the proof now, immediately before the write.
-    proof.consume(&state.db).await?;
+    let verified_proof = proof.consume(&state.db).await?;
 
     // Ensure source repo is on local disk (downloads from Tigris on cache miss)
     let source_path = state
@@ -1509,9 +1534,38 @@ pub async fn fork_repo(
 
     state.db.create_repo(&record).await?;
 
+    // Persist the proof so the fork carries it when it propagates to peers.
+    if let Some(p) = verified_proof {
+        if let Err(e) = p.record_for_repo(&state.db, &record.id).await {
+            tracing::warn!(fork = %fork_name, err = %e, "failed to record iCaptcha proof for fork");
+        }
+    }
+
     tracing::info!(fork = %fork_name, source = %source.name, forker = %forker_did, "forked repository");
 
     Ok((StatusCode::CREATED, Json(to_response(&record, &state, 0))))
+}
+
+/// GET /api/v1/repos/{owner}/{repo}/icaptcha-proof
+///
+/// Returns the iCaptcha proof token this repo was created with (`null` if none).
+/// A peer mirroring this repo fetches it and re-verifies it offline before
+/// admitting the mirror (see [`crate::icaptcha::admit_mirror`]). Not owner-gated,
+/// but gated on whole-repo `"/"` read like the other replication endpoints, so a
+/// private repo's proof is never disclosed.
+pub async fn get_icaptcha_proof(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
+    Path((owner, repo)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>> {
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
+    let proof = state.db.get_repo_proof_token(&record.id).await?;
+    Ok(Json(serde_json::json!({
+        "repo": format!("{owner}/{repo}"),
+        "proof": proof,
+    })))
 }
 
 // ── Pkt-line parsing ──────────────────────────────────────────────────────

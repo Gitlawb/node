@@ -290,16 +290,19 @@ locals {
   )
 
   compose_yaml = templatefile("${path.module}/compose.yaml.tftpl", {
-    image_repo     = local.image_repo
-    image_tag      = var.image_tag
-    domain_name    = var.domain_name
-    db_host        = var.use_rds ? aws_db_instance.node[0].address : ""
-    gitlawb_port   = var.gitlawb_port
-    p2p_port       = var.gitlawb_p2p_port
-    metrics_port   = var.metrics_port
-    expose_metrics = local.expose_metrics
-    pg_user        = var.postgres_user
-    pg_db          = var.postgres_db
+    image_repo              = local.image_repo
+    image_tag               = var.image_tag
+    domain_name             = var.domain_name
+    db_host                 = var.use_rds ? aws_db_instance.node[0].address : ""
+    gitlawb_port            = var.gitlawb_port
+    p2p_port                = var.gitlawb_p2p_port
+    metrics_port            = var.metrics_port
+    expose_metrics          = local.expose_metrics
+    pg_user                 = var.postgres_user
+    pg_db                   = var.postgres_db
+    icaptcha_mode           = var.icaptcha_mode
+    icaptcha_pubkey         = var.icaptcha_pubkey
+    icaptcha_required_level = var.icaptcha_required_level
   })
 
   user_data = templatefile("${path.module}/user-data.sh.tftpl", {

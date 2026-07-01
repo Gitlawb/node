@@ -31,6 +31,15 @@ use crate::error::AppError;
 
 const PROOF_HEADER: &str = "x-icaptcha-proof";
 
+/// How long a mirror-admission `jti` stays in the replay ledger. The direct
+/// request path spends a proof against its own `exp` (it can't be presented once
+/// expired). The propagation path deliberately accepts already-expired proofs,
+/// so spending against `exp` would store an already-past expiry that the next
+/// sweep deletes — letting the same token admit another mirror minutes later.
+/// We instead retain the mirror replay record for a long, fixed window so the
+/// per-node single-use property is durable.
+const MIRROR_REPLAY_RETENTION_SECS: i64 = 365 * 24 * 60 * 60;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Off,
@@ -176,9 +185,40 @@ enum Decision {
     Allow,
     /// Enforce mode and verification failed; reject with this reason.
     Reject(String),
-    /// Enforce mode and the proof verified; the caller must consume this `jti`
-    /// (and reject replays) before allowing.
-    Consume { jti: String, exp: i64 },
+    /// Enforce mode and the proof verified; the caller must consume its `jti`
+    /// (and reject replays) before allowing, then may persist it.
+    Consume(VerifiedProof),
+}
+
+/// A verified proof: the raw token plus the claims we act on. Carried by a
+/// [`ProofGuard`] so that, once consumed, the gated handler can persist it with
+/// the created repo — letting the proof travel with the repo when it propagates
+/// to peers (see [`admit_mirror`]).
+#[derive(Debug)]
+pub struct VerifiedProof {
+    token: String,
+    sub: String,
+    level: u32,
+    jti: String,
+    exp: i64,
+}
+
+impl VerifiedProof {
+    /// Persist this proof against a freshly-created repo so a mirroring peer can
+    /// re-verify it. Best-effort callers may ignore failures; the gate's
+    /// security does not depend on it (propagation just falls back to quarantine).
+    pub async fn record_for_repo(&self, db: &crate::db::Db, repo_id: &str) -> Result<(), AppError> {
+        db.record_repo_proof(
+            repo_id,
+            &self.token,
+            &self.sub,
+            self.level as i32,
+            &self.jti,
+            self.exp,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// A verified proof awaiting consumption. Verification (which rejects invalid or
@@ -187,25 +227,24 @@ enum Decision {
 /// The caller must `consume()` this guard immediately before the gated write.
 /// For off/shadow/inert there is nothing to consume.
 #[must_use = "a verified iCaptcha proof must be consumed before the gated action"]
-pub struct ProofGuard(Option<ConsumeJob>);
-
-struct ConsumeJob {
-    jti: String,
-    exp: i64,
-}
+pub struct ProofGuard(Option<VerifiedProof>);
 
 impl ProofGuard {
-    /// Spend the proof's `jti` (single-use). A replay is rejected. No-op when
-    /// there is nothing to consume (off/shadow/inert).
-    pub async fn consume(self, db: &crate::db::Db) -> Result<(), AppError> {
-        if let Some(job) = self.0 {
-            if !db.consume_proof_jti(&job.jti, job.exp).await? {
-                return Err(AppError::IcaptchaProofRequired(
-                    "iCaptcha proof already used (replay); solve a fresh challenge".to_string(),
-                ));
+    /// Spend the proof's `jti` (single-use) and return the verified proof so the
+    /// caller can persist it. A replay is rejected. Returns `None` when there is
+    /// nothing to consume (off/shadow/inert).
+    pub async fn consume(self, db: &crate::db::Db) -> Result<Option<VerifiedProof>, AppError> {
+        match self.0 {
+            Some(p) => {
+                if !db.consume_proof_jti(&p.jti, p.exp).await? {
+                    return Err(AppError::IcaptchaProofRequired(
+                        "iCaptcha proof already used (replay); solve a fresh challenge".to_string(),
+                    ));
+                }
+                Ok(Some(p))
             }
+            None => Ok(None),
         }
-        Ok(())
     }
 }
 
@@ -221,7 +260,7 @@ pub fn verify_request(headers: &HeaderMap, did: &str) -> Result<ProofGuard, AppE
     match decide(v, headers, did, now_secs()) {
         Decision::Allow => Ok(ProofGuard(None)),
         Decision::Reject(reason) => Err(reject_error(v, &reason)),
-        Decision::Consume { jti, exp } => Ok(ProofGuard(Some(ConsumeJob { jti, exp }))),
+        Decision::Consume(proof) => Ok(ProofGuard(Some(proof))),
     }
 }
 
@@ -247,12 +286,21 @@ fn decide(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Decision {
         return Decision::Allow;
     }
 
-    match verify(v, headers, did, now) {
-        Ok(claims) => match v.mode {
-            Mode::Enforce => Decision::Consume {
+    let token = headers.get(PROOF_HEADER).and_then(|h| h.to_str().ok());
+    let result = match token {
+        Some(t) => verify_token(v, t, did, now, true).map(|claims| (t, claims)),
+        None => Err("missing proof header".to_string()),
+    };
+
+    match result {
+        Ok((token, claims)) => match v.mode {
+            Mode::Enforce => Decision::Consume(VerifiedProof {
+                token: token.to_string(),
+                sub: claims.sub,
+                level: claims.level,
                 jti: claims.jti,
                 exp: claims.exp,
-            },
+            }),
             // Shadow/Off: never reject, and do not consume (observational only).
             _ => Decision::Allow,
         },
@@ -267,16 +315,34 @@ fn decide(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Decision {
     }
 }
 
-/// Core verification, separated for testability. Returns the validated claims.
-/// `now` is unix seconds.
+/// Header-extracting wrapper over [`verify_token`] (enforces expiry). The
+/// production path inlines this in [`decide`]; retained as the unit-test entry
+/// point that also exercises header extraction.
+#[cfg(test)]
 fn verify(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Result<ProofClaims, String> {
-    let key = v.key.as_ref().ok_or("verifier has no public key")?;
     let proof = headers
         .get(PROOF_HEADER)
         .and_then(|h| h.to_str().ok())
         .ok_or("missing proof header")?;
+    verify_token(v, proof, did, now, true)
+}
 
-    let (payload, sig_b64) = proof.split_once('.').ok_or("malformed proof")?;
+/// Core verification of a raw proof token, separated for testability and reuse.
+/// Checks the Ed25519 signature, the required level, and the DID binding. `exp`
+/// is only enforced when `check_exp` is true: the direct request path enforces
+/// freshness, but the propagation path ([`admit_mirror`]) does not — a proof has
+/// usually expired by the time a repo mirrors, and the origin enforced freshness
+/// at creation. `now` is unix seconds.
+fn verify_token(
+    v: &Verifier,
+    token: &str,
+    did: &str,
+    now: i64,
+    check_exp: bool,
+) -> Result<ProofClaims, String> {
+    let key = v.key.as_ref().ok_or("verifier has no public key")?;
+
+    let (payload, sig_b64) = token.split_once('.').ok_or("malformed proof")?;
     let sig_bytes = URL_SAFE_NO_PAD
         .decode(sig_b64)
         .map_err(|_| "bad signature encoding")?;
@@ -289,7 +355,7 @@ fn verify(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Result<Proo
         .map_err(|_| "bad payload encoding")?;
     let claims: ProofClaims = serde_json::from_slice(&claims_bytes).map_err(|_| "bad claims")?;
 
-    if claims.exp < now {
+    if check_exp && claims.exp < now {
         return Err("proof expired".to_string());
     }
     if claims.level < v.required_level {
@@ -302,6 +368,93 @@ fn verify(v: &Verifier, headers: &HeaderMap, did: &str, now: i64) -> Result<Proo
         return Err("proof subject does not match authenticated DID".to_string());
     }
     Ok(claims)
+}
+
+/// Outcome of admitting a repo mirrored from a peer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MirrorAdmission {
+    /// Admit the mirror normally (off/shadow/inert, or a valid proof in enforce).
+    Admit,
+    /// Enforce mode and the mirror's proof is missing/invalid/replayed — mirror
+    /// it but quarantine until an operator releases it. Carries the reason.
+    Quarantine(String),
+}
+
+/// Decide whether to admit a repo being mirrored from a peer, given the proof
+/// token the origin served (`None` if it had none or the fetch failed) and the
+/// mirrored repo's owner DID.
+///
+/// Off/shadow/inert always admit (shadow logs the would-be quarantine and writes
+/// nothing). In enforce mode the proof is re-verified offline against the local
+/// public key — signature, level, and owner-DID binding, but NOT expiry — and
+/// its `jti` is consumed in the local ledger, so one solved challenge admits at
+/// most one mirror per node (a malicious origin cannot reuse one proof to bless
+/// many spam repos here).
+///
+/// LIMITATION (proof is not repo-bound): an iCaptcha proof commits only to the
+/// solver's DID (`sub`), never to a repo — the proof is minted before the repo
+/// exists. So the guarantee enforced here is "a level≥N challenge was solved by
+/// this repo's owner DID", not "the owner intended THIS repo". A malicious origin
+/// that harvests a victim's public proof (served by `get_icaptcha_proof`) can use
+/// it to get ONE spam repo nominally owned by that victim admitted per node — the
+/// per-node `jti` single-use caps the amplification at one repo per distinct
+/// harvested proof, but does not eliminate it. Fully binding a proof to a repo
+/// would require the iCaptcha service to embed a repo/target identifier in the
+/// signed challenge (a protocol change, tracked as future work).
+pub async fn admit_mirror(
+    db: &crate::db::Db,
+    token: Option<&str>,
+    owner_did: &str,
+) -> MirrorAdmission {
+    let v = match VERIFIER.get() {
+        Some(v) => v,
+        None => return MirrorAdmission::Admit, // not initialized -> inert
+    };
+    // Off, or inert because no key could be loaded: admit unconditionally.
+    if v.mode == Mode::Off || v.key.is_none() {
+        return MirrorAdmission::Admit;
+    }
+    let shadow = v.mode == Mode::Shadow;
+
+    // Quarantine in enforce; in shadow just log and admit (observational, no IO).
+    let quarantine = |reason: String| -> MirrorAdmission {
+        if shadow {
+            tracing::warn!(owner = %owner_did, reason, "iCaptcha (shadow) would quarantine mirror");
+            MirrorAdmission::Admit
+        } else {
+            MirrorAdmission::Quarantine(reason)
+        }
+    };
+
+    let token = match token {
+        Some(t) => t,
+        None => return quarantine("origin served no iCaptcha proof".to_string()),
+    };
+
+    match verify_token(v, token, owner_did, now_secs(), false) {
+        Ok(claims) => {
+            if shadow {
+                // Observational: a valid proof would admit. Do not consume, so a
+                // later switch to enforce still sees the jti as fresh.
+                return MirrorAdmission::Admit;
+            }
+            // Retain the replay record on a fixed forward window, NOT the proof's
+            // own (already-past) exp — otherwise the next sweep frees the jti and
+            // the same token could admit another mirror here.
+            let retain_until = now_secs().saturating_add(MIRROR_REPLAY_RETENTION_SECS);
+            match db.consume_proof_jti(&claims.jti, retain_until).await {
+                Ok(true) => MirrorAdmission::Admit,
+                Ok(false) => MirrorAdmission::Quarantine(
+                    "iCaptcha proof already used to admit another mirror".to_string(),
+                ),
+                Err(e) => {
+                    tracing::warn!(owner = %owner_did, err = %e, "iCaptcha mirror ledger error; quarantining");
+                    MirrorAdmission::Quarantine("iCaptcha proof ledger unavailable".to_string())
+                }
+            }
+        }
+        Err(reason) => quarantine(reason),
+    }
 }
 
 #[cfg(test)]
@@ -435,11 +588,46 @@ mod tests {
         // the caller can spend it once and reject replays.
         let v = verifier(3);
         match decide(&v, &headers_with(PROOF), SUB, IAT) {
-            Decision::Consume { jti, exp } => {
-                assert_eq!(jti, "4b5228a5bed7122dee9f47ff");
-                assert_eq!(exp, 1782573151);
+            Decision::Consume(p) => {
+                assert_eq!(p.jti, "4b5228a5bed7122dee9f47ff");
+                assert_eq!(p.exp, 1782573151);
+                assert_eq!(p.token, PROOF, "the raw token is retained for persistence");
+                assert_eq!(p.sub, SUB);
             }
             other => panic!("expected Consume, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn propagation_accepts_an_expired_proof() {
+        // The mirror-admission path verifies sig/level/DID but NOT expiry, since a
+        // proof has usually expired by the time a repo propagates. The same proof
+        // that the direct path rejects as expired must verify here.
+        let v = verifier(3);
+        let now = 9_999_999_999; // far past the proof's exp
+        assert!(
+            verify_token(&v, PROOF, SUB, now, true).is_err(),
+            "direct path (check_exp=true) rejects the expired proof"
+        );
+        assert!(
+            verify_token(&v, PROOF, SUB, now, false).is_ok(),
+            "propagation path (check_exp=false) accepts it"
+        );
+    }
+
+    #[test]
+    fn propagation_still_enforces_signature_level_and_did() {
+        let v = verifier(3);
+        // wrong owner DID
+        assert!(verify_token(&v, PROOF, "did:key:zother", IAT, false).is_err());
+        // insufficient level
+        let v5 = verifier(5);
+        assert!(verify_token(&v5, PROOF, SUB, IAT, false).is_err());
+        // tampered signature
+        let (payload, sig) = PROOF.split_once('.').unwrap();
+        let mut chars: Vec<char> = sig.chars().collect();
+        chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
+        let tampered = format!("{}.{}", payload, chars.into_iter().collect::<String>());
+        assert!(verify_token(&v, &tampered, SUB, IAT, false).is_err());
     }
 }

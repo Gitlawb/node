@@ -11,7 +11,11 @@ members = [
 [workspace.package]
 # Per-crate versions live in each crate's [package] so release-please can manage
 # them (it cannot rewrite an inherited `version.workspace = true`). They are kept
-# in lockstep by release-please's Rust workspace strategy.
+# in lockstep by release-please's generic updater: each crate's `version` line
+# carries an `# x-release-please-version` annotation and is listed under
+# `extra-files` in release-please-config.json. The release type is `simple`
+# (not `rust`) because the rust strategy unconditionally tries to rewrite this
+# virtual workspace root as a package manifest and errors out.
 edition = "2021"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"

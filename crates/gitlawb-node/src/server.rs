@@ -382,6 +382,10 @@ pub fn build_router(state: AppState) -> Router {
             axum::routing::get(visibility::withheld_paths),
         )
         .route(
+            "/api/v1/repos/{owner}/{repo}/icaptcha-proof",
+            axum::routing::get(repos::get_icaptcha_proof),
+        )
+        .route(
             "/api/v1/repos/{owner}/{repo}/encrypted-blobs",
             axum::routing::get(crate::api::encrypted::list_encrypted_blobs),
         )
