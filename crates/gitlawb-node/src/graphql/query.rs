@@ -49,7 +49,11 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         repo: Option<String>,
-        #[graphql(default = 20)] limit: i64,
+        #[graphql(
+            default = 20,
+            desc = "Max 200; larger requests return the newest 200 rows (no continuation cursor)."
+        )]
+        limit: i64,
     ) -> Result<Vec<RefUpdateType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
 
@@ -354,5 +358,22 @@ mod tests {
                 "every returned row must be the public repo's"
             );
         }
+    }
+
+    // Scenario 8 — a quarantined mirror is withheld on the GraphQL surface too.
+    // Guards that the resolver keeps delegating to the shared collector (where the
+    // quarantine fold lives); a REST-only test would miss a resolver that stopped.
+    #[sqlx::test]
+    async fn ref_updates_quarantined_mirror_dropped_for_anon(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6MkQuar", "secret", "/tmp/q", None, true)
+            .await
+            .unwrap();
+        db.insert_ref_update(&ref_row("u1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+        let schema = schema(db);
+        let q = r#"{ refUpdates { repo } }"#;
+        assert_eq!(count(&anon(&schema, q).await), 0);
     }
 }

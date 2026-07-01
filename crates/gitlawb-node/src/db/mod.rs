@@ -1069,6 +1069,22 @@ impl Db {
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
+    /// Repos currently quarantined (admitted as mirrors but withheld from every
+    /// listing surface). `list_all_repos_deduped` excludes these (its `DEDUP_CTE`
+    /// filters `quarantined = FALSE`), so a gate that resolves a slug against the
+    /// deduped set must also match against these and fail closed, or a quarantined
+    /// repo's row is misclassified as remote/gossip-only and served.
+    pub async fn list_quarantined_repos(&self) -> Result<Vec<RepoRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE quarantined = TRUE",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
     /// Count of distinct logical repos (mirror + canonical collapsed). Uses the
     /// same did:key-aware owner-key grouping as `DEDUP_CTE` (the CASE must stay
     /// byte-identical); the marker/tiebreak only decide which row would survive,

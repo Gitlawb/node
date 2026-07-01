@@ -9,6 +9,10 @@ use crate::auth::AuthenticatedDid;
 use crate::error::Result;
 use crate::state::AppState;
 
+/// Hard ceiling on rows any ref-update feed returns in one request. Shared by the
+/// shared collector's clamp and the per-handler request caps so they can't drift.
+const MAX_VISIBLE_REF_UPDATES: i64 = 200;
+
 /// Collect up to `limit` ref-update rows visible to `caller`, newest first,
 /// paging past rows the feed gate drops. Filtering after a plain SQL `LIMIT`
 /// under-serves an anonymous caller whenever the newest rows name private local
@@ -37,21 +41,37 @@ async fn collect_visible_ref_updates_inner(
     caller: Option<&str>,
     page: i64,
 ) -> Result<Vec<crate::db::ReceivedRefUpdate>> {
-    let want = limit.max(0) as usize;
-    let mut visible = Vec::with_capacity(want.min(200));
+    // Clamp the effective limit inside the shared collector so both callers are
+    // bounded: REST already caps at MAX_VISIBLE_REF_UPDATES, but the GraphQL
+    // resolver passes its caller-provided limit straight through, which would
+    // otherwise let a large request return unbounded rows and scan unbounded DB
+    // rows.
+    let bounded_limit = limit.clamp(0, MAX_VISIBLE_REF_UPDATES);
+    let want = bounded_limit as usize;
+    let mut visible = Vec::with_capacity(want);
     if want == 0 {
         return Ok(visible);
     }
 
     // Gate inputs loaded once; DB errors abort (fail closed, never serve).
-    let deduped = db.list_all_repos_deduped().await?;
+    let mut deduped = db.list_all_repos_deduped().await?;
+    // Quarantined mirrors are withheld from every listing surface but excluded
+    // from the deduped set; fold them in with is_public=false so a matching feed
+    // row fails closed instead of being served as a remote row. is_public=false is
+    // the load-bearing control: mirrors carry no visibility rules today, but if a
+    // rule ever became addressable by a mirror id, is_public=false still denies.
+    let mut quarantined = db.list_quarantined_repos().await?;
+    for q in &mut quarantined {
+        q.is_public = false;
+    }
+    deduped.extend(quarantined);
     let ids: Vec<String> = deduped.iter().map(|r| r.id.clone()).collect();
     let rules = db.list_visibility_rules_for_repos(&ids).await?;
 
     // Never scan fewer rows than the caller asked for (no regression vs the old
     // single LIMIT), but cap the walk so a feed of newest-private rows can't
     // force an unbounded scan. The cap only fails safe (may return fewer).
-    let max_scan = limit.max(2_048);
+    let max_scan = bounded_limit.max(2_048);
     let mut offset: i64 = 0;
     while offset < max_scan {
         let rows = db.list_ref_updates_page(repo, page, offset).await?;
@@ -82,7 +102,7 @@ pub async fn list_ref_updates(
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(50)
-        .min(200);
+        .min(MAX_VISIBLE_REF_UPDATES);
 
     // Fail-closed visibility gate (#114), applied before the limit via paging so
     // an anon caller still gets the latest visible events, not a short page.
@@ -124,7 +144,7 @@ pub async fn list_repo_events(
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(50)
-        .min(200);
+        .min(MAX_VISIBLE_REF_UPDATES);
 
     // Look up the repo record once so we can use the full owner DID
     let repo_record = state.db.get_repo(&owner, &repo_name).await.ok().flatten();
@@ -545,5 +565,57 @@ mod ref_updates_feed_tests {
         // … each exactly once (no duplicate rows across page boundaries).
         let unique: std::collections::HashSet<&str> = got.iter().map(|u| u.id.as_str()).collect();
         assert_eq!(unique.len(), 3, "no row returned twice across pages");
+    }
+
+    // Scenario 9 — an oversized limit (the GraphQL resolver passes its
+    // caller-provided limit uncapped) must be clamped inside the shared collector
+    // so it can't return unbounded rows or scan unbounded DB rows.
+    #[sqlx::test]
+    async fn collect_visible_clamps_oversized_limit(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        // 201 public rows — one more than the 200 cap.
+        for i in 0..201 {
+            let mut r = ref_row(&format!("pub{i}"), "z6MkOwner/openrepo");
+            r.timestamp = format!("2026-07-01T10:00:00.{i:04}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+
+        let got = super::collect_visible_ref_updates_inner(&state.db, None, 100_000, None, 128)
+            .await
+            .unwrap();
+        assert_eq!(got.len(), 200, "oversized limit must clamp to 200");
+    }
+
+    // Scenario 10 — a quarantined mirror is withheld from every listing surface.
+    // Its rows are excluded from list_all_repos_deduped, so without folding them
+    // into the match universe the gate would misclassify the row as remote and
+    // serve it to anon.
+    #[sqlx::test]
+    async fn feed_quarantined_mirror_withheld_from_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        // Quarantined mirror: admitted but unvalidated, withheld from listings.
+        state
+            .db
+            .upsert_mirror_repo("z6MkQuar", "secret", "/tmp/q", None, true)
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+
+        let resp = router(state).oneshot(anon_get()).await.unwrap();
+        let body = body_json(resp).await;
+        assert!(
+            slugs(&body).is_empty(),
+            "quarantined mirror's ref-update must be withheld from anon, got {:?}",
+            slugs(&body)
+        );
     }
 }
