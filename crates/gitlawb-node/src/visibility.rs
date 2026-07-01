@@ -167,11 +167,22 @@ pub fn ref_update_row_visible(
         return true;
     };
 
-    // Normalize the slug's owner to the same short-key form `record_key` (below)
-    // and the dedup grouping use: the last ':'-delimited segment. Using the same
-    // rule on both sides keeps the match symmetric for every DID method, not just
-    // `did:key` — a `did:web:host:user` owner and its full-DID slug normalize to
-    // the same segment instead of failing the prefix test and over-serving.
+    // Reduce the slug's owner to its last ':'-delimited segment — the SAME lossy
+    // form the emitter broadcasts. `publish_ref_update` (api/repos.rs) builds the
+    // wire slug as `{last-segment-of-owner_did}/{name}`, so a repo's own canonical
+    // ref-update rows always arrive keyed by that trailing segment. Matching on it
+    // is what lets the gate recognize, and (when private) drop, a repo's own rows.
+    //
+    // This intentionally diverges from `did_matches` / `DEDUP_CTE`, which strip
+    // only bare `did:key:` and keep other DID methods whole. Those compare
+    // trusted, canonical owner DIDs; this slug is untrusted and already
+    // method-stripped by the emitter, so applying that keep-whole rule here would
+    // fail open — a private `did:web:host:user` repo's short slug `user/name`
+    // would not prefix-match the whole `did:web:host:user` record and would leak.
+    // The price of the stricter rule is a fail-SAFE over-drop when a remote owner
+    // shares both a trailing segment and a repo name with a local private repo
+    // (negligible for full did:key ids; only did:web / truncated forms collide):
+    // it can hide a genuinely remote row, never serve a private local one.
     let row_key = owner_part.split(':').next_back().unwrap_or(owner_part);
 
     // A record matches the slug when its name is equal and one owner key is a
@@ -666,12 +677,29 @@ mod tests {
     }
 
     #[test]
+    fn feed_private_didweb_short_slug_dropped_for_anon() {
+        // The canonical, load-bearing case for the last-segment normalization:
+        // the emitter broadcasts a did:web repo's rows under the SHORT slug
+        // `{last-segment}/{name}` (publish_ref_update, api/repos.rs). A private
+        // such repo must drop that slug for anon. A did:key-aware (keep-whole)
+        // rule would fail to match `alice` against `did:web:host:alice` and leak.
+        let deduped = [rec("r1", "did:web:host:alice", "widget", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "alice/widget"
+        ));
+    }
+
+    #[test]
     fn feed_multi_segment_did_slug_dropped_for_anon() {
-        // A private repo owned by a multi-segment DID (e.g. did:web) must still
-        // fail closed when a peer stores the row under the full-DID slug form.
-        // Both sides normalize to the last ':' segment ("user"), so they match
-        // and the row drops. The old strip-only-`did:key:` normalization left
-        // row_key as the whole DID here, missed the match, and over-served.
+        // A private repo owned by a multi-segment DID must also fail closed when a
+        // peer *crafts* the row under the full-DID slug form. This form is
+        // non-canonical (the emitter only ever broadcasts the short slug above),
+        // but the gate still drops it: both sides reduce to the last ':' segment
+        // ("user"), so they match. Fail-safe against a hand-forged slug.
         let deduped = [rec("r1", "did:web:host:user", "widget", false)];
         let rules = HashMap::new();
         assert!(!ref_update_row_visible(
