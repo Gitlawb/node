@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 gitlawb-core = { path = "../gitlawb-core" }
+icaptcha-client = { path = "../icaptcha-client" }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }

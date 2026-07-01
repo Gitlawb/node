@@ -19,7 +19,33 @@
 use anyhow::{bail, Context, Result};
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
+use icaptcha_client::IcaptchaCfg;
 use std::io::{self, BufRead, Read, Write};
+
+/// Max iCaptcha solve+retry attempts on a 403 push response.
+const ICAPTCHA_MAX_RETRIES: u32 = 2;
+
+/// If a 403 response advertises an iCaptcha challenge (`x-icaptcha-*` headers),
+/// build the solve config binding the proof `sub` to our DID. `None` for a
+/// non-iCaptcha 403 or when there's no keypair to bind to.
+fn icaptcha_cfg_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    keypair: Option<&Keypair>,
+) -> Option<IcaptchaCfg> {
+    let url = headers.get("x-icaptcha-url").and_then(|v| v.to_str().ok());
+    let level = headers
+        .get("x-icaptcha-level")
+        .and_then(|v| v.to_str().ok());
+    if url.is_none() && level.is_none() {
+        return None;
+    }
+    let kp = keypair?;
+    Some(IcaptchaCfg::new(
+        kp.did().to_string(),
+        url.map(str::to_string),
+        level.and_then(|l| l.parse().ok()),
+    ))
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -269,37 +295,56 @@ fn handle_connect(
     // Extract the URL path for signing (e.g., "/z6Mk.../my-repo/git-receive-pack")
     let path_for_sig = url_path(&post_url);
 
-    let mut req = client
-        .post(&post_url)
-        .header("Content-Type", format!("application/x-{}-request", service))
-        .header("User-Agent", "git/2.0 git-remote-gitlawb/0.1.0");
+    // Send the pack, signing push (git-receive-pack) with RFC 9421. If the node
+    // ever answers a push with a 403 iCaptcha challenge (push is signed-only
+    // today, so this is a safety net), solve it and retry with the proof header —
+    // the same flow `gl` uses. The happy path moves the body (no clone); a clone
+    // happens only on the rare retry.
+    let mut proof: Option<String> = None;
+    let mut attempts = 0u32;
+    let pack_resp = loop {
+        let mut req = client
+            .post(&post_url)
+            .header("Content-Type", format!("application/x-{}-request", service))
+            .header("User-Agent", "git/2.0 git-remote-gitlawb/0.4.0");
 
-    // Add RFC 9421 HTTP Signature auth on push operations
-    if service == "git-receive-pack" {
-        if let Some(kp) = keypair {
-            let signed = sign_request(kp, "POST", &path_for_sig, &request_body);
-            req = req
-                .header("Content-Digest", signed.content_digest)
-                .header("Signature-Input", signed.signature_input)
-                .header("Signature", signed.signature);
-            tracing::debug!("attached RFC 9421 HTTP Signature (DID: {})", kp.did());
-        } else {
-            tracing::warn!(
-                "no identity keypair found — push will be unsigned (v0.1 local alpha only)"
-            );
+        if service == "git-receive-pack" {
+            if let Some(kp) = keypair {
+                let signed = sign_request(kp, "POST", &path_for_sig, &request_body);
+                req = req
+                    .header("Content-Digest", signed.content_digest)
+                    .header("Signature-Input", signed.signature_input)
+                    .header("Signature", signed.signature);
+                tracing::debug!("attached RFC 9421 HTTP Signature (DID: {})", kp.did());
+            } else {
+                tracing::warn!(
+                    "no identity keypair found — push will be unsigned (v0.1 local alpha only)"
+                );
+            }
         }
-    }
+        if let Some(p) = &proof {
+            req = req.header(icaptcha_client::PROOF_HEADER, p);
+        }
 
-    // Attach the body after signing so the pack bytes are moved, not cloned —
-    // packs can be large and the clone doubled peak memory on push.
-    let pack_resp = req
-        .body(request_body)
-        .send()
-        .with_context(|| format!("POST {post_url}"))?;
+        // Clone the pack so the body survives a possible iCaptcha retry. (Push
+        // is signed-only today, so the retry path is essentially never taken.)
+        let resp = req
+            .body(request_body.clone())
+            .send()
+            .with_context(|| format!("POST {post_url}"))?;
 
-    if !pack_resp.status().is_success() {
-        bail!("POST /{} returned {}", service, pack_resp.status());
-    }
+        if resp.status().is_success() {
+            break resp;
+        }
+        if resp.status().as_u16() == 403 && attempts < ICAPTCHA_MAX_RETRIES {
+            if let Some(cfg) = icaptcha_cfg_from_headers(resp.headers(), keypair) {
+                attempts += 1;
+                proof = Some(icaptcha_client::obtain_proof(&cfg, None)?);
+                continue;
+            }
+        }
+        bail!("POST /{} returned {}", service, resp.status());
+    };
 
     let pack_bytes = pack_resp.bytes().context("reading pack response")?;
     tracing::debug!("pack response: {} bytes from node", pack_bytes.len());
