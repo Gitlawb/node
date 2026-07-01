@@ -167,13 +167,12 @@ pub fn ref_update_row_visible(
         return true;
     };
 
-    // Normalize the slug's owner to the same short-key form the dedup grouping
-    // and `did_matches` use: strip a leading `did:key:` only when the remainder
-    // is a bare key id (no further ':').
-    let row_key = match owner_part.strip_prefix("did:key:") {
-        Some(rest) if !rest.contains(':') => rest,
-        _ => owner_part,
-    };
+    // Normalize the slug's owner to the same short-key form `record_key` (below)
+    // and the dedup grouping use: the last ':'-delimited segment. Using the same
+    // rule on both sides keeps the match symmetric for every DID method, not just
+    // `did:key` — a `did:web:host:user` owner and its full-DID slug normalize to
+    // the same segment instead of failing the prefix test and over-serving.
+    let row_key = owner_part.split(':').next_back().unwrap_or(owner_part);
 
     // A record matches the slug when its name is equal and one owner key is a
     // prefix of the other (prefix-tolerant per the doc comment above).
@@ -663,6 +662,23 @@ mod tests {
             &rules,
             None,
             "zZZZOTHER/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_multi_segment_did_slug_dropped_for_anon() {
+        // A private repo owned by a multi-segment DID (e.g. did:web) must still
+        // fail closed when a peer stores the row under the full-DID slug form.
+        // Both sides normalize to the last ':' segment ("user"), so they match
+        // and the row drops. The old strip-only-`did:key:` normalization left
+        // row_key as the whole DID here, missed the match, and over-served.
+        let deduped = [rec("r1", "did:web:host:user", "widget", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "did:web:host:user/widget"
         ));
     }
 

@@ -1205,17 +1205,26 @@ pub async fn git_receive_pack(
             }
 
             // Broadcast ref update to GraphQL subscription listeners — one per ref.
+            // Gated on `announce`: /graphql/ws is unauthenticated (mounted after
+            // the optional_signature layer), and the subscription resolver has no
+            // caller to gate against, so only publicly-readable ref updates may
+            // reach anonymous subscribers. Mirrors the gossip (above) and Arweave
+            // (below) sends, which are already `announce`-gated. Without this a
+            // private-repo push would leak live ref metadata over the socket —
+            // the subscription analog of #112/#114.
             let now_ts = chrono::Utc::now().to_rfc3339();
-            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
-                    repo: repo_slug.clone(),
-                    ref_name: ref_name.clone(),
-                    old_sha: old_sha.clone(),
-                    new_sha: new_sha.clone(),
-                    pusher_did: pusher_did_clone.clone(),
-                    node_did: node_did_str.clone(),
-                    timestamp: now_ts.clone(),
-                });
+            if announce {
+                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                    let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
+                        repo: repo_slug.clone(),
+                        ref_name: ref_name.clone(),
+                        old_sha: old_sha.clone(),
+                        new_sha: new_sha.clone(),
+                        pusher_did: pusher_did_clone.clone(),
+                        node_did: node_did_str.clone(),
+                        timestamp: now_ts.clone(),
+                    });
+                }
             }
 
             // Arweave permanent anchoring — fire for each ref update.
@@ -1773,6 +1782,32 @@ mod tests {
             forked_from: None,
             machine_id: None,
         }
+    }
+
+    /// `announce` is the single boolean that gates every network-facing emission
+    /// of a push: gossip, Arweave anchoring, and the GraphQL subscription
+    /// broadcast (the last one added in this change). It must be false for a repo
+    /// the anonymous public cannot read, or the unauthenticated `/graphql/ws`
+    /// subscription leaks live private-repo ref metadata. Pin both directions of
+    /// the decision the broadcast now sits behind. No disk access: a non-announce
+    /// repo returns early, and a public repo with no path-scoped rule skips the
+    /// withheld walk.
+    #[tokio::test]
+    async fn replication_announce_false_for_private_true_for_public() {
+        let dummy = std::path::PathBuf::from("/nonexistent");
+
+        // Private: no rules at all.
+        let (announce, _) = replication_withheld_set(None, OWNER_DID, false, dummy.clone()).await;
+        assert!(!announce, "private repo (no rules) must not announce");
+
+        // Private: empty rule set, is_public=false → still not listable at root.
+        let (announce, _) =
+            replication_withheld_set(Some(vec![]), OWNER_DID, false, dummy.clone()).await;
+        assert!(!announce, "private repo (empty rules) must not announce");
+
+        // Public: empty rule set, is_public=true → listable at root, announces.
+        let (announce, _) = replication_withheld_set(Some(vec![]), OWNER_DID, true, dummy).await;
+        assert!(announce, "public repo must announce");
     }
 
     /// A rejection must be a 403 Forbidden (authenticated but not authorized),
