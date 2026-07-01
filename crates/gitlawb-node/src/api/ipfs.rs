@@ -41,7 +41,7 @@ use crate::visibility::{visibility_check, Decision};
 /// (`visibility_check` at `"/"`), never re-resolving via `authorize_repo_read`
 /// — `get_repo`'s fuzzy match could otherwise authorize a different physical
 /// row than the one read (KTD2a). We check object existence via
-/// `store::read_object` *before* the expensive reachability walk so random-CID
+/// `store::object_type` *before* the expensive reachability walk so random-CID
 /// spray cannot trigger full-history git walks on repos that don't carry the
 /// object. When the row carries path-scoped rules (KTD4) the served object
 /// must be either a non-blob (trees/commits are structural; KTD3) OR a blob
