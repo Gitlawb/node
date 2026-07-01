@@ -66,7 +66,7 @@ pub async fn list_anchors(
         None
     };
 
-    let limit = q.limit.min(200);
+    let limit = q.limit.clamp(0, 200);
     let raw_anchors = state
         .db
         .list_arweave_anchors(normalized_repo.as_deref(), limit)

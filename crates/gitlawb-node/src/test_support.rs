@@ -2053,6 +2053,43 @@ mod tests {
         );
     }
 
+    /// #121: authenticated caller gets 200 through the production build_router.
+    ///
+    /// Unlike pins_list_allows_authenticated (which uses a mini pins_router with
+    /// only the one route), this test exercises server::build_router to verify
+    /// that /api/v1/ipfs/pins is wired through optional_signature in the real
+    /// route table and that a signed request reaches list_pins successfully.
+    #[sqlx::test]
+    async fn pins_list_allows_authenticated_through_build_router(pool: PgPool) {
+        let state = test_state(pool).await;
+        let setup = setup_pin_test(&state, "build-router-pins").await;
+
+        let pinned_sha = setup.fx.public_oid.clone();
+        let pinned_cid = cid_for_oid(&pinned_sha);
+
+        state
+            .db
+            .record_pinned_cid(&pinned_sha, &pinned_cid)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(signed_get(&setup.owner, "/api/v1/ipfs/pins"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 1,
+            "build_router wiring: pin for the real git object must be returned"
+        );
+        assert_eq!(
+            body["pins"][0]["sha256_hex"], pinned_sha,
+            "build_router wiring: returned pin must match the seeded object OID"
+        );
+    }
+
     #[sqlx::test]
     async fn pins_list_excludes_quarantined_repos(pool: PgPool) {
         let state = test_state(pool).await;
