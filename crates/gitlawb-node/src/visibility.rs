@@ -167,9 +167,10 @@ pub fn ref_update_row_visible(
         return true;
     };
 
-    // Reduce the slug's owner to its last ':'-delimited segment — the SAME lossy
-    // form the emitter broadcasts. `publish_ref_update` (api/repos.rs) builds the
-    // wire slug as `{last-segment-of-owner_did}/{name}`, so a repo's own canonical
+    // Reduce the slug's owner to its last ':'-delimited segment, the SAME lossy
+    // form the emitter broadcasts. The receive-pack push handler (`git_receive_pack`,
+    // api/repos.rs) builds the wire slug as `{last-segment-of-owner_did}/{name}` and
+    // hands it to `publish_ref_update` to broadcast, so a repo's own canonical
     // ref-update rows always arrive keyed by that trailing segment. Matching on it
     // is what lets the gate recognize, and (when private) drop, a repo's own rows.
     //
@@ -177,7 +178,7 @@ pub fn ref_update_row_visible(
     // only bare `did:key:` and keep other DID methods whole. Those compare
     // trusted, canonical owner DIDs; this slug is untrusted and already
     // method-stripped by the emitter, so applying that keep-whole rule here would
-    // fail open — a private `did:web:host:user` repo's short slug `user/name`
+    // fail open: a private `did:web:host:user` repo's short slug `user/name`
     // would not prefix-match the whole `did:web:host:user` record and would leak.
     // The price of the stricter rule is a fail-SAFE over-drop when a remote owner
     // shares both a trailing segment and a repo name with a local private repo
