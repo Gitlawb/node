@@ -1987,6 +1987,33 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    struct PinTestFixture {
+        owner: gitlawb_core::identity::Keypair,
+        owner_did: String,
+        fx: CidFixture,
+        repo: crate::db::RepoRecord,
+    }
+
+    async fn setup_pin_test(state: &AppState, repo_name: &str) -> PinTestFixture {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let fs_slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let fx = seed_cid_repos(&fs_slug, &short, &[repo_name]);
+        let repo = seed_repo(&owner_did, repo_name);
+        state.db.create_repo(&repo).await.unwrap();
+
+        PinTestFixture {
+            owner,
+            owner_did,
+            fx,
+            repo,
+        }
+    }
+
     /// #121: authenticated caller gets 200 from /api/v1/ipfs/pins.
     ///
     /// list_pins only returns pins whose SHA-256 appears in a repo the caller
@@ -1998,33 +2025,12 @@ mod tests {
     ///  3. Records a pin for the real object OID.
     #[sqlx::test]
     async fn pins_list_allows_authenticated(pool: PgPool) {
-        use gitlawb_core::identity::Keypair;
-
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
-        // RepoStore maps owner_did to a filesystem slug by replacing ':' and '/' with '_'.
-        let fs_slug = owner_did.replace([':', '/'], "_");
-        // The short slug is the last ':'-separated segment of the DID (what push writes).
-        let short = owner_did.split(':').next_back().unwrap().to_string();
-
         let state = test_state(pool).await;
+        let setup = setup_pin_test(&state, "pinrepo").await;
 
-        // Build a real SHA-256 bare git repo under /tmp/<fs_slug>/pinrepo.git so
-        // list_all_objects can enumerate actual object SHA-256 IDs.
-        let fx = seed_cid_repos(&fs_slug, &short, &["pinrepo"]);
-        // seed_cid_repos uses sha256 object format; fx.public_oid is a real git OID.
-        let pinned_sha = fx.public_oid.clone();
+        let pinned_sha = setup.fx.public_oid.clone();
         let pinned_cid = cid_for_oid(&pinned_sha);
 
-        // Seed the repo DB record with the same owner_did so list_all_repos returns
-        // it and visibility_check passes (public repo, no rules).
-        state
-            .db
-            .create_repo(&seed_repo(&owner_did, "pinrepo"))
-            .await
-            .unwrap();
-
-        // Record the pin for the real git object SHA.
         state
             .db
             .record_pinned_cid(&pinned_sha, &pinned_cid)
@@ -2032,7 +2038,7 @@ mod tests {
             .unwrap();
 
         let resp = pins_router(&state)
-            .oneshot(signed_get(&owner, "/api/v1/ipfs/pins"))
+            .oneshot(signed_get(&setup.owner, "/api/v1/ipfs/pins"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2049,22 +2055,17 @@ mod tests {
 
     #[sqlx::test]
     async fn pins_list_excludes_quarantined_repos(pool: PgPool) {
-        use gitlawb_core::identity::Keypair;
-
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
-        let fs_slug = owner_did.replace([':', '/'], "_");
-        let short = owner_did.split(':').next_back().unwrap().to_string();
-
         let state = test_state(pool).await;
+        let setup = setup_pin_test(&state, "pinrepo").await;
 
-        let fx = seed_cid_repos(&fs_slug, &short, &["pinrepo"]);
-        let pinned_sha = fx.public_oid.clone();
+        let pinned_sha = setup.fx.public_oid.clone();
         let pinned_cid = cid_for_oid(&pinned_sha);
 
-        let repo = seed_repo(&owner_did, "pinrepo");
-        state.db.create_repo(&repo).await.unwrap();
-        state.db.set_repo_quarantine(&repo.id, true).await.unwrap();
+        state
+            .db
+            .set_repo_quarantine(&setup.repo.id, true)
+            .await
+            .unwrap();
 
         state
             .db
@@ -2073,7 +2074,7 @@ mod tests {
             .unwrap();
 
         let resp = pins_router(&state)
-            .oneshot(signed_get(&owner, "/api/v1/ipfs/pins"))
+            .oneshot(signed_get(&setup.owner, "/api/v1/ipfs/pins"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2089,27 +2090,24 @@ mod tests {
         use crate::db::VisibilityMode;
         use gitlawb_core::identity::Keypair;
 
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
-        let fs_slug = owner_did.replace([':', '/'], "_");
-        let short = owner_did.split(':').next_back().unwrap().to_string();
-
+        let state = test_state(pool).await;
+        let setup = setup_pin_test(&state, "pinrepo").await;
         let stranger = Keypair::generate();
 
-        let state = test_state(pool).await;
-
-        let fx = seed_cid_repos(&fs_slug, &short, &["pinrepo"]);
-        let public_sha = fx.public_oid.clone();
+        let public_sha = setup.fx.public_oid.clone();
         let public_cid = cid_for_oid(&public_sha);
-        let secret_sha = fx.secret_oid.clone();
+        let secret_sha = setup.fx.secret_oid.clone();
         let secret_cid = cid_for_oid(&secret_sha);
-
-        let repo = seed_repo(&owner_did, "pinrepo");
-        state.db.create_repo(&repo).await.unwrap();
 
         state
             .db
-            .set_visibility_rule(&repo.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .set_visibility_rule(
+                &setup.repo.id,
+                "/secret/**",
+                VisibilityMode::B,
+                &[],
+                &setup.owner_did,
+            )
             .await
             .unwrap();
 
@@ -2178,6 +2176,35 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    struct AnchorTestFixture {
+        owner: gitlawb_core::identity::Keypair,
+        owner_did: String,
+    }
+
+    async fn setup_anchor_test(
+        state: &AppState,
+        repo_name: &str,
+        is_public: bool,
+    ) -> AnchorTestFixture {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let owner_short = owner_did.split(':').next_back().unwrap().to_string();
+        let short_slug = format!("{owner_short}/{repo_name}");
+
+        let repo = if is_public {
+            seed_repo(&owner_did, repo_name)
+        } else {
+            seed_private_repo(&owner_did, repo_name)
+        };
+
+        state.db.create_repo(&repo).await.unwrap();
+        seed_anchor(&state.db, &short_slug, &owner_did).await;
+
+        AnchorTestFixture { owner, owner_did }
+    }
+
     /// #121: /api/v1/arweave/anchors without ?repo= allows authenticated.
     ///
     /// The global listing filters each anchor through authorize_repo_read, which
@@ -2187,29 +2214,11 @@ mod tests {
     /// LIKE match finds the repo record.
     #[sqlx::test]
     async fn anchors_global_allows_authenticated(pool: PgPool) {
-        use gitlawb_core::identity::Keypair;
-
         let state = test_state(pool).await;
-        let kp = Keypair::generate();
-        let owner_did = kp.did().to_string();
-        let repo_name = "globalrepo";
-        // Short slug: the last ':'-separated segment of the DID, matching what
-        // repos.rs writes to the arweave_anchors table on push.
-        let owner_short = owner_did.split(':').next_back().unwrap().to_string();
-        let short_slug = format!("{owner_short}/{repo_name}");
-
-        // Seed a public repo so authorize_repo_read succeeds for this anchor.
-        state
-            .db
-            .create_repo(&seed_repo(&owner_did, repo_name))
-            .await
-            .unwrap();
-
-        // Record the anchor with the short-form slug that production writes.
-        seed_anchor(&state.db, &short_slug, &owner_did).await;
+        let fx = setup_anchor_test(&state, "globalrepo", true).await;
 
         let resp = anchors_router(&state)
-            .oneshot(signed_get(&kp, "/api/v1/arweave/anchors"))
+            .oneshot(signed_get(&fx.owner, "/api/v1/arweave/anchors"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2223,22 +2232,9 @@ mod tests {
     #[sqlx::test]
     async fn anchors_global_denies_non_reader(pool: PgPool) {
         use gitlawb_core::identity::Keypair;
-
         let state = test_state(pool).await;
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
+        let _fx = setup_anchor_test(&state, "privaterepo", false).await;
         let stranger = Keypair::generate();
-        let repo_name = "privaterepo";
-        let owner_short = owner_did.split(':').next_back().unwrap().to_string();
-        let short_slug = format!("{owner_short}/{repo_name}");
-
-        state
-            .db
-            .create_repo(&seed_private_repo(&owner_did, repo_name))
-            .await
-            .unwrap();
-
-        seed_anchor(&state.db, &short_slug, &owner_did).await;
 
         let resp = anchors_router(&state)
             .oneshot(signed_get(&stranger, "/api/v1/arweave/anchors"))
@@ -2258,31 +2254,42 @@ mod tests {
     /// 404 for anon on private) — no anonymous-rejection guard is needed here.
     #[sqlx::test]
     async fn anchors_repo_denies_anonymous_on_private(pool: PgPool) {
-        use gitlawb_core::identity::Keypair;
-
         let state = test_state(pool).await;
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
         let repo_name = "private-repo";
-        // Short slug written by the push path.
-        let owner_short = owner_did.split(':').next_back().unwrap().to_string();
-        let short_slug = format!("{owner_short}/{repo_name}");
+        let fx = setup_anchor_test(&state, repo_name, false).await;
 
-        state
-            .db
-            .create_repo(&seed_private_repo(&owner_did, repo_name))
-            .await
-            .unwrap();
-        // Store anchor with the short slug that production writes.
-        seed_anchor(&state.db, &short_slug, &owner_did).await;
-
-        // ?repo= accepts the full DID form; list_anchors normalises it before querying.
-        let uri = format!("/api/v1/arweave/anchors?repo={owner_did}/{repo_name}");
+        let uri = format!(
+            "/api/v1/arweave/anchors?repo={}/{}",
+            fx.owner_did, repo_name
+        );
         let resp = anchors_router(&state)
             .oneshot(anon_get(&uri))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #121: /api/v1/arweave/anchors with ?repo= allows anonymous on public repo.
+    #[sqlx::test]
+    async fn anchors_repo_allows_anonymous_on_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo_name = "public-repo";
+        let fx = setup_anchor_test(&state, repo_name, true).await;
+
+        let uri = format!(
+            "/api/v1/arweave/anchors?repo={}/{}",
+            fx.owner_did, repo_name
+        );
+        let resp = anchors_router(&state)
+            .oneshot(anon_get(&uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 1,
+            "anonymous caller sees the seeded public anchor"
+        );
     }
 
     /// #121: /api/v1/arweave/anchors with ?repo= allows repo owner.
@@ -2292,27 +2299,16 @@ mod tests {
     /// slug before issuing the DB query.
     #[sqlx::test]
     async fn anchors_repo_allows_owner(pool: PgPool) {
-        use gitlawb_core::identity::Keypair;
-
         let state = test_state(pool).await;
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
         let repo_name = "owners-repo";
-        // Short slug matching what repos.rs writes on push.
-        let owner_short = owner_did.split(':').next_back().unwrap().to_string();
-        let short_slug = format!("{owner_short}/{repo_name}");
+        let fx = setup_anchor_test(&state, repo_name, false).await;
 
-        state
-            .db
-            .create_repo(&seed_private_repo(&owner_did, repo_name))
-            .await
-            .unwrap();
-        // Store anchor with the short slug that production writes.
-        seed_anchor(&state.db, &short_slug, &owner_did).await;
-
-        let uri = format!("/api/v1/arweave/anchors?repo={owner_did}/{repo_name}");
+        let uri = format!(
+            "/api/v1/arweave/anchors?repo={}/{}",
+            fx.owner_did, repo_name
+        );
         let resp = anchors_router(&state)
-            .oneshot(signed_get(&owner, &uri))
+            .oneshot(signed_get(&fx.owner, &uri))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2324,23 +2320,15 @@ mod tests {
     #[sqlx::test]
     async fn anchors_repo_denies_non_reader(pool: PgPool) {
         use gitlawb_core::identity::Keypair;
-
         let state = test_state(pool).await;
-        let owner = Keypair::generate();
-        let owner_did = owner.did().to_string();
-        let stranger = Keypair::generate();
         let repo_name = "private-repo";
-        let owner_short = owner_did.split(':').next_back().unwrap().to_string();
-        let short_slug = format!("{owner_short}/{repo_name}");
+        let fx = setup_anchor_test(&state, repo_name, false).await;
+        let stranger = Keypair::generate();
 
-        state
-            .db
-            .create_repo(&seed_private_repo(&owner_did, repo_name))
-            .await
-            .unwrap();
-        seed_anchor(&state.db, &short_slug, &owner_did).await;
-
-        let uri = format!("/api/v1/arweave/anchors?repo={owner_did}/{repo_name}");
+        let uri = format!(
+            "/api/v1/arweave/anchors?repo={}/{}",
+            fx.owner_did, repo_name
+        );
         let resp = anchors_router(&state)
             .oneshot(signed_get(&stranger, &uri))
             .await
