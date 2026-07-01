@@ -3346,6 +3346,42 @@ mod dedup_db_tests {
         );
     }
 
+    /// A PRIVATE canonical repo and a PUBLIC mirror row for the same
+    /// (owner, name) collapse to a single survivor whose `is_public` is the
+    /// canonical `false`, not the mirror's `true`. `upsert_mirror_repo` always
+    /// writes `is_public=true`, so without this the deduped set could carry a
+    /// public flag for a locally-private repo and the ref-updates feed gate
+    /// would over-serve. Pins the DEDUP_CTE tiebreak so a future regression
+    /// that flips the survivor can't leak silently.
+    #[sqlx::test]
+    async fn deduped_private_canonical_beats_public_mirror(pool: PgPool) {
+        let db = db(pool).await;
+        // Private canonical row (rec() forces is_public=true, so build inline).
+        let mut canonical = rec(
+            "uuid-private-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "private canonical",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        canonical.is_public = false;
+        db.create_repo(&canonical).await.unwrap();
+        // Public mirror row for the same (owner, name): id = "z6Mkwbud/nipmod",
+        // is_public = true.
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "the pair collapses to one logical repo");
+        assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+        assert!(
+            !out[0].is_public,
+            "survivor keeps the canonical private is_public=false, not the mirror's true"
+        );
+    }
+
     /// upsert_mirror_repo's own rows dedupe against a canonical twin (proves the
     /// real mirror writer's row shape is classified correctly).
     #[sqlx::test]
