@@ -891,7 +891,13 @@ impl Db {
             "SELECT id, name, owner_did, description, is_public, default_branch,
                     created_at, updated_at, disk_path, forked_from, machine_id
              FROM repos
-             WHERE (owner_did = $1 OR owner_did LIKE '%:' || $1 || '%') AND name = $2",
+              WHERE (owner_did = $1 OR owner_did LIKE '%:' || $1 || '%') AND name = $2
+             -- Prefer canonical rows (UUID id, no slash) over mirror rows (slash id).
+             -- Mirror rows are inserted by upsert_mirror_repo with is_public=true and
+             -- no visibility rules; using them for visibility checks would bypass the
+             -- canonical row's gate (issue #124).
+             ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
+                      created_at ASC, id ASC",
         )
         .bind(owner_did)
         .bind(name)
@@ -3699,6 +3705,78 @@ mod dedup_db_tests {
         let count = db.count_repos_deduped().await.unwrap();
         assert_eq!(list_len, 2);
         assert_eq!(count, list_len, "count must equal the deduped list length");
+    }
+
+    /// get_repo must prefer the canonical row over the mirror row when both match,
+    /// so the visibility gate keys off the canonical row's rules and is_public flag
+    /// rather than the mirror's hardcoded public-with-no-rules (issue #124).
+    #[sqlx::test]
+    async fn get_repo_prefers_canonical_over_mirror(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkwbud";
+        let owner_did = "did:key:z6Mkwbud";
+
+        // Mirror row seeded FIRST — hardcoded is_public=true, no visibility rules.
+        // Without the ORDER BY fix, fetch_optional returns this row by insertion order,
+        // so the test fails (proving it locks in the fix).
+        db.upsert_mirror_repo(short, "secret-repo", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        // Canonical row with is_public=false.
+        let canonical = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "secret-repo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            disk_path: "/srv/secret".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        db.create_repo(&canonical).await.unwrap();
+
+        // Querying with bare short DID should return the canonical row.
+        let got = db
+            .get_repo(short, "secret-repo")
+            .await
+            .unwrap()
+            .expect("get_repo should find the repo");
+
+        assert_eq!(
+            got.owner_did, owner_did,
+            "canonical row (did:key: form) must win over mirror row (bare short DID)"
+        );
+        assert!(
+            !got.id.contains('/'),
+            "canonical row id must not contain a slash"
+        );
+        assert!(
+            !got.is_public,
+            "canonical row's is_public must be preserved"
+        );
+    }
+
+    /// get_repo still returns the mirror row when no canonical row exists
+    /// (mirror-only group), so sync and read paths remain functional.
+    #[sqlx::test]
+    async fn get_repo_returns_mirror_when_no_canonical(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6Lonely", "orphan", "/srv/m", None, false)
+            .await
+            .unwrap();
+
+        let got = db
+            .get_repo("z6Lonely", "orphan")
+            .await
+            .unwrap()
+            .expect("get_repo should find the mirror");
+
+        assert_eq!(got.id, "z6Lonely/orphan", "mirror row is returned");
+        assert!(got.is_public, "mirror row's is_public should be true");
     }
 }
 
