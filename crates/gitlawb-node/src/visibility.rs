@@ -151,7 +151,6 @@ pub fn listable_at_root(
 ///
 /// The live call sites are the #112 (GraphQL) and #114 (REST) feed handlers,
 /// added in the following units; exercised by the unit tests below meanwhile.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn ref_update_row_visible(
     deduped: &[RepoRecord],
     rules_by_repo: &HashMap<String, Vec<VisibilityRule>>,
