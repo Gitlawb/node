@@ -58,6 +58,10 @@ services:
       GITLAWB_P2P_PORT: "${p2p_port}"
       GITLAWB_REPOS_DIR: /data/repos
       GITLAWB_KEY: /data/keys/identity.pem
+      # iCaptcha proof-of-intelligence gate (spam protection on create/fork/register)
+      ICAPTCHA_MODE: ${icaptcha_mode}
+      ICAPTCHA_PUBKEY: ${icaptcha_pubkey}
+      ICAPTCHA_REQUIRED_LEVEL: "${icaptcha_required_level}"
       GITLAWB_PUBLIC_URL: $${GITLAWB_PUBLIC_URL}
       GITLAWB_BOOTSTRAP_PEERS: $${GITLAWB_BOOTSTRAP_PEERS}
       GITLAWB_AUTO_SYNC: $${GITLAWB_AUTO_SYNC}
