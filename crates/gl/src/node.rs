@@ -225,6 +225,18 @@ async fn fetch_pins(node: &str, keypair: Option<Keypair>) -> PinsPanel {
     }
 }
 
+/// Render the one-line pins-panel status for the `gl node status` dashboard.
+fn pins_status_line(panel: &PinsPanel) -> String {
+    match panel {
+        PinsPanel::Pins(count) => format!("  Pinned CIDs: {count}"),
+        PinsPanel::Empty => "  Pinned CIDs: 0".to_string(),
+        PinsPanel::Unavailable => "  IPFS pins: unavailable".to_string(),
+        PinsPanel::NeedsIdentity => {
+            "  IPFS pins: sign in to view (run `gl identity new`)".to_string()
+        }
+    }
+}
+
 async fn cmd_status(node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
@@ -360,20 +372,7 @@ async fn cmd_status(node: String) -> Result<()> {
 
     // Pins
     println!("Pins");
-    match pins_panel {
-        PinsPanel::Pins(count) => {
-            println!("  Pinned CIDs: {count}");
-        }
-        PinsPanel::Empty => {
-            println!("  Pinned CIDs: 0");
-        }
-        PinsPanel::Unavailable => {
-            println!("  IPFS pins: unavailable");
-        }
-        PinsPanel::NeedsIdentity => {
-            println!("  IPFS pins: sign in to view (run `gl identity new`)");
-        }
-    }
+    println!("{}", pins_status_line(&pins_panel));
     println!();
 
     Ok(())
@@ -569,5 +568,61 @@ mod tests {
         );
 
         m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pins_malformed_body_returns_unavailable() {
+        let mut server = mockito::Server::new_async().await;
+        let kp = Keypair::generate();
+
+        // 2xx but the body is not valid JSON: must degrade to Unavailable,
+        // never panic.
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not json{{{")
+            .create_async()
+            .await;
+
+        let panel = fetch_pins(&server.url(), Some(kp)).await;
+        assert!(
+            matches!(panel, PinsPanel::Unavailable),
+            "malformed body -> Unavailable, got {panel:?}"
+        );
+
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pins_transport_error_returns_unavailable() {
+        // Bind then drop to obtain a definitely-closed port -> connection
+        // refused -> get_signed Err -> Unavailable (no panic).
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let kp = Keypair::generate();
+
+        let panel = fetch_pins(&format!("http://127.0.0.1:{port}"), Some(kp)).await;
+        assert!(
+            matches!(panel, PinsPanel::Unavailable),
+            "transport error -> Unavailable, got {panel:?}"
+        );
+    }
+
+    #[test]
+    fn test_pins_status_line_renders_each_state() {
+        assert_eq!(pins_status_line(&PinsPanel::Pins(3)), "  Pinned CIDs: 3");
+        assert_eq!(pins_status_line(&PinsPanel::Empty), "  Pinned CIDs: 0");
+        assert_eq!(
+            pins_status_line(&PinsPanel::Unavailable),
+            "  IPFS pins: unavailable"
+        );
+        assert_eq!(
+            pins_status_line(&PinsPanel::NeedsIdentity),
+            "  IPFS pins: sign in to view (run `gl identity new`)"
+        );
     }
 }
