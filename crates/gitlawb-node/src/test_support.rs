@@ -1954,4 +1954,493 @@ mod tests {
         );
         assert!(!body.contains("DANGLING SECRET"));
     }
+
+    fn pins_router(state: &AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/ipfs/pins",
+                axum::routing::get(crate::api::ipfs::list_pins),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state.clone())
+    }
+
+    fn signed_get(kp: &gitlawb_core::identity::Keypair, uri: &str) -> Request<Body> {
+        let s = gitlawb_core::http_sig::sign_request(kp, "GET", uri, b"");
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("content-digest", s.content_digest)
+            .header("signature-input", s.signature_input)
+            .header("signature", s.signature)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// #121: anonymous caller gets 401 from /api/v1/ipfs/pins.
+    #[sqlx::test]
+    async fn pins_list_denies_anonymous(pool: PgPool) {
+        let state = test_state(pool).await;
+        let resp = pins_router(&state)
+            .oneshot(anon_get("/api/v1/ipfs/pins"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    struct PinTestFixture {
+        owner: gitlawb_core::identity::Keypair,
+        owner_did: String,
+        fx: CidFixture,
+        repo: crate::db::RepoRecord,
+    }
+
+    async fn setup_pin_test(state: &AppState, repo_name: &str) -> PinTestFixture {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let fs_slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let fx = seed_cid_repos(&fs_slug, &short, &[repo_name]);
+        let repo = seed_repo(&owner_did, repo_name);
+        state.db.create_repo(&repo).await.unwrap();
+
+        PinTestFixture {
+            owner,
+            owner_did,
+            fx,
+            repo,
+        }
+    }
+
+    /// #121: authenticated caller gets 200 from /api/v1/ipfs/pins.
+    ///
+    /// list_pins only returns pins whose SHA-256 appears in a repo the caller
+    /// can read. The test therefore:
+    ///  1. Creates a real SHA-256 bare git repo on disk (via seed_cid_repos) so
+    ///     list_all_objects finds the object.
+    ///  2. Inserts a matching public repo row (owner_did = full DID from the keypair)
+    ///     so list_all_repos/visibility_check passes.
+    ///  3. Records a pin for the real object OID.
+    #[sqlx::test]
+    async fn pins_list_allows_authenticated(pool: PgPool) {
+        let state = test_state(pool).await;
+        let setup = setup_pin_test(&state, "pinrepo").await;
+
+        let pinned_sha = setup.fx.public_oid.clone();
+        let pinned_cid = cid_for_oid(&pinned_sha);
+
+        state
+            .db
+            .record_pinned_cid(&pinned_sha, &pinned_cid)
+            .await
+            .unwrap();
+
+        let resp = pins_router(&state)
+            .oneshot(signed_get(&setup.owner, "/api/v1/ipfs/pins"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 1,
+            "pin for the real git object must be returned"
+        );
+        assert_eq!(
+            body["pins"][0]["sha256_hex"], pinned_sha,
+            "returned pin must match the seeded object OID"
+        );
+    }
+
+    /// #121: authenticated caller gets 200 through the production build_router.
+    ///
+    /// Unlike pins_list_allows_authenticated (which uses a mini pins_router with
+    /// only the one route), this test exercises server::build_router to verify
+    /// that /api/v1/ipfs/pins is wired through optional_signature in the real
+    /// route table and that a signed request reaches list_pins successfully.
+    #[sqlx::test]
+    async fn pins_list_allows_authenticated_through_build_router(pool: PgPool) {
+        let state = test_state(pool).await;
+        let setup = setup_pin_test(&state, "build-router-pins").await;
+
+        let pinned_sha = setup.fx.public_oid.clone();
+        let pinned_cid = cid_for_oid(&pinned_sha);
+
+        state
+            .db
+            .record_pinned_cid(&pinned_sha, &pinned_cid)
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(signed_get(&setup.owner, "/api/v1/ipfs/pins"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 1,
+            "build_router wiring: pin for the real git object must be returned"
+        );
+        assert_eq!(
+            body["pins"][0]["sha256_hex"], pinned_sha,
+            "build_router wiring: returned pin must match the seeded object OID"
+        );
+    }
+
+    #[sqlx::test]
+    async fn pins_list_excludes_quarantined_repos(pool: PgPool) {
+        let state = test_state(pool).await;
+        let setup = setup_pin_test(&state, "pinrepo").await;
+
+        let pinned_sha = setup.fx.public_oid.clone();
+        let pinned_cid = cid_for_oid(&pinned_sha);
+
+        state
+            .db
+            .set_repo_quarantine(&setup.repo.id, true)
+            .await
+            .unwrap();
+
+        state
+            .db
+            .record_pinned_cid(&pinned_sha, &pinned_cid)
+            .await
+            .unwrap();
+
+        let resp = pins_router(&state)
+            .oneshot(signed_get(&setup.owner, "/api/v1/ipfs/pins"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 0,
+            "quarantined repo objects must be withheld from pin index"
+        );
+    }
+
+    #[sqlx::test]
+    async fn pins_list_withholds_path_scoped_blobs(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let state = test_state(pool).await;
+        let setup = setup_pin_test(&state, "pinrepo").await;
+        let stranger = Keypair::generate();
+
+        let public_sha = setup.fx.public_oid.clone();
+        let public_cid = cid_for_oid(&public_sha);
+        let secret_sha = setup.fx.secret_oid.clone();
+        let secret_cid = cid_for_oid(&secret_sha);
+
+        state
+            .db
+            .set_visibility_rule(
+                &setup.repo.id,
+                "/secret/**",
+                VisibilityMode::B,
+                &[],
+                &setup.owner_did,
+            )
+            .await
+            .unwrap();
+
+        state
+            .db
+            .record_pinned_cid(&public_sha, &public_cid)
+            .await
+            .unwrap();
+        state
+            .db
+            .record_pinned_cid(&secret_sha, &secret_cid)
+            .await
+            .unwrap();
+
+        let resp = pins_router(&state)
+            .oneshot(signed_get(&stranger, "/api/v1/ipfs/pins"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+
+        assert_eq!(body["count"], 1, "stranger sees only the public pin");
+        assert_eq!(
+            body["pins"][0]["sha256_hex"], public_sha,
+            "stranger sees the public pin"
+        );
+    }
+
+    // ---- #121: GET /api/v1/arweave/anchors auth and visibility gate ----
+
+    fn anchors_router(state: &AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/arweave/anchors",
+                axum::routing::get(crate::api::arweave::list_anchors),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state.clone())
+    }
+
+    async fn seed_anchor(db: &crate::db::Db, repo: &str, owner_did: &str) {
+        use crate::db::RecordAnchorInput;
+        db.record_arweave_anchor(&RecordAnchorInput {
+            repo,
+            owner_did,
+            ref_name: "refs/heads/main",
+            old_sha: "0000000000000000000000000000000000000000000000000000000000000000",
+            new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            cid: Some("bafkreihipknrba7vz6ahh2l5qk6pxwtywn3u7worv6hmi6dkt6nv5phb4u"),
+            irys_tx_id: "tx-test",
+            arweave_url: "https://arweave.net/test",
+            node_did: "did:key:zNODE",
+        })
+        .await
+        .unwrap();
+    }
+
+    /// #121: /api/v1/arweave/anchors without ?repo= denies anonymous.
+    #[sqlx::test]
+    async fn anchors_global_denies_anonymous(pool: PgPool) {
+        let state = test_state(pool).await;
+        let resp = anchors_router(&state)
+            .oneshot(anon_get("/api/v1/arweave/anchors"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    struct AnchorTestFixture {
+        owner: gitlawb_core::identity::Keypair,
+        owner_did: String,
+    }
+
+    async fn setup_anchor_test(
+        state: &AppState,
+        repo_name: &str,
+        is_public: bool,
+    ) -> AnchorTestFixture {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let owner_short = owner_did.split(':').next_back().unwrap().to_string();
+        let short_slug = format!("{owner_short}/{repo_name}");
+
+        let repo = if is_public {
+            seed_repo(&owner_did, repo_name)
+        } else {
+            seed_private_repo(&owner_did, repo_name)
+        };
+
+        state.db.create_repo(&repo).await.unwrap();
+        seed_anchor(&state.db, &short_slug, &owner_did).await;
+
+        AnchorTestFixture { owner, owner_did }
+    }
+
+    /// #121: /api/v1/arweave/anchors without ?repo= allows authenticated.
+    ///
+    /// The global listing filters each anchor through authorize_repo_read, which
+    /// splits anchor.repo on '/' to get (owner, name) and calls get_repo. The
+    /// anchor row must therefore carry the same short owner slug that the push
+    /// path writes (last ':'-separated segment of the DID) so get_repo's fuzzy
+    /// LIKE match finds the repo record.
+    #[sqlx::test]
+    async fn anchors_global_allows_authenticated(pool: PgPool) {
+        let state = test_state(pool).await;
+        let fx = setup_anchor_test(&state, "globalrepo", true).await;
+
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&fx.owner, "/api/v1/arweave/anchors"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 1,
+            "authenticated caller sees the seeded anchor"
+        );
+    }
+
+    #[sqlx::test]
+    async fn anchors_global_denies_non_reader(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let state = test_state(pool).await;
+        let _fx = setup_anchor_test(&state, "privaterepo", false).await;
+        let stranger = Keypair::generate();
+
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&stranger, "/api/v1/arweave/anchors"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 0,
+            "non-reader is denied the private anchor in global listing"
+        );
+    }
+
+    /// #121: /api/v1/arweave/anchors with ?repo= denies anonymous on private repo.
+    ///
+    /// The ?repo= path gate is purely visibility-based (authorize_repo_read returns
+    /// 404 for anon on private) — no anonymous-rejection guard is needed here.
+    #[sqlx::test]
+    async fn anchors_repo_denies_anonymous_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo_name = "private-repo";
+        let fx = setup_anchor_test(&state, repo_name, false).await;
+
+        let uri = format!(
+            "/api/v1/arweave/anchors?repo={}/{}",
+            fx.owner_did, repo_name
+        );
+        let resp = anchors_router(&state)
+            .oneshot(anon_get(&uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #121: /api/v1/arweave/anchors with ?repo= allows anonymous on public repo.
+    #[sqlx::test]
+    async fn anchors_repo_allows_anonymous_on_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo_name = "public-repo";
+        let fx = setup_anchor_test(&state, repo_name, true).await;
+
+        let uri = format!(
+            "/api/v1/arweave/anchors?repo={}/{}",
+            fx.owner_did, repo_name
+        );
+        let resp = anchors_router(&state)
+            .oneshot(anon_get(&uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 1,
+            "anonymous caller sees the seeded public anchor"
+        );
+    }
+
+    /// #121: /api/v1/arweave/anchors with ?repo= allows repo owner.
+    ///
+    /// Anchor is stored with the short owner slug that push writes; the ?repo=
+    /// query carries the full DID which list_anchors normalises to the same short
+    /// slug before issuing the DB query.
+    #[sqlx::test]
+    async fn anchors_repo_allows_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo_name = "owners-repo";
+        let fx = setup_anchor_test(&state, repo_name, false).await;
+
+        let uri = format!(
+            "/api/v1/arweave/anchors?repo={}/{}",
+            fx.owner_did, repo_name
+        );
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&fx.owner, &uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 1, "repo owner sees their anchor");
+    }
+
+    /// #121: /api/v1/arweave/anchors with ?repo= denies authenticated non-reader on private repo.
+    #[sqlx::test]
+    async fn anchors_repo_denies_non_reader(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let state = test_state(pool).await;
+        let repo_name = "private-repo";
+        let fx = setup_anchor_test(&state, repo_name, false).await;
+        let stranger = Keypair::generate();
+
+        let uri = format!(
+            "/api/v1/arweave/anchors?repo={}/{}",
+            fx.owner_did, repo_name
+        );
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&stranger, &uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// #136: ?repo= resolves against the deduped canonical repo, not a public mirror.
+    ///
+    /// When a repo has both a private canonical row and a public mirror row, the
+    /// ?repo= path must gate on the canonical survivor's visibility (denying a
+    /// stranger) rather than the public mirror's (which would allow).
+    #[sqlx::test]
+    async fn anchors_repo_denies_stranger_when_canonical_is_private_even_with_public_mirror(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::identity::Keypair;
+
+        let state = test_state(pool).await;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let repo_name = "mirror-canonical";
+
+        // Create a private canonical repo.
+        let canonical = seed_private_repo(&owner_did, repo_name);
+        state.db.create_repo(&canonical).await.unwrap();
+
+        // Create a public mirror for the same repo.
+        state
+            .db
+            .upsert_mirror_repo(&short, repo_name, "/tmp/mirror", None, false)
+            .await
+            .unwrap();
+
+        // Seed an anchor with the short slug (matching both rows).
+        let short_slug = format!("{short}/{repo_name}");
+        seed_anchor(&state.db, &short_slug, &owner_did).await;
+
+        let stranger = Keypair::generate();
+        let uri = format!("/api/v1/arweave/anchors?repo={owner_did}/{repo_name}");
+
+        // Stranger must be denied (404), not served anchor via the public mirror.
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&stranger, &uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Owner still gets the anchor.
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&owner, &uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 1, "owner sees their anchor through ?repo=");
+    }
+
+    /// #121: negative limit is clamped to 0 and returns a bounded response (no 500).
+    #[sqlx::test]
+    async fn anchors_global_negative_limit_is_clamped(pool: PgPool) {
+        let state = test_state(pool).await;
+        let fx = setup_anchor_test(&state, "neg-limit-repo", true).await;
+
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&fx.owner, "/api/v1/arweave/anchors?limit=-1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 0,
+            "negative limit clamps to 0, returning empty result"
+        );
+    }
 }

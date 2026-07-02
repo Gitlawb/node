@@ -26,6 +26,7 @@ use std::str::FromStr;
 
 use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
+use crate::git::push_delta;
 use crate::git::store;
 use crate::git::visibility_pack::{allowed_blob_set_for_caller, has_path_scoped_rule};
 use crate::state::AppState;
@@ -216,12 +217,107 @@ pub async fn get_by_cid(
 /// Returns all CIDs that have been pinned to the local IPFS node from git
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
-pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
-    let pins = state
+///
+/// Requires authentication: the global pin index would otherwise disclose
+/// metadata for every object ever pushed to the node (#121).
+///
+/// The global listing filters each pinned object on current repo visibility
+/// to prevent metadata disclosure when repos are made private after push (#136).
+/// Only pins from repos the caller can currently read are returned.
+pub async fn list_pins(
+    State(state): State<AppState>,
+    auth: Option<Extension<AuthenticatedDid>>,
+) -> Result<Json<serde_json::Value>> {
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+
+    // Reject anonymous callers: the pin index spans the entire node and would
+    // expose metadata for every object ever pushed here (#121).
+    if caller.is_none() {
+        return Err(AppError::Unauthorized(
+            "authentication required for pin listing".into(),
+        ));
+    }
+    let caller_owned = caller.map(|c| c.to_string());
+
+    let raw_pins = state
         .db
         .list_pinned_cids()
         .await
         .map_err(AppError::Internal)?;
+
+    // Build a set of sha256_hex values from repos the caller can read.
+    // Use the deduped repo list so mirror rows never bypass the canonical
+    // repo's visibility rules (#136).
+    let repos = state
+        .db
+        .list_all_repos_deduped()
+        .await
+        .map_err(AppError::Internal)?;
+
+    let repo_ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
+    let rules_by_repo = state
+        .db
+        .list_visibility_rules_for_repos(&repo_ids)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let mut allowed_sha256s = std::collections::HashSet::new();
+
+    for repo in &repos {
+        let rules: &[crate::db::VisibilityRule] = rules_by_repo
+            .get(&repo.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        // Check repo-level visibility.
+        if visibility_check(rules, repo.is_public, &repo.owner_did, caller, "/") == Decision::Deny {
+            continue;
+        }
+
+        let repo_path = match state.repo_store.acquire(&repo.owner_did, &repo.name).await {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        // If path-scoped rules exist, compute the set of blobs the caller is
+        // allowed to read. Otherwise every blob in the repo is allowed.
+        let allowed_blobs = if has_path_scoped_rule(rules) {
+            let rp = repo_path.clone();
+            let r = rules.to_vec();
+            let is_public = repo.is_public;
+            let owner = repo.owner_did.clone();
+            let caller_for_walk = caller_owned.clone();
+
+            match tokio::task::spawn_blocking(move || {
+                allowed_blob_set_for_caller(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
+            })
+            .await
+            {
+                Ok(Ok(set)) => set,
+                _ => {
+                    tracing::warn!(repo = %repo.name, "allowed-blob walk failed; skipping repo for pins listing");
+                    continue;
+                }
+            }
+        } else {
+            // No path-scoped rules: all objects reachable in this repo are allowed.
+            match push_delta::list_all_objects(&repo_path) {
+                Ok(objects) => objects.into_iter().collect(),
+                Err(_) => continue,
+            }
+        };
+
+        // Add the allowed blobs to the global allowed set.
+        for sha in allowed_blobs {
+            allowed_sha256s.insert(sha);
+        }
+    }
+
+    // Filter pins to only those in allowed set.
+    let pins: Vec<_> = raw_pins
+        .into_iter()
+        .filter(|pin| allowed_sha256s.contains(&pin.sha256_hex))
+        .collect();
 
     Ok(Json(serde_json::json!({
         "pins": pins,

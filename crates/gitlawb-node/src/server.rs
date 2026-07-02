@@ -187,17 +187,20 @@ pub fn build_router(state: AppState) -> Router {
     );
 
     // ── IPFS content-addressed retrieval and pin listing ──────────────────
-    // `/ipfs/{cid}` carries `optional_signature` so `get_by_cid` sees the caller
-    // identity and can apply per-repo visibility (#110); anonymous callers stay
-    // anonymous and still read genuinely public content. `/api/v1/ipfs/pins`
-    // stays unsigned — gating the pin index is tracked separately (#121).
+    // Both routes carry `optional_signature` so `get_by_cid` and `list_pins`
+    // can apply per-repo visibility and authentication checks (#110, #121);
+    // anonymous callers stay anonymous and still read genuinely public content.
     let ipfs_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
-        .layer(middleware::from_fn(auth::optional_signature))
-        .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
+        .route("/api/v1/ipfs/pins", get(ipfs::list_pins))
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
-    let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
+    // Carries `optional_signature` so `list_anchors` can check caller visibility
+    // when `?repo=` is provided and require authentication for global listing (#121).
+    let arweave_routes = Router::new()
+        .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
