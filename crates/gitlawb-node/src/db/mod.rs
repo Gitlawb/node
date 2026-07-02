@@ -3916,3 +3916,162 @@ mod icaptcha_quarantine_tests {
         assert!(with_stars.iter().all(|(r, _)| r.name != "spam"));
     }
 }
+
+#[cfg(test)]
+mod ref_update_db_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn update(
+        id: &str,
+        repo: &str,
+        owner_did: Option<&str>,
+        ref_name: &str,
+        sha: &str,
+    ) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.to_string(),
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: repo.to_string(),
+            owner_did: owner_did.map(|s| s.to_string()),
+            ref_name: ref_name.to_string(),
+            old_sha: "0000000000000000000000000000000000000000".into(),
+            new_sha: sha.to_string(),
+            timestamp: "2026-07-02T12:00:00Z".into(),
+            cert_id: None,
+            received_at: "2026-07-02T12:00:01Z".into(),
+            from_peer: "12D3KooWTest".into(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_with_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u1",
+            "zOwner/myrepo",
+            Some("did:key:zOwner"),
+            "refs/heads/main",
+            "aaaa",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates(100).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did.as_deref(), Some("did:key:zOwner"));
+        assert_eq!(all[0].repo, "zOwner/myrepo");
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_without_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u2",
+            "zOwner/myrepo",
+            None,
+            "refs/heads/main",
+            "bbbb",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates(100).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did, None);
+    }
+
+    #[sqlx::test]
+    async fn list_repo_ref_updates_filters_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u3",
+            "alice/repo1",
+            Some("did:key:zAlice"),
+            "refs/heads/main",
+            "cccc",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u4",
+            "bob/repo2",
+            Some("did:key:zBob"),
+            "refs/heads/feat",
+            "dddd",
+        ))
+        .await
+        .unwrap();
+
+        let alice_events = db.list_repo_ref_updates("alice/repo1", 100).await.unwrap();
+        assert_eq!(alice_events.len(), 1);
+        assert_eq!(alice_events[0].id, "u3");
+        assert_eq!(alice_events[0].owner_did.as_deref(), Some("did:key:zAlice"));
+
+        let bob_events = db.list_repo_ref_updates("bob/repo2", 100).await.unwrap();
+        assert_eq!(bob_events.len(), 1);
+        assert_eq!(bob_events[0].id, "u4");
+        assert_eq!(bob_events[0].owner_did.as_deref(), Some("did:key:zBob"));
+
+        let empty = db.list_repo_ref_updates("other/repo", 100).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn list_ref_updates_filtered_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u5",
+            "ownerA/proj",
+            Some("did:key:zA"),
+            "refs/heads/main",
+            "eeee",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u6",
+            "ownerB/proj",
+            Some("did:web:host:zB"),
+            "refs/heads/main",
+            "ffff",
+        ))
+        .await
+        .unwrap();
+
+        let filtered = db
+            .list_ref_updates_filtered(Some("ownerA/proj"), 100)
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "u5");
+
+        let all = db.list_ref_updates_filtered(None, 100).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn insert_update_idempotent_on_conflict(pool: PgPool) {
+        let db = db(pool).await;
+        let u = update(
+            "u7",
+            "repo/x",
+            Some("did:key:zX"),
+            "refs/heads/main",
+            "gggg",
+        );
+        db.insert_ref_update(&u).await.unwrap();
+        db.insert_ref_update(&u).await.unwrap();
+
+        let all = db.list_ref_updates(100).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].new_sha, "gggg");
+    }
+}

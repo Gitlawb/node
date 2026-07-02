@@ -1954,4 +1954,91 @@ mod tests {
         );
         assert!(!body.contains("DANGLING SECRET"));
     }
+
+    // ── Ref-update events (issue #144: owner_did wire format) ─────────────────
+
+    fn events_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/events/ref-updates",
+                axum::routing::get(crate::api::events::list_ref_updates),
+            )
+            .with_state(state)
+    }
+
+    #[sqlx::test]
+    async fn events_returns_inserted_ref_updates(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zEVENTSOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Insert a gossip event with owner_did set
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/myrepo", owner.split(':').next_back().unwrap()),
+                owner_did: Some(owner.into()),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["repo"],
+            format!("{}/myrepo", owner.split(':').next_back().unwrap())
+        );
+    }
+
+    #[sqlx::test]
+    async fn events_limit_respects_limit_param(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zEVENTLIMITAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        for i in 0..5 {
+            state
+                .db
+                .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    node_did: "did:key:zNode".into(),
+                    pusher_did: "did:key:zPusher".into(),
+                    repo: format!("{}/r{i}", owner.split(':').next_back().unwrap()),
+                    owner_did: Some(owner.into()),
+                    ref_name: "refs/heads/main".into(),
+                    old_sha: "0000000000000000000000000000000000000000".into(),
+                    new_sha: format!("{i:040x}"),
+                    timestamp: format!("2026-07-02T12:00:{i:02}Z"),
+                    cert_id: None,
+                    received_at: format!("2026-07-02T12:00:{i:02}Z"),
+                    from_peer: "12D3KooWTest".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates?limit=2"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"].as_i64(), Some(2));
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
+    }
 }
