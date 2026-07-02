@@ -102,7 +102,7 @@ pub async fn list_ref_updates(
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(50)
-        .min(MAX_VISIBLE_REF_UPDATES);
+        .clamp(0, MAX_VISIBLE_REF_UPDATES);
 
     // Fail-closed visibility gate (#114), applied before the limit via paging so
     // an anon caller still gets the latest visible events, not a short page.
@@ -141,11 +141,16 @@ pub async fn list_repo_events(
     Query(params): Query<HashMap<String, String>>,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
+    // The lower bound of this clamp is load-bearing, not just an upper cap: the
+    // local ref-cert half below is bounded only by `all_events.truncate(limit as
+    // usize)`, which bypasses the shared collector. A negative limit would wrap to
+    // usize::MAX and leave that truncate a no-op. Do not relax to `.min` here (the
+    // global feed can, since its limit is re-clamped inside the collector).
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(50)
-        .min(MAX_VISIBLE_REF_UPDATES);
+        .clamp(0, MAX_VISIBLE_REF_UPDATES);
 
     // Gate this handler in two layers (#112/#114). First, a repo-root read gate on
     // THIS repo: authorize_repo_read returns RepoNotFound (→ 404) when the repo is
@@ -566,6 +571,40 @@ mod ref_updates_feed_tests {
             slugs(&body).iter().all(|s| s == "z6MkOwner/openrepo"),
             "returned rows must all be the public repo's, got {:?}",
             slugs(&body)
+        );
+    }
+
+    // A negative limit on the GLOBAL feed must return zero, not the whole visible
+    // set. Unlike the repo feed, this handler has no local `truncate`; its guard is
+    // the shared collector's `clamp(0, MAX)` (want==0 short-circuits before any
+    // scan), so the handler-level clamp here is a consistency measure, not the
+    // load-bearing one. Seeded with 5 visible public rows so an unbounded return
+    // would be 5; asserting 0 proves the clamp chain holds.
+    #[sqlx::test]
+    async fn feed_negative_limit_returns_empty(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        for i in 0..5 {
+            let mut r = ref_row(&format!("pub{i}"), "z6MkOwner/openrepo");
+            r.timestamp = format!("2026-07-01T10:00:0{i}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/events/ref-updates?limit=-1")
+            .body(Body::empty())
+            .expect("request builder");
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            count(&body_json(resp).await),
+            0,
+            "negative limit must clamp to 0, not return the full visible set"
         );
     }
 
@@ -1031,6 +1070,39 @@ mod ref_updates_feed_tests {
             count(&body_json(resp).await),
             200,
             "limit must clamp to MAX_VISIBLE_REF_UPDATES"
+        );
+    }
+
+    // A negative limit must floor to 0 at this handler, not wrap to usize::MAX and
+    // leave the local ref-cert list untruncated. The bug lives in the LOCAL half's
+    // `truncate(limit as usize)` (the gossip half is already clamped in the shared
+    // collector), so the repo is seeded with local certs and no gossip rows to keep
+    // the assertion load-bearing.
+    #[sqlx::test]
+    async fn repo_events_negative_limit_clamped(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        for i in 0..3 {
+            let mut c = ref_cert(&format!("c{i}"), "pub");
+            c.ref_name = format!("refs/heads/b{i}");
+            state.db.insert_ref_certificate(&c).await.unwrap();
+        }
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/repos/z6MkOwner/openrepo/events?limit=-1")
+            .body(Body::empty())
+            .expect("request builder");
+        let resp = repo_events_router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            count(&body_json(resp).await),
+            0,
+            "negative limit must clamp to 0, not leave the local set untruncated"
         );
     }
 
