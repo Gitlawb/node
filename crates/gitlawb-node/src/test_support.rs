@@ -1953,6 +1953,7 @@ mod tests {
             "owner also 404s on dangling blobs under path-scoped rules (fail-closed default)"
         );
         assert!(!body.contains("DANGLING SECRET"));
+    }
 
     fn pins_router(state: &AppState) -> Router {
         Router::new()

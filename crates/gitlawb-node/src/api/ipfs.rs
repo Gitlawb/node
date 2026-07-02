@@ -279,41 +279,37 @@ pub async fn list_pins(
             Err(_) => continue,
         };
 
-        // If path-scoped rules exist, we need to compute withheld blobs.
-        let withheld_set = if has_path_scoped_rule(rules) {
+        // If path-scoped rules exist, compute the set of blobs the caller is
+        // allowed to read. Otherwise every blob in the repo is allowed.
+        let allowed_blobs = if has_path_scoped_rule(rules) {
             let rp = repo_path.clone();
             let r = rules.to_vec();
             let is_public = repo.is_public;
             let owner = repo.owner_did.clone();
             let caller_for_walk = caller_owned.clone();
 
-            let walk = tokio::task::spawn_blocking(move || {
-                withheld_blob_oids(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
+            match tokio::task::spawn_blocking(move || {
+                allowed_blob_set_for_caller(&rp, &r, is_public, &owner, caller_for_walk.as_deref())
             })
-            .await;
-
-            match walk {
-                Ok(Ok(set)) => Some(set),
+            .await
+            {
+                Ok(Ok(set)) => set,
                 _ => {
-                    // Fail closed: if we can't compute withheld set, skip this repo.
-                    tracing::warn!(repo = %repo.name, "withheld walk failed; skipping repo for pins listing");
+                    tracing::warn!(repo = %repo.name, "allowed-blob walk failed; skipping repo for pins listing");
                     continue;
                 }
             }
         } else {
-            None
+            // No path-scoped rules: all objects reachable in this repo are allowed.
+            match push_delta::list_all_objects(&repo_path) {
+                Ok(objects) => objects.into_iter().collect(),
+                Err(_) => continue,
+            }
         };
 
-        // Read all objects in this repo and add non-withheld ones to allowed set.
-        if let Ok(objects) = push_delta::list_all_objects(&repo_path) {
-            for sha in objects {
-                if let Some(ref withheld) = withheld_set {
-                    if withheld.contains(&sha) {
-                        continue;
-                    }
-                }
-                allowed_sha256s.insert(sha);
-            }
+        // Add the allowed blobs to the global allowed set.
+        for sha in allowed_blobs {
+            allowed_sha256s.insert(sha);
         }
     }
 
