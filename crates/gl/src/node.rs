@@ -186,8 +186,8 @@ async fn try_get_json(client: &NodeClient, path: &str) -> Option<Value> {
 /// sign in. A pins failure never aborts the dashboard.
 #[derive(Debug)]
 enum PinsPanel {
-    /// Signed read succeeded and returned pins (carries the raw JSON body).
-    Pins(Value),
+    /// Signed read succeeded and returned pins (carries the resolved count).
+    Pins(u64),
     /// Signed read succeeded but the node has no pins recorded.
     Empty,
     /// Signed read was rejected (401/other) or errored.
@@ -221,7 +221,7 @@ async fn fetch_pins(node: &str, keypair: Option<Keypair>) -> PinsPanel {
     if count == 0 {
         PinsPanel::Empty
     } else {
-        PinsPanel::Pins(body)
+        PinsPanel::Pins(count)
     }
 }
 
@@ -361,14 +361,11 @@ async fn cmd_status(node: String) -> Result<()> {
     // Pins
     println!("Pins");
     match pins_panel {
-        PinsPanel::Pins(ref pins) => {
-            let count = pins["count"]
-                .as_u64()
-                .unwrap_or_else(|| pins["pins"].as_array().map(|a| a.len() as u64).unwrap_or(0));
+        PinsPanel::Pins(count) => {
             println!("  Pinned CIDs: {count}");
         }
         PinsPanel::Empty => {
-            println!("  IPFS not configured");
+            println!("  Pinned CIDs: 0");
         }
         PinsPanel::Unavailable => {
             println!("  IPFS pins: unavailable");
@@ -499,10 +496,7 @@ mod tests {
 
         let panel = fetch_pins(&server.url(), Some(kp)).await;
         match panel {
-            PinsPanel::Pins(pins) => {
-                assert_eq!(pins["count"].as_u64(), Some(1));
-                assert_eq!(pins["pins"].as_array().map(|a| a.len()), Some(1));
-            }
+            PinsPanel::Pins(count) => assert_eq!(count, 1),
             other => panic!("expected Pins, got {other:?}"),
         }
 

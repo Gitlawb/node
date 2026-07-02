@@ -49,9 +49,13 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
     // error (it already names `gl identity new`) rather than a bare 401.
     let keypair = crate::identity::load_keypair_from_dir(dir.as_deref())?;
     let client = NodeClient::new(&node, Some(keypair));
-    let resp: Value = client
-        .get_signed("/api/v1/ipfs/pins")
-        .await?
+    let resp = client.get_signed("/api/v1/ipfs/pins").await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("node returned {status} for pins listing: {body}");
+    }
+    let resp: Value = resp
         .json()
         .await
         .context("failed to parse pins response")?;
@@ -203,6 +207,33 @@ mod tests {
             err.to_string().contains("gl identity new")
                 || err.to_string().contains("no identity found"),
             "error should name `gl identity new`, got: {err}"
+        );
+
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cmd_list_non_success_status_is_error_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let keystore = seed_keystore();
+
+        // A signed request the node rejects (401) must surface as an error,
+        // not be silently parsed into an empty pin list.
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_list(server.url(), Some(keystore.path().to_path_buf()))
+            .await
+            .expect_err("non-2xx status should be an error");
+        assert!(
+            err.to_string().contains("401"),
+            "error should mention the status, got: {err}"
         );
 
         m.assert_async().await;
