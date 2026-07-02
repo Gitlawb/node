@@ -2374,6 +2374,58 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// #136: ?repo= resolves against the deduped canonical repo, not a public mirror.
+    ///
+    /// When a repo has both a private canonical row and a public mirror row, the
+    /// ?repo= path must gate on the canonical survivor's visibility (denying a
+    /// stranger) rather than the public mirror's (which would allow).
+    #[sqlx::test]
+    async fn anchors_repo_denies_stranger_when_canonical_is_private_even_with_public_mirror(
+        pool: PgPool,
+    ) {
+        use gitlawb_core::identity::Keypair;
+
+        let state = test_state(pool).await;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let repo_name = "mirror-canonical";
+
+        // Create a private canonical repo.
+        let canonical = seed_private_repo(&owner_did, repo_name);
+        state.db.create_repo(&canonical).await.unwrap();
+
+        // Create a public mirror for the same repo.
+        state
+            .db
+            .upsert_mirror_repo(&short, repo_name, "/tmp/mirror", None, false)
+            .await
+            .unwrap();
+
+        // Seed an anchor with the short slug (matching both rows).
+        let short_slug = format!("{short}/{repo_name}");
+        seed_anchor(&state.db, &short_slug, &owner_did).await;
+
+        let stranger = Keypair::generate();
+        let uri = format!("/api/v1/arweave/anchors?repo={owner_did}/{repo_name}");
+
+        // Stranger must be denied (404), not served anchor via the public mirror.
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&stranger, &uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Owner still gets the anchor.
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&owner, &uri))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 1, "owner sees their anchor through ?repo=");
+    }
+
     /// #121: negative limit is clamped to 0 and returns a bounded response (no 500).
     #[sqlx::test]
     async fn anchors_global_negative_limit_is_clamped(pool: PgPool) {

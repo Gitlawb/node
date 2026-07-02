@@ -2382,6 +2382,40 @@ impl Db {
             })
             .collect())
     }
+
+    /// Bounded global anchor query: returns anchors for any of the given repo
+    /// slugs, ordered by anchored_at DESC, capped at `limit`.
+    pub async fn list_arweave_anchors_for_repos(
+        &self,
+        repos: &[String],
+        limit: i64,
+    ) -> Result<Vec<ArweaveAnchor>> {
+        let rows = sqlx::query(
+            "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
+             FROM arweave_anchors WHERE repo = ANY($1) ORDER BY anchored_at DESC LIMIT $2",
+        )
+        .bind(repos)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ArweaveAnchor {
+                id: r.get("id"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
+                ref_name: r.get("ref_name"),
+                old_sha: r.get("old_sha"),
+                new_sha: r.get("new_sha"),
+                cid: r.get("cid"),
+                irys_tx_id: r.get("irys_tx_id"),
+                arweave_url: r.get("arweave_url"),
+                node_did: r.get("node_did"),
+                anchored_at: r.get("anchored_at"),
+            })
+            .collect())
+    }
 }
 
 // ── Row helpers ───────────────────────────────────────────────────────────────
