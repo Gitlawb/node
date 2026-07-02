@@ -2125,23 +2125,6 @@ impl Db {
         Ok(())
     }
 
-    pub async fn list_repo_ref_updates(
-        &self,
-        repo: &str,
-        limit: i64,
-    ) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = sqlx::query(
-            "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
-             FROM received_ref_updates WHERE repo = $1 ORDER BY timestamp DESC LIMIT $2",
-        )
-        .bind(repo)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_ref_update).collect())
-    }
-
     /// One page of ref updates (newest first), optionally scoped to one repo.
     /// The `(timestamp DESC, id DESC)` order gives a stable tiebreak so offset
     /// paging does not skip or duplicate rows when timestamps collide. Used by
