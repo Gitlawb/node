@@ -539,10 +539,8 @@ const MIGRATIONS: &[Migration] = &[
                 received_at TEXT NOT NULL,
                 from_peer   TEXT NOT NULL
             )"#,
-            "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
             "CREATE INDEX IF NOT EXISTS idx_ref_updates_repo ON received_ref_updates(repo)",
             "CREATE INDEX IF NOT EXISTS idx_ref_updates_ts  ON received_ref_updates(timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_ref_updates_owner ON received_ref_updates(owner_did)",
             r#"CREATE TABLE IF NOT EXISTS pull_requests (
                 id            TEXT NOT NULL PRIMARY KEY,
                 repo_id       TEXT NOT NULL,
@@ -825,6 +823,14 @@ const MIGRATIONS: &[Migration] = &[
             // until an operator releases it. Default false; only the mirror
             // admission path sets it true.
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE",
+        ],
+    },
+    Migration {
+        version: 10,
+        name: "ref_update_owner_did",
+        stmts: &[
+            "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_ref_updates_owner ON received_ref_updates(owner_did)",
         ],
     },
 ];
@@ -3185,6 +3191,53 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+
+    /// Run a full migration from scratch and verify v10 creates the owner_did
+    /// column and index. Also verifies that an existing node re-running the
+    /// migration won't error (idempotent ALTER TABLE ADD COLUMN IF NOT EXISTS).
+    #[sqlx::test]
+    async fn migration_v10_creates_owner_did_column(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+
+        // Run the full migration (v1..v10) on a fresh database.
+        db.migrate().await.unwrap();
+
+        // Verify the owner_did column exists and is nullable TEXT.
+        let col: (String, String, String) = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'received_ref_updates' AND column_name = 'owner_did'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "owner_did");
+        assert_eq!(col.1, "text");
+
+        // Verify the index exists.
+        let idx: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pg_indexes
+             WHERE tablename = 'received_ref_updates' AND indexname = 'idx_ref_updates_owner'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(idx.0, 1, "idx_ref_updates_owner must exist");
+
+        // Verify version 10 is recorded as applied.
+        let v10_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 10")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            v10_count.0, 1,
+            "migration v10 must be recorded in schema_migrations"
+        );
+
+        // Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
+        db.migrate().await.unwrap();
     }
 }
 
