@@ -174,6 +174,9 @@ pub struct ReceivedRefUpdate {
     pub cert_id: Option<String>,
     pub received_at: String,
     pub from_peer: String,
+    /// Full owner DID — populated by new peers; None for events from older
+    /// peers that predate the wire-format change (#144).
+    pub owner_did: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,6 +823,14 @@ const MIGRATIONS: &[Migration] = &[
             // until an operator releases it. Default false; only the mirror
             // admission path sets it true.
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE",
+        ],
+    },
+    Migration {
+        version: 10,
+        name: "ref_update_owner_did",
+        stmts: &[
+            "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_ref_updates_owner ON received_ref_updates(owner_did)",
         ],
     },
 ];
@@ -2089,8 +2100,8 @@ impl Db {
         sqlx::query(
             "INSERT INTO received_ref_updates
              (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-              cert_id, received_at, from_peer)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+              cert_id, received_at, from_peer, owner_did)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&update.id)
@@ -2104,6 +2115,7 @@ impl Db {
         .bind(&update.cert_id)
         .bind(&update.received_at)
         .bind(&update.from_peer)
+        .bind(&update.owner_did)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2112,7 +2124,7 @@ impl Db {
     pub async fn list_ref_updates(&self, limit: i64) -> Result<Vec<ReceivedRefUpdate>> {
         let rows = sqlx::query(
             "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
+                    cert_id, received_at, from_peer, owner_did
              FROM received_ref_updates ORDER BY timestamp DESC LIMIT $1",
         )
         .bind(limit)
@@ -2128,7 +2140,7 @@ impl Db {
     ) -> Result<Vec<ReceivedRefUpdate>> {
         let rows = sqlx::query(
             "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
+                    cert_id, received_at, from_peer, owner_did
              FROM received_ref_updates WHERE repo = $1 ORDER BY timestamp DESC LIMIT $2",
         )
         .bind(repo)
@@ -2147,7 +2159,7 @@ impl Db {
         let rows = if let Some(r) = repo {
             sqlx::query(
                 "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                        cert_id, received_at, from_peer
+                        cert_id, received_at, from_peer, owner_did
                  FROM received_ref_updates WHERE repo=$1 ORDER BY timestamp DESC LIMIT $2",
             )
             .bind(r)
@@ -2157,7 +2169,7 @@ impl Db {
         } else {
             sqlx::query(
                 "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                        cert_id, received_at, from_peer
+                        cert_id, received_at, from_peer, owner_did
                  FROM received_ref_updates ORDER BY timestamp DESC LIMIT $1",
             )
             .bind(limit)
@@ -2469,6 +2481,7 @@ fn row_to_ref_update(r: sqlx::postgres::PgRow) -> ReceivedRefUpdate {
         cert_id: r.get("cert_id"),
         received_at: r.get("received_at"),
         from_peer: r.get("from_peer"),
+        owner_did: r.get("owner_did"),
     }
 }
 
@@ -3178,6 +3191,53 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+
+    /// Run a full migration from scratch and verify v10 creates the owner_did
+    /// column and index. Also verifies that an existing node re-running the
+    /// migration won't error (idempotent ALTER TABLE ADD COLUMN IF NOT EXISTS).
+    #[sqlx::test]
+    async fn migration_v10_creates_owner_did_column(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+
+        // Run the full migration (v1..v10) on a fresh database.
+        db.migrate().await.unwrap();
+
+        // Verify the owner_did column exists and is nullable TEXT.
+        let col: (String, String, String) = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'received_ref_updates' AND column_name = 'owner_did'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "owner_did");
+        assert_eq!(col.1, "text");
+
+        // Verify the index exists.
+        let idx: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pg_indexes
+             WHERE tablename = 'received_ref_updates' AND indexname = 'idx_ref_updates_owner'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(idx.0, 1, "idx_ref_updates_owner must exist");
+
+        // Verify version 10 is recorded as applied.
+        let v10_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 10")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            v10_count.0, 1,
+            "migration v10 must be recorded in schema_migrations"
+        );
+
+        // Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
+        db.migrate().await.unwrap();
     }
 }
 
@@ -3907,5 +3967,165 @@ mod icaptcha_quarantine_tests {
 
         let with_stars = db.list_all_repos_deduped_with_stars(None).await.unwrap();
         assert!(with_stars.iter().all(|(r, _)| r.name != "spam"));
+    }
+}
+
+#[cfg(test)]
+mod ref_update_db_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn update(
+        id: &str,
+        repo: &str,
+        owner_did: Option<&str>,
+        ref_name: &str,
+        sha: &str,
+    ) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.to_string(),
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: repo.to_string(),
+            owner_did: owner_did.map(|s| s.to_string()),
+            ref_name: ref_name.to_string(),
+            old_sha: "0000000000000000000000000000000000000000".into(),
+            new_sha: sha.to_string(),
+            timestamp: "2026-07-02T12:00:00Z".into(),
+            cert_id: None,
+            received_at: "2026-07-02T12:00:01Z".into(),
+            from_peer: "12D3KooWTest".into(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_with_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u1",
+            "zOwner/myrepo",
+            Some("did:key:zOwner"),
+            "refs/heads/main",
+            "aaaa",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates(100).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did.as_deref(), Some("did:key:zOwner"));
+        assert_eq!(all[0].repo, "zOwner/myrepo");
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_without_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u2",
+            "zOwner/myrepo",
+            None,
+            "refs/heads/main",
+            "bbbb",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates(100).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did, None);
+    }
+
+    #[sqlx::test]
+    async fn list_repo_ref_updates_filters_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u3",
+            "alice/repo1",
+            Some("did:key:zAlice"),
+            "refs/heads/main",
+            "cccc",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u4",
+            "bob/repo2",
+            Some("did:key:zBob"),
+            "refs/heads/feat",
+            "dddd",
+        ))
+        .await
+        .unwrap();
+
+        let alice_events = db.list_repo_ref_updates("alice/repo1", 100).await.unwrap();
+        assert_eq!(alice_events.len(), 1);
+        assert_eq!(alice_events[0].id, "u3");
+        assert_eq!(alice_events[0].owner_did.as_deref(), Some("did:key:zAlice"));
+
+        let bob_events = db.list_repo_ref_updates("bob/repo2", 100).await.unwrap();
+        assert_eq!(bob_events.len(), 1);
+        assert_eq!(bob_events[0].id, "u4");
+        assert_eq!(bob_events[0].owner_did.as_deref(), Some("did:key:zBob"));
+
+        let empty = db.list_repo_ref_updates("other/repo", 100).await.unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn list_ref_updates_filtered_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u5",
+            "ownerA/proj",
+            Some("did:key:zA"),
+            "refs/heads/main",
+            "eeee",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u6",
+            "ownerB/proj",
+            Some("did:web:host:zB"),
+            "refs/heads/main",
+            "ffff",
+        ))
+        .await
+        .unwrap();
+
+        let filtered = db
+            .list_ref_updates_filtered(Some("ownerA/proj"), 100)
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "u5");
+        assert_eq!(filtered[0].owner_did.as_deref(), Some("did:key:zA"));
+
+        let all = db.list_ref_updates_filtered(None, 100).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn insert_update_idempotent_on_conflict(pool: PgPool) {
+        let db = db(pool).await;
+        let u = update(
+            "u7",
+            "repo/x",
+            Some("did:key:zX"),
+            "refs/heads/main",
+            "gggg",
+        );
+        db.insert_ref_update(&u).await.unwrap();
+        db.insert_ref_update(&u).await.unwrap();
+
+        let all = db.list_ref_updates(100).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].new_sha, "gggg");
     }
 }

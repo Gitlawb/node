@@ -39,6 +39,11 @@ pub struct RefUpdateEvent {
     pub pusher_did: String,
     /// Repository identifier (owner/name)
     pub repo: String,
+    /// Full owner DID — added in #144 so the feed gate can distinguish
+    /// different DID methods that share the same trailing segment.
+    /// Optional for backward compat with older peers that don't include it.
+    #[serde(default)]
+    pub owner_did: Option<String>,
     /// Git ref that changed (e.g., "refs/heads/main")
     pub ref_name: String,
     /// SHA before the push (all-zeros for new ref)
@@ -307,6 +312,7 @@ pub async fn start(
                                     node_did: event.node_did.clone(),
                                     pusher_did: event.pusher_did.clone(),
                                     repo: event.repo.clone(),
+                                    owner_did: event.owner_did.clone(),
                                     ref_name: event.ref_name.clone(),
                                     old_sha: event.old_sha.clone(),
                                     new_sha: event.new_sha.clone(),
@@ -431,4 +437,68 @@ pub async fn start(
     });
 
     Ok(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ref_update_event_round_trip_with_owner_did() {
+        let event = RefUpdateEvent {
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: "zOwner/myrepo".into(),
+            owner_did: Some("did:key:zOwner".into()),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0000000000000000000000000000000000000000".into(),
+            new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            timestamp: "2026-07-02T12:00:00Z".into(),
+            cert_id: None,
+            cid: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        // owner_did must be present in the serialized output
+        assert_eq!(json["owner_did"], "did:key:zOwner");
+        assert_eq!(json["repo"], "zOwner/myrepo");
+
+        let deserialized: RefUpdateEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.owner_did, Some("did:key:zOwner".into()));
+    }
+
+    #[test]
+    fn ref_update_event_backward_compat_no_owner_did() {
+        let old_json = serde_json::json!({
+            "node_did": "did:key:zNode",
+            "pusher_did": "did:key:zPusher",
+            "repo": "zOwner/myrepo",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000000000000000000000000000000000000000",
+            "new_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": "2026-07-02T12:00:00Z",
+            "cert_id": null,
+            "cid": null
+        });
+        let deserialized: RefUpdateEvent = serde_json::from_value(old_json).unwrap();
+        assert_eq!(deserialized.owner_did, None);
+        assert_eq!(deserialized.repo, "zOwner/myrepo");
+    }
+
+    #[test]
+    fn ref_update_event_backward_compat_null_owner_did() {
+        let with_null = serde_json::json!({
+            "node_did": "did:key:zNode",
+            "pusher_did": "did:key:zPusher",
+            "repo": "zOwner/myrepo",
+            "owner_did": null,
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000000000000000000000000000000000000000",
+            "new_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "timestamp": "2026-07-02T12:00:00Z",
+            "cert_id": null,
+            "cid": null
+        });
+        let deserialized: RefUpdateEvent = serde_json::from_value(with_null).unwrap();
+        assert_eq!(deserialized.owner_did, None);
+    }
 }

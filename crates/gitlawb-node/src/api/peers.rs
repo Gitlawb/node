@@ -347,6 +347,10 @@ pub struct NotifyRequest {
     pub timestamp: Option<String>,
     #[serde(default)]
     pub cert_id: Option<String>,
+    /// Full owner DID — added in #144 for DID-aware feed gating.
+    /// Optional for backward compat with older senders.
+    #[serde(default)]
+    pub owner_did: Option<String>,
 }
 
 pub async fn notify_sync(
@@ -391,6 +395,7 @@ pub async fn notify_sync(
         node_did: req.node_did.clone(),
         pusher_did: req.pusher_did.clone().unwrap_or_default(),
         repo: req.repo.clone(),
+        owner_did: req.owner_did.clone(),
         ref_name: req.ref_name.clone(),
         old_sha: req.old_sha.clone().unwrap_or_default(),
         new_sha: req.new_sha.clone(),
