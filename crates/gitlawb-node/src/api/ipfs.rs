@@ -246,9 +246,11 @@ pub async fn list_pins(
         .map_err(AppError::Internal)?;
 
     // Build a set of sha256_hex values from repos the caller can read.
+    // Use the deduped repo list so mirror rows never bypass the canonical
+    // repo's visibility rules (#136).
     let repos = state
         .db
-        .list_all_repos()
+        .list_all_repos_deduped()
         .await
         .map_err(AppError::Internal)?;
 
@@ -262,18 +264,6 @@ pub async fn list_pins(
     let mut allowed_sha256s = std::collections::HashSet::new();
 
     for repo in &repos {
-        // Preserve the quarantine gate from authorize_repo_read: a quarantined
-        // mirror is treated as nonexistent on every read surface, so its objects
-        // must not contribute to the allowed SHA-256 set (#P2).
-        if state
-            .db
-            .is_repo_quarantined(&repo.id)
-            .await
-            .map_err(AppError::Internal)?
-        {
-            continue;
-        }
-
         let rules: &[crate::db::VisibilityRule] = rules_by_repo
             .get(&repo.id)
             .map(Vec::as_slice)

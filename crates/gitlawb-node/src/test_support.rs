@@ -2372,4 +2372,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    /// #121: negative limit is clamped to 0 and returns a bounded response (no 500).
+    #[sqlx::test]
+    async fn anchors_global_negative_limit_is_clamped(pool: PgPool) {
+        let state = test_state(pool).await;
+        let fx = setup_anchor_test(&state, "neg-limit-repo", true).await;
+
+        let resp = anchors_router(&state)
+            .oneshot(signed_get(&fx.owner, "/api/v1/arweave/anchors?limit=-1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 0,
+            "negative limit clamps to 0, returning empty result"
+        );
+    }
 }
