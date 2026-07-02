@@ -2326,7 +2326,9 @@ mod tests {
             .match_body(mockito::Matcher::AllOf(vec![
                 mockito::Matcher::PartialJsonString(format!(r#"{{"old_sha":"{zero}"}}"#)),
                 mockito::Matcher::PartialJsonString(format!(r#"{{"new_sha":"{new_sha}"}}"#)),
-                mockito::Matcher::PartialJsonString(r#"{"owner_did":"did:key:zOwner"}"#.to_string()),
+                mockito::Matcher::PartialJsonString(
+                    r#"{"owner_did":"did:key:zOwner"}"#.to_string(),
+                ),
             ]))
             .with_status(200)
             .expect(1)
