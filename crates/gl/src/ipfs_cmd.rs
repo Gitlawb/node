@@ -3,6 +3,8 @@
 //! Communicates with the gitlawb node to list pinned CIDs and retrieve git
 //! objects by their content-addressed CID.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
@@ -21,6 +23,9 @@ pub enum IpfsCmd {
     List {
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        /// Identity directory (default: ~/.gitlawb)
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Retrieve and display a git object from the node by its CIDv1
     Get {
@@ -33,15 +38,19 @@ pub enum IpfsCmd {
 
 pub async fn run(args: IpfsArgs) -> Result<()> {
     match args.cmd {
-        IpfsCmd::List { node } => cmd_list(node).await,
+        IpfsCmd::List { node, dir } => cmd_list(node, dir).await,
         IpfsCmd::Get { cid, node } => cmd_get(cid, node).await,
     }
 }
 
-async fn cmd_list(node: String) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
+    // #134 gates /api/v1/ipfs/pins behind auth: sign the request with the
+    // caller's identity. On no identity, propagate load_keypair_from_dir's
+    // error (it already names `gl identity new`) rather than a bare 401.
+    let keypair = crate::identity::load_keypair_from_dir(dir.as_deref())?;
+    let client = NodeClient::new(&node, Some(keypair));
     let resp: Value = client
-        .get("/api/v1/ipfs/pins")
+        .get_signed("/api/v1/ipfs/pins")
         .await?
         .json()
         .await
@@ -107,4 +116,95 @@ async fn cmd_get(cid: String, node: String) -> Result<()> {
         .context("failed to write to stdout")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seed a keypair into a temp dir the way `load_keypair_from_dir` expects,
+    /// then return the dir handle (keeps it alive for the test's duration).
+    fn seed_keystore() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_cmd_list_signs_request_and_renders_pins() {
+        let mut server = mockito::Server::new_async().await;
+        let keystore = seed_keystore();
+
+        // Happy path: signed GET to /api/v1/ipfs/pins carrying the RFC 9421
+        // signature headers, node returns a populated pins body.
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .match_header("content-digest", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"pins":[{"cid":"bafyone","sha256_hex":"abc123","pinned_at":"2026-07-02T12:00:00.123456Z"}],"count":1}"#,
+            )
+            .create_async()
+            .await;
+
+        cmd_list(server.url(), Some(keystore.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cmd_list_empty_pins() {
+        let mut server = mockito::Server::new_async().await;
+        let keystore = seed_keystore();
+
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"pins":[],"count":0}"#)
+            .create_async()
+            .await;
+
+        cmd_list(server.url(), Some(keystore.path().to_path_buf()))
+            .await
+            .unwrap();
+
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_cmd_list_no_identity_errors_without_request() {
+        let mut server = mockito::Server::new_async().await;
+        // Empty keystore dir: no identity.pem present.
+        let empty = tempfile::TempDir::new().unwrap();
+
+        // The endpoint must never be hit when there is no identity.
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_list(server.url(), Some(empty.path().to_path_buf()))
+            .await
+            .expect_err("no identity should be an error");
+        assert!(
+            err.to_string().contains("gl identity new")
+                || err.to_string().contains("no identity found"),
+            "error should name `gl identity new`, got: {err}"
+        );
+
+        m.assert_async().await;
+    }
 }
