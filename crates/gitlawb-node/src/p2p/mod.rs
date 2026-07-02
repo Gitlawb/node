@@ -39,6 +39,11 @@ pub struct RefUpdateEvent {
     pub pusher_did: String,
     /// Repository identifier (owner/name)
     pub repo: String,
+    /// Full owner DID — added in #144 so the feed gate can distinguish
+    /// different DID methods that share the same trailing segment.
+    /// Optional for backward compat with older peers that don't include it.
+    #[serde(default)]
+    pub owner_did: Option<String>,
     /// Git ref that changed (e.g., "refs/heads/main")
     pub ref_name: String,
     /// SHA before the push (all-zeros for new ref)
@@ -307,6 +312,7 @@ pub async fn start(
                                     node_did: event.node_did.clone(),
                                     pusher_did: event.pusher_did.clone(),
                                     repo: event.repo.clone(),
+                                    owner_did: event.owner_did.clone(),
                                     ref_name: event.ref_name.clone(),
                                     old_sha: event.old_sha.clone(),
                                     new_sha: event.new_sha.clone(),

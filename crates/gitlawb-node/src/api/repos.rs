@@ -1200,6 +1200,7 @@ pub async fn git_receive_pack(
                             node_did: node_did_str.clone(),
                             pusher_did: pusher_did_clone.clone(),
                             repo: repo_slug.clone(),
+                            owner_did: Some(record.owner_did.clone()),
                             ref_name: ref_name.clone(),
                             old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
