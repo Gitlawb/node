@@ -259,14 +259,23 @@ pub struct ListReposQuery {
     /// Row offset. Ignored unless `limit` is also provided.
     #[serde(default)]
     pub offset: Option<i64>,
+    /// Case-insensitive substring filter over name, description, and owner DID.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Sort order: `updated` (default, updated_at DESC), `created`, `oldest`,
+    /// `name`, or `stars`.
+    #[serde(default)]
+    pub sort: Option<String>,
 }
 
-/// GET /api/v1/repos[?owner=<short>][&limit=&offset=]
+/// GET /api/v1/repos[?owner=<short>][&limit=&offset=][&q=][&sort=]
 ///
-/// Lists repositories on this node, optionally filtered by owner. When `limit` is
-/// present, returns one page and the `X-Total-Count` response header carries the
-/// total matching row count. Without `limit`, falls back to returning every row
-/// (kept for backwards compat with peer sync and existing CLI tooling).
+/// Lists repositories on this node, optionally filtered by owner and/or a
+/// case-insensitive substring `q` (name, description, owner DID), sorted by
+/// `sort` (`updated` default, `created`, `oldest`, `name`, `stars`). When `limit`
+/// is present, returns one page and the `X-Total-Count` response header carries
+/// the total matching row count. Without `limit`, falls back to returning every
+/// row (kept for backwards compat with peer sync and existing CLI tooling).
 ///
 /// Every returned row passes the per-caller `"/"` visibility gate
 /// (`crate::visibility::listable_at_root`), the same decision the per-repo
@@ -296,13 +305,17 @@ pub async fn list_repos(
 
     let ids: Vec<String> = owner_filtered.iter().map(|(r, _)| r.id.clone()).collect();
     let rules_by_repo = state.db.list_visibility_rules_for_repos(&ids).await?;
-    let visible: Vec<(crate::db::RepoRecord, i64)> = owner_filtered
+    let mut visible: Vec<(crate::db::RepoRecord, i64)> = owner_filtered
         .into_iter()
         .filter(|(r, _)| {
             let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
             crate::visibility::listable_at_root(rules, r.is_public, &r.owner_did, caller)
         })
         .collect();
+
+    // Search and sort run AFTER the visibility gate, so `total` (and therefore
+    // X-Total-Count) only ever counts repos the caller may read (#97).
+    filter_and_sort_repos(&mut visible, query.q.as_deref(), query.sort.as_deref());
 
     let total = visible.len() as i64;
 
@@ -327,6 +340,36 @@ pub async fn list_repos(
         HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
     );
     Ok(response)
+}
+
+/// Applies the `q` substring filter and `sort` order to the caller-visible repo
+/// rows (with star counts). Must run after the visibility gate so the resulting
+/// length is safe to expose as X-Total-Count (#97). Unknown/absent `sort` keeps
+/// the incoming order (updated_at DESC from the query).
+fn filter_and_sort_repos(
+    visible: &mut Vec<(crate::db::RepoRecord, i64)>,
+    q: Option<&str>,
+    sort: Option<&str>,
+) {
+    if let Some(q) = q.map(str::trim).filter(|s| !s.is_empty()) {
+        let q = q.to_lowercase();
+        visible.retain(|(r, _)| {
+            r.name.to_lowercase().contains(&q)
+                || r.owner_did.to_lowercase().contains(&q)
+                || r.description
+                    .as_deref()
+                    .is_some_and(|d| d.to_lowercase().contains(&q))
+        });
+    }
+    match sort {
+        Some("created") => visible.sort_by(|a, b| b.0.created_at.cmp(&a.0.created_at)),
+        Some("oldest") => visible.sort_by(|a, b| a.0.created_at.cmp(&b.0.created_at)),
+        Some("name") => {
+            visible.sort_by(|a, b| a.0.name.to_lowercase().cmp(&b.0.name.to_lowercase()))
+        }
+        Some("stars") => visible.sort_by(|a, b| b.1.cmp(&a.1)),
+        _ => {}
+    }
 }
 
 /// GET /api/v1/repos/:owner/:repo
@@ -1845,6 +1888,83 @@ mod tests {
             matches!(rejection, Some(AppError::Forbidden(_))),
             "expected Some(Forbidden), got {rejection:?}"
         );
+    }
+
+    fn named_repo(
+        name: &str,
+        description: Option<&str>,
+        stars: i64,
+        age_secs: i64,
+    ) -> (crate::db::RepoRecord, i64) {
+        let mut r = repo_owned_by(OWNER_DID);
+        r.name = name.into();
+        r.description = description.map(Into::into);
+        r.created_at -= chrono::Duration::seconds(age_secs);
+        (r, stars)
+    }
+
+    #[test]
+    fn filter_and_sort_repos_q_matches_name_description_and_owner() {
+        let mut rows = vec![
+            named_repo("alpha-tool", None, 0, 0),
+            named_repo("beta", Some("an ALPHA implementation"), 0, 0),
+            named_repo("gamma", None, 0, 0),
+        ];
+        filter_and_sort_repos(&mut rows, Some("alpha"), None);
+        let names: Vec<_> = rows.iter().map(|(r, _)| r.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha-tool", "beta"]);
+
+        // Owner DID substring matches every row (all share OWNER_DID)
+        let mut rows = vec![named_repo("a", None, 0, 0), named_repo("b", None, 0, 0)];
+        filter_and_sort_repos(&mut rows, Some("z6MkpTHR"), None);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn filter_and_sort_repos_blank_q_and_unknown_sort_are_noops() {
+        let mut rows = vec![named_repo("b", None, 1, 10), named_repo("a", None, 2, 0)];
+        filter_and_sort_repos(&mut rows, Some("   "), Some("bogus"));
+        let names: Vec<_> = rows.iter().map(|(r, _)| r.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "a"], "incoming order must be preserved");
+    }
+
+    #[test]
+    fn filter_and_sort_repos_sort_orders() {
+        let rows = || {
+            vec![
+                named_repo("Bravo", None, 5, 100),
+                named_repo("alpha", None, 1, 0),
+                named_repo("charlie", None, 9, 50),
+            ]
+        };
+
+        let mut by_name = rows();
+        filter_and_sort_repos(&mut by_name, None, Some("name"));
+        let names: Vec<_> = by_name.iter().map(|(r, _)| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "Bravo", "charlie"],
+            "name sort is case-insensitive"
+        );
+
+        let mut by_stars = rows();
+        filter_and_sort_repos(&mut by_stars, None, Some("stars"));
+        let stars: Vec<_> = by_stars.iter().map(|(_, s)| *s).collect();
+        assert_eq!(stars, vec![9, 5, 1]);
+
+        let mut by_created = rows();
+        filter_and_sort_repos(&mut by_created, None, Some("created"));
+        let names: Vec<_> = by_created.iter().map(|(r, _)| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "charlie", "Bravo"],
+            "created = newest first"
+        );
+
+        let mut by_oldest = rows();
+        filter_and_sort_repos(&mut by_oldest, None, Some("oldest"));
+        let names: Vec<_> = by_oldest.iter().map(|(r, _)| r.name.as_str()).collect();
+        assert_eq!(names, vec!["Bravo", "charlie", "alpha"]);
     }
 
     #[test]
