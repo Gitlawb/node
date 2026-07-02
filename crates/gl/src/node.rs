@@ -2,10 +2,12 @@
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use gitlawb_core::identity::Keypair;
 use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
+use crate::identity::load_keypair_from_dir;
 use crate::node_stake;
 
 #[derive(Args)]
@@ -177,6 +179,52 @@ async fn try_get_json(client: &NodeClient, path: &str) -> Option<Value> {
     resp.json::<Value>().await.ok()
 }
 
+/// Outcome of fetching the IPFS pins panel for `gl node status`.
+///
+/// #134 gates `/api/v1/ipfs/pins` behind auth, so this panel signs its request
+/// when an identity is available and otherwise reports that the caller must
+/// sign in. A pins failure never aborts the dashboard.
+#[derive(Debug)]
+enum PinsPanel {
+    /// Signed read succeeded and returned pins (carries the raw JSON body).
+    Pins(Value),
+    /// Signed read succeeded but the node has no pins recorded.
+    Empty,
+    /// Signed read was rejected (401/other) or errored.
+    Unavailable,
+    /// No identity available; no request was issued.
+    NeedsIdentity,
+}
+
+/// Fetch the pins panel state. With a keypair, signs the `/api/v1/ipfs/pins`
+/// read and maps the outcome; without one, returns `NeedsIdentity` and issues
+/// no request. Injectable (node URL + optional keypair) so tests drive it with
+/// a mock server and never touch the default keystore.
+async fn fetch_pins(node: &str, keypair: Option<Keypair>) -> PinsPanel {
+    let Some(kp) = keypair else {
+        return PinsPanel::NeedsIdentity;
+    };
+    let client = NodeClient::new(node, Some(kp));
+    let resp = match client.get_signed("/api/v1/ipfs/pins").await {
+        Ok(r) => r,
+        Err(_) => return PinsPanel::Unavailable,
+    };
+    if !resp.status().is_success() {
+        return PinsPanel::Unavailable;
+    }
+    let Ok(body) = resp.json::<Value>().await else {
+        return PinsPanel::Unavailable;
+    };
+    let count = body["count"]
+        .as_u64()
+        .unwrap_or_else(|| body["pins"].as_array().map(|a| a.len() as u64).unwrap_or(0));
+    if count == 0 {
+        PinsPanel::Empty
+    } else {
+        PinsPanel::Pins(body)
+    }
+}
+
 async fn cmd_status(node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
@@ -194,13 +242,18 @@ async fn cmd_status(node: String) -> Result<()> {
     let version = info["version"].as_str().unwrap_or("unknown");
     let network = info["network"].as_str().unwrap_or("unknown");
 
+    // The pins panel signs its read (#134 gates /api/v1/ipfs/pins behind auth);
+    // load the identity gracefully so a missing keystore never aborts status.
+    let keypair = load_keypair_from_dir(None).ok();
+
     // ── Fetch remaining endpoints in parallel ─────────────────────────────
-    let (peers_val, repos_val, p2p_val, events_val, pins_val) = tokio::join!(
+    // Peers/repos/p2p/events stay anonymous; only pins is signed.
+    let (peers_val, repos_val, p2p_val, events_val, pins_panel) = tokio::join!(
         try_get_json(&client, "/api/v1/peers"),
         try_get_json(&client, "/api/v1/repos"),
         try_get_json(&client, "/api/v1/p2p/info"),
         try_get_json(&client, "/api/v1/events/ref-updates?limit=5"),
-        try_get_json(&client, "/api/v1/ipfs/pins"),
+        fetch_pins(&node, keypair),
     );
 
     // ── Render dashboard ──────────────────────────────────────────────────
@@ -307,13 +360,22 @@ async fn cmd_status(node: String) -> Result<()> {
 
     // Pins
     println!("Pins");
-    if let Some(ref pins) = pins_val {
-        let count = pins["count"]
-            .as_u64()
-            .unwrap_or_else(|| pins["pins"].as_array().map(|a| a.len() as u64).unwrap_or(0));
-        println!("  Pinned CIDs: {count}");
-    } else {
-        println!("  IPFS not configured");
+    match pins_panel {
+        PinsPanel::Pins(ref pins) => {
+            let count = pins["count"]
+                .as_u64()
+                .unwrap_or_else(|| pins["pins"].as_array().map(|a| a.len() as u64).unwrap_or(0));
+            println!("  Pinned CIDs: {count}");
+        }
+        PinsPanel::Empty => {
+            println!("  IPFS not configured");
+        }
+        PinsPanel::Unavailable => {
+            println!("  IPFS pins: unavailable");
+        }
+        PinsPanel::NeedsIdentity => {
+            println!("  IPFS pins: sign in to view (run `gl identity new`)");
+        }
     }
     println!();
 
@@ -408,4 +470,110 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitlawb_core::identity::Keypair;
+
+    #[tokio::test]
+    async fn test_fetch_pins_keyed_happy_signs_and_returns_pins() {
+        let mut server = mockito::Server::new_async().await;
+        let kp = Keypair::generate();
+
+        // A keyed fetch must sign the request (RFC 9421 headers) and, on a
+        // populated 200 body, land in the Pins state carrying the pins.
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .match_header("content-digest", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"pins":[{"cid":"bafyone","sha256_hex":"abc123","pinned_at":"2026-07-02T12:00:00Z"}],"count":1}"#,
+            )
+            .create_async()
+            .await;
+
+        let panel = fetch_pins(&server.url(), Some(kp)).await;
+        match panel {
+            PinsPanel::Pins(pins) => {
+                assert_eq!(pins["count"].as_u64(), Some(1));
+                assert_eq!(pins["pins"].as_array().map(|a| a.len()), Some(1));
+            }
+            other => panic!("expected Pins, got {other:?}"),
+        }
+
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pins_keyed_empty_returns_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let kp = Keypair::generate();
+
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"pins":[],"count":0}"#)
+            .create_async()
+            .await;
+
+        let panel = fetch_pins(&server.url(), Some(kp)).await;
+        assert!(
+            matches!(panel, PinsPanel::Empty),
+            "expected Empty, got {panel:?}"
+        );
+
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pins_keyed_rejected_returns_unavailable() {
+        let mut server = mockito::Server::new_async().await;
+        let kp = Keypair::generate();
+
+        // Node rejects the signed read (401): the panel must degrade to
+        // Unavailable without panicking, so cmd_status still completes.
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"unauthorized"}"#)
+            .create_async()
+            .await;
+
+        let panel = fetch_pins(&server.url(), Some(kp)).await;
+        assert!(
+            matches!(panel, PinsPanel::Unavailable),
+            "expected Unavailable, got {panel:?}"
+        );
+
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pins_unkeyed_needs_identity_without_request() {
+        let mut server = mockito::Server::new_async().await;
+
+        // With no keypair the endpoint must never be hit.
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let panel = fetch_pins(&server.url(), None).await;
+        assert!(
+            matches!(panel, PinsPanel::NeedsIdentity),
+            "expected NeedsIdentity, got {panel:?}"
+        );
+
+        m.assert_async().await;
+    }
 }
