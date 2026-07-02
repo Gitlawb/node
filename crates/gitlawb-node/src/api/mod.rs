@@ -407,7 +407,6 @@ mod authz_guard {
             ("list_labels", "#120"),
             ("list_repo_bounties", "#120"),
             ("get_star_status", "#120"),
-            ("list_repo_events", "#94 (PR #113)"),
             ("list_webhooks", "#94 (PR #113)"),
             ("list_replicas", "PR #113"),
             ("list_protected_branches", "PR #113"),

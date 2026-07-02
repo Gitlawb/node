@@ -139,6 +139,7 @@ pub async fn list_repo_events(
     State(state): State<AppState>,
     Path((owner, repo_name)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
     let limit = params
         .get("limit")
@@ -146,75 +147,84 @@ pub async fn list_repo_events(
         .unwrap_or(50)
         .min(MAX_VISIBLE_REF_UPDATES);
 
-    // Look up the repo record once so we can use the full owner DID
-    let repo_record = state.db.get_repo(&owner, &repo_name).await.ok().flatten();
+    // Gate this handler in two layers (#112/#114). First, a repo-root read gate on
+    // THIS repo: authorize_repo_read returns RepoNotFound (→ 404) when the repo is
+    // quarantined, visibility-denied, or not hosted here, so the local ref
+    // certificates (keyed by the unique repo record id) are served only to a caller
+    // who may read this repo. A repo this node does not host returns 404: it holds no
+    // visibility record for it, so it fails closed (remote gossip is read via the
+    // global /api/v1/events/ref-updates feed). Second, the gossip half below is
+    // filtered per row: received_ref_updates rows are keyed by a lossy, non-unique
+    // wire slug, so the repo-root gate alone would leak a colliding private repo's
+    // rows — the shared collector's row gate closes that.
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo_name, caller, "/").await?;
 
     // Build the repo identifier using the FULL DID key part (not the 8-char URL truncation).
     // Gossip events are stored as "{full_key_part}/{repo_name}" (e.g. "z6MksXZDfullkeyhere/myrepo"),
     // but the URL only carries the first 8 chars of the key.  Without the full slug the
     // WHERE repo = '...' query never matches and the events tab appears empty.
-    let repo_id_str = if let Some(ref record) = repo_record {
-        format!(
-            "{}/{}",
-            crate::db::normalize_owner_key(&record.owner_did),
-            repo_name
-        )
-    } else {
-        format!("{owner}/{repo_name}")
-    };
+    let repo_id_str = format!(
+        "{}/{}",
+        crate::db::normalize_owner_key(&record.owner_did),
+        repo_name
+    );
 
-    // Fetch local ref certificates for this repo (if the repo exists on this node)
-    let cert_events: Vec<serde_json::Value> = if let Some(ref record) = repo_record {
-        state
-            .db
-            .list_ref_certificates(&record.id)
-            .await
-            .unwrap_or_default()
-            .iter()
-            .map(|c| {
-                serde_json::json!({
-                    "type":       "local_cert",
-                    "id":         c.id,
-                    "repo":       repo_id_str,
-                    "ref_name":   c.ref_name,
-                    "old_sha":    c.old_sha,
-                    "new_sha":    c.new_sha,
-                    "pusher_did": c.pusher_did,
-                    "node_did":   c.node_did,
-                    "timestamp":  c.issued_at,
-                    "source":     "local",
-                })
-            })
-            .collect()
-    } else {
-        vec![]
-    };
-
-    // Fetch gossipsub received ref updates for this repo (uses full slug built above)
-    let gossip_events: Vec<serde_json::Value> = state
+    // Fetch this repo's local ref certificates (keyed by the unique record id, so no
+    // slug-collision concern). DB errors propagate as 500 rather than being swallowed
+    // into an empty 200, matching the gossip half below.
+    let cert_events: Vec<serde_json::Value> = state
         .db
-        .list_repo_ref_updates(&repo_id_str, limit)
-        .await
-        .unwrap_or_default()
+        .list_ref_certificates(&record.id)
+        .await?
         .iter()
-        .map(|u| {
+        .map(|c| {
             serde_json::json!({
-                "type":        "gossipsub",
-                "id":          u.id,
-                "repo":        u.repo,
-                "ref_name":    u.ref_name,
-                "old_sha":     u.old_sha,
-                "new_sha":     u.new_sha,
-                "pusher_did":  u.pusher_did,
-                "node_did":    u.node_did,
-                "timestamp":   u.timestamp,
-                "cert_id":     u.cert_id,
-                "received_at": u.received_at,
-                "from_peer":   u.from_peer,
-                "source":      "gossipsub",
+                "type":       "local_cert",
+                "id":         c.id,
+                "repo":       repo_id_str,
+                "ref_name":   c.ref_name,
+                "old_sha":    c.old_sha,
+                "new_sha":    c.new_sha,
+                "pusher_did": c.pusher_did,
+                "node_did":   c.node_did,
+                "timestamp":  c.issued_at,
+                "source":     "local",
             })
         })
         .collect();
+
+    // Fetch gossipsub received ref updates for this repo (uses full slug built above),
+    // filtered per row by the SAME shared gate the cross-repo feeds use. The slug is
+    // the non-unique wire form {last-segment}/{name}: two owners (e.g.
+    // did:web:a:alice and did:web:b:alice) collide on `alice/name`, so a plain
+    // `WHERE repo = slug` query would serve a colliding PRIVATE repo's rows to anyone
+    // allowed to read this one. collect_visible_ref_updates drops any row whose slug
+    // matches a local repo the caller cannot read (fail-closed), and propagates DB
+    // errors instead of swallowing them.
+    let gossip_events: Vec<serde_json::Value> =
+        collect_visible_ref_updates(&state.db, Some(&repo_id_str), limit, caller)
+            .await?
+            .iter()
+            .map(|u| {
+                serde_json::json!({
+                    "type":        "gossipsub",
+                    "id":          u.id,
+                    "repo":        u.repo,
+                    "ref_name":    u.ref_name,
+                    "old_sha":     u.old_sha,
+                    "new_sha":     u.new_sha,
+                    "pusher_did":  u.pusher_did,
+                    "node_did":    u.node_did,
+                    "timestamp":   u.timestamp,
+                    "cert_id":     u.cert_id,
+                    "received_at": u.received_at,
+                    "from_peer":   u.from_peer,
+                    "source":      "gossipsub",
+                })
+            })
+            .collect();
 
     // Merge both lists
     let mut all_events: Vec<serde_json::Value> = cert_events;
@@ -238,7 +248,7 @@ pub async fn list_repo_events(
 
 #[cfg(test)]
 mod ref_updates_feed_tests {
-    use crate::db::{ReceivedRefUpdate, RepoRecord};
+    use crate::db::{ReceivedRefUpdate, RefCertificate, RepoRecord};
     use crate::test_support::{signed_request_as, test_state};
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
@@ -318,6 +328,42 @@ mod ref_updates_feed_tests {
 
     fn count(v: &serde_json::Value) -> u64 {
         v["count"].as_u64().expect("count number")
+    }
+
+    // --- repo-scoped events endpoint (list_repo_events) gate tests ---
+    // The handler serves one repo's ref certificates + received gossip ref-updates.
+    // authorize_repo_read gates the whole handler on repo-root read visibility:
+    // allow → serve both datasets; deny / quarantine / not-hosted → opaque 404.
+
+    fn repo_events_router(state: crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/events",
+                axum::routing::get(super::list_repo_events),
+            )
+            .with_state(state)
+    }
+
+    fn ref_cert(id: &str, repo_id: &str) -> RefCertificate {
+        RefCertificate {
+            id: id.into(),
+            repo_id: repo_id.into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "b".repeat(40),
+            pusher_did: "did:key:z6MkPusher".into(),
+            node_did: "did:key:z6MkNode".into(),
+            signature: "sig".into(),
+            issued_at: Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn anon_repo_events(owner: &str, name: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/repos/{owner}/{name}/events"))
+            .body(Body::empty())
+            .expect("request builder")
     }
 
     // Scenario 1 — load-bearing RED→GREEN: anon must not get a private local
@@ -612,6 +658,467 @@ mod ref_updates_feed_tests {
             slugs(&body).is_empty(),
             "quarantined mirror's ref-update must be withheld from anon, got {:?}",
             slugs(&body)
+        );
+    }
+
+    // RED→GREEN: anon must not read a private repo's ref metadata; a denied read is
+    // an opaque 404, not a 200 carrying the cert/gossip rows.
+    #[sqlx::test]
+    async fn repo_events_private_repo_404_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r1", OWNER, "widget", false))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_certificate(&ref_cert("c1", "r1"))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkOwner/widget"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("z6MkOwner", "widget"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "anon read of a private repo's events must be an opaque 404"
+        );
+    }
+
+    // Owner reads their own private repo → 200 with BOTH datasets (cert + gossip),
+    // guarding against a one-dataset half-fix.
+    #[sqlx::test]
+    async fn repo_events_private_repo_served_to_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r1", OWNER, "widget", false))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_certificate(&ref_cert("c1", "r1"))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkOwner/widget"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(signed_request_as(
+                OWNER,
+                Method::GET,
+                "/api/v1/repos/z6MkOwner/widget/events",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            count(&body),
+            2,
+            "owner sees both the cert and the gossip row"
+        );
+        let sources: Vec<&str> = body["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .filter_map(|e| e["source"].as_str())
+            .collect();
+        assert!(
+            sources.contains(&"local"),
+            "cert row must be present, got {sources:?}"
+        );
+        assert!(
+            sources.contains(&"gossipsub"),
+            "gossip row must be present, got {sources:?}"
+        );
+    }
+
+    // Anon reads a PUBLIC repo → 200 with data (positive control: the gate must not
+    // over-withhold).
+    #[sqlx::test]
+    async fn repo_events_public_repo_served_to_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_certificate(&ref_cert("c1", "pub"))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkOwner/openrepo"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("z6MkOwner", "openrepo"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(count(&body_json(resp).await), 2);
+    }
+
+    // Anon reads a quarantined mirror → 404 (withheld without disclosing existence
+    // via authorize_repo_read's quarantine short-circuit).
+    #[sqlx::test]
+    async fn repo_events_quarantined_mirror_404_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo("z6MkQuar", "secret", "/tmp/q", None, true)
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("z6MkQuar", "secret"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Authenticated non-owner with no visibility grant → 404 (visibility_check deny
+    // path, distinct from the anonymous case).
+    #[sqlx::test]
+    async fn repo_events_private_repo_404_for_non_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r1", OWNER, "widget", false))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkOwner/widget"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(signed_request_as(
+                "did:key:z6MkStranger",
+                Method::GET,
+                "/api/v1/repos/z6MkOwner/widget/events",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // RED→GREEN characterization of the deliberate behavior change: a repo NOT
+    // hosted here (no repos row) but with a received gossip row under a matching
+    // last-segment slug was served a populated 200 pre-gate; the gate closes it to
+    // 404 (this node holds no visibility record for a not-hosted repo, so it fails
+    // closed). Every other scenario seeds a local row and is blind to this path.
+    #[sqlx::test]
+    async fn repo_events_not_local_with_gossip_404_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        // No create_repo → get_repo returns None. A did:web-style short last segment
+        // ("alice") makes the stored gossip slug equal the URL owner, so pre-gate the
+        // not-local fallback slug matched and served the row.
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "alice/widget"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("alice", "widget"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a repo this node does not host must 404, not serve its gossip"
+        );
+    }
+
+    // A private LOCAL did:web repo denies anon → 404. Complements the not-local test:
+    // this proves anon cannot read a private did:web repo; the not-local test is what
+    // exercises the truncated-owner resolution path.
+    #[sqlx::test]
+    async fn repo_events_did_web_private_local_404_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r1", "did:web:example.com:alice", "widget", false))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "alice/widget"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("alice", "widget"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // RED→GREEN: the repo-root gate authorizes a record, but gossip rows are keyed by
+    // the lossy, non-unique wire slug {last-segment}/{name}. Two did:web owners
+    // (good.com:alice, evil.com:alice) collide on `alice/widget`, so without per-row
+    // filtering an anon read of the PUBLIC repo is served the colliding PRIVATE repo's
+    // gossip. The gossip half must drop it (fail-closed on the shared slug).
+    #[sqlx::test]
+    async fn repo_events_gossip_slug_collision_withheld_from_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", "did:web:good.com:alice", "widget", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_repo(&repo("priv", "did:web:evil.com:alice", "widget", false))
+            .await
+            .unwrap();
+        // One gossip row under the shared last-segment slug (how both repos' rows key).
+        state
+            .db
+            .insert_ref_update(&ref_row("collide", "alice/widget"))
+            .await
+            .unwrap();
+
+        // Full owner_did in the URL so get_repo resolves the PUBLIC repo deterministically
+        // (exact owner_did match; the private repo only LIKE-matches a short owner).
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("did:web:good.com:alice", "widget"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public repo is anon-readable (cert half)"
+        );
+        let body = body_json(resp).await;
+        let gossip_served = body["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .any(|e| e["source"].as_str() == Some("gossipsub"));
+        assert!(
+            !gossip_served,
+            "collision leak: anon read of public alice/widget served gossip keyed to a private sibling: {}",
+            body["events"]
+        );
+    }
+
+    // Authenticated non-owner reads a PUBLIC repo → 200 with data. Exercises
+    // visibility_check's is_public Allow branch with a Some(caller), which the
+    // anon-public and non-owner-private tests do not cover together.
+    #[sqlx::test]
+    async fn repo_events_public_repo_served_to_authenticated_non_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkOwner/openrepo"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(signed_request_as(
+                "did:key:z6MkStranger",
+                Method::GET,
+                "/api/v1/repos/z6MkOwner/openrepo/events",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(count(&body_json(resp).await), 1);
+    }
+
+    // did:web OWNER reads their own private repo → 200 with both datasets. Confirms the
+    // last-segment slug ("alice/widget") serves gossip to an authorized non-did:key
+    // owner (the happy-path complement to the did:web deny test); exercises the gossip
+    // KEEP branch of the shared collector for a did:web caller.
+    #[sqlx::test]
+    async fn repo_events_did_web_owner_reads_own_gossip(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:web:example.com:alice";
+        state
+            .db
+            .create_repo(&repo("r1", owner, "widget", false))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_certificate(&ref_cert("c1", "r1"))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "alice/widget"))
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                "/api/v1/repos/did:web:example.com:alice/widget/events",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(count(&body), 2, "did:web owner sees cert + gossip");
+        let sources: Vec<&str> = body["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .filter_map(|e| e["source"].as_str())
+            .collect();
+        assert!(
+            sources.contains(&"gossipsub"),
+            "did:web owner's own gossip must be served, got {sources:?}"
+        );
+    }
+
+    // An oversized limit is clamped at this handler (parity with the global feed).
+    #[sqlx::test]
+    async fn repo_events_oversized_limit_clamped(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        for i in 0..201 {
+            let mut r = ref_row(&format!("g{i}"), "z6MkOwner/openrepo");
+            r.timestamp = format!("2026-07-01T10:00:00.{i:04}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/repos/z6MkOwner/openrepo/events?limit=100000")
+            .body(Body::empty())
+            .expect("request builder");
+        let resp = repo_events_router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            count(&body_json(resp).await),
+            200,
+            "limit must clamp to MAX_VISIBLE_REF_UPDATES"
+        );
+    }
+
+    // A mirror released from quarantine becomes readable → 200 (complements the
+    // quarantined→404 test; guards against the gate staying closed after release).
+    #[sqlx::test]
+    async fn repo_events_released_mirror_served_to_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo("z6MkQuar", "secret", "/tmp/q", None, true)
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+        // upsert_mirror_repo builds the id as "{owner_short}/{name}".
+        state
+            .db
+            .set_repo_quarantine("z6MkQuar/secret", false)
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("z6MkQuar", "secret"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a released mirror must be readable again"
+        );
+    }
+
+    // A DB error in the gate fails closed as 500, not swallowed into an empty 200 (the
+    // regression the old get_repo().ok().flatten() allowed). Inject by dropping a
+    // column get_repo selects so its query errors.
+    #[sqlx::test]
+    async fn repo_events_db_error_fails_closed_500(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        state
+            .db
+            .create_repo(&repo("r1", OWNER, "widget", true))
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE repos DROP COLUMN is_public")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("z6MkOwner", "widget"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a DB error must fail closed (500), never serve an empty 200"
+        );
+    }
+
+    // Symmetric to the gate DB-error test: a DB error in the CERT fetch (after the gate
+    // passes) must also fail closed as 500, not an empty 200. Drop a column
+    // list_ref_certificates selects so its query errors. (sqlx::test gives each test its
+    // own isolated database, so the schema change cannot bleed into other tests.)
+    #[sqlx::test]
+    async fn repo_events_cert_db_error_fails_closed_500(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        state
+            .db
+            .create_repo(&repo("r1", OWNER, "widget", true))
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE ref_certificates DROP COLUMN signature")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = repo_events_router(state)
+            .oneshot(anon_repo_events("z6MkOwner", "widget"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a DB error in the cert fetch must fail closed (500), never an empty 200"
         );
     }
 }
