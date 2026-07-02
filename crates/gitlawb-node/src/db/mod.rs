@@ -1069,6 +1069,22 @@ impl Db {
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
+    /// Repos currently quarantined (admitted as mirrors but withheld from every
+    /// listing surface). `list_all_repos_deduped` excludes these (its `DEDUP_CTE`
+    /// filters `quarantined = FALSE`), so a gate that resolves a slug against the
+    /// deduped set must also match against these and fail closed, or a quarantined
+    /// repo's row is misclassified as remote/gossip-only and served.
+    pub async fn list_quarantined_repos(&self) -> Result<Vec<RepoRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE quarantined = TRUE",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
     /// Count of distinct logical repos (mirror + canonical collapsed). Uses the
     /// same did:key-aware owner-key grouping as `DEDUP_CTE` (the CASE must stay
     /// byte-identical); the marker/tiebreak only decide which row would survive,
@@ -2109,58 +2125,38 @@ impl Db {
         Ok(())
     }
 
-    pub async fn list_ref_updates(&self, limit: i64) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = sqlx::query(
-            "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
-             FROM received_ref_updates ORDER BY timestamp DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_ref_update).collect())
-    }
-
-    pub async fn list_repo_ref_updates(
-        &self,
-        repo: &str,
-        limit: i64,
-    ) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = sqlx::query(
-            "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
-             FROM received_ref_updates WHERE repo = $1 ORDER BY timestamp DESC LIMIT $2",
-        )
-        .bind(repo)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_ref_update).collect())
-    }
-
-    /// Filtered ref updates — optionally scoped to a specific repo.
-    pub async fn list_ref_updates_filtered(
+    /// One page of ref updates (newest first), optionally scoped to one repo.
+    /// The `(timestamp DESC, id DESC)` order gives a stable tiebreak so offset
+    /// paging does not skip or duplicate rows when timestamps collide. Used by
+    /// the visibility-gated feed collector, which pages past dropped private rows
+    /// so a small limit still returns the latest visible events (#114).
+    pub async fn list_ref_updates_page(
         &self,
         repo: Option<&str>,
         limit: i64,
+        offset: i64,
     ) -> Result<Vec<ReceivedRefUpdate>> {
         let rows = if let Some(r) = repo {
             sqlx::query(
                 "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
                         cert_id, received_at, from_peer
-                 FROM received_ref_updates WHERE repo=$1 ORDER BY timestamp DESC LIMIT $2",
+                 FROM received_ref_updates WHERE repo=$1
+                 ORDER BY timestamp DESC, id DESC LIMIT $2 OFFSET $3",
             )
             .bind(r)
             .bind(limit)
+            .bind(offset)
             .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query(
                 "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
                         cert_id, received_at, from_peer
-                 FROM received_ref_updates ORDER BY timestamp DESC LIMIT $1",
+                 FROM received_ref_updates
+                 ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2",
             )
             .bind(limit)
+            .bind(offset)
             .fetch_all(&self.pool)
             .await?
         };
@@ -3343,6 +3339,42 @@ mod dedup_db_tests {
             out[0].updated_at,
             ts("2026-03-01T00:00:00Z"),
             "survivor inherits the group's MAX(updated_at)"
+        );
+    }
+
+    /// A PRIVATE canonical repo and a PUBLIC mirror row for the same
+    /// (owner, name) collapse to a single survivor whose `is_public` is the
+    /// canonical `false`, not the mirror's `true`. `upsert_mirror_repo` always
+    /// writes `is_public=true`, so without this the deduped set could carry a
+    /// public flag for a locally-private repo and the ref-updates feed gate
+    /// would over-serve. Pins the DEDUP_CTE tiebreak so a future regression
+    /// that flips the survivor can't leak silently.
+    #[sqlx::test]
+    async fn deduped_private_canonical_beats_public_mirror(pool: PgPool) {
+        let db = db(pool).await;
+        // Private canonical row (rec() forces is_public=true, so build inline).
+        let mut canonical = rec(
+            "uuid-private-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "private canonical",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        canonical.is_public = false;
+        db.create_repo(&canonical).await.unwrap();
+        // Public mirror row for the same (owner, name): id = "z6Mkwbud/nipmod",
+        // is_public = true.
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "the pair collapses to one logical repo");
+        assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+        assert!(
+            !out[0].is_public,
+            "survivor keeps the canonical private is_public=false, not the mirror's true"
         );
     }
 
