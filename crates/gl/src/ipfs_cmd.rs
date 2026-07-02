@@ -55,10 +55,7 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("node returned {status} for pins listing: {body}");
     }
-    let resp: Value = resp
-        .json()
-        .await
-        .context("failed to parse pins response")?;
+    let resp: Value = resp.json().await.context("failed to parse pins response")?;
 
     let pins = resp["pins"].as_array().cloned().unwrap_or_default();
     let count = resp["count"].as_u64().unwrap_or(pins.len() as u64);
