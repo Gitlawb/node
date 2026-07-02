@@ -3990,6 +3990,56 @@ mod dedup_db_tests {
         );
         assert!(!got.is_public, "non-key row's is_public must be preserved");
     }
+
+    /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
+    /// expression agree on every boundary value in the owner-key normalization
+    /// set. A mismatch would let the Rust code bind a different key than the SQL
+    /// predicate filters on, silently breaking the did:key-only matching contract.
+    #[sqlx::test]
+    async fn normalize_owner_key_matches_sql_case(pool: PgPool) {
+        // The full boundary set: did:key short/full, bare, non-key DIDs,
+        // did:key with extra colon, empty, empty residual, uppercase.
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        // Build a VALUES list with the column aliased as `owner_did` so the
+        // OWNER_KEY_CASE_SQL expression (which references `owner_did`) works
+        // verbatim — no search-and-replace that could hide a drift.
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(owner_did) AS (VALUES {values_sql})
+             SELECT owner_did, ({key}) AS normalized FROM data ORDER BY owner_did",
+            key = super::OWNER_KEY_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "normalize_owner_key(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
 }
 
 /// Exercises the iCaptcha single-use proof ledger (`icaptcha_consumed_proofs`),
