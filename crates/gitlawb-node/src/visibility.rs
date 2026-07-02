@@ -27,7 +27,7 @@ fn nfc(s: &str) -> String {
 /// True if `caller` is the repo owner (matches full did:key or its short form),
 /// mirroring the owner-match idiom in `api/protect.rs`.
 fn is_owner(owner_did: &str, caller: &str) -> bool {
-    let owner_short = owner_did.split(':').next_back().unwrap_or(owner_did);
+    let owner_short = crate::db::normalize_owner_key(owner_did);
     caller == owner_did || caller == owner_short
 }
 

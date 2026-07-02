@@ -296,8 +296,8 @@ pub async fn trigger_sync(State(state): State<AppState>) -> Result<Json<serde_js
                 repo.get("name").and_then(|v| v.as_str()),
             ) {
                 (Some(owner), Some(name)) => {
-                    // Use short owner (last colon segment) matching DB convention
-                    let short = owner.split(':').next_back().unwrap_or(owner);
+                    // Use short owner (did:key-only normalization) matching DB convention
+                    let short = crate::db::normalize_owner_key(owner);
                     format!("{short}/{name}")
                 }
                 _ => continue,

@@ -67,11 +67,7 @@ pub async fn list_repo_events(
     let repo_id_str = if let Some(ref record) = repo_record {
         format!(
             "{}/{}",
-            record
-                .owner_did
-                .split(':')
-                .next_back()
-                .unwrap_or(&record.owner_did),
+            crate::db::normalize_owner_key(&record.owner_did),
             repo_name
         )
     } else {

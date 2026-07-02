@@ -945,11 +945,7 @@ pub async fn git_receive_pack(
             .as_deref()
             .unwrap_or("http://127.0.0.1:7545")
             .trim_end_matches('/');
-        let owner_short = record
-            .owner_did
-            .split(':')
-            .next_back()
-            .unwrap_or(&record.owner_did);
+        let owner_short = crate::db::normalize_owner_key(&record.owner_did);
         let clone_url = format!("{}/{}/{}.git", base_url, owner_short, record.name);
 
         for update in &ref_updates {
@@ -1096,7 +1092,7 @@ pub async fn git_receive_pack(
                     // this push to Arweave, so the oid->cid index survives total
                     // node loss. Best-effort; never fails the push.
                     if !delta.is_empty() && !irys_url.is_empty() {
-                        let owner_short = owner_did.split(':').next_back().unwrap_or(&owner_did);
+                        let owner_short = crate::db::normalize_owner_key(&owner_did);
                         let repo_slug = format!("{owner_short}/{repo_name}");
                         let ts = chrono::Utc::now().to_rfc3339();
                         let manifest = crate::arweave::EncryptedManifest {
@@ -1141,11 +1137,7 @@ pub async fn git_receive_pack(
         let node_did_str = state.node_did.to_string();
         let repo_slug = format!(
             "{}/{}",
-            record
-                .owner_did
-                .split(':')
-                .next_back()
-                .unwrap_or(&record.owner_did),
+            crate::db::normalize_owner_key(&record.owner_did),
             record.name
         );
         let ref_updates_clone = ref_updates
@@ -1474,7 +1466,7 @@ pub async fn fork_repo(
     }
 
     // Check no name conflict under the forker's ownership
-    let forker_short = forker_did.split(':').next_back().unwrap_or(&forker_did);
+    let forker_short = crate::db::normalize_owner_key(&forker_did);
     if state.db.get_repo(forker_short, &fork_name).await?.is_some() {
         return Err(AppError::BadRequest(format!(
             "you already have a repo named {fork_name}"
@@ -1632,11 +1624,7 @@ fn parse_ref_updates(body: &[u8]) -> Vec<RefUpdate> {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn to_response(record: &crate::db::RepoRecord, state: &AppState, star_count: i64) -> RepoResponse {
-    let owner_short = record
-        .owner_did
-        .split(':')
-        .next_back()
-        .unwrap_or(&record.owner_did);
+    let owner_short = crate::db::normalize_owner_key(&record.owner_did);
 
     let base_url = state
         .config
@@ -2339,5 +2327,55 @@ mod tests {
         .await;
 
         _mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn to_response_generates_correct_clone_url_slug() {
+        let state = crate::test_support::test_state_lazy();
+        let now = chrono::Utc::now();
+
+        // 1. did:key owner (should strip did:key: prefix)
+        let repo_key = crate::db::RepoRecord {
+            id: "uuid-1".into(),
+            name: "my-repo".into(),
+            owner_did: "did:key:z6Mkwbud".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/my-repo".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        let response_key = to_response(&repo_key, &state, 5);
+        assert!(
+            response_key.clone_url.contains("/z6Mkwbud/my-repo.git"),
+            "clone_url should use the bare did:key ID. got: {}",
+            response_key.clone_url
+        );
+
+        // 2. did:gitlawb owner (non-key DID method, should NOT strip)
+        let repo_non_key = crate::db::RepoRecord {
+            id: "uuid-2".into(),
+            name: "other-repo".into(),
+            owner_did: "did:gitlawb:z6Mkwbud".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: "/tmp/other-repo".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        let response_non_key = to_response(&repo_non_key, &state, 10);
+        assert!(
+            response_non_key
+                .clone_url
+                .contains("/did:gitlawb:z6Mkwbud/other-repo.git"),
+            "clone_url should preserve the full non-key owner DID. got: {}",
+            response_non_key.clone_url
+        );
     }
 }
