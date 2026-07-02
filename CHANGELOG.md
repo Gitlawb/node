@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/Gitlawb/node/compare/v0.4.0...v0.4.1) (2026-07-02)
+
+
+### Bug Fixes
+
+* **node:** gate GET /ipfs/{cid} on reachable allowed-set, not deny-set ([#126](https://github.com/Gitlawb/node/issues/126)) ([#133](https://github.com/Gitlawb/node/issues/133)) ([466a550](https://github.com/Gitlawb/node/commit/466a550915edd711856ef32035f9f474e2577c4f))
+* **remote:** include HTTP error response body ([#137](https://github.com/Gitlawb/node/issues/137)) ([09a0cb2](https://github.com/Gitlawb/node/commit/09a0cb23b9f284ccbd69aca6958b70671f3bfb46))
+
 ## [0.4.0](https://github.com/Gitlawb/node/compare/v0.3.9...v0.4.0) (2026-06-30)
 
 
