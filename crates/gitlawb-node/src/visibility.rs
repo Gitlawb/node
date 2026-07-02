@@ -24,11 +24,11 @@ fn nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
-/// True if `caller` is the repo owner (matches full did:key or its short form),
-/// mirroring the owner-match idiom in `api/protect.rs`.
+/// True if `caller` is the repo owner. Delegates to [`crate::api::did_matches`]
+/// so the read gate and `require_repo_owner` share one normalization: bare and
+/// full forms collapse only within `did:key:`, never across DID methods.
 fn is_owner(owner_did: &str, caller: &str) -> bool {
-    let owner_short = owner_did.split(':').next_back().unwrap_or(owner_did);
-    caller == owner_did || caller == owner_short
+    crate::api::did_matches(owner_did, caller)
 }
 
 /// The match prefix for a glob: "/" stays "/", "/secret/**" becomes "/secret".
@@ -380,6 +380,41 @@ mod tests {
         assert_eq!(
             visibility_check(&rules, true, OWNER, Some("did:key:z6MkStranger"), "/"),
             Decision::Allow
+        );
+    }
+
+    #[test]
+    fn owner_match_normalizes_did_key_both_directions() {
+        // Bare owner stored (mirror rows), full did:key caller signs in.
+        assert_eq!(
+            visibility_check(&[], false, "zABC", Some("did:key:zABC"), "/"),
+            Decision::Allow
+        );
+        // Full owner stored, bare caller.
+        assert_eq!(
+            visibility_check(&[], false, "did:key:zABC", Some("zABC"), "/"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn owner_match_rejects_cross_method_collision() {
+        // A did:gitlawb caller sharing the base58 id must not be admitted as the
+        // did:key owner.
+        assert_eq!(
+            visibility_check(&[], false, "did:key:zABC", Some("did:gitlawb:zABC"), "/"),
+            Decision::Deny
+        );
+        // The over-match the old trailing-segment split allowed: an owner stored
+        // under a non-key method must not be matched by the bare base58 id. The
+        // old `owner_short` compare would wrongly Allow this; did_matches denies.
+        assert_eq!(
+            visibility_check(&[], false, "did:gitlawb:zABC", Some("zABC"), "/"),
+            Decision::Deny
+        );
+        assert_eq!(
+            visibility_check(&[], false, "did:gitlawb:zABC", Some("did:key:zABC"), "/"),
+            Decision::Deny
         );
     }
 

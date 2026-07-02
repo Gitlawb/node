@@ -71,15 +71,18 @@ pub async fn remove_label(
 }
 
 /// GET /api/v1/repos/:owner/:repo/labels
+///
+/// Read-visibility-gated (INV-2 root listing): a public repo's labels stay
+/// anonymously listable; a private repo's label names are hidden (404) from
+/// anyone who cannot read it at the root.
 pub async fn list_labels(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let labels = state.db.list_labels(&record.id).await?;
     Ok(Json(serde_json::json!({ "labels": labels })))

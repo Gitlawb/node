@@ -52,6 +52,23 @@ impl NodeClient {
         req.send().await.with_context(|| format!("GET {url}"))
     }
 
+    /// GET that signs when an identity keypair is present and falls back to an
+    /// anonymous GET otherwise — for read-visibility endpoints, where a public
+    /// repo is readable anonymously but a private repo requires the owner/reader
+    /// to be authenticated. Mirrors the conditional signing of post/put/delete.
+    pub async fn get_maybe_signed(&self, path: &str) -> Result<reqwest::Response> {
+        let url = format!("{}{}", self.node_url, path);
+        let mut req = self.inner.get(&url);
+        if let Some(kp) = &self.keypair {
+            let signed = sign_request(kp, "GET", path, b"");
+            req = req
+                .header("Content-Digest", signed.content_digest)
+                .header("Signature-Input", signed.signature_input)
+                .header("Signature", signed.signature);
+        }
+        req.send().await.with_context(|| format!("GET {url}"))
+    }
+
     /// POST with JSON body + RFC 9421 HTTP Signature auth.
     pub async fn post(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.node_url, path);
