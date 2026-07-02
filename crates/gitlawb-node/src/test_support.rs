@@ -1966,6 +1966,29 @@ mod tests {
             .with_state(state)
     }
 
+    fn update(
+        repo: &str,
+        owner_did: Option<&str>,
+        new_sha: &str,
+        timestamp: &str,
+        received_at: &str,
+    ) -> crate::db::ReceivedRefUpdate {
+        crate::db::ReceivedRefUpdate {
+            id: uuid::Uuid::new_v4().to_string(),
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: repo.to_string(),
+            owner_did: owner_did.map(|s| s.to_string()),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0000000000000000000000000000000000000000".into(),
+            new_sha: new_sha.to_string(),
+            timestamp: timestamp.to_string(),
+            cert_id: None,
+            received_at: received_at.to_string(),
+            from_peer: "12D3KooWTest".into(),
+        }
+    }
+
     #[sqlx::test]
     async fn events_returns_inserted_ref_updates(pool: PgPool) {
         let state = test_state(pool).await;
@@ -1974,20 +1997,13 @@ mod tests {
         // Insert a gossip event with owner_did set
         state
             .db
-            .insert_ref_update(&crate::db::ReceivedRefUpdate {
-                id: uuid::Uuid::new_v4().to_string(),
-                node_did: "did:key:zNode".into(),
-                pusher_did: "did:key:zPusher".into(),
-                repo: format!("{}/myrepo", owner.split(':').next_back().unwrap()),
-                owner_did: Some(owner.into()),
-                ref_name: "refs/heads/main".into(),
-                old_sha: "0000000000000000000000000000000000000000".into(),
-                new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                timestamp: "2026-07-02T12:00:00Z".into(),
-                cert_id: None,
-                received_at: "2026-07-02T12:00:01Z".into(),
-                from_peer: "12D3KooWTest".into(),
-            })
+            .insert_ref_update(&update(
+                &format!("{}/myrepo", owner.split(':').next_back().unwrap()),
+                Some(owner),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "2026-07-02T12:00:00Z",
+                "2026-07-02T12:00:01Z",
+            ))
             .await
             .unwrap();
 
@@ -2004,6 +2020,7 @@ mod tests {
             events[0]["repo"],
             format!("{}/myrepo", owner.split(':').next_back().unwrap())
         );
+        assert_eq!(events[0]["owner_did"], owner);
     }
 
     #[sqlx::test]
@@ -2014,20 +2031,13 @@ mod tests {
         for i in 0..5 {
             state
                 .db
-                .insert_ref_update(&crate::db::ReceivedRefUpdate {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    node_did: "did:key:zNode".into(),
-                    pusher_did: "did:key:zPusher".into(),
-                    repo: format!("{}/r{i}", owner.split(':').next_back().unwrap()),
-                    owner_did: Some(owner.into()),
-                    ref_name: "refs/heads/main".into(),
-                    old_sha: "0000000000000000000000000000000000000000".into(),
-                    new_sha: format!("{i:040x}"),
-                    timestamp: format!("2026-07-02T12:00:{i:02}Z"),
-                    cert_id: None,
-                    received_at: format!("2026-07-02T12:00:{i:02}Z"),
-                    from_peer: "12D3KooWTest".into(),
-                })
+                .insert_ref_update(&update(
+                    &format!("{}/r{i}", owner.split(':').next_back().unwrap()),
+                    Some(owner),
+                    &format!("{i:040x}"),
+                    &format!("2026-07-02T12:00:{i:02}Z"),
+                    &format!("2026-07-02T12:00:{i:02}Z"),
+                ))
                 .await
                 .unwrap();
         }

@@ -35,6 +35,7 @@ pub async fn list_ref_updates(
                 "cert_id":     u.cert_id,
                 "received_at": u.received_at,
                 "from_peer":   u.from_peer,
+                "owner_did":   u.owner_did,
             })
         })
         .collect();

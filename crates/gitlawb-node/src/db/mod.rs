@@ -4052,6 +4052,7 @@ mod ref_update_db_tests {
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "u5");
+        assert_eq!(filtered[0].owner_did.as_deref(), Some("did:key:zA"));
 
         let all = db.list_ref_updates_filtered(None, 100).await.unwrap();
         assert_eq!(all.len(), 2);
