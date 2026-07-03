@@ -207,14 +207,16 @@ pub async fn list_repo_events(
         })
         .collect();
 
-    // Fetch gossipsub received ref updates for this repo (uses full slug built above),
-    // filtered per row by the SAME shared gate the cross-repo feeds use. The slug is
-    // the non-unique wire form {last-segment}/{name}: two owners (e.g.
-    // did:web:a:alice and did:web:b:alice) collide on `alice/name`, so a plain
-    // `WHERE repo = slug` query would serve a colliding PRIVATE repo's rows to anyone
-    // allowed to read this one. collect_visible_ref_updates drops any row whose slug
-    // matches a local repo the caller cannot read (fail-closed), and propagates DB
-    // errors instead of swallowing them.
+    // Fetch gossipsub received ref updates for this repo (uses the normalize_owner_key
+    // slug built above), filtered per row by the SAME shared gate the cross-repo feeds
+    // use. The stored slug is an UNTRUSTED, non-unique wire form: the exact-match
+    // `WHERE repo = slug` narrows to this repo's canonical slug, but a peer can plant a
+    // row under a colliding owner form, and a did:key canonical owner and its bare
+    // short-key mirror normalize to the SAME slug, so the query alone could serve a
+    // colliding PRIVATE repo's rows to anyone allowed to read this one.
+    // collect_visible_ref_updates drops any row whose slug matches a local repo the
+    // caller cannot read (fail-closed), and propagates DB errors instead of swallowing
+    // them.
     let gossip_events: Vec<serde_json::Value> =
         collect_visible_ref_updates(&state.db, Some(&repo_id_str), limit, caller)
             .await?

@@ -198,19 +198,21 @@ pub fn ref_update_row_visible(
 ///
 /// A record matches when the slug's `name` half is equal and one owner key is a
 /// prefix of the other (prefix-tolerant: exact short key, full `did:key:` form,
-/// and the URL-truncated 8-char form). The slug owner is reduced to its last
-/// ':'-delimited segment — the SAME lossy form the emitter broadcasts
-/// (`git_receive_pack` in api/repos.rs builds the wire slug as
-/// `{last-segment-of-owner_did}/{name}`), so a repo's own rows always arrive
-/// keyed by that trailing segment.
+/// and the URL-truncated 8-char form). Both the slug owner and the record owner
+/// are reduced to their last ':'-delimited segment before comparing. The node's
+/// own emitter builds the wire slug via `normalize_owner_key` (bare short key for
+/// a single-segment `did:key:`, the full DID for every other method; see
+/// api/repos.rs), but the stored slug is UNTRUSTED: a peer can broadcast a row
+/// under any owner form, including a method-stripped `user/name`. Reducing both
+/// sides to the trailing segment matches a repo's own rows whichever form keyed
+/// them, and still catches an attacker-planted short slug.
 ///
-/// This intentionally diverges from `did_matches` / `DEDUP_CTE`, which strip
-/// only bare `did:key:` and keep other DID methods whole: those compare trusted,
-/// canonical DIDs, while this slug is untrusted and already method-stripped by
-/// the emitter. Applying the keep-whole rule here would fail open — a private
-/// `did:web:host:user` repo's short slug `user/name` would not prefix-match the
-/// whole record and would leak. The price is a fail-SAFE over-match when a
-/// remote owner shares both a trailing segment and a repo name with a local
+/// This intentionally diverges from `did_matches` / `DEDUP_CTE`, which strip only
+/// bare `did:key:` and keep other DID methods whole: those compare trusted,
+/// canonical DIDs, while this slug is untrusted. Applying the keep-whole rule here
+/// would fail open: a hostile `user/name` slug would not prefix-match a private
+/// `did:web:host:user` record and would leak. The price is a fail-SAFE over-match
+/// when a remote owner shares both a trailing segment and a repo name with a local
 /// private repo (negligible for full did:key ids; only did:web / truncated forms
 /// collide): it can hide a genuinely remote row, never serve a private one.
 pub fn ref_update_row_names_repo(record: &RepoRecord, row_repo: &str) -> bool {
@@ -691,11 +693,13 @@ mod tests {
 
     #[test]
     fn feed_private_didweb_short_slug_dropped_for_anon() {
-        // The canonical, load-bearing case for the last-segment normalization:
-        // the emitter broadcasts a did:web repo's rows under the SHORT slug
-        // `{last-segment}/{name}` (publish_ref_update, api/repos.rs). A private
-        // such repo must drop that slug for anon. A did:key-aware (keep-whole)
-        // rule would fail to match `alice` against `did:web:host:alice` and leak.
+        // A private did:web repo must drop its row for anon when the slug arrives
+        // in the short `{last-segment}/{name}` form. Post-#141 the emitter no longer
+        // produces this form for did:web (normalize_owner_key keeps the full DID),
+        // so this is the untrusted/crafted variant a peer can broadcast; the full-DID
+        // variant the emitter now sends is covered by the next test. A did:key-aware
+        // (keep-whole) rule would fail to match `alice` against `did:web:host:alice`
+        // and leak.
         let deduped = [rec("r1", "did:web:host:alice", "widget", false)];
         let rules = HashMap::new();
         assert!(!ref_update_row_visible(
@@ -708,11 +712,11 @@ mod tests {
 
     #[test]
     fn feed_multi_segment_did_slug_dropped_for_anon() {
-        // A private repo owned by a multi-segment DID must also fail closed when a
-        // peer *crafts* the row under the full-DID slug form. This form is
-        // non-canonical (the emitter only ever broadcasts the short slug above),
-        // but the gate still drops it: both sides reduce to the last ':' segment
-        // ("user"), so they match. Fail-safe against a hand-forged slug.
+        // A private repo owned by a multi-segment DID must also fail closed under
+        // the full-DID slug form. Post-#141 this IS the form the emitter broadcasts
+        // (normalize_owner_key keeps non-did:key methods whole), and a peer can craft
+        // it too. The gate drops it: both sides reduce to the last ':' segment
+        // ("user"), so they match. Fail-safe regardless of which form keyed the row.
         let deduped = [rec("r1", "did:web:host:user", "widget", false)];
         let rules = HashMap::new();
         assert!(!ref_update_row_visible(
