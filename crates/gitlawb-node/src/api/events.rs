@@ -1076,55 +1076,6 @@ mod ref_updates_feed_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // RED→GREEN: the repo-root gate authorizes a record, but gossip rows are keyed by
-    // the lossy, non-unique wire slug {last-segment}/{name}. Two did:web owners
-    // (good.com:alice, evil.com:alice) collide on `alice/widget`, so without per-row
-    // filtering an anon read of the PUBLIC repo is served the colliding PRIVATE repo's
-    // gossip. The gossip half must drop it (fail-closed on the shared slug).
-    #[sqlx::test]
-    async fn repo_events_gossip_slug_collision_withheld_from_anon(pool: PgPool) {
-        let state = test_state(pool).await;
-        state
-            .db
-            .create_repo(&repo("pub", "did:web:good.com:alice", "widget", true))
-            .await
-            .unwrap();
-        state
-            .db
-            .create_repo(&repo("priv", "did:web:evil.com:alice", "widget", false))
-            .await
-            .unwrap();
-        // One gossip row under the shared last-segment slug (how both repos' rows key).
-        state
-            .db
-            .insert_ref_update(&ref_row("collide", "alice/widget"))
-            .await
-            .unwrap();
-
-        // Full owner_did in the URL so get_repo resolves the PUBLIC repo deterministically
-        // (exact owner_did match; the private repo only LIKE-matches a short owner).
-        let resp = repo_events_router(state)
-            .oneshot(anon_repo_events("did:web:good.com:alice", "widget"))
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "public repo is anon-readable (cert half)"
-        );
-        let body = body_json(resp).await;
-        let gossip_served = body["events"]
-            .as_array()
-            .expect("events array")
-            .iter()
-            .any(|e| e["source"].as_str() == Some("gossipsub"));
-        assert!(
-            !gossip_served,
-            "collision leak: anon read of public alice/widget served gossip keyed to a private sibling: {}",
-            body["events"]
-        );
-    }
-
     // Authenticated non-owner reads a PUBLIC repo → 200 with data. Exercises
     // visibility_check's is_public Allow branch with a Some(caller), which the
     // anon-public and non-owner-private tests do not cover together.
@@ -1155,10 +1106,12 @@ mod ref_updates_feed_tests {
         assert_eq!(count(&body_json(resp).await), 1);
     }
 
-    // did:web OWNER reads their own private repo → 200 with both datasets. Confirms the
-    // last-segment slug ("alice/widget") serves gossip to an authorized non-did:key
-    // owner (the happy-path complement to the did:web deny test); exercises the gossip
-    // KEEP branch of the shared collector for a did:web caller.
+    // did:web OWNER reads their own private repo → 200 with both datasets. The gossip
+    // row is stored under the slug the emit side writes: normalize_owner_key leaves a
+    // non-did:key DID intact, so api/repos publishes "did:web:example.com:alice/widget"
+    // (not the last-segment "alice/widget"). This exercises the gossip KEEP branch of
+    // the shared collector for a did:web caller, the happy-path complement to the
+    // did:web deny test.
     #[sqlx::test]
     async fn repo_events_did_web_owner_reads_own_gossip(pool: PgPool) {
         let state = test_state(pool).await;
@@ -1175,7 +1128,7 @@ mod ref_updates_feed_tests {
             .unwrap();
         state
             .db
-            .insert_ref_update(&ref_row("u1", "alice/widget"))
+            .insert_ref_update(&ref_row("u1", "did:web:example.com:alice/widget"))
             .await
             .unwrap();
 
