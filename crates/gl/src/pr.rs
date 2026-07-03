@@ -234,12 +234,11 @@ async fn cmd_create(
         .await
         .context("failed to connect to node")?;
     let status = resp.status();
-    let pr: Value = resp.json().await.context("invalid JSON")?;
-
+    let raw_text = resp.text().await.context("failed to read response body")?;
     if !status.is_success() {
-        let msg = pr["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("create PR failed ({status}): {msg}");
+        anyhow::bail!("create PR failed ({status}): {raw_text}");
     }
+    let pr: Value = serde_json::from_str(&raw_text).context("invalid JSON")?;
 
     let number = pr["number"].as_i64().unwrap_or(0);
     println!("✓ Opened PR #{number}: {title}");
