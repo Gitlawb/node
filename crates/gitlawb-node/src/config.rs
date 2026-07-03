@@ -152,6 +152,16 @@ pub struct Config {
     /// in flight and exits. Default: 30s.
     #[arg(long, env = "GITLAWB_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
     pub shutdown_grace_secs: u64,
+
+    /// Maximum number of creation requests (repo create, issue create, PR
+    /// create, register, fork) allowed per DID within the rate-limit window.
+    #[arg(long, env = "GITLAWB_RATE_LIMIT_MAX", default_value_t = 10)]
+    pub rate_limit_max_requests: u32,
+
+    /// Rate-limit window size, in seconds, over which
+    /// `rate_limit_max_requests` applies.
+    #[arg(long, env = "GITLAWB_RATE_LIMIT_WINDOW_SECS", default_value_t = 3600)]
+    pub rate_limit_window_secs: u64,
 }
 
 impl Config {

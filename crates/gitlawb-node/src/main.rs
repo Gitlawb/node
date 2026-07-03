@@ -190,7 +190,10 @@ async fn main() -> Result<()> {
     let repo_store =
         git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
 
-    let rate_limiter = rate_limit::RateLimiter::new(10, std::time::Duration::from_secs(3600));
+    let rate_limiter = rate_limit::RateLimiter::new(
+        config.rate_limit_max_requests as usize,
+        std::time::Duration::from_secs(config.rate_limit_window_secs),
+    );
 
     // Initialize the iCaptcha proof gate (inert unless ICAPTCHA_MODE is set).
     icaptcha::init().await;
