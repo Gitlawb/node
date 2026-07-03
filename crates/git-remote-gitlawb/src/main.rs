@@ -15,9 +15,12 @@
 //!   capabilities → "connect\n\n"
 //!   connect git-upload-pack  → GET /info/refs | POST /git-upload-pack
 //!   connect git-receive-pack → GET /info/refs | POST /git-receive-pack
-//! When an identity keypair is present, both the advertisement GET and the pack
-//! POST are RFC-9421 signed for BOTH services, so the node authorizes the owner on
-//! visibility-gated private repos (fetch and push); public repos work anonymously.
+//! Push (git-receive-pack) is RFC-9421 signed from the first request when an
+//! identity keypair is present, since a push can never be anonymous. Fetch
+//! (git-upload-pack) stays anonymous and is signed only on a single retry, after
+//! the node denies the anonymous advertisement with 404 — so a public clone never
+//! discloses the caller's DID, while a private repo's owner (or an authorized
+//! reader) still authenticates when the node demands it.
 
 use anyhow::{bail, Context, Result};
 use gitlawb_core::http_sig::sign_request;
@@ -66,9 +69,10 @@ fn main() -> Result<()> {
     let repo_base = format!("{}/{}/{}", node_base, short_owner, repo_name);
     tracing::debug!("repo_base: {repo_base}");
 
-    // Load keypair for signing requests (optional). When present, the helper signs
-    // both fetch and push so a private repo's owner is authorized; absent, public
-    // repos still work and push falls back to unsigned (v0.1 local alpha only).
+    // Load keypair for signing requests (optional). Push always signs when a key is
+    // present; fetch signs only if the node 404s the anonymous advertisement, so
+    // public fetches stay anonymous. Absent a key, public fetch still works and push
+    // falls back to unsigned (v0.1 local alpha only).
     let keypair = load_keypair();
 
     run_helper(&repo_base, keypair.as_ref())
@@ -203,12 +207,39 @@ fn handle_connect<R: Read>(
     //
     // The server advertises its refs. git reads this to decide what to fetch/push.
 
+    // Signing policy for this exchange, carried through to the Phase-2 POST:
+    //  - git-receive-pack (push): sign from the first request; a push is
+    //    signature-gated and can never be anonymous.
+    //  - git-upload-pack (fetch): start anonymous so a public clone never discloses
+    //    the caller's DID, then escalate to a single signed retry only if the node
+    //    denies the anonymous advertisement with 404 (how it withholds a private
+    //    repo from an unauthenticated reader).
+    let mut signing_key = if service == "git-receive-pack" {
+        keypair
+    } else {
+        None
+    };
+
     let refs_url = format!("{}/info/refs?service={}", repo_base, service);
     tracing::debug!("GET {refs_url}");
 
-    let refs_resp = build_advertisement_request(&client, &refs_url, keypair)
+    let mut refs_resp = build_advertisement_request(&client, &refs_url, signing_key)
         .send()
         .with_context(|| format!("GET {refs_url}"))?;
+
+    // Fetch escalation: retry the advertisement signed once when the anonymous try
+    // is denied and we hold an identity. A public repo answers 200 on the first
+    // (anonymous) request and never reaches here, so it stays DID-private.
+    if service == "git-upload-pack"
+        && refs_resp.status() == reqwest::StatusCode::NOT_FOUND
+        && keypair.is_some()
+    {
+        tracing::debug!("anonymous info/refs returned 404; retrying signed");
+        signing_key = keypair;
+        refs_resp = build_advertisement_request(&client, &refs_url, signing_key)
+            .send()
+            .with_context(|| format!("GET {refs_url} (signed retry)"))?;
+    }
 
     if !refs_resp.status().is_success() {
         let status = refs_resp.status();
@@ -277,7 +308,7 @@ fn handle_connect<R: Read>(
     let post_url = format!("{}/{}", repo_base, service);
     tracing::debug!("POST {post_url} ({} bytes)", request_body.len());
 
-    let req = build_pack_post_request(&client, &post_url, service, &request_body, keypair);
+    let req = build_pack_post_request(&client, &post_url, service, &request_body, signing_key);
 
     // Attach the body after signing so the pack bytes are moved, not cloned —
     // packs can be large and the clone doubled peak memory on push.
@@ -778,6 +809,174 @@ mod tests {
             .unwrap();
         assert!(resp.status().is_success());
         get_mock.assert();
+    }
+
+    // ── Phase-1 retry-on-404 (P2, #119): fetch stays anonymous until the node
+    //    denies it, then escalates to ONE signed retry. Drives handle_connect end to
+    //    end against the recording mock, asserting what actually goes on the wire.
+    //    A request is "signed" iff it carries the `signature-input` header.
+
+    /// Public fetch: the node serves the anonymous advertisement (200), so the
+    /// client never signs — not the advertisement GET, not the upload-pack POST —
+    /// even though an identity is present. This is the privacy fix: a public clone
+    /// must not disclose the caller's DID.
+    #[test]
+    fn fetch_public_stays_anonymous_even_with_keypair() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(b"0009done\n".to_vec());
+        handle_connect(&repo_base, "git-upload-pack", Some(&kp), &mut stdin)
+            .expect("public fetch should succeed");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "public fetch must not retry");
+        assert!(
+            !requests[0].to_lowercase().contains("signature-input"),
+            "the advertisement GET must be anonymous for a public fetch"
+        );
+        assert!(
+            !requests[1].to_lowercase().contains("signature-input"),
+            "the upload-pack POST must be anonymous for a public fetch"
+        );
+    }
+
+    /// Private fetch: the anonymous advertisement is denied (404); with an identity
+    /// present the client retries the GET signed and — because Phase 1 needed
+    /// signing — also signs the Phase-2 upload-pack POST. The FIRST request is still
+    /// anonymous: the DID is not disclosed until the node demands authentication.
+    #[test]
+    fn fetch_private_retries_signed_on_404_and_signs_the_pack_post() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "404 Not Found",
+                body: r#"{"message":"repository is not registered on this node"}"#,
+            },
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(b"0009done\n".to_vec());
+        handle_connect(&repo_base, "git-upload-pack", Some(&kp), &mut stdin)
+            .expect("signed retry should succeed");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "expected anon GET, signed GET retry, signed POST"
+        );
+        assert!(
+            !requests[0].to_lowercase().contains("signature-input"),
+            "the first advertisement GET must be anonymous"
+        );
+        assert!(
+            requests[1].to_lowercase().contains("signature-input"),
+            "the retry advertisement GET must be signed"
+        );
+        assert!(
+            requests[2].to_lowercase().contains("signature-input"),
+            "the upload-pack POST must be signed once the fetch needed auth"
+        );
+    }
+
+    /// Private fetch with no identity: the anonymous advertisement 404s and there is
+    /// no keypair to retry with, so the client surfaces the error after exactly one
+    /// request — no retry, no hang.
+    #[test]
+    fn fetch_without_keypair_does_not_retry_on_404() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+            status: "404 Not Found",
+            body: r#"{"message":"not found"}"#,
+        }]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = handle_connect(&repo_base, "git-upload-pack", None, &mut stdin).unwrap_err();
+        assert!(err.to_string().contains("returned 404 Not Found"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1, "no keypair means no signed retry");
+        assert!(!requests[0].to_lowercase().contains("signature-input"));
+    }
+
+    /// Private fetch where the SIGNED retry is also denied (caller is not a reader):
+    /// the client retries exactly once, then surfaces the 404 rather than looping.
+    /// Bounds the escalation to a single signed attempt.
+    #[test]
+    fn fetch_signed_retry_still_denied_surfaces_error_once() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "404 Not Found",
+                body: r#"{"message":"not found"}"#,
+            },
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "404 Not Found",
+                body: r#"{"message":"not found"}"#,
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = handle_connect(&repo_base, "git-upload-pack", Some(&kp), &mut stdin).unwrap_err();
+        assert!(err.to_string().contains("returned 404 Not Found"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "exactly one signed retry, then surface");
+        assert!(!requests[0].to_lowercase().contains("signature-input"));
+        assert!(requests[1].to_lowercase().contains("signature-input"));
+    }
+
+    /// Push (git-receive-pack) is unchanged: it signs from the FIRST request — you
+    /// cannot push anonymously — so there is no anonymous-first probe for push.
+    #[test]
+    fn push_advertisement_is_signed_from_the_first_request() {
+        let kp = Keypair::generate();
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-receive-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-receive-pack",
+                status: "200 OK",
+                body: "",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = std::io::Cursor::new(b"0000".to_vec());
+        handle_connect(&repo_base, "git-receive-pack", Some(&kp), &mut stdin)
+            .expect("push should succeed");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].to_lowercase().contains("signature-input"),
+            "push advertisement must be signed from the first request"
+        );
+        assert!(
+            requests[1].to_lowercase().contains("signature-input"),
+            "push POST must be signed"
+        );
     }
 
     /// Cross-crate seam: the signature the CLIENT actually emits (via the real
