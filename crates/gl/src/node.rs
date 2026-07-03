@@ -22,6 +22,9 @@ pub enum NodeCmd {
     Status {
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        /// Identity directory (default: ~/.gitlawb)
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Check trust score for a DID
     Trust {
@@ -123,7 +126,7 @@ pub enum NodeCmd {
 
 pub async fn run(args: NodeArgs) -> Result<()> {
     match args.cmd {
-        NodeCmd::Status { node } => cmd_status(node).await,
+        NodeCmd::Status { node, dir } => cmd_status(node, dir).await,
         NodeCmd::Trust { did, node } => cmd_trust(did, node).await,
         NodeCmd::Resolve { did, node } => cmd_resolve(did, node).await,
         NodeCmd::Register {
@@ -194,15 +197,48 @@ enum PinsPanel {
     Unavailable,
     /// No identity available; no request was issued.
     NeedsIdentity,
+    /// An explicit `--dir` was given but held no usable identity; carries the dir
+    /// so the panel can name it instead of the misleading "sign in" prompt.
+    IdentityError(PathBuf),
+}
+
+/// Identity resolved for the signed pins read, decided before the request so the
+/// dashboard can distinguish "no identity at all" from "an explicit `--dir` that
+/// could not be loaded".
+enum PinsAuth {
+    /// A usable keypair; the read will be signed.
+    Keyed(Keypair),
+    /// No identity requested and none in the default keystore.
+    Anonymous,
+    /// An explicit `--dir` was given but held no usable identity (carries the dir).
+    DirUnusable(PathBuf),
+}
+
+/// Resolve the pins-panel identity from an optional `--dir`. Mirrors `gl ipfs
+/// list`'s identity selection: an explicit `--dir` that fails to load is reported
+/// as `DirUnusable` (so the panel names the bad path) rather than collapsing to
+/// the misleading "sign in to view"; a missing default keystore (no `--dir`)
+/// degrades quietly to `Anonymous`.
+fn resolve_pins_auth(dir: Option<&std::path::Path>) -> PinsAuth {
+    match load_keypair_from_dir(dir) {
+        Ok(kp) => PinsAuth::Keyed(kp),
+        Err(_) => match dir {
+            Some(d) => PinsAuth::DirUnusable(d.to_path_buf()),
+            None => PinsAuth::Anonymous,
+        },
+    }
 }
 
 /// Fetch the pins panel state. With a keypair, signs the `/api/v1/ipfs/pins`
-/// read and maps the outcome; without one, returns `NeedsIdentity` and issues
-/// no request. Injectable (node URL + optional keypair) so tests drive it with
-/// a mock server and never touch the default keystore.
-async fn fetch_pins(node: &str, keypair: Option<Keypair>) -> PinsPanel {
-    let Some(kp) = keypair else {
-        return PinsPanel::NeedsIdentity;
+/// read and maps the outcome; with no identity it returns `NeedsIdentity`, and
+/// with an unusable explicit `--dir` it returns `IdentityError` — both without
+/// issuing a request. Injectable (node URL + resolved auth) so tests drive it
+/// with a mock server and never touch the default keystore.
+async fn fetch_pins(node: &str, auth: PinsAuth) -> PinsPanel {
+    let kp = match auth {
+        PinsAuth::Keyed(kp) => kp,
+        PinsAuth::Anonymous => return PinsPanel::NeedsIdentity,
+        PinsAuth::DirUnusable(dir) => return PinsPanel::IdentityError(dir),
     };
     let client = NodeClient::new(node, Some(kp));
     let resp = match client.get_signed("/api/v1/ipfs/pins").await {
@@ -234,10 +270,13 @@ fn pins_status_line(panel: &PinsPanel) -> String {
         PinsPanel::NeedsIdentity => {
             "  IPFS pins: sign in to view (run `gl identity new`)".to_string()
         }
+        PinsPanel::IdentityError(dir) => {
+            format!("  IPFS pins: no usable identity in {}", dir.display())
+        }
     }
 }
 
-async fn cmd_status(node: String) -> Result<()> {
+async fn cmd_status(node: String, dir: Option<PathBuf>) -> Result<()> {
     let client = NodeClient::new(&node, None);
 
     // ── Fetch node info (required — bail if unreachable) ──────────────────
@@ -254,9 +293,12 @@ async fn cmd_status(node: String) -> Result<()> {
     let version = info["version"].as_str().unwrap_or("unknown");
     let network = info["network"].as_str().unwrap_or("unknown");
 
-    // The pins panel signs its read (#134 gates /api/v1/ipfs/pins behind auth);
-    // load the identity gracefully so a missing keystore never aborts status.
-    let keypair = load_keypair_from_dir(None).ok();
+    // The pins panel signs its read (#134 gates /api/v1/ipfs/pins behind auth).
+    // `--dir` selects the same identity directory as `gl ipfs list` (#146); an
+    // explicit --dir that can't be loaded is surfaced in the panel rather than
+    // masquerading as "no identity", while a missing default keystore degrades
+    // quietly. A pins failure never aborts the dashboard.
+    let pins_auth = resolve_pins_auth(dir.as_deref());
 
     // ── Fetch remaining endpoints in parallel ─────────────────────────────
     // Peers/repos/p2p/events stay anonymous; only pins is signed.
@@ -265,7 +307,7 @@ async fn cmd_status(node: String) -> Result<()> {
         try_get_json(&client, "/api/v1/repos"),
         try_get_json(&client, "/api/v1/p2p/info"),
         try_get_json(&client, "/api/v1/events/ref-updates?limit=5"),
-        fetch_pins(&node, keypair),
+        fetch_pins(&node, pins_auth),
     );
 
     // ── Render dashboard ──────────────────────────────────────────────────
@@ -493,7 +535,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), Some(kp)).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
         match panel {
             PinsPanel::Pins(count) => assert_eq!(count, 1),
             other => panic!("expected Pins, got {other:?}"),
@@ -516,7 +558,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), Some(kp)).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
         assert!(
             matches!(panel, PinsPanel::Empty),
             "expected Empty, got {panel:?}"
@@ -541,7 +583,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), Some(kp)).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
         assert!(
             matches!(panel, PinsPanel::Unavailable),
             "expected Unavailable, got {panel:?}"
@@ -561,7 +603,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), None).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Anonymous).await;
         assert!(
             matches!(panel, PinsPanel::NeedsIdentity),
             "expected NeedsIdentity, got {panel:?}"
@@ -586,7 +628,7 @@ mod tests {
             .create_async()
             .await;
 
-        let panel = fetch_pins(&server.url(), Some(kp)).await;
+        let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
         assert!(
             matches!(panel, PinsPanel::Unavailable),
             "malformed body -> Unavailable, got {panel:?}"
@@ -605,7 +647,7 @@ mod tests {
         };
         let kp = Keypair::generate();
 
-        let panel = fetch_pins(&format!("http://127.0.0.1:{port}"), Some(kp)).await;
+        let panel = fetch_pins(&format!("http://127.0.0.1:{port}"), PinsAuth::Keyed(kp)).await;
         assert!(
             matches!(panel, PinsPanel::Unavailable),
             "transport error -> Unavailable, got {panel:?}"
@@ -624,5 +666,94 @@ mod tests {
             pins_status_line(&PinsPanel::NeedsIdentity),
             "  IPFS pins: sign in to view (run `gl identity new`)"
         );
+        assert_eq!(
+            pins_status_line(&PinsPanel::IdentityError(PathBuf::from("/tmp/id"))),
+            "  IPFS pins: no usable identity in /tmp/id"
+        );
+    }
+
+    // Adversarial follow-up to jatmn #146 P2: an explicit `--dir` that holds no
+    // usable identity must resolve to DirUnusable (which names the path), NOT the
+    // Anonymous "sign in to view / run `gl identity new`" case — otherwise a user
+    // who did supply an identity dir is misdirected to create one they may have.
+    #[test]
+    fn resolve_pins_auth_reports_explicit_bad_dir_as_unusable() {
+        let bad = PathBuf::from("/nonexistent/gl-id-xyz");
+        match resolve_pins_auth(Some(&bad)) {
+            PinsAuth::DirUnusable(d) => assert_eq!(d, bad),
+            _ => panic!("explicit unusable --dir must be DirUnusable, not Anonymous"),
+        }
+    }
+
+    // The success wiring for #146: an explicit --dir with a valid identity must
+    // load that key (dir -> load_keypair_from_dir -> Keyed), so the pins read is
+    // signed with the selected identity rather than the default keystore.
+    #[test]
+    fn resolve_pins_auth_loads_keyed_identity_from_explicit_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            matches!(resolve_pins_auth(Some(dir.path())), PinsAuth::Keyed(_)),
+            "an explicit --dir with a valid identity must resolve to Keyed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_pins_dir_unusable_reports_identity_error_without_request() {
+        let mut server = mockito::Server::new_async().await;
+        // An unusable explicit --dir must render the identity error and never hit
+        // the endpoint (no identity to sign with).
+        let m = server
+            .mock("GET", "/api/v1/ipfs/pins")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let bad = PathBuf::from("/nonexistent/gl-id-xyz");
+        let panel = fetch_pins(&server.url(), PinsAuth::DirUnusable(bad.clone())).await;
+        match panel {
+            PinsPanel::IdentityError(d) => assert_eq!(d, bad),
+            other => panic!("expected IdentityError, got {other:?}"),
+        }
+
+        m.assert_async().await;
+    }
+
+    // jatmn #146 P2: `gl node status` must accept the same `--dir` identity
+    // selector as `gl ipfs list`, so a user who selected an identity via --dir can
+    // authenticate the status pins panel instead of seeing "sign in to view".
+    #[test]
+    fn status_accepts_dir_identity_selector() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            args: NodeArgs,
+        }
+        let cli = TestCli::try_parse_from([
+            "gl",
+            "status",
+            "--node",
+            "http://example",
+            "--dir",
+            "/tmp/id",
+        ])
+        .expect("`node status` must accept --dir");
+        let NodeCmd::Status { dir, .. } = cli.args.cmd else {
+            panic!("expected the Status subcommand");
+        };
+        assert_eq!(dir, Some(PathBuf::from("/tmp/id")));
+
+        // Absent --dir must stay None so the default keystore path is unchanged.
+        let cli = TestCli::try_parse_from(["gl", "status"]).expect("status parses without --dir");
+        let NodeCmd::Status { dir, .. } = cli.args.cmd else {
+            panic!("expected the Status subcommand");
+        };
+        assert_eq!(dir, None);
     }
 }
