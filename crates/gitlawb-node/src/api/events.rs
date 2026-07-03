@@ -512,6 +512,53 @@ mod ref_updates_feed_tests {
         assert_eq!(count(&body), 0);
     }
 
+    // Scenario 5b — two-repo owner-key collision, load-bearing RED->GREEN. A public
+    // bare-key mirror (`z6MkX`) and a private did:key canonical repo (`did:key:z6MkX`)
+    // normalize to the SAME owner key, so their gossip rows share the `z6MkX/...` slug
+    // space. The gate keys on the FULL slug (owner + name), so the public mirror's own
+    // row still reaches anon while the private repo's row is dropped: a readable public
+    // repo under an owner key must not unlock that owner's OTHER private repos' rows.
+    // (post-#141 normalize_owner_key collapses did:key canonical and bare mirror to the
+    // same key; the removed repo-scoped did:web collision test never covered this pair.)
+    // Disabling the per-row gate serves `z6MkX/secret` to anon, so this pins the drop.
+    #[sqlx::test]
+    async fn feed_public_mirror_does_not_unlock_private_canonical_sibling(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("mirror", "z6MkX", "widget", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .create_repo(&repo("canon", "did:key:z6MkX", "secret", false))
+            .await
+            .unwrap();
+        // The public mirror's legit row and the private canonical's row, both keyed
+        // under the shared `z6MkX` owner-key slug space.
+        state
+            .db
+            .insert_ref_update(&ref_row("u_pub", "z6MkX/widget"))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u_priv", "z6MkX/secret"))
+            .await
+            .unwrap();
+
+        let resp = router(state).oneshot(anon_get()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            slugs(&body),
+            vec!["z6MkX/widget".to_string()],
+            "anon must see the public mirror's row but NOT the private canonical sibling's; got {:?}",
+            slugs(&body)
+        );
+        assert_eq!(count(&body), 1);
+    }
+
     // Scenario 6 — remote slug (no local match) is returned to anon.
     #[sqlx::test]
     async fn feed_remote_slug_kept_for_anon(pool: PgPool) {
