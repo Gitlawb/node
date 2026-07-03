@@ -685,6 +685,18 @@ mod tests {
         }
     }
 
+    // Mirror of the above for the absent-`--dir` case: `None` must never resolve to
+    // DirUnusable — it degrades to Anonymous (no default keystore) or Keyed (one
+    // present). Env-independent: only the None->DirUnusable mapping is guarded, so it
+    // holds whether or not the runner has a default `~/.gitlawb` identity.
+    #[test]
+    fn resolve_pins_auth_none_is_never_dir_unusable() {
+        assert!(
+            !matches!(resolve_pins_auth(None), PinsAuth::DirUnusable(_)),
+            "absent --dir must degrade to Anonymous (or Keyed), never DirUnusable"
+        );
+    }
+
     // The success wiring for #146: an explicit --dir with a valid identity must
     // load that key (dir -> load_keypair_from_dir -> Keyed), so the pins read is
     // signed with the selected identity rather than the default keystore.
@@ -697,9 +709,16 @@ mod tests {
             kp.to_pem().unwrap().as_bytes(),
         )
         .unwrap();
-        assert!(
-            matches!(resolve_pins_auth(Some(dir.path())), PinsAuth::Keyed(_)),
-            "an explicit --dir with a valid identity must resolve to Keyed"
+        let PinsAuth::Keyed(loaded) = resolve_pins_auth(Some(dir.path())) else {
+            panic!("an explicit --dir with a valid identity must resolve to Keyed");
+        };
+        // A bare `Keyed(_)` match would also pass if load fell through to the default
+        // keystore; assert the loaded identity is the one written to --dir so the pins
+        // read signs with the selected key, never the default.
+        assert_eq!(
+            loaded.did(),
+            kp.did(),
+            "must sign with the identity from --dir, not the default keystore"
         );
     }
 
