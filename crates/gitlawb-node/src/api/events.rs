@@ -54,17 +54,16 @@ async fn collect_visible_ref_updates_inner(
     }
 
     // Gate inputs loaded once; DB errors abort (fail closed, never serve).
-    let mut deduped = db.list_all_repos_deduped().await?;
-    // Quarantined mirrors are withheld from every listing surface but excluded
-    // from the deduped set; fold them in with is_public=false so a matching feed
-    // row fails closed instead of being served as a remote row. is_public=false is
-    // the load-bearing control: mirrors carry no visibility rules today, but if a
-    // rule ever became addressable by a mirror id, is_public=false still denies.
-    let mut quarantined = db.list_quarantined_repos().await?;
-    for q in &mut quarantined {
-        q.is_public = false;
-    }
-    deduped.extend(quarantined);
+    let deduped = db.list_all_repos_deduped().await?;
+    // Quarantined mirrors are excluded from the deduped set, and quarantine must
+    // be withheld from every surface INCLUDING the owner: it's a status decided
+    // at admission, checked separately from the mirror's (untrustworthy)
+    // visibility fields. A folded is_public=false cannot enforce that here —
+    // visibility_check short-circuits to Allow for the owner before is_public is
+    // read, so an owner-matched row would leak. Instead, drop any row that names a
+    // quarantined repo in the loop below, before the visibility gate runs, so the
+    // drop bypasses that owner short-circuit entirely.
+    let quarantined = db.list_quarantined_repos().await?;
     let ids: Vec<String> = deduped.iter().map(|r| r.id.clone()).collect();
     let rules = db.list_visibility_rules_for_repos(&ids).await?;
 
@@ -77,6 +76,14 @@ async fn collect_visible_ref_updates_inner(
         let rows = db.list_ref_updates_page(repo, page, offset).await?;
         let fetched = rows.len() as i64;
         for u in rows {
+            // Quarantine denies unconditionally, before the visibility gate, so
+            // even a caller matching the mirror's owner_did cannot read the row.
+            if quarantined
+                .iter()
+                .any(|q| crate::visibility::ref_update_row_names_repo(q, &u.repo))
+            {
+                continue;
+            }
             if crate::visibility::ref_update_row_visible(&deduped, &rules, caller, &u.repo) {
                 visible.push(u);
                 if visible.len() == want {
@@ -696,6 +703,158 @@ mod ref_updates_feed_tests {
         assert!(
             slugs(&body).is_empty(),
             "quarantined mirror's ref-update must be withheld from anon, got {:?}",
+            slugs(&body)
+        );
+    }
+
+    // Scenario 10b — a quarantined mirror must be withheld even from a caller who
+    // matches its owner_did, not just from anon. is_public=false cannot enforce
+    // this: visibility_check short-circuits to Allow for the owner BEFORE is_public
+    // is read, so quarantine has to deny before that check runs. The anon test
+    // above never exercises that owner short-circuit; this one does (RED before
+    // the collector's explicit quarantine drop). upsert_mirror_repo stores the
+    // owner as the bare short key, so the matching caller is the bare form.
+    #[sqlx::test]
+    async fn feed_quarantined_mirror_withheld_from_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo("z6MkQuar", "secret", "/tmp/q", None, true)
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+
+        let got =
+            super::collect_visible_ref_updates_inner(&state.db, None, 50, Some("z6MkQuar"), 128)
+                .await
+                .unwrap();
+        let got_slugs: Vec<&str> = got.iter().map(|u| u.repo.as_str()).collect();
+        assert!(
+            got_slugs.is_empty(),
+            "quarantined mirror must be withheld from its own owner, got {got_slugs:?}"
+        );
+    }
+
+    // Scenario 10c — a quarantined repo whose owner_did is a full did:key must be
+    // withheld from that full-DID owner, the exact identity require_signature
+    // injects on the live path. This is the reachable shape once an operator
+    // quarantines a canonical repo via set_repo_quarantine. RED before the drop:
+    // the owner short-circuit keeps the row for the full-DID caller.
+    #[sqlx::test]
+    async fn feed_quarantined_full_did_repo_withheld_from_owner(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("q1", "did:key:z6MkQuar", "secret", false))
+            .await
+            .unwrap();
+        let touched = state.db.set_repo_quarantine("q1", true).await.unwrap();
+        assert_eq!(touched, 1, "quarantine flag must be set on the repo");
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+
+        let got = super::collect_visible_ref_updates_inner(
+            &state.db,
+            None,
+            50,
+            Some("did:key:z6MkQuar"),
+            128,
+        )
+        .await
+        .unwrap();
+        let got_slugs: Vec<&str> = got.iter().map(|u| u.repo.as_str()).collect();
+        assert!(
+            got_slugs.is_empty(),
+            "quarantined full-DID repo must be withheld from its owner, got {got_slugs:?}"
+        );
+    }
+
+    // Must-not: the quarantine drop withholds ONLY the rows it names, never an
+    // unrelated visible row. A servable public repo alongside two quarantined
+    // mirrors — the public row is served, both quarantined rows withheld. This is
+    // the drop's `.any() == false → serve` branch over a NON-EMPTY (multi-element)
+    // quarantined set, which the single-repo tests above never reach.
+    #[sqlx::test]
+    async fn feed_quarantine_drop_does_not_suppress_unrelated_rows(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_mirror_repo("z6MkQuar", "secret", "/tmp/q", None, true)
+            .await
+            .unwrap();
+        state
+            .db
+            .upsert_mirror_repo("z6MkOther", "hidden", "/tmp/o", None, true)
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("pub1", "z6MkOwner/openrepo"))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("q1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("q2", "z6MkOther/hidden"))
+            .await
+            .unwrap();
+
+        let got = super::collect_visible_ref_updates_inner(&state.db, None, 50, None, 128)
+            .await
+            .unwrap();
+        let got_slugs: Vec<&str> = got.iter().map(|u| u.repo.as_str()).collect();
+        assert_eq!(
+            got_slugs,
+            vec!["z6MkOwner/openrepo"],
+            "quarantine must withhold only its own rows, still serving unrelated visible ones"
+        );
+    }
+
+    // The live REST handler (not just the collector) must withhold a quarantined
+    // repo from an authenticated owner. Drives list_ref_updates through the router
+    // with the owner's full DID as caller — the identity require_signature injects.
+    #[sqlx::test]
+    async fn feed_quarantined_repo_withheld_from_owner_via_router(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("q1", "did:key:z6MkQuar", "secret", false))
+            .await
+            .unwrap();
+        state.db.set_repo_quarantine("q1", true).await.unwrap();
+        state
+            .db
+            .insert_ref_update(&ref_row("u1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+
+        let req = signed_request_as(
+            "did:key:z6MkQuar",
+            Method::GET,
+            "/api/v1/events/ref-updates",
+            Body::empty(),
+        );
+        let resp = router(state).oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert!(
+            slugs(&body).is_empty(),
+            "quarantined repo must be withheld from its owner via the REST handler, got {:?}",
             slugs(&body)
         );
     }

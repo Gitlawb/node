@@ -161,51 +161,24 @@ pub fn ref_update_row_visible(
     caller: Option<&str>,
     row_repo: &str,
 ) -> bool {
-    // No '/': the slug cannot name a local owner/name pair. Remote by
+    // A slug with no '/' cannot name a local owner/name pair — remote by
     // definition (same branch as "matches nothing local") → KEEP.
-    let Some((owner_part, name)) = row_repo.rsplit_once('/') else {
+    if row_repo.rsplit_once('/').is_none() {
         return true;
-    };
+    }
 
-    // Reduce the slug's owner to its last ':'-delimited segment, the SAME lossy
-    // form the emitter broadcasts. The receive-pack push handler (`git_receive_pack`,
-    // api/repos.rs) builds the wire slug as `{last-segment-of-owner_did}/{name}` and
-    // hands it to `publish_ref_update` to broadcast, so a repo's own canonical
-    // ref-update rows always arrive keyed by that trailing segment. Matching on it
-    // is what lets the gate recognize, and (when private) drop, a repo's own rows.
-    //
-    // This intentionally diverges from `did_matches` / `DEDUP_CTE`, which strip
-    // only bare `did:key:` and keep other DID methods whole. Those compare
-    // trusted, canonical owner DIDs; this slug is untrusted and already
-    // method-stripped by the emitter, so applying that keep-whole rule here would
-    // fail open: a private `did:web:host:user` repo's short slug `user/name`
-    // would not prefix-match the whole `did:web:host:user` record and would leak.
-    // The price of the stricter rule is a fail-SAFE over-drop when a remote owner
-    // shares both a trailing segment and a repo name with a local private repo
-    // (negligible for full did:key ids; only did:web / truncated forms collide):
-    // it can hide a genuinely remote row, never serve a private local one.
-    let row_key = owner_part.split(':').next_back().unwrap_or(owner_part);
-
-    // A record matches the slug when its name is equal and one owner key is a
-    // prefix of the other (prefix-tolerant per the doc comment above).
+    // Match each local record with the shared slug predicate (one matcher, so
+    // this gate and the collector's quarantine drop cannot disagree about which
+    // rows a repo owns), then fail closed on any matched record the caller
+    // cannot read at root.
     for record in deduped {
-        if record.name != name {
-            continue;
-        }
-        let record_key = record
-            .owner_did
-            .split(':')
-            .next_back()
-            .unwrap_or(&record.owner_did);
-        if !(record_key.starts_with(row_key) || row_key.starts_with(record_key)) {
+        if !ref_update_row_names_repo(record, row_repo) {
             continue;
         }
         let rules = rules_by_repo
             .get(&record.id)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        // Fail closed: any matched local record the caller cannot read at root
-        // drops the row.
         if !listable_at_root(rules, record.is_public, &record.owner_did, caller) {
             return false;
         }
@@ -215,6 +188,45 @@ pub fn ref_update_row_visible(
     // matched (remote/gossip-only). Both are the KEEP paths; there is no
     // default-keep on unexpected state — an unreadable match already returned.
     true
+}
+
+/// Whether `row_repo`'s peer-supplied slug names the local `record`. The single
+/// match predicate shared by the feed gate ([`ref_update_row_visible`]) and the
+/// quarantine hard-drop in the ref-update collector, so the two cannot diverge
+/// about which rows a repo owns — a second, drifting matcher is exactly the #134
+/// slug-collision class.
+///
+/// A record matches when the slug's `name` half is equal and one owner key is a
+/// prefix of the other (prefix-tolerant: exact short key, full `did:key:` form,
+/// and the URL-truncated 8-char form). The slug owner is reduced to its last
+/// ':'-delimited segment — the SAME lossy form the emitter broadcasts
+/// (`git_receive_pack` in api/repos.rs builds the wire slug as
+/// `{last-segment-of-owner_did}/{name}`), so a repo's own rows always arrive
+/// keyed by that trailing segment.
+///
+/// This intentionally diverges from `did_matches` / `DEDUP_CTE`, which strip
+/// only bare `did:key:` and keep other DID methods whole: those compare trusted,
+/// canonical DIDs, while this slug is untrusted and already method-stripped by
+/// the emitter. Applying the keep-whole rule here would fail open — a private
+/// `did:web:host:user` repo's short slug `user/name` would not prefix-match the
+/// whole record and would leak. The price is a fail-SAFE over-match when a
+/// remote owner shares both a trailing segment and a repo name with a local
+/// private repo (negligible for full did:key ids; only did:web / truncated forms
+/// collide): it can hide a genuinely remote row, never serve a private one.
+pub fn ref_update_row_names_repo(record: &RepoRecord, row_repo: &str) -> bool {
+    let Some((owner_part, name)) = row_repo.rsplit_once('/') else {
+        return false;
+    };
+    if record.name != name {
+        return false;
+    }
+    let row_key = owner_part.split(':').next_back().unwrap_or(owner_part);
+    let record_key = record
+        .owner_did
+        .split(':')
+        .next_back()
+        .unwrap_or(&record.owner_did);
+    record_key.starts_with(row_key) || row_key.starts_with(record_key)
 }
 
 /// The subtree path globs that `caller` (None = anonymous) may NOT read, given
@@ -744,6 +756,30 @@ mod tests {
             "z6MkOwner/widget"
         ));
         assert!(ref_update_row_visible(&deduped, &rules, None, "anything"));
+    }
+
+    // The shared slug matcher underpinning both the feed gate and the collector's
+    // quarantine drop: it must recognize a repo's own row across every owner-DID
+    // form (bare short key, full did:key, URL-truncated prefix) and must not
+    // over-match a different name or an unrelated owner. The quarantine drop calls
+    // this directly, so its match contract is load-bearing for withholding a
+    // quarantined mirror from a caller who matches the mirror's owner_did.
+    #[test]
+    fn names_repo_matches_owner_forms_and_rejects_mismatches() {
+        // Bare short owner key (the form upsert_mirror_repo stores).
+        let bare = rec("m", "z6MkQuar", "secret", false);
+        assert!(ref_update_row_names_repo(&bare, "z6MkQuar/secret"));
+        // Full did:key owner; the short-segment slug still matches via last-segment.
+        let full = rec("c", "did:key:z6MkQuar", "secret", false);
+        assert!(ref_update_row_names_repo(&full, "z6MkQuar/secret"));
+        assert!(ref_update_row_names_repo(&full, "did:key:z6MkQuar/secret"));
+        // URL-truncated 8-char prefix slug → prefix-tolerant match.
+        let long = rec("l", "did:key:z6MkQuarLONGKEY", "secret", false);
+        assert!(ref_update_row_names_repo(&long, "z6MkQuar/secret"));
+        // Different name, different owner, and no-slash → no match.
+        assert!(!ref_update_row_names_repo(&bare, "z6MkQuar/other"));
+        assert!(!ref_update_row_names_repo(&bare, "z6MkOther/secret"));
+        assert!(!ref_update_row_names_repo(&bare, "noslash"));
     }
 
     // #101: a deny rule must withhold a path that denotes the same characters in

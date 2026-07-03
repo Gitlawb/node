@@ -376,4 +376,23 @@ mod tests {
         let q = r#"{ refUpdates { repo } }"#;
         assert_eq!(count(&anon(&schema, q).await), 0);
     }
+
+    // Scenario 8b — the GraphQL surface also withholds a quarantined repo from an
+    // authenticated OWNER, not just anon. Without the collector's quarantine drop
+    // the owner short-circuit in visibility_check keeps the row on this surface
+    // too, so the REST owner test alone would not guard the resolver.
+    #[sqlx::test]
+    async fn ref_updates_quarantined_repo_dropped_for_owner(pool: PgPool) {
+        let db = db(pool).await;
+        db.create_repo(&repo("q1", "did:key:z6MkQuar", "secret", false))
+            .await
+            .unwrap();
+        db.set_repo_quarantine("q1", true).await.unwrap();
+        db.insert_ref_update(&ref_row("u1", "z6MkQuar/secret"))
+            .await
+            .unwrap();
+        let schema = schema(db);
+        let q = r#"{ refUpdates { repo } }"#;
+        assert_eq!(count(&authed(&schema, q, "did:key:z6MkQuar").await), 0);
+    }
 }
