@@ -340,6 +340,32 @@ mod authz_guard {
         out
     }
 
+    /// The `.rs` files under `api_root` (as paths RELATIVE to it) that the
+    /// completeness scan must inspect: everything except the top-level `mod.rs` (the
+    /// guard file itself) and the top-level files already covered by the per-handler
+    /// `sources` loop. A nested `api/<module>/<name>.rs` is a distinct source file
+    /// even when its basename matches a listed top-level file, so it stays in scope.
+    fn unlisted_source_files(
+        api_root: &std::path::Path,
+        listed: &std::collections::HashSet<&str>,
+    ) -> Vec<String> {
+        collect_rs_files(api_root)
+            .iter()
+            .filter_map(|path| {
+                let rel = path
+                    .strip_prefix(api_root)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel == "mod.rs" || listed.contains(rel.as_str()) {
+                    None
+                } else {
+                    Some(rel)
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn collect_rs_files_recurses_subdirs() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -372,6 +398,42 @@ mod authz_guard {
             "non-rs files excluded"
         );
         assert_eq!(names.len(), 3);
+    }
+
+    // P3 (#119): the completeness scan must skip already-covered files by their path
+    // RELATIVE to api_root, not by basename. A nested api/<module>/repos.rs is a
+    // distinct source file from the covered top-level repos.rs and must still be
+    // scanned, or a new nested module could smuggle in an ungated repo-scoped handler
+    // behind a colliding filename.
+    #[test]
+    fn unlisted_source_files_scans_nested_file_with_colliding_basename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("repos.rs"), "").unwrap();
+        std::fs::write(root.join("mod.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/repos.rs"), "").unwrap();
+        std::fs::write(root.join("sub/fresh.rs"), "").unwrap();
+        let listed: std::collections::HashSet<&str> = ["repos.rs"].into_iter().collect();
+
+        let unlisted = unlisted_source_files(root, &listed);
+
+        assert!(
+            unlisted.contains(&"sub/repos.rs".to_string()),
+            "a nested file whose basename matches a listed top-level file must still be scanned"
+        );
+        assert!(
+            unlisted.contains(&"sub/fresh.rs".to_string()),
+            "a nested file with a unique name must be scanned"
+        );
+        assert!(
+            !unlisted.contains(&"repos.rs".to_string()),
+            "the listed top-level file is covered by the per-handler loop"
+        );
+        assert!(
+            !unlisted.contains(&"mod.rs".to_string()),
+            "the top-level guard file is skipped"
+        );
     }
 
     /// Egress gate guard: every repo-scoped handler (`Path<(String, String..)>`)
@@ -427,25 +489,15 @@ mod authz_guard {
             );
         }
         let api_root = std::path::Path::new(api_dir);
-        for path in collect_rs_files(api_root) {
-            let fname = path.file_name().unwrap().to_string_lossy().into_owned();
-            // Skip the guard file itself (the top-level mod.rs) and files already
-            // covered by the per-handler loop. A nested module file (including a
-            // nested mod.rs) IS scanned, so a new api/<module>/ cannot smuggle in
-            // an ungated repo-scoped handler the scrape never looks at.
-            if path == api_root.join("mod.rs") || listed.contains(fname.as_str()) {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).expect("read api file");
+        for rel in unlisted_source_files(api_root, &listed) {
+            let src = std::fs::read_to_string(api_root.join(&rel)).expect("read api file");
             let has_repo_handler = handler_names(&src)
                 .iter()
                 .any(|n| is_repo_scoped(&fn_body(&src, n)));
-            let rel = path.strip_prefix(api_root).unwrap_or(path.as_path());
             assert!(
                 !has_repo_handler,
-                "api/{} declares a repo-scoped handler but is not in the egress \
-                 guard `sources` list — add it so its handlers are gate-checked",
-                rel.display()
+                "api/{rel} declares a repo-scoped handler but is not in the egress \
+                 guard `sources` list — add it so its handlers are gate-checked"
             );
         }
 
