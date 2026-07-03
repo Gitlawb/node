@@ -166,6 +166,22 @@ pub struct Config {
     /// in flight and exits. Default: 30s.
     #[arg(long, env = "GITLAWB_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
     pub shutdown_grace_secs: u64,
+
+    /// Maximum wall-clock time a single served git operation (upload-pack /
+    /// receive-pack through `run_git_service`) may run before it is aborted and
+    /// its process group torn down, in seconds. Bounds a git that neither
+    /// finishes nor disconnects. Must be positive; set it very large to
+    /// effectively disable the bound. Default: 600s (10 min), generous for large
+    /// clones. Does not cover the ref advertisement (`info/refs`) or the
+    /// withheld-blob fetch path (`upload_pack_excluding`, a blocking
+    /// `spawn_blocking` a tokio timeout cannot cancel); both remain unbounded.
+    #[arg(
+        long,
+        env = "GITLAWB_GIT_SERVICE_TIMEOUT_SECS",
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub git_service_timeout_secs: u64,
 }
 
 impl Config {
@@ -181,5 +197,27 @@ impl Config {
             }
         }
         PathBuf::from(&self.key_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_service_timeout_defaults_to_600_and_rejects_zero() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).git_service_timeout_secs,
+            600
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--git-service-timeout-secs", "30"])
+                .git_service_timeout_secs,
+            30
+        );
+        // 0 is a footgun (immediate-504 on every request); clap must reject it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
     }
 }

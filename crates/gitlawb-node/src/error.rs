@@ -44,6 +44,9 @@ pub enum AppError {
     #[error("git error: {0}")]
     Git(String),
 
+    #[error("git service timed out: {0}")]
+    Timeout(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -105,6 +108,9 @@ impl IntoResponse for AppError {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }
             AppError::Git(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "git_error", msg.clone()),
+            // 504, distinct from the 500 git_error and from the read-gate's 404 /
+            // the auth 401, so the client can tell a deadline from a failure.
+            AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "git_timeout", msg.clone()),
             AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
             AppError::Internal(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -123,3 +129,21 @@ impl IntoResponse for AppError {
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_maps_to_504_distinct_from_git_500() {
+        assert_eq!(
+            AppError::Timeout("x".into()).into_response().status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        // Guard against a swap with the generic git failure (500).
+        assert_eq!(
+            AppError::Git("x".into()).into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+}

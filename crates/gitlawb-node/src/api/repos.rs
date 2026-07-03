@@ -578,6 +578,26 @@ pub async fn git_info_refs(
         })
 }
 
+/// Map an error from a `smart_http` git service call to the right `AppError`:
+/// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
+/// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
+/// callers add their own tracing.
+fn git_service_app_error(err: &anyhow::Error) -> AppError {
+    if err
+        .downcast_ref::<smart_http::GitServiceTimeout>()
+        .is_some()
+    {
+        AppError::Timeout("git service timed out".into())
+    } else {
+        let msg = err.to_string();
+        if msg.contains("bad line length") || msg.contains("protocol error") {
+            AppError::BadRequest(msg)
+        } else {
+            AppError::Git(msg)
+        }
+    }
+}
+
 /// POST /:owner/:repo.git/git-upload-pack
 pub async fn git_upload_pack(
     State(state): State<AppState>,
@@ -615,8 +635,9 @@ pub async fn git_upload_pack(
     // No path-scoped rule can withhold an individual blob, and the whole-repo
     // "/" gate above already enforced repo-level access. Skip the per-blob
     // withheld walk and serve the pack directly.
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     let resp = if !visibility_pack::has_path_scoped_rule(&rules) {
-        smart_http::upload_pack(&disk_path, body).await
+        smart_http::upload_pack(&disk_path, body, git_timeout).await
     } else {
         // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
         // that off the async worker thread.
@@ -641,21 +662,22 @@ pub async fn git_upload_pack(
         };
 
         if withheld.is_empty() {
-            smart_http::upload_pack(&disk_path, body).await
+            smart_http::upload_pack(&disk_path, body, git_timeout).await
         } else {
             tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
             smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
         }
     }
     .map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("bad line length") || msg.contains("protocol error") {
-            tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request");
-            AppError::BadRequest(msg)
-        } else {
-            tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
-            AppError::Git(msg)
+        let app = git_service_app_error(&e);
+        match &app {
+            AppError::Timeout(_) => tracing::warn!(repo = %name, "git-upload-pack timed out"),
+            AppError::BadRequest(msg) => {
+                tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request")
+            }
+            _ => tracing::error!(repo = %name, err = %e, "git-upload-pack failed"),
         }
+        app
     })?;
     crate::metrics::record_fetch(&format!("{owner}/{name}"));
     crate::metrics::observe_pack_size(body_len as f64);
@@ -902,7 +924,8 @@ pub async fn git_receive_pack(
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
-    let receive_result = smart_http::receive_pack(&disk_path, body).await;
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let receive_result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
@@ -910,8 +933,12 @@ pub async fn git_receive_pack(
     guard.release(receive_result.is_ok()).await;
 
     let result = receive_result.map_err(|e| {
-        tracing::error!(repo = %name, err = %e, "git receive-pack failed");
-        AppError::Git(e.to_string())
+        let app = git_service_app_error(&e);
+        match &app {
+            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
+            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
+        }
+        app
     })?;
 
     // Update the repo's updated_at timestamp after a successful push
@@ -1794,6 +1821,25 @@ mod tests {
     const OWNER_DID: &str = "did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
+
+    #[test]
+    fn git_service_app_error_classifies_timeout_bad_request_and_git() {
+        // GitServiceTimeout carried through anyhow -> 504 Timeout.
+        let timeout_err: anyhow::Error = smart_http::GitServiceTimeout.into();
+        assert!(matches!(
+            git_service_app_error(&timeout_err),
+            AppError::Timeout(_)
+        ));
+        // A malformed client request -> 400.
+        let bad = anyhow::anyhow!("fatal: bad line length character: 0000");
+        assert!(matches!(
+            git_service_app_error(&bad),
+            AppError::BadRequest(_)
+        ));
+        // Anything else -> 500 git error.
+        let other = anyhow::anyhow!("some other git failure");
+        assert!(matches!(git_service_app_error(&other), AppError::Git(_)));
+    }
 
     fn repo_owned_by(owner_did: &str) -> crate::db::RepoRecord {
         let now = chrono::Utc::now();

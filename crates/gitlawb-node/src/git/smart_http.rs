@@ -6,7 +6,8 @@ use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 /// Handle `GET /:owner/:repo/info/refs?service=git-upload-pack`
@@ -51,8 +52,13 @@ pub async fn info_refs(repo_path: &Path, service: &str) -> Result<Response> {
 ///
 /// Serves pack data for a clone or fetch. This is stateless — the entire
 /// negotiation happens in a single request/response.
-pub async fn upload_pack(repo_path: &Path, request_body: Bytes) -> Result<Response> {
-    let output = run_git_service("git", "git-upload-pack", repo_path, request_body).await?;
+pub async fn upload_pack(
+    repo_path: &Path,
+    request_body: Bytes,
+    timeout: Duration,
+) -> Result<Response> {
+    let output =
+        run_git_service("git", "git-upload-pack", repo_path, request_body, timeout).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -65,8 +71,13 @@ pub async fn upload_pack(repo_path: &Path, request_body: Bytes) -> Result<Respon
 ///
 /// Accepts a push. The caller MUST verify HTTP Signature auth before
 /// calling this function.
-pub async fn receive_pack(repo_path: &Path, request_body: Bytes) -> Result<Response> {
-    let output = run_git_service("git", "git-receive-pack", repo_path, request_body).await?;
+pub async fn receive_pack(
+    repo_path: &Path,
+    request_body: Bytes,
+    timeout: Duration,
+) -> Result<Response> {
+    let output =
+        run_git_service("git", "git-receive-pack", repo_path, request_body, timeout).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -112,17 +123,86 @@ impl Drop for KillGroupOnDrop {
     }
 }
 
+/// Error returned when [`run_git_service`] aborts a git op on its timeout.
+///
+/// Carried through the `anyhow` chain so the HTTP handler can `downcast_ref` it
+/// and map to 504 Gateway Timeout, distinct from the generic 500 git error.
+#[derive(Debug, thiserror::Error)]
+#[error("git service timed out")]
+pub struct GitServiceTimeout;
+
+/// On a served-git timeout, tear the process group down AND reap the leader
+/// before returning, so a caller that releases a write lock (receive-pack) can't
+/// race a still-live git touching the same repo. SIGTERM first (lets git remove
+/// its `.git/*.lock` files), escalate to SIGKILL if the leader lingers past a
+/// grace, then reap. Bounded, so a git that ignores SIGTERM can't block the
+/// response unboundedly.
+#[cfg(unix)]
+async fn reap_group_on_timeout(child: &mut tokio::process::Child) {
+    let Some(pid) = child.id() else {
+        // Never got a pid; nothing to signal, best-effort reap.
+        let _ = child.wait().await;
+        return;
+    };
+    let pgid = pid as i32;
+    // SAFETY: kill(2) takes only integers and borrows no Rust memory; ESRCH on an
+    // already-gone group is ignored.
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+    // Wait for the WHOLE group to exit before returning — not just the leader but
+    // grandchildren (index-pack / pack-objects) that reparent to init and can
+    // still be touching the repo, so a caller releasing a write lock can't race
+    // them. Reap our direct child along the way (`try_wait`, else it lingers as a
+    // zombie) and poll the group's liveness with `kill(-pgid, 0)` (ESRCH once
+    // every member is gone). SIGTERM grace, then SIGKILL, then a hard cap so a
+    // stuck process can never block the response unboundedly.
+    let mut sigkilled = false;
+    for step in 0..400u32 {
+        let _ = child.try_wait();
+        if unsafe { libc::kill(-pgid, 0) } != 0 {
+            return; // ESRCH: every group member has exited
+        }
+        if step == 200 && !sigkilled {
+            // ~2s SIGTERM grace elapsed; force the group down.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+            sigkilled = true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // ~4s hard cap. Only reached if a group member survives SIGKILL, which means
+    // it is wedged in uninterruptible (D-state) I/O — a fsync on stuck storage, a
+    // hung mount — that no signal interrupts until the kernel returns. Nothing in
+    // userspace can kill it; blocking here (or holding the write lock) would just
+    // re-create the "hung git pins the repo" problem this bounds. Reap best-effort
+    // (tokio's orphan reaper collects it once the syscall unblocks) and return;
+    // git-level quarantine/ref-locking still guards the brief window before the
+    // D-state process finishes.
+    tracing::warn!(
+        pid,
+        "served git survived SIGKILL past the teardown cap (uninterruptible I/O?); \
+         releasing without a confirmed group reap"
+    );
+    let _ = child.try_wait();
+}
+
 /// Run a stateless-rpc git service and return its stdout.
 ///
 /// `git_bin` is the git executable to spawn; production callers pass `"git"`
 /// (resolved via `PATH`). It is injectable purely so the process-group teardown
 /// wiring (`process_group(0)` + [`KillGroupOnDrop`]) can be driven end-to-end by
 /// a fake `git` in tests without mutating the process-global `PATH`.
+///
+/// `timeout` bounds the whole child interaction; on expiry the op is aborted with
+/// [`GitServiceTimeout`] and its process group is torn down.
 async fn run_git_service(
     git_bin: &str,
     service: &str,
     repo_path: &Path,
     input: Bytes,
+    timeout: Duration,
 ) -> Result<Vec<u8>> {
     let mut command = Command::new(git_bin);
     command
@@ -142,33 +222,85 @@ async fn run_git_service(
 
     // Arm the group-kill guard for the lifetime of the request. With
     // process_group(0) the child is its own group leader, so pgid == its pid.
+    // This fires on a client disconnect (the whole future is dropped mid-request).
     #[cfg(unix)]
     let mut group_guard = KillGroupOnDrop {
         pgid: child.id().map(|id| id as i32),
     };
 
-    // Write the request body to git's stdin, but don't early-return on a write
-    // error: always reap the child first (below), so the guard only ever fires on
-    // an actual future-drop (client disconnect), never on a pid we just reaped.
-    let write_result: std::io::Result<()> = match child.stdin.take() {
-        Some(mut stdin) => stdin.write_all(&input).await,
-        None => Ok(()),
+    // Own the pipes so `child` stays reap-able after a timeout: wait_with_output
+    // would consume it, but on timeout we must actively reap the group before
+    // returning (see reap_group_on_timeout).
+    let mut stdin = child.stdin.take();
+    let mut stdout = child.stdout.take().context("git stdout was not piped")?;
+    let mut stderr = child.stderr.take().context("git stderr was not piped")?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+
+    // Bound the whole child interaction: a git that neither finishes nor
+    // disconnects would otherwise pin the pid forever. Write stdin, drain stdout
+    // and stderr, and wait for the child all concurrently (draining while writing
+    // avoids a pipe deadlock on a large body), under one deadline.
+    let interact = async {
+        // Don't early-return on a write error: the join still waits on the child,
+        // so an error is surfaced only after the child has been waited on.
+        let write = async {
+            match stdin.take() {
+                Some(mut s) => s.write_all(&input).await,
+                None => Ok(()),
+            }
+        };
+        let (write_result, r_out, r_err, status) = tokio::join!(
+            write,
+            stdout.read_to_end(&mut out),
+            stderr.read_to_end(&mut err),
+            child.wait(),
+        );
+        r_out?;
+        r_err?;
+        Ok::<_, anyhow::Error>((write_result, status?))
     };
 
-    let output = child.wait_with_output().await?;
+    let timed = tokio::time::timeout(timeout, interact).await;
+    let (write_result, status) = match timed {
+        Ok(result) => {
+            // The join runs all arms to completion, so the child is reaped: disarm
+            // before surfacing any interaction error (a read/wait error), else the
+            // guard's drop would fire SIGTERM on the reaped, possibly-reused pgid.
+            #[cfg(unix)]
+            group_guard.disarm();
+            result?
+        }
+        Err(_elapsed) => {
+            // Timeout: tear the whole group down and reap it before returning so a
+            // caller releasing a write lock can't race a still-live git. Then disarm
+            // the (now redundant) guard so its drop can't hit a reused pgid.
+            #[cfg(unix)]
+            {
+                reap_group_on_timeout(&mut child).await;
+                group_guard.disarm();
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+            }
+            return Err(GitServiceTimeout.into());
+        }
+    };
 
-    // Child reaped, so its group is gone: disarm before surfacing any error.
-    #[cfg(unix)]
-    group_guard.disarm();
-
-    write_result.context("failed to write to git stdin")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    // Surface git's own failure (its stderr, which the handler may classify as a
+    // 400) before any stdin-write error: when git rejects a malformed body it
+    // exits non-zero and closes stdin, so the write's EPIPE would otherwise mask
+    // the real cause.
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&err);
         bail!("{service} failed: {stderr}");
     }
 
-    Ok(output.stdout)
+    write_result.context("failed to write to git stdin")?;
+
+    Ok(out)
 }
 
 fn service_to_command(service: &str) -> &str {
@@ -957,6 +1089,7 @@ mod tests {
             "git-upload-pack",
             tmp.path(),
             Bytes::new(),
+            Duration::from_secs(60),
         ));
 
         // Advance the future until the fake has spawned its grandchild.
@@ -1032,6 +1165,7 @@ mod tests {
             "git-upload-pack",
             tmp.path(),
             Bytes::new(),
+            Duration::from_secs(60),
         )
         .await;
 
@@ -1077,6 +1211,7 @@ mod tests {
             "git-upload-pack",
             tmp.path(),
             Bytes::new(),
+            Duration::from_secs(60),
         )
         .await;
 
@@ -1096,5 +1231,162 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    // A git that hangs (never finishes, never disconnects) must be bounded: it
+    // returns GitServiceTimeout (the handler maps that to 504) and its process
+    // group is torn down. Goes RED if the timeout wrap is removed — the OUTER
+    // bound below then fires instead of run_git_service's own, so the test fails
+    // loudly rather than hanging CI.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_service_times_out_and_tears_down_a_hung_git() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("pids");
+        // Fork a grandchild, then hang forever.
+        let body = format!(
+            "#!/bin/sh\nsleep 300 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"{}\"\nwait\n",
+            pidfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        // Generous vs the fake's microsecond pidfile write, so a loaded runner
+        // can't fire the timeout before the fake records its pids; still far under
+        // the 5s outer bound.
+        let git_timeout = Duration::from_millis(1000);
+        // Outer bound well above git_timeout: if run_git_service's own timeout is
+        // broken it hangs, and this fires instead so we assert-fail, not hang.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_git_service(
+                git_bin.to_str().unwrap(),
+                "git-upload-pack",
+                tmp.path(),
+                Bytes::new(),
+                git_timeout,
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "run_git_service must return via its own timeout, not hang"
+        );
+        let err = outcome
+            .unwrap()
+            .expect_err("a hung git must surface as Err");
+        assert!(
+            err.downcast_ref::<GitServiceTimeout>().is_some(),
+            "the error must be GitServiceTimeout (maps to 504), got: {err:#}"
+        );
+
+        // The hung git's group must be torn down (the armed guard fires on the
+        // timeout return), not leaked. Poll the pidfile for fs-visibility rather
+        // than a single read that could race a loaded runner.
+        let mut pids = None;
+        for _ in 0..200 {
+            if let Some(p) = read_two_pids(&pidfile) {
+                pids = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (_leader, grandchild) = pids.expect("fake git should have written its pids");
+        let _cleanup = ReapOnPanic(vec![grandchild]);
+        let mut gone = false;
+        for _ in 0..500 {
+            if !alive(grandchild) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone,
+            "a timed-out git's process group must be torn down, not leaked"
+        );
+    }
+
+    // On timeout, run_git_service must REAP the group before returning, so a
+    // caller releasing a write lock (receive-pack) can't race a still-live git.
+    // The fake traps SIGTERM and lingers ~1s (git-cleanup stand-in): with the
+    // reap the call waits for it to exit, so the leader is dead by the time we
+    // return; without it, the call returns while the fake is still mid-trap.
+    // Goes RED if the timeout arm's reap is removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_service_reaps_the_group_before_returning_on_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("pids");
+        // Leader traps SIGTERM and lingers ~1s; the grandchild (a sub-shell) traps
+        // and lingers ~3s, past the 2s SIGKILL grace, so "wait for the whole group"
+        // (leader AND grandchildren) is observable and the SIGKILL escalation is
+        // exercised.
+        let body = format!(
+            "#!/bin/sh\ntrap 'sleep 1; exit 0' TERM\nsh -c 'trap \"sleep 3; exit 0\" TERM; sleep 300' >/dev/null 2>&1 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"{}\"\nwait\n",
+            pidfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_git_service(
+                git_bin.to_str().unwrap(),
+                "git-upload-pack",
+                tmp.path(),
+                Bytes::new(),
+                Duration::from_millis(300),
+            ),
+        )
+        .await;
+        assert!(outcome.is_ok(), "must return via its own timeout, not hang");
+        assert!(outcome.unwrap().is_err(), "a hung git must surface as Err");
+
+        // The WHOLE group (leader AND the lingering grandchild) must be gone by the
+        // time we get here.
+        let (leader, grandchild) =
+            read_two_pids(&pidfile).expect("fake git should have written its pids");
+        let _cleanup = ReapOnPanic(vec![grandchild]);
+        assert!(
+            !alive(leader) && !alive(grandchild),
+            "run_git_service must reap the whole git process group (leader AND \
+             grandchildren) before returning on a timeout, so a write-lock release \
+             can't race a still-live git"
+        );
+    }
+
+    // A malformed request: git exits non-zero with a recognizable pkt-line error
+    // on stderr AND does not read stdin, so a body larger than the pipe buffer
+    // makes the write EPIPE. run_git_service must surface git's stderr (which the
+    // handler classifies as a 400), not the EPIPE write error (a generic 500).
+    // Goes RED if the stdin-write check runs before the exit-status check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_service_surfaces_git_stderr_over_a_stdin_epipe() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_bin = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\necho 'fatal: bad line length character: 0000' >&2\nexit 128\n",
+        );
+
+        // Larger than a pipe buffer (~64 KiB) so the write blocks then EPIPEs when
+        // the fake exits without draining stdin, exercising the ordering.
+        let big = Bytes::from(vec![0u8; 256 * 1024]);
+        let result = run_git_service(
+            git_bin.to_str().unwrap(),
+            "git-upload-pack",
+            tmp.path(),
+            big,
+            Duration::from_secs(60),
+        )
+        .await;
+
+        let err = result.expect_err("non-zero git must surface as Err");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("bad line length"),
+            "run_git_service must surface git's stderr (a classifiable 400), not the \
+             stdin-write EPIPE (a generic 500); got: {msg}"
+        );
     }
 }
