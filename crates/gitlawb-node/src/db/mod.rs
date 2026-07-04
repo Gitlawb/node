@@ -2228,36 +2228,58 @@ impl Db {
     /// paging does not skip or duplicate rows when timestamps collide. Used by
     /// the visibility-gated feed collector, which pages past dropped private rows
     /// so a small limit still returns the latest visible events (#114).
-    pub async fn list_ref_updates_page(
+    /// One page of ref updates for the visibility collector, ordered
+    /// `timestamp DESC, id DESC`, using a **keyset** cursor rather than
+    /// `LIMIT/OFFSET`.
+    ///
+    /// `after` is the `(timestamp, id)` of the last row of the previous page;
+    /// the next page reads rows strictly older than it via the row-value
+    /// predicate `(timestamp, id) < (after_ts, after_id)`, which matches the
+    /// `ORDER BY` exactly (same id tie-break). Because a concurrently inserted
+    /// row is newer (larger `timestamp`) and so sorts to the front, it lands
+    /// *above* the window we are paging through and cannot shift it. That keeps
+    /// a single multi-page scan free of the duplicate/skip that OFFSET paging
+    /// suffers when `received_ref_updates` is written between page reads.
+    pub async fn list_ref_updates_keyset(
         &self,
         repo: Option<&str>,
         limit: i64,
-        offset: i64,
+        after: Option<(&str, &str)>,
     ) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = if let Some(r) = repo {
-            sqlx::query(
-                "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                        cert_id, received_at, from_peer
-                 FROM received_ref_updates WHERE repo=$1
-                 ORDER BY timestamp DESC, id DESC LIMIT $2 OFFSET $3",
-            )
-            .bind(r)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
+        const COLS: &str = "id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, \
+                            timestamp, cert_id, received_at, from_peer";
+
+        // Positional params in bind order: repo?, after_ts?, after_id?, limit.
+        let mut conds: Vec<String> = Vec::new();
+        let mut n = 0;
+        if repo.is_some() {
+            n += 1;
+            conds.push(format!("repo = ${n}"));
+        }
+        if after.is_some() {
+            let (a, b) = (n + 1, n + 2);
+            n += 2;
+            conds.push(format!("(timestamp, id) < (${a}, ${b})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
         } else {
-            sqlx::query(
-                "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                        cert_id, received_at, from_peer
-                 FROM received_ref_updates
-                 ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2",
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?
+            format!(" WHERE {}", conds.join(" AND "))
         };
+        let sql = format!(
+            "SELECT {COLS} FROM received_ref_updates{where_clause} \
+             ORDER BY timestamp DESC, id DESC LIMIT ${}",
+            n + 1
+        );
+
+        let mut q = sqlx::query(&sql);
+        if let Some(r) = repo {
+            q = q.bind(r.to_string());
+        }
+        if let Some((ts, id)) = after {
+            q = q.bind(ts.to_string()).bind(id.to_string());
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_ref_update).collect())
     }
 }
@@ -4279,5 +4301,281 @@ mod icaptcha_quarantine_tests {
 
         let with_stars = db.list_all_repos_deduped_with_stars(None).await.unwrap();
         assert!(with_stars.iter().all(|(r, _)| r.name != "spam"));
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_paging_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn rru(id: &str, ts: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: "z6MkOwner/openrepo".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+        }
+    }
+
+    async fn seed_r1_to_r4(db: &Db) {
+        for i in 1..=4 {
+            db.insert_ref_update(&rru(
+                &format!("r{i}"),
+                &format!("2026-07-01T10:00:0{i}+00:00"),
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    // Documents the bug jatmn flagged: OFFSET paging re-reads a page-1 row when a
+    // newer row is inserted between page reads (the newer row shifts every offset).
+    #[sqlx::test]
+    async fn offset_paging_duplicates_a_row_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        seed_r1_to_r4(&db).await;
+
+        let offset_page = |limit: i64, offset: i64| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM received_ref_updates \
+                     ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        let p1 = offset_page(2, 0).await;
+        assert_eq!(p1, vec!["r4", "r3"], "offset page 1");
+        // concurrent insert of a newer row shifts every later offset by one
+        db.insert_ref_update(&rru("r5", "2026-07-01T10:00:09+00:00"))
+            .await
+            .unwrap();
+        let p2 = offset_page(2, 2).await;
+        assert!(
+            p2.contains(&"r3".to_string()),
+            "OFFSET paging re-reads r3 after the concurrent insert (the bug keyset fixes); got {p2:?}"
+        );
+    }
+
+    // The fix: keyset paging on (timestamp, id) reads strictly older rows each
+    // page, so a concurrent newer insert cannot duplicate or skip a row.
+    #[sqlx::test]
+    async fn keyset_paging_is_stable_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        seed_r1_to_r4(&db).await;
+
+        let p1 = db.list_ref_updates_keyset(None, 2, None).await.unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(p1_ids, vec!["r4", "r3"], "keyset page 1");
+        let last = p1.last().unwrap();
+        let cursor = (last.timestamp.clone(), last.id.clone());
+
+        // concurrent insert of a newer row between page reads
+        db.insert_ref_update(&rru("r5", "2026-07-01T10:00:09+00:00"))
+            .await
+            .unwrap();
+
+        let p2 = db
+            .list_ref_updates_keyset(None, 2, Some((cursor.0.as_str(), cursor.1.as_str())))
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["r2", "r1"],
+            "keyset page 2 reads strictly older rows, unaffected by the concurrent insert"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(uniq.len(), 4, "no row appears twice across pages");
+        assert!(
+            !all.iter().any(|id| id == "r5"),
+            "a row inserted above the scan window is not folded in mid-scan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_repo_filtered_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn rru_repo(id: &str, ts: &str, repo: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: repo.into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+        }
+    }
+
+    // Exercises the (Some(repo), Some(after)) keyset branch: a repo-filtered
+    // multi-page continuation that emits `WHERE repo=$1 AND (timestamp,id)<($2,$3)`
+    // with four binds. Also confirms the repo filter holds across pages, noise
+    // rows are excluded, and a concurrent insert does not duplicate or skip.
+    #[sqlx::test]
+    async fn keyset_repo_filtered_multipage_stable_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        let target = "z6MkOwner/target";
+        let other = "z6MkOwner/other";
+
+        // 3 target rows (older) + 2 noise rows for another repo (newer, so they
+        // sort to the front of the global order and must be filtered out).
+        for (id, ts) in [("T1", "01"), ("T2", "02"), ("T3", "03")] {
+            db.insert_ref_update(&rru_repo(
+                id,
+                &format!("2026-07-01T10:00:{ts}+00:00"),
+                target,
+            ))
+            .await
+            .unwrap();
+        }
+        for (id, ts) in [("O1", "04"), ("O2", "05")] {
+            db.insert_ref_update(&rru_repo(
+                id,
+                &format!("2026-07-01T10:00:{ts}+00:00"),
+                other,
+            ))
+            .await
+            .unwrap();
+        }
+
+        // page 1: (Some(repo), None) -> two newest TARGET rows only
+        let p1 = db
+            .list_ref_updates_keyset(Some(target), 2, None)
+            .await
+            .unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p1_ids,
+            vec!["T3", "T2"],
+            "repo-filtered page 1 excludes other-repo rows"
+        );
+        assert!(
+            p1.iter().all(|u| u.repo == target),
+            "no noise rows on page 1"
+        );
+        let last = p1.last().unwrap();
+        let cursor = (last.timestamp.clone(), last.id.clone());
+
+        // concurrent insert of a newer TARGET row between page reads
+        db.insert_ref_update(&rru_repo("T4", "2026-07-01T10:00:06+00:00", target))
+            .await
+            .unwrap();
+
+        // page 2: (Some(repo), Some(after)) -> the four-bind continuation branch
+        let p2 = db
+            .list_ref_updates_keyset(
+                Some(target),
+                2,
+                Some((cursor.0.as_str(), cursor.1.as_str())),
+            )
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["T1"],
+            "repo-filtered keyset page 2 reads only older target rows"
+        );
+        assert!(
+            p2.iter().all(|u| u.repo == target),
+            "no noise rows on page 2"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(uniq.len(), 3, "each target row exactly once across pages");
+        assert!(
+            !all.iter().any(|id| id == "T4"),
+            "concurrent newer row not folded in mid-scan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_same_timestamp_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn row(id: &str, ts: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: "z6MkOwner/openrepo".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+        }
+    }
+
+    // Load-bearing for the `id` half of the (timestamp, id) keyset cursor: all
+    // rows share ONE timestamp, so ordering and the page boundary fall entirely
+    // on `id DESC`. A timestamp-only cursor would return nothing for page 2 and
+    // silently skip b and a; the (timestamp, id) tie-break must advance instead.
+    #[sqlx::test]
+    async fn keyset_advances_within_an_equal_timestamp_run(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        let ts = "2026-07-01T10:00:00+00:00";
+        for id in ["a", "b", "c", "d"] {
+            db.insert_ref_update(&row(id, ts)).await.unwrap();
+        }
+
+        // id DESC over equal timestamps: d, c, b, a
+        let p1 = db.list_ref_updates_keyset(None, 2, None).await.unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(p1_ids, vec!["d", "c"], "page 1 by id DESC");
+        let last = p1.last().unwrap();
+
+        // page boundary lands INSIDE the equal-timestamp group (cursor = (ts, "c"))
+        let p2 = db
+            .list_ref_updates_keyset(None, 2, Some((last.timestamp.as_str(), last.id.as_str())))
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["b", "a"],
+            "keyset must advance by id within an equal-timestamp run (a timestamp-only cursor would skip these)"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            4,
+            "no dup or skip across a same-timestamp page boundary"
+        );
     }
 }

@@ -71,10 +71,31 @@ async fn collect_visible_ref_updates_inner(
     // single LIMIT), but cap the walk so a feed of newest-private rows can't
     // force an unbounded scan. The cap only fails safe (may return fewer).
     let max_scan = bounded_limit.max(2_048);
-    let mut offset: i64 = 0;
-    while offset < max_scan {
-        let rows = db.list_ref_updates_page(repo, page, offset).await?;
+    let mut scanned: i64 = 0;
+    // Keyset cursor: the (timestamp, id) of the last row fetched so far. Paging
+    // by this instead of OFFSET keeps one multi-page scan stable when
+    // received_ref_updates is written concurrently (a newer row sorts above the
+    // window and cannot shift it, so no page duplicates or skips a row). It is
+    // the last FETCHED row (pre-filter), because the scan pages past withheld
+    // rows too; there is no client-facing cursor here, so INV-13 does not apply.
+    let mut after: Option<(String, String)> = None;
+    while scanned < max_scan {
+        let rows = db
+            .list_ref_updates_keyset(
+                repo,
+                page,
+                after.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
+            )
+            .await?;
         let fetched = rows.len() as i64;
+        if fetched == 0 {
+            break; // table exhausted
+        }
+        // Advance the cursor to the last row of this page BEFORE the filter loop
+        // consumes `rows`.
+        if let Some(last) = rows.last() {
+            after = Some((last.timestamp.clone(), last.id.clone()));
+        }
         for u in rows {
             // Quarantine denies unconditionally, before the visibility gate, so
             // even a caller matching the mirror's owner_did cannot read the row.
@@ -91,7 +112,7 @@ async fn collect_visible_ref_updates_inner(
                 }
             }
         }
-        offset += fetched;
+        scanned += fetched;
         if fetched < page {
             break; // page under-filled → table exhausted
         }
@@ -666,9 +687,9 @@ mod ref_updates_feed_tests {
 
     // Scenario 8 (#114 P2) — multi-page paging: a page smaller than the dataset
     // must still collect the requested visible rows from older pages, advancing
-    // the offset without skipping or duplicating. page=2 over 5 newest-private +
-    // 3 older-public rows spans four fetches (offset 0→2→4→6). Guards the offset
-    // paging that the single-page feed tests above can't reach.
+    // the keyset cursor without skipping or duplicating. page=2 over 5
+    // newest-private + 3 older-public rows spans four keyset pages. Guards the
+    // multi-page collection the single-page feed tests above can't reach.
     #[sqlx::test]
     async fn collect_visible_pages_across_page_boundary(pool: PgPool) {
         let state = test_state(pool).await;
@@ -702,6 +723,69 @@ mod ref_updates_feed_tests {
         // … each exactly once (no duplicate rows across page boundaries).
         let unique: std::collections::HashSet<&str> = got.iter().map(|u| u.id.as_str()).collect();
         assert_eq!(unique.len(), 3, "no row returned twice across pages");
+    }
+
+    // Scenario 8b — the collector's repo-filtered path across a page boundary:
+    // repo=Some AND a keyset continuation (after=Some) in one collect, exercising
+    // the four-bind `WHERE repo=$1 AND (timestamp,id)<($2,$3)` query end to end
+    // through the collector, not just the DB primitive.
+    #[sqlx::test]
+    async fn collect_visible_repo_filtered_pages_across_boundary(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("pub", OWNER, "openrepo", true))
+            .await
+            .unwrap();
+        // 3 visible rows for the target repo …
+        for i in 0..3 {
+            let mut r = ref_row(&format!("t{i}"), "z6MkOwner/openrepo");
+            r.timestamp = format!("2026-07-01T10:00:0{i}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+        // … plus newer noise rows for a different repo that the SQL repo filter
+        // must exclude on every page.
+        for i in 0..2 {
+            let mut r = ref_row(&format!("n{i}"), "z6MkOther/elsewhere");
+            r.timestamp = format!("2026-07-01T10:00:1{i}+00:00");
+            state.db.insert_ref_update(&r).await.unwrap();
+        }
+
+        let got = super::collect_visible_ref_updates_inner(
+            &state.db,
+            Some("z6MkOwner/openrepo"),
+            3,
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got.len(), 3, "all three target rows collected across pages");
+        assert!(
+            got.iter().all(|u| u.repo == "z6MkOwner/openrepo"),
+            "repo filter holds across the keyset continuation; no noise rows"
+        );
+        let unique: std::collections::HashSet<&str> = got.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(
+            unique.len(),
+            3,
+            "no duplicate across the repo-filtered page boundary"
+        );
+    }
+
+    // Scenario 8c — the empty-table termination: want > 0 but no rows, so the
+    // first keyset page returns zero and the loop hits the `fetched == 0` break
+    // (distinct from the want == 0 short-circuit above the loop).
+    #[sqlx::test]
+    async fn collect_visible_empty_table_terminates_empty(pool: PgPool) {
+        let state = test_state(pool).await;
+        let got = super::collect_visible_ref_updates_inner(&state.db, None, 5, None, 2)
+            .await
+            .unwrap();
+        assert!(
+            got.is_empty(),
+            "empty received_ref_updates returns empty, no hang"
+        );
     }
 
     // Scenario 9 — an oversized limit (the GraphQL resolver passes its
