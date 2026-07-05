@@ -175,6 +175,11 @@ pub fn build_router(state: AppState) -> Router {
     // HTTP Signature is enforced on receive-pack (push) — the git-remote-gitlawb
     // helper signs requests with RFC 9421 signatures using the agent's keypair.
     let pack_limit = state.config.max_pack_bytes;
+    // Per-IP throttle wraps the auth layer (outermost = runs first): flood
+    // traffic is rejected before signature verification burns CPU. Per-DID
+    // limiting is deliberately NOT used here — a DID farm (one throwaway
+    // identity per repo, as in the June 2026 push flood) never trips it.
+    let push_limiter = rate_limit::IpRateLimiter(state.push_rate_limiter.clone());
     let git_write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -184,7 +189,9 @@ pub fn build_router(state: AppState) -> Router {
             .layer(DefaultBodyLimit::disable())
             .layer(RequestBodyLimitLayer::new(pack_limit)),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(push_limiter));
 
     // ── IPFS content-addressed retrieval and pin listing ──────────────────
     // `/ipfs/{cid}` carries `optional_signature` so `get_by_cid` sees the caller

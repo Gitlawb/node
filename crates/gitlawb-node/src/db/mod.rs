@@ -1372,18 +1372,18 @@ impl Db {
         Ok(row.map(|r| r.get::<f64, _>("trust_score")).unwrap_or(0.0))
     }
 
+    /// Update an EXISTING agent's trust score; a no-op for unregistered DIDs.
+    /// Deliberately never inserts: the only path into the agents table is
+    /// `register_agent`, which sits behind the iCaptcha gate on /api/register.
+    /// This used to be an upsert, which let any authenticated push/issue/PR
+    /// re-create a deregistered DID's row with a fresh `registered_at`,
+    /// bypassing the registration gate entirely.
     pub async fn update_trust_score(&self, agent_did: &str, score: f64) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO agents (did, trust_score, capabilities, registered_at)
-             VALUES ($1, $2, '[]', $3)
-             ON CONFLICT(did) DO UPDATE SET trust_score = $2",
-        )
-        .bind(agent_did)
-        .bind(score)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE agents SET trust_score = $2 WHERE did = $1")
+            .bind(agent_did)
+            .bind(score)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -4301,6 +4301,27 @@ mod icaptcha_quarantine_tests {
 
         let with_stars = db.list_all_repos_deduped_with_stars(None).await.unwrap();
         assert!(with_stars.iter().all(|(r, _)| r.name != "spam"));
+    }
+
+    /// `update_trust_score` must never create an agent row. Registration (behind
+    /// the iCaptcha gate) is the only way in; otherwise a push/issue/PR from a
+    /// deregistered DID would silently re-register it and bypass the gate.
+    #[sqlx::test]
+    async fn update_trust_score_never_creates_agent(pool: PgPool) {
+        let db = db(pool).await;
+        let did = "did:key:zNeverRegistered";
+
+        // Unregistered DID: updating its score is a no-op, not an insert.
+        db.update_trust_score(did, 0.9).await.unwrap();
+        assert!(
+            db.get_agent(did).await.unwrap().is_none(),
+            "update_trust_score must not resurrect an unregistered DID"
+        );
+
+        // Once genuinely registered, the score updates in place.
+        db.register_agent(did, &[]).await.unwrap();
+        db.update_trust_score(did, 0.9).await.unwrap();
+        assert_eq!(db.get_trust_score(did).await.unwrap(), 0.9);
     }
 }
 

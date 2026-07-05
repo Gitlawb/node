@@ -184,6 +184,20 @@ async fn main() -> Result<()> {
 
     let rate_limiter = rate_limit::RateLimiter::new(10, std::time::Duration::from_secs(3600));
 
+    // Push-path flood brake: max git-receive-pack requests per client IP per
+    // hour. Sized for heavy agent automation (600/h = 10/min sustained) while
+    // still stopping flood traffic (the June 2026 attack pushed several times
+    // per second per IP). GITLAWB_PUSH_RATE_LIMIT overrides; 0 disables.
+    let push_limit = std::env::var("GITLAWB_PUSH_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(600);
+    let push_rate_limiter =
+        rate_limit::RateLimiter::new(push_limit, std::time::Duration::from_secs(3600));
+    if push_limit == 0 {
+        tracing::warn!("GITLAWB_PUSH_RATE_LIMIT=0 — per-IP push rate limiting disabled");
+    }
+
     // Initialize the iCaptcha proof gate (inert unless ICAPTCHA_MODE is set).
     icaptcha::init().await;
 
@@ -200,6 +214,7 @@ async fn main() -> Result<()> {
         machine_id,
         repo_store,
         rate_limiter,
+        push_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
     };
 
@@ -260,6 +275,7 @@ async fn main() -> Result<()> {
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
         let rl = state.rate_limiter.clone();
+        let push_rl = state.push_rate_limiter.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
@@ -267,6 +283,7 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
                         rl.cleanup().await;
+                        push_rl.cleanup().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)

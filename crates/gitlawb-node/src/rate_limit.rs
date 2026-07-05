@@ -32,6 +32,10 @@ impl RateLimiter {
     }
 
     async fn check(&self, key: &str) -> bool {
+        // max_requests == 0 means the limiter is disabled, not "block all".
+        if self.max_requests == 0 {
+            return true;
+        }
         let now = Instant::now();
         let mut state = self.state.lock().await;
         // Look up before inserting so the common case (key already tracked)
@@ -88,6 +92,53 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// Per-client-IP limiter for the git push path. A newtype so it can coexist
+/// with the per-DID [`RateLimiter`] in request extensions (which are keyed by
+/// type). Per-DID limits are useless against the push-flood pattern — the June
+/// 2026 attack held one throwaway DID per repo, so every DID stayed under any
+/// per-identity threshold while the node absorbed several pushes per second.
+#[derive(Clone)]
+pub struct IpRateLimiter(pub RateLimiter);
+
+/// Client IP as reported by the fronting proxy. Fly sets `Fly-Client-IP`;
+/// generic reverse proxies set `X-Forwarded-For` (first hop). Both are only
+/// trustworthy when a proxy the operator controls sets them, which is the
+/// deployment shape this node documents (Fly, or Caddy on the AWS image).
+fn client_ip(request: &Request) -> Option<String> {
+    let headers = request.headers();
+    if let Some(ip) = headers.get("fly-client-ip").and_then(|v| v.to_str().ok()) {
+        return Some(ip.trim().to_string());
+    }
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|ip| ip.trim().to_string())
+        .filter(|ip| !ip.is_empty())
+}
+
+/// Throttle by client IP. Fail-open when no IP header is present (direct
+/// connections without a fronting proxy) — the limiter is a flood brake, not
+/// an auth boundary, and rejecting proxy-less deployments outright would break
+/// self-hosted nodes.
+pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
+    let limiter = request.extensions().get::<IpRateLimiter>().cloned();
+
+    if let (Some(limiter), Some(ip)) = (limiter, client_ip(&request)) {
+        if !limiter.0.check(&ip).await {
+            tracing::warn!(ip = %ip, path = %request.uri().path(), "push rate limit exceeded");
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", "60")],
+                "push rate limit exceeded — try again later",
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +184,33 @@ mod tests {
         limiter.cleanup().await;
         let state = limiter.state.lock().await;
         assert!(state.is_empty());
+    }
+
+    fn request_with_headers(pairs: &[(&str, &str)]) -> Request {
+        let mut builder = axum::http::Request::builder().uri("/x/y/git-receive-pack");
+        for (k, v) in pairs {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn client_ip_prefers_fly_header() {
+        let req = request_with_headers(&[
+            ("fly-client-ip", "203.0.113.7"),
+            ("x-forwarded-for", "198.51.100.1, 10.0.0.1"),
+        ]);
+        assert_eq!(client_ip(&req).as_deref(), Some("203.0.113.7"));
+    }
+
+    #[test]
+    fn client_ip_falls_back_to_first_forwarded_hop() {
+        let req = request_with_headers(&[("x-forwarded-for", " 198.51.100.1 , 10.0.0.1")]);
+        assert_eq!(client_ip(&req).as_deref(), Some("198.51.100.1"));
+    }
+
+    #[test]
+    fn client_ip_none_without_proxy_headers() {
+        assert_eq!(client_ip(&request_with_headers(&[])), None);
     }
 }

@@ -51,6 +51,10 @@ pub struct AppState {
     pub repo_store: RepoStore,
     /// Per-DID rate limiter for creation endpoints (repos, issues, PRs)
     pub rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for git-receive-pack. Per-DID limits cannot
+    /// brake a push flood from a DID farm (one throwaway DID per repo), so the
+    /// push path throttles on the proxy-reported client IP instead.
+    pub push_rate_limiter: RateLimiter,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:
