@@ -271,9 +271,8 @@ pub struct TreeEntry {
 /// `/ipfs/<cid>` is computed from these same content bytes via
 /// `gitlawb_core::cid::Cid::from_git_object_bytes`.
 ///
-/// Returns `None` if the object does not exist in this repo.
-pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String, Vec<u8>)>> {
-    // First check if the object exists and get its type
+/// Get just the object type. Returns `None` if the object doesn't exist.
+pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>> {
     let type_output = Command::new("git")
         .args(["cat-file", "-t", sha256_hex])
         .current_dir(repo_path)
@@ -284,13 +283,17 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
         return Ok(None);
     }
 
-    let obj_type = String::from_utf8_lossy(&type_output.stdout)
-        .trim()
-        .to_string();
+    Ok(Some(
+        String::from_utf8_lossy(&type_output.stdout)
+            .trim()
+            .to_string(),
+    ))
+}
 
-    // Read the raw content bytes
+/// Read an object's content if its type is already known.
+pub fn read_object_content(repo_path: &Path, sha256_hex: &str, obj_type: &str) -> Result<Vec<u8>> {
     let content_output = Command::new("git")
-        .args(["cat-file", &obj_type, sha256_hex])
+        .args(["cat-file", obj_type, sha256_hex])
         .current_dir(repo_path)
         .output()
         .context("failed to run git cat-file <type>")?;
@@ -300,7 +303,24 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
         bail!("git cat-file failed: {stderr}");
     }
 
-    Ok(Some((obj_type, content_output.stdout)))
+    Ok(content_output.stdout)
+}
+
+/// Read a git object by its SHA-256 hex object ID.
+///
+/// Returns `(object_type, content_bytes)` where `content_bytes` is the raw
+/// object content (without the git framing header). The CID served over
+/// `/ipfs/<cid>` is computed from these same content bytes via
+/// `gitlawb_core::cid::Cid::from_git_object_bytes`.
+///
+/// Returns `None` if the object does not exist in this repo.
+pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String, Vec<u8>)>> {
+    let obj_type = match object_type(repo_path, sha256_hex)? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let content = read_object_content(repo_path, sha256_hex, &obj_type)?;
+    Ok(Some((obj_type, content)))
 }
 
 /// Get the diff between two branches: changes on source_branch not in target_branch.

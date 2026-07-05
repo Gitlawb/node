@@ -133,10 +133,30 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
         with:
-          key: audit
+          key: audit-0.22.2
 
-      - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
+      - name: Install cargo-audit (pinned)
+        # Pin the scanner on this BLOCKING gate: an unpinned `cargo install`
+        # floats to the latest release, so a regressed cargo-audit could red CI
+        # repo-wide with no code change. Advisory-DB freshness is fetched at scan
+        # time, independent of the binary, so this does not weaken what the gate
+        # catches. The weekly Scheduled Audit (audit-schedule.yml) deliberately
+        # floats to latest as the drift canary; when it shows a newer cargo-audit
+        # behaving differently, bump this version (and the cache key above) as a
+        # deliberate maintainer action. If 0.22.2 is ever yanked from crates.io
+        # this step fails loud until the pin is bumped.
+        run: |
+          set -euo pipefail
+          cargo install --locked --version 0.22.2 cargo-audit
+          # Assert the pin took effect so an accidental future unpin (or a drift
+          # off 0.22.2) fails loudly here instead of silently running a different
+          # scanner. `cargo audit --version` prints "cargo-audit-audit 0.22.2".
+          installed="$(cargo audit --version)"
+          echo "cargo-audit installed: $installed"
+          echo "$installed" | grep -qE '(^| )0\.22\.2($| )' || {
+            echo "::error::cargo-audit is not the pinned 0.22.2 (got: $installed)"
+            exit 1
+          }
 
       # Hard-fail gate. Suppressions live in .cargo/audit.toml (read automatically
       # from the repo root), each with no available upstream fix. A green check

@@ -310,10 +310,32 @@ pub fn replicable_blob_set(
     is_public: bool,
     owner_did: &str,
 ) -> Result<HashSet<String>> {
+    allowed_blob_set_for_caller(repo_path, rules, is_public, owner_did, None)
+}
+
+/// Reachable blob OIDs that visibility ALLOWS `caller` at some path. The
+/// caller-aware generalization of `replicable_blob_set` (which is the anonymous
+/// `caller = None` case). Used by `GET /ipfs/{cid}` to gate fail-closed against
+/// dangling/unreachable blobs (#126): a blob written via `git hash-object -w`
+/// but unreferenced is absent from the reachable walk, so it is never in this
+/// set and the IPFS serve path drops it — even from the owner, who has no path
+/// to authorize the blob at.
+///
+/// A blob reachable at an allowed path is included even when also denied
+/// elsewhere (its content is readable to this caller elsewhere). Trees and
+/// commits are NOT included here; the caller decides per object type whether
+/// the allow-set applies (it does not for trees/commits — KTD3).
+pub fn allowed_blob_set_for_caller(
+    repo_path: &Path,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Result<HashSet<String>> {
     let pairs = blob_paths(repo_path)?;
     let mut allowed = HashSet::new();
     for (oid, path) in &pairs {
-        if visibility_check(rules, is_public, owner_did, None, path) == Decision::Allow {
+        if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
             allowed.insert(oid.clone());
         }
     }
@@ -741,6 +763,78 @@ mod tests {
             replicable.contains(&public_oid),
             "the public blob still replicates"
         );
+    }
+
+    #[test]
+    fn allowed_set_excludes_dangling_blob_for_every_caller() {
+        // #126: a blob written via `git hash-object -w` but never referenced has
+        // no path to gate on, so it is absent from the reachable allowed-set —
+        // for anonymous callers, listed readers, AND the owner. The IPFS serve
+        // path relies on this fail-closed property to drop dangling withheld
+        // blobs that the deny-set model leaked.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(work.join("public")).unwrap();
+        std::fs::write(work.join("public/a.txt"), b"public bytes\n").unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["add", "."]);
+        run(&["commit", "-qm", "init"]);
+        let oid_of = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let public_oid = oid_of("HEAD:public/a.txt");
+
+        std::fs::write(work.join("orphan.bin"), b"DANGLING SECRET\n").unwrap();
+        let dangling_oid = {
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "orphan.bin"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert!(
+            matches!(dangling_oid.len(), 40 | 64),
+            "precondition: hash-object stored the dangling blob"
+        );
+
+        // Path-scoped rule: /secret/** denied to anon, allowed to a listed reader.
+        let reader = "did:key:zReader";
+        let rules = [rule("/secret/**", &[reader])];
+
+        // Every gate-relevant caller: anonymous, listed reader, owner. None of
+        // them can put the dangling blob in the allowed set — it has no path.
+        for caller in [None, Some(reader), Some(OWNER)] {
+            let allowed = allowed_blob_set_for_caller(&work, &rules, true, OWNER, caller).unwrap();
+            assert!(
+                !allowed.contains(&dangling_oid),
+                "dangling blob must be absent from allowed-set (caller={caller:?})"
+            );
+            // Sanity: the reachable public blob is still in the set for every
+            // caller (the rule does not deny /public/**).
+            assert!(
+                allowed.contains(&public_oid),
+                "reachable public blob must be in allowed-set (caller={caller:?})"
+            );
+        }
     }
 
     #[test]

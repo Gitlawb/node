@@ -778,6 +778,7 @@ const MIGRATIONS: &[Migration] = &[
             // the matching expression index. The CASE must stay byte-for-byte in
             // sync with DEDUP_CTE / count_repos_deduped or Postgres won't use it.
             "DROP INDEX IF EXISTS idx_repos_owner_short_name",
+            // Keep byte-identical to OWNER_KEY_CASE_SQL so Postgres uses the index.
             "CREATE INDEX IF NOT EXISTS idx_repos_owner_key_name ON repos ((CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END), name)",
         ],
     },
@@ -825,6 +826,85 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
+
+pub(crate) fn normalize_owner_key(did: &str) -> &str {
+    match did.strip_prefix("did:key:") {
+        Some(rest) if !rest.contains(':') => rest,
+        _ => did,
+    }
+}
+
+/// SQL CASE expression byte-identical to `normalize_owner_key`. All queries that
+/// filter or group by owner key use this const so the Rust and SQL sides cannot
+/// drift apart. If you change `normalize_owner_key`, update this const too.
+const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
+
+#[cfg(test)]
+mod normalize_owner_key_tests {
+    use super::normalize_owner_key;
+
+    // Boundary set matching the SQL CASE: did:key short/full, empty residual,
+    // did:key:z:extra, non-key, bare, empty, uppercase.
+    #[test]
+    fn strips_did_key_prefix() {
+        assert_eq!(normalize_owner_key("did:key:z6Mkfoo"), "z6Mkfoo");
+    }
+
+    #[test]
+    fn keeps_full_did_key_unchanged_when_not_a_prefix() {
+        assert_eq!(normalize_owner_key("z6Mkfoo"), "z6Mkfoo");
+    }
+
+    #[test]
+    fn leaves_non_key_did_intact() {
+        assert_eq!(
+            normalize_owner_key("did:gitlawb:z6Mkfoo"),
+            "did:gitlawb:z6Mkfoo"
+        );
+    }
+
+    #[test]
+    fn leaves_web_did_intact() {
+        assert_eq!(
+            normalize_owner_key("did:web:example.com:alice"),
+            "did:web:example.com:alice"
+        );
+    }
+
+    #[test]
+    fn does_not_strip_did_key_with_extra_colon() {
+        // did:key:did:gitlawb:z6... — the remainder contains ':', so it's left whole.
+        assert_eq!(
+            normalize_owner_key("did:key:did:gitlawb:z6Mkfoo"),
+            "did:key:did:gitlawb:z6Mkfoo"
+        );
+    }
+
+    #[test]
+    fn empty_string_returns_empty() {
+        assert_eq!(normalize_owner_key(""), "");
+    }
+
+    #[test]
+    fn bare_did_key_colon_becomes_empty() {
+        // did:key: with nothing after still has the prefix stripped.
+        assert_eq!(normalize_owner_key("did:key:"), "");
+    }
+
+    #[test]
+    fn uppercase_prefix_is_untouched() {
+        assert_eq!(normalize_owner_key("DID:KEY:z6Mkfoo"), "DID:KEY:z6Mkfoo");
+    }
+
+    #[test]
+    fn strips_did_key_even_with_trailing_slash() {
+        // did:key:z6Mkfoo/extra has no ':' in the remainder, so it strips.
+        assert_eq!(
+            normalize_owner_key("did:key:z6Mkfoo/extra"),
+            "z6Mkfoo/extra"
+        );
+    }
+}
 
 impl Db {
     pub async fn create_repo(&self, repo: &RepoRecord) -> Result<()> {
@@ -887,16 +967,32 @@ impl Db {
     }
 
     pub async fn get_repo(&self, owner_did: &str, name: &str) -> Result<Option<RepoRecord>> {
-        let row = sqlx::query(
+        // Normalize owner_did to its did:key short form, mirroring did_matches and
+        // the DEDUP_CTE's owner-key CASE: strip `did:key:` only when the remainder
+        // is a bare key id (no further `:`). This keeps `did:key:z...` and bare
+        // `z...` interchangeable while `did:gitlawb:z...` / `did:web:z...` stay
+        // distinct — the old LIKE '%:' || $1 || '%' was too broad (issue #124 P2).
+        let owner_key = normalize_owner_key(owner_did);
+        let sql = format!(
             "SELECT id, name, owner_did, description, is_public, default_branch,
                     created_at, updated_at, disk_path, forked_from, machine_id
              FROM repos
-             WHERE (owner_did = $1 OR owner_did LIKE '%:' || $1 || '%') AND name = $2",
-        )
-        .bind(owner_did)
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+              WHERE ({key}) = $1
+                AND name = $2
+             -- Prefer canonical rows (UUID id, no slash) over mirror rows (slash id).
+             -- Mirror rows are inserted by upsert_mirror_repo with is_public=true and
+             -- no visibility rules; using them for visibility checks would bypass the
+             -- canonical row's gate (issue #124).
+             ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
+                      created_at ASC, id ASC
+             LIMIT 1",
+            key = OWNER_KEY_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(owner_key)
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(row_to_repo))
     }
@@ -969,15 +1065,17 @@ impl Db {
     /// full tie still picks a deterministic survivor. `list_all_repos_deduped_with_stars`,
     /// `list_all_repos_deduped`, and the marker logic in
     /// `crate::api::repos::dedupe_canonical_repos` must stay in sync.
-    const DEDUP_CTE: &'static str = "WITH deduped AS (
-                 SELECT DISTINCT ON (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)
+    fn dedup_cte() -> String {
+        format!(
+            "WITH deduped AS (
+                 SELECT DISTINCT ON ({key}, name)
                      id, name, owner_did, description, is_public, default_branch,
                      created_at,
                      -- group MAX, not the canonical row's own value: pushes that
                      -- arrive via gossip touch only the mirror row, so the
                      -- canonical updated_at goes stale
                      MAX(updated_at) OVER (
-                         PARTITION BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name
+                         PARTITION BY {key}, name
                      ) AS updated_at,
                      disk_path, forked_from, machine_id
                  FROM repos
@@ -987,15 +1085,18 @@ impl Db {
                  -- does. Callers bind the already-normalized key ($1).
                  -- Quarantined mirrors (admitted but unvalidated by the iCaptcha
                  -- propagation gate) are withheld from every listing surface.
-                 WHERE quarantined = FALSE AND ($1::text IS NULL OR (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END) = $1)
-                 ORDER BY CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name,
-                     -- mirror rows carry a slash-form id (\"{owner_short}/{name}\"),
+                 WHERE quarantined = FALSE AND ($1::text IS NULL OR ({key}) = $1)
+                 ORDER BY {key}, name,
+                     -- mirror rows carry a slash-form id (\"{{owner_short}}/{{name}}\"),
                      -- written only by upsert_mirror_repo; canonical ids are UUIDs.
                      -- Rank canonical (no slash) ahead of the mirror in each group,
                      -- keyed on the structural id, not the user-settable description.
                      CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END,
                      created_at ASC, id ASC
-             )";
+             )",
+            key = OWNER_KEY_CASE_SQL
+        )
+    }
 
     /// All repos with star counts, mirror-deduplicated via `DEDUP_CTE` and
     /// ordered newest-first, optionally filtered to one owner. Returns the full
@@ -1015,10 +1116,7 @@ impl Db {
         // Mirror did_matches: strip `did:key:` only when the remainder is a bare
         // key id (no further `:`). The DEDUP_CTE applies the identical CASE to
         // owner_did, so the two compare on the same normalized key.
-        let owner_key = owner_filter.map(|o| match o.strip_prefix("did:key:") {
-            Some(rest) if !rest.contains(':') => rest,
-            _ => o,
-        });
+        let owner_key = owner_filter.map(normalize_owner_key);
         let sql = format!(
             "{}
              SELECT
@@ -1031,7 +1129,7 @@ impl Db {
                  SELECT repo_id, COUNT(*) AS cnt FROM repo_stars GROUP BY repo_id
              ) s ON s.repo_id = d.id
              ORDER BY d.updated_at DESC",
-            Self::DEDUP_CTE
+            Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
             .bind(owner_key)
@@ -1049,7 +1147,7 @@ impl Db {
 
     /// Deduped repo list (no stars, no paging) for the unfiltered read surfaces
     /// (GraphQL `repos`). One logical repo per mirror+canonical group, ordered by
-    /// the group's most recent activity. Shares `DEDUP_CTE` with the paged path so
+    /// the group's most recent activity. Shares `dedup_cte()` with the paged path so
     /// the dedup rule cannot drift; binds a NULL owner filter (all rows).
     pub async fn list_all_repos_deduped(&self) -> Result<Vec<RepoRecord>> {
         let sql = format!(
@@ -1059,13 +1157,29 @@ impl Db {
                  d.forked_from, d.machine_id
              FROM deduped d
              ORDER BY d.updated_at DESC",
-            Self::DEDUP_CTE
+            Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
             .bind(None::<&str>)
             .fetch_all(&self.pool)
             .await?;
 
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Repos currently quarantined (admitted as mirrors but withheld from every
+    /// listing surface). `list_all_repos_deduped` excludes these (its `DEDUP_CTE`
+    /// filters `quarantined = FALSE`), so a gate that resolves a slug against the
+    /// deduped set must also match against these and fail closed, or a quarantined
+    /// repo's row is misclassified as remote/gossip-only and served.
+    pub async fn list_quarantined_repos(&self) -> Result<Vec<RepoRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE quarantined = TRUE",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
@@ -1080,11 +1194,11 @@ impl Db {
     /// CASE that the live list paths depend on. Allowed dead outside tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub async fn count_repos_deduped(&self) -> Result<i64> {
-        let row = sqlx::query(
-            "SELECT COUNT(DISTINCT (CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END, name)) AS cnt FROM repos",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let sql = format!(
+            "SELECT COUNT(DISTINCT ({key}, name)) AS cnt FROM repos",
+            key = OWNER_KEY_CASE_SQL
+        );
+        let row = sqlx::query(&sql).fetch_one(&self.pool).await?;
         Ok(row.get::<i64, _>("cnt"))
     }
 
@@ -1258,18 +1372,18 @@ impl Db {
         Ok(row.map(|r| r.get::<f64, _>("trust_score")).unwrap_or(0.0))
     }
 
+    /// Update an EXISTING agent's trust score; a no-op for unregistered DIDs.
+    /// Deliberately never inserts: the only path into the agents table is
+    /// `register_agent`, which sits behind the iCaptcha gate on /api/register.
+    /// This used to be an upsert, which let any authenticated push/issue/PR
+    /// re-create a deregistered DID's row with a fresh `registered_at`,
+    /// bypassing the registration gate entirely.
     pub async fn update_trust_score(&self, agent_did: &str, score: f64) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "INSERT INTO agents (did, trust_score, capabilities, registered_at)
-             VALUES ($1, $2, '[]', $3)
-             ON CONFLICT(did) DO UPDATE SET trust_score = $2",
-        )
-        .bind(agent_did)
-        .bind(score)
-        .bind(&now)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE agents SET trust_score = $2 WHERE did = $1")
+            .bind(agent_did)
+            .bind(score)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -2109,61 +2223,63 @@ impl Db {
         Ok(())
     }
 
-    pub async fn list_ref_updates(&self, limit: i64) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = sqlx::query(
-            "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
-             FROM received_ref_updates ORDER BY timestamp DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_ref_update).collect())
-    }
-
-    pub async fn list_repo_ref_updates(
-        &self,
-        repo: &str,
-        limit: i64,
-    ) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = sqlx::query(
-            "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                    cert_id, received_at, from_peer
-             FROM received_ref_updates WHERE repo = $1 ORDER BY timestamp DESC LIMIT $2",
-        )
-        .bind(repo)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_ref_update).collect())
-    }
-
-    /// Filtered ref updates — optionally scoped to a specific repo.
-    pub async fn list_ref_updates_filtered(
+    /// One page of ref updates (newest first), optionally scoped to one repo.
+    /// The `(timestamp DESC, id DESC)` order gives a stable tiebreak so offset
+    /// paging does not skip or duplicate rows when timestamps collide. Used by
+    /// the visibility-gated feed collector, which pages past dropped private rows
+    /// so a small limit still returns the latest visible events (#114).
+    /// One page of ref updates for the visibility collector, ordered
+    /// `timestamp DESC, id DESC`, using a **keyset** cursor rather than
+    /// `LIMIT/OFFSET`.
+    ///
+    /// `after` is the `(timestamp, id)` of the last row of the previous page;
+    /// the next page reads rows strictly older than it via the row-value
+    /// predicate `(timestamp, id) < (after_ts, after_id)`, which matches the
+    /// `ORDER BY` exactly (same id tie-break). Because a concurrently inserted
+    /// row is newer (larger `timestamp`) and so sorts to the front, it lands
+    /// *above* the window we are paging through and cannot shift it. That keeps
+    /// a single multi-page scan free of the duplicate/skip that OFFSET paging
+    /// suffers when `received_ref_updates` is written between page reads.
+    pub async fn list_ref_updates_keyset(
         &self,
         repo: Option<&str>,
         limit: i64,
+        after: Option<(&str, &str)>,
     ) -> Result<Vec<ReceivedRefUpdate>> {
-        let rows = if let Some(r) = repo {
-            sqlx::query(
-                "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                        cert_id, received_at, from_peer
-                 FROM received_ref_updates WHERE repo=$1 ORDER BY timestamp DESC LIMIT $2",
-            )
-            .bind(r)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+        const COLS: &str = "id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, \
+                            timestamp, cert_id, received_at, from_peer";
+
+        // Positional params in bind order: repo?, after_ts?, after_id?, limit.
+        let mut conds: Vec<String> = Vec::new();
+        let mut n = 0;
+        if repo.is_some() {
+            n += 1;
+            conds.push(format!("repo = ${n}"));
+        }
+        if after.is_some() {
+            let (a, b) = (n + 1, n + 2);
+            n += 2;
+            conds.push(format!("(timestamp, id) < (${a}, ${b})"));
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
         } else {
-            sqlx::query(
-                "SELECT id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-                        cert_id, received_at, from_peer
-                 FROM received_ref_updates ORDER BY timestamp DESC LIMIT $1",
-            )
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?
+            format!(" WHERE {}", conds.join(" AND "))
         };
+        let sql = format!(
+            "SELECT {COLS} FROM received_ref_updates{where_clause} \
+             ORDER BY timestamp DESC, id DESC LIMIT ${}",
+            n + 1
+        );
+
+        let mut q = sqlx::query(&sql);
+        if let Some(r) = repo {
+            q = q.bind(r.to_string());
+        }
+        if let Some((ts, id)) = after {
+            q = q.bind(ts.to_string()).bind(id.to_string());
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_ref_update).collect())
     }
 }
@@ -3346,6 +3462,42 @@ mod dedup_db_tests {
         );
     }
 
+    /// A PRIVATE canonical repo and a PUBLIC mirror row for the same
+    /// (owner, name) collapse to a single survivor whose `is_public` is the
+    /// canonical `false`, not the mirror's `true`. `upsert_mirror_repo` always
+    /// writes `is_public=true`, so without this the deduped set could carry a
+    /// public flag for a locally-private repo and the ref-updates feed gate
+    /// would over-serve. Pins the DEDUP_CTE tiebreak so a future regression
+    /// that flips the survivor can't leak silently.
+    #[sqlx::test]
+    async fn deduped_private_canonical_beats_public_mirror(pool: PgPool) {
+        let db = db(pool).await;
+        // Private canonical row (rec() forces is_public=true, so build inline).
+        let mut canonical = rec(
+            "uuid-private-canonical",
+            "did:key:z6Mkwbud",
+            "nipmod",
+            "private canonical",
+            "2026-01-15T00:00:00Z",
+            "2026-01-15T00:00:00Z",
+        );
+        canonical.is_public = false;
+        db.create_repo(&canonical).await.unwrap();
+        // Public mirror row for the same (owner, name): id = "z6Mkwbud/nipmod",
+        // is_public = true.
+        db.upsert_mirror_repo("z6Mkwbud", "nipmod", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        let out = db.list_all_repos_deduped().await.unwrap();
+        assert_eq!(out.len(), 1, "the pair collapses to one logical repo");
+        assert_eq!(out[0].owner_did, "did:key:z6Mkwbud", "canonical row wins");
+        assert!(
+            !out[0].is_public,
+            "survivor keeps the canonical private is_public=false, not the mirror's true"
+        );
+    }
+
     /// upsert_mirror_repo's own rows dedupe against a canonical twin (proves the
     /// real mirror writer's row shape is classified correctly).
     #[sqlx::test]
@@ -3700,6 +3852,248 @@ mod dedup_db_tests {
         assert_eq!(list_len, 2);
         assert_eq!(count, list_len, "count must equal the deduped list length");
     }
+
+    /// get_repo must prefer the canonical row over the mirror row when both match,
+    /// so the visibility gate keys off the canonical row's rules and is_public flag
+    /// rather than the mirror's hardcoded public-with-no-rules (issue #124).
+    #[sqlx::test]
+    async fn get_repo_prefers_canonical_over_mirror(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkwbud";
+        let owner_did = "did:key:z6Mkwbud";
+
+        // Mirror row seeded FIRST — hardcoded is_public=true, no visibility rules.
+        // Without the ORDER BY fix, fetch_optional returns this row by insertion order,
+        // so the test fails (proving it locks in the fix).
+        db.upsert_mirror_repo(short, "secret-repo", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        // Canonical row with is_public=false.
+        let canonical = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "secret-repo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            // Date after the mirror (Utc::now()) so that created_at ASC alone
+            // would pick the mirror; the CASE WHEN position('/' in id) > 0 term
+            // is what makes the canonical row win.
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
+            disk_path: "/srv/secret".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        db.create_repo(&canonical).await.unwrap();
+
+        // Querying with bare short DID should return the canonical row.
+        let got = db
+            .get_repo(short, "secret-repo")
+            .await
+            .unwrap()
+            .expect("get_repo should find the repo");
+
+        assert_eq!(
+            got.owner_did, owner_did,
+            "canonical row (did:key: form) must win over mirror row (bare short DID)"
+        );
+        assert!(
+            !got.id.contains('/'),
+            "canonical row id must not contain a slash"
+        );
+        assert!(
+            !got.is_public,
+            "canonical row's is_public must be preserved"
+        );
+
+        // Querying with full did:key: form should also return the canonical row.
+        let got_full = db
+            .get_repo(owner_did, "secret-repo")
+            .await
+            .unwrap()
+            .expect("get_repo should find the repo with full did:key");
+
+        assert_eq!(
+            got_full.owner_did, owner_did,
+            "canonical row must be found using full did:key: form"
+        );
+        assert!(
+            !got_full.id.contains('/'),
+            "canonical row id must not contain a slash"
+        );
+        assert!(
+            !got_full.is_public,
+            "canonical row's is_public must be preserved"
+        );
+    }
+
+    /// Seed a private canonical plus a public mirror twin for the same owner+name
+    /// (mirror inserted first), call authorize_repo_read with caller=None, and
+    /// assert Err(RepoNotFound). That locks the property at the gate.
+    #[sqlx::test]
+    async fn authorize_repo_read_denies_private_canonical_even_with_public_mirror(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let short = "z6Mkwbud";
+        let owner_did = "did:key:z6Mkwbud";
+
+        // Mirror row seeded FIRST — hardcoded is_public=true, no visibility rules.
+        state
+            .db
+            .upsert_mirror_repo(short, "secret-repo", "/srv/mirror", None, false)
+            .await
+            .unwrap();
+
+        // Canonical row with is_public=false.
+        let canonical = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "secret-repo".into(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
+            disk_path: "/srv/secret".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&canonical).await.unwrap();
+
+        // call authorize_repo_read with caller=None, and assert Err(RepoNotFound)
+        let res = crate::api::authorize_repo_read(&state, short, "secret-repo", None, "/").await;
+        assert!(
+            matches!(res, Err(crate::error::AppError::RepoNotFound(_))),
+            "expected Err(RepoNotFound), got {res:?}"
+        );
+    }
+
+    /// get_repo still returns the mirror row when no canonical row exists
+    /// (mirror-only group), so sync and read paths remain functional.
+    #[sqlx::test]
+    async fn get_repo_returns_mirror_when_no_canonical(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6Lonely", "orphan", "/srv/m", None, false)
+            .await
+            .unwrap();
+
+        let got = db
+            .get_repo("z6Lonely", "orphan")
+            .await
+            .unwrap()
+            .expect("get_repo should find the mirror");
+
+        assert_eq!(got.id, "z6Lonely/orphan", "mirror row is returned");
+        assert!(got.is_public, "mirror row's is_public should be true");
+    }
+
+    /// get_repo must NOT match a non-key DID row (e.g. did:gitlawb:) when queried
+    /// with the bare short DID — the old LIKE '%:' || $1 || '%' was too broad and
+    /// could rank a non-key canonical row ahead of the exact mirror.
+    #[sqlx::test]
+    async fn get_repo_does_not_match_non_key_did(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkwbud";
+
+        // Mirror row for the bare short DID.
+        db.upsert_mirror_repo(short, "shared-name", "/srv/m", None, false)
+            .await
+            .unwrap();
+
+        // Non-key DID row sharing the same trailing id — must stay distinct.
+        let non_key = RepoRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "shared-name".into(),
+            owner_did: format!("did:gitlawb:{short}"),
+            description: None,
+            is_public: false,
+            default_branch: "main".into(),
+            created_at: ts("2126-01-01T00:00:00Z"),
+            updated_at: ts("2126-01-01T00:00:00Z"),
+            disk_path: "/srv/other".into(),
+            forked_from: None,
+            machine_id: None,
+        };
+        db.create_repo(&non_key).await.unwrap();
+
+        // Querying with the bare short DID must return the mirror, NOT the
+        // did:gitlawb row (different DID method, separate owner).
+        let got = db
+            .get_repo(short, "shared-name")
+            .await
+            .unwrap()
+            .expect("get_repo should find the mirror row");
+
+        assert!(
+            got.id.contains('/'),
+            "must return the mirror (slash id), not a non-key canonical row"
+        );
+        assert!(got.is_public, "mirror row's is_public should be true");
+
+        // Querying with the full non-key DID must return that exact row.
+        let got = db
+            .get_repo(&format!("did:gitlawb:{short}"), "shared-name")
+            .await
+            .unwrap()
+            .expect("get_repo should find the non-key DID row");
+
+        assert!(
+            !got.id.contains('/'),
+            "must return the non-key canonical row (UUID id)"
+        );
+        assert!(!got.is_public, "non-key row's is_public must be preserved");
+    }
+
+    /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
+    /// expression agree on every boundary value in the owner-key normalization
+    /// set. A mismatch would let the Rust code bind a different key than the SQL
+    /// predicate filters on, silently breaking the did:key-only matching contract.
+    #[sqlx::test]
+    async fn normalize_owner_key_matches_sql_case(pool: PgPool) {
+        // The full boundary set: did:key short/full, bare, non-key DIDs,
+        // did:key with extra colon, empty, empty residual, uppercase.
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        // Build a VALUES list with the column aliased as `owner_did` so the
+        // OWNER_KEY_CASE_SQL expression (which references `owner_did`) works
+        // verbatim — no search-and-replace that could hide a drift.
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(owner_did) AS (VALUES {values_sql})
+             SELECT owner_did, ({key}) AS normalized FROM data ORDER BY owner_did",
+            key = super::OWNER_KEY_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "normalize_owner_key(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
 }
 
 /// Exercises the iCaptcha single-use proof ledger (`icaptcha_consumed_proofs`),
@@ -3907,5 +4301,302 @@ mod icaptcha_quarantine_tests {
 
         let with_stars = db.list_all_repos_deduped_with_stars(None).await.unwrap();
         assert!(with_stars.iter().all(|(r, _)| r.name != "spam"));
+    }
+
+    /// `update_trust_score` must never create an agent row. Registration (behind
+    /// the iCaptcha gate) is the only way in; otherwise a push/issue/PR from a
+    /// deregistered DID would silently re-register it and bypass the gate.
+    #[sqlx::test]
+    async fn update_trust_score_never_creates_agent(pool: PgPool) {
+        let db = db(pool).await;
+        let did = "did:key:zNeverRegistered";
+
+        // Unregistered DID: updating its score is a no-op, not an insert.
+        db.update_trust_score(did, 0.9).await.unwrap();
+        assert!(
+            db.get_agent(did).await.unwrap().is_none(),
+            "update_trust_score must not resurrect an unregistered DID"
+        );
+
+        // Once genuinely registered, the score updates in place.
+        db.register_agent(did, &[]).await.unwrap();
+        db.update_trust_score(did, 0.9).await.unwrap();
+        assert_eq!(db.get_trust_score(did).await.unwrap(), 0.9);
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_paging_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn rru(id: &str, ts: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: "z6MkOwner/openrepo".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+        }
+    }
+
+    async fn seed_r1_to_r4(db: &Db) {
+        for i in 1..=4 {
+            db.insert_ref_update(&rru(
+                &format!("r{i}"),
+                &format!("2026-07-01T10:00:0{i}+00:00"),
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    // Documents the bug jatmn flagged: OFFSET paging re-reads a page-1 row when a
+    // newer row is inserted between page reads (the newer row shifts every offset).
+    #[sqlx::test]
+    async fn offset_paging_duplicates_a_row_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        seed_r1_to_r4(&db).await;
+
+        let offset_page = |limit: i64, offset: i64| {
+            let pool = db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT id FROM received_ref_updates \
+                     ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+
+        let p1 = offset_page(2, 0).await;
+        assert_eq!(p1, vec!["r4", "r3"], "offset page 1");
+        // concurrent insert of a newer row shifts every later offset by one
+        db.insert_ref_update(&rru("r5", "2026-07-01T10:00:09+00:00"))
+            .await
+            .unwrap();
+        let p2 = offset_page(2, 2).await;
+        assert!(
+            p2.contains(&"r3".to_string()),
+            "OFFSET paging re-reads r3 after the concurrent insert (the bug keyset fixes); got {p2:?}"
+        );
+    }
+
+    // The fix: keyset paging on (timestamp, id) reads strictly older rows each
+    // page, so a concurrent newer insert cannot duplicate or skip a row.
+    #[sqlx::test]
+    async fn keyset_paging_is_stable_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        seed_r1_to_r4(&db).await;
+
+        let p1 = db.list_ref_updates_keyset(None, 2, None).await.unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(p1_ids, vec!["r4", "r3"], "keyset page 1");
+        let last = p1.last().unwrap();
+        let cursor = (last.timestamp.clone(), last.id.clone());
+
+        // concurrent insert of a newer row between page reads
+        db.insert_ref_update(&rru("r5", "2026-07-01T10:00:09+00:00"))
+            .await
+            .unwrap();
+
+        let p2 = db
+            .list_ref_updates_keyset(None, 2, Some((cursor.0.as_str(), cursor.1.as_str())))
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["r2", "r1"],
+            "keyset page 2 reads strictly older rows, unaffected by the concurrent insert"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(uniq.len(), 4, "no row appears twice across pages");
+        assert!(
+            !all.iter().any(|id| id == "r5"),
+            "a row inserted above the scan window is not folded in mid-scan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_repo_filtered_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn rru_repo(id: &str, ts: &str, repo: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: repo.into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+        }
+    }
+
+    // Exercises the (Some(repo), Some(after)) keyset branch: a repo-filtered
+    // multi-page continuation that emits `WHERE repo=$1 AND (timestamp,id)<($2,$3)`
+    // with four binds. Also confirms the repo filter holds across pages, noise
+    // rows are excluded, and a concurrent insert does not duplicate or skip.
+    #[sqlx::test]
+    async fn keyset_repo_filtered_multipage_stable_under_concurrent_insert(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        let target = "z6MkOwner/target";
+        let other = "z6MkOwner/other";
+
+        // 3 target rows (older) + 2 noise rows for another repo (newer, so they
+        // sort to the front of the global order and must be filtered out).
+        for (id, ts) in [("T1", "01"), ("T2", "02"), ("T3", "03")] {
+            db.insert_ref_update(&rru_repo(
+                id,
+                &format!("2026-07-01T10:00:{ts}+00:00"),
+                target,
+            ))
+            .await
+            .unwrap();
+        }
+        for (id, ts) in [("O1", "04"), ("O2", "05")] {
+            db.insert_ref_update(&rru_repo(
+                id,
+                &format!("2026-07-01T10:00:{ts}+00:00"),
+                other,
+            ))
+            .await
+            .unwrap();
+        }
+
+        // page 1: (Some(repo), None) -> two newest TARGET rows only
+        let p1 = db
+            .list_ref_updates_keyset(Some(target), 2, None)
+            .await
+            .unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p1_ids,
+            vec!["T3", "T2"],
+            "repo-filtered page 1 excludes other-repo rows"
+        );
+        assert!(
+            p1.iter().all(|u| u.repo == target),
+            "no noise rows on page 1"
+        );
+        let last = p1.last().unwrap();
+        let cursor = (last.timestamp.clone(), last.id.clone());
+
+        // concurrent insert of a newer TARGET row between page reads
+        db.insert_ref_update(&rru_repo("T4", "2026-07-01T10:00:06+00:00", target))
+            .await
+            .unwrap();
+
+        // page 2: (Some(repo), Some(after)) -> the four-bind continuation branch
+        let p2 = db
+            .list_ref_updates_keyset(
+                Some(target),
+                2,
+                Some((cursor.0.as_str(), cursor.1.as_str())),
+            )
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["T1"],
+            "repo-filtered keyset page 2 reads only older target rows"
+        );
+        assert!(
+            p2.iter().all(|u| u.repo == target),
+            "no noise rows on page 2"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(uniq.len(), 3, "each target row exactly once across pages");
+        assert!(
+            !all.iter().any(|id| id == "T4"),
+            "concurrent newer row not folded in mid-scan"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_update_keyset_same_timestamp_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    fn row(id: &str, ts: &str) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.into(),
+            node_did: "did:key:zN".into(),
+            pusher_did: "did:key:zP".into(),
+            repo: "z6MkOwner/openrepo".into(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".into(),
+            new_sha: "1".into(),
+            timestamp: ts.into(),
+            cert_id: None,
+            received_at: ts.into(),
+            from_peer: "peer".into(),
+        }
+    }
+
+    // Load-bearing for the `id` half of the (timestamp, id) keyset cursor: all
+    // rows share ONE timestamp, so ordering and the page boundary fall entirely
+    // on `id DESC`. A timestamp-only cursor would return nothing for page 2 and
+    // silently skip b and a; the (timestamp, id) tie-break must advance instead.
+    #[sqlx::test]
+    async fn keyset_advances_within_an_equal_timestamp_run(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        let ts = "2026-07-01T10:00:00+00:00";
+        for id in ["a", "b", "c", "d"] {
+            db.insert_ref_update(&row(id, ts)).await.unwrap();
+        }
+
+        // id DESC over equal timestamps: d, c, b, a
+        let p1 = db.list_ref_updates_keyset(None, 2, None).await.unwrap();
+        let p1_ids: Vec<String> = p1.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(p1_ids, vec!["d", "c"], "page 1 by id DESC");
+        let last = p1.last().unwrap();
+
+        // page boundary lands INSIDE the equal-timestamp group (cursor = (ts, "c"))
+        let p2 = db
+            .list_ref_updates_keyset(None, 2, Some((last.timestamp.as_str(), last.id.as_str())))
+            .await
+            .unwrap();
+        let p2_ids: Vec<String> = p2.iter().map(|u| u.id.clone()).collect();
+        assert_eq!(
+            p2_ids,
+            vec!["b", "a"],
+            "keyset must advance by id within an equal-timestamp run (a timestamp-only cursor would skip these)"
+        );
+
+        let all: Vec<String> = p1_ids.into_iter().chain(p2_ids).collect();
+        let uniq: std::collections::HashSet<&String> = all.iter().collect();
+        assert_eq!(
+            uniq.len(),
+            4,
+            "no dup or skip across a same-timestamp page boundary"
+        );
     }
 }

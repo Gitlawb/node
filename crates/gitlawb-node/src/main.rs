@@ -145,16 +145,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Do not follow redirects: this client fans out to peer-supplied URLs
-    // (sync trigger, profile/repo fetches). A peer answering `302 Location:
-    // http://127.0.0.1/` would otherwise bypass the announce-time public-URL
-    // check and turn the redirect into an SSRF.
-    let http_client = Arc::new(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?,
-    );
+    // Shared no-redirect HTTP client. See build_http_client for the SSRF rationale.
+    let http_client = Arc::new(build_http_client()?);
 
     let (ref_update_tx, _) = tokio::sync::broadcast::channel::<state::RefUpdateBroadcast>(256);
     let (task_event_tx, _) = tokio::sync::broadcast::channel::<state::TaskEventBroadcast>(256);
@@ -190,7 +182,36 @@ async fn main() -> Result<()> {
     let repo_store =
         git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
 
-    let rate_limiter = rate_limit::RateLimiter::new(10, std::time::Duration::from_secs(3600));
+    // Per-DID limiter for the creation endpoints. Keyed on the authenticated
+    // DID (attacker-varied), so bound its key set to cap memory.
+    let rate_limiter =
+        rate_limit::RateLimiter::new_bounded(10, std::time::Duration::from_secs(3600), 200_000);
+
+    // Push-path flood brake: max git-receive-pack requests per client IP per
+    // hour (counts both the info/refs advertisement and the push POST). Sized
+    // for heavy agent automation while still stopping flood traffic (the June
+    // 2026 attack pushed several times per second per IP). GITLAWB_PUSH_RATE_LIMIT
+    // overrides; 0 disables. Bounded key set — the key is a client-influenced IP.
+    let push_limit = std::env::var("GITLAWB_PUSH_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(600);
+    let push_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        push_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if push_limit == 0 {
+        tracing::warn!("GITLAWB_PUSH_RATE_LIMIT=0 — per-IP push rate limiting disabled");
+    }
+
+    // Which forwarded header the edge is trusted to set. Default None (trust
+    // nothing, key on the socket peer). Fly nodes set GITLAWB_TRUSTED_PROXY=fly;
+    // a node behind Caddy/NGINX sets it to x-forwarded-for.
+    let push_limiter_trust = rate_limit::TrustedProxy::from_env_value(
+        &std::env::var("GITLAWB_TRUSTED_PROXY").unwrap_or_default(),
+    );
+    tracing::info!(trust = ?push_limiter_trust, push_limit, "push rate limiter configured");
 
     // Initialize the iCaptcha proof gate (inert unless ICAPTCHA_MODE is set).
     icaptcha::init().await;
@@ -208,6 +229,8 @@ async fn main() -> Result<()> {
         machine_id,
         repo_store,
         rate_limiter,
+        push_rate_limiter,
+        push_limiter_trust,
         shutdown_tx: shutdown_tx.clone(),
     };
 
@@ -268,6 +291,7 @@ async fn main() -> Result<()> {
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
         let rl = state.rate_limiter.clone();
+        let push_rl = state.push_rate_limiter.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
@@ -275,6 +299,7 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
                         rl.cleanup().await;
+                        push_rl.cleanup().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -399,19 +424,25 @@ async fn main() -> Result<()> {
     let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
 
-    let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            let mut rx = shutdown_signal_for_axum;
-            // Wait until the watcher flips to true, then return so axum
-            // can begin draining.
-            while !*rx.borrow_and_update() {
-                if rx.changed().await.is_err() {
-                    // Sender dropped — treat as shutdown.
-                    break;
-                }
+    // `into_make_service_with_connect_info` exposes the socket peer address as
+    // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client
+    // when no trusted proxy header applies (see `rate_limit::client_key`).
+    let serve_result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let mut rx = shutdown_signal_for_axum;
+        // Wait until the watcher flips to true, then return so axum
+        // can begin draining.
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // Sender dropped — treat as shutdown.
+                break;
             }
-        })
-        .await;
+        }
+    })
+    .await;
 
     // Server has stopped accepting new connections and drained in-flight
     // requests. Tear the rest of the system down.
@@ -515,7 +546,12 @@ async fn gossip_task(
         }
     }
 
-    let client = reqwest::Client::new();
+    // Reuse the shared no-redirect client for every gossip outbound call (the
+    // bootstrap announce POST and the periodic peer /health ping). Peer URLs are
+    // attacker-influenceable, so a 3xx to a private address must not be followed.
+    // Do NOT fall back to reqwest::Client::new(): its default follows redirects
+    // and would reintroduce the SSRF closed here (#93).
+    let client = state.http_client.clone();
     let my_did = state.node_did.to_string();
     let my_url = state.config.public_url.clone().unwrap_or_default();
 
@@ -590,13 +626,7 @@ async fn gossip_task(
                     Err(_) => continue,
                 };
                 for peer in peers {
-                    let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-                    let ok = client
-                        .get(&url)
-                        .send()
-                        .await
-                        .map(|r| r.status().is_success())
-                        .unwrap_or(false);
+                    let ok = ping_peer_health(&client, &peer.http_url).await;
                     let _ = state.db.mark_peer_ping(&peer.did, ok).await;
                 }
             }
@@ -608,6 +638,38 @@ async fn gossip_task(
             }
         }
     }
+}
+
+/// Build the shared node HTTP client used for every outbound fan-out (sync
+/// trigger, profile/repo fetches, gossip announce + peer pings).
+///
+/// No redirects: peer URLs are attacker-influenceable, so a `3xx` to a private
+/// address must not be followed (SSRF guard, #78/#93). Do NOT replace with
+/// `reqwest::Client::new()` — its default follows redirects. Kept as a named
+/// builder so tests bind the redirect guarantee to the real client the node
+/// runs, not a hand-rolled equivalent.
+fn build_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Ping a peer's `/health` endpoint and report whether it answered 2xx.
+///
+/// Takes the client by reference so callers supply the shared, no-redirect
+/// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
+/// private address must not be followed. Do NOT call this with a bare
+/// `reqwest::Client::new()`: its default follows redirects and would
+/// reintroduce the SSRF this guards against (#93).
+async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
+    let url = format!("{}/health", http_url.trim_end_matches('/'));
+    client
+        .get(&url)
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
@@ -640,5 +702,66 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
         info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
         Ok(kp)
+    }
+}
+
+#[cfg(test)]
+mod gossip_ssrf_tests {
+    use super::ping_peer_health;
+
+    // Build the client exactly as production does (super::build_http_client) so
+    // these tests bind the redirect guarantee to the real shared client the
+    // node runs. A regression that makes build_http_client follow redirects
+    // fails ping_peer_health_does_not_follow_redirect.
+    fn production_http_client() -> reqwest::Client {
+        super::build_http_client().expect("failed to build production http client")
+    }
+
+    // A peer answering `/health` with a 302 toward an internal address must not
+    // be followed: the redirect target must never be requested (#93).
+    #[tokio::test]
+    async fn ping_peer_health_does_not_follow_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let internal = server
+            .mock("GET", "/internal-metadata")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _health = server
+            .mock("GET", "/health")
+            .with_status(302)
+            .with_header("location", &format!("{}/internal-metadata", server.url()))
+            .create_async()
+            .await;
+
+        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a 302 must not count as a healthy peer");
+        // expect(0) is enforced only at assert time; this fails if the redirect
+        // was followed to the internal target.
+        internal.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_health_reports_success_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let _health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
+
+        assert!(ok, "a 200 /health must count as a healthy peer");
+    }
+
+    // A transport error (nothing listening) must map to unhealthy, never a
+    // spurious healthy — the .unwrap_or(false) arm.
+    #[tokio::test]
+    async fn ping_peer_health_reports_unhealthy_on_connection_error() {
+        let ok = ping_peer_health(&production_http_client(), "http://127.0.0.1:1").await;
+        assert!(!ok, "a connection error must count as an unhealthy peer");
     }
 }

@@ -16,6 +16,10 @@ primary_region = "iad"
   GITLAWB_BOOTSTRAP_PEERS = "https://node.gitlawb.com,https://node2.gitlawb.com,https://node3.gitlawb.com"
   GITLAWB_AUTO_SYNC = "true"
   GITLAWB_MAX_PACK_BYTES = "524288000"
+  # On Fly: the edge sets Fly-Client-IP (overwriting any client-supplied value),
+  # so the push rate limiter keys on the real client. Without this the limiter
+  # would fall back to the socket peer (Fly's proxy) and over-throttle.
+  GITLAWB_TRUSTED_PROXY = "fly"
 
 [http_service]
   internal_port = 7545

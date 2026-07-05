@@ -4,7 +4,8 @@
 //! based on the repo's visibility rules with a fallback to the legacy
 //! `is_public` flag. It performs no I/O so it is exhaustively unit tested.
 
-use crate::db::VisibilityRule;
+use crate::db::{RepoRecord, VisibilityRule};
+use std::collections::HashMap;
 use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,11 +25,15 @@ fn nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
-/// True if `caller` is the repo owner. Delegates to [`crate::api::did_matches`]
-/// so the read gate and `require_repo_owner` share one normalization: bare and
-/// full forms collapse only within `did:key:`, never across DID methods.
+/// True if `caller` is the repo owner. Matches exactly or against the
+/// did:key short form — a non-key DID (did:gitlawb:/did:web:) in `owner_did`
+/// never matches a bare short segment, and a non-key DID in `caller` never
+/// matches a did:key owner's short form. Uses `normalize_owner_key` (not
+/// `did_matches`) so the did:key-only rule is stricter: cross-method matching
+/// would let a non-key canonical row bypass the #124 visibility gate.
 fn is_owner(owner_did: &str, caller: &str) -> bool {
-    crate::api::did_matches(owner_did, caller)
+    let owner_short = crate::db::normalize_owner_key(owner_did);
+    caller == owner_did || caller == owner_short
 }
 
 /// The match prefix for a glob: "/" stays "/", "/secret/**" becomes "/secret".
@@ -125,6 +130,105 @@ pub fn listable_at_root(
     caller: Option<&str>,
 ) -> bool {
     visibility_check(rules, is_public, owner_did, caller, "/") == Decision::Allow
+}
+
+/// Whether a single `received_ref_updates` row (identified by its peer-supplied
+/// `row_repo` slug) should be shown to `caller` (None = anonymous) on the
+/// cross-repo ref-updates feeds (#112 GraphQL, #114 REST).
+///
+/// Pure and I/O-free: both call sites load the deduped local repo set and its
+/// visibility rules once per request and pass them in, so the gate logic lives
+/// here and visibility.rs keeps its "no I/O" property.
+///
+/// The slug is written verbatim from the inbound gossip/notify message, so it is
+/// untrusted input, not a canonical key. The decision is fail-closed by
+/// construction: the only KEEP paths are (a) a slug with no `/` (cannot name a
+/// local `owner/name` pair, so remote by definition), (b) all matched local
+/// records are readable, and (c) no local record matches (remote/gossip-only).
+/// Any local match the caller cannot read at root DROPs the row. There is no
+/// catch-all keep on unexpected state.
+///
+/// Slug/record owner keys are matched prefix-tolerantly (one is a prefix of the
+/// other), covering the exact short-key, the full `did:key:` form, and the
+/// URL-truncated 8-char form. Prefix over-match can only over-drop a genuinely
+/// remote row (fail-safe), never over-serve a private local one.
+///
+/// The live call sites are the #112 (GraphQL) and #114 (REST) feed handlers,
+/// added in the following units; exercised by the unit tests below meanwhile.
+pub fn ref_update_row_visible(
+    deduped: &[RepoRecord],
+    rules_by_repo: &HashMap<String, Vec<VisibilityRule>>,
+    caller: Option<&str>,
+    row_repo: &str,
+) -> bool {
+    // A slug with no '/' cannot name a local owner/name pair — remote by
+    // definition (same branch as "matches nothing local") → KEEP.
+    if row_repo.rsplit_once('/').is_none() {
+        return true;
+    }
+
+    // Match each local record with the shared slug predicate (one matcher, so
+    // this gate and the collector's quarantine drop cannot disagree about which
+    // rows a repo owns), then fail closed on any matched record the caller
+    // cannot read at root.
+    for record in deduped {
+        if !ref_update_row_names_repo(record, row_repo) {
+            continue;
+        }
+        let rules = rules_by_repo
+            .get(&record.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if !listable_at_root(rules, record.is_public, &record.owner_did, caller) {
+            return false;
+        }
+    }
+
+    // Reached only if every matched local record is readable, or nothing local
+    // matched (remote/gossip-only). Both are the KEEP paths; there is no
+    // default-keep on unexpected state — an unreadable match already returned.
+    true
+}
+
+/// Whether `row_repo`'s peer-supplied slug names the local `record`. The single
+/// match predicate shared by the feed gate ([`ref_update_row_visible`]) and the
+/// quarantine hard-drop in the ref-update collector, so the two cannot diverge
+/// about which rows a repo owns — a second, drifting matcher is exactly the #134
+/// slug-collision class.
+///
+/// A record matches when the slug's `name` half is equal and one owner key is a
+/// prefix of the other (prefix-tolerant: exact short key, full `did:key:` form,
+/// and the URL-truncated 8-char form). Both the slug owner and the record owner
+/// are reduced to their last ':'-delimited segment before comparing. The node's
+/// own emitter builds the wire slug via `normalize_owner_key` (bare short key for
+/// a single-segment `did:key:`, the full DID for every other method; see
+/// api/repos.rs), but the stored slug is UNTRUSTED: a peer can broadcast a row
+/// under any owner form, including a method-stripped `user/name`. Reducing both
+/// sides to the trailing segment matches a repo's own rows whichever form keyed
+/// them, and still catches an attacker-planted short slug.
+///
+/// This intentionally diverges from `did_matches` / `DEDUP_CTE`, which strip only
+/// bare `did:key:` and keep other DID methods whole: those compare trusted,
+/// canonical DIDs, while this slug is untrusted. Applying the keep-whole rule here
+/// would fail open: a hostile `user/name` slug would not prefix-match a private
+/// `did:web:host:user` record and would leak. The price is a fail-SAFE over-match
+/// when a remote owner shares both a trailing segment and a repo name with a local
+/// private repo (negligible for full did:key ids; only did:web / truncated forms
+/// collide): it can hide a genuinely remote row, never serve a private one.
+pub fn ref_update_row_names_repo(record: &RepoRecord, row_repo: &str) -> bool {
+    let Some((owner_part, name)) = row_repo.rsplit_once('/') else {
+        return false;
+    };
+    if record.name != name {
+        return false;
+    }
+    let row_key = owner_part.split(':').next_back().unwrap_or(owner_part);
+    let record_key = record
+        .owner_did
+        .split(':')
+        .next_back()
+        .unwrap_or(&record.owner_did);
+    record_key.starts_with(row_key) || row_key.starts_with(record_key)
 }
 
 /// The subtree path globs that `caller` (None = anonymous) may NOT read, given
@@ -300,6 +404,31 @@ mod tests {
     }
 
     #[test]
+    fn non_key_owner_bare_short_does_not_match() {
+        // A non-key DID owner (did:gitlawb:z6MkFoo) probed with the bare last
+        // segment (z6MkFoo) must NOT match — the old is_owner would return true
+        // via split(':').next_back(), which this PR tightens.
+        let rules = [rule("/", VisibilityMode::A, &[])];
+        assert_eq!(
+            visibility_check(&rules, false, "did:gitlawb:z6MkFoo", Some("z6MkFoo"), "/"),
+            Decision::Deny,
+            "bare short must not match a non-key DID owner"
+        );
+        // The full non-key DID still matches itself.
+        assert_eq!(
+            visibility_check(
+                &rules,
+                false,
+                "did:gitlawb:z6MkFoo",
+                Some("did:gitlawb:z6MkFoo"),
+                "/"
+            ),
+            Decision::Allow,
+            "full non-key DID still matches itself"
+        );
+    }
+
+    #[test]
     fn root_rule_allows_listed_reader() {
         let rules = [rule("/", VisibilityMode::A, &["did:key:z6MkFriend"])];
         assert_eq!(
@@ -383,41 +512,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn owner_match_normalizes_did_key_both_directions() {
-        // Bare owner stored (mirror rows), full did:key caller signs in.
-        assert_eq!(
-            visibility_check(&[], false, "zABC", Some("did:key:zABC"), "/"),
-            Decision::Allow
-        );
-        // Full owner stored, bare caller.
-        assert_eq!(
-            visibility_check(&[], false, "did:key:zABC", Some("zABC"), "/"),
-            Decision::Allow
-        );
-    }
-
-    #[test]
-    fn owner_match_rejects_cross_method_collision() {
-        // A did:gitlawb caller sharing the base58 id must not be admitted as the
-        // did:key owner.
-        assert_eq!(
-            visibility_check(&[], false, "did:key:zABC", Some("did:gitlawb:zABC"), "/"),
-            Decision::Deny
-        );
-        // The over-match the old trailing-segment split allowed: an owner stored
-        // under a non-key method must not be matched by the bare base58 id. The
-        // old `owner_short` compare would wrongly Allow this; did_matches denies.
-        assert_eq!(
-            visibility_check(&[], false, "did:gitlawb:zABC", Some("zABC"), "/"),
-            Decision::Deny
-        );
-        assert_eq!(
-            visibility_check(&[], false, "did:gitlawb:zABC", Some("did:key:zABC"), "/"),
-            Decision::Deny
-        );
-    }
-
     // Mirrors the gossip-announce gate in git_receive_pack: announce iff an
     // anonymous caller can read "/".
     #[test]
@@ -436,6 +530,260 @@ mod tests {
             &[rule("/secret/**", VisibilityMode::B, &[])],
             true
         ));
+    }
+
+    // ── ref_update_row_visible (feed gate) ──────────────────────────────────
+
+    fn rec(id: &str, owner_did: &str, name: &str, is_public: bool) -> RepoRecord {
+        RepoRecord {
+            id: id.into(),
+            name: name.into(),
+            owner_did: owner_did.into(),
+            description: None,
+            is_public,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: format!("/srv/{id}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    fn rules_for(entries: &[(&str, &[VisibilityRule])]) -> HashMap<String, Vec<VisibilityRule>> {
+        entries
+            .iter()
+            .map(|(id, rs)| (id.to_string(), rs.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn feed_public_local_repo_kept_for_anon() {
+        let deduped = [rec("r1", "did:key:z6MkOwner", "widget", true)];
+        let rules = HashMap::new();
+        assert!(ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "z6MkOwner/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_private_local_repo_dropped_for_anon_kept_for_owner() {
+        let deduped = [rec("r1", "did:key:z6MkOwner", "widget", false)];
+        let rules = HashMap::new();
+        // Anonymous → drop.
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "z6MkOwner/widget"
+        ));
+        // Owner (full DID) → keep.
+        assert!(ref_update_row_visible(
+            &deduped,
+            &rules,
+            Some("did:key:z6MkOwner"),
+            "z6MkOwner/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_root_rule_reader_reincluded() {
+        // Private repo (is_public=false) with a root rule granting a named
+        // reader. Delegates to listable_at_root: anon and non-reader denied,
+        // named reader allowed.
+        let deduped = [rec("r1", OWNER, "widget", false)];
+        let root = [rule("/", VisibilityMode::A, &["did:key:z6MkFriend"])];
+        let rules = rules_for(&[("r1", &root)]);
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "z6MkOwner/widget"
+        ));
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            Some("did:key:z6MkStranger"),
+            "z6MkOwner/widget"
+        ));
+        assert!(ref_update_row_visible(
+            &deduped,
+            &rules,
+            Some("did:key:z6MkFriend"),
+            "z6MkOwner/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_alias_full_did_slug_dropped_for_anon() {
+        // Owner stored full-DID; slug also carries the full-DID form. Still
+        // matches (row_key normalizes to the short key) → drop. Round 1's
+        // string-match would have leaked this.
+        let deduped = [rec("r1", "did:key:zABC", "widget", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "did:key:zABC/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_truncated_key_slug_dropped_for_anon() {
+        // Slug carries an 8-char URL-truncated prefix of the owner key; still
+        // matches via prefix tolerance → drop. Round 2's get_repo path leaked.
+        let deduped = [rec("r1", "did:key:zABCDEFGH", "widget", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "zABCDEF/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_mirror_coexistence_private_canonical_dropped_for_anon() {
+        // Pure-level mirror-coexistence: the deduped set contains only the
+        // private canonical record for (owner,name). A matching slug drops for
+        // anon. (DB-level dedup survivor property is pinned separately.)
+        let deduped = [rec("uuid-canonical", "did:key:z6Mkwbud", "nipmod", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "z6Mkwbud/nipmod"
+        ));
+    }
+
+    #[test]
+    fn feed_empty_owner_slug_matches_and_drops() {
+        // Slug "/name": empty owner_part → row_key "" → starts_with("") matches
+        // every same-named record. Fail-safe pin for a private repo.
+        let deduped = [rec("r1", "did:key:z6MkOwner", "widget", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(&deduped, &rules, None, "/widget"));
+    }
+
+    #[test]
+    fn feed_one_char_owner_slug_matches_and_drops() {
+        // 1-char owner prefix that the private repo's key starts with → match.
+        let deduped = [rec("r1", "did:key:z6MkOwner", "widget", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(&deduped, &rules, None, "z/widget"));
+    }
+
+    #[test]
+    fn feed_remote_slug_no_match_kept() {
+        // Different owner key, no prefix relation → no local match → keep.
+        let deduped = [rec("r1", "did:key:z6MkOwner", "widget", false)];
+        let rules = HashMap::new();
+        assert!(ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "zZZZOTHER/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_private_didweb_short_slug_dropped_for_anon() {
+        // A private did:web repo must drop its row for anon when the slug arrives
+        // in the short `{last-segment}/{name}` form. Post-#141 the emitter no longer
+        // produces this form for did:web (normalize_owner_key keeps the full DID),
+        // so this is the untrusted/crafted variant a peer can broadcast; the full-DID
+        // variant the emitter now sends is covered by the next test. A did:key-aware
+        // (keep-whole) rule would fail to match `alice` against `did:web:host:alice`
+        // and leak.
+        let deduped = [rec("r1", "did:web:host:alice", "widget", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "alice/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_multi_segment_did_slug_dropped_for_anon() {
+        // A private repo owned by a multi-segment DID must also fail closed under
+        // the full-DID slug form. Post-#141 this IS the form the emitter broadcasts
+        // (normalize_owner_key keeps non-did:key methods whole), and a peer can craft
+        // it too. The gate drops it: both sides reduce to the last ':' segment
+        // ("user"), so they match. Fail-safe regardless of which form keyed the row.
+        let deduped = [rec("r1", "did:web:host:user", "widget", false)];
+        let rules = HashMap::new();
+        assert!(!ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "did:web:host:user/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_multi_segment_did_slug_kept_for_public() {
+        // Symmetric keep-side: a PUBLIC multi-segment-DID repo's row must still be
+        // returned to anon after the last-':'-segment normalization — guards
+        // against a regression that over-drops legitimate did:web rows.
+        let deduped = [rec("r1", "did:web:host:user", "widget", true)];
+        let rules = HashMap::new();
+        assert!(ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "did:web:host:user/widget"
+        ));
+    }
+
+    #[test]
+    fn feed_malformed_slug_no_slash_kept_no_panic() {
+        let deduped = [rec("r1", "did:key:z6MkOwner", "widget", false)];
+        let rules = HashMap::new();
+        assert!(ref_update_row_visible(&deduped, &rules, None, "noslug"));
+    }
+
+    #[test]
+    fn feed_empty_deduped_set_keeps_any_slug() {
+        let deduped: [RepoRecord; 0] = [];
+        let rules = HashMap::new();
+        assert!(ref_update_row_visible(
+            &deduped,
+            &rules,
+            None,
+            "z6MkOwner/widget"
+        ));
+        assert!(ref_update_row_visible(&deduped, &rules, None, "anything"));
+    }
+
+    // The shared slug matcher underpinning both the feed gate and the collector's
+    // quarantine drop: it must recognize a repo's own row across every owner-DID
+    // form (bare short key, full did:key, URL-truncated prefix) and must not
+    // over-match a different name or an unrelated owner. The quarantine drop calls
+    // this directly, so its match contract is load-bearing for withholding a
+    // quarantined mirror from a caller who matches the mirror's owner_did.
+    #[test]
+    fn names_repo_matches_owner_forms_and_rejects_mismatches() {
+        // Bare short owner key (the form upsert_mirror_repo stores).
+        let bare = rec("m", "z6MkQuar", "secret", false);
+        assert!(ref_update_row_names_repo(&bare, "z6MkQuar/secret"));
+        // Full did:key owner; the short-segment slug still matches via last-segment.
+        let full = rec("c", "did:key:z6MkQuar", "secret", false);
+        assert!(ref_update_row_names_repo(&full, "z6MkQuar/secret"));
+        assert!(ref_update_row_names_repo(&full, "did:key:z6MkQuar/secret"));
+        // URL-truncated 8-char prefix slug → prefix-tolerant match.
+        let long = rec("l", "did:key:z6MkQuarLONGKEY", "secret", false);
+        assert!(ref_update_row_names_repo(&long, "z6MkQuar/secret"));
+        // Different name, different owner, and no-slash → no match.
+        assert!(!ref_update_row_names_repo(&bare, "z6MkQuar/other"));
+        assert!(!ref_update_row_names_repo(&bare, "z6MkOther/secret"));
+        assert!(!ref_update_row_names_repo(&bare, "noslash"));
     }
 
     // #101: a deny rule must withhold a path that denotes the same characters in
