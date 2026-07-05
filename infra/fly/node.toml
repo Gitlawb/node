@@ -1,14 +1,20 @@
 # Fly config for node.gitlawb.com — deploys the public Gitlawb/node source.
-# The primary/busiest bootstrap node: 2-machine HA in sjc, each with its own
-# 250GB volume and DISTINCT identity. Deploy from the repo root:
-#   fly deploy -a gitlawb-node -c infra/fly/node.toml
+# The primary/busiest bootstrap node: a SINGLE machine in sjc with its own
+# 250GB volume. Deploy from the repo root:
+#   fly deploy -a gitlawb-node -c infra/fly/node.toml --ha=false
 #
-# Reuses both sjc volumes `gitlawb_data` (identity key + repos), the attached
+# NOTE: node was consolidated from 2 machines to 1 (2026-06-22) to fix a
+# split-brain (per-machine volumes diverged behind one hostname). Keep this at
+# a single machine — min_machines_running=2 would spawn a second machine with a
+# fresh empty volume and reintroduce the split-brain.
+#
+# Reuses the sjc volume `gitlawb_data` (identity key + repos), the attached
 # Postgres (DATABASE_URL), and Tigris S3 + Pinata + contract secrets — all
 # app-level, preserved across deploys.
 #
-# IMPORTANT: both volumes were created by the old root image, so /data is
-# root-owned. chown BOTH to uid 1000 BEFORE deploy or that machine crash-loops:
+# IMPORTANT: the volume was created by the old root image, so /data is
+# root-owned. If the machine crash-loops on first boot of the public image,
+# chown /data to uid 1000:
 #   fly ssh console -a gitlawb-node --machine <id> -C "chown -R 1000:1000 /data"
 app = "gitlawb-node"
 primary_region = "sjc"
@@ -32,8 +38,9 @@ primary_region = "sjc"
   force_https = true
   auto_stop_machines = false
   auto_start_machines = true
-  # Keep both HA machines up; Fly rolls them one at a time (zero-downtime).
-  min_machines_running = 2
+  # Single-machine node (see header): keep this at 1. Raising it spawns a
+  # second machine with a fresh volume and reintroduces the split-brain.
+  min_machines_running = 1
 
   [http_service.concurrency]
     type = "connections"
