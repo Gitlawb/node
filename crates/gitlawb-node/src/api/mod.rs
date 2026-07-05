@@ -324,6 +324,118 @@ mod authz_guard {
         })
     }
 
+    /// Collect `.rs` source files under `dir`. Recursive so the completeness scan
+    /// covers nested API modules (`api/<module>/mod.rs` and deeper), not only the
+    /// immediate `api/*.rs` children.
+    fn collect_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read api dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                out.extend(collect_rs_files(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// The `.rs` files under `api_root` (as paths RELATIVE to it) that the
+    /// completeness scan must inspect: everything except the top-level `mod.rs` (the
+    /// guard file itself) and the top-level files already covered by the per-handler
+    /// `sources` loop. A nested `api/<module>/<name>.rs` is a distinct source file
+    /// even when its basename matches a listed top-level file, so it stays in scope.
+    fn unlisted_source_files(
+        api_root: &std::path::Path,
+        listed: &std::collections::HashSet<&str>,
+    ) -> Vec<String> {
+        collect_rs_files(api_root)
+            .iter()
+            .filter_map(|path| {
+                let rel = path
+                    .strip_prefix(api_root)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if rel == "mod.rs" || listed.contains(rel.as_str()) {
+                    None
+                } else {
+                    Some(rel)
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collect_rs_files_recurses_subdirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.rs"), "").unwrap();
+        std::fs::write(root.join("note.txt"), "").unwrap();
+        std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        std::fs::write(root.join("sub/mod.rs"), "").unwrap();
+        std::fs::write(root.join("sub/deep/c.rs"), "").unwrap();
+        let names: std::collections::HashSet<String> = collect_rs_files(root)
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(names.contains("a.rs"));
+        assert!(
+            names.contains("sub/mod.rs"),
+            "nested module file must be collected"
+        );
+        assert!(
+            names.contains("sub/deep/c.rs"),
+            "deeply nested file must be collected"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with(".txt")),
+            "non-rs files excluded"
+        );
+        assert_eq!(names.len(), 3);
+    }
+
+    // P3 (#119): the completeness scan must skip already-covered files by their path
+    // RELATIVE to api_root, not by basename. A nested api/<module>/repos.rs is a
+    // distinct source file from the covered top-level repos.rs and must still be
+    // scanned, or a new nested module could smuggle in an ungated repo-scoped handler
+    // behind a colliding filename.
+    #[test]
+    fn unlisted_source_files_scans_nested_file_with_colliding_basename() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("repos.rs"), "").unwrap();
+        std::fs::write(root.join("mod.rs"), "").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/repos.rs"), "").unwrap();
+        std::fs::write(root.join("sub/fresh.rs"), "").unwrap();
+        let listed: std::collections::HashSet<&str> = ["repos.rs"].into_iter().collect();
+
+        let unlisted = unlisted_source_files(root, &listed);
+
+        assert!(
+            unlisted.contains(&"sub/repos.rs".to_string()),
+            "a nested file whose basename matches a listed top-level file must still be scanned"
+        );
+        assert!(
+            unlisted.contains(&"sub/fresh.rs".to_string()),
+            "a nested file with a unique name must be scanned"
+        );
+        assert!(
+            !unlisted.contains(&"repos.rs".to_string()),
+            "the listed top-level file is covered by the per-handler loop"
+        );
+        assert!(
+            !unlisted.contains(&"mod.rs".to_string()),
+            "the top-level guard file is skipped"
+        );
+    }
+
     /// Egress gate guard: every repo-scoped handler (`Path<(String, String..)>`)
     /// must carry an authz marker — a read gate (`authorize_repo_read` /
     /// `visibility_check`), or a write gate (`require_repo_owner` / `require_owner`
@@ -376,19 +488,15 @@ mod authz_guard {
                 "read-guard `sources` lists {f} but the file does not exist"
             );
         }
-        for entry in std::fs::read_dir(api_dir).expect("read src/api") {
-            let path = entry.expect("dir entry").path();
-            let fname = path.file_name().unwrap().to_string_lossy().into_owned();
-            if !fname.ends_with(".rs") || fname == "mod.rs" || listed.contains(fname.as_str()) {
-                continue;
-            }
-            let src = std::fs::read_to_string(&path).expect("read api file");
+        let api_root = std::path::Path::new(api_dir);
+        for rel in unlisted_source_files(api_root, &listed) {
+            let src = std::fs::read_to_string(api_root.join(&rel)).expect("read api file");
             let has_repo_handler = handler_names(&src)
                 .iter()
                 .any(|n| is_repo_scoped(&fn_body(&src, n)));
             assert!(
                 !has_repo_handler,
-                "api/{fname} declares a repo-scoped handler but is not in the egress \
+                "api/{rel} declares a repo-scoped handler but is not in the egress \
                  guard `sources` list — add it so its handlers are gate-checked"
             );
         }
@@ -396,9 +504,6 @@ mod authz_guard {
         // Repo-scoped reads known to be ungated today, each tracked by an issue.
         // Remove an entry the moment its gate lands (the staleness assert enforces it).
         let known_ungated: &[(&str, &str)] = &[
-            // info/refs gates only git-upload-pack today; git-receive-pack
-            // advertisement is ungated until #119 makes the gate unconditional.
-            ("git_info_refs", "#119"),
             ("list_certs", "#120"),
             ("get_cert", "#120"),
             ("list_issues", "#120"),
@@ -407,7 +512,6 @@ mod authz_guard {
             ("list_labels", "#120"),
             ("list_repo_bounties", "#120"),
             ("get_star_status", "#120"),
-            ("list_repo_events", "#94 (PR #113)"),
             ("list_webhooks", "#94 (PR #113)"),
             ("list_replicas", "PR #113"),
             ("list_protected_branches", "PR #113"),

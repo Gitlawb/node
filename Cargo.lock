@@ -3304,6 +3304,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "gitlawb-core",
+ "mockito",
  "reqwest",
  "tracing",
  "tracing-subscriber",
@@ -3419,6 +3420,7 @@ dependencies = [
  "clap",
  "dirs",
  "gitlawb-core",
+ "icaptcha-client",
  "mockito",
  "reqwest",
  "serde",
@@ -3811,6 +3813,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "icaptcha-client"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "gitlawb-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

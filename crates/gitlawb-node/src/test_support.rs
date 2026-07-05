@@ -76,6 +76,8 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         machine_id: None,
         repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+        push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         shutdown_tx: tokio::sync::watch::channel(false).0,
     }
 }
@@ -667,6 +669,436 @@ mod tests {
             json["repos"], 2,
             "stats must count logical repos (mirror+canonical collapsed)"
         );
+    }
+
+    // ── #119: git-info-refs advertisement gate + client signing ──────────────
+
+    /// A1 read-gate bypass + its client remedy. `git_info_refs` serves BOTH the
+    /// `git-upload-pack` (clone/fetch) and `git-receive-pack` (push) ref
+    /// advertisement off one route, but the visibility gate was wrapped in
+    /// `if service == "git-upload-pack"`, so a private repo's ref advertisement
+    /// (branch/tag names + commit tips) leaked to any anonymous caller who asked
+    /// for `?service=git-receive-pack`. The fix gates the advertisement for both
+    /// services. Because the gate now denies an *unauthenticated* advertisement
+    /// of a private repo for both services, `git-remote-gitlawb` signs its
+    /// Phase-1 advertisement GET (over path_and_query) so the owner can still
+    /// fetch and push; this test exercises that exact request with a REAL
+    /// RFC-9421 signature through the production `optional_signature` middleware.
+    ///
+    /// Denied → 404 (`RepoNotFound`, existence-hiding) at the gate, before disk
+    /// access. Allowed → the handler clears the gate and falls through to
+    /// `acquire` + real `git ... --advertise-refs` against a repo absent from the
+    /// test disk, returning 500; that 500 (anything but 404) is the signal the
+    /// caller cleared the gate.
+    #[sqlx::test]
+    async fn git_info_refs_gates_advertisement_for_both_services(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        // Short owner form in the URL so the signed @path and the node's
+        // path_and_query() match byte-for-byte; get_repo's owner LIKE + did_matches
+        // still authorize the full-DID signer as the owner.
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let mut priv_repo = seed_repo(&owner_did, "ir-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+        // A public repo to guard against the unconditional gate accidentally
+        // denying public, anonymous clones.
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "ir-pub"))
+            .await
+            .expect("seed public repo");
+
+        // Production-shaped router: the real optional_signature middleware, so a
+        // signed request is genuinely verified (not the injected-DID shortcut).
+        let router = || {
+            Router::new()
+                .route(
+                    "/{owner}/{repo}/info/refs",
+                    axum::routing::get(crate::api::repos::git_info_refs),
+                )
+                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .with_state(state.clone())
+        };
+        let path = |service: &str| format!("/{short}/ir-priv.git/info/refs?service={service}");
+        let anon = |service: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(path(service))
+                .body(Body::empty())
+                .unwrap()
+        };
+        // The advertisement GET exactly as git-remote-gitlawb now builds it: a
+        // real signature over the path_and_query, empty body.
+        let signed = |service: &str| {
+            let p = path(service);
+            let s = sign_request(&kp, "GET", &p, b"");
+            Request::builder()
+                .method(Method::GET)
+                .uri(&p)
+                .header("content-digest", s.content_digest)
+                .header("signature-input", s.signature_input)
+                .header("signature", s.signature)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Leak fix: anonymous advertisement of a private repo is denied (404) for
+        // BOTH services. Pre-fix the receive-pack case returned 500 (gate skipped).
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let resp = router().oneshot(anon(service)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "anonymous {service} advertisement of a private repo must be denied"
+            );
+        }
+
+        // No-regression: a PUBLIC repo's advertisement stays anonymous for BOTH
+        // services. The gate admits the anonymous caller, so the handler clears it
+        // and 500s on the missing test-disk repo; anything but 404 (a gate denial)
+        // proves the unconditional gate did not accidentally lock out public reads.
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/{short}/ir-pub.git/info/refs?service={service}"))
+                .body(Body::empty())
+                .unwrap();
+            let resp = router().oneshot(req).await.unwrap();
+            // 500 (not just non-404): the gate admits the public anonymous caller,
+            // so the handler reaches acquire + git advertise-refs on the missing
+            // test-disk repo. Pinning the exact 500 rules out a 401/403 regression
+            // masquerading as "not gated".
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "anonymous {service} advertisement of a PUBLIC repo must not be gated"
+            );
+        }
+
+        // Client remedy: the owner's SIGNED advertisement GET clears the gate for
+        // BOTH services (so fetch and push of a private repo keep working). It
+        // 500s on the missing test-disk repo; anything but 404 means cleared.
+        for service in ["git-upload-pack", "git-receive-pack"] {
+            let resp = router().oneshot(signed(service)).await.unwrap();
+            // INTERNAL_SERVER_ERROR specifically: the signature VERIFIED (passed
+            // require_signature, not 401/403) and the owner cleared the read gate
+            // (not 404), so the handler proceeded to acquire + git on a repo absent
+            // from the test disk. Asserting the exact 500 (rather than merely
+            // "not 404") proves the request got PAST auth, not rejected by it.
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the owner's signed {service} advertisement must verify and clear the gate"
+            );
+        }
+    }
+
+    /// Push is signature-gated, not merely owner-gated: an UNSIGNED
+    /// git-receive-pack POST is rejected by `require_signature` (401) before
+    /// reaching `git_receive_pack`. 401 (not the handler's 404/500) is the
+    /// discriminator that proves the request never reached the handler.
+    #[sqlx::test]
+    async fn unsigned_receive_pack_post_is_rejected(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner_did = Keypair::generate().did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "rp-repo"))
+            .await
+            .expect("seed repo");
+
+        // Production wiring: the receive-pack POST sits behind require_signature
+        // (server.rs add_auth_layers); apply that same layer here.
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{short}/rp-repo.git/git-receive-pack"))
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an unsigned receive-pack POST must be rejected by require_signature, \
+             not reach the handler"
+        );
+    }
+
+    /// A1 Phase-2 contract: the `git-upload-pack` POST (the actual fetch, after
+    /// the advertisement) is itself read-visibility gated. An ANONYMOUS upload-pack
+    /// POST against a private repo is denied (404), so signing only the Phase-1
+    /// advertisement GET is NOT enough; `git-remote-gitlawb` must also sign this
+    /// POST, or an owner's fetch of their own private repo clears the advertisement
+    /// and then dies on the pack POST. A real owner signature clears the gate
+    /// (non-404; the missing test-disk repo then errors downstream).
+    #[sqlx::test]
+    async fn git_upload_pack_post_is_read_gated_on_private_repo(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let mut priv_repo = seed_repo(&owner_did, "up-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/{owner}/{repo}/git-upload-pack",
+                    axum::routing::post(crate::api::repos::git_upload_pack),
+                )
+                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .with_state(state.clone())
+        };
+        // A non-empty body (git-remote-gitlawb skips the POST when the body is empty).
+        let body = b"0032want 0000000000000000000000000000000000000000\n".to_vec();
+        let path = format!("/{short}/up-priv.git/git-upload-pack");
+
+        // Anonymous Phase-2 fetch of a private repo: denied at the gate (404). This
+        // is exactly the request git-remote-gitlawb sends today for upload-pack
+        // (the unsigned POST), which is why fetch breaks for the owner.
+        let anon = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/x-git-upload-pack-request")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let resp = router().oneshot(anon).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "an anonymous upload-pack POST against a private repo must be denied"
+        );
+
+        // The same POST signed by the owner clears the read gate (non-404). This is
+        // the request the client must send once it signs the upload-pack POST.
+        let signed = sign_request(&kp, "POST", &path, &body);
+        let signed_req = Request::builder()
+            .method(Method::POST)
+            .uri(&path)
+            .header("content-type", "application/x-git-upload-pack-request")
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router().oneshot(signed_req).await.unwrap();
+        // 500 (not merely non-404): the signature VERIFIED (passed require_signature,
+        // not 401/403) AND the owner cleared the read gate (not 404), so the handler
+        // reached git on the missing test-disk repo. Pinning 500 proves the request
+        // got past auth; a 401 regression would slip through a bare `!= 404`.
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the owner's signed upload-pack POST must verify and clear the read gate"
+        );
+    }
+
+    /// Served-content seam: with a REAL on-disk bare repo (branch
+    /// `topsecret-branch`), the advertisement serves the actual ref names to
+    /// authorized callers and withholds them from denied ones, proving real
+    /// content egress + withholding, not just the gate decision (the other tests
+    /// land on a 500 from a missing-disk repo). Asserts the branch name appears for
+    /// allowed callers and never appears in a denied 404 body.
+    #[sqlx::test]
+    async fn advertisement_serves_real_refs_only_to_authorized_callers(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+        use std::process::Command;
+
+        // repo_store::for_testing fixes the on-disk layout (/tmp/<slug>/<name>.git
+        // and /tmp/gl-seam-src-<short>), so tempfile::TempDir's random paths don't
+        // fit. Wrap each known path in a Drop guard so the dirs are removed even if
+        // an assertion below panics.
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        // repo_store::for_testing uses /tmp; local_path = /tmp/<slug>/<name>.git
+        // with slug = owner_did with ':' and '/' replaced by '_'.
+        let slug = owner_did.replace([':', '/'], "_");
+        let state = test_state(pool).await;
+
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        // Source repo with a recognizable branch + one commit.
+        let src = std::env::temp_dir().join(format!("gl-seam-src-{short}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        let _src_guard = DirGuard(src.clone());
+        run(&["init", "-q", "-b", "topsecret-branch"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        std::fs::write(src.join("f.txt"), b"hi").unwrap();
+        run(&["add", "f.txt"], &src);
+        run(&["commit", "-q", "-m", "seed"], &src);
+
+        // Bare-clone into the exact path repo_store.acquire() will read.
+        let bare_for = |name: &str| {
+            let dir = std::path::PathBuf::from("/tmp")
+                .join(&slug)
+                .join(format!("{name}.git"));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+            let out = Command::new("git")
+                .args([
+                    "clone",
+                    "--bare",
+                    "-q",
+                    src.to_str().unwrap(),
+                    dir.to_str().unwrap(),
+                ])
+                .output()
+                .expect("git clone runs");
+            assert!(
+                out.status.success(),
+                "bare clone failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            dir
+        };
+        let pub_dir = bare_for("served-pub");
+        let _pub_guard = DirGuard(pub_dir.clone());
+        let priv_dir = bare_for("served-priv");
+        let _priv_guard = DirGuard(priv_dir.clone());
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "served-pub"))
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(&owner_did, "served-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/{owner}/{repo}/info/refs",
+                    axum::routing::get(crate::api::repos::git_info_refs),
+                )
+                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .with_state(state.clone())
+        };
+        async fn body_of(resp: axum::response::Response) -> String {
+            let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&b).to_string()
+        }
+
+        // Public repo, anonymous → 200 and the real ref name is served.
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/{short}/served-pub.git/info/refs?service=git-upload-pack"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            body_of(resp).await.contains("topsecret-branch"),
+            "public advertisement must serve the real ref name"
+        );
+
+        // Private repo, anonymous → 404 and the ref name is withheld.
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!(
+                        "/{short}/served-priv.git/info/refs?service=git-upload-pack"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !body_of(resp).await.contains("topsecret-branch"),
+            "a denied 404 must not leak the real ref name"
+        );
+
+        // Private repo, owner's REAL signature → 200 and the real ref is served.
+        let path = format!("/{short}/served-priv.git/info/refs?service=git-upload-pack");
+        let s = sign_request(&kp, "GET", &path, b"");
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&path)
+                    .header("content-digest", s.content_digest)
+                    .header("signature-input", s.signature_input)
+                    .header("signature", s.signature)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the owner's signed request reads the private advertisement"
+        );
+        assert!(
+            body_of(resp).await.contains("topsecret-branch"),
+            "the verified owner gets the real ref name"
+        );
+
+        // Cleanup runs via the DirGuard Drop impls above, on success or panic.
     }
 
     // ── #97: repo-listing surfaces are visibility-gated ──────────────────────

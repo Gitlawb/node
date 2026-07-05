@@ -211,7 +211,12 @@ pub async fn create_repo(
         .repo_store
         .init(&owner_did, &req.name)
         .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .map_err(|e| {
+            // `{:#}` walks the anyhow chain to the leaf cause; the other git
+            // handlers log their failures, this one didn't.
+            tracing::error!(owner = %owner_did, repo = %req.name, err = %format!("{e:#}"), "repo create failed");
+            AppError::Git(e.to_string())
+        })?;
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {
@@ -482,11 +487,13 @@ pub async fn get_tree(
 
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
 
-/// GET /:owner/:repo.git/info/refs?service=git-upload-pack
+/// GET /:owner/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
 pub async fn git_info_refs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<InfoRefsQuery>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
@@ -508,10 +515,14 @@ pub async fn git_info_refs(
         .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
     tracing::debug!(service = %service, repo = %name, "info/refs service");
 
-    // Enforce read (clone/fetch) visibility. The push advertisement
-    // (service=git-receive-pack) is authorized separately on the
-    // git-receive-pack POST, so leave it untouched here.
-    if service == "git-upload-pack" {
+    // Enforce read visibility on the ref advertisement, for BOTH services. The
+    // upload-pack (clone/fetch) and receive-pack (push) advertisements expose the
+    // same ref metadata (branch/tag names and commit tips), so a private repo's
+    // advertisement must be withheld from a non-reader regardless of which service
+    // is requested. The push itself stays separately owner-gated on the
+    // git-receive-pack POST; push access implies read access here, so a
+    // legitimate pusher (the owner) always clears this gate.
+    {
         let rules = state.db.list_visibility_rules(&record.id).await?;
         let caller = auth.as_ref().map(|e| e.0 .0.as_str());
         // Subtree (mode B) rules do not gate the advertisement: refs expose commit
@@ -519,8 +530,25 @@ pub async fn git_info_refs(
         if visibility_check(&rules, record.is_public, &record.owner_did, caller, "/")
             == Decision::Deny
         {
-            tracing::debug!(repo = %name, caller = ?caller, "info/refs read denied by visibility");
+            tracing::debug!(repo = %name, caller = ?caller, service = %service, "info/refs read denied by visibility");
             return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+        }
+    }
+
+    // Push flood brake on the advertisement phase. A push always hits this
+    // GET first, and for receive-pack it forces a fresh Tigris download below;
+    // throttling only the receive-pack POST would leave the expensive
+    // fresh-acquire reachable unauthenticated and unlimited. Applied before the
+    // acquire so a rejected request does no Tigris work. Same per-IP limiter and
+    // trusted-proxy policy as the POST middleware (shared buckets).
+    if service == "git-receive-pack" {
+        if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
+            if !state.push_rate_limiter.check(&key).await {
+                tracing::warn!(repo = %name, key = %key, "receive-pack advertisement rate limited");
+                return Err(AppError::TooManyRequests(
+                    "push rate limit exceeded — try again later".into(),
+                ));
+            }
         }
     }
 
@@ -1205,17 +1233,26 @@ pub async fn git_receive_pack(
             }
 
             // Broadcast ref update to GraphQL subscription listeners — one per ref.
+            // Gated on `announce`: /graphql/ws is unauthenticated (mounted after
+            // the optional_signature layer), and the subscription resolver has no
+            // caller to gate against, so only publicly-readable ref updates may
+            // reach anonymous subscribers. Mirrors the gossip (above) and Arweave
+            // (below) sends, which are already `announce`-gated. Without this a
+            // private-repo push would leak live ref metadata over the socket —
+            // the subscription analog of #112/#114.
             let now_ts = chrono::Utc::now().to_rfc3339();
-            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
-                    repo: repo_slug.clone(),
-                    ref_name: ref_name.clone(),
-                    old_sha: old_sha.clone(),
-                    new_sha: new_sha.clone(),
-                    pusher_did: pusher_did_clone.clone(),
-                    node_did: node_did_str.clone(),
-                    timestamp: now_ts.clone(),
-                });
+            if announce {
+                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                    let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
+                        repo: repo_slug.clone(),
+                        ref_name: ref_name.clone(),
+                        old_sha: old_sha.clone(),
+                        new_sha: new_sha.clone(),
+                        pusher_did: pusher_did_clone.clone(),
+                        node_did: node_did_str.clone(),
+                        timestamp: now_ts.clone(),
+                    });
+                }
             }
 
             // Arweave permanent anchoring — fire for each ref update.
@@ -1773,6 +1810,32 @@ mod tests {
             forked_from: None,
             machine_id: None,
         }
+    }
+
+    /// `announce` is the single boolean that gates every network-facing emission
+    /// of a push: gossip, Arweave anchoring, and the GraphQL subscription
+    /// broadcast (the last one added in this change). It must be false for a repo
+    /// the anonymous public cannot read, or the unauthenticated `/graphql/ws`
+    /// subscription leaks live private-repo ref metadata. Pin both directions of
+    /// the decision the broadcast now sits behind. No disk access: a non-announce
+    /// repo returns early, and a public repo with no path-scoped rule skips the
+    /// withheld walk.
+    #[tokio::test]
+    async fn replication_announce_false_for_private_true_for_public() {
+        let dummy = std::path::PathBuf::from("/nonexistent");
+
+        // Private: no rules at all.
+        let (announce, _) = replication_withheld_set(None, OWNER_DID, false, dummy.clone()).await;
+        assert!(!announce, "private repo (no rules) must not announce");
+
+        // Private: empty rule set, is_public=false → still not listable at root.
+        let (announce, _) =
+            replication_withheld_set(Some(vec![]), OWNER_DID, false, dummy.clone()).await;
+        assert!(!announce, "private repo (empty rules) must not announce");
+
+        // Public: empty rule set, is_public=true → listable at root, announces.
+        let (announce, _) = replication_withheld_set(Some(vec![]), OWNER_DID, true, dummy).await;
+        assert!(announce, "public repo must announce");
     }
 
     /// A rejection must be a 403 Forbidden (authenticated but not authorized),
@@ -2384,6 +2447,51 @@ mod tests {
                 .contains("/did:gitlawb:z6Mkwbud/other-repo.git"),
             "clone_url should preserve the full non-key owner DID. got: {}",
             response_non_key.clone_url
+        );
+    }
+
+    /// The receive-pack *advertisement* (`GET info/refs?service=git-receive-pack`)
+    /// must be throttled by the per-IP push limiter BEFORE it does the fresh
+    /// Tigris acquire — otherwise the flood brake on the POST is bypassable via
+    /// the cheaper unauthenticated GET (PR #152 review P1). Pre-filling the
+    /// bucket makes the assertion deterministic and keeps the test off the
+    /// acquire path entirely.
+    #[sqlx::test]
+    async fn receive_pack_advertisement_is_rate_limited(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Tiny limit, keyed on the socket peer (no trusted proxy).
+        state.push_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6advowner", "adv", "/tmp/adv", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.55:6000".parse().unwrap();
+        // Exhaust this peer's single-request budget up front.
+        assert!(state.push_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advowner/adv/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let status = router.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "receive-pack advertisement must be throttled before the Tigris acquire"
         );
     }
 }

@@ -52,7 +52,7 @@ pub async fn info_refs(repo_path: &Path, service: &str) -> Result<Response> {
 /// Serves pack data for a clone or fetch. This is stateless — the entire
 /// negotiation happens in a single request/response.
 pub async fn upload_pack(repo_path: &Path, request_body: Bytes) -> Result<Response> {
-    let output = run_git_service("git-upload-pack", repo_path, request_body).await?;
+    let output = run_git_service("git", "git-upload-pack", repo_path, request_body).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -66,7 +66,7 @@ pub async fn upload_pack(repo_path: &Path, request_body: Bytes) -> Result<Respon
 /// Accepts a push. The caller MUST verify HTTP Signature auth before
 /// calling this function.
 pub async fn receive_pack(repo_path: &Path, request_body: Bytes) -> Result<Response> {
-    let output = run_git_service("git-receive-pack", repo_path, request_body).await?;
+    let output = run_git_service("git", "git-receive-pack", repo_path, request_body).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -112,8 +112,19 @@ impl Drop for KillGroupOnDrop {
     }
 }
 
-async fn run_git_service(service: &str, repo_path: &Path, input: Bytes) -> Result<Vec<u8>> {
-    let mut command = Command::new("git");
+/// Run a stateless-rpc git service and return its stdout.
+///
+/// `git_bin` is the git executable to spawn; production callers pass `"git"`
+/// (resolved via `PATH`). It is injectable purely so the process-group teardown
+/// wiring (`process_group(0)` + [`KillGroupOnDrop`]) can be driven end-to-end by
+/// a fake `git` in tests without mutating the process-global `PATH`.
+async fn run_git_service(
+    git_bin: &str,
+    service: &str,
+    repo_path: &Path,
+    input: Bytes,
+) -> Result<Vec<u8>> {
+    let mut command = Command::new(git_bin);
     command
         .arg(service_to_command(service))
         .arg("--stateless-rpc")
@@ -875,5 +886,215 @@ mod tests {
         // Clean up the still-running child.
         let _ = child.kill().await;
         let _ = child.wait().await;
+    }
+
+    // ── #62 PR1: end-to-end teardown wiring through run_git_service ─────────
+    //
+    // The kill_group_guard_* tests above build a KillGroupOnDrop by hand and
+    // never call run_git_service, so deleting `process_group(0)` (spawn site) or
+    // the guard-arming, or the post-reap disarm, would leave them green. These
+    // drive the REAL run_git_service via an injected fake `git` (the `git_bin`
+    // seam) and assert the production spawn path actually wires the teardown up.
+    // Faithful to the real invocation: run_git_service spawns
+    // `<git_bin> <cmd> --stateless-rpc <repo_path>` in its own process group.
+
+    /// SIGKILLs the given pids on drop (ignoring all kill errors, e.g. ESRCH for
+    /// an already-dead pid) so a panicking assertion can't leak the fake `git` or
+    /// its grandchild onto the test runner.
+    #[cfg(unix)]
+    struct ReapOnPanic(Vec<i32>);
+
+    #[cfg(unix)]
+    impl Drop for ReapOnPanic {
+        fn drop(&mut self) {
+            for &pid in &self.0 {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// Write an executable fake `git` (named `git`) into `dir`; return its path.
+    #[cfg(unix)]
+    fn write_fake_git(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("git");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Read a two-line `leader\ngrandchild` pidfile once both lines are present.
+    #[cfg(unix)]
+    fn read_two_pids(pidfile: &std::path::Path) -> Option<(i32, i32)> {
+        let s = std::fs::read_to_string(pidfile).ok()?;
+        let mut lines = s.lines();
+        let leader: i32 = lines.next()?.trim().parse().ok()?;
+        let grandchild: i32 = lines.next()?.trim().parse().ok()?;
+        Some((leader, grandchild))
+    }
+
+    // Dropping the request future mid-flight (client disconnect) must SIGTERM the
+    // whole group so git AND its pack-objects grandchild die together. Goes RED
+    // if `process_group(0)` or the guard-arming is removed: without its own
+    // group, kill(-pgid) hits no group and the grandchild survives.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_service_tears_down_group_when_future_dropped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("pids");
+        // Fork a grandchild (stands in for pack-objects), record leader+grandchild
+        // pids, then hang so run_git_service parks in wait_with_output.
+        let body = format!(
+            "#!/bin/sh\nsleep 300 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"{}\"\nwait\n",
+            pidfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let mut fut = Box::pin(run_git_service(
+            git_bin.to_str().unwrap(),
+            "git-upload-pack",
+            tmp.path(),
+            Bytes::new(),
+        ));
+
+        // Advance the future until the fake has spawned its grandchild.
+        let mut pids = None;
+        for _ in 0..500 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = read_two_pids(&pidfile) {
+                pids = Some(p);
+                break;
+            }
+        }
+        // Dropping the future (below or on the None arm) makes tokio reap the
+        // fake leader itself, so only the grandchild needs panic-cleanup —
+        // carrying the already-reaped leader pid risks SIGKILLing a recycled pid
+        // under parallel test load.
+        let (_leader, grandchild) = match pids {
+            Some(p) => p,
+            // Drop the still-armed future first so its guard reaps the fake
+            // group, then fail — otherwise a spawn hiccup orphans the processes.
+            None => {
+                drop(fut);
+                panic!("fake git should spawn a grandchild and write its pids");
+            }
+        };
+        let _cleanup = ReapOnPanic(vec![grandchild]);
+        assert!(
+            alive(grandchild),
+            "grandchild should be running before the drop"
+        );
+
+        // Client disconnect: drop the request future. The armed KillGroupOnDrop
+        // must SIGTERM the whole group.
+        drop(fut);
+
+        let mut gone = false;
+        for _ in 0..500 {
+            if !alive(grandchild) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            gone,
+            "grandchild must be torn down via the process group on future-drop \
+             (proves run_git_service sets process_group(0) and arms the guard)"
+        );
+    }
+
+    // A request that runs to completion must DISARM the guard after reaping, so
+    // no stray group SIGTERM fires. The fake exits non-zero (surfacing as Err)
+    // but leaves a grandchild alive; the grandchild must survive. Goes RED if the
+    // post-reap disarm is removed: the guard would then fire on return and, since
+    // the grandchild still holds the group open, sweep it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_service_disarms_on_completion_leaving_group_alive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("pids");
+        // The grandchild is long-lived with stdio redirected to /dev/null:
+        // /dev/null so it doesn't inherit (and hold open) run_git_service's stdout
+        // pipe (which would block wait_with_output until it exits); long-lived so
+        // the "still alive" assertion below can't race the sleep exiting on its own
+        // under a starved scheduler. ReapOnPanic cleans it up.
+        let body = format!(
+            "#!/bin/sh\nsleep 300 >/dev/null 2>&1 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"{}\"\nexit 1\n",
+            pidfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let result = run_git_service(
+            git_bin.to_str().unwrap(),
+            "git-upload-pack",
+            tmp.path(),
+            Bytes::new(),
+        )
+        .await;
+
+        // wait_with_output already reaped the fake leader, so only the grandchild
+        // needs panic-cleanup — SIGKILLing the reaped leader pid could hit a
+        // recycled pid under parallel test load.
+        let (_leader, grandchild) =
+            read_two_pids(&pidfile).expect("fake git should have written its pids");
+        let _cleanup = ReapOnPanic(vec![grandchild]);
+
+        assert!(result.is_err(), "non-zero git exit must surface as Err");
+        // A mutant that left the guard armed fires SIGTERM on return; poll a short
+        // window so a killed grandchild is reliably observed dead — a single
+        // alive() check can race the SIGTERM+reap and miss it.
+        for _ in 0..30 {
+            assert!(
+                alive(grandchild),
+                "grandchild must survive: run_git_service must disarm the guard after \
+                 reaping, not fire a group SIGTERM on the completion path"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    // The SUCCESS path (exit 0, Ok) must disarm too — the disarm test above only
+    // exercises the exit-1/Err branch. Goes RED if disarm is gated on failure
+    // (e.g. moved inside the `!status.success()` branch): the guard would then
+    // fire after a clean completion and sweep the still-live grandchild.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_service_disarms_on_success_leaving_group_alive() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("pids");
+        // Long-lived, stdio to /dev/null (same reasons as the exit-1 test).
+        let body = format!(
+            "#!/bin/sh\nsleep 300 >/dev/null 2>&1 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"{}\"\nexit 0\n",
+            pidfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let result = run_git_service(
+            git_bin.to_str().unwrap(),
+            "git-upload-pack",
+            tmp.path(),
+            Bytes::new(),
+        )
+        .await;
+
+        let (_leader, grandchild) =
+            read_two_pids(&pidfile).expect("fake git should have written its pids");
+        let _cleanup = ReapOnPanic(vec![grandchild]);
+
+        assert!(result.is_ok(), "zero-exit git must surface as Ok");
+        // Poll a short window (see the exit-1 test): a mutant that disarms only on
+        // failure fires the guard on this success path, and a single alive() check
+        // can race the SIGTERM+reap.
+        for _ in 0..30 {
+            assert!(
+                alive(grandchild),
+                "grandchild must survive: run_git_service must disarm on the success \
+                 path too, not fire a group SIGTERM after a clean completion"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }

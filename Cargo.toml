@@ -6,6 +6,7 @@ members = [
     "crates/gl",
     "crates/git-remote-gitlawb",
     "crates/gitlawb-attest",
+    "crates/icaptcha-client",
 ]
 
 [workspace.package]

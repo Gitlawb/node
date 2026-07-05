@@ -58,6 +58,12 @@ services:
       GITLAWB_P2P_PORT: "${p2p_port}"
       GITLAWB_REPOS_DIR: /data/repos
       GITLAWB_KEY: /data/keys/identity.pem
+      # Only trust X-Forwarded-For when the Caddy sidecar above is actually
+      # deployed (domain_name != ""). Caddy appends the real client as the
+      # rightmost hop, letting the push rate limiter key on the true client IP
+      # rather than Caddy's container address. Without Caddy, this header is
+      # fully client-controlled and must not be trusted.
+      GITLAWB_TRUSTED_PROXY: "${domain_name != "" ? "x-forwarded-for" : ""}"
       # iCaptcha proof-of-intelligence gate (spam protection on create/fork/register)
       ICAPTCHA_MODE: ${icaptcha_mode}
       ICAPTCHA_PUBKEY: ${icaptcha_pubkey}

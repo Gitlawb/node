@@ -208,20 +208,16 @@ pub async fn run(args: RepoArgs) -> Result<()> {
 }
 
 /// Derive the short DID key segment from a keypair, or fall back to the node's DID.
-async fn resolve_owner_did(node: &str, dir: Option<&std::path::Path>) -> Result<String> {
-    if let Ok(kp) = load_keypair_from_dir(dir) {
-        let did = kp.did().to_string();
-        return Ok(did.split(':').next_back().unwrap_or(&did).to_string());
-    }
-    let client = NodeClient::new(node, None);
-    let info: Value = client
-        .get("/")
-        .await?
-        .json()
-        .await
-        .context("failed to fetch node info")?;
-    let did = info["did"].as_str().context("node missing DID")?;
-    Ok(did.split(':').next_back().unwrap_or(did).to_string())
+/// Resolve the owner short-DID for a bare repo name from the LOCAL identity.
+/// Never falls back to the node's own DID (that produced bogus "owned by the
+/// node" results for repos that don't exist) — if there's no local identity the
+/// caller must pass an explicit `owner/name`.
+async fn resolve_owner_did(_node: &str, dir: Option<&std::path::Path>) -> Result<String> {
+    let kp = load_keypair_from_dir(dir).context(
+        "no local identity to resolve the repo owner — pass `owner/name`, or run `gl identity new`",
+    )?;
+    let did = kp.did().to_string();
+    Ok(did.split(':').next_back().unwrap_or(&did).to_string())
 }
 
 async fn cmd_create(
@@ -306,25 +302,28 @@ async fn cmd_list(node: String, dir: Option<PathBuf>) -> Result<()> {
 }
 
 async fn cmd_clone(name: String, node: String, dir: Option<PathBuf>) -> Result<()> {
-    let did = if let Ok(kp) = load_keypair_from_dir(dir.as_deref()) {
-        kp.did().to_string()
+    // Owner is taken from an explicit `owner/name`, else the LOCAL identity —
+    // never the node's own DID. A missing repo then surfaces as the helper's
+    // clear 404 rather than a clone under an invented owner.
+    let (did, repo_name) = if let Some((owner, rest)) = name.split_once('/') {
+        (owner.to_string(), rest.to_string())
     } else {
-        let client = NodeClient::new(&node, None);
-        let info: Value = client.get("/").await?.json().await?;
-        info["did"]
-            .as_str()
-            .context("node missing DID")?
-            .to_string()
+        // Bare name: derive the SHORT owner key via the same helper the other
+        // commands use, so the URL is `gitlawb://z6Mk.../name` — not the full
+        // `did:key:z6Mk...` form, whose colons in the authority break the helper.
+        (resolve_owner_did(&node, dir.as_deref()).await?, name)
     };
-    let url = format!("gitlawb://{did}/{name}");
+    let url = format!("gitlawb://{did}/{repo_name}");
     println!("  cloning {url}");
     let status = std::process::Command::new("git")
         .arg("clone")
         .arg(&url)
+        // Point the remote helper at the same node the user selected.
+        .env("GITLAWB_NODE", &node)
         .status()
         .context("failed to run git clone — is git installed?")?;
     if !status.success() {
-        anyhow::bail!("git clone failed");
+        anyhow::bail!("git clone failed — does the repo exist on this node?");
     }
     Ok(())
 }
@@ -340,12 +339,24 @@ async fn cmd_info(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         (short, repo)
     };
 
-    let r: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{name}"))
-        .await?
-        .json()
-        .await
-        .context("repo not found")?;
+    let resp = client.get(&format!("/api/v1/repos/{owner}/{name}")).await?;
+    // A non-existent (or unreadable/quarantined) repo is a real 404 from the
+    // node — surface it plainly instead of printing a stub card with `?` fields
+    // and a placeholder owner DID.
+    if !resp.status().is_success() {
+        if resp.status().as_u16() == 404 {
+            anyhow::bail!("repository '{owner}/{name}' not found");
+        }
+        let status = resp.status();
+        let msg = resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v["message"].as_str().map(String::from))
+            .unwrap_or_else(|| "request failed".to_string());
+        anyhow::bail!("repo info failed ({status}): {msg}");
+    }
+    let r: Value = resp.json().await.context("parse repo info")?;
 
     let owner_did = r["owner_did"].as_str().unwrap_or(&owner);
     let gitlawb_url = format!("gitlawb://{owner_did}/{name}");
