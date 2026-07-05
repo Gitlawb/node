@@ -26,11 +26,18 @@ pub struct RateLimiter {
     state: Arc<Mutex<HashMap<String, Window>>>,
     max_requests: usize,
     window: Duration,
-    /// Hard cap on tracked keys. When full, expired keys are evicted inline;
-    /// if still full, a request under a *new* key is rejected rather than
-    /// inserted — so the map can never exceed this bound and a rejected
-    /// request never allocates a new entry.
+    /// Hard cap on tracked keys. When full, expired keys are evicted (at most
+    /// once per [`sweep_interval`](Self::sweep_interval), see below); if still
+    /// full, a request under a *new* key is rejected rather than inserted — so
+    /// the map can never exceed this bound and a rejected request never
+    /// allocates a new entry.
     max_keys: usize,
+    /// Timestamp of the last inline capacity sweep. The eviction scan is
+    /// O(max_keys), so under a distinct-key flood (when the map sits at the
+    /// cap) running it on every miss would serialize all traffic behind a full
+    /// scan. Gating it to at most once per interval amortizes that cost; the
+    /// background [`cleanup`](Self::cleanup) loop still reclaims on its own.
+    last_sweep: Arc<Mutex<Instant>>,
 }
 
 impl RateLimiter {
@@ -51,7 +58,16 @@ impl RateLimiter {
             max_requests,
             window,
             max_keys: max_keys.max(1),
+            last_sweep: Arc::new(Mutex::new(Instant::now())),
         }
+    }
+
+    /// How often the inline capacity sweep may run: at most once per second, or
+    /// once per window when the window is shorter. Bounds post-flood staleness
+    /// (a full map self-heals within one interval) without paying the O(max_keys)
+    /// scan on every capacity miss.
+    fn sweep_interval(&self) -> Duration {
+        self.window.min(Duration::from_secs(1))
     }
 
     pub(crate) async fn check(&self, key: &str) -> bool {
@@ -78,11 +94,20 @@ impl RateLimiter {
         // New key. Enforce the cap BEFORE inserting so a flood of distinct keys
         // cannot grow the map, and a rejected request never allocates an entry.
         if state.len() >= self.max_keys {
-            state.retain(|_, w| {
-                w.timestamps
-                    .retain(|t| now.duration_since(*t) < self.window);
-                !w.timestamps.is_empty()
-            });
+            // Reclaim expired keys, but at most once per sweep interval — the
+            // scan is O(max_keys) and the map sits at the cap precisely during a
+            // distinct-key flood, so sweeping per miss would serialize traffic
+            // behind a full scan. Between sweeps a new key is simply rejected.
+            let mut last_sweep = self.last_sweep.lock().await;
+            if now.duration_since(*last_sweep) >= self.sweep_interval() {
+                state.retain(|_, w| {
+                    w.timestamps
+                        .retain(|t| now.duration_since(*t) < self.window);
+                    !w.timestamps.is_empty()
+                });
+                *last_sweep = now;
+            }
+            drop(last_sweep);
             if state.len() >= self.max_keys {
                 return false;
             }
@@ -347,6 +372,25 @@ mod tests {
         let state = limiter.state.lock().await;
         assert!(state.contains_key("new"));
         assert!(!state.contains_key("old"));
+    }
+
+    #[tokio::test]
+    async fn capacity_sweep_is_amortized_within_interval() {
+        // The O(max_keys) eviction scan must not run on every capacity miss.
+        // With a 1s sweep interval, the resident (unexpired) key is never
+        // evicted by a burst of misses, so repeated new keys are all rejected
+        // without disturbing existing state.
+        let limiter = RateLimiter::new_bounded(100, Duration::from_secs(1), 1);
+        assert!(limiter.check("resident").await);
+        for i in 0..100 {
+            assert!(
+                !limiter.check(&format!("flood-{i}")).await,
+                "new key must be rejected while the single slot is held"
+            );
+        }
+        let state = limiter.state.lock().await;
+        assert_eq!(state.len(), 1, "no flood key was ever inserted");
+        assert!(state.contains_key("resident"));
     }
 
     // ── client_key / trusted-proxy resolution (P1 + P2) ─────────────────
