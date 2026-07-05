@@ -185,6 +185,45 @@ git clone gitlawb://did:key:z6Mk.../my-repo
 
 For public-network use, make sure `GITLAWB_NODE` points to the node you want. The helper defaults to localhost for local development.
 
+### Full lifecycle against an iCaptcha-enforcing node
+
+Public nodes (e.g. `node.gitlawb.com`) require two things on writes:
+
+1. **RFC 9421 HTTP Signatures** — every write is signed by your identity key. `gl`
+   and the `git-remote-gitlawb` helper do this automatically. An old/unsigned CLI
+   fails with `401 not_an_agent`; `gl` will tell you to upgrade and register.
+2. **An iCaptcha proof** on the spam-gated writes (**repo create, fork, register**).
+   `gl` solves this for you: on the node's `403 icaptcha_proof_required` it reads the
+   `x-icaptcha-url` / `x-icaptcha-level` hints, requests a challenge, solves it
+   locally (arithmetic / algebra / sequence), and **retries the same signed request**
+   with the `x-icaptcha-proof` header — no manual steps, no env vars.
+
+```bash
+gl identity new                                   # create did:key identity
+gl register      --node https://node.gitlawb.com  # signed + auto-solves iCaptcha
+gl repo create memlawb --node https://node.gitlawb.com   # signed + auto-solves iCaptcha
+git push  origin2 main                            # origin2 = gitlawb://<your-did>/memlawb (signed)
+git clone gitlawb://<your-did>/memlawb            # public read, no proof needed
+gl doctor                                         # preflight: identity, node, version, iCaptcha
+```
+
+Notes:
+
+- **`requesterId` is always your DID.** The proof's `sub` claim must equal the
+  authenticated signer; `gl`/helper set this automatically and the node enforces
+  `sub == authenticated DID` (so a proof minted for another identity is rejected).
+- **Proofs are short-lived (~5 min TTL) and single-use.** If one expires between
+  solving and use, the client transparently solves a fresh one and retries.
+- **What needs what:** create / fork / register are signed **and** iCaptcha-gated;
+  `git push` is **signed-only** (owner signature is the gate — no per-push challenge);
+  reads (clone / fetch / `repo info`) need no proof. A non-existent repo returns a
+  clear `404`, never a placeholder.
+- **API-key iCaptcha deployments:** set `GITLAWB_ICAPTCHA_URL` to your iCaptcha
+  origin and `GITLAWB_ICAPTCHA_API_KEY` to its key. The client only talks to an
+  `https` origin whose host is allowlisted (that URL or the public default), and
+  sends the bearer token **only** to your configured origin — never to a URL a
+  node advertises — so a hostile node can't capture the key or redirect the solve.
+
 ---
 
 ## Architecture

@@ -174,6 +174,19 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
                 "node",
                 format!("{} — v{version} ({short_did}…)", args.node),
             ));
+            // Capability drift: a node newer than this CLI may require features
+            // (RFC 9421 signing, iCaptcha) the CLI doesn't speak.
+            let gl_ver = env!("CARGO_PKG_VERSION");
+            if version != "?" && is_newer(version, gl_ver) {
+                checks.push(Check::warn(
+                    "gl version",
+                    format!(
+                        "node is v{version} but gl is v{gl_ver} — your CLI may be missing \
+                         features (signing / iCaptcha) this node requires"
+                    ),
+                    "upgrade gl: curl -sSf https://gitlawb.com/install.sh | sh",
+                ));
+            }
         }
         Ok(resp) => {
             checks.push(Check::fail(
@@ -187,6 +200,31 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
                 "node",
                 format!("{} unreachable: {e}", args.node),
                 "check your internet connection or set GITLAWB_NODE",
+            ));
+        }
+    }
+
+    // ── 4b. iCaptcha capability ───────────────────────────────────────────
+    // Gated writes (repo create / register / fork) auto-solve a challenge at the
+    // iCaptcha service; check it's reachable so the failure mode is obvious.
+    let icaptcha_url = std::env::var("GITLAWB_ICAPTCHA_URL")
+        .unwrap_or_else(|_| icaptcha_client::DEFAULT_URL.to_string());
+    match NodeClient::new(&icaptcha_url, None).get("/v1/pubkey").await {
+        Ok(resp) if resp.status().is_success() => {
+            checks.push(Check::pass("iCaptcha", format!("{icaptcha_url} reachable")));
+        }
+        Ok(resp) => {
+            checks.push(Check::warn(
+                "iCaptcha",
+                format!("{icaptcha_url} returned HTTP {}", resp.status()),
+                "gated writes (repo create / register) may fail until iCaptcha is reachable",
+            ));
+        }
+        Err(e) => {
+            checks.push(Check::warn(
+                "iCaptcha",
+                format!("{icaptcha_url} unreachable: {e}"),
+                "set GITLAWB_ICAPTCHA_URL or check connectivity — repo create / register solve a challenge there",
             ));
         }
     }
