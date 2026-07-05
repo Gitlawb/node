@@ -218,8 +218,11 @@ Notes:
   `git push` is **signed-only** (owner signature is the gate — no per-push challenge);
   reads (clone / fetch / `repo info`) need no proof. A non-existent repo returns a
   clear `404`, never a placeholder.
-- **API-key iCaptcha deployments:** set `GITLAWB_ICAPTCHA_API_KEY` and the client
-  sends it as a bearer token to the iCaptcha service.
+- **API-key iCaptcha deployments:** set `GITLAWB_ICAPTCHA_URL` to your iCaptcha
+  origin and `GITLAWB_ICAPTCHA_API_KEY` to its key. The client only talks to an
+  `https` origin whose host is allowlisted (that URL or the public default), and
+  sends the bearer token **only** to your configured origin — never to a URL a
+  node advertises — so a hostile node can't capture the key or redirect the solve.
 
 ---
 

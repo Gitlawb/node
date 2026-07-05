@@ -308,10 +308,10 @@ async fn cmd_clone(name: String, node: String, dir: Option<PathBuf>) -> Result<(
     let (did, repo_name) = if let Some((owner, rest)) = name.split_once('/') {
         (owner.to_string(), rest.to_string())
     } else {
-        let kp = load_keypair_from_dir(dir.as_deref()).context(
-            "no local identity to resolve the repo owner — pass `owner/name`, or run `gl identity new`",
-        )?;
-        (kp.did().to_string(), name)
+        // Bare name: derive the SHORT owner key via the same helper the other
+        // commands use, so the URL is `gitlawb://z6Mk.../name` — not the full
+        // `did:key:z6Mk...` form, whose colons in the authority break the helper.
+        (resolve_owner_did(&node, dir.as_deref()).await?, name)
     };
     let url = format!("gitlawb://{did}/{repo_name}");
     println!("  cloning {url}");
