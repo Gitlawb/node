@@ -211,7 +211,12 @@ pub async fn create_repo(
         .repo_store
         .init(&owner_did, &req.name)
         .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .map_err(|e| {
+            // `{:#}` walks the anyhow chain to the leaf cause; the other git
+            // handlers log their failures, this one didn't.
+            tracing::error!(owner = %owner_did, repo = %req.name, err = %format!("{e:#}"), "repo create failed");
+            AppError::Git(e.to_string())
+        })?;
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {
