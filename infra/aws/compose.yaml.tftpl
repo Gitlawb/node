@@ -58,6 +58,10 @@ services:
       GITLAWB_P2P_PORT: "${p2p_port}"
       GITLAWB_REPOS_DIR: /data/repos
       GITLAWB_KEY: /data/keys/identity.pem
+      # Behind the Caddy reverse-proxy sidecar, which appends the real client as
+      # the rightmost X-Forwarded-For hop. Lets the push rate limiter key on the
+      # true client IP rather than Caddy's container address.
+      GITLAWB_TRUSTED_PROXY: x-forwarded-for
       # iCaptcha proof-of-intelligence gate (spam protection on create/fork/register)
       ICAPTCHA_MODE: ${icaptcha_mode}
       ICAPTCHA_PUBKEY: ${icaptcha_pubkey}

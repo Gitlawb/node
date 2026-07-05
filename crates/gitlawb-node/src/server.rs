@@ -179,7 +179,10 @@ pub fn build_router(state: AppState) -> Router {
     // traffic is rejected before signature verification burns CPU. Per-DID
     // limiting is deliberately NOT used here — a DID farm (one throwaway
     // identity per repo, as in the June 2026 push flood) never trips it.
-    let push_limiter = rate_limit::IpRateLimiter(state.push_rate_limiter.clone());
+    let push_limiter = rate_limit::IpRateLimiter {
+        limiter: state.push_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
     let git_write_routes = add_auth_layers(
         Router::new()
             .route(

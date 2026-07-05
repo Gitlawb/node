@@ -182,21 +182,36 @@ async fn main() -> Result<()> {
     let repo_store =
         git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
 
-    let rate_limiter = rate_limit::RateLimiter::new(10, std::time::Duration::from_secs(3600));
+    // Per-DID limiter for the creation endpoints. Keyed on the authenticated
+    // DID (attacker-varied), so bound its key set to cap memory.
+    let rate_limiter =
+        rate_limit::RateLimiter::new_bounded(10, std::time::Duration::from_secs(3600), 200_000);
 
     // Push-path flood brake: max git-receive-pack requests per client IP per
-    // hour. Sized for heavy agent automation (600/h = 10/min sustained) while
-    // still stopping flood traffic (the June 2026 attack pushed several times
-    // per second per IP). GITLAWB_PUSH_RATE_LIMIT overrides; 0 disables.
+    // hour (counts both the info/refs advertisement and the push POST). Sized
+    // for heavy agent automation while still stopping flood traffic (the June
+    // 2026 attack pushed several times per second per IP). GITLAWB_PUSH_RATE_LIMIT
+    // overrides; 0 disables. Bounded key set — the key is a client-influenced IP.
     let push_limit = std::env::var("GITLAWB_PUSH_RATE_LIMIT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(600);
-    let push_rate_limiter =
-        rate_limit::RateLimiter::new(push_limit, std::time::Duration::from_secs(3600));
+    let push_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        push_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
     if push_limit == 0 {
         tracing::warn!("GITLAWB_PUSH_RATE_LIMIT=0 — per-IP push rate limiting disabled");
     }
+
+    // Which forwarded header the edge is trusted to set. Default None (trust
+    // nothing, key on the socket peer). Fly nodes set GITLAWB_TRUSTED_PROXY=fly;
+    // a node behind Caddy/NGINX sets it to x-forwarded-for.
+    let push_limiter_trust = rate_limit::TrustedProxy::from_env_value(
+        &std::env::var("GITLAWB_TRUSTED_PROXY").unwrap_or_default(),
+    );
+    tracing::info!(trust = ?push_limiter_trust, push_limit, "push rate limiter configured");
 
     // Initialize the iCaptcha proof gate (inert unless ICAPTCHA_MODE is set).
     icaptcha::init().await;
@@ -215,6 +230,7 @@ async fn main() -> Result<()> {
         repo_store,
         rate_limiter,
         push_rate_limiter,
+        push_limiter_trust,
         shutdown_tx: shutdown_tx.clone(),
     };
 
@@ -408,19 +424,25 @@ async fn main() -> Result<()> {
     let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
 
-    let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            let mut rx = shutdown_signal_for_axum;
-            // Wait until the watcher flips to true, then return so axum
-            // can begin draining.
-            while !*rx.borrow_and_update() {
-                if rx.changed().await.is_err() {
-                    // Sender dropped — treat as shutdown.
-                    break;
-                }
+    // `into_make_service_with_connect_info` exposes the socket peer address as
+    // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client
+    // when no trusted proxy header applies (see `rate_limit::client_key`).
+    let serve_result = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        let mut rx = shutdown_signal_for_axum;
+        // Wait until the watcher flips to true, then return so axum
+        // can begin draining.
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                // Sender dropped — treat as shutdown.
+                break;
             }
-        })
-        .await;
+        }
+    })
+    .await;
 
     // Server has stopped accepting new connections and drained in-flight
     // requests. Tear the rest of the system down.

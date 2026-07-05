@@ -487,6 +487,8 @@ pub async fn git_info_refs(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(query): Query<InfoRefsQuery>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     let name = repo.trim_end_matches(".git");
@@ -525,6 +527,23 @@ pub async fn git_info_refs(
         {
             tracing::debug!(repo = %name, caller = ?caller, service = %service, "info/refs read denied by visibility");
             return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
+        }
+    }
+
+    // Push flood brake on the advertisement phase. A push always hits this
+    // GET first, and for receive-pack it forces a fresh Tigris download below;
+    // throttling only the receive-pack POST would leave the expensive
+    // fresh-acquire reachable unauthenticated and unlimited. Applied before the
+    // acquire so a rejected request does no Tigris work. Same per-IP limiter and
+    // trusted-proxy policy as the POST middleware (shared buckets).
+    if service == "git-receive-pack" {
+        if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
+            if !state.push_rate_limiter.check(&key).await {
+                tracing::warn!(repo = %name, key = %key, "receive-pack advertisement rate limited");
+                return Err(AppError::TooManyRequests(
+                    "push rate limit exceeded — try again later".into(),
+                ));
+            }
         }
     }
 
@@ -2423,6 +2442,51 @@ mod tests {
                 .contains("/did:gitlawb:z6Mkwbud/other-repo.git"),
             "clone_url should preserve the full non-key owner DID. got: {}",
             response_non_key.clone_url
+        );
+    }
+
+    /// The receive-pack *advertisement* (`GET info/refs?service=git-receive-pack`)
+    /// must be throttled by the per-IP push limiter BEFORE it does the fresh
+    /// Tigris acquire — otherwise the flood brake on the POST is bypassable via
+    /// the cheaper unauthenticated GET (PR #152 review P1). Pre-filling the
+    /// bucket makes the assertion deterministic and keeps the test off the
+    /// acquire path entirely.
+    #[sqlx::test]
+    async fn receive_pack_advertisement_is_rate_limited(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Tiny limit, keyed on the socket peer (no trusted proxy).
+        state.push_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6advowner", "adv", "/tmp/adv", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.55:6000".parse().unwrap();
+        // Exhaust this peer's single-request budget up front.
+        assert!(state.push_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advowner/adv/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let status = router.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "receive-pack advertisement must be throttled before the Tigris acquire"
         );
     }
 }

@@ -53,8 +53,11 @@ pub struct AppState {
     pub rate_limiter: RateLimiter,
     /// Per-client-IP rate limiter for git-receive-pack. Per-DID limits cannot
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
-    /// push path throttles on the proxy-reported client IP instead.
+    /// push path throttles on the resolved client IP instead.
     pub push_rate_limiter: RateLimiter,
+    /// Which forwarded header (if any) the edge is trusted to set, for
+    /// resolving the push limiter's client-IP key. See `GITLAWB_TRUSTED_PROXY`.
+    pub push_limiter_trust: crate::rate_limit::TrustedProxy,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:

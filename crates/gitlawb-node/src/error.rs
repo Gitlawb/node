@@ -29,6 +29,9 @@ pub enum AppError {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
+
     #[error("git error: {0}")]
     Git(String),
 
@@ -65,6 +68,9 @@ impl IntoResponse for AppError {
                 msg.clone(),
             ),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            AppError::TooManyRequests(msg) => {
+                (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
+            }
             AppError::Git(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "git_error", msg.clone()),
             AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
             AppError::Internal(e) => (

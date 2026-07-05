@@ -77,6 +77,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         shutdown_tx: tokio::sync::watch::channel(false).0,
     }
 }
