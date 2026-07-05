@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0](https://github.com/Gitlawb/node/compare/v0.4.0...v0.5.0) (2026-07-05)
+
+
+### Features
+
+* **gl:** sanctioned iCaptcha client flow + secure git lifecycle ([#138](https://github.com/Gitlawb/node/issues/138)) ([06388ec](https://github.com/Gitlawb/node/commit/06388ec26aa29d356ae311276fdb91be054e9ecc))
+
+
+### Bug Fixes
+
+* **gl:** sign the CLI's /ipfs/pins reads under the [#134](https://github.com/Gitlawb/node/issues/134) auth gate ([#146](https://github.com/Gitlawb/node/issues/146)) ([20d6848](https://github.com/Gitlawb/node/commit/20d6848846b3a988d604208833167a528b7d8820))
+* **node,git-remote:** gate receive-pack advertisement, sign client fetch/push ([#119](https://github.com/Gitlawb/node/issues/119)) ([6f36fc0](https://github.com/Gitlawb/node/commit/6f36fc07b8e10a650c5948b269feac1cb25cae2a))
+* **node,gossip:** route gossip HTTP through the no-redirect client ([#93](https://github.com/Gitlawb/node/issues/93)) ([#140](https://github.com/Gitlawb/node/issues/140)) ([563c456](https://github.com/Gitlawb/node/commit/563c456803bf3e958d63869db424b3940472bc3d))
+* **node:** close two spam-vector root causes (trust upsert + ungated push) ([#152](https://github.com/Gitlawb/node/issues/152)) ([2df6ff9](https://github.com/Gitlawb/node/commit/2df6ff9d30de62f754fa41473e85db316021718e))
+* **node:** gate GET /ipfs/{cid} on reachable allowed-set, not deny-set ([#126](https://github.com/Gitlawb/node/issues/126)) ([#133](https://github.com/Gitlawb/node/issues/133)) ([466a550](https://github.com/Gitlawb/node/commit/466a550915edd711856ef32035f9f474e2577c4f))
+* **node:** gate the ref-updates feeds on read visibility ([#112](https://github.com/Gitlawb/node/issues/112), [#114](https://github.com/Gitlawb/node/issues/114)) ([#143](https://github.com/Gitlawb/node/issues/143)) ([4891db3](https://github.com/Gitlawb/node/commit/4891db38892663326ee0c1417a2db931988be4b5))
+* **node:** prefer canonical repo row over mirror row in get_repo ([#124](https://github.com/Gitlawb/node/issues/124)) ([#141](https://github.com/Gitlawb/node/issues/141)) ([6c95592](https://github.com/Gitlawb/node/commit/6c95592d188222ac3446dc23ef8d9befbf82ad6f))
+* **remote:** include HTTP error response body ([#137](https://github.com/Gitlawb/node/issues/137)) ([09a0cb2](https://github.com/Gitlawb/node/commit/09a0cb23b9f284ccbd69aca6958b70671f3bfb46))
+* **repos:** log the cause when repo create fails ([#103](https://github.com/Gitlawb/node/issues/103)) ([2620e97](https://github.com/Gitlawb/node/commit/2620e973e3cd4835ed42ddd4adcd8183b5b3080e))
+
 ## [0.4.0](https://github.com/Gitlawb/node/compare/v0.3.9...v0.4.0) (2026-06-30)
 
 
