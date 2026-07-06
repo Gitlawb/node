@@ -76,13 +76,32 @@ pub async fn run(args: WebhookArgs) -> Result<()> {
     }
 }
 
-async fn resolve_owner(client: &NodeClient) -> Result<String> {
-    let info: Value = client.get("/").await?.json().await?;
-    let did = info["did"]
-        .as_str()
-        .context("node missing DID")?
-        .to_string();
-    Ok(did.split(':').next_back().unwrap_or(&did).to_string())
+/// Resolve "repo" into (owner, name). If repo already contains a slash
+/// (owner/repo form), use it directly. Otherwise, prefer the caller's own
+/// identity (matching the pattern used elsewhere, e.g. cert.rs's
+/// resolve_repo) so webhooks are created/listed against the DID that's
+/// actually calling, not the node's own operator DID -- falls back to the
+/// node's root DID only if no local keypair is available at all.
+async fn resolve_owner(
+    repo: &str,
+    dir: Option<&std::path::Path>,
+    client: &NodeClient,
+) -> Result<(String, String)> {
+    if let Some((owner, name)) = repo.split_once('/') {
+        return Ok((owner.to_string(), name.to_string()));
+    }
+    let short = if let Ok(kp) = load_keypair_from_dir(dir) {
+        let did = kp.did().to_string();
+        did.split(':').next_back().unwrap_or(&did).to_string()
+    } else {
+        let info: Value = client.get("/").await?.json().await?;
+        let did = info["did"]
+            .as_str()
+            .context("node missing DID")?
+            .to_string();
+        did.split(':').next_back().unwrap_or(&did).to_string()
+    };
+    Ok((short, repo.to_string()))
 }
 
 async fn cmd_create(
@@ -95,7 +114,7 @@ async fn cmd_create(
 ) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let client = NodeClient::new(&node, Some(keypair));
-    let owner = resolve_owner(&client).await?;
+    let (owner, repo) = resolve_owner(&repo, dir.as_deref(), &client).await?;
 
     let event_list: Vec<&str> = events.split(',').map(str::trim).collect();
 
@@ -145,7 +164,7 @@ async fn cmd_create(
 
 async fn cmd_list(repo: String, node: String) -> Result<()> {
     let client = NodeClient::new(&node, None);
-    let owner = resolve_owner(&client).await?;
+    let (owner, repo) = resolve_owner(&repo, None, &client).await?;
 
     let resp: Value = client
         .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
@@ -186,7 +205,7 @@ async fn cmd_list(repo: String, node: String) -> Result<()> {
 async fn cmd_delete(repo: String, id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let client = NodeClient::new(&node, Some(keypair));
-    let owner = resolve_owner(&client).await?;
+    let (owner, repo) = resolve_owner(&repo, dir.as_deref(), &client).await?;
 
     let payload = serde_json::to_vec(&serde_json::json!({}))?;
     let resp = client
