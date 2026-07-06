@@ -23,8 +23,14 @@ pub enum AppError {
     #[allow(dead_code)]
     Forbidden(String),
 
-    #[error("icaptcha proof required: {0}")]
-    IcaptchaProofRequired(String),
+    #[error("icaptcha proof required: {message}")]
+    IcaptchaProofRequired {
+        message: String,
+        /// iCaptcha service base URL the client should solve against.
+        url: String,
+        /// Minimum proof level this node requires.
+        level: u32,
+    },
 
     #[error("invalid request: {0}")]
     BadRequest(String),
@@ -44,6 +50,34 @@ pub enum AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        // iCaptcha challenges carry structured discovery so clients don't have to
+        // scrape the message: the service URL and required level are returned as
+        // both JSON fields and `x-icaptcha-url` / `x-icaptcha-level` headers
+        // (mirroring the header-bearing `human_detected` response in auth/mod.rs).
+        if let AppError::IcaptchaProofRequired {
+            message,
+            url,
+            level,
+        } = &self
+        {
+            use axum::http::HeaderValue;
+            let body = Json(json!({
+                "error": "icaptcha_proof_required",
+                "message": message,
+                "icaptcha_url": url,
+                "required_level": level,
+            }));
+            let mut resp = (StatusCode::FORBIDDEN, body).into_response();
+            let headers = resp.headers_mut();
+            if let Ok(v) = HeaderValue::from_str(url) {
+                headers.insert("x-icaptcha-url", v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&level.to_string()) {
+                headers.insert("x-icaptcha-level", v);
+            }
+            return resp;
+        }
+
         let (status, code, message) = match &self {
             AppError::RepoNotFound(r) => (
                 StatusCode::NOT_FOUND,
@@ -58,15 +92,8 @@ impl IntoResponse for AppError {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, "not_an_agent", msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "forbidden", msg.clone()),
-            // 403, not 401: the caller IS an authenticated agent (credentials are
-            // valid) but is forbidden from this action without a valid, fresh
-            // iCaptcha proof. The distinct `icaptcha_proof_required` code — which
-            // clients branch on — keeps it separable from a plain `forbidden`.
-            AppError::IcaptchaProofRequired(msg) => (
-                StatusCode::FORBIDDEN,
-                "icaptcha_proof_required",
-                msg.clone(),
-            ),
+            // IcaptchaProofRequired is handled above (it carries extra headers/fields).
+            AppError::IcaptchaProofRequired { .. } => unreachable!("handled before this match"),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
             AppError::TooManyRequests(msg) => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
