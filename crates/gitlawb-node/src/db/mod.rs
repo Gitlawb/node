@@ -1971,20 +1971,28 @@ impl Db {
 
 impl Db {
     /// Insert a ref certificate, or update it if a row for `(repo_id, ref_name)`
-    /// already exists. Returns the id of the row that is now in the database
-    /// (the original id on upsert; the passed id on insert).
+    /// already exists.  The update only applies when the incoming row is newer
+    /// (compared by `issued_at`), so a late-landing older cert cannot regress a
+    /// ref's persisted state.  Returns the id of the row that is now in the
+    /// database (the original id on upsert; the passed id on insert).
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<String> {
         let row: (String,) = sqlx::query_as(
             "INSERT INTO ref_certificates
              (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (repo_id, ref_name) DO UPDATE SET
-                old_sha   = EXCLUDED.old_sha,
-                new_sha   = EXCLUDED.new_sha,
-                pusher_did = EXCLUDED.pusher_did,
-                node_did  = EXCLUDED.node_did,
-                signature = EXCLUDED.signature,
-                issued_at = EXCLUDED.issued_at
+                old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
+                new_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.new_sha   ELSE ref_certificates.new_sha   END,
+                pusher_did = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                  THEN EXCLUDED.pusher_did ELSE ref_certificates.pusher_did END,
+                node_did  = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.node_did  ELSE ref_certificates.node_did  END,
+                signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.signature ELSE ref_certificates.signature END,
+                issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
              RETURNING id",
         )
         .bind(&cert.id)
@@ -4813,6 +4821,40 @@ mod ref_certificate_tests {
         );
         assert_eq!(certs[0].old_sha, "aaaa", "old_sha updated");
         assert_eq!(certs[0].new_sha, "bbbb", "new_sha updated");
+        assert_eq!(
+            certs[0].issued_at, "2026-07-03T21:00:00Z",
+            "newer issued_at overwrites older"
+        );
+
+        // Now try to overwrite with an OLDER cert — the guard must reject it.
+        db.insert_ref_certificate(&make_cert(
+            "stale-id",
+            &repo_id,
+            "refs/heads/main",
+            "stale",
+            "stale",
+            "2026-07-03T19:00:00Z",
+        ))
+        .await
+        .unwrap();
+        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "no extra row from stale cert");
+        assert_eq!(
+            certs[0].id, "cert-original",
+            "stale cert does not change the original id"
+        );
+        assert_eq!(
+            certs[0].old_sha, "aaaa",
+            "stale cert does not regress old_sha"
+        );
+        assert_eq!(
+            certs[0].new_sha, "bbbb",
+            "stale cert does not regress new_sha"
+        );
+        assert_eq!(
+            certs[0].issued_at, "2026-07-03T21:00:00Z",
+            "stale cert does not regress issued_at"
+        );
     }
 
     #[sqlx::test]
