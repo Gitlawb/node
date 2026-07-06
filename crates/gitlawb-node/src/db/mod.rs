@@ -3420,17 +3420,83 @@ mod migration_tests {
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
     }
 
-    /// Run a full migration from scratch and verify v11 creates the owner_did
-    /// column. Also verifies that an existing node re-running the migration
-    /// won't error (idempotent ALTER TABLE ADD COLUMN IF NOT EXISTS).
+    /// Simulate an existing node at v9 with populated received_ref_updates,
+    /// then apply the v11 migration and verify (a) owner_did IS NULL on
+    /// existing rows, (b) the column exists and is nullable TEXT, and
+    /// (c) idempotent re-run does not error.
     #[sqlx::test]
     async fn migration_v11_creates_owner_did_column(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
 
-        // Run the full migration (v1..v11) on a fresh database.
+        // Create all tables by running the full migration chain from scratch.
         db.migrate().await.unwrap();
 
-        // Verify the owner_did column exists and is nullable TEXT.
+        // Truncate schema_migrations and re-seed at v9 — simulate an existing
+        // node that has run v1..v9 but not yet v10.
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 10) {
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(m.version)
+            .bind(m.name)
+            .bind("2026-07-01T00:00:00Z")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // ── Simulate an existing node with rows recorded before v11 ────────
+        // The owner_did column does not exist yet, so we INSERT without it.
+        let row_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO received_ref_updates
+             (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha,
+              timestamp, cert_id, received_at, from_peer)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(&row_id)
+        .bind("did:key:zNode")
+        .bind("did:key:zPusher")
+        .bind("z6MkOwner/myrepo")
+        .bind("refs/heads/main")
+        .bind("0000000000000000000000000000000000000000")
+        .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("2026-07-01T12:00:00Z")
+        .bind::<Option<String>>(None)
+        .bind("2026-07-01T12:00:01Z")
+        .bind("12D3KooWPeer")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM received_ref_updates")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            1,
+            "pre-migration row must exist"
+        );
+
+        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did) ──
+        db.migrate().await.unwrap();
+
+        // ── Assertions ────────────────────────────────────────────────────
+
+        // (a) Existing row has owner_did IS NULL (not overwritten).
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_did FROM received_ref_updates WHERE id = $1")
+                .bind(&row_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, None, "existing row's owner_did must be NULL");
+
+        // (b) Column exists and is nullable TEXT.
         let col: (String, String, String) = sqlx::query_as(
             "SELECT column_name, data_type, is_nullable
              FROM information_schema.columns
@@ -3442,7 +3508,7 @@ mod migration_tests {
         assert_eq!(col.0, "owner_did");
         assert_eq!(col.1, "text");
 
-        // Verify version 11 is recorded as applied.
+        // (c) Version 11 is recorded as applied.
         let v11_count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 11")
                 .fetch_one(&db.pool)
@@ -3453,7 +3519,7 @@ mod migration_tests {
             "migration v11 must be recorded in schema_migrations"
         );
 
-        // Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
+        // (d) Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
         db.migrate().await.unwrap();
     }
 }

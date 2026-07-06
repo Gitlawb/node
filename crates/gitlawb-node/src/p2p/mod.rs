@@ -39,9 +39,9 @@ pub struct RefUpdateEvent {
     pub pusher_did: String,
     /// Repository identifier (owner/name)
     pub repo: String,
-    /// Full owner DID — added in #144 so the feed gate can distinguish
-    /// different DID methods that share the same trailing segment.
-    /// Optional for backward compat with older peers that don't include it.
+    /// Full owner DID — added in #144 for display and storage; not yet
+    /// wired into the feed gate matcher. Optional for backward compat with
+    /// older peers that don't include it.
     #[serde(default)]
     pub owner_did: Option<String>,
     /// Git ref that changed (e.g., "refs/heads/main")
