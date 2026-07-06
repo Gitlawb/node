@@ -158,7 +158,7 @@ async fn cmd_create(
     if has_secret {
         println!("  Secret: set (HMAC-SHA256 signing enabled)");
     }
-    println!("\n  Delete: gl webhook delete {repo} {id}");
+    println!("\n  Delete: gl webhook delete {owner}/{repo} {id}");
     Ok(())
 }
 
