@@ -74,12 +74,11 @@ pub async fn remove_label(
 pub async fn list_labels(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let labels = state.db.list_labels(&record.id).await?;
     Ok(Json(serde_json::json!({ "labels": labels })))

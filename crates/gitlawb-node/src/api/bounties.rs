@@ -115,7 +115,11 @@ pub async fn list_repo_bounties(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(q): Query<ListBountiesQuery>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
+
     let bounties = state
         .db
         .list_bounties(

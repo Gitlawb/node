@@ -90,12 +90,11 @@ pub async fn create_issue(
 pub async fn list_issues(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let disk_path = state
         .repo_store
@@ -120,12 +119,11 @@ pub async fn list_issues(
 pub async fn get_issue(
     State(state): State<AppState>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let disk_path = state
         .repo_store
@@ -191,12 +189,21 @@ pub async fn create_issue_comment(
 pub async fn list_issue_comments(
     State(state): State<AppState>,
     Path((owner, repo, issue_id)): Path<(String, String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let _record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
+
+    let disk_path = state
+        .repo_store
+        .acquire(&record.owner_did, &record.name)
+        .await
+        .map_err(|e| AppError::Git(e.to_string()))?;
+    // Confirm the issue belongs to this repo before listing comments.
+    git_issues::get_issue(&disk_path, &issue_id)
+        .map_err(|e| AppError::Git(e.to_string()))?
+        .ok_or_else(|| AppError::RepoNotFound(format!("issue {issue_id} not found")))?;
 
     let comments = state.db.list_issue_comments(&issue_id).await?;
     Ok(Json(serde_json::json!({ "comments": comments })))

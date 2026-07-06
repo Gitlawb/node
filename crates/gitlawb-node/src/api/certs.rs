@@ -1,8 +1,9 @@
 //! API handlers for ref certificates.
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::Json;
 
+use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
@@ -10,12 +11,11 @@ use crate::state::AppState;
 pub async fn list_certs(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let certs = state.db.list_ref_certificates(&record.id).await?;
     let certs_json: Vec<serde_json::Value> = certs
@@ -42,19 +42,21 @@ pub async fn list_certs(
 pub async fn get_cert(
     State(state): State<AppState>,
     Path((owner, name, id)): Path<(String, String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    // Verify the repo exists
-    let _record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let cert = state
         .db
         .get_ref_certificate(&id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("certificate {id}")))?;
+
+    if cert.repo_id != record.id {
+        return Err(AppError::NotFound(format!("certificate {id}")));
+    }
 
     Ok(Json(serde_json::json!({
         "id":         cert.id,
