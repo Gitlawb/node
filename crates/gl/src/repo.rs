@@ -1603,3 +1603,90 @@ mod tests {
         );
     }
 }
+
+// Drives the three deny/negative arms that the merge reconciliation changed but
+// that no existing test executed (they were only reasoned): resolve_owner_did
+// with no identity, cmd_info on an authenticated-but-denied 403, and
+// get_maybe_signed with no keypair. Each asserts the must-not case.
+#[cfg(test)]
+mod vet_merge_deny_arms {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_identity(dir: &TempDir) {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+    }
+
+    // No local identity must hard-error, never fall back to the node's own DID.
+    // (Load-bearing: #113's pre-merge resolve_owner_did returned Ok via a node
+    // fetch here; a reintroduced fallback makes this go red.)
+    #[tokio::test]
+    async fn resolve_owner_did_no_identity_errors_not_fallback() {
+        let empty = TempDir::new().unwrap(); // no identity.pem written
+        let err = resolve_owner_did("http://unused.invalid", Some(empty.path()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no local identity to resolve the repo owner"),
+            "got: {err}"
+        );
+    }
+
+    // An authenticated caller DENIED with a 403 must surface an error, never
+    // render a repo card (deny-as-success is the INV-8 client-contract break).
+    #[tokio::test]
+    async fn cmd_info_403_denied_surfaces_error_not_card() {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/owner/myrepo$".to_string()),
+            )
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"forbidden"}"#)
+            .create_async()
+            .await;
+        let err = cmd_info(
+            "owner/myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("repo info failed (403"),
+            "got: {err}"
+        );
+    }
+
+    // No keypair must send an unsigned GET; the mock only matches when the
+    // Signature header is absent, so a wrongly-signed request fails to match.
+    #[tokio::test]
+    async fn get_maybe_signed_no_keypair_sends_unsigned() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/owner/pub")
+            .match_header("signature", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), None);
+        let resp = client
+            .get_maybe_signed("/api/v1/repos/owner/pub")
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "unsigned GET should match the Missing-signature mock; got {}",
+            resp.status()
+        );
+    }
+}
