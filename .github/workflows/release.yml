@@ -116,10 +116,14 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+          # Native arm64 runner: cross-compiling this target with the glibc
+          # toolchain broke aws-lc-sys, and native lets the smoke test run.
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04-arm
+          # macos-13 (the last plain Intel image) is retired and queues forever;
+          # macos-15-intel is GitHub's supported Intel label.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-pc-windows-msvc
@@ -137,16 +141,13 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
+      # Both musl targets build natively on a matching-arch runner, so the stock
+      # musl-gcc wrapper is all that's needed (no cross toolchain).
       - name: Install musl tools (linux)
         if: contains(matrix.target, 'linux-musl')
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-            echo "CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          fi
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
@@ -171,10 +172,9 @@ jobs:
           cargo build --release --target ${{ matrix.target }} $args
 
       # Run each packaged binary's --version so a broken release artifact fails the
-      # build instead of shipping. Skipped for cross-compiled targets that can't run
-      # on the host runner (aarch64 linux on an x86_64 runner).
+      # build instead of shipping. Every target builds on a matching-arch runner,
+      # so all of them can execute here.
       - name: Smoke test binaries
-        if: ${{ matrix.target != 'aarch64-unknown-linux-musl' }}
         shell: bash
         run: |
           set -euo pipefail
