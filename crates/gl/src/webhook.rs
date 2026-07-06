@@ -42,6 +42,8 @@ pub enum WebhookCmd {
         repo: String,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Delete a webhook
     Delete {
@@ -66,7 +68,7 @@ pub async fn run(args: WebhookArgs) -> Result<()> {
             node,
             dir,
         } => cmd_create(repo, url, events, secret, node, dir).await,
-        WebhookCmd::List { repo, node } => cmd_list(repo, node).await,
+        WebhookCmd::List { repo, node, dir } => cmd_list(repo, node, dir).await,
         WebhookCmd::Delete {
             repo,
             id,
@@ -81,7 +83,8 @@ pub async fn run(args: WebhookArgs) -> Result<()> {
 /// identity (matching the pattern used elsewhere, e.g. cert.rs's
 /// resolve_repo) so webhooks are created/listed against the DID that's
 /// actually calling, not the node's own operator DID -- falls back to the
-/// node's root DID only if no local keypair is available at all.
+/// node's root DID if loading a local keypair fails for any reason
+/// (missing, unreadable, or unparseable).
 async fn resolve_owner(
     repo: &str,
     dir: Option<&std::path::Path>,
@@ -162,24 +165,29 @@ async fn cmd_create(
     Ok(())
 }
 
-async fn cmd_list(repo: String, node: String) -> Result<()> {
+async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let client = NodeClient::new(&node, None);
-    let (owner, repo) = resolve_owner(&repo, None, &client).await?;
+    let (owner, repo) = resolve_owner(&repo, dir.as_deref(), &client).await?;
 
-    let resp: Value = client
+    let resp = client
         .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-        .await?
-        .json()
         .await
-        .context("invalid JSON")?;
+        .context("failed to connect to node")?;
+    let status = resp.status();
+    let body: Value = resp.json().await.context("invalid JSON")?;
 
-    let hooks = resp["webhooks"].as_array().cloned().unwrap_or_default();
+    if !status.is_success() {
+        let msg = body["message"].as_str().unwrap_or("unknown error");
+        anyhow::bail!("list webhooks failed ({status}): {msg}");
+    }
+
+    let hooks = body["webhooks"].as_array().cloned().unwrap_or_default();
     if hooks.is_empty() {
-        println!("No webhooks for {repo}");
+        println!("No webhooks for {owner}/{repo}");
         return Ok(());
     }
 
-    println!("Webhooks for {repo} ({} total)\n", hooks.len());
+    println!("Webhooks for {owner}/{repo} ({} total)\n", hooks.len());
     for hook in &hooks {
         let id = hook["id"].as_str().unwrap_or("?");
         let url = hook["url"].as_str().unwrap_or("?");
@@ -366,7 +374,7 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list("my-repo".to_string(), server.url()).await.unwrap();
+        cmd_list("my-repo".to_string(), server.url(), None).await.unwrap();
     }
 
     #[tokio::test]
@@ -382,7 +390,58 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list("my-repo".to_string(), server.url()).await.unwrap();
+        cmd_list("my-repo".to_string(), server.url(), None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_webhooks_uses_caller_identity_for_bare_repo_name() {
+        let mut server = mockito::Server::new_async().await;
+        // A root mock is present (it would resolve to "z6MkTestOwner"), but a
+        // local identity is also supplied -- the identity must win, matching
+        // create/delete. If cmd_list fell back to the root DID instead, it
+        // would hit a path with no matching mock and fail.
+        let _root = mock_root(&mut server).await;
+        let (dir, kp) = tmp_identity();
+        let did = kp.did().to_string();
+        let short = did.split(':').next_back().unwrap_or(&did).to_string();
+
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!(r"/repos/{short}/my-repo/hooks$")),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"webhooks":[]}"#)
+            .create_async()
+            .await;
+
+        cmd_list(
+            "my-repo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_list_webhooks_error_status_propagates() {
+        let mut server = mockito::Server::new_async().await;
+        let _root = mock_root(&mut server).await;
+
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repo not found"}"#)
+            .create_async()
+            .await;
+
+        let err = cmd_list("my-repo".to_string(), server.url(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("repo not found"));
     }
 
     // ── delete ───────────────────────────────────────────────────────
