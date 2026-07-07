@@ -3327,6 +3327,194 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn list_all_bounties_same_private_repo_two_bounties_anon_sees_none(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zP1SAME2PRIVBOUNTYOWNERAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        for id in ["private-bounty-a", "private-bounty-b"] {
+            let b = crate::db::BountyRecord {
+                id: id.into(),
+                repo_owner: owner.into(),
+                repo_name: "secret-repo".into(),
+                issue_id: None,
+                title: "Private Bounty".into(),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            };
+            state.db.create_bounty(&b).await.unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(anon_get("/api/v1/bounties")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let bounties = body["bounties"].as_array().unwrap();
+        assert_eq!(
+            bounties.len(),
+            0,
+            "anon should see 0 bounties from private repo even with 2 entries"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_all_bounties_past_private_window_finds_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zP2PASTPRIVWINDOWOWNERAAAAAAAAAAAAAAAAA";
+
+        // Seed a private repo with 6 bounties (more than one page of page_size=5)
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "private-repo"))
+            .await
+            .unwrap();
+        for i in 0..6 {
+            let b = crate::db::BountyRecord {
+                id: format!("private-bounty-{i}"),
+                repo_owner: owner.into(),
+                repo_name: "private-repo".into(),
+                issue_id: None,
+                title: format!("Private Bounty {i}"),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: format!("2026-01-{:02}T00:00:00Z", 6 - i),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            };
+            state.db.create_bounty(&b).await.unwrap();
+        }
+
+        // Public repo with a bounty created after the private ones
+        let mut pub_repo = seed_private_repo(owner, "public-repo");
+        pub_repo.is_public = true;
+        state.db.create_repo(&pub_repo).await.unwrap();
+        let pub_bounty = crate::db::BountyRecord {
+            id: "public-bounty-past-window".into(),
+            repo_owner: owner.into(),
+            repo_name: "public-repo".into(),
+            issue_id: None,
+            title: "Public Bounty".into(),
+            amount: 200,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            // This is older (earlier date) so it appears after the private ones in DESC order
+            created_at: "2025-12-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&pub_bounty).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties?limit=1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let bounties = body["bounties"].as_array().unwrap();
+        assert_eq!(
+            bounties.len(),
+            1,
+            "anon should find the public bounty past the private window"
+        );
+        assert_eq!(bounties[0]["id"], "public-bounty-past-window");
+    }
+
+    #[sqlx::test]
+    async fn star_repo_gate_denies_non_reader_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zSTARGATEDENYOWNERAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let non_owner_kp = gitlawb_core::identity::Keypair::generate();
+        let uri = format!("/api/v1/repos/{short}/secret-repo/star");
+        let sig = gitlawb_core::http_sig::sign_request(&non_owner_kp, "PUT", &uri, b"");
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn unstar_repo_gate_denies_non_reader_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zUNSTARGATEDENYOWNERAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let non_owner_kp = gitlawb_core::identity::Keypair::generate();
+        let uri = format!("/api/v1/repos/{short}/secret-repo/star");
+        let sig = gitlawb_core::http_sig::sign_request(&non_owner_kp, "DELETE", &uri, b"");
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(&uri)
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
     async fn repo_gate_owner_bare_key_vs_full_did(pool: PgPool) {
         let state = test_state(pool).await;
         let owner = "did:key:zBAREKEYFULLDIDOWNERAAAAAAAAAAAAAAAAAA";

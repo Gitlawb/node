@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::Json;
 
 use crate::auth::AuthenticatedDid;
-use crate::error::{AppError, Result};
+use crate::error::Result;
 use crate::state::AppState;
 
 /// PUT /api/v1/repos/:owner/:repo/star
@@ -19,11 +19,8 @@ pub async fn star_repo(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<serde_json::Value>)> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let caller = &auth.0;
     let inserted = state.db.star_repo(&record.id, caller).await?;
@@ -54,11 +51,8 @@ pub async fn unstar_repo(
     Extension(auth): Extension<AuthenticatedDid>,
     Path((owner, repo)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, Some(auth.0.as_str()), "/").await?;
 
     let caller = &auth.0;
     state.db.unstar_repo(&record.id, caller).await?;

@@ -125,7 +125,7 @@ pub async fn list_repo_bounties(
     let limit = q.limit.unwrap_or(50).clamp(1, MAX_BOUNTY_LIMIT);
     let bounties = state
         .db
-        .list_bounties(Some(&owner), Some(&repo), q.status.as_deref(), limit)
+        .list_bounties(Some(&owner), Some(&repo), q.status.as_deref(), limit, 0)
         .await?;
 
     Ok(Json(serde_json::json!({ "bounties": bounties })))
@@ -139,33 +139,49 @@ pub async fn list_all_bounties(
 ) -> Result<Json<serde_json::Value>> {
     let raw_limit = q.limit.unwrap_or(50);
     let limit = raw_limit.clamp(1, MAX_BOUNTY_LIMIT);
-    // Over-fetch to account for filtered-out private-repo bounties so the
-    // caller gets up to `limit` readable results even when newer rows are
-    // inaccessible.
-    let fetch = (limit * 5).min(1000);
-    let bounties = state
-        .db
-        .list_bounties(None, None, q.status.as_deref(), fetch)
-        .await?;
 
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let mut seen = std::collections::HashSet::new();
-    let mut allowed = Vec::new();
-    for b in &bounties {
-        let key = format!("{}/{}", b.repo_owner, b.repo_name);
-        if seen.contains(&key) {
-            allowed.push(b.clone());
-            continue;
+    let mut memo = std::collections::HashMap::new();
+    let mut allowed: Vec<BountyRecord> = Vec::new();
+    let page_size = (limit * 5).clamp(1, 200);
+    let max_rows = 10_000i64;
+    let mut scanned: i64 = 0;
+
+    while (allowed.len() as i64) < limit && scanned < max_rows {
+        let bounties = state
+            .db
+            .list_bounties(None, None, q.status.as_deref(), page_size, scanned)
+            .await?;
+        if bounties.is_empty() {
+            break;
         }
-        seen.insert(key.clone());
-        if crate::api::authorize_repo_read(&state, &b.repo_owner, &b.repo_name, caller, "/")
-            .await
-            .is_ok()
-        {
-            allowed.push(b.clone());
+
+        for b in &bounties {
+            if (allowed.len() as i64) >= limit {
+                break;
+            }
+            let key = format!("{}/{}", b.repo_owner, b.repo_name);
+            let admitted = if let Some(&result) = memo.get(&key) {
+                result
+            } else {
+                let result = crate::api::authorize_repo_read(
+                    &state,
+                    &b.repo_owner,
+                    &b.repo_name,
+                    caller,
+                    "/",
+                )
+                .await
+                .is_ok();
+                memo.insert(key, result);
+                result
+            };
+            if admitted {
+                allowed.push(b.clone());
+            }
         }
+        scanned += bounties.len() as i64;
     }
-    allowed.truncate(limit as usize);
 
     Ok(Json(serde_json::json!({ "bounties": allowed })))
 }
