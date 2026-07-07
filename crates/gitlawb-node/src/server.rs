@@ -277,15 +277,41 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/peers", get(peers::list_peers))
         .route("/api/v1/peers/{did}/ping", get(peers::ping_peer));
 
+    // /sync/trigger drives an O(peers) outbound fan-out + per-repo enqueue, so it
+    // ALWAYS requires a signature (both config modes) and carries a tight per-IP
+    // brake. A signature alone does not cap cost — a did:key farm self-registers
+    // (INV-10) — so the IP brake is a separate, load-bearing half. The brake is
+    // outermost (runs before signature verification burns CPU) and is keyed on the
+    // client IP before any DID is read, so DID rotation cannot bypass it.
+    let sync_trigger_routes = add_auth_layers(
+        Router::new().route("/api/v1/sync/trigger", post(peers::trigger_sync)),
+        state.clone(),
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(rate_limit::IpRateLimiter {
+        limiter: state.sync_trigger_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    }));
+
+    // announce + notify keep their rolling-upgrade signature behavior (unsigned
+    // accepted until all peers upgrade), but both reach peer-write side effects —
+    // notify hits the same enqueue_sync sink as trigger — so they carry a per-IP
+    // brake too, on a SEPARATE bucket from trigger's, so an unsigned notify flood
+    // cannot drain the signed trigger caller's quota.
     let mut peer_write_routes = Router::new()
         .route("/api/v1/peers/announce", post(peers::announce))
-        .route("/api/v1/sync/trigger", post(peers::trigger_sync))
         .route("/api/v1/sync/notify", post(peers::notify_sync));
     peer_write_routes = if state.config.require_signed_peer_writes {
         add_auth_layers(peer_write_routes, state.clone())
     } else {
         peer_write_routes.layer(middleware::from_fn(auth::optional_signature))
     };
+    let peer_write_routes = peer_write_routes
+        .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(rate_limit::IpRateLimiter {
+            limiter: state.peer_write_rate_limiter.clone(),
+            trust: state.push_limiter_trust,
+        }));
 
     // ── Read routes — open for public repos ───────────────────────────────
     let read_routes = Router::new()
@@ -434,6 +460,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(read_routes)
         .merge(peer_read_routes)
         .merge(peer_write_routes)
+        .merge(sync_trigger_routes)
         .merge(ipfs_routes)
         .merge(arweave_routes)
         .merge(meta_routes)
