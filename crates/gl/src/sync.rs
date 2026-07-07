@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
@@ -30,8 +30,13 @@ pub enum SyncCmd {
 pub async fn run(args: SyncArgs) -> Result<()> {
     match args.cmd {
         SyncCmd::Trigger => {
-            let keypair = load_keypair_from_dir(args.dir.as_deref()).ok();
-            let client = NodeClient::new(&args.node, keypair);
+            // /api/v1/sync/trigger always requires a signature, so a missing or
+            // unreadable identity must fail here, locally, rather than sending an
+            // unsigned request that can only 401 remotely (matches the other
+            // signed CLI writes).
+            let keypair = load_keypair_from_dir(args.dir.as_deref())
+                .context("identity not found — run `gl identity new` first")?;
+            let client = NodeClient::new(&args.node, Some(keypair));
             let resp = client.post("/api/v1/sync/trigger", b"{}").await?;
             // The node now requires a signature on this route and rate-limits it,
             // so a denial (401/429/…) is expected. Check the status BEFORE parsing:
@@ -149,16 +154,43 @@ mod tests {
     use super::*;
 
     fn trigger_args(node: String) -> (SyncArgs, tempfile::TempDir) {
-        // Empty identity dir → unsigned client. The mock returns a fixed status
-        // regardless of the signature; we only exercise the client's status
-        // handling. Return the TempDir so the caller keeps it alive.
+        // Seed a real identity so `run` gets past the mandatory-keypair check and
+        // reaches the status-handling path. The mocks below return a fixed status
+        // regardless of the signature, so these tests exercise the client's
+        // status-check-before-parse, not signature verification (that is proved
+        // server-side). Return the TempDir so the caller keeps it alive.
         let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
         let args = SyncArgs {
             cmd: SyncCmd::Trigger,
             node,
             dir: Some(dir.path().to_path_buf()),
         };
         (args, dir)
+    }
+
+    #[tokio::test]
+    async fn trigger_requires_identity_fails_before_request() {
+        // Empty identity dir → no keypair. `sync trigger` must fail locally with
+        // a clear identity error BEFORE issuing any request. The node URL points
+        // at an unreachable port, so a request attempt would surface a different
+        // (connection) error; getting the identity error proves we never dialed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let args = SyncArgs {
+            cmd: SyncCmd::Trigger,
+            node: "http://127.0.0.1:1".to_string(),
+            dir: Some(dir.path().to_path_buf()),
+        };
+        let err = run(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("identity not found"),
+            "expected a local identity error before any request, got: {err}"
+        );
     }
 
     #[tokio::test]

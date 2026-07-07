@@ -2293,9 +2293,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-gitlawb"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "gitlawb-core",
@@ -3312,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-attest"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-node"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3412,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "gl"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "alloy",
  "anyhow",

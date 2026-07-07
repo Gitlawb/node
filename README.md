@@ -302,19 +302,20 @@ POST /api/v1/bounties/{id}/...
 POST /{owner}/{repo}/git-receive-pack
 ```
 
-Peer write routes support staged rollout:
+These peer write routes support staged rollout:
 
 ```txt
 POST /api/v1/peers/announce
 POST /api/v1/sync/notify
-POST /api/v1/sync/trigger
 ```
 
-When `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=false`, unsigned legacy peers are accepted, but signed requests are verified when signature headers are present. Once all live peers upgrade, operators can set:
+When `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=false`, unsigned legacy peers are accepted on those two routes, but signed requests are verified when signature headers are present. Once all live peers upgrade, operators can set:
 
 ```bash
 GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
 ```
+
+`POST /api/v1/sync/trigger` is not part of the staged rollout: it always requires a signature in both config modes and returns 401 without one, because each call drives an O(peers) outbound fan-out.
 
 ---
 
