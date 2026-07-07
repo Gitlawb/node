@@ -250,12 +250,14 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
-/// The shared 429 response for the push flood brake.
+/// The shared 429 response for the per-IP flood brakes. Route-agnostic: this
+/// middleware now serves the push path AND the peer-sync routes, so the message
+/// stays generic (the offending path is recorded in the warn log below).
 pub fn too_many_requests() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
         [("retry-after", "60")],
-        "push rate limit exceeded — try again later",
+        "rate limit exceeded — try again later",
     )
         .into_response()
 }
