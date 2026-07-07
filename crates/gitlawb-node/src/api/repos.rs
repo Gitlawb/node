@@ -1836,6 +1836,13 @@ mod tests {
             git_service_app_error(&bad),
             AppError::BadRequest(_)
         ));
+        // The `protocol error` marker (with no "bad line length" substring) also
+        // -> 400, exercising the second arm of the classifier independently.
+        let proto = anyhow::anyhow!("fatal: protocol error: unexpected flush packet");
+        assert!(matches!(
+            git_service_app_error(&proto),
+            AppError::BadRequest(_)
+        ));
         // Anything else -> 500 git error.
         let other = anyhow::anyhow!("some other git failure");
         assert!(matches!(git_service_app_error(&other), AppError::Git(_)));

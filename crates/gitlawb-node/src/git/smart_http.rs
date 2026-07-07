@@ -157,18 +157,17 @@ async fn reap_group_on_timeout(child: &mut tokio::process::Child) {
     // zombie) and poll the group's liveness with `kill(-pgid, 0)` (ESRCH once
     // every member is gone). SIGTERM grace, then SIGKILL, then a hard cap so a
     // stuck process can never block the response unboundedly.
-    let mut sigkilled = false;
     for step in 0..400u32 {
         let _ = child.try_wait();
         if unsafe { libc::kill(-pgid, 0) } != 0 {
             return; // ESRCH: every group member has exited
         }
-        if step == 200 && !sigkilled {
-            // ~2s SIGTERM grace elapsed; force the group down.
+        if step == 200 {
+            // ~2s SIGTERM grace elapsed; force the group down. `step == 200` fires
+            // exactly once in the 0..400 loop, so no re-entry guard is needed.
             unsafe {
                 libc::kill(-pgid, libc::SIGKILL);
             }
-            sigkilled = true;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1318,12 +1317,16 @@ mod tests {
     async fn run_git_service_reaps_the_group_before_returning_on_timeout() {
         let tmp = tempfile::TempDir::new().unwrap();
         let pidfile = tmp.path().join("pids");
-        // Leader traps SIGTERM and lingers ~1s; the grandchild (a sub-shell) traps
-        // and lingers ~3s, past the 2s SIGKILL grace, so "wait for the whole group"
-        // (leader AND grandchildren) is observable and the SIGKILL escalation is
-        // exercised.
+        // Leader traps SIGTERM and exits after ~1s. The grandchild (a sub-shell)
+        // IGNORES SIGTERM entirely (`trap "" TERM`) and sleeps far past the ~4s reap
+        // cap, so nothing but the untrappable SIGKILL escalation can kill it within
+        // the cap. That makes the escalation load-bearing: neuter the SIGKILL and
+        // this test goes RED. (A grandchild that merely trapped-and-slept UNDER the
+        // cap would self-exit and hide a broken escalation.) "Wait for the whole
+        // group" (leader AND grandchild) is observable because both must be dead
+        // before run_git_service returns.
         let body = format!(
-            "#!/bin/sh\ntrap 'sleep 1; exit 0' TERM\nsh -c 'trap \"sleep 3; exit 0\" TERM; sleep 300' >/dev/null 2>&1 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"{}\"\nwait\n",
+            "#!/bin/sh\ntrap 'sleep 1; exit 0' TERM\nsh -c 'trap \"\" TERM; sleep 300' >/dev/null 2>&1 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\" > \"{}\"\nwait\n",
             pidfile.display()
         );
         let git_bin = write_fake_git(tmp.path(), &body);
@@ -1344,14 +1347,59 @@ mod tests {
 
         // The WHOLE group (leader AND the lingering grandchild) must be gone by the
         // time we get here.
-        let (leader, grandchild) =
-            read_two_pids(&pidfile).expect("fake git should have written its pids");
+        // Poll for fs-visibility of the pidfile rather than a single read that
+        // could race a loaded runner where the fake hasn't written it yet.
+        let mut pids = None;
+        for _ in 0..200 {
+            if let Some(p) = read_two_pids(&pidfile) {
+                pids = Some(p);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (leader, grandchild) = pids.expect("fake git should have written its pids");
         let _cleanup = ReapOnPanic(vec![grandchild]);
         assert!(
             !alive(leader) && !alive(grandchild),
             "run_git_service must reap the whole git process group (leader AND \
              grandchildren) before returning on a timeout, so a write-lock release \
              can't race a still-live git"
+        );
+    }
+
+    // The timeout bounds git-receive-pack too, not just upload-pack: on the push
+    // path a hung git also holds the repo's write lock, so an unbounded receive-pack
+    // pins the repo until the process dies. run_git_service must return
+    // Err(GitServiceTimeout) for the receive-pack service exactly as it does for
+    // upload-pack. Goes RED if the internal timeout is removed (the fake never
+    // exits, so the outer bound trips and the outcome is not Ok).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_service_times_out_a_hung_receive_pack() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\nsleep 300\n");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_git_service(
+                git_bin.to_str().unwrap(),
+                "git-receive-pack",
+                tmp.path(),
+                Bytes::new(),
+                Duration::from_millis(200),
+            ),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "receive-pack must return via its own timeout, not hang"
+        );
+        let err = outcome
+            .unwrap()
+            .expect_err("a hung receive-pack must surface as Err");
+        assert!(
+            err.downcast_ref::<GitServiceTimeout>().is_some(),
+            "a hung receive-pack must time out as GitServiceTimeout (maps to 504); \
+             got: {err:#}"
         );
     }
 
