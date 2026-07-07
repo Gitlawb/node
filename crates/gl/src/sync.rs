@@ -57,8 +57,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
                 );
             }
             let resp: serde_json::Value = resp.json().await?;
-            let peers = resp["peers_reached"].as_u64().unwrap_or(0);
-            let enqueued = resp["repos_enqueued"].as_u64().unwrap_or(0);
+            let (peers, enqueued) = trigger_counts(&resp);
             println!("✓ sync triggered");
             println!("  peers reached:   {peers}");
             println!("  repos enqueued:  {enqueued}");
@@ -88,6 +87,16 @@ pub async fn run(args: SyncArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Extract `(peers_reached, repos_enqueued)` from a successful sync-trigger
+/// response. Split out so the extraction is unit-testable (missing or malformed
+/// fields default to 0 rather than panicking).
+fn trigger_counts(resp: &serde_json::Value) -> (u64, u64) {
+    (
+        resp["peers_reached"].as_u64().unwrap_or(0),
+        resp["repos_enqueued"].as_u64().unwrap_or(0),
+    )
 }
 
 /// Read at most `cap` bytes of a response body. Bounds the allocation from a
@@ -271,6 +280,35 @@ mod tests {
             s.len() < 500,
             "error message not bounded: {} chars",
             s.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_body_capped_bounds_the_read() {
+        // The read must stop at the cap — a 2 MB body yields at most `cap` bytes,
+        // not the whole thing (which resp.text() would return).
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/big")
+            .with_status(200)
+            .with_body("A".repeat(2_000_000))
+            .create_async()
+            .await;
+        let resp = reqwest::get(format!("{}/big", server.url())).await.unwrap();
+        let out = read_body_capped(resp, 8192).await;
+        assert!(out.len() <= 8192, "read not bounded: {} bytes", out.len());
+        assert!(!out.is_empty(), "expected some body");
+    }
+
+    #[test]
+    fn trigger_counts_extracts_both_values() {
+        let v = serde_json::json!({"peers_reached": 2, "repos_enqueued": 5});
+        assert_eq!(trigger_counts(&v), (2, 5));
+        // Missing/malformed fields default to 0, never panic.
+        assert_eq!(trigger_counts(&serde_json::json!({})), (0, 0));
+        assert_eq!(
+            trigger_counts(&serde_json::json!({"peers_reached": "x"})),
+            (0, 0)
         );
     }
 }

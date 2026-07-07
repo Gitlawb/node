@@ -275,7 +275,7 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
     if let Some(limiter) = limiter {
         if let Some(key) = client_key(request.headers(), peer, limiter.trust) {
             if !limiter.limiter.check(&key).await {
-                tracing::warn!(key = %key, path = %request.uri().path(), "push rate limit exceeded");
+                tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
                 return too_many_requests();
             }
         }

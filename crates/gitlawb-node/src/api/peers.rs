@@ -553,6 +553,7 @@ mod tests {
     use axum::http::{header, Method, Request, StatusCode};
     use axum::routing::post;
     use axum::{middleware, Extension, Router};
+    use gitlawb_core::http_sig::sign_request;
     use gitlawb_core::identity::Keypair;
     use sqlx::PgPool;
     use std::net::SocketAddr;
@@ -878,5 +879,116 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Build a request carrying a REAL RFC 9421 signature (not just an injected
+    // extension), so it passes require_signature on the full production router.
+    fn real_signed_trigger(peer: &str) -> Request<Body> {
+        let kp = Keypair::generate();
+        let body = b"{}";
+        let s = sign_request(&kp, "POST", "/api/v1/sync/trigger", body);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/sync/trigger")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("content-digest", s.content_digest)
+            .header("signature-input", s.signature_input)
+            .header("signature", s.signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        req
+    }
+
+    #[sqlx::test]
+    async fn sync_trigger_admits_real_signature_through_full_router(pool: PgPool) {
+        // The positive path through the REAL gate: a validly-signed trigger passes
+        // require_signature on the full router and reaches the handler (no peers
+        // seeded → 200), in BOTH config modes.
+        let state = test_state(pool.clone()).await;
+        let resp = crate::server::build_router(state)
+            .oneshot(real_signed_trigger("203.0.113.30:5000"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a real signature must reach the handler (default mode)"
+        );
+
+        let mut state = test_state(pool).await;
+        require_signed_peer_writes(&mut state);
+        let resp = crate::server::build_router(state)
+            .oneshot(real_signed_trigger("203.0.113.30:5001"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a real signature must reach the handler (signed-writes mode)"
+        );
+    }
+
+    #[sqlx::test]
+    async fn announce_flood_is_throttled(pool: PgPool) {
+        // The peer_write brake covers /peers/announce too (co-benefit): limit 1,
+        // first unsigned announce from an IP is 200, the second from that IP 429.
+        let mut state = test_state(pool).await;
+        state.peer_write_rate_limiter = RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = TrustedProxy::None;
+        let did = Keypair::generate().did().to_string();
+        let body = format!(r#"{{"did":"{did}","http_url":"https://peer.example.com"}}"#);
+        let router = crate::server::build_router(state);
+        let ip = "203.0.113.31:5000";
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(unsigned_post("/api/v1/peers/announce", &body, ip))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            router
+                .oneshot(unsigned_post("/api/v1/peers/announce", &body, ip))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "announce must be braked by the peer_write limiter"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_trigger_429_body_is_generic_not_push(pool: PgPool) {
+        // The shared 429 middleware now serves the sync routes, so its body must
+        // not claim "push" (RED before the message was genericized).
+        let mut state = test_state(pool).await;
+        state.sync_trigger_rate_limiter = RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = TrustedProxy::None;
+        let peer = "203.0.113.32:5000";
+        assert!(
+            state
+                .sync_trigger_rate_limiter
+                .check(&peer.parse::<SocketAddr>().unwrap().ip().to_string())
+                .await
+        );
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post("/api/v1/sync/trigger", "{}", peer))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let s = String::from_utf8_lossy(&bytes);
+        assert!(s.contains("rate limit exceeded"), "429 body: {s:?}");
+        assert!(
+            !s.contains("push"),
+            "a 429 on a sync route must not say 'push': {s:?}"
+        );
     }
 }
