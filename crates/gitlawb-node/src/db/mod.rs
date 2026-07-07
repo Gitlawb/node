@@ -2935,7 +2935,8 @@ impl Db {
         repo_name: Option<&str>,
         status: Option<&str>,
         limit: i64,
-        offset: i64,
+        after_created_at: Option<&str>,
+        after_id: Option<&str>,
     ) -> Result<Vec<BountyRecord>> {
         let mut sql = String::from("SELECT * FROM bounties WHERE 1=1");
         let mut binds: Vec<String> = Vec::new();
@@ -2956,17 +2957,21 @@ impl Db {
             binds.push(s.to_string());
             idx += 1;
         }
-        sql.push_str(&format!(
-            " ORDER BY created_at DESC LIMIT ${idx} OFFSET ${}",
-            idx + 1
-        ));
+        if let Some(ts) = after_created_at {
+            let id = after_id.unwrap_or("");
+            sql.push_str(&format!(" AND (created_at, id) < (${idx}, ${})", idx + 1));
+            binds.push(ts.to_string());
+            idx += 1;
+            binds.push(id.to_string());
+            idx += 1;
+        }
+        sql.push_str(&format!(" ORDER BY created_at DESC, id DESC LIMIT ${idx}"));
 
         let mut q = sqlx::query(&sql);
         for b in &binds {
             q = q.bind(b);
         }
         q = q.bind(limit);
-        q = q.bind(offset);
 
         let rows = q.fetch_all(&self.pool).await?;
         Ok(rows.iter().map(|r| self.bounty_from_row(r)).collect())
