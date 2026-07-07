@@ -78,6 +78,8 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
+        sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
+        peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         shutdown_tx: tokio::sync::watch::channel(false).0,
     }
 }
