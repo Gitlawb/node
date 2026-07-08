@@ -517,15 +517,7 @@ mod authz_guard {
 
         // Repo-scoped reads known to be ungated today, each tracked by an issue.
         // Remove an entry the moment its gate lands (the staleness assert enforces it).
-        let known_ungated: &[(&str, &str)] = &[
-            ("list_certs", "#120"),
-            ("get_cert", "#120"),
-            ("list_issues", "#120"),
-            ("get_issue", "#120"),
-            ("list_issue_comments", "#120"),
-            ("list_repo_bounties", "#120"),
-            ("get_star_status", "#120"),
-        ];
+        let known_ungated: &[(&str, &str)] = &[];
         let is_known = |n: &str| known_ungated.iter().any(|(k, _)| *k == n);
         // Any one of these = the handler binds the caller to an authz decision: the
         // first two are read gates, the rest are the write/owner/self-binding forms.

@@ -57,7 +57,19 @@ pub struct AppState {
     pub push_rate_limiter: RateLimiter,
     /// Which forwarded header (if any) the edge is trusted to set, for
     /// resolving the push limiter's client-IP key. See `GITLAWB_TRUSTED_PROXY`.
+    /// Node-wide; also keys the two peer-sync limiters below.
     pub push_limiter_trust: crate::rate_limit::TrustedProxy,
+    /// Per-client-IP limiter for `POST /api/v1/sync/trigger` (tight). The route
+    /// requires a signature, but a signature does not cap cost (a did:key farm
+    /// self-registers), and its per-call cost is an O(peers) fan-out, so the IP
+    /// brake is a separate, load-bearing half. Its own bucket so an unsigned
+    /// `/sync/notify` flood cannot drain the signed trigger caller's quota.
+    pub sync_trigger_rate_limiter: RateLimiter,
+    /// Per-client-IP limiter for the peer-write routes (`/peers/announce`,
+    /// `/sync/notify`) (generous). `/sync/notify` reaches the same `enqueue_sync`
+    /// sink as trigger and accepts unsigned requests from known peers, so it is
+    /// braked too; each peer's distinct IP gets its own bucket.
+    pub peer_write_rate_limiter: RateLimiter,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:

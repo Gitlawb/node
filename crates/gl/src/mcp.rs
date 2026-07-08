@@ -990,14 +990,14 @@ async fn call_tool(
                 }
                 u
             };
-            let resp: Value = client.get(&url).await?.json().await?;
+            let resp: Value = client.get_authed(&url).await?.json().await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_show" => {
             let id = args["id"].as_str().context("missing 'id'")?;
             let resp: Value = client
-                .get(&format!("/api/v1/bounties/{id}"))
+                .get_authed(&format!("/api/v1/bounties/{id}"))
                 .await?
                 .json()
                 .await?;
@@ -1185,7 +1185,7 @@ async fn call_tool(
                 (owner, repo.to_string())
             };
             let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/issues"))
+                .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
                 .await?
                 .json()
                 .await?;

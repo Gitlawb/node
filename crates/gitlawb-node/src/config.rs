@@ -140,6 +140,20 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_MAX_PACK_BYTES", default_value_t = 2_147_483_648)]
     pub max_pack_bytes: usize,
 
+    /// Per-client-IP rate limit for `POST /api/v1/sync/trigger`, in requests per
+    /// hour. `/sync/trigger` requires a signature and drives an O(peers) outbound
+    /// fan-out per call, so it gets a tight bucket. `0` disables. Default: 60.
+    #[arg(long, env = "GITLAWB_SYNC_TRIGGER_RATE_LIMIT", default_value_t = 60)]
+    pub sync_trigger_rate_limit: usize,
+
+    /// Per-client-IP rate limit for the peer-write routes (`/peers/announce`,
+    /// `/sync/notify`), in requests per hour. These accept unsigned requests from
+    /// known peers and run at higher frequency, so the bucket is generous. Keeping
+    /// it separate from the trigger bucket stops an unsigned notify flood from
+    /// draining the signed trigger caller's quota. `0` disables. Default: 600.
+    #[arg(long, env = "GITLAWB_PEER_WRITE_RATE_LIMIT", default_value_t = 600)]
+    pub peer_write_rate_limit: usize,
+
     /// Optional address to bind a Prometheus `/metrics` exposition endpoint on.
     /// Example: `127.0.0.1:9091`. Leave empty (default) to disable.
     /// Bind to localhost or a private interface — the metrics endpoint is

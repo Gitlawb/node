@@ -5,9 +5,14 @@
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::http::NodeClient;
 use crate::identity::load_keypair_from_dir;
+
+fn signed_client(node: &str, dir: Option<&std::path::Path>) -> NodeClient {
+    NodeClient::new(node, load_keypair_from_dir(dir).ok())
+}
 
 #[derive(Args)]
 pub struct CertArgs {
@@ -23,6 +28,8 @@ pub enum CertCmd {
         repo: String,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Show a specific ref certificate and verify its signature
     Show {
@@ -32,28 +39,39 @@ pub enum CertCmd {
         id: String,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
 pub async fn run(args: CertArgs) -> Result<()> {
     match args.cmd {
-        CertCmd::List { repo, node } => cmd_list(repo, node).await,
-        CertCmd::Show { repo, id, node } => cmd_show(repo, id, node).await,
+        CertCmd::List { repo, node, dir } => cmd_list(repo, node, dir).await,
+        CertCmd::Show {
+            repo,
+            id,
+            node,
+            dir,
+        } => cmd_show(repo, id, node, dir).await,
     }
 }
 
 /// Resolve "repo" into (owner, name) using the caller's DID when no slash is given.
-async fn resolve_repo(repo: &str, node: &str) -> Result<(String, String)> {
+async fn resolve_repo(
+    repo: &str,
+    node: &str,
+    dir: Option<&std::path::Path>,
+) -> Result<(String, String)> {
     if let Some((owner, name)) = repo.split_once('/') {
         Ok((owner.to_string(), name.to_string()))
     } else {
-        let short = if let Ok(kp) = load_keypair_from_dir(None) {
+        let short = if let Ok(kp) = load_keypair_from_dir(dir) {
             let did = kp.did().to_string();
             did.split(':').next_back().unwrap_or(&did).to_string()
         } else {
-            let client = NodeClient::new(node, None);
+            let client = signed_client(node, dir);
             let info: Value = client
-                .get("/")
+                .get_authed("/")
                 .await?
                 .json()
                 .await
@@ -65,13 +83,13 @@ async fn resolve_repo(repo: &str, node: &str) -> Result<(String, String)> {
     }
 }
 
-async fn cmd_list(repo: String, node: String) -> Result<()> {
-    let (owner, name) = resolve_repo(&repo, &node).await?;
+async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+    let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
 
-    let client = NodeClient::new(&node, None);
+    let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/certs");
     let resp: Value = client
-        .get(&path)
+        .get_authed(&path)
         .await?
         .json()
         .await
@@ -96,16 +114,16 @@ async fn cmd_list(repo: String, node: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_show(repo: String, id: String, node: String) -> Result<()> {
-    let (owner, name) = resolve_repo(&repo, &node).await?;
+async fn cmd_show(repo: String, id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+    let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
 
-    let client = NodeClient::new(&node, None);
+    let client = signed_client(&node, dir.as_deref());
     let id = resolve_cert_id(&client, &owner, &name, &id).await?;
 
     // Fetch the certificate
     let path = format!("/api/v1/repos/{owner}/{name}/certs/{id}");
     let resp = client
-        .get(&path)
+        .get_authed(&path)
         .await?
         .error_for_status()
         .context("certificate not found")?;
@@ -170,7 +188,7 @@ async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str)
 
     let path = format!("/api/v1/repos/{owner}/{name}/certs");
     let resp: Value = client
-        .get(&path)
+        .get_authed(&path)
         .await?
         .error_for_status()
         .context("failed to list certificates")?
