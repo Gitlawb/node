@@ -1066,6 +1066,60 @@ mod tests {
         Some((leader, grandchild))
     }
 
+    /// Retry policy for the fake-git spawn race, shared by `fake_git_run_with_pids`
+    /// and the drop test's inline loop (which can't use the helper — it must keep
+    /// the winning future pending). `nth` retry waits `n * STEP_MS` ms.
+    #[cfg(unix)]
+    const FAKE_GIT_RETRY_ATTEMPTS: u64 = 12;
+    #[cfg(unix)]
+    const FAKE_GIT_BACKOFF_STEP_MS: u64 = 100;
+
+    /// Run a fake-git-based `run` under the parallel test runner, retrying if the
+    /// fake transiently fails to record its pids. Under `cargo test --workspace`
+    /// fork-storm load a freshly-written fake `git` can fail to exec (ETXTBSY: a
+    /// concurrent worker forked while its write fd was still open) or be killed by
+    /// the service timeout before it is scheduled to write its pidfile; both leave
+    /// no pids. These misses are *correlated* (bursty) under fork pressure, so each
+    /// retry backs off (growing) to let a spike subside rather than burning every
+    /// attempt inside one. `pidfile` is removed before each attempt. Returns the
+    /// successful attempt's outcome together with the recorded pids; a genuine
+    /// never-spawns bug still fails loudly after the cap. Retried attempts don't
+    /// leak in practice: a miss almost always means the fake never exec'd (nothing
+    /// to clean up), and a spawn that got far enough is reaped by the timeout/drop
+    /// path before this returns.
+    #[cfg(unix)]
+    async fn fake_git_run_with_pids<R, F, Fut>(
+        pidfile: &std::path::Path,
+        mut run: F,
+    ) -> (R, (i32, i32))
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
+            let _ = std::fs::remove_file(pidfile);
+            let outcome = run().await;
+            // A successful run writes its pids before it returns, so a short poll
+            // catches them (allowing only for fs-visibility lag).
+            for _ in 0..50 {
+                if let Some(p) = read_two_pids(pidfile) {
+                    return (outcome, p);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // Miss: back off before retrying so a bursty fork-pressure spike
+            // subsides (see the doc note on correlated ETXTBSY/EAGAIN failures).
+            tokio::time::sleep(std::time::Duration::from_millis(
+                FAKE_GIT_BACKOFF_STEP_MS * (i + 1),
+            ))
+            .await;
+        }
+        panic!(
+            "fake git failed to spawn and record its pids after {FAKE_GIT_RETRY_ATTEMPTS} \
+             attempts (persistent failure, not a transient parallel-runner miss)"
+        );
+    }
+
     // Dropping the request future mid-flight (client disconnect) must SIGTERM the
     // whole group so git AND its pack-objects grandchild die together. Goes RED
     // if `process_group(0)` or the guard-arming is removed: without its own
@@ -1083,34 +1137,67 @@ mod tests {
         );
         let git_bin = write_fake_git(tmp.path(), &body);
 
-        let mut fut = Box::pin(run_git_service(
-            git_bin.to_str().unwrap(),
-            "git-upload-pack",
-            tmp.path(),
-            Bytes::new(),
-            Duration::from_secs(60),
-        ));
+        // Retry under fork-storm load: a freshly-written fake `git` can transiently
+        // fail to exec (ETXTBSY) or exit before recording its pids; both leave no
+        // pids and are independent per attempt (see fake_git_run_with_pids). The
+        // winning attempt's future is kept PENDING so the drop below exercises the
+        // client-disconnect teardown. Dropping a losing attempt's future makes its
+        // guard reap anything that spawned, so retries don't leak.
+        let (fut, grandchild) = {
+            let mut attempt = 0u64;
+            loop {
+                attempt += 1;
+                let _ = std::fs::remove_file(&pidfile);
+                let mut fut = Box::pin(run_git_service(
+                    git_bin.to_str().unwrap(),
+                    "git-upload-pack",
+                    tmp.path(),
+                    Bytes::new(),
+                    Duration::from_secs(60),
+                ));
 
-        // Advance the future until the fake has spawned its grandchild.
-        let mut pids = None;
-        for _ in 0..500 {
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
-            if let Some(p) = read_two_pids(&pidfile) {
-                pids = Some(p);
-                break;
-            }
-        }
-        // Dropping the future (below or on the None arm) makes tokio reap the
-        // fake leader itself, so only the grandchild needs panic-cleanup —
-        // carrying the already-reaped leader pid risks SIGKILLing a recycled pid
-        // under parallel test load.
-        let (_leader, grandchild) = match pids {
-            Some(p) => p,
-            // Drop the still-armed future first so its guard reaps the fake
-            // group, then fail — otherwise a spawn hiccup orphans the processes.
-            None => {
-                drop(fut);
-                panic!("fake git should spawn a grandchild and write its pids");
+                // Advance the future a slice at a time until the fake records its
+                // pids. `Ok(_)` means run_git_service returned before the pidfile
+                // appeared (spawn error / early exit); stop polling then, since
+                // re-polling a completed future panics with `async fn resumed after
+                // completion`. Read the pidfile first so a fake that wrote its pids
+                // and then exited is still captured.
+                let mut pids = None;
+                for _ in 0..500 {
+                    let finished =
+                        tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut)
+                            .await
+                            .is_ok();
+                    if let Some(p) = read_two_pids(&pidfile) {
+                        pids = Some(p);
+                        break;
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                // Only the grandchild needs panic-cleanup: dropping the future makes
+                // tokio reap the fake leader, and carrying the reaped leader pid
+                // risks SIGKILLing a recycled pid under parallel test load.
+                match pids {
+                    Some((_leader, g)) => break (fut, g),
+                    None => {
+                        // Transient spawn miss: drop the still-armed future so its
+                        // guard reaps anything that spawned, then back off (growing)
+                        // so a bursty fork-pressure spike subsides before retrying.
+                        drop(fut);
+                        assert!(
+                            attempt < FAKE_GIT_RETRY_ATTEMPTS,
+                            "fake git failed to spawn and record its pids after \
+                             {FAKE_GIT_RETRY_ATTEMPTS} attempts (persistent failure, \
+                             not a transient parallel-runner miss)"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            FAKE_GIT_BACKOFF_STEP_MS * attempt,
+                        ))
+                        .await;
+                    }
+                }
             }
         };
         let _cleanup = ReapOnPanic(vec![grandchild]);
@@ -1159,20 +1246,20 @@ mod tests {
         );
         let git_bin = write_fake_git(tmp.path(), &body);
 
-        let result = run_git_service(
-            git_bin.to_str().unwrap(),
-            "git-upload-pack",
-            tmp.path(),
-            Bytes::new(),
-            Duration::from_secs(60),
-        )
-        .await;
-
         // wait_with_output already reaped the fake leader, so only the grandchild
         // needs panic-cleanup — SIGKILLing the reaped leader pid could hit a
-        // recycled pid under parallel test load.
-        let (_leader, grandchild) =
-            read_two_pids(&pidfile).expect("fake git should have written its pids");
+        // recycled pid under parallel test load. Retry the run so a transient spawn
+        // miss under fork-storm load doesn't fail the test (see fake_git_run_with_pids).
+        let (result, (_leader, grandchild)) = fake_git_run_with_pids(&pidfile, || {
+            run_git_service(
+                git_bin.to_str().unwrap(),
+                "git-upload-pack",
+                tmp.path(),
+                Bytes::new(),
+                Duration::from_secs(60),
+            )
+        })
+        .await;
         let _cleanup = ReapOnPanic(vec![grandchild]);
 
         assert!(result.is_err(), "non-zero git exit must surface as Err");
@@ -1205,17 +1292,18 @@ mod tests {
         );
         let git_bin = write_fake_git(tmp.path(), &body);
 
-        let result = run_git_service(
-            git_bin.to_str().unwrap(),
-            "git-upload-pack",
-            tmp.path(),
-            Bytes::new(),
-            Duration::from_secs(60),
-        )
+        // Retry the run so a transient spawn miss under fork-storm load doesn't
+        // fail the test (see fake_git_run_with_pids).
+        let (result, (_leader, grandchild)) = fake_git_run_with_pids(&pidfile, || {
+            run_git_service(
+                git_bin.to_str().unwrap(),
+                "git-upload-pack",
+                tmp.path(),
+                Bytes::new(),
+                Duration::from_secs(60),
+            )
+        })
         .await;
-
-        let (_leader, grandchild) =
-            read_two_pids(&pidfile).expect("fake git should have written its pids");
         let _cleanup = ReapOnPanic(vec![grandchild]);
 
         assert!(result.is_ok(), "zero-exit git must surface as Ok");
@@ -1249,22 +1337,23 @@ mod tests {
         );
         let git_bin = write_fake_git(tmp.path(), &body);
 
-        // Generous vs the fake's microsecond pidfile write, so a loaded runner
-        // can't fire the timeout before the fake records its pids; still far under
-        // the 5s outer bound.
-        let git_timeout = Duration::from_millis(1000);
         // Outer bound well above git_timeout: if run_git_service's own timeout is
         // broken it hangs, and this fires instead so we assert-fail, not hang.
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(5),
-            run_git_service(
-                git_bin.to_str().unwrap(),
-                "git-upload-pack",
-                tmp.path(),
-                Bytes::new(),
-                git_timeout,
-            ),
-        )
+        // fake_git_run_with_pids retries a transient spawn/schedule miss under
+        // fork-storm load and returns the pidfile the fake recorded.
+        let git_timeout = Duration::from_millis(1000);
+        let (outcome, (_leader, grandchild)) = fake_git_run_with_pids(&pidfile, || {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                run_git_service(
+                    git_bin.to_str().unwrap(),
+                    "git-upload-pack",
+                    tmp.path(),
+                    Bytes::new(),
+                    git_timeout,
+                ),
+            )
+        })
         .await;
 
         assert!(
@@ -1280,17 +1369,7 @@ mod tests {
         );
 
         // The hung git's group must be torn down (the armed guard fires on the
-        // timeout return), not leaked. Poll the pidfile for fs-visibility rather
-        // than a single read that could race a loaded runner.
-        let mut pids = None;
-        for _ in 0..200 {
-            if let Some(p) = read_two_pids(&pidfile) {
-                pids = Some(p);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let (_leader, grandchild) = pids.expect("fake git should have written its pids");
+        // timeout return), not leaked.
         let _cleanup = ReapOnPanic(vec![grandchild]);
         let mut gone = false;
         for _ in 0..500 {
@@ -1331,33 +1410,30 @@ mod tests {
         );
         let git_bin = write_fake_git(tmp.path(), &body);
 
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(10),
-            run_git_service(
-                git_bin.to_str().unwrap(),
-                "git-upload-pack",
-                tmp.path(),
-                Bytes::new(),
-                Duration::from_millis(300),
-            ),
-        )
+        // fake_git_run_with_pids retries a transient spawn/schedule miss under
+        // fork-storm load and returns the pids the fake recorded; the outer 10s
+        // bound fires only if run_git_service's own timeout is broken (so we
+        // assert-fail rather than hang), well above the git_timeout plus the
+        // SIGKILL-escalation reap of the SIGTERM-ignoring grandchild.
+        let git_timeout = Duration::from_millis(300);
+        let (outcome, (leader, grandchild)) = fake_git_run_with_pids(&pidfile, || {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                run_git_service(
+                    git_bin.to_str().unwrap(),
+                    "git-upload-pack",
+                    tmp.path(),
+                    Bytes::new(),
+                    git_timeout,
+                ),
+            )
+        })
         .await;
         assert!(outcome.is_ok(), "must return via its own timeout, not hang");
         assert!(outcome.unwrap().is_err(), "a hung git must surface as Err");
 
         // The WHOLE group (leader AND the lingering grandchild) must be gone by the
         // time we get here.
-        // Poll for fs-visibility of the pidfile rather than a single read that
-        // could race a loaded runner where the fake hasn't written it yet.
-        let mut pids = None;
-        for _ in 0..200 {
-            if let Some(p) = read_two_pids(&pidfile) {
-                pids = Some(p);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let (leader, grandchild) = pids.expect("fake git should have written its pids");
         let _cleanup = ReapOnPanic(vec![grandchild]);
         assert!(
             !alive(leader) && !alive(grandchild),
