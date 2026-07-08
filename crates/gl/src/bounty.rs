@@ -8,6 +8,10 @@ use std::path::PathBuf;
 use crate::http::NodeClient;
 use crate::identity::load_keypair_from_dir;
 
+fn signed_client(node: &str, dir: Option<&std::path::Path>) -> NodeClient {
+    NodeClient::new(node, load_keypair_from_dir(dir).ok())
+}
+
 #[derive(Args)]
 pub struct BountyArgs {
     #[command(subcommand)]
@@ -49,6 +53,8 @@ pub enum BountyCmd {
         status: Option<String>,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Show details of a specific bounty
     Show {
@@ -56,6 +62,8 @@ pub enum BountyCmd {
         id: String,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
     /// Claim an open bounty
     Claim {
@@ -121,8 +129,13 @@ pub async fn run(args: BountyArgs) -> Result<()> {
             node,
             dir,
         } => cmd_create(repo, title, amount, issue, tx_hash, deadline, node, dir).await,
-        BountyCmd::List { repo, status, node } => cmd_list(repo, status, node).await,
-        BountyCmd::Show { id, node } => cmd_show(id, node).await,
+        BountyCmd::List {
+            repo,
+            status,
+            node,
+            dir,
+        } => cmd_list(repo, status, node, dir).await,
+        BountyCmd::Show { id, node, dir } => cmd_show(id, node, dir).await,
         BountyCmd::Claim {
             id,
             wallet,
@@ -192,8 +205,13 @@ async fn cmd_create(
     Ok(())
 }
 
-async fn cmd_list(repo: Option<String>, status: Option<String>, node: String) -> Result<()> {
-    let client = NodeClient::new(&node, None);
+async fn cmd_list(
+    repo: Option<String>,
+    status: Option<String>,
+    node: String,
+    dir: Option<PathBuf>,
+) -> Result<()> {
+    let client = signed_client(&node, dir.as_deref());
 
     let url = if let Some(ref repo) = repo {
         let (owner, name) = repo
@@ -214,7 +232,7 @@ async fn cmd_list(repo: Option<String>, status: Option<String>, node: String) ->
     };
 
     let resp = client
-        .get(&url)
+        .get_authed(&url)
         .await
         .context("failed to connect to node")?;
     let body: Value = resp.json().await.unwrap_or_default();
@@ -237,9 +255,9 @@ async fn cmd_list(repo: Option<String>, status: Option<String>, node: String) ->
     Ok(())
 }
 
-async fn cmd_show(id: String, node: String) -> Result<()> {
-    let client = NodeClient::new(&node, None);
-    let resp = client.get(&format!("/api/v1/bounties/{id}")).await?;
+async fn cmd_show(id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
+    let client = signed_client(&node, dir.as_deref());
+    let resp = client.get_authed(&format!("/api/v1/bounties/{id}")).await?;
 
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or_default();
@@ -462,7 +480,7 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_list(None, None, server.url()).await.unwrap();
+        cmd_list(None, None, server.url(), None).await.unwrap();
     }
 
     #[tokio::test]
@@ -506,7 +524,7 @@ mod tests {
             .create_async()
             .await;
 
-        let err = cmd_show("nonexistent".to_string(), server.url())
+        let err = cmd_show("nonexistent".to_string(), server.url(), None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));

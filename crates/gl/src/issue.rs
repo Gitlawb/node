@@ -10,6 +10,10 @@ use uuid::Uuid;
 use crate::http::NodeClient;
 use crate::identity::load_keypair_from_dir;
 
+fn signed_client(node: &str, dir: Option<&std::path::Path>) -> NodeClient {
+    NodeClient::new(node, load_keypair_from_dir(dir).ok())
+}
+
 #[derive(Args)]
 pub struct IssueArgs {
     #[command(subcommand)]
@@ -215,10 +219,10 @@ async fn cmd_create(
 async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
 
-    let client = NodeClient::new(&node, None);
+    let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/issues");
     let resp: Value = client
-        .get(&path)
+        .get_authed(&path)
         .await?
         .json()
         .await
@@ -254,10 +258,10 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 async fn cmd_show(repo: String, id: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
 
-    let client = NodeClient::new(&node, None);
+    let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/issues/{id}");
     let resp = client
-        .get(&path)
+        .get_authed(&path)
         .await
         .context("failed to connect to node")?;
     let status = resp.status();
@@ -347,10 +351,10 @@ async fn cmd_issue_comments(
     dir: Option<PathBuf>,
 ) -> Result<()> {
     let (owner, name) = resolve_repo(&repo, &node, dir.as_deref()).await?;
-    let client = NodeClient::new(&node, None);
+    let client = signed_client(&node, dir.as_deref());
 
     let resp: Value = client
-        .get(&format!(
+        .get_authed(&format!(
             "/api/v1/repos/{owner}/{name}/issues/{id}/comments"
         ))
         .await?

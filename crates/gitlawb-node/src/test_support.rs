@@ -2388,4 +2388,1163 @@ mod tests {
         );
         assert!(!body.contains("DANGLING SECRET"));
     }
+
+    // ---------------------------------------------------------------------------
+    // Issue #120 — repo-scoped read surfaces visibility gate
+    // ---------------------------------------------------------------------------
+
+    #[sqlx::test]
+    async fn list_certs_gate_denies_anon_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCERTSOWNER0000000000000000000000000000000";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs",
+                    axum::routing::get(crate::api::certs::list_certs),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(anon_get(
+                "/api/v1/repos/zCERTSOWNER0000000000000000000000000000000/secret-repo/certs",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn list_certs_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCERTSOWNER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs",
+                    axum::routing::get(crate::api::certs::list_certs),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                "/api/v1/repos/zCERTSOWNER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/secret-repo/certs",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn get_cert_gate_denies_anon_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCERTGETOWN00000000000000000000000000000000";
+        let repo = seed_private_repo(owner, "secret-repo");
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+
+        let cert = crate::db::RefCertificate {
+            id: "real-cert-120".into(),
+            repo_id,
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "b".repeat(40),
+            pusher_did: owner.into(),
+            node_did: "did:key:zNode".into(),
+            signature: "sig".into(),
+            issued_at: "2026-01-01T00:00:00Z".into(),
+        };
+        state.db.insert_ref_certificate(&cert).await.unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs/{id}",
+                    axum::routing::get(crate::api::certs::get_cert),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(anon_get("/api/v1/repos/zCERTGETOWN00000000000000000000000000000000/secret-repo/certs/real-cert-120"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn get_cert_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCERTGETOWN1BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let repo = seed_private_repo(owner, "secret-repo");
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+        let cert = crate::db::RefCertificate {
+            id: "real-cert-120".into(),
+            repo_id: repo_id.clone(),
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "b".repeat(40),
+            pusher_did: owner.into(),
+            node_did: "did:key:zNode".into(),
+            signature: "sig".into(),
+            issued_at: "2026-01-01T00:00:00Z".into(),
+        };
+        state.db.insert_ref_certificate(&cert).await.unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs/{id}",
+                    axum::routing::get(crate::api::certs::get_cert),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                "/api/v1/repos/zCERTGETOWN1BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB/secret-repo/certs/real-cert-120",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn list_issues_gate_denies_anon_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zISSOWNER0000000000000000000000000000000000";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/issues",
+                    axum::routing::get(crate::api::issues::list_issues),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(anon_get(
+                "/api/v1/repos/zISSOWNER0000000000000000000000000000000000/secret-repo/issues",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn list_issues_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zISSOWNER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let slug = owner.replace([':', '/'], "_");
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let repo_dir = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("secret-repo.git");
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        let _repo_guard = DirGuard(repo_dir.clone());
+        crate::git::store::init_bare(&repo_dir).unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/issues",
+                    axum::routing::get(crate::api::issues::list_issues),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                "/api/v1/repos/zISSOWNER1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/secret-repo/issues",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn get_issue_gate_denies_anon_on_private(pool: PgPool) {
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let state = test_state(pool).await;
+        let owner = "did:key:zISGETOWN0000000000000000000000000000000000";
+        let slug = owner.replace([':', '/'], "_");
+        let repo_dir = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("secret-repo.git");
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        crate::git::store::init_bare(&repo_dir).unwrap();
+        let _repo_guard = DirGuard(repo_dir.clone());
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let issue_id = "real-issue-120";
+        let issue_json = serde_json::json!({
+            "id": issue_id,
+            "title": "Test Issue",
+            "body": "test body",
+            "author": owner,
+            "created_at": "2026-01-01T00:00:00Z",
+            "status": "open",
+        });
+        crate::git::issues::create_issue(&repo_dir, issue_id, &issue_json.to_string()).unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/issues/{id}",
+                    axum::routing::get(crate::api::issues::get_issue),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(anon_get("/api/v1/repos/zISGETOWN0000000000000000000000000000000000/secret-repo/issues/real-issue-120"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn get_issue_gate_admits_owner_on_private(pool: PgPool) {
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let state = test_state(pool).await;
+        let owner = "did:key:zISGETOWN1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let slug = owner.replace([':', '/'], "_");
+        let repo_dir = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("secret-repo.git");
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        let _repo_guard = DirGuard(repo_dir.clone());
+        crate::git::store::init_bare(&repo_dir).unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let issue_id = "real-issue-120";
+        let issue_json = serde_json::json!({
+            "id": issue_id,
+            "title": "Test Issue",
+            "body": "test body",
+            "author": owner,
+            "created_at": "2026-01-01T00:00:00Z",
+            "status": "open",
+        });
+        crate::git::issues::create_issue(&repo_dir, issue_id, &issue_json.to_string()).unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/issues/{id}",
+                    axum::routing::get(crate::api::issues::get_issue),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/secret-repo/issues/{issue_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn list_issue_comments_gate_denies_anon_on_private(pool: PgPool) {
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let state = test_state(pool).await;
+        let owner = "did:key:zISCMTOWN0000000000000000000000000000000000";
+        let slug = owner.replace([':', '/'], "_");
+        let repo_dir = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("secret-repo.git");
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        crate::git::store::init_bare(&repo_dir).unwrap();
+        let _repo_guard = DirGuard(repo_dir.clone());
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let issue_id = "real-issue-comment-120";
+        let issue_json = serde_json::json!({
+            "id": issue_id,
+            "title": "Test Issue",
+            "body": "test body",
+            "author": owner,
+            "created_at": "2026-01-01T00:00:00Z",
+            "status": "open",
+        });
+        crate::git::issues::create_issue(&repo_dir, issue_id, &issue_json.to_string()).unwrap();
+        let comment = crate::db::IssueComment {
+            id: "real-comment-120".into(),
+            issue_id: issue_id.into(),
+            author_did: owner.into(),
+            body: "a comment".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        state.db.create_issue_comment(&comment).await.unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/issues/{id}/comments",
+                    axum::routing::get(crate::api::issues::list_issue_comments),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(anon_get("/api/v1/repos/zISCMTOWN0000000000000000000000000000000000/secret-repo/issues/real-issue-comment-120/comments"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn list_issue_comments_gate_admits_owner_on_private(pool: PgPool) {
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let state = test_state(pool).await;
+        let owner = "did:key:zISCMTOWN1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short_key = "zISCMTOWN1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let slug = owner.replace([':', '/'], "_");
+        let repo_dir = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("secret-repo.git");
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        let _repo_guard = DirGuard(repo_dir.clone());
+        crate::git::store::init_bare(&repo_dir).unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let issue_id = "real-issue-comment-120";
+        let issue_json = serde_json::json!({
+            "id": issue_id,
+            "title": "Test Issue",
+            "body": "test body",
+            "author": owner,
+            "created_at": "2026-01-01T00:00:00Z",
+            "status": "open",
+        });
+        crate::git::issues::create_issue(&repo_dir, issue_id, &issue_json.to_string()).unwrap();
+        let comment = crate::db::IssueComment {
+            id: "real-comment-120".into(),
+            issue_id: issue_id.into(),
+            author_did: owner.into(),
+            body: "a comment".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        state.db.create_issue_comment(&comment).await.unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/issues/{id}/comments",
+                    axum::routing::get(crate::api::issues::list_issue_comments),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{short_key}/secret-repo/issues/{issue_id}/comments"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn list_labels_gate_denies_anon_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLABELOWN00000000000000000000000000000000000";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels",
+                    axum::routing::get(crate::api::labels::list_labels),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(anon_get(
+                "/api/v1/repos/zLABELOWN00000000000000000000000000000000000/secret-repo/labels",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn list_labels_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLABELOWN1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels",
+                    axum::routing::get(crate::api::labels::list_labels),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                "/api/v1/repos/zLABELOWN1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/secret-repo/labels",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn list_repo_bounties_gate_denies_anon_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zBONOWNER00000000000000000000000000000000000";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get(
+                "/api/v1/repos/zBONOWNER00000000000000000000000000000000000/secret-repo/bounties",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn get_star_status_gate_denies_anon_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zSTAROWN000000000000000000000000000000000000";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/star",
+                    axum::routing::get(crate::api::stars::get_star_status),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(anon_get(
+                "/api/v1/repos/zSTAROWN000000000000000000000000000000000000/secret-repo/star",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn get_star_status_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zSTAROWN1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/star",
+                    axum::routing::get(crate::api::stars::get_star_status),
+                )
+                .with_state(state.clone())
+        };
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                "/api/v1/repos/zSTAROWN1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/secret-repo/star",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn list_repo_bounties_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let owner = kp.did().to_string();
+        let short = owner.split(':').next_back().unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(&owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let uri = format!("/api/v1/repos/{short}/secret-repo/bounties");
+        let sig = gitlawb_core::http_sig::sign_request(&kp, "GET", &uri, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn get_cert_rejects_cross_repo_idor(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCERTIDOROWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        let repo_a = seed_private_repo(owner, "repo-a");
+        state.db.create_repo(&repo_a).await.unwrap();
+
+        let repo_b = seed_private_repo(owner, "repo-b");
+        let repo_b_id = repo_b.id.clone();
+        state.db.create_repo(&repo_b).await.unwrap();
+
+        let cert = crate::db::RefCertificate {
+            id: "cert-in-b".into(),
+            repo_id: repo_b_id,
+            ref_name: "refs/heads/main".into(),
+            old_sha: "0".repeat(40),
+            new_sha: "b".repeat(40),
+            pusher_did: owner.into(),
+            node_did: "did:key:zNode".into(),
+            signature: "sig".into(),
+            issued_at: "2026-01-01T00:00:00Z".into(),
+        };
+        state.db.insert_ref_certificate(&cert).await.unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs/{id}",
+                    axum::routing::get(crate::api::certs::get_cert),
+                )
+                .with_state(state.clone())
+        };
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{short}/repo-a/certs/cert-in-b"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn list_issue_comments_rejects_cross_repo_idor(pool: PgPool) {
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let state = test_state(pool).await;
+        let owner = "did:key:zISSCMTIDORAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        let slug = owner.replace([':', '/'], "_");
+
+        let repo_dir_a = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("repo-a.git");
+        let _ = std::fs::remove_dir_all(&repo_dir_a);
+        std::fs::create_dir_all(repo_dir_a.parent().unwrap()).unwrap();
+        crate::git::store::init_bare(&repo_dir_a).unwrap();
+        let _guard_a = DirGuard(repo_dir_a.clone());
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "repo-a"))
+            .await
+            .unwrap();
+
+        let repo_dir_b = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("repo-b.git");
+        let _ = std::fs::remove_dir_all(&repo_dir_b);
+        std::fs::create_dir_all(repo_dir_b.parent().unwrap()).unwrap();
+        crate::git::store::init_bare(&repo_dir_b).unwrap();
+        let _guard_b = DirGuard(repo_dir_b.clone());
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "repo-b"))
+            .await
+            .unwrap();
+
+        let issue_id = "idor-issue-120";
+        let issue_json = serde_json::json!({
+            "id": issue_id,
+            "title": "Test Issue",
+            "body": "test body",
+            "author": owner,
+            "created_at": "2026-01-01T00:00:00Z",
+            "status": "open",
+        });
+        crate::git::issues::create_issue(&repo_dir_b, issue_id, &issue_json.to_string()).unwrap();
+        let comment = crate::db::IssueComment {
+            id: "idor-comment-120".into(),
+            issue_id: issue_id.into(),
+            author_did: owner.into(),
+            body: "a comment".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        state.db.create_issue_comment(&comment).await.unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/issues/{id}/comments",
+                    axum::routing::get(crate::api::issues::list_issue_comments),
+                )
+                .with_state(state.clone())
+        };
+
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{short}/repo-a/issues/{issue_id}/comments"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn repo_gate_quarantined_repo_denied(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zQUARANTINEOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        let mut repo = seed_private_repo(owner, "quarantined-repo");
+        repo.is_public = true; // Make it public to prove quarantine still denies it
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+
+        state.db.set_repo_quarantine(&repo_id, true).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get(&format!(
+                "/api/v1/repos/{short}/quarantined-repo/issues"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn repo_gate_public_repo_anon_read_admitted(pool: PgPool) {
+        struct DirGuard(std::path::PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let state = test_state(pool).await;
+        let owner = "did:key:zPUBLICREPOOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+
+        let slug = owner.replace([':', '/'], "_");
+        let repo_dir = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("public-repo.git");
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        std::fs::create_dir_all(repo_dir.parent().unwrap()).unwrap();
+        crate::git::store::init_bare(&repo_dir).unwrap();
+        let _repo_guard = DirGuard(repo_dir.clone());
+
+        let mut repo = seed_private_repo(owner, "public-repo");
+        repo.is_public = true;
+        state.db.create_repo(&repo).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get(&format!(
+                "/api/v1/repos/{short}/public-repo/issues"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[sqlx::test]
+    async fn get_bounty_gate_denies_anon_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zGNB0UNTYANONPRIVOWNERAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+        let bounty = crate::db::BountyRecord {
+            id: "anon-private-bounty".into(),
+            repo_owner: owner.into(),
+            repo_name: "secret-repo".into(),
+            issue_id: None,
+            title: "Secret Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties/anon-private-bounty"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn get_bounty_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let owner = kp.did().to_string();
+        state
+            .db
+            .create_repo(&seed_private_repo(&owner, "secret-repo"))
+            .await
+            .unwrap();
+        let bounty = crate::db::BountyRecord {
+            id: "owner-private-bounty".into(),
+            repo_owner: owner.clone(),
+            repo_name: "secret-repo".into(),
+            issue_id: None,
+            title: "Owner Bounty".into(),
+            amount: 200,
+            creator_did: owner.clone(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let uri = "/api/v1/bounties/owner-private-bounty";
+        let sig = gitlawb_core::http_sig::sign_request(&kp, "GET", uri, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn list_all_bounties_filters_private_repos_for_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zLSTALLBOUNTYOWNERAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Private repo with a bounty (should be filtered out)
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "private-bounty-repo"))
+            .await
+            .unwrap();
+        let private_bounty = crate::db::BountyRecord {
+            id: "private-bounty-1".into(),
+            repo_owner: owner.into(),
+            repo_name: "private-bounty-repo".into(),
+            issue_id: None,
+            title: "Private Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&private_bounty).await.unwrap();
+
+        // Public repo with a bounty (should be visible to anon)
+        let mut public_repo = seed_private_repo(owner, "public-bounty-repo");
+        public_repo.is_public = true;
+        state.db.create_repo(&public_repo).await.unwrap();
+        let public_bounty = crate::db::BountyRecord {
+            id: "public-bounty-1".into(),
+            repo_owner: owner.into(),
+            repo_name: "public-bounty-repo".into(),
+            issue_id: None,
+            title: "Public Bounty".into(),
+            amount: 200,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-02T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&public_bounty).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(anon_get("/api/v1/bounties")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let bounties = body["bounties"].as_array().unwrap();
+        assert_eq!(bounties.len(), 1, "anon should see only the public bounty");
+        assert_eq!(bounties[0]["id"], "public-bounty-1");
+    }
+
+    #[sqlx::test]
+    async fn list_all_bounties_same_private_repo_two_bounties_anon_sees_none(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zP1SAME2PRIVBOUNTYOWNERAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        for id in ["private-bounty-a", "private-bounty-b"] {
+            let b = crate::db::BountyRecord {
+                id: id.into(),
+                repo_owner: owner.into(),
+                repo_name: "secret-repo".into(),
+                issue_id: None,
+                title: "Private Bounty".into(),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            };
+            state.db.create_bounty(&b).await.unwrap();
+        }
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(anon_get("/api/v1/bounties")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let bounties = body["bounties"].as_array().unwrap();
+        assert_eq!(
+            bounties.len(),
+            0,
+            "anon should see 0 bounties from private repo even with 2 entries"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_all_bounties_past_private_window_finds_public(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zP2PASTPRIVWINDOWOWNERAAAAAAAAAAAAAAAAA";
+
+        // Seed a private repo with 6 bounties (more than one page of page_size=5)
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "private-repo"))
+            .await
+            .unwrap();
+        for i in 0..6 {
+            let b = crate::db::BountyRecord {
+                id: format!("private-bounty-{i}"),
+                repo_owner: owner.into(),
+                repo_name: "private-repo".into(),
+                issue_id: None,
+                title: format!("Private Bounty {i}"),
+                amount: 100,
+                creator_did: owner.into(),
+                claimant_did: None,
+                claimant_wallet: None,
+                pr_id: None,
+                status: "open".into(),
+                created_at: format!("2026-01-{:02}T00:00:00Z", 6 - i),
+                claimed_at: None,
+                submitted_at: None,
+                completed_at: None,
+                deadline_secs: 86400,
+                tx_hash: None,
+            };
+            state.db.create_bounty(&b).await.unwrap();
+        }
+
+        // Public repo with a bounty created after the private ones
+        let mut pub_repo = seed_private_repo(owner, "public-repo");
+        pub_repo.is_public = true;
+        state.db.create_repo(&pub_repo).await.unwrap();
+        let pub_bounty = crate::db::BountyRecord {
+            id: "public-bounty-past-window".into(),
+            repo_owner: owner.into(),
+            repo_name: "public-repo".into(),
+            issue_id: None,
+            title: "Public Bounty".into(),
+            amount: 200,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            // This is older (earlier date) so it appears after the private ones in DESC order
+            created_at: "2025-12-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&pub_bounty).await.unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(anon_get("/api/v1/bounties?limit=1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let bounties = body["bounties"].as_array().unwrap();
+        assert_eq!(
+            bounties.len(),
+            1,
+            "anon should find the public bounty past the private window"
+        );
+        assert_eq!(bounties[0]["id"], "public-bounty-past-window");
+    }
+
+    #[sqlx::test]
+    async fn star_repo_gate_denies_non_reader_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zSTARGATEDENYOWNERAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let non_owner_kp = gitlawb_core::identity::Keypair::generate();
+        let uri = format!("/api/v1/repos/{short}/secret-repo/star");
+        let sig = gitlawb_core::http_sig::sign_request(&non_owner_kp, "PUT", &uri, b"");
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri(&uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn unstar_repo_gate_denies_non_reader_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zUNSTARGATEDENYOWNERAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+
+        let non_owner_kp = gitlawb_core::identity::Keypair::generate();
+        let uri = format!("/api/v1/repos/{short}/secret-repo/star");
+        let sig = gitlawb_core::http_sig::sign_request(&non_owner_kp, "DELETE", &uri, b"");
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri(&uri)
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn repo_gate_owner_bare_key_vs_full_did(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zBAREKEYFULLDIDOWNERAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+
+        // Save repo with bare key as owner
+        let repo = seed_private_repo(short, "bare-repo");
+        state.db.create_repo(&repo).await.unwrap();
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs",
+                    axum::routing::get(crate::api::certs::list_certs),
+                )
+                .with_state(state.clone())
+        };
+
+        // Caller is full DID, should match bare key in DB
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{short}/bare-repo/certs"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
 }

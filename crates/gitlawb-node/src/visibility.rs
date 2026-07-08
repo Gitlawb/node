@@ -33,7 +33,8 @@ fn nfc(s: &str) -> String {
 /// would let a non-key canonical row bypass the #124 visibility gate.
 fn is_owner(owner_did: &str, caller: &str) -> bool {
     let owner_short = crate::db::normalize_owner_key(owner_did);
-    caller == owner_did || caller == owner_short
+    let caller_short = crate::db::normalize_owner_key(caller);
+    owner_short == caller_short
 }
 
 /// The match prefix for a glob: "/" stays "/", "/secret/**" becomes "/secret".

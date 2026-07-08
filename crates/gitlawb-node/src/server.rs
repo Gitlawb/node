@@ -248,7 +248,8 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/agents/{did}/bounties",
             get(bounties::agent_bounty_stats),
-        );
+        )
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Profile routes (write — require HTTP Signature) ─────────────────
     let profile_write_routes = add_auth_layers(

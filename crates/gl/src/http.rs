@@ -45,6 +45,15 @@ impl NodeClient {
             .with_context(|| format!("GET {url}"))
     }
 
+    /// GET that signs when a keypair is available; falls back to unsigned for public repos.
+    pub async fn get_authed(&self, path: &str) -> Result<reqwest::Response> {
+        if self.keypair.is_some() {
+            self.get_signed(path).await
+        } else {
+            self.get(path).await
+        }
+    }
+
     /// GET with RFC 9421 HTTP Signature auth, for owner-only read endpoints.
     /// Signs over the empty body (same shape the node verifies for signed reads).
     pub async fn get_signed(&self, path: &str) -> Result<reqwest::Response> {
