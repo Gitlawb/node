@@ -936,6 +936,9 @@ pub async fn git_receive_pack(
         let app = git_service_app_error(&e);
         match &app {
             AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
+            AppError::BadRequest(msg) => {
+                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
+            }
             _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
         }
         app
