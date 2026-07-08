@@ -442,6 +442,7 @@ pub fn build_router(state: AppState) -> Router {
     let meta_routes = Router::new()
         .route("/", get(node_info))
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/api/v1/p2p/info", get(p2p_info))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/contracts", get(contracts_info));
@@ -482,6 +483,10 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+async fn ready() -> Json<serde_json::Value> {
+    Json(json!({ "status": "ready" }))
 }
 
 async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {

@@ -111,6 +111,11 @@ impl IntoResponse for AppError {
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
             AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "git_timeout", msg.clone()),
+            AppError::Db(sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "db_unavailable",
+                "database is temporarily unavailable".into(),
+            ),
             AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
             AppError::Internal(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

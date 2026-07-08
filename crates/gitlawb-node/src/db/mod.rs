@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
@@ -266,7 +267,36 @@ impl Db {
     }
 
     pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPool::connect(database_url).await?;
+        let max_connections = std::env::var("GITLAWB_DB_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(50);
+        let acquire_timeout_secs = std::env::var("GITLAWB_DB_ACQUIRE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(5);
+        let connect_timeout_secs = std::env::var("GITLAWB_DB_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(10);
+
+        info!(
+            max_connections,
+            acquire_timeout_secs, connect_timeout_secs, "connecting to postgres"
+        );
+        let pool = tokio::time::timeout(
+            Duration::from_secs(connect_timeout_secs),
+            PgPoolOptions::new()
+                .max_connections(max_connections)
+                .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
+                .connect(database_url),
+        )
+        .await
+        .context("postgres connect timed out")??;
+        info!(max_connections, "postgres pool configured");
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
