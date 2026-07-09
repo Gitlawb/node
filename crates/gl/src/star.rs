@@ -34,12 +34,14 @@ pub enum StarCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Show star count for a repository (no auth required)
+    /// Show star count for a repository
     Count {
         /// Repository in owner/repo format
         repo: String,
         #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
         node: String,
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -47,7 +49,7 @@ pub async fn run(args: StarArgs) -> Result<()> {
     match args.cmd {
         StarCmd::Add { repo, node, dir } => cmd_add(repo, node, dir).await,
         StarCmd::Remove { repo, node, dir } => cmd_remove(repo, node, dir).await,
-        StarCmd::Count { repo, node } => cmd_count(repo, node).await,
+        StarCmd::Count { repo, node, dir } => cmd_count(repo, node, dir).await,
     }
 }
 
@@ -110,15 +112,15 @@ async fn cmd_remove(repo: String, node: String, dir: Option<PathBuf>) -> Result<
     Ok(())
 }
 
-async fn cmd_count(repo: String, node: String) -> Result<()> {
+async fn cmd_count(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = repo
         .split_once('/')
         .map(|(o, n)| (o.to_string(), n.to_string()))
         .context("use owner/repo format for count (e.g. alice/myrepo)")?;
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
     let resp = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/star"))
+        .get_authed(&format!("/api/v1/repos/{owner}/{name}/star"))
         .await
         .context("failed to connect to node")?;
 
@@ -310,16 +312,20 @@ mod tests {
             .create_async()
             .await;
 
-        cmd_count("alice/myrepo".to_string(), server.url())
+        cmd_count("alice/myrepo".to_string(), server.url(), None)
             .await
             .unwrap();
     }
 
     #[tokio::test]
     async fn test_cmd_count_requires_slash() {
-        let err = cmd_count("noslash".to_string(), "http://127.0.0.1:1".to_string())
-            .await
-            .unwrap_err();
+        let err = cmd_count(
+            "noslash".to_string(),
+            "http://127.0.0.1:1".to_string(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("owner/repo format"));
     }
 

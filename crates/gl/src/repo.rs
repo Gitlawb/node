@@ -658,10 +658,10 @@ async fn cmd_label_remove(
 
 async fn cmd_label_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = resolve_owner_repo_pair(&repo, &node, dir.as_deref()).await?;
-    let client = NodeClient::new(&node, None);
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
     let resp: Value = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/labels"))
+        .get_authed(&format!("/api/v1/repos/{owner}/{name}/labels"))
         .await?
         .json()
         .await

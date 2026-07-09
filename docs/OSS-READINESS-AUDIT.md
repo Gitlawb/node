@@ -120,7 +120,7 @@ Positive:
 Risks:
 
 - Many commands default to the public node; `git-remote-gitlawb` defaults to localhost. This split should be called out in README examples.
-- `gl sync trigger` signs the request when a local identity is available and falls back to the legacy unsigned request for live compatibility.
+- `gl sync trigger` requires a local identity and always sends a signed request; the `/api/v1/sync/trigger` route rejects unsigned calls, so the command fails locally when no identity is configured.
 - Several CLI commands parse dynamic JSON responses permissively; good for compatibility, but error messages can hide response-shape regressions.
 
 ## CI and release readiness

@@ -110,19 +110,28 @@ pub async fn create_bounty(
     Ok((StatusCode::CREATED, Json(bounty)))
 }
 
+const MAX_BOUNTY_LIMIT: i64 = 200;
+
 /// GET /api/v1/repos/{owner}/{repo}/bounties
 pub async fn list_repo_bounties(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Query(q): Query<ListBountiesQuery>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
+
+    let limit = q.limit.unwrap_or(50).clamp(1, MAX_BOUNTY_LIMIT);
     let bounties = state
         .db
         .list_bounties(
             Some(&owner),
             Some(&repo),
             q.status.as_deref(),
-            q.limit.unwrap_or(50),
+            limit,
+            None,
+            None,
         )
         .await?;
 
@@ -133,25 +142,92 @@ pub async fn list_repo_bounties(
 pub async fn list_all_bounties(
     State(state): State<AppState>,
     Query(q): Query<ListBountiesQuery>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let bounties = state
-        .db
-        .list_bounties(None, None, q.status.as_deref(), q.limit.unwrap_or(50))
-        .await?;
+    let raw_limit = q.limit.unwrap_or(50);
+    let limit = raw_limit.clamp(1, MAX_BOUNTY_LIMIT);
 
-    Ok(Json(serde_json::json!({ "bounties": bounties })))
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let mut memo = std::collections::HashMap::new();
+    let mut allowed: Vec<BountyRecord> = Vec::new();
+    let page_size = (limit * 5).clamp(1, 200);
+    let max_scanned = 10_000i64;
+    let mut total_scanned: i64 = 0;
+    let mut cursor: Option<(String, String)> = None;
+
+    while (allowed.len() as i64) < limit {
+        let after = cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str()));
+        let bounties = state
+            .db
+            .list_bounties(
+                None,
+                None,
+                q.status.as_deref(),
+                page_size,
+                after.map(|(ts, _)| ts),
+                after.map(|(_, id)| id),
+            )
+            .await?;
+        if bounties.is_empty() {
+            break;
+        }
+
+        total_scanned += bounties.len() as i64;
+        if total_scanned > max_scanned {
+            return Err(AppError::Incomplete(
+                "too many rows scanned; refine your filters".into(),
+            ));
+        }
+
+        let last = bounties.last().unwrap();
+        for b in &bounties {
+            if (allowed.len() as i64) >= limit {
+                break;
+            }
+            let key = format!("{}/{}", b.repo_owner, b.repo_name);
+            let admitted = if let Some(&result) = memo.get(&key) {
+                result
+            } else {
+                let result = crate::api::authorize_repo_read(
+                    &state,
+                    &b.repo_owner,
+                    &b.repo_name,
+                    caller,
+                    "/",
+                )
+                .await
+                .is_ok();
+                memo.insert(key, result);
+                result
+            };
+            if admitted {
+                allowed.push(b.clone());
+            }
+        }
+        cursor = Some((last.created_at.clone(), last.id.clone()));
+    }
+
+    Ok(Json(serde_json::json!({ "bounties": allowed })))
 }
 
 /// GET /api/v1/bounties/{id}
 pub async fn get_bounty(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state
-        .db
-        .get_bounty(&id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
+    let not_found = || AppError::NotFound(format!("bounty {id} not found"));
+
+    let bounty = state.db.get_bounty(&id).await?.ok_or_else(not_found)?;
+
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    if crate::api::authorize_repo_read(&state, &bounty.repo_owner, &bounty.repo_name, caller, "/")
+        .await
+        .is_err()
+    {
+        return Err(not_found());
+    }
+
     Ok(Json(bounty))
 }
 
@@ -162,11 +238,22 @@ pub async fn claim_bounty(
     Path(id): Path<String>,
     Json(req): Json<ClaimBountyRequest>,
 ) -> Result<Json<BountyRecord>> {
-    let bounty = state
-        .db
-        .get_bounty(&id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("bounty {id} not found")))?;
+    let not_found = || AppError::NotFound(format!("bounty {id} not found"));
+
+    let bounty = state.db.get_bounty(&id).await?.ok_or_else(not_found)?;
+
+    if crate::api::authorize_repo_read(
+        &state,
+        &bounty.repo_owner,
+        &bounty.repo_name,
+        Some(auth.0.as_str()),
+        "/",
+    )
+    .await
+    .is_err()
+    {
+        return Err(not_found());
+    }
 
     if bounty.status != "open" {
         return Err(AppError::BadRequest(format!(
