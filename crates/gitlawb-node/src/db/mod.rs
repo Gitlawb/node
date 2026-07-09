@@ -1972,11 +1972,12 @@ impl Db {
 impl Db {
     /// Insert a ref certificate, or update it if a row for `(repo_id, ref_name)`
     /// already exists.  The update only applies when the incoming row is newer
-    /// (compared by `issued_at`), so a late-landing older cert cannot regress a
-    /// ref's persisted state.  Returns the id of the row that is now in the
-    /// database (the original id on upsert; the passed id on insert).
-    pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<String> {
-        let row: (String,) = sqlx::query_as(
+    /// (compared by `issued_at`, which assumes a monotonic wall clock), so a
+    /// late-landing older cert cannot regress a ref's persisted state.  Returns
+    /// the full row as it now exists in the database (the original row on a
+    /// rejected upsert; the passed row on insert).
+    pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
+        let row = sqlx::query(
             "INSERT INTO ref_certificates
              (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
@@ -1993,7 +1994,7 @@ impl Db {
                                  THEN EXCLUDED.signature ELSE ref_certificates.signature END,
                 issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
-             RETURNING id",
+             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -2006,7 +2007,7 @@ impl Db {
         .bind(&cert.issued_at)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row.0)
+        Ok(row_to_cert(row))
     }
 
     pub async fn list_ref_certificates(
@@ -4910,6 +4911,10 @@ mod ref_certificate_tests {
         assert!(certs.is_empty());
     }
 
+    /// NOTE: this test hand-copies the migration SQL as string literals and will
+    /// silently drift if the v10 migration block changes.  The load-bearing
+    /// upgrade-path test is `v10_upgrade_dedup_via_migration`, which fires the
+    /// real MIGRATIONS[v10] entry via run_migrations().
     #[sqlx::test]
     async fn v10_dedup_removes_old_duplicates(pool: PgPool) {
         let db = db(pool.clone()).await;
