@@ -185,3 +185,341 @@ async fn obtain_proof(cfg: IcaptchaCfg) -> Result<String> {
         .await
         .context("iCaptcha solver task panicked")?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitlawb_core::identity::Keypair;
+    use mockito::Server;
+
+    fn test_keypair() -> Keypair {
+        Keypair::generate()
+    }
+
+    fn headers_from_pairs(pairs: &[(&str, &str)]) -> reqwest::header::HeaderMap {
+        let mut h = reqwest::header::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                k.parse::<reqwest::header::HeaderName>().unwrap(),
+                v.parse::<reqwest::header::HeaderValue>().unwrap(),
+            );
+        }
+        h
+    }
+
+    // ── icaptcha_cfg ────────────────────────────────────────────────────
+
+    #[test]
+    fn icaptcha_cfg_returns_some_when_both_headers_present() {
+        let kp = test_keypair();
+        let client = NodeClient::new("http://localhost", Some(kp.clone()));
+        let headers = headers_from_pairs(&[
+            ("x-icaptcha-url", "https://icaptcha.gitlawb.com"),
+            ("x-icaptcha-level", "3"),
+        ]);
+        let cfg = client.icaptcha_cfg(&headers).unwrap().unwrap();
+        assert_eq!(cfg.did, kp.did().to_string());
+        assert_eq!(cfg.level, 3);
+    }
+
+    #[test]
+    fn icaptcha_cfg_defaults_level_when_only_url_present() {
+        let kp = test_keypair();
+        let client = NodeClient::new("http://localhost", Some(kp));
+        let headers = headers_from_pairs(&[("x-icaptcha-url", "https://icaptcha.gitlawb.com")]);
+        let cfg = client.icaptcha_cfg(&headers).unwrap().unwrap();
+        assert_eq!(cfg.level, icaptcha_client::DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn icaptcha_cfg_defaults_url_when_only_level_present() {
+        let kp = test_keypair();
+        let client = NodeClient::new("http://localhost", Some(kp));
+        let headers = headers_from_pairs(&[("x-icaptcha-level", "5")]);
+        let cfg = client.icaptcha_cfg(&headers).unwrap().unwrap();
+        assert_eq!(cfg.level, 5);
+    }
+
+    #[test]
+    fn icaptcha_cfg_returns_none_without_icaptcha_headers() {
+        let client = NodeClient::new("http://localhost", Some(test_keypair()));
+        let headers = reqwest::header::HeaderMap::new();
+        assert!(client.icaptcha_cfg(&headers).unwrap().is_none());
+    }
+
+    #[test]
+    fn icaptcha_cfg_returns_none_with_unrelated_headers() {
+        let client = NodeClient::new("http://localhost", Some(test_keypair()));
+        let headers = headers_from_pairs(&[("content-type", "application/json")]);
+        assert!(client.icaptcha_cfg(&headers).unwrap().is_none());
+    }
+
+    #[test]
+    fn icaptcha_cfg_errors_when_no_keypair() {
+        let client = NodeClient::new("http://localhost", None);
+        let headers = headers_from_pairs(&[("x-icaptcha-level", "3")]);
+        let err = client.icaptcha_cfg(&headers).unwrap_err();
+        assert!(err.to_string().contains("identity keypair"));
+    }
+
+    #[test]
+    fn icaptcha_cfg_ignores_unparseable_level() {
+        let client = NodeClient::new("http://localhost", Some(test_keypair()));
+        let headers = headers_from_pairs(&[
+            ("x-icaptcha-url", "https://icaptcha.gitlawb.com"),
+            ("x-icaptcha-level", "not-a-number"),
+        ]);
+        let cfg = client.icaptcha_cfg(&headers).unwrap().unwrap();
+        assert_eq!(cfg.level, icaptcha_client::DEFAULT_LEVEL);
+    }
+
+    // ── send_once ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_once_attaches_proof_header_when_provided() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/test")
+            .match_header("x-icaptcha-proof", "test.proof.token")
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), None);
+        let resp = client
+            .send_once("POST", "/api/test", b"{}", Some("test.proof.token"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn send_once_omits_proof_header_when_not_provided() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/test")
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), None);
+        let resp = client
+            .send_once("POST", "/api/test", b"{}", None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn send_once_signs_request_when_keypair_present() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/test")
+            .match_header("Signature", mockito::Matcher::Any)
+            .match_header("Signature-Input", mockito::Matcher::Any)
+            .match_header("Content-Digest", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), Some(test_keypair()));
+        let resp = client
+            .send_once("POST", "/api/test", b"{}", None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn send_once_does_not_sign_when_no_keypair() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/test")
+            .with_status(200)
+            .with_body("ok")
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), None);
+        let resp = client
+            .send_once("POST", "/api/test", b"{}", None)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        m.assert();
+    }
+
+    // ── send_signed ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_signed_returns_non_icaptcha_403_without_retry() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/register")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"forbidden"}"#)
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), Some(test_keypair()));
+        let resp = client
+            .send_signed("POST", "/api/register", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_first_response_on_success() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/register")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"created"}"#)
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), Some(test_keypair()));
+        let resp = client
+            .send_signed("POST", "/api/register", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+        m.assert();
+    }
+
+    #[tokio::test]
+    async fn send_signed_handles_405_not_icaptcha() {
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/register")
+            .with_status(405)
+            .with_body(r#"{"error":"method not allowed"}"#)
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), Some(test_keypair()));
+        let resp = client
+            .send_signed("POST", "/api/register", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 405);
+        m.assert();
+    }
+
+    // ── send_signed iCaptcha retry (full integration) ────────────────────
+
+    /// Helper: set GITLAWB_ICAPTCHA_URL so the iCaptcha client trusts the mock
+    /// server URL and clean it up on drop.
+    struct IcaptchaEnv;
+
+    impl IcaptchaEnv {
+        fn new(url: &str) -> Self {
+            std::env::set_var("GITLAWB_ICAPTCHA_URL", url);
+            IcaptchaEnv
+        }
+    }
+
+    impl Drop for IcaptchaEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("GITLAWB_ICAPTCHA_URL");
+        }
+    }
+
+    /// Helper: set up a mock iCaptcha server that responds to challenge + answer.
+    struct MockIcaptcha {
+        _c: mockito::Mock,
+        _a: mockito::Mock,
+        _guard: IcaptchaEnv,
+        url: String,
+    }
+
+    impl MockIcaptcha {
+        async fn new(server: &mut mockito::ServerGuard) -> Self {
+            let url = server.url();
+            let guard = IcaptchaEnv::new(&url);
+            let _c = server
+                .mock("POST", "/v1/challenge")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(
+                    r#"{"challengeId":"c1","type":"arithmetic","difficulty":1,"prompt":"What is 1 + 1?","token":"tk1"}"#,
+                )
+                .create_async()
+                .await;
+            let _a = server
+                .mock("POST", "/v1/answer")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"status":"passed","proof":"mock.proof"}"#)
+                .create_async()
+                .await;
+            Self {
+                _c,
+                _a,
+                _guard: guard,
+                url,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn send_signed_solves_icaptcha_and_retries_to_success() {
+        let mut node = Server::new_async().await;
+        let mut icaptcha = Server::new_async().await;
+        let _ic = MockIcaptcha::new(&mut icaptcha).await;
+
+        let _n1 = node
+            .mock("POST", "/api/register")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_header("x-icaptcha-url", &_ic.url)
+            .with_header("x-icaptcha-level", "3")
+            .with_body(r#"{"error":"icaptcha_proof_required"}"#)
+            .create_async()
+            .await;
+        let _n2 = node
+            .mock("POST", "/api/register")
+            .match_header("x-icaptcha-proof", mockito::Matcher::Any)
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"status":"created"}"#)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(test_keypair()));
+        let resp = client
+            .send_signed("POST", "/api/register", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_403_after_icaptcha_retries_exhausted() {
+        let mut node = Server::new_async().await;
+        let mut icaptcha = Server::new_async().await;
+        let _ic = MockIcaptcha::new(&mut icaptcha).await;
+
+        // Every call to the node returns 403 with iCaptcha headers, exhausting
+        // MAX_ICAPTCHA_RETRIES (2). The original + 2 retries = 3 node calls.
+        let _n = node
+            .mock("POST", "/api/register")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_header("x-icaptcha-url", &_ic.url)
+            .with_header("x-icaptcha-level", "3")
+            .with_body(r#"{"error":"icaptcha_proof_required"}"#)
+            .create_async()
+            .await;
+
+        let client = NodeClient::new(node.url(), Some(test_keypair()));
+        let resp = client
+            .send_signed("POST", "/api/register", b"{}")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403);
+    }
+}

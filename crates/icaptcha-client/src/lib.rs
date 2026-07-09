@@ -81,11 +81,28 @@ fn sanitize_excerpt(s: &str) -> String {
     out
 }
 
-/// Whether `u` parses as an `https` URL.
+/// Whether `u` parses as a trusted URL (https in production; also allows
+/// localhost/127.0.0.1 in tests so the full iCaptcha retry path can be
+/// exercised against a mockito server).
 fn is_https(u: &str) -> bool {
-    reqwest::Url::parse(u)
+    let parsed = reqwest::Url::parse(u);
+    if parsed
+        .as_ref()
         .map(|p| p.scheme() == "https")
         .unwrap_or(false)
+    {
+        return true;
+    }
+    // Allow local test servers in test builds (mockito runs on 127.0.0.1:PORT).
+    #[cfg(test)]
+    if parsed
+        .as_ref()
+        .map(|p| p.host_str() == Some("127.0.0.1") || p.host_str() == Some("localhost"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    false
 }
 
 /// Lowercased host of a URL, if it parses and has one.
