@@ -566,6 +566,28 @@ pub async fn git_info_refs(
         }
     }
 
+    // Per-caller read sub-cap (#174): acquired AFTER the visibility + push-rate
+    // gates (KTD7) so a denied or rate-limited request never consumes a caller's
+    // scarce read slot. Applies to BOTH advertisements. Held for the whole op.
+    let caller_key = read_caller_key(
+        auth.as_ref().map(|e| e.0 .0.as_str()),
+        &headers,
+        peer,
+        state.push_limiter_trust,
+    );
+    let _caller_permit = match &caller_key {
+        Some(k) => match state.git_read_per_caller.try_acquire(k) {
+            Some(p) => Some(p),
+            None => {
+                tracing::warn!(repo = %name, caller = %k, "per-caller read cap reached; shedding info/refs with 503");
+                return Err(AppError::Overloaded(
+                    "git read service at capacity for this caller, retry shortly".into(),
+                ));
+            }
+        },
+        None => None,
+    };
+
     // For receive-pack (push), download the latest from Tigris so the client
     // sees the same refs that acquire_write() will operate on.
     let disk_path = if service == "git-receive-pack" {
@@ -608,6 +630,23 @@ fn git_permit(
     })
 }
 
+/// Resolve the per-caller key for the read sub-cap (#174): the authenticated DID
+/// when the caller signed (via `optional_signature`), else the trusted client IP
+/// (`client_key`). `None` when neither is available — such a request is bounded by
+/// the global read pool only, never a 500. The per-source-IP key is only as
+/// granular as `trust`; see the `max_concurrent_reads_per_caller` config doc.
+fn read_caller_key(
+    caller_did: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    trust: crate::rate_limit::TrustedProxy,
+) -> Option<String> {
+    match caller_did {
+        Some(did) => Some(did.to_string()),
+        None => crate::rate_limit::client_key(headers, peer, trust),
+    }
+}
+
 /// Map an error from a `smart_http` git service call to the right `AppError`:
 /// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
 /// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
@@ -633,6 +672,8 @@ pub async fn git_upload_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     auth: Option<Extension<AuthenticatedDid>>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
     // Shed with a 503 before spawning git when the concurrency cap is saturated;
@@ -657,6 +698,23 @@ pub async fn git_upload_pack(
         tracing::debug!(repo = %name, caller = ?caller, "upload-pack read denied by visibility");
         return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
+
+    // Per-caller read sub-cap (#174): after the visibility gate (KTD7) so a
+    // visibility-denied caller never consumes a scarce read slot. Keyed per-DID
+    // when signed, else per-source-IP; no resolvable key -> global read pool only.
+    let caller_key = read_caller_key(caller, &headers, peer, state.push_limiter_trust);
+    let _caller_permit = match &caller_key {
+        Some(k) => match state.git_read_per_caller.try_acquire(k) {
+            Some(p) => Some(p),
+            None => {
+                tracing::warn!(repo = %name, caller = %k, "per-caller read cap reached; shedding upload-pack with 503");
+                return Err(AppError::Overloaded(
+                    "git read service at capacity for this caller, retry shortly".into(),
+                ));
+            }
+        },
+        None => None,
+    };
 
     let disk_path = state
         .repo_store
@@ -2615,6 +2673,158 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "receive-pack advertisement must be throttled before the Tigris acquire"
+        );
+    }
+
+    /// #174 SC2 (info_refs probe): the per-caller read sub-cap sheds a caller that
+    /// is already at its concurrency budget on the upload-pack advertisement, while
+    /// a DIFFERENT caller still enters. Remove the sub-cap from `git_info_refs` and
+    /// the same-caller assertion goes green-not-503 — this is the info_refs half of
+    /// the two-handler mutation probe.
+    #[sqlx::test]
+    async fn info_refs_per_caller_cap_sheds_one_caller_not_others(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6pcadv", "pc", "/tmp/pc-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.31:5000".parse().unwrap();
+        // Fill this caller's single read slot (a clone shares the Arc-backed map).
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first slot for this caller");
+
+        // Same caller (IP) at its cap -> shed 503 before the git/Tigris work.
+        let router = crate::server::build_router(state.clone());
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcadv/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a caller already at its per-caller read cap must shed the advertisement with 503"
+        );
+
+        // A DIFFERENT caller (IP) has its own budget -> not shed by the per-caller cap.
+        let other: SocketAddr = "203.0.113.32:5000".parse().unwrap();
+        let router2 = crate::server::build_router(state.clone());
+        let mut req2 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcadv/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(other));
+        assert_ne!(
+            router2.oneshot(req2).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a different caller must not be shed by another caller's saturated budget"
+        );
+    }
+
+    /// #174 SC2 (upload_pack probe): the same per-caller shed on the POST
+    /// upload-pack path. Remove the sub-cap from `git_upload_pack` and this goes
+    /// green-not-503 — the upload_pack half of the two-handler mutation probe.
+    #[sqlx::test]
+    async fn upload_pack_per_caller_cap_sheds_one_caller_not_others(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6pcupl", "pc", "/tmp/pc-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.41:5000".parse().unwrap();
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first slot for this caller");
+
+        let router = crate::server::build_router(state.clone());
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/z6pcupl/pc/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a caller already at its per-caller read cap must shed upload-pack with 503"
+        );
+
+        let other: SocketAddr = "203.0.113.42:5000".parse().unwrap();
+        let router2 = crate::server::build_router(state.clone());
+        let mut req2 = Request::builder()
+            .method(Method::POST)
+            .uri("/z6pcupl/pc/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(other));
+        assert_ne!(
+            router2.oneshot(req2).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a different caller must not be shed by another caller's saturated budget"
+        );
+    }
+
+    /// #174 SC2 (None-key): a request with no resolvable caller key (no ConnectInfo,
+    /// no trusted header) must NOT be shed by the per-caller cap even when another
+    /// caller's budget is full — it is bounded by the global read pool only. A None
+    /// key never keys into the map, so it never 503s from the per-caller sub-cap.
+    #[sqlx::test]
+    async fn info_refs_none_key_bypasses_per_caller_cap(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6pcnone", "pc", "/tmp/pc-nonexistent", None, false)
+            .await
+            .unwrap();
+        // Saturate an unrelated caller's budget; the None-key request must be
+        // unaffected because it never keys into the per-caller map.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire("203.0.113.99")
+            .expect("hold an unrelated caller's slot");
+
+        // No ConnectInfo inserted -> PeerAddr is None -> no per-caller key.
+        let router = crate::server::build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcnone/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        assert_ne!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a request with no resolvable caller key must not be shed by the per-caller cap"
         );
     }
 

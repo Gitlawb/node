@@ -382,6 +382,9 @@ async fn main() -> Result<()> {
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.max_concurrent_git_pushes,
         )),
+        git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.max_concurrent_reads_per_caller,
+        ),
     };
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled

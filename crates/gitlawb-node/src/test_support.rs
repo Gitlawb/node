@@ -85,6 +85,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         // Generous — no test drives the handler-level shed (git_permit is unit-tested).
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
     }
 }
 
