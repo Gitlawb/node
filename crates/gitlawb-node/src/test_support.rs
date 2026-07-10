@@ -83,7 +83,8 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         // Generous — no test drives the handler-level shed (git_permit is unit-tested).
-        git_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
     }
 }
 
@@ -199,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn git_info_refs_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
-        state.git_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
 
         let router = Router::new()
             .route(
@@ -235,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn git_upload_pack_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
-        state.git_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
 
         let router = Router::new()
             .route(
@@ -273,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn git_receive_pack_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
-        state.git_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        state.git_write_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
 
         let router = Router::new()
             .route(
@@ -295,7 +296,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "an exhausted git semaphore must shed git-receive-pack with 503 before touching the DB"
+            "an exhausted write pool must shed git-receive-pack with 503 before touching the DB"
         );
         assert_eq!(
             resp.headers()
@@ -303,6 +304,42 @@ mod tests {
                 .and_then(|h| h.to_str().ok()),
             Some("1"),
             "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// #174 (SC1, load-bearing): a saturated READ pool must NOT shed an
+    /// authenticated push — the write pool is a separate budget. Read pool at zero,
+    /// write pool with capacity: the push proceeds PAST admission (it then errors on
+    /// the placeholder DB, but crucially it is not a 503). Route git-receive-pack
+    /// back to the read pool and this goes red — that is the isolation proof.
+    #[tokio::test]
+    async fn git_receive_pack_not_shed_by_exhausted_read_pool() {
+        let mut state = test_state_lazy();
+        // Read pool exhausted as if a flood of anonymous clones held every slot.
+        state.git_read_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        // Write pool keeps its default capacity from test_state_lazy.
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .with_state(state);
+        let owner = "did:key:zRECVCROSSBOUNDARYAAAAAAAAAAAAAAAAAAAAA";
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/alice/repo.git/git-receive-pack",
+                Body::from(&b"0000"[..]),
+            ))
+            .await
+            .unwrap();
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted READ pool must not shed a push — the write pool is a separate budget (#174)"
         );
     }
 
