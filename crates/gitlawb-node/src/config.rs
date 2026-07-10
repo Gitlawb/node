@@ -172,9 +172,9 @@ pub struct Config {
     /// its process group torn down, in seconds. Bounds a git that neither
     /// finishes nor disconnects. Must be positive; set it very large to
     /// effectively disable the bound. Default: 600s (10 min), generous for large
-    /// clones. Does not cover the ref advertisement (`info/refs`) or the
-    /// withheld-blob fetch path (`upload_pack_excluding`, a blocking
-    /// `spawn_blocking` a tokio timeout cannot cancel); both remain unbounded.
+    /// clones. Also bounds the ref advertisement (`info/refs`) and the withheld-blob
+    /// pack build (`upload_pack_excluding`'s pack-objects stage), which now share the
+    /// same timeout + process-group teardown (#174).
     #[arg(
         long,
         env = "GITLAWB_GIT_SERVICE_TIMEOUT_SECS",
@@ -243,20 +243,20 @@ pub struct Config {
     /// cap is a different axis (500 connections each fan out to git +
     /// pack-objects + threads). Size below the process budget with headroom.
     ///
-    /// A permit is held for the whole op. upload-pack/receive-pack are
-    /// duration-bounded by `git_service_timeout_secs`, but the `info/refs`
-    /// advertisement and the withheld-blob (`upload_pack_excluding`) path are
-    /// not, so a hung git on those two paths holds its slot until it exits, so a
-    /// stuck advertisement permanently costs one unit of capacity. Bounding
-    /// those paths' duration is tracked as separate follow-up.
+    /// This is the READ pool (`git_read_semaphore`): upload-pack and both info/refs
+    /// advertisements. Authenticated pushes draw from a separate write pool
+    /// (`max_concurrent_git_pushes`) and each caller is additionally bounded by
+    /// `max_concurrent_reads_per_caller`, so an anonymous flood can neither shed a
+    /// push nor monopolize reads (#174).
     ///
-    /// The same two paths have the mirror gap on cancellation: the permit frees
-    /// when the handler future drops (client disconnect), but neither reaps its
-    /// git child — `info/refs` runs a bare `Command`, and `upload_pack_excluding`
-    /// a blocking `spawn_blocking` a dropped future cannot cancel — so the child
-    /// runs to completion after its slot is freed and live git can briefly exceed
-    /// the cap. The main pack path (`run_git_service`) tears its process group
-    /// down on drop, so this is confined to the same two follow-up paths.
+    /// A permit is held for the whole op, and every capped path is now
+    /// duration-bounded and reaps its process group on disconnect: upload-pack,
+    /// receive-pack, and both info/refs advertisements run under
+    /// `git_service_timeout_secs` with `process_group(0)` teardown, and the
+    /// withheld-blob (`upload_pack_excluding`) pack-objects stage runs on the async
+    /// side under the same teardown. So a hung git can no longer pin a slot and a
+    /// client disconnect no longer orphans its git child (#174 closed the two
+    /// duration/cancellation gaps this comment previously tracked as follow-up).
     ///
     /// Default: 128. Must be between 1 and 1_048_576; the ceiling keeps the value
     /// well under tokio's `Semaphore` permit limit so an oversized value is a
