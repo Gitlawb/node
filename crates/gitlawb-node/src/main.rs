@@ -287,6 +287,26 @@ async fn main() -> Result<()> {
     let rate_limiter =
         rate_limit::RateLimiter::new_bounded(10, std::time::Duration::from_secs(3600), 200_000);
 
+    // Per-client-IP flood brake for the creation endpoints. The per-DID limiter
+    // above is bypassed by a DID farm (one throwaway did:key per repo), which is
+    // exactly how the recurring spam-repo floods get past both it and the
+    // iCaptcha gate. Keyed on the resolved client IP so a single-source flood is
+    // capped regardless of how many identities it mints. Sized well above any
+    // legitimate per-IP creation rate; GITLAWB_CREATE_RATE_LIMIT overrides, 0
+    // disables. Bounded key set — the key is a client-influenced IP.
+    let create_limit = std::env::var("GITLAWB_CREATE_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(120);
+    let create_ip_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        create_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if create_limit == 0 {
+        tracing::warn!("GITLAWB_CREATE_RATE_LIMIT=0 — per-IP creation rate limiting disabled");
+    }
+
     // Push-path flood brake: max git-receive-pack requests per client IP per
     // hour (counts both the info/refs advertisement and the push POST). Sized
     // for heavy agent automation while still stopping flood traffic (the June
@@ -352,6 +372,7 @@ async fn main() -> Result<()> {
         machine_id,
         repo_store,
         rate_limiter,
+        create_ip_rate_limiter,
         push_rate_limiter,
         push_limiter_trust,
         sync_trigger_rate_limiter,
@@ -388,6 +409,7 @@ async fn main() -> Result<()> {
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
         let rl = state.rate_limiter.clone();
+        let create_ip_rl = state.create_ip_rate_limiter.clone();
         let push_rl = state.push_rate_limiter.clone();
         let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
         let peer_write_rl = state.peer_write_rate_limiter.clone();
@@ -398,6 +420,7 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
                         rl.cleanup().await;
+                        create_ip_rl.cleanup().await;
                         push_rl.cleanup().await;
                         sync_trigger_rl.cleanup().await;
                         peer_write_rl.cleanup().await;
