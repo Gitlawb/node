@@ -19,6 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
+pub mod pow;
 pub mod solvers;
 
 /// Default iCaptcha service base URL (used when the node doesn't advertise one).
@@ -201,6 +202,10 @@ pub struct Challenge {
     pub difficulty: u32,
     pub prompt: String,
     pub token: String,
+    /// Proof-of-work to solve and echo back as `powNonce` on the answer. Present
+    /// only when the service has PoW enabled; absent/None means no PoW required.
+    #[serde(default)]
+    pub pow: Option<pow::PowChallenge>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,7 +242,28 @@ pub fn obtain_proof(cfg: &IcaptchaCfg, solver: Option<&Solver>) -> Result<String
                 )
             })?;
 
-        match submit_answer(&client, cfg, &challenge.token, &answer)? {
+        // Solve the proof-of-work bound to this challenge, if the service
+        // requires one. A required-but-unsolvable PoW (unknown algorithm or a
+        // difficulty above our cap) is a hard error — submitting without it
+        // would just be rejected.
+        let pow_nonce = match &challenge.pow {
+            Some(p) => Some(pow::solve(p).ok_or_else(|| {
+                anyhow!(
+                    "cannot solve iCaptcha proof-of-work (algorithm '{}', difficulty {})",
+                    p.algorithm,
+                    p.difficulty
+                )
+            })?),
+            None => None,
+        };
+
+        match submit_answer(
+            &client,
+            cfg,
+            &challenge.token,
+            &answer,
+            pow_nonce.as_deref(),
+        )? {
             AnswerResult::Passed { proof } => return Ok(proof),
             AnswerResult::Continue { challenge: next } => challenge = next,
             AnswerResult::Failed { reason } => {
@@ -273,11 +299,14 @@ fn submit_answer(
     cfg: &IcaptchaCfg,
     token: &str,
     answer: &str,
+    pow_nonce: Option<&str>,
 ) -> Result<AnswerResult> {
     let url = format!("{}/v1/answer", cfg.url.trim_end_matches('/'));
-    let mut req = client
-        .post(&url)
-        .json(&json!({ "token": token, "answer": answer }));
+    let mut body = json!({ "token": token, "answer": answer });
+    if let Some(nonce) = pow_nonce {
+        body["powNonce"] = json!(nonce);
+    }
+    let mut req = client.post(&url).json(&body);
     if let Some(key) = &cfg.api_key {
         req = req.bearer_auth(key);
     }
