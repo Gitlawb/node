@@ -114,6 +114,12 @@ mod did_tests {
         assert!(!did_matches("did:key:zABC", "did:key:zXYZ"));
         assert!(!did_matches("zABC", "zXYZ"));
     }
+
+    #[test]
+    fn empty_did_matches() {
+        assert!(did_matches("", ""));
+        assert!(did_matches("", "did:key:"));
+    }
 }
 
 /// Drift guard (plan 002 §Gate-type table, Step 5). Every in-scope mutation

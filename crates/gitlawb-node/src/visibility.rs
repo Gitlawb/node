@@ -25,16 +25,12 @@ fn nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
-/// True if `caller` is the repo owner. Matches exactly or against the
-/// did:key short form — a non-key DID (did:gitlawb:/did:web:) in `owner_did`
-/// never matches a bare short segment, and a non-key DID in `caller` never
-/// matches a did:key owner's short form. Uses `normalize_owner_key` (not
-/// `did_matches`) so the did:key-only rule is stricter: cross-method matching
-/// would let a non-key canonical row bypass the #124 visibility gate.
+/// True if `caller` is the repo owner. Uses [`crate::api::did_matches`] so the
+/// owner check is representation-agnostic within `did:key` (full `did:key:z...`
+/// matches bare `z...` stored by mirror rows) while still denying cross-method
+/// collisions (`did:gitlawb:z...` vs bare `z...`).
 fn is_owner(owner_did: &str, caller: &str) -> bool {
-    let owner_short = crate::db::normalize_owner_key(owner_did);
-    let caller_short = crate::db::normalize_owner_key(caller);
-    owner_short == caller_short
+    crate::api::did_matches(owner_did, caller)
 }
 
 /// The match prefix for a glob: "/" stays "/", "/secret/**" becomes "/secret".
@@ -426,6 +422,35 @@ mod tests {
             ),
             Decision::Allow,
             "full non-key DID still matches itself"
+        );
+    }
+
+    // #153 forward guard: is_owner must match across bare-key / full-did:key
+    // representations should someone revert to single-side normalize_owner_key.
+    #[test]
+    fn bare_owner_full_caller_allows_owner() {
+        let rules = [rule("/", VisibilityMode::A, &[])];
+        assert_eq!(
+            visibility_check(&rules, false, "z6MkOwner", Some("did:key:z6MkOwner"), "/"),
+            Decision::Allow,
+            "bare owner + full did:key caller must match (guard against single-side revert)"
+        );
+    }
+
+    // #153 regression: cross-method DID must still be denied even when the
+    // trailing segment collides with a bare owner key.
+    #[test]
+    fn cross_method_did_denied_with_bare_owner() {
+        let rules = [rule("/", VisibilityMode::A, &[])];
+        assert_eq!(
+            visibility_check(&rules, false, "z6MkFoo", Some("did:gitlawb:z6MkFoo"), "/"),
+            Decision::Deny,
+            "cross-method DID must not match a bare did:key owner"
+        );
+        assert_eq!(
+            visibility_check(&rules, false, "z6MkFoo", Some("did:web:z6MkFoo"), "/"),
+            Decision::Deny,
+            "did:web must not match a bare did:key owner"
         );
     }
 
