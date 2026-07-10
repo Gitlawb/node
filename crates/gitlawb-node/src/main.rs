@@ -378,7 +378,10 @@ async fn main() -> Result<()> {
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
-        git_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
     };
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled

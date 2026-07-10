@@ -509,7 +509,7 @@ pub async fn git_info_refs(
 ) -> Result<Response> {
     // Shed with a 503 before spawning git when the concurrency cap is saturated;
     // held for the whole op (incl. the smart_http call), released on return.
-    let _permit = git_permit(&state.git_semaphore)?;
+    let _permit = git_permit(&state.git_read_semaphore)?;
     let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
     let record = state
@@ -637,7 +637,7 @@ pub async fn git_upload_pack(
 ) -> Result<Response> {
     // Shed with a 503 before spawning git when the concurrency cap is saturated;
     // held for the whole op (incl. the smart_http call), released on return.
-    let _permit = git_permit(&state.git_semaphore)?;
+    let _permit = git_permit(&state.git_read_semaphore)?;
     let name = smart_http_repo_name(&repo)?;
     let record = state
         .db
@@ -876,9 +876,11 @@ pub async fn git_receive_pack(
     body: Bytes,
 ) -> Result<Response> {
     // Shed with a 503 before spawning git when the concurrency cap is saturated.
-    // Acquired at the very top so it wraps the write-guard below; held for the
-    // whole op (incl. the smart_http call), released on return.
-    let _permit = git_permit(&state.git_semaphore)?;
+    // Pushes draw from the dedicated WRITE pool, separate from reads, so a flood of
+    // anonymous reads cannot shed an authenticated push (#174). Acquired at the very
+    // top so it wraps the write-guard below (and precedes the Tigris acquire_write,
+    // bounding concurrent fresh acquires — INV-10); held for the whole op.
+    let _permit = git_permit(&state.git_write_semaphore)?;
     let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "receive-pack request");
     let record = state
