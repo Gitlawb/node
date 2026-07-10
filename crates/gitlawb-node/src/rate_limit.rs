@@ -543,4 +543,66 @@ mod tests {
         assert_eq!(post_from(&router, b).await, StatusCode::OK); // independent bucket
         assert_eq!(post_from(&router, a).await, StatusCode::TOO_MANY_REQUESTS);
     }
+
+    // ── creation-route layering: IP brake runs BEFORE auth ──────────────
+
+    /// A minimal stand-in for the creation route group: an inner "auth" layer
+    /// that rejects every request with 401 (as signature verification would for
+    /// an unsigned caller), wrapped by the per-IP creation limiter as the
+    /// outermost layer — exactly the ordering `server::build_router` applies to
+    /// `/api/v1/repos` et al. Lets us assert the security-relevant property
+    /// (flood traffic is braked before auth burns CPU) without a database, which
+    /// the full `#[sqlx::test]` route test in `api::repos` cannot cover in the
+    /// plain unit-test pass.
+    fn ip_limited_over_auth_router(limiter: IpRateLimiter) -> axum::Router {
+        async fn always_unauthorized(_req: Request, _next: Next) -> Response {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+        axum::Router::new()
+            .route(
+                "/api/v1/repos",
+                axum::routing::post(|| async { StatusCode::CREATED }),
+            )
+            .layer(axum::middleware::from_fn(always_unauthorized))
+            .layer(axum::middleware::from_fn(rate_limit_by_ip))
+            .layer(axum::Extension(limiter))
+    }
+
+    async fn post_repos_from(router: &axum::Router, peer: SocketAddr) -> StatusCode {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/repos")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn creation_ip_brake_rejects_before_auth() {
+        // A DID farm mints a fresh signature per repo, so the per-DID limiter
+        // never trips; the per-IP brake is what stops the flood. It must run
+        // outermost, ahead of auth, so a flood is rejected with 429 before
+        // signature verification — otherwise every request would reach (and pay
+        // for) auth and merely 401.
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::None,
+        });
+        let peer: SocketAddr = "203.0.113.42:7000".parse().unwrap();
+
+        // First request passes the IP brake and reaches the (failing) auth layer.
+        assert_eq!(
+            post_repos_from(&router, peer).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Budget now exhausted: the IP brake short-circuits with 429 *before*
+        // auth — proving the limiter is the outermost layer.
+        assert_eq!(
+            post_repos_from(&router, peer).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an exhausted IP must be braked with 429 before auth runs, not leak to 401"
+        );
+    }
 }
