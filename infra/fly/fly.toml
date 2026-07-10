@@ -44,7 +44,7 @@ primary_region = "iad"
     # and a deploy with a bad DATABASE_URL fails visibly instead of going green.
     interval = "15s"
     timeout = "5s"
-    grace_period = "30s"
+    grace_period = "75s"
     method = "GET"
     path = "/ready"
 
