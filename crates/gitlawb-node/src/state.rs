@@ -51,6 +51,16 @@ pub struct AppState {
     pub repo_store: RepoStore,
     /// Per-DID rate limiter for creation endpoints (repos, issues, PRs)
     pub rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for the same creation endpoints. The per-DID
+    /// limiter above cannot brake a creation flood from a DID farm — one
+    /// throwaway `did:key` per repo means each DID makes a single create call
+    /// and never trips its own bucket. A valid iCaptcha proof does not cap this
+    /// either: the enforced level draws only machine-solvable deterministic
+    /// challenges (and the caller can pin the easy type), so a bot mints a fresh
+    /// DID, solves a proof, and creates a repo unthrottled. Braking on the
+    /// resolved client IP is what actually stops a single-source flood (same
+    /// rationale as `push_rate_limiter`). Keyed by `push_limiter_trust`.
+    pub create_ip_rate_limiter: RateLimiter,
     /// Per-client-IP rate limiter for git-receive-pack. Per-DID limits cannot
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
     /// push path throttles on the resolved client IP instead.

@@ -2578,4 +2578,51 @@ mod tests {
             "receive-pack advertisement must be throttled before the Tigris acquire"
         );
     }
+
+    /// Repo creation must be throttled by the per-IP creation limiter BEFORE
+    /// signature verification — otherwise a DID farm (one throwaway did:key per
+    /// repo, each carrying a valid but machine-solved iCaptcha proof) walks past
+    /// the per-DID limiter and floods the network, as in the recurring spam-repo
+    /// incidents. A 429 (not a 401) on an unsigned request from an exhausted IP
+    /// proves the IP brake runs outermost, ahead of auth.
+    #[sqlx::test]
+    async fn repo_creation_is_rate_limited_by_ip(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Tiny limit, keyed on the socket peer (no trusted proxy).
+        state.create_ip_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.77:7000".parse().unwrap();
+        // Exhaust this peer's single-request budget up front.
+        assert!(
+            state
+                .create_ip_rate_limiter
+                .check(&peer.ip().to_string())
+                .await
+        );
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/repos")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"flood","is_public":true}"#))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let status = router.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "repo creation must be IP-throttled before signature verification"
+        );
+    }
 }

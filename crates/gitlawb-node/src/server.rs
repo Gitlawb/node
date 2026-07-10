@@ -81,8 +81,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tasks", get(tasks::list_tasks))
         .route("/api/v1/tasks/{id}", get(tasks::get_task));
 
-    // ── Rate-limited creation routes — require HTTP Signature + per-DID throttle
+    // ── Rate-limited creation routes — require HTTP Signature, plus a per-DID
+    // throttle AND a per-IP flood brake. The per-DID limiter (inner) caps a
+    // single identity; the per-IP limiter (outer) caps a DID farm that mints a
+    // fresh throwaway did:key per repo to slip past both the per-DID limit and
+    // the iCaptcha gate — the mechanism behind the recurring spam-repo floods.
+    // The per-IP layer wraps the auth layer (outermost = runs first) so flood
+    // traffic is rejected before signature verification burns CPU, matching the
+    // push path.
     let limiter = state.rate_limiter.clone();
+    let create_ip_limiter = rate_limit::IpRateLimiter {
+        limiter: state.create_ip_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
     let creation_routes = add_auth_layers(
         Router::new()
             .route("/api/v1/repos", post(repos::create_repo))
@@ -96,7 +107,9 @@ pub fn build_router(state: AppState) -> Router {
             .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
             .layer(axum::Extension(limiter)),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(create_ip_limiter));
 
     // ── Write routes — require HTTP Signature (no rate limit) ─────────────
     let write_routes = add_auth_layers(
