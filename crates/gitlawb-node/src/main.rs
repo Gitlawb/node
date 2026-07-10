@@ -24,8 +24,14 @@ mod test_support;
 mod visibility;
 mod webhooks;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::{Json, Router};
 use clap::Parser;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -37,6 +43,20 @@ use gitlawb_core::identity::Keypair;
 use config::Config;
 use db::Db;
 use state::AppState;
+
+#[derive(Clone)]
+struct DegradedState {
+    node_did: String,
+    db_startup: Arc<DbStartupStatus>,
+}
+
+/// Two independent counters with no cross-field invariant — atomics, not a
+/// lock, so the retry loop and the degraded handlers never contend.
+#[derive(Default)]
+struct DbStartupStatus {
+    attempts: AtomicU64,
+    next_retry_secs: AtomicU64,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -76,21 +96,101 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION")
     );
     info!("╚══════════════════════════════════════════╝");
-    info!(did = %node_did, "node identity");
-    info!(addr = %config.bind_addr(), "listening");
-
     // Process-wide shutdown signal. One sender lives in AppState (cloned
     // into every handler); main() keeps a clone and flips it on SIGINT
     // or SIGTERM. Tasks that hold a watch::Receiver get notified at
     // their next await point.
     let (shutdown_tx, _shutdown_rx_for_main) = watch::channel(false);
+    spawn_shutdown_signal(shutdown_tx.clone());
 
-    // Connect to PostgreSQL database
-    let db = Arc::new(
-        Db::connect(&config.database_url)
-            .await
-            .context("failed to connect to database")?,
-    );
+    info!(did = %node_did, "node identity");
+    info!(addr = %config.bind_addr(), "binding HTTP listener");
+
+    // Bind HTTP once, before dependency initialization, and keep this socket
+    // for the life of the process. The degraded server accepts on a dup of the
+    // same socket, so the degraded→full handoff never closes the port: while
+    // the full server initializes, connections queue in the shared backlog
+    // instead of being refused.
+    let listener = TcpListener::bind(config.bind_addr())
+        .await
+        .with_context(|| format!("failed to bind to {}", config.bind_addr()))?;
+    let full_std_listener = listener.into_std()?;
+    let degraded_listener = TcpListener::from_std(
+        full_std_listener
+            .try_clone()
+            .context("failed to clone HTTP listener for degraded server")?,
+    )?;
+
+    // Metrics must stay observable during a database outage — the degraded
+    // window is exactly when dashboards need data — so this listener starts
+    // before the DB connects.
+    let metrics_handle = if !config.metrics_addr.is_empty() {
+        match spawn_metrics_server(&config.metrics_addr, shutdown_tx.subscribe()).await {
+            Ok(handle) => {
+                info!(addr = %config.metrics_addr, "metrics endpoint listening");
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(err = %e, addr = %config.metrics_addr, "failed to start metrics endpoint — continuing without");
+                None
+            }
+        }
+    } else {
+        info!("metrics endpoint disabled (GITLAWB_METRICS_ADDR not set)");
+        None
+    };
+
+    let db_startup = Arc::new(DbStartupStatus::default());
+    let (db_ready_tx, db_ready_rx) = watch::channel(false);
+    let mut degraded_handle = tokio::spawn(run_degraded_server(
+        degraded_listener,
+        node_did.to_string(),
+        Arc::clone(&db_startup),
+        db_ready_rx,
+        shutdown_tx.subscribe(),
+    ));
+
+    // Connect to PostgreSQL database. A transient outage or bad secret should
+    // not crash-loop the process and hammer the database provider; permanent
+    // misconfiguration surfaces through error-level logs and the /ready check.
+    let db = tokio::select! {
+        db = connect_db_with_retry(&config, Arc::clone(&db_startup), shutdown_tx.subscribe()) => {
+            match db {
+                Some(db) => db,
+                None => {
+                    // Shutdown requested while waiting for the database. The
+                    // degraded server only serves one-shot 503s — abort it
+                    // rather than drain, so a slow client can't stall exit.
+                    degraded_handle.abort();
+                    return Ok(());
+                }
+            }
+        }
+        degraded = &mut degraded_handle => {
+            if *shutdown_tx.borrow() {
+                return Ok(());
+            }
+            return match degraded {
+                Ok(Ok(())) => Err(anyhow!("degraded HTTP server stopped before database became ready")),
+                Ok(Err(err)) => Err(err.context("degraded HTTP server failed")),
+                Err(err) => Err(anyhow!("degraded HTTP server task failed: {err}")),
+            };
+        }
+    };
+
+    // Flip the degraded server into graceful shutdown, but do NOT await the
+    // drain: one slow in-flight request must not delay the full server, and
+    // the shared socket means there is no port gap to cover. The drain
+    // finishes (and logs) in the background.
+    db_ready_tx.send(true).ok();
+    tokio::spawn(async move {
+        match degraded_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(err = %err, "degraded HTTP server exited with error"),
+            Err(err) => warn!(err = %err, "degraded HTTP server task failed"),
+        }
+    });
+    info!(addr = %config.bind_addr(), "database ready; starting full HTTP server");
 
     // Prune peer rows that point back at this node (stale self-loop entries)
     if let Some(public_url) = config.public_url.as_deref() {
@@ -285,34 +385,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Spawn a task that flips the shutdown signal on SIGINT or SIGTERM.
-    // On Unix, both signals are handled. On Windows, only Ctrl-C is
-    // supported by tokio::signal::ctrl_c.
-    {
-        let tx = shutdown_tx.clone();
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                use tokio::signal::unix::{signal as unix_signal, SignalKind};
-                let mut sigterm =
-                    unix_signal(SignalKind::terminate()).expect("install SIGTERM handler");
-                let mut sigint =
-                    unix_signal(SignalKind::interrupt()).expect("install SIGINT handler");
-                tokio::select! {
-                    _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
-                    _ = sigint.recv()  => info!("SIGINT received, shutting down"),
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                use tokio::signal;
-                let _ = signal::ctrl_c().await;
-                info!("Ctrl-C received, shutting down");
-            }
-            tx.send(true).ok();
-        });
-    }
-
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
         let rl = state.rate_limiter.clone();
@@ -348,9 +420,10 @@ async fn main() -> Result<()> {
     }
 
     let router = server::build_router(state.clone());
-    let listener = TcpListener::bind(config.bind_addr())
-        .await
-        .with_context(|| format!("failed to bind to {}", config.bind_addr()))?;
+    // Re-register the socket bound at startup — same fd, so there was never a
+    // moment with the port closed between the degraded and full servers.
+    let listener = TcpListener::from_std(full_std_listener)
+        .context("failed to re-register HTTP listener with the runtime")?;
 
     info!("✓ node started — did:{}", node_did);
     info!("  repos dir: {}", config.repos_dir.display());
@@ -358,23 +431,6 @@ async fn main() -> Result<()> {
         "  database:  PostgreSQL ({})",
         &config.database_url.split('@').next_back().unwrap_or("?")
     );
-
-    // Optional Prometheus metrics listener on a separate port.
-    let metrics_handle = if !config.metrics_addr.is_empty() {
-        match spawn_metrics_server(&config.metrics_addr, state.clone()).await {
-            Ok(handle) => {
-                info!(addr = %config.metrics_addr, "metrics endpoint listening");
-                Some(handle)
-            }
-            Err(e) => {
-                warn!(err = %e, addr = %config.metrics_addr, "failed to start metrics endpoint — continuing without");
-                None
-            }
-        }
-    } else {
-        info!("metrics endpoint disabled (GITLAWB_METRICS_ADDR not set)");
-        None
-    };
 
     // Publish our DID record to the Kademlia DHT shortly after startup
     if let Some(p2p) = &state.p2p {
@@ -485,12 +541,224 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal as unix_signal, SignalKind};
+            let mut sigterm =
+                unix_signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut sigint = unix_signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => info!("SIGTERM received, shutting down"),
+                _ = sigint.recv()  => info!("SIGINT received, shutting down"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            use tokio::signal;
+            let _ = signal::ctrl_c().await;
+            info!("Ctrl-C received, shutting down");
+        }
+        tx.send(true).ok();
+    });
+}
+
+async fn connect_db_with_retry(
+    config: &Config,
+    db_startup: Arc<DbStartupStatus>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Option<Arc<Db>> {
+    let initial_retry_secs = config.db_retry_initial_secs;
+    let max_retry_secs = config.db_retry_max_secs.max(initial_retry_secs);
+    let acquire_timeout = std::time::Duration::from_secs(config.db_acquire_timeout_secs);
+    let attempt_timeout = std::time::Duration::from_secs(config.db_connect_timeout_secs);
+    let mut attempts = 0_u64;
+
+    loop {
+        if *shutdown_rx.borrow() {
+            return None;
+        }
+
+        attempts = attempts.saturating_add(1);
+        db_startup.attempts.store(attempts, Ordering::Relaxed);
+
+        // Bound the whole attempt, not just the pool connect: migrations
+        // block on a cross-instance advisory lock, and an unbounded wait
+        // there would wedge this loop — no retries, no logs, no recovery.
+        // Timing out and retrying is safe; migrations are idempotent.
+        let attempt = match tokio::time::timeout(
+            attempt_timeout,
+            Db::connect(
+                &config.database_url,
+                config.db_max_connections,
+                acquire_timeout,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!(
+                "connect + migrate attempt exceeded {}s (GITLAWB_DB_CONNECT_TIMEOUT_SECS); \
+                 is another instance holding the migration lock?",
+                attempt_timeout.as_secs()
+            )),
+        };
+
+        match attempt {
+            Ok(db) => {
+                info!(attempts, "database connection established");
+                return Some(Arc::new(db));
+            }
+            Err(err) => {
+                // A bad DATABASE_URL or rejected credentials won't heal on
+                // their own. Still retry (exiting would crash-loop and hammer
+                // the provider — and take liveness down with it), but log at
+                // error level and skip straight to the maximum backoff; the
+                // /ready health check is what surfaces this to deploys.
+                let permanent = is_likely_permanent_db_error(&err);
+                let retry_secs = if permanent {
+                    max_retry_secs
+                } else {
+                    database_retry_delay_secs(initial_retry_secs, max_retry_secs, attempts)
+                };
+                db_startup
+                    .next_retry_secs
+                    .store(retry_secs, Ordering::Relaxed);
+                if permanent {
+                    tracing::error!(
+                        attempts,
+                        retry_secs,
+                        err = %err,
+                        "database rejected our configuration (bad DATABASE_URL or credentials?) — retrying, but operator action is likely required"
+                    );
+                } else {
+                    warn!(
+                        attempts,
+                        retry_secs,
+                        err = %err,
+                        "database unavailable during startup; retrying"
+                    );
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(retry_secs)) => {}
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Errors that indicate misconfiguration rather than a transient outage: a
+/// malformed DATABASE_URL, or a server that answered and rejected us —
+/// Postgres error class 28xxx (invalid authorization) or 3D000 (database
+/// does not exist). Best-effort: an error that anyhow can't downcast back to
+/// sqlx just counts as transient.
+fn is_likely_permanent_db_error(err: &anyhow::Error) -> bool {
+    match err.downcast_ref::<sqlx::Error>() {
+        Some(sqlx::Error::Configuration(_)) => true,
+        Some(sqlx::Error::Database(db)) => db
+            .code()
+            .map(|c| c.starts_with("28") || c.starts_with("3D"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn database_retry_delay_secs(initial_secs: u64, max_secs: u64, attempts: u64) -> u64 {
+    // The exponent bound only keeps the u32 cast safe — max_secs is the real
+    // (operator-configurable) cap, and saturating math handles overflow.
+    let exponent = attempts.saturating_sub(1).min(63) as u32;
+    initial_secs
+        .saturating_mul(2_u64.saturating_pow(exponent))
+        .min(max_secs)
+}
+
+async fn run_degraded_server(
+    listener: TcpListener,
+    node_did: String,
+    db_startup: Arc<DbStartupStatus>,
+    mut db_ready_rx: watch::Receiver<bool>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    let addr = listener.local_addr().ok();
+    let router = build_degraded_router(node_did, db_startup);
+    info!(?addr, "degraded HTTP server ready");
+
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            // wait_for resolves on predicate-true or sender-drop; either way
+            // this phase is over.
+            tokio::select! {
+                _ = db_ready_rx.wait_for(|ready| *ready) => {}
+                _ = shutdown_rx.wait_for(|stop| *stop) => {}
+            }
+        })
+        .await?;
+
+    Ok(())
+}
+
+fn build_degraded_router(node_did: String, db_startup: Arc<DbStartupStatus>) -> Router {
+    let state = DegradedState {
+        node_did,
+        db_startup,
+    };
+    // Everything answers 503 with the same body — including /health and
+    // /ready, so peer pings (which treat any 2xx /health as alive) and
+    // uptime monitors correctly see a node that cannot serve traffic.
+    // `/` additionally carries the node identity for probing peers.
+    Router::new()
+        .route("/", get(degraded_node_info))
+        .fallback(degraded_unavailable)
+        .with_state(state)
+}
+
+/// One source of truth for the degraded 503 body, sharing the error
+/// vocabulary with error.rs so clients see the same code/message for
+/// "database unavailable" regardless of which phase produced it.
+fn degraded_body(db_startup: &DbStartupStatus) -> serde_json::Value {
+    serde_json::json!({
+        "status": "degraded",
+        "database": "initializing",
+        "error": error::DB_UNAVAILABLE_CODE,
+        "message": error::DB_UNAVAILABLE_MESSAGE,
+        "db_attempts": db_startup.attempts.load(Ordering::Relaxed),
+        "db_next_retry_secs": db_startup.next_retry_secs.load(Ordering::Relaxed),
+    })
+}
+
+async fn degraded_node_info(State(state): State<DegradedState>) -> impl IntoResponse {
+    let mut body = degraded_body(&state.db_startup);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("name".into(), "gitlawb-node".into());
+        obj.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+        obj.insert("did".into(), state.node_did.clone().into());
+    }
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
+async fn degraded_unavailable(State(state): State<DegradedState>) -> impl IntoResponse {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(degraded_body(&state.db_startup)),
+    )
+}
+
 /// Spawn a small axum router that exposes only `GET /metrics` on its own
 /// listener. Returns the JoinHandle so `main()` can abort it on shutdown.
 /// This is deliberately separate from the main router so the metrics port
 /// can be firewalled differently from the API port — bind to localhost
 /// or a private interface only.
-async fn spawn_metrics_server(addr: &str, state: AppState) -> Result<tokio::task::JoinHandle<()>> {
+async fn spawn_metrics_server(
+    addr: &str,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<tokio::task::JoinHandle<()>> {
     use axum::{response::IntoResponse, routing::get, Router};
 
     async fn metrics_handler() -> impl IntoResponse {
@@ -514,7 +782,6 @@ async fn spawn_metrics_server(addr: &str, state: AppState) -> Result<tokio::task
         }
     }
 
-    let mut shutdown_rx = state.subscribe_shutdown();
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind metrics listener to {addr}"))?;

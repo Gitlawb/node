@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
@@ -265,11 +266,40 @@ impl Db {
         self.migrate().await
     }
 
-    pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPool::connect(database_url).await?;
+    /// Connect the pool and run migrations. The initial connection is bounded
+    /// by `acquire_timeout` (sqlx routes pool connects through the acquire
+    /// path); migrations are unbounded here — the caller wraps the whole call
+    /// in its own attempt timeout, since the migration advisory lock can
+    /// legitimately block while another instance migrates.
+    pub async fn connect(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<Self> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "connecting to postgres"
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect(database_url)
+            .await
+            .context("connecting to postgres")?;
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Cheap liveness probe against the pool, for readiness checks: one
+    /// `SELECT 1` that fails fast when the database is unreachable.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .context("db ping")?;
+        Ok(())
     }
 
     /// Run all pending versioned migrations in order, inside a single

@@ -487,6 +487,17 @@ pub async fn get_tree(
 
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
 
+fn smart_http_repo_name(repo: &str) -> Result<&str> {
+    // Strip at most one ".git" suffix: trim_end_matches strips repeatedly,
+    // which would misdirect a repo literally named "foo.git" (creatable via
+    // the peer mirror path, which skips API name validation) to repo "foo".
+    let name = repo.strip_suffix(".git").unwrap_or(repo);
+    if name.is_empty() {
+        return Err(AppError::BadRequest("missing repository name".into()));
+    }
+    Ok(name)
+}
+
 /// GET /:owner/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
 pub async fn git_info_refs(
     State(state): State<AppState>,
@@ -496,7 +507,7 @@ pub async fn git_info_refs(
     headers: axum::http::HeaderMap,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
-    let name = repo.trim_end_matches(".git");
+    let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
     let record = state
         .db
@@ -605,7 +616,7 @@ pub async fn git_upload_pack(
     auth: Option<Extension<AuthenticatedDid>>,
     body: Bytes,
 ) -> Result<Response> {
-    let name = repo.trim_end_matches(".git");
+    let name = smart_http_repo_name(&repo)?;
     let record = state
         .db
         .get_repo(&owner, name)
@@ -842,7 +853,7 @@ pub async fn git_receive_pack(
     Extension(auth): Extension<AuthenticatedDid>,
     body: Bytes,
 ) -> Result<Response> {
-    let name = repo.trim_end_matches(".git");
+    let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "receive-pack request");
     let record = state
         .db
@@ -1901,6 +1912,23 @@ mod tests {
             matches!(rejection, Some(AppError::Forbidden(_))),
             "expected Some(Forbidden), got {rejection:?}"
         );
+    }
+
+    #[test]
+    fn smart_http_repo_name_rejects_empty_after_git_suffix() {
+        assert_eq!(smart_http_repo_name("demo.git").unwrap(), "demo");
+        assert_eq!(smart_http_repo_name("demo").unwrap(), "demo");
+        // Only one suffix is stripped: a repo literally named "demo.git"
+        // stays addressable and never aliases to "demo".
+        assert_eq!(smart_http_repo_name("demo.git.git").unwrap(), "demo.git");
+        assert!(matches!(
+            smart_http_repo_name(".git"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            smart_http_repo_name(""),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
