@@ -765,7 +765,7 @@ pub async fn git_upload_pack(
             smart_http::upload_pack(&disk_path, body, git_timeout).await
         } else {
             tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
-            smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
+            smart_http::upload_pack_excluding(&disk_path, body, &withheld, git_timeout).await
         }
     }
     .map_err(|e| {
