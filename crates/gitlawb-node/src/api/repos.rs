@@ -575,18 +575,12 @@ pub async fn git_info_refs(
         peer,
         state.push_limiter_trust,
     );
-    let _caller_permit = match &caller_key {
-        Some(k) => match state.git_read_per_caller.try_acquire(k) {
-            Some(p) => Some(p),
-            None => {
-                tracing::warn!(repo = %name, caller = %k, "per-caller read cap reached; shedding info/refs with 503");
-                return Err(AppError::Overloaded(
-                    "git read service at capacity for this caller, retry shortly".into(),
-                ));
-            }
-        },
-        None => None,
-    };
+    let _caller_permit = acquire_read_caller_permit(
+        &state.git_read_per_caller,
+        caller_key.as_deref(),
+        name,
+        "info/refs",
+    )?;
 
     // For receive-pack (push), download the latest from Tigris so the client
     // sees the same refs that acquire_write() will operate on.
@@ -656,6 +650,30 @@ fn read_caller_key(
     }
 }
 
+/// Acquire the per-caller read sub-cap permit (#174), or shed with a 503. `key` is
+/// `None` when no caller key resolves — that request is bounded by the global read
+/// pool only and is never shed here (returns `Ok(None)`). `handler` labels the shed
+/// log line. Shared by both read handlers so the two acquire sites cannot drift.
+fn acquire_read_caller_permit(
+    limiter: &crate::rate_limit::PerCallerConcurrency,
+    key: Option<&str>,
+    repo: &str,
+    handler: &str,
+) -> Result<Option<crate::rate_limit::PerCallerPermit>> {
+    match key {
+        Some(k) => match limiter.try_acquire(k) {
+            Some(p) => Ok(Some(p)),
+            None => {
+                tracing::warn!(repo = %repo, caller = %k, handler, "per-caller read cap reached; shedding with 503");
+                Err(AppError::Overloaded(
+                    "git read service at capacity for this caller, retry shortly".into(),
+                ))
+            }
+        },
+        None => Ok(None),
+    }
+}
+
 /// Map an error from a `smart_http` git service call to the right `AppError`:
 /// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
 /// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
@@ -712,18 +730,12 @@ pub async fn git_upload_pack(
     // visibility-denied caller never consumes a scarce read slot. Keyed per-DID
     // when signed, else per-source-IP; no resolvable key -> global read pool only.
     let caller_key = read_caller_key(caller, &headers, peer, state.push_limiter_trust);
-    let _caller_permit = match &caller_key {
-        Some(k) => match state.git_read_per_caller.try_acquire(k) {
-            Some(p) => Some(p),
-            None => {
-                tracing::warn!(repo = %name, caller = %k, "per-caller read cap reached; shedding upload-pack with 503");
-                return Err(AppError::Overloaded(
-                    "git read service at capacity for this caller, retry shortly".into(),
-                ));
-            }
-        },
-        None => None,
-    };
+    let _caller_permit = acquire_read_caller_permit(
+        &state.git_read_per_caller,
+        caller_key.as_deref(),
+        name,
+        "upload-pack",
+    )?;
 
     let disk_path = state
         .repo_store
@@ -2795,6 +2807,73 @@ mod tests {
             router2.oneshot(req2).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "a different caller must not be shed by another caller's saturated budget"
+        );
+    }
+
+    /// #174 SC2 (per-DID key): a SIGNED caller is keyed by its DID, not its source
+    /// IP. Fill the DID's single read slot, then drive a request carrying that
+    /// `AuthenticatedDid` from an IP whose own slot is free — it must shed 503,
+    /// proving the key is the DID. A second request from the SAME IP but a DIFFERENT
+    /// DID is not shed. Collapse `read_caller_key` to its IP arm and the first
+    /// assertion goes green-not-503 (the IP slot is free) — this is the per-DID half
+    /// of the keying proof that the per-IP probes above do not cover.
+    #[sqlx::test]
+    async fn info_refs_per_caller_cap_keys_on_did_not_ip(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6pcdid", "pc", "/tmp/pc-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let did_a = "did:key:z6MkPerCallerKeyingProofDidAAAAAAAAAAAAAAAA";
+        let did_b = "did:key:z6MkPerCallerKeyingProofDidBBBBBBBBBBBBBBBB";
+        let peer: SocketAddr = "203.0.113.51:5000".parse().unwrap();
+
+        // Fill DID_A's single read slot; the IP's own slot is left untouched.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(did_a)
+            .expect("first slot for this DID");
+
+        // Signed as DID_A, from `peer` (whose IP slot is free): keyed by DID -> shed.
+        let router = crate::server::build_router(state.clone());
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcdid/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        req.extensions_mut()
+            .insert(crate::auth::AuthenticatedDid(did_a.to_string()));
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a signed caller at its per-DID read cap must shed with 503 (keyed by DID, not the free IP slot)"
+        );
+
+        // Same IP, DIFFERENT DID -> its own budget -> not shed by DID_A's saturation.
+        let router2 = crate::server::build_router(state.clone());
+        let mut req2 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcdid/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(peer));
+        req2.extensions_mut()
+            .insert(crate::auth::AuthenticatedDid(did_b.to_string()));
+        assert_ne!(
+            router2.oneshot(req2).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a different DID from the same IP must not be shed by another DID's saturated budget"
         );
     }
 

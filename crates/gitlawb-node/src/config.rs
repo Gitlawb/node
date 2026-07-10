@@ -244,19 +244,23 @@ pub struct Config {
     /// pack-objects + threads). Size below the process budget with headroom.
     ///
     /// This is the READ pool (`git_read_semaphore`): upload-pack and both info/refs
-    /// advertisements. Authenticated pushes draw from a separate write pool
-    /// (`max_concurrent_git_pushes`) and each caller is additionally bounded by
-    /// `max_concurrent_reads_per_caller`, so an anonymous flood can neither shed a
-    /// push nor monopolize reads (#174).
+    /// advertisements. The authenticated push POST draws from a separate write pool
+    /// (`max_concurrent_git_pushes`) that anonymous reads can never reach, and each
+    /// caller is additionally bounded by `max_concurrent_reads_per_caller`, so an
+    /// anonymous flood cannot shed the actual push nor monopolize reads (#174). (The
+    /// receive-pack advertisement itself shares the read pool; a shed advertisement
+    /// is a cheap retryable GET, and the write POST it precedes always has capacity.)
     ///
-    /// A permit is held for the whole op, and every capped path is now
+    /// A permit is held for the whole op. Every git subprocess that STREAMS is
     /// duration-bounded and reaps its process group on disconnect: upload-pack,
     /// receive-pack, and both info/refs advertisements run under
     /// `git_service_timeout_secs` with `process_group(0)` teardown, and the
     /// withheld-blob (`upload_pack_excluding`) pack-objects stage runs on the async
-    /// side under the same teardown. So a hung git can no longer pin a slot and a
-    /// client disconnect no longer orphans its git child (#174 closed the two
-    /// duration/cancellation gaps this comment previously tracked as follow-up).
+    /// side under the same teardown (#174 closed the two duration/cancellation gaps
+    /// this comment previously tracked). The one remaining blocking stage is the
+    /// `rev-list` object enumeration in the withheld-blob path — a bounded walk that
+    /// terminates, run off the async runtime; it is not process-group-reaped on
+    /// disconnect, so a stuck rev-list can still hold its slot until git exits.
     ///
     /// Default: 128. Must be between 1 and 1_048_576; the ceiling keeps the value
     /// well under tokio's `Semaphore` permit limit so an oversized value is a
