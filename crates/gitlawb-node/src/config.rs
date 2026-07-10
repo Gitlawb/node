@@ -268,6 +268,42 @@ pub struct Config {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
     pub max_concurrent_git_ops: usize,
+
+    /// Maximum number of concurrent `git-receive-pack` (push) operations. Pushes
+    /// draw from this dedicated pool, separate from `max_concurrent_git_ops`
+    /// (reads), so a flood of anonymous reads cannot shed an authenticated push at
+    /// admission (#174). Beyond this a push sheds a clean 503 + Retry-After.
+    ///
+    /// Default: 32. Must be between 1 and 1_048_576 (the ceiling keeps the value
+    /// under tokio's `Semaphore` permit limit so an oversized value is a clean CLI
+    /// error rather than a boot-time panic).
+    #[arg(
+        long,
+        env = "GITLAWB_MAX_CONCURRENT_GIT_PUSHES",
+        default_value_t = 32,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub max_concurrent_git_pushes: usize,
+
+    /// Maximum concurrent read operations (`upload-pack` and the `info/refs`
+    /// advertisements) a single caller may hold at once, so one caller cannot
+    /// monopolize the `max_concurrent_git_ops` read pool (#174). Callers are keyed
+    /// per-DID when signed, else per-source-IP. IMPORTANT: the per-source-IP key is
+    /// only as granular as `GITLAWB_TRUSTED_PROXY`. Left unset (the default), a node
+    /// behind an edge/NAT keys all anonymous callers on the edge IP, so this cap
+    /// collapses to a single global anonymous cap rather than per-client. Set
+    /// `GITLAWB_TRUSTED_PROXY` to key on the real client; a known high-fanout caller
+    /// (a CI fleet behind one NAT) should authenticate for a per-DID budget or the
+    /// operator raises this. Over-cap for a caller sheds a clean 503 + Retry-After.
+    ///
+    /// Default: 16. Must be between 1 and 1_048_576.
+    #[arg(
+        long,
+        env = "GITLAWB_MAX_CONCURRENT_READS_PER_CALLER",
+        default_value_t = 16,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub max_concurrent_reads_per_caller: usize,
 }
 
 impl Config {
@@ -330,6 +366,66 @@ mod tests {
         assert_eq!(
             Config::parse_from(["gitlawb-node", "--max-concurrent-git-ops", "1048576"])
                 .max_concurrent_git_ops,
+            1_048_576
+        );
+    }
+
+    #[test]
+    fn max_concurrent_git_pushes_defaults_and_rejects_out_of_range() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).max_concurrent_git_pushes,
+            32
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--max-concurrent-git-pushes", "8"])
+                .max_concurrent_git_pushes,
+            8
+        );
+        // 0 permits would shed every push with a 503; clap must reject it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--max-concurrent-git-pushes", "0"]).is_err()
+        );
+        // Above the ceiling would panic tokio's Semaphore::new at boot; clap rejects it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--max-concurrent-git-pushes", "1048577"])
+                .is_err()
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--max-concurrent-git-pushes", "1048576"])
+                .max_concurrent_git_pushes,
+            1_048_576
+        );
+    }
+
+    #[test]
+    fn max_concurrent_reads_per_caller_defaults_and_rejects_out_of_range() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).max_concurrent_reads_per_caller,
+            16
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--max-concurrent-reads-per-caller", "4"])
+                .max_concurrent_reads_per_caller,
+            4
+        );
+        // 0 would shed every read from a keyed caller; clap must reject it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--max-concurrent-reads-per-caller", "0"])
+                .is_err()
+        );
+        assert!(Config::try_parse_from([
+            "gitlawb-node",
+            "--max-concurrent-reads-per-caller",
+            "1048577"
+        ])
+        .is_err());
+        assert_eq!(
+            Config::parse_from([
+                "gitlawb-node",
+                "--max-concurrent-reads-per-caller",
+                "1048576"
+            ])
+            .max_concurrent_reads_per_caller,
             1_048_576
         );
     }
