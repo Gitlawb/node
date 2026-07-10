@@ -349,12 +349,17 @@ fn pkt_line(data: &str) -> Vec<u8> {
     format!("{len:04x}{data}").into_bytes()
 }
 
-/// Build a packfile containing every object reachable from all refs EXCEPT the
-/// given blob OIDs. Commits and trees are always included, so SHAs stay intact;
-/// only the named blobs are dropped.
-pub fn build_filtered_pack(repo_path: &Path, withheld: &HashSet<String>) -> Result<Vec<u8>> {
-    // All reachable objects as "oid [path]" lines.
-    let rev = std::process::Command::new("git")
+/// Run `rev-list --objects --all` and return the reachable object ids minus the
+/// withheld blobs. Blocking (shells out to git); the caller runs it off the async
+/// runtime. Kept separate from the pack-objects stage so that stage can live on the
+/// async side under [`drive_git_child`] (`git_bin` is injectable for the same
+/// fake-git testing reason as `run_git_service`).
+fn rev_list_keep(
+    git_bin: &str,
+    repo_path: &Path,
+    withheld: &HashSet<String>,
+) -> Result<Vec<String>> {
+    let rev = std::process::Command::new(git_bin)
         .args(["rev-list", "--objects", "--all"])
         .current_dir(repo_path)
         .output()?;
@@ -372,39 +377,39 @@ pub fn build_filtered_pack(repo_path: &Path, withheld: &HashSet<String>) -> Resu
         }
         keep.push(oid.to_string());
     }
-    let mut child = std::process::Command::new("git")
-        .args(["pack-objects", "--stdout"])
-        .current_dir(repo_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    // Feed the object ids on stdin, but always reap the child afterward even if
-    // the write fails or stdin is missing, so an error can't drop the Child
-    // unwaited and leak a zombie (#53).
-    let write_result: std::io::Result<()> = {
-        use std::io::Write as _;
-        match child.stdin.take() {
-            Some(mut stdin) => {
-                let mut data = keep.join("\n").into_bytes();
-                data.push(b'\n');
-                stdin.write_all(&data)
-            }
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "git pack-objects stdin unavailable",
-            )),
-        }
+    Ok(keep)
+}
+
+/// Build a packfile containing every object reachable from all refs EXCEPT the
+/// given blob OIDs. Commits and trees are always included, so SHAs stay intact;
+/// only the named blobs are dropped.
+///
+/// The rev-list enumeration runs blocking off the async runtime; the streaming
+/// `pack-objects` stage runs under [`drive_git_child`], so a hung/slow pack build is
+/// duration-bounded and its process group is reaped on client disconnect. An outer
+/// `tokio::time::timeout` around a `spawn_blocking` cannot cancel the blocking
+/// thread, so the streaming stage MUST live on the async side (#174, KTD5).
+pub async fn build_filtered_pack(
+    git_bin: &str,
+    repo_path: &Path,
+    withheld: &HashSet<String>,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    let keep = {
+        let git_bin = git_bin.to_string();
+        let repo_path = repo_path.to_path_buf();
+        let withheld = withheld.clone();
+        tokio::task::spawn_blocking(move || rev_list_keep(&git_bin, &repo_path, &withheld))
+            .await
+            .context("rev-list task panicked")??
     };
-    let out = child.wait_with_output()?;
-    write_result.context("failed to write object ids to git pack-objects stdin")?;
-    if !out.status.success() {
-        bail!(
-            "git pack-objects failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(out.stdout)
+    let mut data = keep.join("\n").into_bytes();
+    data.push(b'\n');
+    let mut command = Command::new(git_bin);
+    command
+        .args(["pack-objects", "--stdout"])
+        .current_dir(repo_path);
+    drive_git_child(command, Bytes::from(data), timeout, "pack-objects").await
 }
 
 /// Serve a clone/fetch with the withheld blobs removed from the response pack.
@@ -434,17 +439,13 @@ pub async fn upload_pack_excluding(
     repo_path: &Path,
     request_body: Bytes,
     withheld: &HashSet<String>,
+    timeout: Duration,
 ) -> Result<Response> {
-    // build_filtered_pack shells out to git (rev-list, pack-objects) with
-    // blocking std::process I/O; run it off the async worker so a large repo's
-    // pack build does not stall the tokio runtime.
-    let pack = {
-        let repo_path = repo_path.to_path_buf();
-        let withheld = withheld.clone();
-        tokio::task::spawn_blocking(move || build_filtered_pack(&repo_path, &withheld))
-            .await
-            .context("filtered-pack build task panicked")??
-    };
+    // The rev-list enumeration runs blocking off the runtime; the streaming
+    // pack-objects stage is duration-bounded and its process group is reaped on
+    // disconnect via drive_git_child (#174), so a hung build no longer pins its
+    // concurrency slot and a client disconnect no longer orphans the git child.
+    let pack = build_filtered_pack("git", repo_path, withheld, timeout).await?;
 
     // The client lists its capabilities on the first `want` line. Honor
     // side-band-64k when offered (every modern smart-HTTP client offers it);
@@ -563,7 +564,9 @@ mod tests {
         let mut withheld = std::collections::HashSet::new();
         withheld.insert(secret.clone());
 
-        let pack = build_filtered_pack(&bare, &withheld).unwrap();
+        let pack = build_filtered_pack("git", &bare, &withheld, Duration::from_secs(30))
+            .await
+            .unwrap();
         let ids = pack_object_ids(&pack);
         assert!(ids.contains(&public), "public blob must be in the pack");
         assert!(
@@ -625,7 +628,9 @@ mod tests {
             b"0098want 0000000000000000000000000000000000000000 \
               side-band-64k ofs-delta agent=git/2\n00000009done\n",
         );
-        let resp = upload_pack_excluding(&bare, req, &withheld).await.unwrap();
+        let resp = upload_pack_excluding(&bare, req, &withheld, Duration::from_secs(30))
+            .await
+            .unwrap();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let ids = pack_object_ids(&extract_pack(&body));
         assert!(
@@ -684,7 +689,7 @@ mod tests {
         axum::extract::State(st): axum::extract::State<std::sync::Arc<FilterState>>,
         body: Bytes,
     ) -> Response {
-        upload_pack_excluding(&st.repo, body, &st.withheld)
+        upload_pack_excluding(&st.repo, body, &st.withheld, Duration::from_secs(30))
             .await
             .unwrap()
     }
@@ -1281,6 +1286,44 @@ mod tests {
         assert!(
             err.downcast_ref::<GitServiceTimeout>().is_some(),
             "a hung advertisement must abort with GitServiceTimeout (-> 504), got: {err}"
+        );
+    }
+
+    // #174 (SC3, KTD5): the filtered-pack build's streaming pack-objects stage is
+    // duration-bounded on the ASYNC side. The old build ran the whole thing in a
+    // spawn_blocking, so an outer tokio timeout could not cancel the blocking thread
+    // and a disconnect orphaned the git child. A fake git that returns objects fast
+    // on rev-list but hangs on pack-objects must now abort with GitServiceTimeout;
+    // the watchdog turns a missing bound into a loud failure. The stage runs under
+    // drive_git_child, so its disconnect/group-teardown is the same code proven by
+    // run_git_service_tears_down_group_when_future_dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_filtered_pack_times_out_a_hung_pack_objects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // rev-list returns one oid fast; pack-objects hangs forever.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ;;\n  pack-objects) sleep 300 ;;\n  *) exit 1 ;;\nesac\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let withheld = HashSet::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            build_filtered_pack(
+                git_bin.to_str().unwrap(),
+                tmp.path(),
+                &withheld,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect(
+            "build_filtered_pack must return within the watchdog — the pack-objects \
+             stage must be timeout-bounded, not an uncancellable spawn_blocking",
+        );
+        let err = result.expect_err("a hung pack-objects must return an error, not hang");
+        assert!(
+            err.downcast_ref::<GitServiceTimeout>().is_some(),
+            "a hung pack-objects must abort with GitServiceTimeout, got: {err}"
         );
     }
 
