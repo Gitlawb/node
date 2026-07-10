@@ -88,6 +88,10 @@ pub struct AppState {
     ///   * the libp2p swarm task
     ///   * the gossip, sync, operator heartbeat, and rate-limit cleanup loops
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Bounds concurrent served git operations. A handler acquires a permit
+    /// before spawning git and holds it for the op; when none are free the
+    /// request is shed with a 503 rather than exhausting the PID/thread table.
+    pub git_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {

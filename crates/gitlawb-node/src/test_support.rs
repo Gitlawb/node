@@ -82,6 +82,8 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         shutdown_tx: tokio::sync::watch::channel(false).0,
+        // Generous — no test drives the handler-level shed (git_permit is unit-tested).
+        git_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
     }
 }
 
@@ -184,6 +186,123 @@ mod tests {
             resp.status().is_success(),
             "owner should be allowed to set visibility, got {}",
             resp.status()
+        );
+    }
+
+    /// PR3 (#62): the served-git concurrency cap sheds at the HTTP layer. One test
+    /// per git handler drives the `let _permit = git_permit(...)` wiring end to end
+    /// (this one plus the git_upload_pack / git_receive_pack siblings below); the
+    /// git_permit unit test covers the helper in isolation. DB-free: an exhausted
+    /// semaphore sheds before any DB/disk access, so a lazy state works. Remove the
+    /// permit line from git_info_refs and this goes red (the request falls through
+    /// to the DB and returns something other than 503).
+    #[tokio::test]
+    async fn git_info_refs_sheds_with_503_when_semaphore_exhausted() {
+        let mut state = test_state_lazy();
+        state.git_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/info/refs",
+                axum::routing::get(crate::api::repos::git_info_refs),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(anon_get(
+                "/alice/repo.git/info/refs?service=git-upload-pack",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted git semaphore must shed info/refs with 503 before touching the DB"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// PR3 (#62) sibling of the info/refs shed test: git-upload-pack also acquires a
+    /// permit at the top, so an exhausted semaphore must shed it with a 503 before
+    /// any DB/disk work. Anonymous-reachable, so no auth injection is needed. Remove
+    /// the permit line from git_upload_pack and this goes red.
+    #[tokio::test]
+    async fn git_upload_pack_sheds_with_503_when_semaphore_exhausted() {
+        let mut state = test_state_lazy();
+        state.git_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-upload-pack",
+                axum::routing::post(crate::api::repos::git_upload_pack),
+            )
+            .with_state(state);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/alice/repo.git/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted git semaphore must shed git-upload-pack with 503 before touching the DB"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// PR3 (#62) sibling for the push path: git-receive-pack requires an
+    /// AuthenticatedDid extension (production: require_signature injects it), so the
+    /// request carries one via signed_request_as — without it the Extension
+    /// extractor 500s before the handler body reaches git_permit. The permit is the
+    /// first statement, so an exhausted semaphore still sheds 503 before any DB
+    /// work. Remove the permit line from git_receive_pack and this goes red.
+    #[tokio::test]
+    async fn git_receive_pack_sheds_with_503_when_semaphore_exhausted() {
+        let mut state = test_state_lazy();
+        state.git_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-receive-pack",
+                axum::routing::post(crate::api::repos::git_receive_pack),
+            )
+            .with_state(state);
+        let owner = "did:key:zRECVSHEDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let resp = router
+            .oneshot(signed_request_as(
+                owner,
+                Method::POST,
+                "/alice/repo.git/git-receive-pack",
+                Body::from(&b"0000"[..]),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted git semaphore must shed git-receive-pack with 503 before touching the DB"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
         );
     }
 

@@ -520,6 +520,7 @@ mod tests {
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
             peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            git_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         }
     }
 

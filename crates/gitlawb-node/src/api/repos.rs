@@ -507,6 +507,9 @@ pub async fn git_info_refs(
     headers: axum::http::HeaderMap,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
+    // Shed with a 503 before spawning git when the concurrency cap is saturated;
+    // held for the whole op (incl. the smart_http call), released on return.
+    let _permit = git_permit(&state.git_semaphore)?;
     let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
     let record = state
@@ -589,6 +592,22 @@ pub async fn git_info_refs(
         })
 }
 
+/// Acquire a permit from the served-git concurrency semaphore, or shed the
+/// request with a 503 + Retry-After when every slot is in use. Bind the returned
+/// permit to a named local so it is held for the whole git op (it releases on
+/// drop); a bare `_` would release it immediately.
+fn git_permit(
+    sem: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    sem.clone().try_acquire_owned().map_err(|_| {
+        // Surface the shed so operators can see the cap engaging, mirroring the
+        // receive-pack rate-limit warn above. A silent 503 makes a saturated or
+        // misconfigured cap look like a client problem instead of a capacity one.
+        tracing::warn!("served-git concurrency cap reached; shedding request with 503");
+        AppError::Overloaded("git service at capacity, retry shortly".into())
+    })
+}
+
 /// Map an error from a `smart_http` git service call to the right `AppError`:
 /// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
 /// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
@@ -616,6 +635,9 @@ pub async fn git_upload_pack(
     auth: Option<Extension<AuthenticatedDid>>,
     body: Bytes,
 ) -> Result<Response> {
+    // Shed with a 503 before spawning git when the concurrency cap is saturated;
+    // held for the whole op (incl. the smart_http call), released on return.
+    let _permit = git_permit(&state.git_semaphore)?;
     let name = smart_http_repo_name(&repo)?;
     let record = state
         .db
@@ -853,6 +875,10 @@ pub async fn git_receive_pack(
     Extension(auth): Extension<AuthenticatedDid>,
     body: Bytes,
 ) -> Result<Response> {
+    // Shed with a 503 before spawning git when the concurrency cap is saturated.
+    // Acquired at the very top so it wraps the write-guard below; held for the
+    // whole op (incl. the smart_http call), released on return.
+    let _permit = git_permit(&state.git_semaphore)?;
     let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "receive-pack request");
     let record = state
@@ -1860,6 +1886,17 @@ mod tests {
         // Anything else -> 500 git error.
         let other = anyhow::anyhow!("some other git failure");
         assert!(matches!(git_service_app_error(&other), AppError::Git(_)));
+    }
+
+    #[test]
+    fn git_permit_sheds_at_capacity_and_releases() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let p1 = git_permit(&sem).expect("first acquire succeeds");
+        // At capacity the next request is shed with Overloaded (-> 503), not queued.
+        assert!(matches!(git_permit(&sem), Err(AppError::Overloaded(_))));
+        // Releasing the permit frees the slot for the next request.
+        drop(p1);
+        assert!(git_permit(&sem).is_ok());
     }
 
     fn repo_owned_by(owner_did: &str) -> crate::db::RepoRecord {
