@@ -3547,4 +3547,104 @@ mod tests {
             .unwrap();
         assert!(resp.status().is_success());
     }
+
+    #[sqlx::test]
+    async fn claim_bounty_gate_denies_non_reader_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCLAIMDENYOWNERRRRRRRRRRRRRRRRRRRRRRRRR";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+        let bounty = crate::db::BountyRecord {
+            id: "claim-bounty-deny".into(),
+            repo_owner: owner.into(),
+            repo_name: "secret-repo".into(),
+            issue_id: None,
+            title: "Secret Claim Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.unwrap();
+
+        // A stranger (not repo owner/reader) tries to claim the bounty
+        let stranger_kp = gitlawb_core::identity::Keypair::generate();
+        let uri = "/api/v1/bounties/claim-bounty-deny/claim";
+        let body = b"{}";
+        let sig = gitlawb_core::http_sig::sign_request(&stranger_kp, "POST", uri, body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn claim_bounty_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let owner = kp.did().to_string();
+        state
+            .db
+            .create_repo(&seed_private_repo(&owner, "secret-repo"))
+            .await
+            .unwrap();
+        let bounty = crate::db::BountyRecord {
+            id: "claim-bounty-admit".into(),
+            repo_owner: owner.clone(),
+            repo_name: "secret-repo".into(),
+            issue_id: None,
+            title: "Owner Claim Bounty".into(),
+            amount: 200,
+            creator_did: owner.clone(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.unwrap();
+
+        // The owner claims their own bounty
+        let uri = "/api/v1/bounties/claim-bounty-admit/claim";
+        let body = b"{}";
+        let sig = gitlawb_core::http_sig::sign_request(&kp, "POST", uri, body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert!(resp.status().is_success());
+    }
 }
