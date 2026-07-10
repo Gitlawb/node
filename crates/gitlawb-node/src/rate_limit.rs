@@ -178,7 +178,12 @@ impl PerCallerConcurrency {
     /// `None` (shed) otherwise. Reject-before-insert: a new key at `max_keys` is
     /// rejected without allocating.
     pub fn try_acquire(&self, key: &str) -> Option<PerCallerPermit> {
-        let mut map = self.state.lock().expect("per-caller mutex poisoned");
+        // Recover from a poisoned lock rather than panicking: the critical section
+        // is pure counter arithmetic and cannot itself panic, so a poisoned mutex
+        // would only ever come from an unrelated abort, and a slightly-off count
+        // self-heals as permits drop. A panic here would instead brick the limiter
+        // for every caller (each subsequent lock re-panics).
+        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match map.get_mut(key) {
             Some(count) => {
                 if *count >= self.per_caller {
@@ -207,7 +212,7 @@ impl PerCallerConcurrency {
 
 impl Drop for PerCallerPermit {
     fn drop(&mut self) {
-        let mut map = self.state.lock().expect("per-caller mutex poisoned");
+        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(count) = map.get_mut(&self.key) {
             *count -= 1;
             if *count == 0 {
