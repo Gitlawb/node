@@ -234,6 +234,40 @@ pub struct Config {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub db_retry_max_secs: u64,
+
+    /// Maximum number of served git operations (upload-pack / receive-pack /
+    /// info-refs) allowed to run concurrently. Beyond this the node sheds the
+    /// request with a clean 503 + Retry-After instead of spawning another git
+    /// subprocess and risking PID/thread exhaustion. Portable backstop: the
+    /// compose `pids_limit` is not present on Fly, whose connection-concurrency
+    /// cap is a different axis (500 connections each fan out to git +
+    /// pack-objects + threads). Size below the process budget with headroom.
+    ///
+    /// A permit is held for the whole op. upload-pack/receive-pack are
+    /// duration-bounded by `git_service_timeout_secs`, but the `info/refs`
+    /// advertisement and the withheld-blob (`upload_pack_excluding`) path are
+    /// not, so a hung git on those two paths holds its slot until it exits, so a
+    /// stuck advertisement permanently costs one unit of capacity. Bounding
+    /// those paths' duration is tracked as separate follow-up.
+    ///
+    /// The same two paths have the mirror gap on cancellation: the permit frees
+    /// when the handler future drops (client disconnect), but neither reaps its
+    /// git child — `info/refs` runs a bare `Command`, and `upload_pack_excluding`
+    /// a blocking `spawn_blocking` a dropped future cannot cancel — so the child
+    /// runs to completion after its slot is freed and live git can briefly exceed
+    /// the cap. The main pack path (`run_git_service`) tears its process group
+    /// down on drop, so this is confined to the same two follow-up paths.
+    ///
+    /// Default: 128. Must be between 1 and 1_048_576; the ceiling keeps the value
+    /// well under tokio's `Semaphore` permit limit so an oversized value is a
+    /// clean CLI error rather than a boot-time panic.
+    #[arg(
+        long,
+        env = "GITLAWB_MAX_CONCURRENT_GIT_OPS",
+        default_value_t = 128,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub max_concurrent_git_ops: usize,
 }
 
 impl Config {
@@ -270,6 +304,33 @@ mod tests {
         // 0 is a footgun (immediate-504 on every request); clap must reject it.
         assert!(
             Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn max_concurrent_git_ops_defaults_and_rejects_out_of_range() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).max_concurrent_git_ops,
+            128
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--max-concurrent-git-ops", "8"])
+                .max_concurrent_git_ops,
+            8
+        );
+        // 0 permits would shed every served-git request with a 503; clap must reject it.
+        assert!(Config::try_parse_from(["gitlawb-node", "--max-concurrent-git-ops", "0"]).is_err());
+        // Above the ceiling would panic tokio's Semaphore::new at boot (permits >
+        // usize::MAX >> 3); clap must reject it as a clean CLI error instead.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--max-concurrent-git-ops", "1048577"])
+                .is_err()
+        );
+        // The ceiling itself is accepted.
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--max-concurrent-git-ops", "1048576"])
+                .max_concurrent_git_ops,
+            1_048_576
         );
     }
 }
