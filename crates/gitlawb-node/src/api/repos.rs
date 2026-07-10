@@ -606,11 +606,20 @@ pub async fn git_info_refs(
         AppError::Git(e.to_string())
     })?;
 
-    smart_http::info_refs(&disk_path, &service)
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    smart_http::info_refs("git", &service, &disk_path, git_timeout)
         .await
         .map_err(|e| {
-            tracing::error!(repo = %name, service = %service, err = %e, "info_refs git failed");
-            AppError::Git(e.to_string())
+            let app = git_service_app_error(&e);
+            match &app {
+                AppError::Timeout(_) => {
+                    tracing::warn!(repo = %name, service = %service, "info/refs advertisement timed out")
+                }
+                _ => {
+                    tracing::error!(repo = %name, service = %service, err = %e, "info_refs git failed")
+                }
+            }
+            app
         })
 }
 

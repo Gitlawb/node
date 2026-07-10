@@ -14,21 +14,29 @@ use tokio::process::Command;
 /// or `?service=git-receive-pack`
 ///
 /// This is the ref advertisement — the first step of a clone or push.
-pub async fn info_refs(repo_path: &Path, service: &str) -> Result<Response> {
+///
+/// `git_bin` is injectable purely so the process-group teardown can be driven by a
+/// fake `git` in tests (production passes `"git"`). `timeout` bounds the whole child
+/// interaction: previously the advertisement ran a bare `Command::output()` with no
+/// deadline and no teardown, so a hung git pinned its concurrency slot indefinitely
+/// and a client disconnect orphaned the child (#174). It now shares
+/// [`drive_git_child`]'s timeout + `process_group(0)` + [`KillGroupOnDrop`] teardown.
+pub async fn info_refs(
+    git_bin: &str,
+    service: &str,
+    repo_path: &Path,
+    timeout: Duration,
+) -> Result<Response> {
     validate_service(service)?;
 
-    let output = Command::new("git")
+    let mut command = Command::new(git_bin);
+    command
         .arg(service_to_command(service))
         .arg("--stateless-rpc")
         .arg("--advertise-refs")
-        .arg(repo_path)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git {service} --advertise-refs failed: {stderr}");
-    }
+        .arg(repo_path);
+    // No request body — advertise-refs does not read stdin.
+    let stdout = drive_git_child(command, Bytes::new(), timeout, "advertise-refs").await?;
 
     let content_type = format!("application/x-{service}-advertisement");
 
@@ -38,7 +46,7 @@ pub async fn info_refs(repo_path: &Path, service: &str) -> Result<Response> {
     let mut body = Vec::new();
     body.extend_from_slice(&pkt_service);
     body.extend_from_slice(flush);
-    body.extend_from_slice(&output.stdout);
+    body.extend_from_slice(&stdout);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -207,7 +215,24 @@ async fn run_git_service(
     command
         .arg(service_to_command(service))
         .arg("--stateless-rpc")
-        .arg(repo_path)
+        .arg(repo_path);
+    drive_git_child(command, input, timeout, service).await
+}
+
+/// Drive a spawned git child under `timeout` with process-group teardown, returning
+/// its stdout. Shared core for [`run_git_service`] and [`info_refs`]: the caller
+/// passes a `Command` with its args set; this adds piped stdio and `process_group(0)`.
+/// On the deadline the whole group is torn down and reaped before returning
+/// [`GitServiceTimeout`]; on a dropped future (client disconnect) the
+/// [`KillGroupOnDrop`] guard fires. `input` is written to the child's stdin (empty
+/// for the advertise-refs path, which has no request body); `what` labels errors.
+async fn drive_git_child(
+    mut command: Command,
+    input: Bytes,
+    timeout: Duration,
+    what: &str,
+) -> Result<Vec<u8>> {
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -294,7 +319,7 @@ async fn run_git_service(
     // the real cause.
     if !status.success() {
         let stderr = String::from_utf8_lossy(&err);
-        bail!("{service} failed: {stderr}");
+        bail!("{what} failed: {stderr}");
     }
 
     write_result.context("failed to write to git stdin")?;
@@ -650,7 +675,9 @@ mod tests {
         axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
     ) -> Response {
         let service = q.get("service").cloned().unwrap_or_default();
-        info_refs(&st.repo, &service).await.unwrap()
+        info_refs("git", &service, &st.repo, Duration::from_secs(30))
+            .await
+            .unwrap()
     }
 
     async fn pack_handler(
@@ -1222,6 +1249,38 @@ mod tests {
             gone,
             "grandchild must be torn down via the process group on future-drop \
              (proves run_git_service sets process_group(0) and arms the guard)"
+        );
+    }
+
+    // #174 (SC3): the info/refs advertisement is now duration-bounded — previously
+    // it ran a bare `Command::output()` with no deadline, so a hung git pinned its
+    // concurrency slot forever. A hung fake git must abort with GitServiceTimeout
+    // (which the handler maps to 504). The outer watchdog turns a missing timeout
+    // into a loud failure instead of hanging the suite. info_refs shares
+    // drive_git_child, so its disconnect/group-teardown is the same code proven by
+    // run_git_service_tears_down_group_when_future_dropped above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn info_refs_times_out_a_hung_advertisement() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // A fake git that hangs forever instead of advertising refs.
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\nsleep 300\n");
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            info_refs(
+                git_bin.to_str().unwrap(),
+                "git-upload-pack",
+                tmp.path(),
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("info_refs must return within the watchdog — its own timeout must fire");
+        let err = result.expect_err("a hung advertisement must return an error, not hang");
+        assert!(
+            err.downcast_ref::<GitServiceTimeout>().is_some(),
+            "a hung advertisement must abort with GitServiceTimeout (-> 504), got: {err}"
         );
     }
 
