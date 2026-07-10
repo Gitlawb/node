@@ -98,6 +98,11 @@ pub struct AppState {
     /// from `git_read_semaphore` so anonymous reads can never shed an authenticated
     /// push (#174). Sized by `max_concurrent_git_pushes`.
     pub git_write_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Per-caller concurrency sub-cap on the read pool: each caller (per-DID when
+    /// signed, else per-source-IP) may hold at most `max_concurrent_reads_per_caller`
+    /// in-flight read ops, so one caller cannot monopolize `git_read_semaphore`
+    /// (#174). Applied by `git_upload_pack` and both `info/refs` advertisements.
+    pub git_read_per_caller: crate::rate_limit::PerCallerConcurrency,
 }
 
 impl AppState {
