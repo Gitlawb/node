@@ -488,7 +488,10 @@ pub async fn get_tree(
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
 
 fn smart_http_repo_name(repo: &str) -> Result<&str> {
-    let name = repo.trim_end_matches(".git");
+    // Strip at most one ".git" suffix: trim_end_matches strips repeatedly,
+    // which would misdirect a repo literally named "foo.git" (creatable via
+    // the peer mirror path, which skips API name validation) to repo "foo".
+    let name = repo.strip_suffix(".git").unwrap_or(repo);
     if name.is_empty() {
         return Err(AppError::BadRequest("missing repository name".into()));
     }
@@ -1914,6 +1917,10 @@ mod tests {
     #[test]
     fn smart_http_repo_name_rejects_empty_after_git_suffix() {
         assert_eq!(smart_http_repo_name("demo.git").unwrap(), "demo");
+        assert_eq!(smart_http_repo_name("demo").unwrap(), "demo");
+        // Only one suffix is stripped: a repo literally named "demo.git"
+        // stays addressable and never aliases to "demo".
+        assert_eq!(smart_http_repo_name("demo.git.git").unwrap(), "demo.git");
         assert!(matches!(
             smart_http_repo_name(".git"),
             Err(AppError::BadRequest(_))

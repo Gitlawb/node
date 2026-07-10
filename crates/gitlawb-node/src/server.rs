@@ -485,8 +485,24 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-async fn ready() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ready" }))
+/// Readiness = "this node can serve real traffic", and every real endpoint
+/// depends on the database, so probe it rather than reporting a constant.
+/// The probe gets its own short bound so a wedged pool can't hang the health
+/// check for the full acquire timeout.
+async fn ready(State(state): State<AppState>) -> axum::response::Response {
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(2), state.db.ping()).await;
+    match probe {
+        Ok(Ok(())) => Json(json!({ "status": "ready" })).into_response(),
+        _ => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "degraded",
+                "error": crate::error::DB_UNAVAILABLE_CODE,
+                "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {

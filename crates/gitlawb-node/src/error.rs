@@ -51,7 +51,38 @@ pub enum AppError {
     Db(#[from] sqlx::Error),
 
     #[error("internal error: {0}")]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
+}
+
+/// Shared error code/message for "the database is unreachable", also used by
+/// the degraded startup server (main.rs) and the readiness probe (server.rs)
+/// so clients see one vocabulary for the condition.
+pub const DB_UNAVAILABLE_CODE: &str = "db_unavailable";
+pub const DB_UNAVAILABLE_MESSAGE: &str = "database is temporarily unavailable";
+
+/// Connection-level sqlx failures that mean the database is unreachable right
+/// now (retryable, 503), as opposed to server-reported query errors.
+fn db_unavailable(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::PoolTimedOut
+            | sqlx::Error::PoolClosed
+            | sqlx::Error::Io(_)
+            | sqlx::Error::Tls(_)
+    )
+}
+
+/// The db layer returns `anyhow::Result`, so sqlx errors reach handlers inside
+/// anyhow chains. Downcast them back out so the status mapping below can see
+/// them — without this, every database outage surfaces as a 500 instead of a
+/// 503. anyhow preserves downcastability through `.context()` layers.
+impl From<anyhow::Error> for AppError {
+    fn from(err: anyhow::Error) -> Self {
+        match err.downcast::<sqlx::Error>() {
+            Ok(sql) => AppError::Db(sql),
+            Err(err) => AppError::Internal(err),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
@@ -111,10 +142,10 @@ impl IntoResponse for AppError {
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
             AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "git_timeout", msg.clone()),
-            AppError::Db(sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed) => (
+            AppError::Db(e) if db_unavailable(e) => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "db_unavailable",
-                "database is temporarily unavailable".into(),
+                DB_UNAVAILABLE_CODE,
+                DB_UNAVAILABLE_MESSAGE.into(),
             ),
             AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
             AppError::Internal(e) => (

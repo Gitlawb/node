@@ -182,6 +182,58 @@ pub struct Config {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub git_service_timeout_secs: u64,
+
+    /// Maximum connections in the PostgreSQL pool. This is a cap, not a floor
+    /// (connections open lazily). Size against the database server's
+    /// max_connections, remembering admin tooling opens its own pool.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_MAX_CONNECTIONS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub db_max_connections: u32,
+
+    /// Maximum time a request waits for a pool connection before failing with
+    /// 503, in seconds. Bounds queueing when the database is slow or down.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_ACQUIRE_TIMEOUT_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub db_acquire_timeout_secs: u64,
+
+    /// Upper bound on each startup connect-and-migrate attempt, in seconds.
+    /// Migrations wait on a cross-instance advisory lock, so this must be
+    /// generous enough for a peer instance to finish migrating; on expiry the
+    /// attempt is retried (migrations are idempotent).
+    #[arg(
+        long,
+        env = "GITLAWB_DB_CONNECT_TIMEOUT_SECS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub db_connect_timeout_secs: u64,
+
+    /// First retry delay when the database is unavailable at startup, in
+    /// seconds. Doubles each attempt up to --db-retry-max-secs.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_RETRY_INITIAL_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub db_retry_initial_secs: u64,
+
+    /// Ceiling on the startup retry delay, in seconds.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_RETRY_MAX_SECS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub db_retry_max_secs: u64,
 }
 
 impl Config {

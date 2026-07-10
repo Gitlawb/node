@@ -266,40 +266,40 @@ impl Db {
         self.migrate().await
     }
 
-    pub async fn connect(database_url: &str) -> Result<Self> {
-        let max_connections = std::env::var("GITLAWB_DB_MAX_CONNECTIONS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u32>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(50);
-        let acquire_timeout_secs = std::env::var("GITLAWB_DB_ACQUIRE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(5);
-        let connect_timeout_secs = std::env::var("GITLAWB_DB_CONNECT_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(10);
-
+    /// Connect the pool and run migrations. The initial connection is bounded
+    /// by `acquire_timeout` (sqlx routes pool connects through the acquire
+    /// path); migrations are unbounded here — the caller wraps the whole call
+    /// in its own attempt timeout, since the migration advisory lock can
+    /// legitimately block while another instance migrates.
+    pub async fn connect(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<Self> {
         info!(
             max_connections,
-            acquire_timeout_secs, connect_timeout_secs, "connecting to postgres"
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "connecting to postgres"
         );
-        let pool = tokio::time::timeout(
-            Duration::from_secs(connect_timeout_secs),
-            PgPoolOptions::new()
-                .max_connections(max_connections)
-                .acquire_timeout(Duration::from_secs(acquire_timeout_secs))
-                .connect(database_url),
-        )
-        .await
-        .context("postgres connect timed out")??;
-        info!(max_connections, "postgres pool configured");
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect(database_url)
+            .await
+            .context("connecting to postgres")?;
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Cheap liveness probe against the pool, for readiness checks: one
+    /// `SELECT 1` that fails fast when the database is unreachable.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .context("db ping")?;
+        Ok(())
     }
 
     /// Run all pending versioned migrations in order, inside a single
