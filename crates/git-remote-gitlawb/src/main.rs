@@ -570,6 +570,13 @@ fn safe_error_body_excerpt(body: &str) -> String {
             continue;
         }
 
+        if gitlawb_core::sanitize::is_bidi_format(ch) {
+            // Drop Cf bidi/format controls (INV-6, #183) without marking
+            // pending_space: unlike a newline/tab they are not whitespace, so
+            // "a\u{202e}c" collapses to "ac" with no phantom gap.
+            continue;
+        }
+
         if ch.is_whitespace() {
             pending_space = true;
             continue;
@@ -1160,6 +1167,50 @@ mod tests {
     }
 
     #[test]
+    fn http_error_message_strips_bidi_format_controls() {
+        // Each Cf bidi class must be stripped (INV-6, #183), not just U+202E:
+        // override (RLO), embedding + pop (LRE/PDF), isolate (LRI/PDI), and marks
+        // (LRM/ALM). Asserted per code point so a partial predicate fails loudly.
+        // The visible words must survive and JOIN with no phantom space at the
+        // strip points: a bidi char is dropped like a control byte, but unlike a
+        // newline/tab it is not whitespace, so it must not set pending_space.
+        let body = "err\u{202e}\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok";
+        let message = http_error_message(
+            "GET",
+            "/info/refs",
+            reqwest::StatusCode::BAD_GATEWAY,
+            body,
+            None,
+        );
+        for c in [
+            '\u{202e}', '\u{202a}', '\u{202c}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{061c}',
+        ] {
+            assert!(!message.contains(c), "bidi U+{:04X} leaked: {message:?}", c as u32);
+        }
+        assert!(
+            message.contains("errok"),
+            "words should join with no phantom space: {message:?}"
+        );
+    }
+
+    #[test]
+    fn http_error_message_preserves_legitimate_and_rtl_text() {
+        // Must not over-strip: plain text, a genuine RTL SCRIPT letter (Arabic
+        // U+0627, category Lo), and ZWJ (U+200D, a legitimate Cf char) survive.
+        let message = http_error_message(
+            "GET",
+            "/info/refs",
+            reqwest::StatusCode::BAD_GATEWAY,
+            "ok \u{0627}\u{200D}b",
+            None,
+        );
+        assert!(
+            message.ends_with("ok \u{0627}\u{200D}b"),
+            "legitimate text was altered: {message:?}"
+        );
+    }
+
+    #[test]
     fn http_error_message_truncates_long_response_body() {
         let body = "x".repeat(MAX_ERROR_BODY_CHARS + 100);
         let message = http_error_message(
@@ -1192,6 +1243,33 @@ mod tests {
         assert!(message.contains("repository is not registered on this node"));
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn connect_error_strips_bidi_from_response_body() {
+        // Transport-path proof: a bidi override in the node's real HTTP error body
+        // must not reach the surfaced error text. Drives the full handle_connect
+        // error path, not just the safe_error_body_excerpt unit boundary (INV-6).
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /z6Mk/myrepo/info/refs?service=git-upload-pack HTTP/1.1",
+            status: "404 Not Found",
+            body: "not\u{202e}found",
+        }]);
+
+        let repo_base = format!("{base_url}/z6Mk/myrepo");
+        let mut stdin = std::io::Cursor::new(Vec::<u8>::new());
+        let err = handle_connect(&repo_base, "git-upload-pack", None, &mut stdin).unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            !message.contains('\u{202e}'),
+            "bidi override reached the terminal: {message:?}"
+        );
+        assert!(
+            message.contains("notfound"),
+            "body should survive with the bidi char stripped: {message:?}"
+        );
+        let _ = server.join();
     }
 
     #[test]
