@@ -463,6 +463,18 @@ mod tests {
         assert_eq!(sanitize_excerpt(&long).chars().count(), MAX_ERR_CHARS);
     }
 
+    #[test]
+    fn sanitize_bidi_chars_do_not_consume_the_length_cap() {
+        // A dropped bidi char must not count toward MAX_ERR_CHARS: it is dropped
+        // before `kept` increments, so interleaving bidi controls cannot truncate
+        // the visible output early. MAX_ERR_CHARS + 100 visible 'x', each trailed by
+        // a bidi override, must still yield exactly MAX_ERR_CHARS visible 'x' with
+        // no phantom spaces. (Would regress to fewer 'x' if bidi consumed budget, or
+        // to spaces if the drop branch wrongly set pending_space.)
+        let body = "x\u{202e}".repeat(MAX_ERR_CHARS + 100);
+        assert_eq!(sanitize_excerpt(&body), "x".repeat(MAX_ERR_CHARS));
+    }
+
     // ── P2: never talk to (or hand a key to) an untrusted node-chosen URL ──
 
     #[test]
