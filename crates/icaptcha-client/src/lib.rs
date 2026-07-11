@@ -64,6 +64,12 @@ fn sanitize_excerpt(s: &str) -> String {
             }
             continue;
         }
+        if gitlawb_core::sanitize::is_bidi_format(ch) {
+            // Drop Cf bidi/format controls (INV-6, #183) without setting
+            // pending_space: they are not whitespace, so stripping leaves no
+            // phantom gap.
+            continue;
+        }
         if ch.is_whitespace() {
             pending_space = true;
             continue;
@@ -419,6 +425,33 @@ mod tests {
             "control survived: {clean:?}"
         );
         assert!(clean.contains("owned") && clean.contains("done"));
+    }
+
+    #[test]
+    fn sanitize_strips_bidi_format_controls() {
+        // The Cc-only test above is vacuous for Cf: it passes whether or not bidi
+        // controls survive, which is why this gap shipped (#183). Here every Cf
+        // bidi class is stripped — override (RLO), embedding + pop (LRE/PDF),
+        // isolate (LRI/PDI), marks (LRM/ALM) — asserted per code point, and the
+        // visible words JOIN with no phantom space (a bidi char is dropped like a
+        // control byte, but unlike a newline/tab it is not whitespace).
+        let out = sanitize_excerpt("err\u{202e}\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok");
+        for c in [
+            '\u{202e}', '\u{202a}', '\u{202c}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{061c}',
+        ] {
+            assert!(!out.contains(c), "bidi U+{:04X} leaked: {out:?}", c as u32);
+        }
+        assert_eq!(out, "errok");
+    }
+
+    #[test]
+    fn sanitize_preserves_legitimate_and_rtl_text() {
+        // Must not over-strip: plain text, a genuine RTL SCRIPT letter (Arabic
+        // U+0627, category Lo), and ZWJ (U+200D, a legitimate Cf char) survive.
+        assert_eq!(
+            sanitize_excerpt("ok \u{0627}\u{200D}b"),
+            "ok \u{0627}\u{200D}b"
+        );
     }
 
     #[test]
