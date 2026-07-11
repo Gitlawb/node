@@ -1173,8 +1173,9 @@ mod tests {
         // (LRM/ALM). Asserted per code point so a partial predicate fails loudly.
         // The visible words must survive and JOIN with no phantom space at the
         // strip points: a bidi char is dropped like a control byte, but unlike a
-        // newline/tab it is not whitespace, so it must not set pending_space.
-        let body = "err\u{202e}\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok";
+        // newline/tab it is not whitespace, so it must not set pending_space. The
+        // leading bidi char (index 0) also exercises the empty-excerpt path.
+        let body = "\u{202e}err\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok";
         let message = http_error_message(
             "GET",
             "/info/refs",

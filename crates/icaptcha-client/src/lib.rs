@@ -434,8 +434,9 @@ mod tests {
         // bidi class is stripped — override (RLO), embedding + pop (LRE/PDF),
         // isolate (LRI/PDI), marks (LRM/ALM) — asserted per code point, and the
         // visible words JOIN with no phantom space (a bidi char is dropped like a
-        // control byte, but unlike a newline/tab it is not whitespace).
-        let out = sanitize_excerpt("err\u{202e}\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok");
+        // control byte, but unlike a newline/tab it is not whitespace). The leading
+        // bidi char (index 0) also exercises the empty-out path.
+        let out = sanitize_excerpt("\u{202e}err\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok");
         for c in [
             '\u{202e}', '\u{202a}', '\u{202c}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{061c}',
         ] {
