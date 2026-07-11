@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
@@ -349,28 +349,27 @@ fn pkt_line(data: &str) -> Vec<u8> {
     format!("{len:04x}{data}").into_bytes()
 }
 
-/// Run `rev-list --objects --all` and return the reachable object ids minus the
-/// withheld blobs. Blocking (shells out to git); the caller runs it off the async
-/// runtime. Kept separate from the pack-objects stage so that stage can live on the
-/// async side under [`drive_git_child`] (`git_bin` is injectable for the same
-/// fake-git testing reason as `run_git_service`).
-fn rev_list_keep(
+/// Run `rev-list --objects --all` under `timeout` and return the reachable object
+/// ids minus the withheld blobs. Runs under [`drive_git_child`] (async, with the
+/// `tokio::time::timeout` + `process_group(0)` + [`KillGroupOnDrop`] teardown), so a
+/// hung/slow enumeration is duration-bounded and reaped on client disconnect just
+/// like the pack-objects stage. A bare blocking `Command::output()` inside a
+/// `spawn_blocking` is uncancellable, so a hung rev-list would pin the endpoint's
+/// concurrency permit for the whole hang (#174). `git_bin` is injectable for the
+/// same fake-git testing reason as `run_git_service`.
+async fn rev_list_keep(
     git_bin: &str,
     repo_path: &Path,
     withheld: &HashSet<String>,
+    timeout: Duration,
 ) -> Result<Vec<String>> {
-    let rev = std::process::Command::new(git_bin)
+    let mut command = Command::new(git_bin);
+    command
         .args(["rev-list", "--objects", "--all"])
-        .current_dir(repo_path)
-        .output()?;
-    if !rev.status.success() {
-        bail!(
-            "git rev-list failed: {}",
-            String::from_utf8_lossy(&rev.stderr)
-        );
-    }
+        .current_dir(repo_path);
+    let stdout = drive_git_child(command, Bytes::new(), timeout, "rev-list").await?;
     let mut keep = Vec::new();
-    for line in String::from_utf8_lossy(&rev.stdout).lines() {
+    for line in String::from_utf8_lossy(&stdout).lines() {
         let oid = line.split_whitespace().next().unwrap_or("");
         if oid.is_empty() || withheld.contains(oid) {
             continue;
@@ -384,32 +383,41 @@ fn rev_list_keep(
 /// given blob OIDs. Commits and trees are always included, so SHAs stay intact;
 /// only the named blobs are dropped.
 ///
-/// The rev-list enumeration runs blocking off the async runtime; the streaming
-/// `pack-objects` stage runs under [`drive_git_child`], so a hung/slow pack build is
-/// duration-bounded and its process group is reaped on client disconnect. An outer
-/// `tokio::time::timeout` around a `spawn_blocking` cannot cancel the blocking
-/// thread, so the streaming stage MUST live on the async side (#174, KTD5).
+/// Both git stages — the `rev-list` enumeration and the streaming `pack-objects`
+/// build — run under [`drive_git_child`] sharing one deadline, so a hung/slow git at
+/// either stage is duration-bounded and its process group is reaped on client
+/// disconnect. An outer `tokio::time::timeout` around a `spawn_blocking` cannot
+/// cancel the blocking thread, so neither stage may live off the async side
+/// (#174, KTD5).
 pub async fn build_filtered_pack(
     git_bin: &str,
     repo_path: &Path,
     withheld: &HashSet<String>,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
-    let keep = {
-        let git_bin = git_bin.to_string();
-        let repo_path = repo_path.to_path_buf();
-        let withheld = withheld.clone();
-        tokio::task::spawn_blocking(move || rev_list_keep(&git_bin, &repo_path, &withheld))
-            .await
-            .context("rev-list task panicked")??
-    };
+    // One deadline spans both git stages so a slow rev-list eats into the pack
+    // budget rather than granting each stage a fresh `timeout` (2x the permit hold).
+    let deadline = Instant::now() + timeout;
+    let keep = rev_list_keep(
+        git_bin,
+        repo_path,
+        withheld,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .await?;
     let mut data = keep.join("\n").into_bytes();
     data.push(b'\n');
     let mut command = Command::new(git_bin);
     command
         .args(["pack-objects", "--stdout"])
         .current_dir(repo_path);
-    drive_git_child(command, Bytes::from(data), timeout, "pack-objects").await
+    drive_git_child(
+        command,
+        Bytes::from(data),
+        deadline.saturating_duration_since(Instant::now()),
+        "pack-objects",
+    )
+    .await
 }
 
 /// Serve a clone/fetch with the withheld blobs removed from the response pack.
@@ -1324,6 +1332,44 @@ mod tests {
         assert!(
             err.downcast_ref::<GitServiceTimeout>().is_some(),
             "a hung pack-objects must abort with GitServiceTimeout, got: {err}"
+        );
+    }
+
+    // #174 (SC3, KTD5): the filtered-pack build's rev-list ENUMERATION stage is now
+    // duration-bounded on the ASYNC side too. It previously ran inside a
+    // spawn_blocking via a bare `Command::output()`, which an outer tokio timeout
+    // cannot cancel, so a hung/slow rev-list pinned the endpoint's concurrency permit
+    // for the whole hang. A fake git that hangs on rev-list must now abort with
+    // GitServiceTimeout; the watchdog turns a missing bound into a loud failure.
+    // rev-list runs under drive_git_child, so its disconnect/group-teardown is the
+    // same code proven by run_git_service_tears_down_group_when_future_dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_filtered_pack_times_out_a_hung_rev_list() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // rev-list hangs forever; pack-objects would return fast if it were reached.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) sleep 300 ;;\n  pack-objects) printf '' ;;\n  *) exit 1 ;;\nesac\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let withheld = HashSet::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            build_filtered_pack(
+                git_bin.to_str().unwrap(),
+                tmp.path(),
+                &withheld,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect(
+            "build_filtered_pack must return within the watchdog — the rev-list \
+             stage must be timeout-bounded, not an uncancellable spawn_blocking",
+        );
+        let err = result.expect_err("a hung rev-list must return an error, not hang");
+        assert!(
+            err.downcast_ref::<GitServiceTimeout>().is_some(),
+            "a hung rev-list must abort with GitServiceTimeout, got: {err}"
         );
     }
 
