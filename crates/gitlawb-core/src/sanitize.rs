@@ -40,10 +40,15 @@ mod tests {
         // marks but not the isolates) fails loudly rather than passing.
         for c in [
             '\u{200E}', '\u{200F}', '\u{061C}', // LRM, RLM, ALM
-            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', // LRE, RLE, PDF, LRO, RLO
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', // LRE, RLE, PDF, LRO, RLO
             '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // LRI, RLI, FSI, PDI
         ] {
-            assert!(is_bidi_format(c), "U+{:04X} must be a bidi-format char", c as u32);
+            assert!(
+                is_bidi_format(c),
+                "U+{:04X} must be a bidi-format char",
+                c as u32
+            );
         }
     }
 
@@ -54,7 +59,11 @@ mod tests {
         // not bidi-format. ESC is a Cc control char — owned by is_control(), not
         // this predicate, which is bidi-only.
         for c in ['a', '\u{0627}', '\u{200D}', '\u{00AD}', '\u{1b}'] {
-            assert!(!is_bidi_format(c), "U+{:04X} must NOT be a bidi-format char", c as u32);
+            assert!(
+                !is_bidi_format(c),
+                "U+{:04X} must NOT be a bidi-format char",
+                c as u32
+            );
         }
     }
 }

@@ -1185,7 +1185,11 @@ mod tests {
         for c in [
             '\u{202e}', '\u{202a}', '\u{202c}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{061c}',
         ] {
-            assert!(!message.contains(c), "bidi U+{:04X} leaked: {message:?}", c as u32);
+            assert!(
+                !message.contains(c),
+                "bidi U+{:04X} leaked: {message:?}",
+                c as u32
+            );
         }
         assert!(
             message.contains("errok"),
