@@ -61,11 +61,7 @@ impl Drop for TestNode {
 fn unique_repos_dir() -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!(
-        "gitlawb-deny-harness-{}-{}",
-        std::process::id(),
-        n
-    ))
+    std::env::temp_dir().join(format!("gitlawb-deny-harness-{}-{}", std::process::id(), n))
 }
 
 /// Build an [`AppState`] over the given migrated pool, mirroring
@@ -185,7 +181,13 @@ impl TestNode {
         created_by: &str,
     ) {
         self.db
-            .set_visibility_rule(repo_id, path_glob, VisibilityMode::B, reader_dids, created_by)
+            .set_visibility_rule(
+                repo_id,
+                path_glob,
+                VisibilityMode::B,
+                reader_dids,
+                created_by,
+            )
             .await
             .expect("set visibility rule");
     }

@@ -64,7 +64,12 @@ mod tests {
 
     #[test]
     fn clean_403_with_no_leak_passes() {
-        let r = check_denied(403, r#"{"error":"only the repo owner can do this"}"#, 403, &["a1b2c3"]);
+        let r = check_denied(
+            403,
+            r#"{"error":"only the repo owner can do this"}"#,
+            403,
+            &["a1b2c3"],
+        );
         assert!(r.is_ok(), "{r:?}");
     }
 
