@@ -11,8 +11,17 @@ mod support;
 use support::assert::assert_denied;
 use support::signing::signed_request;
 
+use gitlawb_core::cid::Cid;
 use gitlawb_core::identity::Keypair;
 use gitlawb_node::test_harness::spawn_node;
+
+/// Build the `/ipfs/{cid}` CID for a 64-hex sha2-256 git object id, matching the
+/// node's own `Cid::from_sha256_bytes` (the value `get_by_cid` decodes back).
+fn cid_for_oid(oid_hex: &str) -> String {
+    let bytes = hex::decode(oid_hex).expect("hex oid");
+    let arr: [u8; 32] = bytes.as_slice().try_into().expect("32-byte sha256 oid");
+    Cid::from_sha256_bytes(&arr).to_string()
+}
 
 // ── U2: the signing client produces signatures require_signature accepts ─────
 
@@ -100,6 +109,60 @@ async fn unsigned_receive_pack_is_denied(pool: sqlx::PgPool) {
     assert_denied(resp, 401, &[]).await;
 }
 
+// ── U5(b): INV-8/INV-2 — anonymous /ipfs/{cid} of a withheld blob is denied ──
+
+/// A public repo with a `/secret/**` withhold rule (readers = one allowed DID).
+/// An anonymous content-addressed read of the withheld blob's CID is denied
+/// (404) and leaks neither the secret bytes nor its OID; the sibling public
+/// blob's CID is served anonymously, proving the withhold is blob-scoped.
+#[sqlx::test]
+async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = reqwest::Client::new();
+
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let reader = Keypair::generate();
+
+    let repo_id = node.seed_repo(&owner_did, "u5b-repo", true).await;
+    // sha256 object format: the /ipfs CID is the sha2-256 object id.
+    let oids = node.seed_bare_repo(
+        &owner_did,
+        "u5b-repo",
+        &[
+            ("public/a.txt", "public bytes U5b"),
+            ("secret/b.txt", "TOPSECRET-U5b"),
+        ],
+        "sha256",
+    );
+    node.withhold_path(&repo_id, "/secret/**", &[reader.did().to_string()], &owner_did)
+        .await;
+
+    let secret_oid = oids["secret/b.txt"].clone();
+    let secret_cid = cid_for_oid(&secret_oid);
+    let public_cid = cid_for_oid(&oids["public/a.txt"]);
+
+    // Anonymous read of the withheld blob's CID: denied, no leak of content or OID.
+    let resp = client
+        .get(format!("{}/ipfs/{secret_cid}", node.base_url))
+        .send()
+        .await
+        .expect("request sends");
+    assert_denied(resp, 404, &["TOPSECRET-U5b", &secret_oid, &secret_oid[..12]]).await;
+
+    // The sibling public blob's CID is served to anon (withhold is blob-scoped).
+    let resp = client
+        .get(format!("{}/ipfs/{public_cid}", node.base_url))
+        .send()
+        .await
+        .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 200, "public blob CID must be served to anon");
+    assert!(
+        resp.text().await.unwrap().contains("public bytes U5b"),
+        "the public blob content is returned"
+    );
+}
+
 // ── U6: INV-1 — a validly signed NON-owner mutation is owner-gated (403) ──────
 
 /// The case the in-crate `oneshot` suite cannot reach over the full stack: a
@@ -155,5 +218,63 @@ async fn wrong_owner_visibility_put_is_forbidden(pool: sqlx::PgPool) {
         resp.status().is_success(),
         "owner's signed visibility PUT must reach the handler, got {}",
         resp.status()
+    );
+}
+
+// ── U7: INV-2 — a read over a withheld path is denied and leaks nothing ───────
+
+/// A public repo with a path-scoped withhold rule on `/secret/**`. An anonymous
+/// blob read of the withheld path is denied (404 RepoNotFound) and the body
+/// carries neither the secret content nor its blob OID; a read of a sibling
+/// public path succeeds, proving the gate is path-scoped, not a blanket refusal.
+#[sqlx::test]
+async fn withheld_path_blob_read_is_denied(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = reqwest::Client::new();
+
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+
+    let repo_id = node.seed_repo(&owner_did, "u7-repo", true).await;
+    let oids = node.seed_bare_repo(
+        &owner_did,
+        "u7-repo",
+        &[
+            ("public.txt", "hello public"),
+            ("secret/data.txt", "TOPSECRET-CONTENT-U7"),
+        ],
+        "sha1",
+    );
+    node.withhold_path(&repo_id, "/secret/**", &[], &owner_did)
+        .await;
+
+    let secret_oid = oids["secret/data.txt"].clone();
+    let short_oid = &secret_oid[..12];
+
+    // Withheld path: denied, and neither the content nor the OID (full or short)
+    // may appear in the denial body.
+    let resp = client
+        .get(format!(
+            "{}/api/v1/repos/{owner_did}/u7-repo/blob/secret/data.txt",
+            node.base_url
+        ))
+        .send()
+        .await
+        .expect("request sends");
+    assert_denied(resp, 404, &["TOPSECRET-CONTENT-U7", &secret_oid, short_oid]).await;
+
+    // Sibling public path: served, proving the withhold is path-scoped.
+    let resp = client
+        .get(format!(
+            "{}/api/v1/repos/{owner_did}/u7-repo/blob/public.txt",
+            node.base_url
+        ))
+        .send()
+        .await
+        .expect("request sends");
+    assert_eq!(resp.status().as_u16(), 200, "public sibling path must be served");
+    assert!(
+        resp.text().await.unwrap().contains("hello public"),
+        "the public blob content is returned"
     );
 }

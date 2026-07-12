@@ -189,4 +189,74 @@ impl TestNode {
             .await
             .expect("set visibility rule");
     }
+
+    /// Create a real bare git repository on disk at the exact path
+    /// `RepoStore::acquire` reads (`<repos_dir>/<owner-slug>/<name>.git`), with
+    /// one commit on `main` containing `files` (`(path, contents)`). Returns the
+    /// blob OID of each path so callers can assert a withheld OID never appears
+    /// in served bytes (U8). Shells out to `git`, mirroring
+    /// `test_support`'s served-content seam.
+    /// `object_format` is `"sha1"` for the git smart-HTTP surfaces and
+    /// `"sha256"` for the content-addressed `/ipfs/{cid}` surface (whose CIDs
+    /// are the sha2-256 object ids).
+    pub fn seed_bare_repo(
+        &self,
+        owner_did: &str,
+        name: &str,
+        files: &[(&str, &str)],
+        object_format: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Build a source work tree, then bare-clone it into the served path.
+        let src = self.repos_dir.join(format!("src-{name}"));
+        std::fs::create_dir_all(&src).expect("create src dir");
+        let fmt_arg = format!("--object-format={object_format}");
+        run(&["init", "-q", "-b", "main", &fmt_arg], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        for (path, contents) in files {
+            let full = src.join(path);
+            if let Some(parent) = full.parent() {
+                std::fs::create_dir_all(parent).expect("create file parent dir");
+            }
+            std::fs::write(&full, contents).expect("write seed file");
+            run(&["add", path], &src);
+        }
+        run(&["commit", "-q", "-m", "seed"], &src);
+
+        let mut oids = std::collections::HashMap::new();
+        for (path, _) in files {
+            let oid = run(&["rev-parse", &format!("HEAD:{path}")], &src);
+            oids.insert((*path).to_string(), oid);
+        }
+
+        let slug = owner_did.replace([':', '/'], "_");
+        let bare = self.repos_dir.join(&slug).join(format!("{name}.git"));
+        std::fs::create_dir_all(bare.parent().unwrap()).expect("create bare parent");
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            &self.repos_dir,
+        );
+
+        oids
+    }
 }

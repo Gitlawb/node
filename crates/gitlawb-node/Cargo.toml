@@ -100,3 +100,4 @@ tempfile = "3"
 # HTTP client that drives deny paths over the socket.
 sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "migrate"] }
 reqwest = { workspace = true }
+hex = "0.4"
