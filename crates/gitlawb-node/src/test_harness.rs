@@ -242,6 +242,8 @@ impl TestNode {
             let oid = run(&["rev-parse", &format!("HEAD:{path}")], &src);
             oids.insert((*path).to_string(), oid);
         }
+        // The HEAD commit oid, used as the `want` when driving upload-pack.
+        oids.insert("HEAD".to_string(), run(&["rev-parse", "HEAD"], &src));
 
         let slug = owner_did.replace([':', '/'], "_");
         let bare = self.repos_dir.join(&slug).join(format!("{name}.git"));

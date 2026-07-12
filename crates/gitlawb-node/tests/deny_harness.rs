@@ -8,6 +8,8 @@
 
 mod support;
 
+use std::process::Command;
+
 use support::assert::assert_denied;
 use support::signing::signed_request;
 
@@ -276,5 +278,101 @@ async fn withheld_path_blob_read_is_denied(pool: sqlx::PgPool) {
     assert!(
         resp.text().await.unwrap().contains("hello public"),
         "the public blob content is returned"
+    );
+}
+
+// ── U8: INV-2 — an anonymous clone/fetch excludes withheld subtree blobs ──────
+
+/// The replication/clone surface, the one `oneshot` cannot serve: a public repo
+/// with a `/secret/**` withhold rule. A real anonymous `git clone` over
+/// git-upload-pack must yield a packfile that omits the withheld blob's object
+/// while keeping the sibling public blob. The assertion is packfile-aware: git
+/// parsed the served pack, and `cat-file -e` checks object presence in it.
+#[sqlx::test]
+async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+
+    let repo_id = node.seed_repo(&owner_did, "u8-repo", true).await;
+    let oids = node.seed_bare_repo(
+        &owner_did,
+        "u8-repo",
+        &[
+            ("public/a.txt", "public bytes U8"),
+            ("secret/b.txt", "TOPSECRET-U8"),
+        ],
+        "sha1",
+    );
+    node.withhold_path(&repo_id, "/secret/**", &[], &owner_did)
+        .await;
+
+    let secret_oid = oids["secret/b.txt"].clone();
+    let public_oid = oids["public/a.txt"].clone();
+    let head = oids["HEAD"].clone();
+
+    // Drive git-upload-pack directly (v0 stateless-RPC): a want for HEAD, a flush,
+    // then done. No side-band capability, so the response is a raw packfile after
+    // the NAK pkt-line. Vanilla `git clone` negotiates protocol v2 and deadlocks
+    // against the node's v0 server; the POST is the real replication surface and,
+    // via a bounded reqwest timeout, cannot wedge the suite.
+    let pkt = |s: &str| format!("{:04x}{}", s.len() + 4, s).into_bytes();
+    let mut req_body: Vec<u8> = Vec::new();
+    req_body.extend(pkt(&format!("want {head}\n")));
+    req_body.extend_from_slice(b"0000"); // flush after wants
+    req_body.extend(pkt("done\n"));
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let resp = client
+        .post(format!("{}/{owner_did}/u8-repo/git-upload-pack", node.base_url))
+        .header("content-type", "application/x-git-upload-pack-request")
+        .body(req_body)
+        .send()
+        .await
+        .expect("upload-pack POST sends");
+    assert_eq!(resp.status().as_u16(), 200, "anon upload-pack POST must serve a pack");
+    let bytes = resp.bytes().await.expect("read pack response");
+
+    // The packfile starts at the "PACK" magic (after the NAK pkt-line).
+    let pack_start = bytes
+        .windows(4)
+        .position(|w| w == b"PACK")
+        .expect("response must contain a packfile");
+    let pack = &bytes[pack_start..];
+
+    // Index the served pack and list its objects (packfile-aware: a raw byte scan
+    // could not see an OID inside the zlib-compressed stream).
+    let dir = std::env::temp_dir().join(format!("gl-u8-pack-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pack_path = dir.join("deny.pack");
+    std::fs::write(&pack_path, pack).unwrap();
+    let idx = Command::new("git")
+        .args(["index-pack", pack_path.to_str().unwrap()])
+        .output()
+        .expect("git index-pack runs");
+    assert!(
+        idx.status.success(),
+        "the served pack must index cleanly: {}",
+        String::from_utf8_lossy(&idx.stderr)
+    );
+    let verify = Command::new("git")
+        .args(["verify-pack", "-v", pack_path.with_extension("idx").to_str().unwrap()])
+        .output()
+        .expect("git verify-pack runs");
+    let listing = String::from_utf8_lossy(&verify.stdout).to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !listing.contains(&secret_oid),
+        "withheld blob {secret_oid} must be absent from the served pack; listing:\n{listing}"
+    );
+    assert!(
+        listing.contains(&public_oid),
+        "public blob {public_oid} must be present (withhold is subtree-scoped); listing:\n{listing}"
     );
 }
