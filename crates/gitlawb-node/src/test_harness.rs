@@ -1,0 +1,142 @@
+//! Test-only spawn surface for the real-node deny harness (see
+//! `tests/deny_harness.rs`). Feature-gated behind `test-harness` so it never
+//! compiles into the production binary. It exposes a single boot constructor so
+//! the out-of-crate integration test can bring up a real node over a bound TCP
+//! socket without the integration crate needing access to `graphql`,
+//! `rate_limit`, `repo_store`, or the other internals `AppState` is built from.
+//!
+//! The node is built the same way `test_support::build_state` builds it (p2p
+//! disabled, real migrated pool), but bound on `127.0.0.1:0` and served through
+//! the real `axum::serve` stack with connect-info, so the middleware order,
+//! body limits, and per-IP rate limiters all run exactly as in production.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::Parser;
+use sqlx::PgPool;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+
+use gitlawb_core::identity::Keypair;
+
+use crate::config::Config;
+use crate::rate_limit::{RateLimiter, TrustedProxy};
+use crate::state::AppState;
+
+/// A running node bound to an ephemeral port. Dropping it signals graceful
+/// shutdown and removes the temporary repository directory.
+pub struct TestNode {
+    /// Base URL of the running node, e.g. `http://127.0.0.1:54321`.
+    pub base_url: String,
+    /// The node's own DID (for building requests that reference it).
+    pub node_did: String,
+    shutdown_tx: watch::Sender<bool>,
+    repos_dir: PathBuf,
+}
+
+impl Drop for TestNode {
+    fn drop(&mut self) {
+        // Flip the shared shutdown signal so the serve task exits, then remove
+        // the temp repos dir. Both are best-effort: a test that already failed
+        // should not panic again in teardown.
+        let _ = self.shutdown_tx.send(true);
+        let _ = std::fs::remove_dir_all(&self.repos_dir);
+    }
+}
+
+/// Allocate a process-unique temp directory for a spawned node's repositories
+/// without pulling in the `tempfile` dev-dependency (which is unavailable to
+/// the library crate under `--features test-harness`).
+fn unique_repos_dir() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "gitlawb-deny-harness-{}-{}",
+        std::process::id(),
+        n
+    ))
+}
+
+/// Build an [`AppState`] over the given migrated pool, mirroring
+/// `test_support::build_state` but with a real on-disk repository directory so
+/// git smart-HTTP routes can serve. P2P is always disabled.
+fn build_state(db: Arc<crate::db::Db>, pool: PgPool, repos_dir: PathBuf) -> AppState {
+    let keypair = Keypair::generate();
+    let node_did = keypair.did();
+    let (ref_tx, _) = tokio::sync::broadcast::channel(1);
+    let (task_tx, _) = tokio::sync::broadcast::channel(1);
+    let schema = Arc::new(crate::graphql::build_schema(
+        db.clone(),
+        ref_tx.clone(),
+        task_tx.clone(),
+    ));
+    AppState {
+        config: Arc::new(Config::parse_from(["gitlawb-node"])),
+        db,
+        node_did,
+        node_keypair: Arc::new(keypair),
+        p2p: None,
+        http_client: Arc::new(reqwest::Client::new()),
+        ref_update_tx: ref_tx,
+        task_event_tx: task_tx,
+        graphql_schema: schema,
+        machine_id: None,
+        repo_store: crate::git::repo_store::RepoStore::for_testing(repos_dir, pool),
+        rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+        create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
+        push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        push_limiter_trust: TrustedProxy::None,
+        sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
+        peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        shutdown_tx: watch::channel(false).0,
+    }
+}
+
+/// Spawn a real node bound to `127.0.0.1:0` over the given (already-created,
+/// empty) test pool. Runs the schema migrations, builds the router, and serves
+/// it on a background task through the production `axum::serve` stack with
+/// connect-info so per-IP layers key on the real peer. Returns once the socket
+/// is bound and accepting connections.
+pub async fn spawn_node(pool: PgPool) -> TestNode {
+    let db = Arc::new(crate::db::Db::for_testing(pool.clone()));
+    db.run_migrations()
+        .await
+        .expect("test schema migrations should apply");
+
+    let repos_dir = unique_repos_dir();
+    std::fs::create_dir_all(&repos_dir).expect("create temp repos dir");
+
+    let state = build_state(db, pool, repos_dir.clone());
+    let node_did = state.node_did.to_string();
+    let shutdown_tx = state.shutdown_tx.clone();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+
+    let router = crate::server::build_router(state);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("read bound addr");
+
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.changed().await;
+        })
+        .await;
+    });
+
+    TestNode {
+        base_url: format!("http://{addr}"),
+        node_did,
+        shutdown_tx,
+        repos_dir,
+    }
+}
