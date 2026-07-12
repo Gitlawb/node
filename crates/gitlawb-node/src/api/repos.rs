@@ -574,16 +574,24 @@ pub async fn git_info_refs(
         }
     }
 
-    // Per-caller read sub-cap (#174): upload-pack advertisement only. The
-    // receive-pack advertisement is a write-path op (it drew from git_write_semaphore
-    // above and is braked per-IP by push_rate_limiter), so it must NOT consume a
-    // read caller's scarce slot (#174 U2). Acquired AFTER the visibility + push-rate
-    // gates (KTD7) so a denied or rate-limited request never consumes a slot. Held
-    // for the whole op.
+    // Per-source concurrency sub-cap (#174), keyed on the resolved source IP and
+    // acquired AFTER the visibility + push-rate gates (KTD7) so a denied or
+    // rate-limited request never consumes a slot; held for the whole op. The
+    // upload-pack advertisement is bounded on the read pool (git_read_per_caller).
+    // The receive-pack advertisement draws from the write pool, so it is bounded per
+    // source (git_push_advert_per_caller) instead: without this, an anonymous
+    // multi-source flood of push-handshake advertisements could hold the write pool's
+    // slots across acquire_fresh and shed authenticated pushes, since the per-IP push
+    // rate limiter caps rate, not concurrency (#174 review fix).
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
     let _caller_permit = if service == "git-receive-pack" {
-        None
+        acquire_read_caller_permit(
+            &state.git_push_advert_per_caller,
+            caller_key.as_deref(),
+            name,
+            "receive-pack advert",
+        )?
     } else {
-        let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
         acquire_read_caller_permit(
             &state.git_read_per_caller,
             caller_key.as_deref(),
@@ -676,7 +684,7 @@ fn acquire_read_caller_permit(
             None => {
                 tracing::warn!(repo = %repo, caller = %k, handler, "per-caller read cap reached; shedding with 503");
                 Err(AppError::Overloaded(
-                    "git read service at capacity for this caller, retry shortly".into(),
+                    "git service at capacity for this caller, retry shortly".into(),
                 ))
             }
         },
@@ -2824,6 +2832,81 @@ mod tests {
             router.oneshot(req).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "receive-pack advertisement must not be shed by the read per-caller cap: it is a write-path op"
+        );
+    }
+
+    /// #174 (review fix): the anon-reachable receive-pack advertisement draws from
+    /// the write pool, so it is bounded per source by `git_push_advert_per_caller` to
+    /// stop one source from monopolizing the write pool and shedding authenticated
+    /// pushes. Fill one source IP's advert slot; its next receive-pack advertisement
+    /// sheds 503, while a different source and the upload-pack advertisement are
+    /// unaffected. Remove the advert-cap acquisition and the same-source assertion
+    /// goes green-not-503.
+    #[sqlx::test]
+    async fn receive_pack_advertisement_capped_per_source(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_push_advert_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6advcap", "ac", "/tmp/ac-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.81:6000".parse().unwrap();
+        // Fill this source IP's single receive-pack-advertisement slot.
+        let _slot = state
+            .git_push_advert_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first advert slot for this source IP");
+
+        // Same source: the receive-pack advertisement sheds 503 (advert cap full).
+        let router = crate::server::build_router(state.clone());
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advcap/ac/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its receive-pack advertisement cap must shed 503, so it cannot monopolize the write pool"
+        );
+
+        // A DIFFERENT source keeps its own advert budget -> not shed.
+        let other: SocketAddr = "203.0.113.82:6000".parse().unwrap();
+        let router2 = crate::server::build_router(state.clone());
+        let mut req2 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advcap/ac/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(other));
+        assert_ne!(
+            router2.oneshot(req2).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a different source must keep its own receive-pack advertisement budget"
+        );
+
+        // The upload-pack advertisement is NOT bounded by the receive-pack advert cap.
+        let router3 = crate::server::build_router(state);
+        let mut req3 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advcap/ac/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req3.extensions_mut().insert(ConnectInfo(peer));
+        assert_ne!(
+            router3.oneshot(req3).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the upload-pack advertisement must not be shed by the receive-pack advert cap"
         );
     }
 

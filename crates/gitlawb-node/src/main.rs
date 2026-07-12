@@ -385,6 +385,13 @@ async fn main() -> Result<()> {
         git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             config.max_concurrent_reads_per_caller,
         ),
+        // Per-source cap on the receive-pack advertisement, sized to an eighth of the
+        // write pool (min 1): a single source can hold at most this many write-pool
+        // slots via the anon advertisement, so saturating the pool takes ~8 distinct
+        // source IPs, each also rate-limited (#174).
+        git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            (config.max_concurrent_git_pushes / 8).max(1),
+        ),
     };
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
