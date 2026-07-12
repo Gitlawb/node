@@ -26,6 +26,9 @@ pub mod state;
 mod sync;
 #[cfg(test)]
 mod test_support;
+#[cfg(feature = "test-harness")]
+#[doc(hidden)]
+pub mod test_harness;
 mod visibility;
 mod webhooks;
 
