@@ -577,11 +577,16 @@ fn negotiate_upload_pack<R: Read>(
     loop {
         let (batch, bend) = read_upload_pack_round(stdin)?;
 
-        if batch.is_empty() && bend == RoundEnd::Eof {
-            // git closed with no new haves (clone with wants+flush+done is handled
-            // by the Done arm below; this is an up-to-date flush-only opener or a
-            // clean abort): nothing more to POST.
-            return Ok(());
+        // Only POST when a round carries new haves or a terminator. A round with no
+        // new haves needs no request: an empty EOF ends the fetch, and a bare flush
+        // (git never sends a content-free flush mid-negotiation, but a malformed
+        // stream could) is skipped so a run of empty flushes cannot amplify into one
+        // signed POST each. A `done` round with no haves still POSTs (the fresh-clone
+        // case), handled by the terminator match below.
+        match (batch.is_empty(), bend) {
+            (true, RoundEnd::Eof) => return Ok(()),
+            (true, RoundEnd::Flush) => continue,
+            _ => {}
         }
 
         acc_haves.extend_from_slice(&batch);
@@ -1916,6 +1921,43 @@ mod tests {
             requests.len(),
             2,
             "a single-shot negotiation must be exactly one POST, not split"
+        );
+    }
+
+    /// Hardening: content-free flush pkts between the wants and the first haves do
+    /// not each fire a POST. Real git never sends a bare mid-negotiation flush, but
+    /// a malformed stream must not amplify into one signed POST per empty flush; the
+    /// loop skips them and POSTs only the round that carries haves + done.
+    #[test]
+    fn repeated_bare_flushes_do_not_amplify_posts() {
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfake",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin_bytes = Vec::new();
+        stdin_bytes.extend_from_slice(&want_line(&"a".repeat(40)));
+        stdin_bytes.extend_from_slice(b"0000");
+        stdin_bytes.extend_from_slice(b"0000"); // bare flush, no haves
+        stdin_bytes.extend_from_slice(b"0000"); // bare flush, no haves
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
+        stdin_bytes.extend_from_slice(&pkt("done\n"));
+        let mut stdin = io::Cursor::new(stdin_bytes);
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("fetch with stray flushes should complete");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "content-free flushes must not each produce a POST"
         );
     }
 }
