@@ -99,3 +99,61 @@ async fn unsigned_receive_pack_is_denied(pool: sqlx::PgPool) {
     // enforces the 4xx-and-not-empty-200 INV-8 shape.
     assert_denied(resp, 401, &[]).await;
 }
+
+// ── U6: INV-1 — a validly signed NON-owner mutation is owner-gated (403) ──────
+
+/// The case the in-crate `oneshot` suite cannot reach over the full stack: a
+/// fully valid RFC-9421 signature from a non-owner DID hits a mutation and is
+/// rejected by `require_owner` with 403, not merely "not authenticated". The
+/// non-owner sends no `x-ucan` header, so `require_ucan_chain` passes through
+/// and the request reaches the owner gate.
+#[sqlx::test]
+async fn wrong_owner_visibility_put_is_forbidden(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = reqwest::Client::new();
+
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let stranger = Keypair::generate();
+
+    node.seed_repo(&owner_did, "harness-repo", true).await;
+
+    let path = format!("/api/v1/repos/{owner_did}/harness-repo/visibility");
+    let body = br#"{"path_glob":"/","reader_dids":[]}"#.to_vec();
+
+    // Non-owner: valid signature, wrong identity -> 403 from the owner gate.
+    let resp = signed_request(
+        &client,
+        reqwest::Method::PUT,
+        &node.base_url,
+        &path,
+        body.clone(),
+        &stranger,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("request sends");
+    assert_denied(resp, 403, &[]).await;
+
+    // Reachability proof: the same request signed by the OWNER is not 403 (it
+    // reaches the handler). Without this, a 403 produced by an earlier layer or
+    // a mis-seeded repo would masquerade as a passing INV-1 case.
+    let resp = signed_request(
+        &client,
+        reqwest::Method::PUT,
+        &node.base_url,
+        &path,
+        body,
+        &owner,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("request sends");
+    assert!(
+        resp.status().is_success(),
+        "owner's signed visibility PUT must reach the handler, got {}",
+        resp.status()
+    );
+}
