@@ -507,10 +507,21 @@ pub async fn git_info_refs(
     headers: axum::http::HeaderMap,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
-    // Shed with a 503 before spawning git when the concurrency cap is saturated;
-    // held for the whole op (incl. the smart_http call), released on return.
-    let _permit = git_permit(&state.git_read_semaphore)?;
     let name = smart_http_repo_name(&repo)?;
+    let service = query
+        .service
+        .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
+    // Shed with a 503 before spawning git when the concurrency cap is saturated;
+    // held for the whole op (incl. the smart_http call), released on return. The
+    // receive-pack advertisement is phase one of a push, so it draws from the WRITE
+    // pool (like the git-receive-pack POST), not the global read pool an anonymous
+    // clone flood can exhaust and thereby starve the push handshake (#174 U2). The
+    // upload-pack advertisement stays on the read pool with its per-caller sub-cap.
+    let _permit = if service == "git-receive-pack" {
+        git_permit(&state.git_write_semaphore)?
+    } else {
+        git_permit(&state.git_read_semaphore)?
+    };
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
     let record = state
         .db
@@ -524,9 +535,6 @@ pub async fn git_info_refs(
         return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
 
-    let service = query
-        .service
-        .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
     tracing::debug!(service = %service, repo = %name, "info/refs service");
 
     // Enforce read visibility on the ref advertisement, for BOTH services. The
@@ -566,16 +574,23 @@ pub async fn git_info_refs(
         }
     }
 
-    // Per-caller read sub-cap (#174): acquired AFTER the visibility + push-rate
-    // gates (KTD7) so a denied or rate-limited request never consumes a caller's
-    // scarce read slot. Applies to BOTH advertisements. Held for the whole op.
-    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
-    let _caller_permit = acquire_read_caller_permit(
-        &state.git_read_per_caller,
-        caller_key.as_deref(),
-        name,
-        "info/refs",
-    )?;
+    // Per-caller read sub-cap (#174): upload-pack advertisement only. The
+    // receive-pack advertisement is a write-path op (it drew from git_write_semaphore
+    // above and is braked per-IP by push_rate_limiter), so it must NOT consume a
+    // read caller's scarce slot (#174 U2). Acquired AFTER the visibility + push-rate
+    // gates (KTD7) so a denied or rate-limited request never consumes a slot. Held
+    // for the whole op.
+    let _caller_permit = if service == "git-receive-pack" {
+        None
+    } else {
+        let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+        acquire_read_caller_permit(
+            &state.git_read_per_caller,
+            caller_key.as_deref(),
+            name,
+            "info/refs",
+        )?
+    };
 
     // For receive-pack (push), download the latest from Tigris so the client
     // sees the same refs that acquire_write() will operate on.
@@ -2690,6 +2705,123 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "receive-pack advertisement must be throttled before the Tigris acquire"
+        );
+    }
+
+    /// #174 U2: the receive-pack advertisement (`GET info/refs?service=git-receive-pack`)
+    /// is phase one of a push, so it draws from the WRITE pool, not the global read
+    /// pool an anonymous clone flood can exhaust. Proven at the handler by saturating
+    /// each pool to zero and checking who shares it (INV-10). Revert the branch to the
+    /// read pool and the read-saturated receive-pack assertion goes 503 (the exact
+    /// push-handshake starvation jatmn flagged).
+    #[sqlx::test]
+    async fn receive_pack_advertisement_draws_from_write_pool(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        // Build a fresh state with the two pools sized independently, then drive one
+        // info/refs advertisement for `service` and return its handler status.
+        async fn advert_status(
+            pool: &sqlx::PgPool,
+            read_permits: usize,
+            write_permits: usize,
+            service: &str,
+        ) -> StatusCode {
+            let mut state = crate::test_support::test_state(pool.clone()).await;
+            state.git_read_semaphore = Arc::new(Semaphore::new(read_permits));
+            state.git_write_semaphore = Arc::new(Semaphore::new(write_permits));
+            state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+            state
+                .db
+                .upsert_mirror_repo("z6wpadv", "wp", "/tmp/wp-nonexistent", None, false)
+                .await
+                .unwrap();
+            let peer: SocketAddr = "203.0.113.61:6000".parse().unwrap();
+            let router = crate::server::build_router(state);
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/z6wpadv/wp/info/refs?service={service}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            router.oneshot(req).await.unwrap().status()
+        }
+
+        // Read pool saturated, write pool free: the push handshake SURVIVES.
+        assert_ne!(
+            advert_status(&pool, 0, 8, "git-receive-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement must draw from the write pool: a saturated read pool must not shed it"
+        );
+        // Write pool saturated, read pool free: the receive-pack advertisement SHEDS,
+        // proving it now consumes the write pool (not the read pool).
+        assert_eq!(
+            advert_status(&pool, 8, 0, "git-receive-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement draws from the write pool, so a saturated write pool sheds it 503"
+        );
+        // Read pool saturated: the upload-pack advertisement still SHEDS (unchanged).
+        assert_eq!(
+            advert_status(&pool, 0, 8, "git-upload-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upload-pack advertisement stays on the read pool: a saturated read pool sheds it 503"
+        );
+        // Write pool saturated, read pool free: the upload-pack advertisement is
+        // UNAFFECTED, proving reads never touch the write pool in either direction.
+        assert_ne!(
+            advert_status(&pool, 8, 0, "git-upload-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upload-pack advertisement never touches the write pool"
+        );
+    }
+
+    /// #174 U2: the receive-pack advertisement is a write-path op, so it must not be
+    /// shed by the READ per-caller sub-cap even when the caller's source IP has
+    /// exhausted its read budget (e.g. concurrent clones from the same host). Fill
+    /// the IP's read per-caller slot, then the receive-pack advertisement from that
+    /// same IP must still get through. Restore the unconditional read-cap acquire on
+    /// the receive-pack branch and this goes 503.
+    #[sqlx::test]
+    async fn receive_pack_advertisement_ignores_read_per_caller_cap(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6wpc", "wp", "/tmp/wp-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.71:6000".parse().unwrap();
+        // Exhaust the source IP's single READ per-caller slot, as concurrent clones
+        // from the same host would.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("fill the IP's read per-caller slot");
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6wpc/wp/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_ne!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement must not be shed by the read per-caller cap: it is a write-path op"
         );
     }
 
