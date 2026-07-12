@@ -569,12 +569,7 @@ pub async fn git_info_refs(
     // Per-caller read sub-cap (#174): acquired AFTER the visibility + push-rate
     // gates (KTD7) so a denied or rate-limited request never consumes a caller's
     // scarce read slot. Applies to BOTH advertisements. Held for the whole op.
-    let caller_key = read_caller_key(
-        auth.as_ref().map(|e| e.0 .0.as_str()),
-        &headers,
-        peer,
-        state.push_limiter_trust,
-    );
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
     let _caller_permit = acquire_read_caller_permit(
         &state.git_read_per_caller,
         caller_key.as_deref(),
@@ -633,21 +628,21 @@ fn git_permit(
     })
 }
 
-/// Resolve the per-caller key for the read sub-cap (#174): the authenticated DID
-/// when the caller signed (via `optional_signature`), else the trusted client IP
-/// (`client_key`). `None` when neither is available — such a request is bounded by
-/// the global read pool only, never a 500. The per-source-IP key is only as
-/// granular as `trust`; see the `max_concurrent_reads_per_caller` config doc.
+/// Resolve the per-caller key for the read sub-cap (#174): always the resolved
+/// source IP (`client_key`), never the signed DID. Public read routes accept any
+/// valid `did:key` via `optional_signature` with no admission step, so keying on
+/// the DID would let one host mint disposable DIDs to multiply its per-source
+/// budget; the push path already throttles on the resolved source IP for exactly
+/// this DID-farm reason (`rate_limit.rs`, `IpRateLimiter`). `None` when no key
+/// resolves (no trusted header and no peer): such a request is bounded by the
+/// global read pool only, never a 500. The per-source-IP key is only as granular
+/// as `trust`; see the `max_concurrent_reads_per_caller` config doc.
 fn read_caller_key(
-    caller_did: Option<&str>,
     headers: &axum::http::HeaderMap,
     peer: Option<std::net::SocketAddr>,
     trust: crate::rate_limit::TrustedProxy,
 ) -> Option<String> {
-    match caller_did {
-        Some(did) => Some(did.to_string()),
-        None => crate::rate_limit::client_key(headers, peer, trust),
-    }
+    crate::rate_limit::client_key(headers, peer, trust)
 }
 
 /// Acquire the per-caller read sub-cap permit (#174), or shed with a 503. `key` is
@@ -727,9 +722,10 @@ pub async fn git_upload_pack(
     }
 
     // Per-caller read sub-cap (#174): after the visibility gate (KTD7) so a
-    // visibility-denied caller never consumes a scarce read slot. Keyed per-DID
-    // when signed, else per-source-IP; no resolvable key -> global read pool only.
-    let caller_key = read_caller_key(caller, &headers, peer, state.push_limiter_trust);
+    // visibility-denied caller never consumes a scarce read slot. Keyed on the
+    // resolved source IP (never the signed DID, #174 U1); no resolvable key ->
+    // global read pool only.
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
     let _caller_permit = acquire_read_caller_permit(
         &state.git_read_per_caller,
         caller_key.as_deref(),
@@ -2810,15 +2806,16 @@ mod tests {
         );
     }
 
-    /// #174 SC2 (per-DID key): a SIGNED caller is keyed by its DID, not its source
-    /// IP. Fill the DID's single read slot, then drive a request carrying that
-    /// `AuthenticatedDid` from an IP whose own slot is free — it must shed 503,
-    /// proving the key is the DID. A second request from the SAME IP but a DIFFERENT
-    /// DID is not shed. Collapse `read_caller_key` to its IP arm and the first
-    /// assertion goes green-not-503 (the IP slot is free) — this is the per-DID half
-    /// of the keying proof that the per-IP probes above do not cover.
+    /// #174 SC2 (per-source key, U1): the per-caller read sub-cap keys on the
+    /// resolved source IP, NOT the signed DID, so a disposable-DID farm cannot
+    /// multiply its budget. Fill the source IP's single read slot, then drive two
+    /// requests signed under DIFFERENT DIDs from that SAME IP: both must shed 503
+    /// (keyed by the saturated IP, not their own free DID slots). A signed request
+    /// from a DIFFERENT source IP keeps its own budget. Revert `read_caller_key` to
+    /// prefer the DID and the same-IP assertions go green-not-503 (each fresh DID
+    /// gets a free slot) -- the farm-defeat mutation probe.
     #[sqlx::test]
-    async fn info_refs_per_caller_cap_keys_on_did_not_ip(pool: sqlx::PgPool) {
+    async fn info_refs_per_caller_cap_keys_on_ip_not_did(pool: sqlx::PgPool) {
         use axum::body::Body;
         use axum::extract::ConnectInfo;
         use axum::http::{Method, Request, StatusCode};
@@ -2830,7 +2827,7 @@ mod tests {
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         state
             .db
-            .upsert_mirror_repo("z6pcdid", "pc", "/tmp/pc-nonexistent", None, false)
+            .upsert_mirror_repo("z6pcip", "pc", "/tmp/pc-nonexistent", None, false)
             .await
             .unwrap();
 
@@ -2838,17 +2835,17 @@ mod tests {
         let did_b = "did:key:z6MkPerCallerKeyingProofDidBBBBBBBBBBBBBBBB";
         let peer: SocketAddr = "203.0.113.51:5000".parse().unwrap();
 
-        // Fill DID_A's single read slot; the IP's own slot is left untouched.
+        // Fill the SOURCE IP's single read slot; both DIDs' own slots stay free.
         let _slot = state
             .git_read_per_caller
-            .try_acquire(did_a)
-            .expect("first slot for this DID");
+            .try_acquire(&peer.ip().to_string())
+            .expect("first slot for this source IP");
 
-        // Signed as DID_A, from `peer` (whose IP slot is free): keyed by DID -> shed.
+        // Signed as DID_A from `peer`: keyed by the saturated source IP -> shed 503.
         let router = crate::server::build_router(state.clone());
         let mut req = Request::builder()
             .method(Method::GET)
-            .uri("/z6pcdid/pc/info/refs?service=git-upload-pack")
+            .uri("/z6pcip/pc/info/refs?service=git-upload-pack")
             .body(Body::empty())
             .unwrap();
         req.extensions_mut().insert(ConnectInfo(peer));
@@ -2857,23 +2854,41 @@ mod tests {
         assert_eq!(
             router.oneshot(req).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a signed caller at its per-DID read cap must shed with 503 (keyed by DID, not the free IP slot)"
+            "a signed caller must be keyed by its source IP, not its DID: the saturated IP must shed it 503"
         );
 
-        // Same IP, DIFFERENT DID -> its own budget -> not shed by DID_A's saturation.
+        // Same IP, a DIFFERENT DID: still keyed by the same saturated IP -> also shed.
+        // The farm defeat: minting a fresh DID buys no fresh per-source budget.
         let router2 = crate::server::build_router(state.clone());
         let mut req2 = Request::builder()
             .method(Method::GET)
-            .uri("/z6pcdid/pc/info/refs?service=git-upload-pack")
+            .uri("/z6pcip/pc/info/refs?service=git-upload-pack")
             .body(Body::empty())
             .unwrap();
         req2.extensions_mut().insert(ConnectInfo(peer));
         req2.extensions_mut()
             .insert(crate::auth::AuthenticatedDid(did_b.to_string()));
-        assert_ne!(
+        assert_eq!(
             router2.oneshot(req2).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a different DID from the same IP must not be shed by another DID's saturated budget"
+            "a second DID from the same source IP must also shed 503: a DID farm cannot multiply the per-source budget"
+        );
+
+        // A signed caller from a DIFFERENT source IP keeps its own budget -> not shed.
+        let other: SocketAddr = "203.0.113.52:5000".parse().unwrap();
+        let router3 = crate::server::build_router(state.clone());
+        let mut req3 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcip/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req3.extensions_mut().insert(ConnectInfo(other));
+        req3.extensions_mut()
+            .insert(crate::auth::AuthenticatedDid(did_a.to_string()));
+        assert_ne!(
+            router3.oneshot(req3).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a signed caller from a different source IP must keep its own per-source budget"
         );
     }
 
