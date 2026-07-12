@@ -63,27 +63,46 @@ fn run_bounded_git(
     // the main thread's stdout drain is exactly what blocks until a hung child is
     // torn down.
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    let watchdog = std::thread::spawn(move || -> bool {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        match done_rx.recv_timeout(wait) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
-            Err(RecvTimeoutError::Timeout) => {
-                // SAFETY: kill(2) takes only integers and borrows no Rust memory;
-                // ESRCH on an already-gone group is ignored.
-                unsafe { libc::kill(-pgid, libc::SIGTERM) };
-                for step in 0..200u32 {
-                    if unsafe { libc::kill(-pgid, 0) } != 0 {
-                        return true; // ESRCH: every group member has exited
+    // Set true the instant the main thread reaps the child, so the watchdog never
+    // SIGTERMs a pgid whose leader is already reaped and whose pid the kernel may
+    // recycle (the reused-pgid hazard smart_http guards via disarm-after-wait).
+    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let reaped = reaped.clone();
+        std::thread::spawn(move || -> bool {
+            use std::sync::atomic::Ordering;
+            let wait = deadline.saturating_duration_since(Instant::now());
+            match done_rx.recv_timeout(wait) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+                Err(RecvTimeoutError::Timeout) => {
+                    // The child was reaped right as the deadline fired: do not signal
+                    // its (possibly-recycled) pgid.
+                    if reaped.load(Ordering::SeqCst) {
+                        return false;
                     }
-                    if step == 100 {
-                        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    // SAFETY: kill(2) takes only integers and borrows no Rust memory;
+                    // ESRCH on an already-gone group is ignored.
+                    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+                    for step in 0..200u32 {
+                        if reaped.load(Ordering::SeqCst) || unsafe { libc::kill(-pgid, 0) } != 0 {
+                            return true; // reaped, or ESRCH: every group member has exited
+                        }
+                        if step == 100 {
+                            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    // Survived SIGKILL past the cap: a wedged (D-state) git, the same
+                    // condition smart_http's reap logs. Warn so an operator sees it.
+                    tracing::warn!(
+                        pgid,
+                        "withheld-walk git survived SIGKILL past the watchdog cap (uninterruptible I/O?)"
+                    );
+                    true
                 }
-                true
             }
-        }
-    });
+        })
+    };
 
     // Feed stdin on a writer thread and drain stderr on a reader thread so the main
     // thread can drain stdout concurrently; writing all of stdin (or draining one
@@ -105,16 +124,21 @@ fn run_bounded_git(
     let mut out = Vec::new();
     let read_result = stdout.read_to_end(&mut out);
     let status = child.wait().context("git wait failed")?;
+    // Reaped: bar the watchdog from signalling the now-reaped (possibly recycled)
+    // pgid before it can fire, then stand it down.
+    reaped.store(true, std::sync::atomic::Ordering::SeqCst);
     let err = err_reader.join().unwrap_or_default();
     let _ = writer.join();
-
-    // Reaped: stand the watchdog down and learn whether it killed on the deadline.
     let _ = done_tx.send(());
     let killed = watchdog.join().unwrap_or(false);
-    if killed {
+    read_result.context("failed to read git stdout")?;
+    // The watchdog runs off a wall clock that can race a child finishing right at the
+    // deadline. A child that exited on its own (success) is not a timeout even if the
+    // watchdog fired late; only a child that did not exit successfully is a genuine
+    // timeout, which keeps a walk completing at its budget from a spurious 504.
+    if killed && !status.success() {
         return Err(crate::git::smart_http::GitServiceTimeout.into());
     }
-    read_result.context("failed to read git stdout")?;
     if !status.success() {
         anyhow::bail!("git {label} failed: {}", String::from_utf8_lossy(&err));
     }
