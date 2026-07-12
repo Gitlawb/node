@@ -44,6 +44,8 @@ async fn replication_withheld_set(
     owner_did: &str,
     is_public: bool,
     disk_path: std::path::PathBuf,
+    git_bin: String,
+    timeout: std::time::Duration,
 ) -> (bool, Option<std::collections::HashSet<String>>) {
     let announce = match &rules {
         Some(rules) => crate::visibility::listable_at_root(rules, is_public, owner_did, None),
@@ -65,8 +67,8 @@ async fn replication_withheld_set(
         Some(rules) => {
             let owner_did = owner_did.to_string();
             tokio::task::spawn_blocking(move || {
-                crate::git::visibility_pack::withheld_blob_oids(
-                    &disk_path, &rules, is_public, &owner_did, None,
+                crate::git::visibility_pack::withheld_blob_oids_bounded(
+                    &disk_path, &git_bin, timeout, &rules, is_public, &owner_did, None,
                 )
             })
             .await
@@ -106,10 +108,12 @@ async fn fail_closed_full_scan_objects(
     is_public: bool,
     owner_did: String,
     candidates: Vec<String>,
+    git_bin: String,
+    timeout: std::time::Duration,
 ) -> Vec<String> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-        let allowed = crate::git::visibility_pack::replicable_blob_set(
-            &disk_path, &rules, is_public, &owner_did,
+        let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
+            &disk_path, &git_bin, timeout, &rules, is_public, &owner_did,
         )?;
         let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path)?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
@@ -778,9 +782,12 @@ pub async fn git_upload_pack(
             let owner_did = record.owner_did.clone();
             let caller_owned = caller.map(str::to_string);
             let is_public = record.is_public;
+            let git_bin = state.git_bin.clone();
             tokio::task::spawn_blocking(move || {
-                visibility_pack::withheld_blob_oids(
+                visibility_pack::withheld_blob_oids_bounded(
                     &path,
+                    &git_bin,
+                    git_timeout,
                     &rules,
                     is_public,
                     &owner_did,
@@ -1185,6 +1192,8 @@ pub async fn git_receive_pack(
         &record.owner_did,
         record.is_public,
         disk_path.clone(),
+        state.git_bin.clone(),
+        std::time::Duration::from_secs(state.config.git_service_timeout_secs),
     )
     .await;
 
@@ -1219,6 +1228,8 @@ pub async fn git_receive_pack(
                 record.is_public,
                 record.owner_did.clone(),
                 pin_set.candidates,
+                state.git_bin.clone(),
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             )
             .await
         } else {
@@ -1244,6 +1255,8 @@ pub async fn git_receive_pack(
         let node_did_str = state.node_did.to_string();
         let node_seed = state.node_keypair.to_seed();
         let repo_name = record.name.clone();
+        let enc_git_bin = state.git_bin.clone();
+        let enc_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
         tokio::spawn(async move {
             let pinned = crate::ipfs_pin::pin_new_objects(
                 &ipfs_api,
@@ -1268,9 +1281,15 @@ pub async fn git_receive_pack(
             {
                 let p = repo_path_clone.clone();
                 let owner = owner_did.clone();
+                let git_bin = enc_git_bin.clone();
                 let recip = tokio::task::spawn_blocking(move || {
-                    crate::git::visibility_pack::withheld_blob_recipients(
-                        &p, &rules, is_public, &owner,
+                    crate::git::visibility_pack::withheld_blob_recipients_bounded(
+                        &p,
+                        &git_bin,
+                        enc_timeout,
+                        &rules,
+                        is_public,
+                        &owner,
                     )
                 })
                 .await;
@@ -2031,16 +2050,39 @@ mod tests {
         let dummy = std::path::PathBuf::from("/nonexistent");
 
         // Private: no rules at all.
-        let (announce, _) = replication_withheld_set(None, OWNER_DID, false, dummy.clone()).await;
+        let (announce, _) = replication_withheld_set(
+            None,
+            OWNER_DID,
+            false,
+            dummy.clone(),
+            "git".into(),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
         assert!(!announce, "private repo (no rules) must not announce");
 
         // Private: empty rule set, is_public=false → still not listable at root.
-        let (announce, _) =
-            replication_withheld_set(Some(vec![]), OWNER_DID, false, dummy.clone()).await;
+        let (announce, _) = replication_withheld_set(
+            Some(vec![]),
+            OWNER_DID,
+            false,
+            dummy.clone(),
+            "git".into(),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
         assert!(!announce, "private repo (empty rules) must not announce");
 
         // Public: empty rule set, is_public=true → listable at root, announces.
-        let (announce, _) = replication_withheld_set(Some(vec![]), OWNER_DID, true, dummy).await;
+        let (announce, _) = replication_withheld_set(
+            Some(vec![]),
+            OWNER_DID,
+            true,
+            dummy,
+            "git".into(),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
         assert!(announce, "public repo must announce");
     }
 
@@ -2130,6 +2172,150 @@ mod tests {
             created_by: OWNER_DID.into(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_git(dir: &std::path::Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fakegit");
+        std::fs::write(&p, body).unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    /// #174 (write-pool twin, vetted by execution not reasoning): the receive-pack
+    /// post-push replication walk is bounded. Drive `replication_withheld_set` with an
+    /// injected fake git that hangs on `rev-list` and a short budget: it must RETURN
+    /// within the budget (so `git_receive_pack` releases the write permit it holds
+    /// across this await, rather than pinning it for the hang) AND fail closed
+    /// (announce suppressed) because the walk could not be vetted. Proves this path
+    /// funnels through the bounded `blob_paths`, on the write-permit-holding side.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replication_walk_is_bounded_and_fails_closed_on_a_hung_git() {
+        use std::time::Duration;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) sleep 30 ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        // Public root (announceable) + a path-scoped rule, so the walk actually runs
+        // rather than taking the has_path_scoped_rule short-circuit.
+        let rules = Some(vec![vis_rule("/secret/**", &[])]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            replication_withheld_set(
+                rules,
+                OWNER_DID,
+                true,
+                tmp.path().to_path_buf(),
+                git_bin,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect(
+            "replication_withheld_set must return within the budget; a hung walk must \
+             not pin the write permit git_receive_pack holds across it",
+        );
+        assert_eq!(
+            result,
+            (false, None),
+            "a walk that could not be vetted must suppress the announce (fail closed)"
+        );
+    }
+
+    /// #174 (serve-path 504, vetted by execution): a hung withheld-blob walk on the
+    /// upload-pack POST maps to 504, not a generic 500. Real repo dir on disk (so
+    /// acquire's fast path returns it) + a path-scoped rule (so the walk runs) +
+    /// an injected fake git that hangs on rev-list. The handler must return 504,
+    /// proving git_upload_pack routes the walk's GitServiceTimeout through
+    /// git_service_app_error end to end.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn upload_pack_hung_withheld_walk_returns_504(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) sleep 30 ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n";
+        let fake = write_fake_git(tmp.path(), body);
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_bin = fake;
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = 1;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo("z6srv504", "sv", "/tmp/z6srv504-sv", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6srv504", "sv").await.unwrap().unwrap();
+        // Path-scoped rule so has_path_scoped_rule() is true and the walk runs; the
+        // public root still lets an anonymous caller past the "/" gate.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[],
+                OWNER_DID,
+            )
+            .await
+            .unwrap();
+        // acquire()'s fast path returns the local path when it exists on disk.
+        let disk = std::path::Path::new("/tmp/z6srv504/sv.git");
+        std::fs::create_dir_all(disk).unwrap();
+
+        let peer: SocketAddr = "203.0.113.91:7000".parse().unwrap();
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/z6srv504/sv/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let status = router.oneshot(req).await.unwrap().status();
+        let _ = std::fs::remove_dir_all("/tmp/z6srv504");
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "a hung withheld-blob walk must surface as 504, not a generic 500"
+        );
+    }
+
+    /// #174 (F2 sizing edge, vetted by execution): the receive-pack advertisement
+    /// per-source cap is derived in main.rs as `(max_concurrent_git_pushes / 8).max(1)`,
+    /// so it is never 0 even at the minimum write-pool size (1). A 0 cap would make
+    /// PerCallerConcurrency shed EVERY receive-pack advertisement and break all pushes.
+    #[test]
+    fn advert_per_caller_cap_sizing_is_never_zero() {
+        let cap = |pushes: usize| (pushes / 8).max(1);
+        for pushes in [1usize, 4, 8, 32, 256] {
+            assert!(
+                cap(pushes) >= 1,
+                "advert cap must be >= 1 for pushes={pushes}"
+            );
+        }
+        assert_eq!(cap(1), 1, "minimum write pool must derive cap 1, not 0");
+        assert_eq!(
+            cap(32),
+            4,
+            "default write pool 32 derives cap 4 (~8 source IPs to fill)"
+        );
+        // A cap of 1 admits one and sheds the second from the same source.
+        let lim = crate::rate_limit::PerCallerConcurrency::new(cap(1), 100);
+        let _held = lim.try_acquire("src").expect("first advert admitted");
+        assert!(
+            lim.try_acquire("src").is_none(),
+            "second advert from the same source is shed"
+        );
     }
 
     #[test]

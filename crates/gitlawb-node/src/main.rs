@@ -392,6 +392,7 @@ async fn main() -> Result<()> {
         git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             (config.max_concurrent_git_pushes / 8).max(1),
         ),
+        git_bin: "git".to_string(),
     };
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled

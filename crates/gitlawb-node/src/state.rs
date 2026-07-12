@@ -115,6 +115,11 @@ pub struct AppState {
     /// a fraction of `max_concurrent_git_pushes`, so filling the write pool takes many
     /// distinct source IPs (each also braked by the per-IP push rate limiter).
     pub git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency,
+    /// The `git` executable the served-git withheld-blob walk spawns. Production is
+    /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
+    /// process-group teardown in handler tests without mutating the process-global
+    /// PATH (#174).
+    pub git_bin: String,
 }
 
 impl AppState {
