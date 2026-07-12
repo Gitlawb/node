@@ -92,4 +92,21 @@ mod tests {
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("expected denial status 403"));
     }
+
+    #[test]
+    fn non_4xx_expected_is_a_test_bug() {
+        // Guards the harness itself: expecting a non-denial status is a test
+        // authoring error, not a node behavior, and must be rejected.
+        let r = check_denied(403, "denied", 200, &[]);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("not a 4xx"));
+    }
+
+    #[test]
+    fn empty_withheld_token_never_false_positives() {
+        // An empty token must be skipped, never treated as "contained in every
+        // body" — otherwise every denial would spuriously fail as a leak.
+        let r = check_denied(403, "any body", 403, &[""]);
+        assert!(r.is_ok(), "{r:?}");
+    }
 }
