@@ -24,11 +24,11 @@ mod rate_limit;
 pub mod server;
 pub mod state;
 mod sync;
-#[cfg(test)]
-mod test_support;
 #[cfg(feature = "test-harness")]
 #[doc(hidden)]
 pub mod test_harness;
+#[cfg(test)]
+mod test_support;
 mod visibility;
 mod webhooks;
 

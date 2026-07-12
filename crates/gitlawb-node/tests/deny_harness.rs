@@ -137,8 +137,13 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
         ],
         "sha256",
     );
-    node.withhold_path(&repo_id, "/secret/**", &[reader.did().to_string()], &owner_did)
-        .await;
+    node.withhold_path(
+        &repo_id,
+        "/secret/**",
+        &[reader.did().to_string()],
+        &owner_did,
+    )
+    .await;
 
     let secret_oid = oids["secret/b.txt"].clone();
     let secret_cid = cid_for_oid(&secret_oid);
@@ -150,7 +155,12 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
         .send()
         .await
         .expect("request sends");
-    assert_denied(resp, 404, &["TOPSECRET-U5b", &secret_oid, &secret_oid[..12]]).await;
+    assert_denied(
+        resp,
+        404,
+        &["TOPSECRET-U5b", &secret_oid, &secret_oid[..12]],
+    )
+    .await;
 
     // The sibling public blob's CID is served to anon (withhold is blob-scoped).
     let resp = client
@@ -158,7 +168,11 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
         .send()
         .await
         .expect("request sends");
-    assert_eq!(resp.status().as_u16(), 200, "public blob CID must be served to anon");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "public blob CID must be served to anon"
+    );
     assert!(
         resp.text().await.unwrap().contains("public bytes U5b"),
         "the public blob content is returned"
@@ -274,7 +288,11 @@ async fn withheld_path_blob_read_is_denied(pool: sqlx::PgPool) {
         .send()
         .await
         .expect("request sends");
-    assert_eq!(resp.status().as_u16(), 200, "public sibling path must be served");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "public sibling path must be served"
+    );
     assert!(
         resp.text().await.unwrap().contains("hello public"),
         "the public blob content is returned"
@@ -328,13 +346,20 @@ async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
         .build()
         .unwrap();
     let resp = client
-        .post(format!("{}/{owner_did}/u8-repo/git-upload-pack", node.base_url))
+        .post(format!(
+            "{}/{owner_did}/u8-repo/git-upload-pack",
+            node.base_url
+        ))
         .header("content-type", "application/x-git-upload-pack-request")
         .body(req_body)
         .send()
         .await
         .expect("upload-pack POST sends");
-    assert_eq!(resp.status().as_u16(), 200, "anon upload-pack POST must serve a pack");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "anon upload-pack POST must serve a pack"
+    );
     let bytes = resp.bytes().await.expect("read pack response");
 
     // The packfile starts at the "PACK" magic (after the NAK pkt-line).
@@ -361,7 +386,11 @@ async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
         String::from_utf8_lossy(&idx.stderr)
     );
     let verify = Command::new("git")
-        .args(["verify-pack", "-v", pack_path.with_extension("idx").to_str().unwrap()])
+        .args([
+            "verify-pack",
+            "-v",
+            pack_path.with_extension("idx").to_str().unwrap(),
+        ])
         .output()
         .expect("git verify-pack runs");
     let listing = String::from_utf8_lossy(&verify.stdout).to_string();
@@ -398,15 +427,30 @@ async fn additional_owner_gates_reject_non_owner(pool: sqlx::PgPool) {
 
     // (method, path, body, needs-json-content-type)
     let cases: Vec<(reqwest::Method, String, Vec<u8>, bool)> = vec![
-        (reqwest::Method::POST, format!("{base}/branches/main/protect"), Vec::new(), false),
-        (reqwest::Method::DELETE, format!("{base}/branches/main/protect"), Vec::new(), false),
+        (
+            reqwest::Method::POST,
+            format!("{base}/branches/main/protect"),
+            Vec::new(),
+            false,
+        ),
+        (
+            reqwest::Method::DELETE,
+            format!("{base}/branches/main/protect"),
+            Vec::new(),
+            false,
+        ),
         (
             reqwest::Method::POST,
             format!("{base}/hooks"),
             br#"{"url":"https://example.com/hook","events":["*"]}"#.to_vec(),
             true,
         ),
-        (reqwest::Method::DELETE, format!("{base}/hooks/deadbeef"), Vec::new(), false),
+        (
+            reqwest::Method::DELETE,
+            format!("{base}/hooks/deadbeef"),
+            Vec::new(),
+            false,
+        ),
         (
             reqwest::Method::DELETE,
             format!("{base}/visibility"),
