@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 /// pathologically slow git child so it cannot pin a served-git permit (the read
 /// permit on the upload-pack serve path, the write permit on the receive-pack
 /// post-push replication path) past the deadline. Every caller funnels through
-/// `blob_paths`, so bounding here bounds both paths at one seam.
+/// `blob_paths`, so bounding here bounds both paths at one seam. Production callers
+/// pass the operator-configured `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` instead; this
+/// fixed budget only backs the `git_bin`-less test wrappers.
+#[cfg(test)]
 const WALK_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Run one git child under a shared `deadline` with process-group teardown,
@@ -122,6 +125,12 @@ fn run_bounded_git(
     });
     let mut stdout = child.stdout.take().context("git stdout was not piped")?;
     let mut out = Vec::new();
+    // Blocking drain, unblocked by the child closing stdout on exit. The watchdog's
+    // SIGTERM/SIGKILL is what makes a hung child exit; a git wedged in uninterruptible
+    // (D-state) I/O survives even SIGKILL, so this drain and the wait below can block
+    // until the kernel returns, pinning the walk thread and its permit. That residual
+    // is unreachable in userspace (no signal reaps a D-state process) and matches the
+    // async `reap_group_on_timeout`, which likewise only warns and gives up there.
     let read_result = stdout.read_to_end(&mut out);
     let status = child.wait().context("git wait failed")?;
     // Reaped: bar the watchdog from signalling the now-reaped (possibly recycled)
@@ -325,6 +334,7 @@ fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<
 ///
 /// The whole-repo "/" gate is handled by the caller before this function runs:
 /// if "/" denies, the caller gets a 404 and never reaches the filtered serve.
+#[cfg(test)]
 pub fn withheld_blob_oids(
     repo_path: &Path,
     rules: &[VisibilityRule],
@@ -332,7 +342,33 @@ pub fn withheld_blob_oids(
     owner_did: &str,
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
-    let pairs = blob_paths(repo_path, "git", WALK_TIMEOUT)?;
+    withheld_blob_oids_bounded(
+        repo_path,
+        "git",
+        WALK_TIMEOUT,
+        rules,
+        is_public,
+        owner_did,
+        caller,
+    )
+}
+
+/// [`withheld_blob_oids`] with an injectable `git_bin` and walk `timeout`. Served
+/// handlers call this with the operator-configured git binary and
+/// `GITLAWB_GIT_SERVICE_TIMEOUT_SECS`, so the whole walk is bounded by the same
+/// budget as the other served-git ops and a fake `git` can drive its teardown in
+/// tests. The `git_bin`-less wrapper above keeps the fixed [`WALK_TIMEOUT`] for the
+/// classification tests that run against real git.
+pub fn withheld_blob_oids_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    timeout: Duration,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Result<HashSet<String>> {
+    let pairs = blob_paths(repo_path, git_bin, timeout)?;
     Ok(withheld_from_pairs(
         &pairs, rules, is_public, owner_did, caller,
     ))
@@ -400,6 +436,7 @@ pub fn replicable_objects(all: Vec<String>, withheld: &HashSet<String>) -> Vec<S
 /// at an allowed path is included even when also denied elsewhere (its content
 /// is public elsewhere). A dangling blob is absent from the reachable walk, so
 /// it is never in this set and the fail-closed filter drops it (#99).
+#[cfg(test)]
 pub fn replicable_blob_set(
     repo_path: &Path,
     rules: &[VisibilityRule],
@@ -407,6 +444,21 @@ pub fn replicable_blob_set(
     owner_did: &str,
 ) -> Result<HashSet<String>> {
     allowed_blob_set_for_caller(repo_path, rules, is_public, owner_did, None)
+}
+
+/// [`replicable_blob_set`] with an injectable `git_bin` and walk `timeout`, for the
+/// fail-closed full-scan pin path on the receive-pack side.
+pub fn replicable_blob_set_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    timeout: Duration,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+) -> Result<HashSet<String>> {
+    allowed_blob_set_for_caller_bounded(
+        repo_path, git_bin, timeout, rules, is_public, owner_did, None,
+    )
 }
 
 /// Reachable blob OIDs that visibility ALLOWS `caller` at some path. The
@@ -421,6 +473,7 @@ pub fn replicable_blob_set(
 /// elsewhere (its content is readable to this caller elsewhere). Trees and
 /// commits are NOT included here; the caller decides per object type whether
 /// the allow-set applies (it does not for trees/commits — KTD3).
+#[cfg(test)]
 pub fn allowed_blob_set_for_caller(
     repo_path: &Path,
     rules: &[VisibilityRule],
@@ -428,7 +481,29 @@ pub fn allowed_blob_set_for_caller(
     owner_did: &str,
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
-    let pairs = blob_paths(repo_path, "git", WALK_TIMEOUT)?;
+    allowed_blob_set_for_caller_bounded(
+        repo_path,
+        "git",
+        WALK_TIMEOUT,
+        rules,
+        is_public,
+        owner_did,
+        caller,
+    )
+}
+
+/// [`allowed_blob_set_for_caller`] with an injectable `git_bin` and walk `timeout`,
+/// for the `GET /ipfs/{cid}` gate.
+pub fn allowed_blob_set_for_caller_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    timeout: Duration,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Result<HashSet<String>> {
+    let pairs = blob_paths(repo_path, git_bin, timeout)?;
     let mut allowed = HashSet::new();
     for (oid, path) in &pairs {
         if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
@@ -461,14 +536,28 @@ pub fn replicable_objects_fail_closed(
 /// owner plus any reader DID that `visibility_check` Allows at some path the
 /// blob appears at. Least-privilege: a reader of one private subtree is not a
 /// recipient of a blob that only lives in another.
+#[cfg(test)]
 pub fn withheld_blob_recipients(
     repo_path: &Path,
     rules: &[VisibilityRule],
     is_public: bool,
     owner_did: &str,
 ) -> Result<HashMap<String, BTreeSet<String>>> {
+    withheld_blob_recipients_bounded(repo_path, "git", WALK_TIMEOUT, rules, is_public, owner_did)
+}
+
+/// [`withheld_blob_recipients`] with an injectable `git_bin` and walk `timeout`, for
+/// the receive-pack encrypt-then-pin path.
+pub fn withheld_blob_recipients_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    timeout: Duration,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+) -> Result<HashMap<String, BTreeSet<String>>> {
     // One history walk feeds both the withheld set and the recipient mapping.
-    let pairs = blob_paths(repo_path, "git", WALK_TIMEOUT)?;
+    let pairs = blob_paths(repo_path, git_bin, timeout)?;
     let withheld = withheld_from_pairs(&pairs, rules, is_public, owner_did, None);
     if withheld.is_empty() {
         return Ok(HashMap::new());
@@ -569,6 +658,82 @@ mod tests {
         assert!(
             gone,
             "the hung git child (pid {pid}) must be reaped, not orphaned, after the walk aborts"
+        );
+    }
+
+    /// #174 (F1 status-gate, vetted by execution): a child that exits SUCCESSFULLY is
+    /// never reported as a timeout even when the watchdog fires, so a walk finishing
+    /// right at its deadline is not a spurious 504. The fake only exits when signalled
+    /// and exits 0 on SIGTERM, so with a deadline already elapsed the watchdog always
+    /// reaches its kill path (killed == true) yet the child's status is success.
+    /// Drop the `!status.success()` guard and this returns GitServiceTimeout (RED).
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_git_success_at_the_deadline_is_not_a_timeout() {
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new().unwrap();
+        let body = "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 30 &\nwait\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let out = run_bounded_git(
+            &git_bin,
+            &["rev-list"],
+            tmp.path(),
+            b"",
+            Instant::now() + Duration::from_millis(100),
+        );
+        assert!(
+            out.is_ok(),
+            "a child that exited successfully must not be reported as a timeout even if the watchdog fired: {out:?}"
+        );
+    }
+
+    /// #174 (F3, vetted by execution): a child that IGNORES SIGTERM is still reaped
+    /// via the watchdog's SIGKILL escalation, so it cannot pin the walk thread or its
+    /// permit. The fake traps SIGTERM and keeps sleeping; run_bounded_git must still
+    /// return (via SIGKILL at the grace step) with a timeout error and the group must
+    /// be gone. (A truly uninterruptible D-state child, which no signal can reap, is
+    /// the documented residual this teardown, like the async twin, cannot cover.)
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_git_reaps_a_sigterm_ignoring_child_via_sigkill() {
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new().unwrap();
+        let body = "#!/bin/sh\ntrap '' TERM\necho $$ > pid\nwhile true; do sleep 1; done\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = tmp.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_bounded_git(
+                &git_bin,
+                &["rev-list"],
+                &path,
+                b"",
+                Instant::now() + Duration::from_millis(100),
+            ));
+        });
+        let out = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("run_bounded_git must return via SIGKILL even for a SIGTERM-ignoring child");
+        assert!(
+            out.is_err(),
+            "a SIGTERM-ignoring child killed by SIGKILL is a timeout, not a success: {out:?}"
+        );
+        let pid: i32 = std::fs::read_to_string(tmp.path().join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..300 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            gone,
+            "the SIGTERM-ignoring child (pid {pid}) must be reaped via SIGKILL, not left running"
         );
     }
     use crate::db::VisibilityMode;

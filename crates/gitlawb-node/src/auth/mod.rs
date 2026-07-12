@@ -525,6 +525,7 @@ mod tests {
             git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
             git_push_advert_per_caller:
                 crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
+            git_bin: "git".to_string(),
         }
     }
 

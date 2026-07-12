@@ -27,7 +27,7 @@ use std::str::FromStr;
 use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::git::store;
-use crate::git::visibility_pack::{allowed_blob_set_for_caller, has_path_scoped_rule};
+use crate::git::visibility_pack::{allowed_blob_set_for_caller_bounded, has_path_scoped_rule};
 use crate::state::AppState;
 use crate::visibility::{visibility_check, Decision};
 
@@ -142,10 +142,16 @@ pub async fn get_by_cid(
                 let is_public = repo.is_public;
                 let owner = repo.owner_did.clone();
                 let caller_for_walk = caller_owned.clone();
-                // Full-history walk shells out to git — keep it off the async runtime.
+                let git_bin = state.git_bin.clone();
+                let walk_timeout =
+                    std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+                // Full-history walk shells out to git — keep it off the async runtime,
+                // bounded and reaped like the served-git ops (#174).
                 let walk = tokio::task::spawn_blocking(move || {
-                    allowed_blob_set_for_caller(
+                    allowed_blob_set_for_caller_bounded(
                         &rp,
+                        &git_bin,
+                        walk_timeout,
                         &r,
                         is_public,
                         &owner,
