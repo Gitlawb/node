@@ -515,17 +515,27 @@ pub async fn git_info_refs(
     let service = query
         .service
         .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
-    // Shed with a 503 before spawning git when the concurrency cap is saturated;
-    // held for the whole op (incl. the smart_http call), released on return. The
-    // receive-pack advertisement is phase one of a push, so it draws from the WRITE
-    // pool (like the git-receive-pack POST), not the global read pool an anonymous
-    // clone flood can exhaust and thereby starve the push handshake (#174 U2). The
-    // upload-pack advertisement stays on the read pool with its per-caller sub-cap.
-    let _permit = if service == "git-receive-pack" {
-        git_permit(&state.git_write_semaphore)?
-    } else {
-        git_permit(&state.git_read_semaphore)?
-    };
+    // #62 cheap pre-DB load shed: if the pool this service draws from is already
+    // saturated, shed with 503 before any DB/disk work. Best-effort (holds no
+    // permit); the authoritative hold is `git_permit` below, after the per-source
+    // cap. Restores the shed-before-DB property the reordered held acquire alone
+    // would drop, while the reorder still prevents one source from occupying global
+    // slots during the DB/visibility window.
+    {
+        let pool = if service == "git-receive-pack" {
+            &state.git_write_semaphore
+        } else {
+            &state.git_read_semaphore
+        };
+        if pool.available_permits() == 0 {
+            tracing::warn!(
+                "served-git concurrency cap reached; shedding request with 503 (pre-DB)"
+            );
+            return Err(AppError::Overloaded(
+                "git service at capacity, retry shortly".into(),
+            ));
+        }
+    }
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
     let record = state
         .db
@@ -602,6 +612,22 @@ pub async fn git_info_refs(
             name,
             "info/refs",
         )?
+    };
+
+    // Shed with a 503 before spawning git when the concurrency cap is saturated;
+    // held for the whole op (incl. the smart_http call), released on return. Taken
+    // AFTER the per-source cap above so one source cannot occupy global slots it
+    // would be sub-cap-denied for during the DB/visibility window and starve other
+    // sources; still before acquire_fresh/git so it bounds the fresh Tigris acquire
+    // and git exec (INV-10). The receive-pack advertisement is phase one of a push,
+    // so it draws from the WRITE pool (like the git-receive-pack POST), not the
+    // global read pool an anonymous clone flood can exhaust and thereby starve the
+    // push handshake (#174 U2). The upload-pack advertisement stays on the read
+    // pool with its per-caller sub-cap.
+    let _permit = if service == "git-receive-pack" {
+        git_permit(&state.git_write_semaphore)?
+    } else {
+        git_permit(&state.git_read_semaphore)?
     };
 
     // For receive-pack (push), download the latest from Tigris so the client
@@ -725,9 +751,15 @@ pub async fn git_upload_pack(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
-    // Shed with a 503 before spawning git when the concurrency cap is saturated;
-    // held for the whole op (incl. the smart_http call), released on return.
-    let _permit = git_permit(&state.git_read_semaphore)?;
+    // #62 cheap pre-DB load shed (see git_info_refs): shed before DB when the read
+    // pool is saturated; the authoritative hold is `git_permit` below, after the
+    // per-source cap.
+    if state.git_read_semaphore.available_permits() == 0 {
+        tracing::warn!("served-git concurrency cap reached; shedding request with 503 (pre-DB)");
+        return Err(AppError::Overloaded(
+            "git service at capacity, retry shortly".into(),
+        ));
+    }
     let name = smart_http_repo_name(&repo)?;
     let record = state
         .db
@@ -759,6 +791,14 @@ pub async fn git_upload_pack(
         name,
         "upload-pack",
     )?;
+
+    // Shed with a 503 before spawning git when the concurrency cap is saturated;
+    // held for the whole op (incl. the smart_http call), released on return. Taken
+    // AFTER the per-source cap above so one source cannot occupy global slots it
+    // would be sub-cap-denied for during the DB/visibility window and starve other
+    // sources; still before acquire/git so it bounds the Tigris acquire and git
+    // exec (INV-10).
+    let _permit = git_permit(&state.git_read_semaphore)?;
 
     let disk_path = state
         .repo_store
@@ -3206,6 +3246,191 @@ mod tests {
             router2.oneshot(req2).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "a different caller must not be shed by another caller's saturated budget"
+        );
+    }
+
+    /// #174 (review fix): the per-source caller cap is an independent brake that
+    /// sheds a capped source even when the global pool has free capacity — the
+    /// sub-cap is not a mere pre-filter for pool exhaustion. Proven by leaving the
+    /// global read pool with capacity (so the pre-DB early shed passes) AND
+    /// pre-holding the source's upload-pack read sub-cap: the request reaches the
+    /// caller cap and sheds there, so its 503 body reads "for this caller". Remove
+    /// the `acquire_read_caller_permit` call and the capped source falls through to
+    /// the git op instead of shedding with "for this caller" — this is the
+    /// caller-cap acquire probe for the info/refs upload-pack branch.
+    #[sqlx::test]
+    async fn info_refs_upload_pack_per_source_cap_sheds_with_global_capacity(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Global read pool has free capacity (early shed passes); source pre-held at
+        // its per-caller cap so it sheds on the caller cap, not the global pool.
+        state.git_read_semaphore = Arc::new(Semaphore::new(4));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6ordir", "oi", "/tmp/oi-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.91:5000".parse().unwrap();
+        // Pin this source at its single upload-pack read slot.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first read slot for this source IP");
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6ordir/oi/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its read sub-cap must shed 503 even with global pool capacity"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("for this caller"),
+            "the per-source cap is an independent brake: with global capacity free, the capped source must still shed with the caller-cap body, got {body}"
+        );
+    }
+
+    /// #174 (review fix): same independent-brake guarantee for the receive-pack
+    /// advertisement branch of info/refs — its per-source cap
+    /// (`git_push_advert_per_caller`) sheds a capped source even when the global
+    /// write pool has capacity. Leave the global write pool with capacity (so the
+    /// pre-DB early shed passes) and pre-hold the source's advert slot: the request
+    /// reaches the caller cap, so the 503 body reads "for this caller". Remove the
+    /// caller-cap acquire and the capped source falls through instead of shedding
+    /// with "for this caller". The push rate limiter is left permissive so the
+    /// request reaches the caller cap.
+    #[sqlx::test]
+    async fn info_refs_receive_pack_per_source_cap_sheds_with_global_capacity(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Global write pool has free capacity (early shed passes); source pre-held at
+        // its advert sub-cap so it sheds on the caller cap, not the global pool.
+        state.git_write_semaphore = Arc::new(Semaphore::new(4));
+        state.git_push_advert_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        // Permissive push rate limiter so the advertisement passes the rate gate and
+        // reaches the per-source concurrency cap.
+        state.push_rate_limiter = crate::rate_limit::RateLimiter::new(100, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6ordrp", "or", "/tmp/or-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.92:5000".parse().unwrap();
+        // Pin this source at its single receive-pack advertisement slot.
+        let _slot = state
+            .git_push_advert_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first advert slot for this source IP");
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6ordrp/or/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its advert sub-cap must shed 503 even with global write pool capacity"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("for this caller"),
+            "the per-source advert cap is an independent brake: with global write capacity free, the capped source must still shed with the caller-cap body, got {body}"
+        );
+    }
+
+    /// #174 (review fix): same independent-brake guarantee for the POST upload-pack
+    /// handler — its per-source read cap sheds a capped source even when the global
+    /// read pool has capacity. Leave the global read pool with capacity (so the
+    /// pre-DB early shed passes) and pre-hold the source's read slot: the request
+    /// reaches the caller cap, so the 503 body reads "for this caller". Remove the
+    /// caller-cap acquire and the capped source falls through instead of shedding
+    /// with "for this caller".
+    #[sqlx::test]
+    async fn upload_pack_per_source_cap_sheds_with_global_capacity(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Global read pool has free capacity (early shed passes); source pre-held at
+        // its per-caller cap so it sheds on the caller cap, not the global pool.
+        state.git_read_semaphore = Arc::new(Semaphore::new(4));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6ordup", "ou", "/tmp/ou-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.93:5000".parse().unwrap();
+        // Pin this source at its single read slot.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first read slot for this source IP");
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/z6ordup/ou/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its read sub-cap must shed 503 even with global pool capacity"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("for this caller"),
+            "the per-source cap is an independent brake: with global capacity free, the capped source must still shed with the caller-cap body, got {body}"
         );
     }
 

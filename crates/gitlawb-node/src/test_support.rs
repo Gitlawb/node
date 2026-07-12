@@ -195,13 +195,14 @@ mod tests {
         );
     }
 
-    /// PR3 (#62): the served-git concurrency cap sheds at the HTTP layer. One test
-    /// per git handler drives the `let _permit = git_permit(...)` wiring end to end
-    /// (this one plus the git_upload_pack / git_receive_pack siblings below); the
-    /// git_permit unit test covers the helper in isolation. DB-free: an exhausted
-    /// semaphore sheds before any DB/disk access, so a lazy state works. Remove the
-    /// permit line from git_info_refs and this goes red (the request falls through
-    /// to the DB and returns something other than 503).
+    /// PR3 (#62): the served-git concurrency cap sheds at the HTTP layer before the
+    /// DB. The held `git_permit` acquire now sits after the per-source cap, so the
+    /// shed-before-DB property is carried by an explicit `available_permits() == 0`
+    /// early check at the top of the handler (the held permit remains the
+    /// authoritative bound further down). DB-free: an exhausted semaphore sheds
+    /// before any DB/disk access, so a lazy state works. Remove the early-shed block
+    /// from git_info_refs and this goes red (the request falls through to the DB and
+    /// returns something other than 503).
     #[tokio::test]
     async fn git_info_refs_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
@@ -234,10 +235,11 @@ mod tests {
         );
     }
 
-    /// PR3 (#62) sibling of the info/refs shed test: git-upload-pack also acquires a
-    /// permit at the top, so an exhausted semaphore must shed it with a 503 before
-    /// any DB/disk work. Anonymous-reachable, so no auth injection is needed. Remove
-    /// the permit line from git_upload_pack and this goes red.
+    /// PR3 (#62) sibling of the info/refs shed test: git-upload-pack carries the same
+    /// explicit `available_permits() == 0` early-shed check at the top, so an
+    /// exhausted semaphore must shed it with a 503 before any DB/disk work.
+    /// Anonymous-reachable, so no auth injection is needed. Remove the early-shed
+    /// block from git_upload_pack and this goes red.
     #[tokio::test]
     async fn git_upload_pack_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
@@ -260,6 +262,44 @@ mod tests {
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "an exhausted git semaphore must shed git-upload-pack with 503 before touching the DB"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// PR3 (#62) receive-pack sibling of the info/refs shed test: the early shed
+    /// selects the WRITE pool for a git-receive-pack advertisement (phase one of a
+    /// push, #174 U2), so an exhausted write pool sheds the advert with 503 before
+    /// any DB/disk work — even while the read pool is free (only the write pool is
+    /// zeroed here). Flip the pool selection to the read pool, or remove the
+    /// early-shed block, and this goes red.
+    #[tokio::test]
+    async fn git_info_refs_receive_pack_sheds_with_503_when_write_pool_exhausted() {
+        let mut state = test_state_lazy();
+        state.git_write_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/info/refs",
+                axum::routing::get(crate::api::repos::git_info_refs),
+            )
+            .with_state(state);
+        let resp = router
+            .oneshot(anon_get(
+                "/alice/repo.git/info/refs?service=git-receive-pack",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted WRITE pool must shed the receive-pack advertisement with 503 before touching the DB"
         );
         assert_eq!(
             resp.headers()
