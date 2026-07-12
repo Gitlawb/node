@@ -781,7 +781,9 @@ pub async fn git_upload_pack(
             })
             .await
             .map_err(|e| AppError::Git(e.to_string()))?
-            .map_err(|e| AppError::Git(e.to_string()))?
+            // A walk that hit its deadline carries GitServiceTimeout; map it to 504
+            // like the smart_http paths, not a generic 500 (#174 U3).
+            .map_err(|e| git_service_app_error(&e))?
         };
 
         if withheld.is_empty() {
