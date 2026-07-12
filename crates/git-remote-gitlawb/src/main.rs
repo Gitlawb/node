@@ -1960,4 +1960,112 @@ mod tests {
             "content-free flushes must not each produce a POST"
         );
     }
+
+    // ── Branch-coverage closure: exercise the remaining changed arms ─────────
+
+    /// A reader that fails with a non-EOF io error, to exercise the error
+    /// propagation arm of `read_upload_pack_round` (distinct from a clean EOF).
+    struct FailingReader;
+    impl Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("simulated read failure"))
+        }
+    }
+
+    /// G4: a non-EOF read error propagates; it is not swallowed as end-of-stream.
+    #[test]
+    fn read_upload_pack_round_propagates_read_error() {
+        let mut r = FailingReader;
+        assert!(read_upload_pack_round(&mut r).is_err());
+    }
+
+    /// G1: an invalid pkt-line length (1..=3) is rejected rather than underflowing
+    /// `pkt_len - 4`.
+    #[test]
+    fn read_upload_pack_round_rejects_invalid_pkt_length() {
+        let mut r = io::Cursor::new(b"0001".to_vec()); // pkt_len 1, < 4
+        let err = read_upload_pack_round(&mut r).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid pkt-line length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// G2: an immediately-empty upload-pack request (EOF at the opening round, with
+    /// a 200 advertisement) skips the POST entirely.
+    #[test]
+    fn upload_pack_empty_request_skips_post() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+            status: "200 OK",
+            body: "0000",
+        }]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = io::Cursor::new(Vec::<u8>::new()); // immediate EOF
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("empty upload-pack request should skip the POST");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "empty request must issue the GET only, no POST"
+        );
+    }
+
+    /// G3: a nonempty have-batch terminated by EOF (no flush, no done) is POSTed as
+    /// the final round, with a `done` terminator appended.
+    #[test]
+    fn nonempty_eof_batch_posts_as_final_round() {
+        let (base_url, server) = serve_http(vec![
+            TestResponse {
+                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+                status: "200 OK",
+                body: "0000",
+            },
+            TestResponse {
+                request_line: "POST /zOwner/myrepo/git-upload-pack",
+                status: "200 OK",
+                body: "0008NAK\nPACKfake",
+            },
+        ]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin_bytes = Vec::new();
+        stdin_bytes.extend_from_slice(&want_line(&"a".repeat(40)));
+        stdin_bytes.extend_from_slice(b"0000");
+        stdin_bytes.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
+        // No trailing flush or done: the stream just ends (EOF) after the have.
+        let mut stdin = io::Cursor::new(stdin_bytes);
+        handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
+            .expect("nonempty EOF batch should POST as a final round");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "one POST for the EOF-terminated final round"
+        );
+        assert!(
+            request_body(&requests[1]).ends_with(b"0009done\n"),
+            "an EOF-terminated final round is sent with a done terminator"
+        );
+    }
+
+    /// G5: an empty receive-pack (push) body skips the POST, unchanged from before.
+    #[test]
+    fn receive_pack_empty_body_skips_post() {
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-receive-pack",
+            status: "200 OK",
+            body: "0000",
+        }]);
+        let repo_base = format!("{base_url}/zOwner/myrepo");
+        let mut stdin = io::Cursor::new(Vec::<u8>::new()); // empty push
+        handle_connect(&repo_base, "git-receive-pack", None, &mut stdin)
+            .expect("empty receive-pack should skip the POST");
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "empty push must issue the GET only, no POST"
+        );
+    }
 }
