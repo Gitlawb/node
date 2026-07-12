@@ -376,3 +376,69 @@ async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
         "public blob {public_oid} must be present (withhold is subtree-scoped); listing:\n{listing}"
     );
 }
+
+// ── Additional INV-1 owner-gates over the real stack (fan-out of U6) ──────────
+
+/// The remaining high-blast-radius owner-gated mutations that previously had
+/// only the source-level authz-table guard and no runtime deny test: branch
+/// protection, webhook create/delete, and visibility removal. Each rejects a
+/// validly-signed non-owner with 403, and the owner reaches the handler (not
+/// 403), proving the 403 is the owner gate. All share `did_matches` as the root
+/// gate (see the mutation check in the harness commit).
+#[sqlx::test]
+async fn additional_owner_gates_reject_non_owner(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = reqwest::Client::new();
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let stranger = Keypair::generate();
+
+    node.seed_repo(&owner_did, "gated-repo", true).await;
+    let base = format!("/api/v1/repos/{owner_did}/gated-repo");
+
+    // (method, path, body, needs-json-content-type)
+    let cases: Vec<(reqwest::Method, String, Vec<u8>, bool)> = vec![
+        (reqwest::Method::POST, format!("{base}/branches/main/protect"), Vec::new(), false),
+        (reqwest::Method::DELETE, format!("{base}/branches/main/protect"), Vec::new(), false),
+        (
+            reqwest::Method::POST,
+            format!("{base}/hooks"),
+            br#"{"url":"https://example.com/hook","events":["*"]}"#.to_vec(),
+            true,
+        ),
+        (reqwest::Method::DELETE, format!("{base}/hooks/deadbeef"), Vec::new(), false),
+        (
+            reqwest::Method::DELETE,
+            format!("{base}/visibility"),
+            br#"{"path_glob":"/"}"#.to_vec(),
+            true,
+        ),
+    ];
+
+    let send = |m: reqwest::Method, path: String, body: Vec<u8>, json: bool, kp: &Keypair| {
+        let mut rb = signed_request(&client, m, &node.base_url, &path, body, kp);
+        if json {
+            rb = rb.header("content-type", "application/json");
+        }
+        rb.send()
+    };
+
+    for (method, path, body, json) in cases {
+        // Non-owner: valid signature, wrong identity -> 403 owner gate, no leak.
+        let resp = send(method.clone(), path.clone(), body.clone(), json, &stranger)
+            .await
+            .unwrap_or_else(|e| panic!("{method} {path} sends: {e}"));
+        assert_denied(resp, 403, &[]).await;
+
+        // Owner reaches the handler: NOT 403 (proves the 403 above was the gate,
+        // not an earlier layer or a 415/404 masquerade).
+        let resp = send(method.clone(), path.clone(), body, json, &owner)
+            .await
+            .unwrap_or_else(|e| panic!("{method} {path} owner sends: {e}"));
+        assert_ne!(
+            resp.status().as_u16(),
+            403,
+            "owner must reach {method} {path} (got 403)"
+        );
+    }
+}
