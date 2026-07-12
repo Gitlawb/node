@@ -16,14 +16,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use clap::Parser;
 use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 use gitlawb_core::identity::Keypair;
 
 use crate::config::Config;
+use crate::db::{Db, RepoRecord, VisibilityMode};
 use crate::rate_limit::{RateLimiter, TrustedProxy};
 use crate::state::AppState;
 
@@ -36,6 +39,10 @@ pub struct TestNode {
     pub node_did: String,
     shutdown_tx: watch::Sender<bool>,
     repos_dir: PathBuf,
+    /// Seeding handle over the same pool the node serves from. Kept private so
+    /// the integration crate seeds through the methods below rather than
+    /// naming `Db`/`RepoRecord` directly.
+    db: Arc<Db>,
 }
 
 impl Drop for TestNode {
@@ -110,7 +117,7 @@ pub async fn spawn_node(pool: PgPool) -> TestNode {
     let repos_dir = unique_repos_dir();
     std::fs::create_dir_all(&repos_dir).expect("create temp repos dir");
 
-    let state = build_state(db, pool, repos_dir.clone());
+    let state = build_state(db.clone(), pool, repos_dir.clone());
     let node_did = state.node_did.to_string();
     let shutdown_tx = state.shutdown_tx.clone();
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -138,5 +145,48 @@ pub async fn spawn_node(pool: PgPool) -> TestNode {
         node_did,
         shutdown_tx,
         repos_dir,
+        db,
+    }
+}
+
+impl TestNode {
+    /// Insert a repo owned by `owner_did` and return its repo id. Mirrors
+    /// `test_support::seed_repo` (the `disk_path` field is unused by the
+    /// integration path — `RepoStore` computes the on-disk path from
+    /// `repos_dir`/owner/name, see [`Self::seed_bare_repo`]).
+    pub async fn seed_repo(&self, owner_did: &str, name: &str, is_public: bool) -> String {
+        let now = Utc::now();
+        let record = RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            owner_did: owner_did.to_string(),
+            description: None,
+            is_public,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{name}"),
+            forked_from: None,
+            machine_id: None,
+        };
+        self.db.create_repo(&record).await.expect("seed repo");
+        record.id
+    }
+
+    /// Add a path-scoped visibility rule restricting `path_glob` to
+    /// `reader_dids` (empty = only the owner). Mode B keeps object SHAs intact
+    /// and withholds blob content, which is what the read/replication gates
+    /// enforce.
+    pub async fn withhold_path(
+        &self,
+        repo_id: &str,
+        path_glob: &str,
+        reader_dids: &[String],
+        created_by: &str,
+    ) {
+        self.db
+            .set_visibility_rule(repo_id, path_glob, VisibilityMode::B, reader_dids, created_by)
+            .await
+            .expect("set visibility rule");
     }
 }
