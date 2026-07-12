@@ -4,11 +4,122 @@
 //! content is held back.
 
 use crate::db::VisibilityRule;
-use crate::git::store;
 use crate::visibility::{visibility_check, Decision};
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// Fixed budget bounding the whole withheld-blob classification walk (#174 U3).
+/// The walk is fast for a real repo; this bound exists to reap a hung or
+/// pathologically slow git child so it cannot pin a served-git permit (the read
+/// permit on the upload-pack serve path, the write permit on the receive-pack
+/// post-push replication path) past the deadline. Every caller funnels through
+/// `blob_paths`, so bounding here bounds both paths at one seam.
+const WALK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Run one git child under a shared `deadline` with process-group teardown,
+/// BLOCKING, and return its stdout. The child runs in its own process group; a
+/// watchdog thread SIGTERMs (lets git clean up its `*.lock` files), then SIGKILLs,
+/// the whole group if the deadline passes before the child is reaped, so a hung or
+/// slow git can pin neither a served-git permit nor a blocking thread past the
+/// deadline (jatmn's "retain admission until they are reaped"). This is the
+/// blocking-side counterpart of `smart_http::drive_git_child`, needed because the
+/// walk's callers run it inside `spawn_blocking`, which an async timeout cannot
+/// cancel. Returns [`crate::git::smart_http::GitServiceTimeout`] on the deadline so
+/// the serve handler maps it to 504. `git_bin` is injectable so a fake `git` can
+/// drive the teardown in tests without mutating the process-global PATH;
+/// `stdin_bytes` feeds children that read stdin (empty for the arg-only children).
+#[cfg(unix)]
+fn run_bounded_git(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let label = args.first().copied().unwrap_or("git");
+    let mut child = std::process::Command::new(git_bin)
+        .args(args)
+        .current_dir(repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("failed to spawn git {label}"))?;
+    // With process_group(0) the child leads its own group, so pgid == its pid.
+    let pgid = child.id() as i32;
+
+    // Watchdog: on the deadline, SIGTERM the whole group, poll until it exits,
+    // escalate to SIGKILL after a grace, and report whether it killed. Signalled to
+    // stand down when the child is reaped in time. Kept off the main thread because
+    // the main thread's stdout drain is exactly what blocks until a hung child is
+    // torn down.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || -> bool {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match done_rx.recv_timeout(wait) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+            Err(RecvTimeoutError::Timeout) => {
+                // SAFETY: kill(2) takes only integers and borrows no Rust memory;
+                // ESRCH on an already-gone group is ignored.
+                unsafe { libc::kill(-pgid, libc::SIGTERM) };
+                for step in 0..200u32 {
+                    if unsafe { libc::kill(-pgid, 0) } != 0 {
+                        return true; // ESRCH: every group member has exited
+                    }
+                    if step == 100 {
+                        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                true
+            }
+        }
+    });
+
+    // Feed stdin on a writer thread and drain stderr on a reader thread so the main
+    // thread can drain stdout concurrently; writing all of stdin (or draining one
+    // pipe) before the others can deadlock once a pipe buffer fills.
+    let mut stdin = child.stdin.take();
+    let input = stdin_bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut s) = stdin.take() {
+            let _ = s.write_all(&input);
+        }
+    });
+    let mut stderr = child.stderr.take().context("git stderr was not piped")?;
+    let err_reader = std::thread::spawn(move || {
+        let mut err = Vec::new();
+        let _ = stderr.read_to_end(&mut err);
+        err
+    });
+    let mut stdout = child.stdout.take().context("git stdout was not piped")?;
+    let mut out = Vec::new();
+    let read_result = stdout.read_to_end(&mut out);
+    let status = child.wait().context("git wait failed")?;
+    let err = err_reader.join().unwrap_or_default();
+    let _ = writer.join();
+
+    // Reaped: stand the watchdog down and learn whether it killed on the deadline.
+    let _ = done_tx.send(());
+    let killed = watchdog.join().unwrap_or(false);
+    if killed {
+        return Err(crate::git::smart_http::GitServiceTimeout.into());
+    }
+    read_result.context("failed to read git stdout")?;
+    if !status.success() {
+        anyhow::bail!("git {label} failed: {}", String::from_utf8_lossy(&err));
+    }
+    Ok(out)
+}
 
 /// Fail closed unless every ref ultimately resolves to a commit (a ref pointing
 /// directly at a blob or tree, or an annotated tag — even a nested one — of such
@@ -21,19 +132,15 @@ use std::path::Path;
 /// Full peeling is why this is not `for-each-ref %(*objecttype)`, which
 /// dereferences only one tag level and so misclassifies a tag-of-a-tag-of-a-
 /// commit as a non-commit.
-fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
-    let refs = std::process::Command::new("git")
-        .args(["for-each-ref", "--format=%(refname)"])
-        .current_dir(repo_path)
-        .output()
-        .context("git for-each-ref failed")?;
-    if !refs.status.success() {
-        anyhow::bail!(
-            "git for-each-ref failed: {}",
-            String::from_utf8_lossy(&refs.stderr)
-        );
-    }
-    let refs_stdout = String::from_utf8_lossy(&refs.stdout);
+fn assert_all_refs_are_commits(repo_path: &Path, git_bin: &str, deadline: Instant) -> Result<()> {
+    let refs_out = run_bounded_git(
+        git_bin,
+        &["for-each-ref", "--format=%(refname)"],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let refs_stdout = String::from_utf8_lossy(&refs_out);
     let refnames: Vec<&str> = refs_stdout
         .lines()
         .map(str::trim)
@@ -43,59 +150,25 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Peel every ref in one `git cat-file --batch-check` pass: one
-    // `<refname>^{}` query per line, one output line per input line, in order.
-    // The stdin write runs on a separate thread so this thread can drain stdout
-    // concurrently. cat-file echoes the full query on a `<query> missing` line,
-    // so output scales with refname length (not a fixed size per ref); writing
-    // all of stdin before reading any stdout would deadlock both pipes once the
-    // child's stdout buffer fills. Dropping `stdin` at the end of the closure
-    // sends EOF.
+    // Peel every ref in one `git cat-file --batch-check` pass: one `<refname>^{}`
+    // query per line, one output line per input line, in order. cat-file echoes the
+    // full query on a `<query> missing` line, so output scales with refname length;
+    // run_bounded_git drains stdout concurrently with the stdin write, so the pipe
+    // cannot deadlock, and the whole peel is bounded by the shared walk deadline.
     let queries = refnames
         .iter()
         .map(|r| format!("{r}^{{}}"))
         .collect::<Vec<_>>()
         .join("\n");
-    use std::io::Write;
-    let mut child = std::process::Command::new("git")
-        .args(["cat-file", "--batch-check=%(objecttype)"])
-        .current_dir(repo_path)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("failed to spawn git cat-file")?;
-    // Feed stdin on a writer thread so this thread can drain stdout via
-    // wait_with_output concurrently; a None handle (the pipe vanished) becomes a
-    // broken-pipe write error. wait_with_output reaps the child unconditionally
-    // before any error is surfaced, so no path drops it unwaited (#53), and the
-    // writer is joined only after the drain so the join cannot deadlock.
-    let writer = child
-        .stdin
-        .take()
-        .map(|mut stdin| std::thread::spawn(move || stdin.write_all(queries.as_bytes())));
-    let peel_result = child.wait_with_output();
-    let write_result = match writer {
-        Some(handle) => handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("git cat-file stdin writer thread panicked"))?,
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "git cat-file stdin unavailable",
-        )),
-    };
-    // Surface a write error only if the process didn't already fail with a
-    // clearer status.
-    let peel = peel_result.context("git cat-file failed")?;
-    if !peel.status.success() {
-        anyhow::bail!(
-            "git cat-file --batch-check failed: {}",
-            String::from_utf8_lossy(&peel.stderr)
-        );
-    }
-    write_result.context("failed to write to git cat-file stdin")?;
+    let peel_out = run_bounded_git(
+        git_bin,
+        &["cat-file", "--batch-check=%(objecttype)"],
+        repo_path,
+        queries.as_bytes(),
+        deadline,
+    )?;
 
-    let peel_stdout = String::from_utf8_lossy(&peel.stdout);
+    let peel_stdout = String::from_utf8_lossy(&peel_out);
     let types: Vec<&str> = peel_stdout.lines().map(str::trim).collect();
     // A short read means at least one ref went unclassified — fail closed.
     if types.len() != refnames.len() {
@@ -147,47 +220,46 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
 /// Fails closed: if commit enumeration or any tree walk fails, returns an error so
 /// the caller aborts the serve/pin rather than producing a partial (under-withheld)
 /// set.
-fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    assert_all_refs_are_commits(repo_path)?;
+fn blob_paths(repo_path: &Path, git_bin: &str, timeout: Duration) -> Result<Vec<(String, String)>> {
+    // One deadline spans the whole walk (the ref check, the HEAD probe, rev-list,
+    // and every per-commit ls-tree), so a slow or hung walk is bounded as a unit
+    // rather than granting each git child a fresh timeout.
+    let deadline = Instant::now() + timeout;
+    assert_all_refs_are_commits(repo_path, git_bin, deadline)?;
 
     // Enumerate every reachable commit, not just ref tips. `--all` walks all refs;
     // append HEAD so a detached HEAD (reachable by rev-list/upload-pack but in no
     // ref) is still classified. When HEAD does not resolve (unborn branch on an
-    // empty repo) `--all` alone yields nothing, which is correct — no objects exist.
-    let head = store::head_commit(repo_path).context("resolve HEAD failed")?;
+    // empty repo) `--all` alone yields nothing, which is correct: no objects exist.
+    // The HEAD probe is a bounded `git rev-parse --verify HEAD` (a clean exit means
+    // HEAD resolves), replacing the previously unbounded `store::head_commit` child.
+    let head_resolves = run_bounded_git(
+        git_bin,
+        &["rev-parse", "--verify", "HEAD"],
+        repo_path,
+        b"",
+        deadline,
+    )
+    .is_ok();
     let mut rev_args = vec!["rev-list", "--all"];
-    if head.is_some() {
+    if head_resolves {
         rev_args.push("HEAD");
     }
-    let commits = std::process::Command::new("git")
-        .args(&rev_args)
-        .current_dir(repo_path)
-        .output()
-        .context("git rev-list --all failed")?;
-    if !commits.status.success() {
-        anyhow::bail!(
-            "git rev-list --all failed: {}",
-            String::from_utf8_lossy(&commits.stderr)
-        );
-    }
-    let commits_stdout = String::from_utf8_lossy(&commits.stdout);
+    let commits_out = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
+    let commits_stdout = String::from_utf8_lossy(&commits_out);
     let mut out: HashSet<(String, String)> = HashSet::new();
     for commit in commits_stdout.lines() {
         let commit = commit.trim();
         if commit.is_empty() {
             continue;
         }
-        let listing = std::process::Command::new("git")
-            .args(["ls-tree", "-rz", commit])
-            .current_dir(repo_path)
-            .output()
-            .context("git ls-tree -rz failed")?;
-        if !listing.status.success() {
-            anyhow::bail!(
-                "git ls-tree -rz {commit} failed: {}",
-                String::from_utf8_lossy(&listing.stderr)
-            );
-        }
+        let listing_out = run_bounded_git(
+            git_bin,
+            &["ls-tree", "-rz", commit],
+            repo_path,
+            b"",
+            deadline,
+        )?;
         // `-z` NUL-delimits records and emits paths raw; plain `git ls-tree -r`
         // C-quotes any path with non-ASCII or special bytes (e.g. café.txt becomes
         // "secret/caf\303\251.txt"), and that quoted literal would not match a
@@ -198,7 +270,7 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
         // path (e.g. a non-UTF-8 directory name) with U+FFFD, and the mangled string
         // would no longer match its deny rule — the same under-withholding class, one
         // layer down. Fail closed instead so the caller aborts rather than leaks.
-        let Ok(listing_stdout) = std::str::from_utf8(&listing.stdout) else {
+        let Ok(listing_stdout) = std::str::from_utf8(&listing_out) else {
             anyhow::bail!(
                 "git ls-tree -rz {commit} returned a non-UTF-8 path; \
                  refusing to produce a partial (under-withheld) set"
@@ -236,7 +308,7 @@ pub fn withheld_blob_oids(
     owner_did: &str,
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
-    let pairs = blob_paths(repo_path)?;
+    let pairs = blob_paths(repo_path, "git", WALK_TIMEOUT)?;
     Ok(withheld_from_pairs(
         &pairs, rules, is_public, owner_did, caller,
     ))
@@ -332,7 +404,7 @@ pub fn allowed_blob_set_for_caller(
     owner_did: &str,
     caller: Option<&str>,
 ) -> Result<HashSet<String>> {
-    let pairs = blob_paths(repo_path)?;
+    let pairs = blob_paths(repo_path, "git", WALK_TIMEOUT)?;
     let mut allowed = HashSet::new();
     for (oid, path) in &pairs {
         if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
@@ -372,7 +444,7 @@ pub fn withheld_blob_recipients(
     owner_did: &str,
 ) -> Result<HashMap<String, BTreeSet<String>>> {
     // One history walk feeds both the withheld set and the recipient mapping.
-    let pairs = blob_paths(repo_path)?;
+    let pairs = blob_paths(repo_path, "git", WALK_TIMEOUT)?;
     let withheld = withheld_from_pairs(&pairs, rules, is_public, owner_did, None);
     if withheld.is_empty() {
         return Ok(HashMap::new());
@@ -402,6 +474,79 @@ pub fn withheld_blob_recipients(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write an executable fake `git` shell script into `dir` and return its path,
+    /// so a test can drive the walk's process-group teardown without a real git and
+    /// without mutating the process-global PATH (the crate's only injection seam).
+    #[cfg(unix)]
+    fn write_fake_git(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fakegit");
+        std::fs::write(&p, body).unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    /// #174 U3: the withheld-blob walk is bounded at the shared `blob_paths` seam, so
+    /// a hung git child cannot pin the caller's permit past the deadline. A fake git
+    /// that hangs on `rev-list` must make `blob_paths` return `GitServiceTimeout`
+    /// within the watchdog budget (not block for the child's lifetime), and the
+    /// child's process group must be reaped (its recorded leader PID gone). Every
+    /// caller (upload-pack serve, receive-pack replication) funnels through
+    /// `blob_paths`, so this seam-level proof covers both permit pools. Neutralize
+    /// the watchdog SIGTERM and this hangs past the recv budget (RED).
+    #[cfg(unix)]
+    #[test]
+    fn blob_paths_times_out_and_reaps_a_hung_walk() {
+        use std::time::Duration;
+        let tmp = TempDir::new().unwrap();
+        // Fast on every stage except rev-list, which records its own (group-leader)
+        // PID and then hangs. `sleep 30` bounds the worst case if the watchdog is
+        // ever broken, so a regression cannot wedge the suite for 300s.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo $$ > revlist.pid ; sleep 30 ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+
+        // Run the walk on a thread with a short budget; the recv_timeout succeeding
+        // is itself proof the walk did not block on the hung child.
+        let (tx, rx) = mpsc::channel();
+        let path = tmp.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(blob_paths(&path, &git_bin, Duration::from_millis(200)));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "blob_paths must return within the watchdog budget, not hang on a stuck git child",
+        );
+        let err = result.expect_err("a hung rev-list must abort the walk with an error");
+        assert!(
+            err.downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
+                .is_some(),
+            "a hung walk must abort with GitServiceTimeout (mapped to 504), got: {err}"
+        );
+
+        // The recorded process-group leader must be gone: the watchdog reaps the
+        // whole group before blob_paths returns, so no orphaned git lingers.
+        let pid: i32 = std::fs::read_to_string(tmp.path().join("revlist.pid"))
+            .expect("the fake git must have recorded its rev-list PID")
+            .trim()
+            .parse()
+            .expect("recorded PID must parse");
+        let mut gone = false;
+        for _ in 0..200 {
+            // SAFETY: kill(2) with signal 0 only probes existence; ESRCH (-1) means
+            // the process is gone. Borrows no Rust memory.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            gone,
+            "the hung git child (pid {pid}) must be reaped, not orphaned, after the walk aborts"
+        );
+    }
     use crate::db::VisibilityMode;
     use chrono::Utc;
     use std::process::Command;
