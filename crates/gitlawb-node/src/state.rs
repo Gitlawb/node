@@ -95,14 +95,26 @@ pub struct AppState {
     /// authenticated push at admission (#174).
     pub git_read_semaphore: Arc<tokio::sync::Semaphore>,
     /// Bounds concurrent `git-receive-pack` (push) operations, a pool separate
-    /// from `git_read_semaphore` so anonymous reads can never shed an authenticated
-    /// push (#174). Sized by `max_concurrent_git_pushes`.
+    /// from `git_read_semaphore` so an anonymous READ flood can never shed an
+    /// authenticated push (#174). Sized by `max_concurrent_git_pushes`. Drawn from
+    /// by the `git-receive-pack` POST (owner-gated) and the receive-pack `info/refs`
+    /// advertisement (anon-reachable); the advertisement is additionally bounded per
+    /// source by `git_push_advert_per_caller` so no single source can monopolize this
+    /// pool and shed pushes.
     pub git_write_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Per-caller concurrency sub-cap on the read pool: each caller (per-DID when
-    /// signed, else per-source-IP) may hold at most `max_concurrent_reads_per_caller`
+    /// Per-caller concurrency sub-cap on the read pool: each caller (keyed on the
+    /// resolved source IP, #174 U1) may hold at most `max_concurrent_reads_per_caller`
     /// in-flight read ops, so one caller cannot monopolize `git_read_semaphore`
-    /// (#174). Applied by `git_upload_pack` and both `info/refs` advertisements.
+    /// (#174). Applied by `git_upload_pack` and the upload-pack `info/refs`
+    /// advertisement.
     pub git_read_per_caller: crate::rate_limit::PerCallerConcurrency,
+    /// Per-source concurrency sub-cap on the anon-reachable receive-pack `info/refs`
+    /// advertisement: each source IP may hold at most a small share of the write
+    /// pool, so a multi-source flood of push-handshake advertisements cannot
+    /// saturate `git_write_semaphore` and shed authenticated pushes (#174). Sized as
+    /// a fraction of `max_concurrent_git_pushes`, so filling the write pool takes many
+    /// distinct source IPs (each also braked by the per-IP push rate limiter).
+    pub git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency,
 }
 
 impl AppState {
