@@ -6,6 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "gitlawb_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gitlawb-node"
 path = "src/main.rs"
