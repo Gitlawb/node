@@ -536,16 +536,22 @@ pub async fn run() -> Result<()> {
         info!("on-chain PoS disabled (GITLAWB_CONTRACT_NODE_STAKING or GITLAWB_OPERATOR_PRIVATE_KEY unset)");
     }
 
-    // axum's `with_graceful_shutdown` waits for in-flight requests to
-    // complete (up to the configured grace) once the future resolves.
+    // axum's `with_graceful_shutdown` begins draining in-flight requests once
+    // the shutdown watch flips. That drain is otherwise unbounded, so we bound
+    // it by `grace`: the closure fires `armed_tx` the instant it observes the
+    // signal, and `drive_serve_with_grace` abandons the drain if it has not
+    // finished `grace` after that moment. The clock starts at the signal, not at
+    // server start, so total uptime is never bounded.
     let shutdown_signal_for_axum = state.subscribe_shutdown();
     let grace = std::time::Duration::from_secs(config.shutdown_grace_secs);
     info!(grace_secs = config.shutdown_grace_secs, "axum server ready");
 
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+
     // `into_make_service_with_connect_info` exposes the socket peer address as
     // `ConnectInfo<SocketAddr>` so the push limiter can key on the real client
     // when no trusted proxy header applies (see `rate_limit::client_key`).
-    let serve_result = axum::serve(
+    let serve = axum::serve(
         listener,
         router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
@@ -559,19 +565,56 @@ pub async fn run() -> Result<()> {
                 break;
             }
         }
-    })
-    .await;
+        // Start the grace clock at the signal, right before axum drains.
+        let _ = armed_tx.send(());
+    });
+
+    // Race the drain against the grace deadline (see `drive_serve_with_grace`):
+    // the clock starts when the closure above arms `armed_rx`, i.e. at the
+    // signal, and the drain is abandoned if it outlasts `grace`.
+    let (serve_result, grace_expired) = drive_serve_with_grace(serve, armed_rx, grace).await;
+
+    if grace_expired {
+        warn!(
+            grace_secs = config.shutdown_grace_secs,
+            "shutdown grace expired; abandoning in-flight requests"
+        );
+    }
 
     // Server has stopped accepting new connections and drained in-flight
-    // requests. Tear the rest of the system down.
+    // requests (or the grace deadline fired). Tear the rest of the system down.
     info!("HTTP server stopped, beginning process shutdown");
     if let Some(h) = metrics_handle {
         h.abort();
     }
-    let _ = grace; // recorded for operators in the log above; not enforced
     serve_result?;
     info!("clean exit");
     Ok(())
+}
+
+/// Drive the HTTP `serve` future to completion, bounding the post-signal drain
+/// by `grace`. `armed` resolves the instant the shutdown signal fires (the serve
+/// future's graceful-shutdown closure sends on it), so the grace clock starts at
+/// the signal, not at server start — total uptime is never bounded. Returns the
+/// serve result plus whether the deadline fired (which abandons in-flight
+/// requests so teardown can proceed).
+async fn drive_serve_with_grace<F>(
+    serve: F,
+    armed: tokio::sync::oneshot::Receiver<()>,
+    grace: std::time::Duration,
+) -> (std::io::Result<()>, bool)
+where
+    F: std::future::IntoFuture<Output = std::io::Result<()>>,
+{
+    let serve = serve.into_future();
+    tokio::select! {
+        result = serve => (result, false),
+        _ = async {
+            // Park until the signal arms the clock, then bound the drain.
+            let _ = armed.await;
+            tokio::time::sleep(grace).await;
+        } => (Ok(()), true),
+    }
 }
 
 fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
@@ -1004,34 +1047,117 @@ async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
     let key_path = config.resolved_key_path();
 
-    if key_path.exists() {
-        let pem = std::fs::read_to_string(&key_path)
-            .with_context(|| format!("failed to read key from {}", key_path.display()))?;
-        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
-        info!(path = %key_path.display(), "loaded existing identity");
-        Ok(kp)
-    } else {
-        let kp = Keypair::generate();
-        let pem = kp
-            .to_pem()
-            .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
-
-        if let Some(parent) = key_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
+    // Load an already-provisioned key. On Unix, defensively tighten looser
+    // permissions to 0600 (do NOT reject a loose key — that would break
+    // existing deployments; just narrow them).
+    fn load_existing(path: &std::path::Path) -> Result<Keypair> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::write(&key_path, pem.as_bytes())?;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            if let Ok(meta) = std::fs::metadata(path) {
+                if meta.permissions().mode() & 0o777 != 0o600 {
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                }
+            }
         }
-        #[cfg(not(unix))]
-        std::fs::write(&key_path, pem.as_bytes())?;
-
-        info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
+        let pem = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read key from {}", path.display()))?;
+        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+        info!(path = %path.display(), "loaded existing identity");
         Ok(kp)
     }
+
+    // Load a key another concurrent start may still be writing. `create_new`
+    // makes the inode appear before its PEM is flushed, so a race loser — or a
+    // fast-path `exists()` that caught the winner mid-write — can momentarily
+    // read an empty/partial file. Retry briefly until it parses rather than
+    // crashing the boot. Bounded (~100ms); an already-provisioned key parses on
+    // the first attempt with no sleep.
+    fn load_racing(path: &std::path::Path) -> Result<Keypair> {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match load_existing(path) {
+                Ok(kp) => return Ok(kp),
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("key at {} unreadable after create race", path.display())
+        }))
+    }
+
+    // Fast path for the common already-provisioned case (still race-safe: a
+    // concurrently-writing winner is handled by the retry inside `load_racing`).
+    if key_path.exists() {
+        return load_racing(&key_path);
+    }
+
+    let kp = Keypair::generate();
+    let pem = kp
+        .to_pem()
+        .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Create atomically. `create_new` fails if the file already exists, which
+    // closes the exists()->write TOCTOU: a lost race deterministically loads
+    // the winner's key instead of overwriting it.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key_path)
+        {
+            Ok(mut f) => {
+                // The file is 0600 from creation, so the PEM is never
+                // world-readable, even momentarily.
+                f.write_all(pem.as_bytes())
+                    .with_context(|| format!("failed to write key to {}", key_path.display()))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A concurrent start won the race and wrote the identity; load
+                // theirs rather than propagating the error or overwriting.
+                return load_racing(&key_path);
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to create key at {}", key_path.display()));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&key_path)
+        {
+            Ok(mut f) => {
+                f.write_all(pem.as_bytes())
+                    .with_context(|| format!("failed to write key to {}", key_path.display()))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return load_racing(&key_path);
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to create key at {}", key_path.display()));
+            }
+        }
+    }
+
+    info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
+    Ok(kp)
 }
 
 #[cfg(test)]
@@ -1092,5 +1218,189 @@ mod gossip_ssrf_tests {
     async fn ping_peer_health_reports_unhealthy_on_connection_error() {
         let ok = ping_peer_health(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unhealthy peer");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod identity_key_tests {
+    use super::{load_or_create_keypair, Config};
+    use clap::Parser;
+    use std::os::unix::fs::PermissionsExt;
+
+    // A freshly created identity key must be 0600 immediately, with no
+    // world-readable disclosure window (the atomic create_new(...).mode(0o600)
+    // guarantee). This is the RED-then-GREEN anchor for the perms fix: the old
+    // fs::write + set_permissions sequence left a 0644 window.
+    #[test]
+    fn created_key_is_mode_0600() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let config = Config::parse_from([
+            "gitlawb-node",
+            "--key-path",
+            key_path.to_str().expect("utf8 path"),
+        ]);
+
+        let _kp = load_or_create_keypair(&config).expect("create keypair");
+
+        let mode = std::fs::metadata(&key_path)
+            .expect("key file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "identity key must be 0600, got {:o}",
+            mode & 0o777
+        );
+    }
+
+    // A lost create race (file already present) must load the existing key
+    // rather than overwrite it, and must not error on AlreadyExists. Loading an
+    // existing loose-permission key tightens it to 0600 defensively.
+    #[test]
+    fn existing_key_is_loaded_and_tightened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let config = Config::parse_from([
+            "gitlawb-node",
+            "--key-path",
+            key_path.to_str().expect("utf8 path"),
+        ]);
+
+        let first = load_or_create_keypair(&config).expect("create keypair");
+        // Loosen perms to simulate a legacy/loose on-disk key.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen perms");
+
+        let second = load_or_create_keypair(&config).expect("load keypair");
+        assert_eq!(
+            first.did(),
+            second.did(),
+            "reloading must return the same identity, not a new one"
+        );
+
+        let mode = std::fs::metadata(&key_path)
+            .expect("key file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "load path must tighten loose perms to 0600, got {:o}",
+            mode & 0o777
+        );
+    }
+
+    // The create-race arm the single-threaded tests skip (they enter via the
+    // `exists()` fast path). N concurrent starts on ONE fresh path must converge
+    // on a single identity: the `create_new` losers hit `AlreadyExists` and load
+    // the winner's key rather than overwriting it. RED: revert the write to a
+    // plain `fs::write` (no `create_new`) and each thread returns its own
+    // freshly generated key, so the DIDs diverge.
+    #[test]
+    fn concurrent_starts_converge_on_one_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let config = std::sync::Arc::new(Config::parse_from([
+            "gitlawb-node",
+            "--key-path",
+            key_path.to_str().expect("utf8 path"),
+        ]));
+
+        let n = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(n));
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let c = config.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    // Release all threads at once to maximize the race.
+                    b.wait();
+                    format!("{}", load_or_create_keypair(&c).expect("keypair").did())
+                })
+            })
+            .collect();
+        let dids: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread joins"))
+            .collect();
+
+        let first = &dids[0];
+        assert!(
+            dids.iter().all(|d| d == first),
+            "all concurrent starts must converge on one identity, got: {dids:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_grace_tests {
+    use super::drive_serve_with_grace;
+    use std::time::{Duration, Instant};
+
+    // The must-not case: the drain (serve future) never completes but the signal
+    // has fired. The grace deadline must fire, report `grace_expired = true`, and
+    // return promptly so teardown proceeds — not hang forever. RED: a helper that
+    // just awaits `serve` (ignoring grace) hangs this test past its bound.
+    #[tokio::test]
+    async fn hung_drain_is_abandoned_after_grace() {
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let _ = armed_tx.send(()); // signal already fired
+        let serve = std::future::pending::<std::io::Result<()>>(); // never drains
+        let start = Instant::now();
+
+        let (result, grace_expired) =
+            drive_serve_with_grace(serve, armed_rx, Duration::from_millis(50)).await;
+
+        assert!(grace_expired, "a drain outlasting grace must be abandoned");
+        assert!(
+            result.is_ok(),
+            "abandon path returns Ok so teardown proceeds"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "must not wait indefinitely for the hung drain"
+        );
+    }
+
+    // Normal drain: the serve future completes before grace, so the real serve
+    // result is propagated and `grace_expired` is false.
+    #[tokio::test]
+    async fn completed_drain_keeps_result_and_does_not_expire() {
+        let (_armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve = std::future::ready(Ok::<(), std::io::Error>(()));
+
+        let (result, grace_expired) =
+            drive_serve_with_grace(serve, armed_rx, Duration::from_secs(3600)).await;
+
+        assert!(
+            !grace_expired,
+            "a completed drain must not report grace expiry"
+        );
+        assert!(result.is_ok());
+    }
+
+    // The grace clock starts at the SIGNAL, not at call time. With the signal
+    // unsent, a finite drain longer than `grace` still completes normally — total
+    // uptime is never bounded by grace. RED: drop `armed.await` from the grace
+    // branch and the deadline fires at 10ms, expiring before the 80ms drain.
+    #[tokio::test]
+    async fn grace_clock_starts_at_signal_not_call() {
+        let (_armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        // Signal never fires; drain finishes after > grace.
+        let serve = async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            Ok::<(), std::io::Error>(())
+        };
+
+        let (result, grace_expired) =
+            drive_serve_with_grace(serve, armed_rx, Duration::from_millis(10)).await;
+
+        assert!(
+            !grace_expired,
+            "grace must not fire while the shutdown signal is unsent"
+        );
+        assert!(result.is_ok());
     }
 }

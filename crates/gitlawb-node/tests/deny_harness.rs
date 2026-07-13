@@ -25,6 +25,15 @@ fn cid_for_oid(oid_hex: &str) -> String {
     Cid::from_sha256_bytes(&arr).to_string()
 }
 
+/// A reqwest client with a bounded timeout so a wedged node route fails the test
+/// fast rather than hanging until the CI job timeout.
+fn bounded_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("client builds")
+}
+
 // ── U2: the signing client produces signatures require_signature accepts ─────
 
 /// A validly signed receive-pack request clears `require_signature` (it does not
@@ -34,7 +43,7 @@ fn cid_for_oid(oid_hex: &str) -> String {
 #[sqlx::test]
 async fn signed_receive_pack_clears_signature_layer(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    let client = bounded_client();
     let kp = Keypair::generate();
 
     let resp = signed_request(
@@ -64,7 +73,7 @@ async fn signed_receive_pack_clears_signature_layer(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn tampered_body_after_signing_is_rejected(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    let client = bounded_client();
     let kp = Keypair::generate();
 
     // Sign one body, then replace it before sending.
@@ -95,7 +104,7 @@ async fn tampered_body_after_signing_is_rejected(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn unsigned_receive_pack_is_denied(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    let client = bounded_client();
 
     let url = format!("{}/alice/repo/git-receive-pack", node.base_url);
     let resp = client
@@ -120,7 +129,7 @@ async fn unsigned_receive_pack_is_denied(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    let client = bounded_client();
 
     let owner = Keypair::generate();
     let owner_did = owner.did().to_string();
@@ -189,7 +198,7 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn wrong_owner_visibility_put_is_forbidden(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    let client = bounded_client();
 
     let owner = Keypair::generate();
     let owner_did = owner.did().to_string();
@@ -246,7 +255,7 @@ async fn wrong_owner_visibility_put_is_forbidden(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn withheld_path_blob_read_is_denied(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    let client = bounded_client();
 
     let owner = Keypair::generate();
     let owner_did = owner.did().to_string();
@@ -341,10 +350,7 @@ async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
     req_body.extend_from_slice(b"0000"); // flush after wants
     req_body.extend(pkt("done\n"));
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .unwrap();
+    let client = bounded_client();
     let resp = client
         .post(format!(
             "{}/{owner_did}/u8-repo/git-upload-pack",
@@ -417,7 +423,7 @@ async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn additional_owner_gates_reject_non_owner(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    let client = bounded_client();
     let owner = Keypair::generate();
     let owner_did = owner.did().to_string();
     let stranger = Keypair::generate();
