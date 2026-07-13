@@ -23,6 +23,12 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 const WALK_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long the process-group watchdog waits after SIGTERM before escalating to
+/// SIGKILL, giving a well-behaved git child time to clean up its `*.lock` files. Only
+/// paid on a timeout (already the exceptional path).
+#[cfg(unix)]
+const WATCHDOG_TERM_GRACE: Duration = Duration::from_secs(1);
+
 /// Run one git child under a shared `deadline` with process-group teardown,
 /// BLOCKING, and return its stdout. The child runs in its own process group; a
 /// watchdog thread SIGTERMs (lets git clean up its `*.lock` files), then SIGKILLs,
@@ -60,52 +66,46 @@ fn run_bounded_git(
     // With process_group(0) the child leads its own group, so pgid == its pid.
     let pgid = child.id() as i32;
 
-    // Watchdog: on the deadline, SIGTERM the whole group, poll until it exits,
-    // escalate to SIGKILL after a grace, and report whether it killed. Signalled to
-    // stand down when the child is reaped in time. Kept off the main thread because
-    // the main thread's stdout drain is exactly what blocks until a hung child is
-    // torn down.
+    // Watchdog: on the deadline, tear the WHOLE process group down — SIGTERM, a grace
+    // for a well-behaved child to clean up its `*.lock` files, then an UNCONDITIONAL
+    // SIGKILL of the group. It never stands down on leader-reap alone: a group member
+    // that ignores SIGTERM while the leader exits cleanly would otherwise escape the
+    // SIGKILL and keep running past the deadline (finding 3, #174). The main thread
+    // defers reaping the leader until this thread returns (see below), so the leader's
+    // pid is still unreaped while every `kill(-pgid)` fires and the pgid cannot have
+    // been recycled — which is why this no longer needs the old `reaped` short-circuit.
+    // Kept off the main thread because the main thread's stdout drain is exactly what
+    // blocks until a hung child is torn down.
     let (done_tx, done_rx) = mpsc::channel::<()>();
-    // Set true the instant the main thread reaps the child, so the watchdog never
-    // SIGTERMs a pgid whose leader is already reaped and whose pid the kernel may
-    // recycle (the reused-pgid hazard smart_http guards via disarm-after-wait).
-    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watchdog = {
-        let reaped = reaped.clone();
-        std::thread::spawn(move || -> bool {
-            use std::sync::atomic::Ordering;
-            let wait = deadline.saturating_duration_since(Instant::now());
-            match done_rx.recv_timeout(wait) {
-                Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
-                Err(RecvTimeoutError::Timeout) => {
-                    // The child was reaped right as the deadline fired: do not signal
-                    // its (possibly-recycled) pgid.
-                    if reaped.load(Ordering::SeqCst) {
-                        return false;
-                    }
-                    // SAFETY: kill(2) takes only integers and borrows no Rust memory;
-                    // ESRCH on an already-gone group is ignored.
-                    unsafe { libc::kill(-pgid, libc::SIGTERM) };
-                    for step in 0..200u32 {
-                        if reaped.load(Ordering::SeqCst) || unsafe { libc::kill(-pgid, 0) } != 0 {
-                            return true; // reaped, or ESRCH: every group member has exited
-                        }
-                        if step == 100 {
-                            unsafe { libc::kill(-pgid, libc::SIGKILL) };
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    // Survived SIGKILL past the cap: a wedged (D-state) git, the same
-                    // condition smart_http's reap logs. Warn so an operator sees it.
+    let watchdog = std::thread::spawn(move || -> bool {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match done_rx.recv_timeout(wait) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+            Err(RecvTimeoutError::Timeout) => {
+                // SAFETY: kill(2) takes only integers and borrows no Rust memory;
+                // ESRCH on an already-gone group is ignored.
+                unsafe { libc::kill(-pgid, libc::SIGTERM) };
+                // Fixed grace: because the main thread defers the leader's reap, a
+                // fully-exited group still shows a zombie leader here, so polling for
+                // ESRCH cannot detect early completion — just wait the grace, then
+                // SIGKILL. On a group of only zombies the SIGKILL is a harmless no-op;
+                // on a SIGTERM-ignoring member it is what actually kills it.
+                std::thread::sleep(WATCHDOG_TERM_GRACE);
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                // Brief settle so the SIGKILL is delivered before the main thread
+                // reaps the leader and frees the pgid. A wedged (D-state) member
+                // survives even SIGKILL — the documented residual, as in smart_http.
+                std::thread::sleep(Duration::from_millis(20));
+                if unsafe { libc::kill(-pgid, 0) } == 0 {
                     tracing::warn!(
                         pgid,
                         "withheld-walk git survived SIGKILL past the watchdog cap (uninterruptible I/O?)"
                     );
-                    true
                 }
+                true
             }
-        })
-    };
+        }
+    });
 
     // Feed stdin on a writer thread and drain stderr on a reader thread so the main
     // thread can drain stdout concurrently; writing all of stdin (or draining one
@@ -132,14 +132,18 @@ fn run_bounded_git(
     // is unreachable in userspace (no signal reaps a D-state process) and matches the
     // async `reap_group_on_timeout`, which likewise only warns and gives up there.
     let read_result = stdout.read_to_end(&mut out);
-    let status = child.wait().context("git wait failed")?;
-    // Reaped: bar the watchdog from signalling the now-reaped (possibly recycled)
-    // pgid before it can fire, then stand it down.
-    reaped.store(true, std::sync::atomic::Ordering::SeqCst);
-    let err = err_reader.join().unwrap_or_default();
-    let _ = writer.join();
+    // The drain has returned: either the child exited on its own, or the watchdog's
+    // teardown closed its pipes. Tell the watchdog the drain is done, then WAIT for it
+    // to return BEFORE reaping the leader. On the timeout path the watchdog runs the
+    // full SIGTERM -> grace -> SIGKILL teardown; joining it before `child.wait()` keeps
+    // the leader's pid unreaped while every `kill(-pgid)` fires (so the pgid can't be
+    // recycled), and guarantees a SIGTERM-ignoring group member has already been
+    // SIGKILLed rather than left running past the deadline (finding 3, #174).
     let _ = done_tx.send(());
     let killed = watchdog.join().unwrap_or(false);
+    let status = child.wait().context("git wait failed")?;
+    let err = err_reader.join().unwrap_or_default();
+    let _ = writer.join();
     read_result.context("failed to read git stdout")?;
     // The watchdog runs off a wall clock that can race a child finishing right at the
     // deadline. A child that exited on its own (success) is not a timeout even if the
@@ -826,6 +830,76 @@ mod tests {
         assert!(
             gone,
             "the SIGTERM-ignoring child (pid {pid}) must be reaped via SIGKILL, not left running"
+        );
+    }
+
+    /// #174 finding 3 (jatmn/CodeRabbit): a group MEMBER that ignores SIGTERM must
+    /// still be SIGKILLed even when the group LEADER exits cleanly on SIGTERM. The
+    /// leader traps SIGTERM to exit 0, but first spawns a descendant (`sh -c`, so its
+    /// `$$` is its OWN pid — a `( )` subshell's `$$` is the parent's) that ignores
+    /// SIGTERM and closes its inherited stdout/stderr. When the watchdog SIGTERMs the
+    /// group, the leader exits, its stdout closes, the main drain unblocks, and the
+    /// leader is reaped — the exact window a `reaped`-gated watchdog stands down in,
+    /// before escalating to SIGKILL. The descendant must be dead when run_bounded_git
+    /// returns; a teardown that stands down on leader-reap leaves it running (RED).
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_git_sigkills_a_sigterm_ignoring_descendant_after_leader_exits() {
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new().unwrap();
+        // Both loops are bounded (~30s) so a broken teardown cannot leak a permanent
+        // orphan or wedge the suite; the assertion fires well before then.
+        let body = "#!/bin/sh\n\
+case \"$1\" in\n\
+  rev-list)\n\
+    sh -c 'trap \"\" TERM; echo $$ > desc.pid; exec 1>&- 2>&-; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done' &\n\
+    trap 'exit 0' TERM\n\
+    i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done ;;\n\
+  *) : ;;\n\
+esac\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = tmp.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_bounded_git(
+                &git_bin,
+                &["rev-list"],
+                &path,
+                b"",
+                Instant::now() + Duration::from_millis(100),
+            ));
+        });
+        let _ = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("run_bounded_git must return within the watchdog budget");
+
+        // Wait for the descendant to record its OWN pid, then assert it is gone.
+        let desc_pid_path = tmp.path().join("desc.pid");
+        let mut desc: Option<i32> = None;
+        for _ in 0..200 {
+            if let Some(p) = std::fs::read_to_string(&desc_pid_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                desc = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let desc = desc.expect("the fake leader must have spawned and recorded a descendant");
+        let mut gone = false;
+        for _ in 0..300 {
+            if unsafe { libc::kill(desc, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Kill it regardless so a RED run leaks no orphan.
+        unsafe { libc::kill(desc, libc::SIGKILL) };
+        assert!(
+            gone,
+            "a SIGTERM-ignoring descendant (pid {desc}) must be SIGKILLed even after the leader exits cleanly, not orphaned"
         );
     }
     use crate::db::VisibilityMode;
