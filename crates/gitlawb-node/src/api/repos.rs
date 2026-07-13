@@ -2684,6 +2684,22 @@ mod tests {
         assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
 
         let router = crate::server::build_router(state);
+
+        // Anchor the test: prove the write bucket is genuinely drained at the
+        // router (a write sink from this peer 429s) so the creation assertion
+        // below cannot pass vacuously on some unrelated non-429 status.
+        let mut wreq = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/repos/someowner/somerepo/star")
+            .body(Body::empty())
+            .unwrap();
+        wreq.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            router.clone().oneshot(wreq).await.unwrap().status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "write bucket must be drained for this peer (test precondition)"
+        );
+
         // Creation from the same peer must NOT be 429 — its bucket is untouched.
         // (It fails later on missing signature; the point is it is not throttled.)
         let mut req = Request::builder()
