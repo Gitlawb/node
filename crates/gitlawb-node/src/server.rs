@@ -58,15 +58,30 @@ fn add_auth_layers(router: Router<AppState>, state: AppState) -> Router<AppState
 pub fn build_router(state: AppState) -> Router {
     // ── GraphQL routes ─────────────────────────────────────────────────────
     let schema = state.graphql_schema.as_ref().clone();
+
+    // Per-IP write brake, shared across every authenticated non-creation write
+    // group (see `AppState::write_rate_limiter`). Built once here so each group
+    // clones the same bucket; attached outermost on each group so a flood is
+    // rejected before auth runs. Separate bucket from the creation brake.
+    let write_ip_limiter = rate_limit::IpRateLimiter {
+        limiter: state.write_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
+
     let graphql_routes = Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
         // Attach the verified DID to /graphql when a signature is present. The
         // layer covers only routes added before it, so /graphql/ws (added after,
-        // read-only subscriptions) stays open.
+        // read-only subscriptions) stays open. The per-IP write brake covers the
+        // same /graphql (KTD-5: an HTTP-layer brake cannot tell a query POST from
+        // a mutation POST, so it counts every /graphql request — acceptable, both
+        // cost work); /graphql/ws subscriptions stay unbraked.
         .layer(middleware::from_fn(auth::optional_signature))
+        .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(write_ip_limiter.clone()))
         .route_service("/graphql/ws", GraphQLSubscription::new(schema));
 
-    // ── Task routes (write — require HTTP Signature) ───────────────────────
+    // ── Task routes (write — require HTTP Signature + per-IP write brake) ──
     let task_write_routes = add_auth_layers(
         Router::new()
             .route("/api/v1/tasks", post(tasks::create_task))
@@ -74,7 +89,9 @@ pub fn build_router(state: AppState) -> Router {
             .route("/api/v1/tasks/{id}/complete", post(tasks::complete_task))
             .route("/api/v1/tasks/{id}/fail", post(tasks::fail_task)),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(write_ip_limiter.clone()));
 
     // ── Task routes (read — open) ──────────────────────────────────────────
     let task_read_routes = Router::new()
@@ -118,10 +135,6 @@ pub fn build_router(state: AppState) -> Router {
     // positive). The bundled visibility GET is a read that also draws from the
     // write bucket — harmless, since the bucket is sized far above any legit
     // per-IP read rate.
-    let write_ip_limiter = rate_limit::IpRateLimiter {
-        limiter: state.write_rate_limiter.clone(),
-        trust: state.push_limiter_trust,
-    };
     let write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -259,7 +272,9 @@ pub fn build_router(state: AppState) -> Router {
                 post(bounties::dispute_bounty),
             ),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(write_ip_limiter.clone()));
 
     // ── Bounty routes (read — open) ──────────────────────────────────────
     let bounty_read_routes = Router::new()
@@ -280,9 +295,11 @@ pub fn build_router(state: AppState) -> Router {
     let profile_write_routes = add_auth_layers(
         Router::new().route("/api/v1/profile", axum::routing::put(profiles::set_profile)),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(write_ip_limiter.clone()));
 
-    // ── Issue routes (write — require HTTP Signature, no rate limit) ─────
+    // ── Issue routes (write — require HTTP Signature + per-IP write brake) ─
     let issue_write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -294,7 +311,9 @@ pub fn build_router(state: AppState) -> Router {
                 post(issues::create_issue_comment),
             ),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(write_ip_limiter.clone()));
 
     // ── Peer discovery routes ─────────────────────────────────────────────
     // Peer writes accept signatures when present and can require them after a
