@@ -207,12 +207,162 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             needs: NO_ENTITY,
             reach: Reach::None,
         },
-        // ── Read-gate (404) — TODO(U1 continuation): populate per-handler-verified
-        //    rows for the repo-scoped 404-reads (get_repo, get_blob, get_tree,
-        //    get_by_cid, git_info_refs, git_upload_pack, get_cert, get_issue,
-        //    get_pr, list_certs, list_issues, ...), each with a Reach twin, and
-        //    keep the global list-filter surfaces (list_repos, list_all_bounties)
-        //    OUT (they filter, they do not 404 — a different class, Flavor B).
+        // ── Read-gate (404) — verified: each handler calls
+        //    authorize_repo_read / visibility_check on "/" which returns
+        //    AppError::RepoNotFound (404) when a non-reader hits a private repo
+        //    (api/mod.rs:44-62). The Reach twin is the owner issuing the same
+        //    request against the private repo and getting 2xx, proving the 404 is
+        //    the gate and not a merely-absent entity/repo. Every row here gates on
+        //    the whole repo ("/"), so ReaderReads (owner re-read) is the twin;
+        //    the fully-private fixture repo needs no per-row sub-entity seeding
+        //    because these reads either return the seeded repo/blob or an empty
+        //    2xx list.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_repo",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/commits",
+            gate: GateClass::ReadGate,
+            handler: "repos::list_commits",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/tree",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_tree_root",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        // Path-scoped read: get_blob gates on "/{path}" (repos.rs:390). The
+        // fully-private fixture repo denies any path to anon (404); the owner
+        // reads the seeded blob at content_path and gets 2xx bytes. (Path-scoped
+        // subtree WITHHOLDING on a *public* repo — the SiblingPublic twin — is
+        // already covered by the U7/U8 cases in deny_harness.rs.)
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/blob/{*path}",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_blob",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/refs",
+            gate: GateClass::ReadGate,
+            handler: "repos::list_refs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/issues",
+            gate: GateClass::ReadGate,
+            handler: "issues::list_issues",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/labels",
+            gate: GateClass::ReadGate,
+            handler: "labels::list_labels",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/certs",
+            gate: GateClass::ReadGate,
+            handler: "certs::list_certs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/events",
+            gate: GateClass::ReadGate,
+            handler: "events::list_repo_events",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls",
+            gate: GateClass::ReadGate,
+            handler: "pulls::list_prs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/changelog",
+            gate: GateClass::ReadGate,
+            handler: "changelog::get_changelog",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/bounties",
+            gate: GateClass::ReadGate,
+            handler: "bounties::list_repo_bounties",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/withheld-paths",
+            gate: GateClass::ReadGate,
+            handler: "visibility::withheld_paths",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/encrypted-blobs",
+            gate: GateClass::ReadGate,
+            handler: "encrypted::list_encrypted_blobs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        // DEFERRED read-gate rows (each verified to gate on "/", but the owner
+        // 2xx twin needs a seeded sub-entity the fixture does not yet create, so
+        // they land with the fixture expansion that seeds them):
+        //   get_issue/{id}, get_pr/{number}, get_pr_diff, list_issue_comments,
+        //   list_reviews, list_comments (need a seeded issue/PR),
+        //   get_cert/{id} (cert), get_bounty/{id} (bounty), get_encrypted_blob/
+        //   {oid} (encrypted blob). Path-scoped get_tree/{*path} needs a seeded
+        //   sub-directory. The git smart-HTTP reads (git_info_refs,
+        //   git_upload_pack, ?service= query) and ipfs::get_by_cid are covered by
+        //   the existing U7/U8/anon_ipfs cases in deny_harness.rs.
+        // EXCLUDED (not 404-deny reads): list_repos, list_federated_repos,
+        //   list_all_bounties, list_ref_updates (global list-FILTER: 200 with the
+        //   unreadable rows removed, never a 404); list_webhooks,
+        //   list_protected_branches, list_replicas (KNOWN_UNGATED, api/mod.rs);
+        //   list_visibility (owner-gate 403, already in the owner-gate tranche).
     ]
 }
 
