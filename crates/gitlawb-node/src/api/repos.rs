@@ -522,8 +522,11 @@ pub async fn git_info_refs(
     // would drop, while the reorder still prevents one source from occupying global
     // slots during the DB/visibility window.
     {
+        // The receive-pack advertisement peeks its DEDICATED advert pool, not the
+        // write pool the authenticated POST uses (#174) — matching the held acquire
+        // below, so the pre-DB shed and the authoritative hold agree on the pool.
         let pool = if service == "git-receive-pack" {
-            &state.git_write_semaphore
+            &state.git_push_advert_semaphore
         } else {
             &state.git_read_semaphore
         };
@@ -620,12 +623,14 @@ pub async fn git_info_refs(
     // would be sub-cap-denied for during the DB/visibility window and starve other
     // sources; still before acquire_fresh/git so it bounds the fresh Tigris acquire
     // and git exec (INV-10). The receive-pack advertisement is phase one of a push,
-    // so it draws from the WRITE pool (like the git-receive-pack POST), not the
-    // global read pool an anonymous clone flood can exhaust and thereby starve the
-    // push handshake (#174 U2). The upload-pack advertisement stays on the read
-    // pool with its per-caller sub-cap.
+    // but it is ANON-reachable, so it draws from the dedicated advert pool
+    // (`git_push_advert_semaphore`), NOT the write pool the authenticated POST uses:
+    // an advert flood can at worst exhaust the advert pool, never a permit a push
+    // POST needs at admission (#174 U2). A clone flood on the read pool likewise
+    // can't touch either. The upload-pack advertisement stays on the read pool with
+    // its per-caller sub-cap.
     let _permit = if service == "git-receive-pack" {
-        git_permit(&state.git_write_semaphore)?
+        git_permit(&state.git_push_advert_semaphore)?
     } else {
         git_permit(&state.git_read_semaphore)?
     };
@@ -2944,14 +2949,19 @@ mod tests {
         );
     }
 
-    /// #174 U2: the receive-pack advertisement (`GET info/refs?service=git-receive-pack`)
-    /// is phase one of a push, so it draws from the WRITE pool, not the global read
-    /// pool an anonymous clone flood can exhaust. Proven at the handler by saturating
-    /// each pool to zero and checking who shares it (INV-10). Revert the branch to the
-    /// read pool and the read-saturated receive-pack assertion goes 503 (the exact
-    /// push-handshake starvation jatmn flagged).
+    /// #174 (jatmn P1): the anon-reachable receive-pack advertisement
+    /// (`GET info/refs?service=git-receive-pack`) draws from a DEDICATED advert pool
+    /// (`git_push_advert_semaphore`), NOT the write pool the authenticated POST uses.
+    /// Proven at the handler by saturating each pool to zero and checking who shares
+    /// it (INV-10, across the auth boundary). The load-bearing pair:
+    ///   * advert pool at 0 -> the advert SHEDS 503 (it is bound to that pool);
+    ///   * write pool at 0 -> the advert SURVIVES (it can NOT consume a permit the
+    ///     authenticated POST needs — the reservation jatmn asked for).
+    /// Revert the branch to `git_write_semaphore` and BOTH flip: the advert-pool-0
+    /// case stops shedding and the write-pool-0 case starts shedding (the exact
+    /// anon-sheds-authed-push starvation).
     #[sqlx::test]
-    async fn receive_pack_advertisement_draws_from_write_pool(pool: sqlx::PgPool) {
+    async fn receive_pack_advertisement_draws_from_dedicated_advert_pool(pool: sqlx::PgPool) {
         use axum::body::Body;
         use axum::extract::ConnectInfo;
         use axum::http::{Method, Request, StatusCode};
@@ -2960,17 +2970,19 @@ mod tests {
         use tokio::sync::Semaphore;
         use tower::ServiceExt;
 
-        // Build a fresh state with the two pools sized independently, then drive one
+        // Build a fresh state with the three pools sized independently, then drive one
         // info/refs advertisement for `service` and return its handler status.
         async fn advert_status(
             pool: &sqlx::PgPool,
             read_permits: usize,
             write_permits: usize,
+            advert_permits: usize,
             service: &str,
         ) -> StatusCode {
             let mut state = crate::test_support::test_state(pool.clone()).await;
             state.git_read_semaphore = Arc::new(Semaphore::new(read_permits));
             state.git_write_semaphore = Arc::new(Semaphore::new(write_permits));
+            state.git_push_advert_semaphore = Arc::new(Semaphore::new(advert_permits));
             state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
             state
                 .db
@@ -2988,31 +3000,39 @@ mod tests {
             router.oneshot(req).await.unwrap().status()
         }
 
-        // Read pool saturated, write pool free: the push handshake SURVIVES.
-        assert_ne!(
-            advert_status(&pool, 0, 8, "git-receive-pack").await,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "receive-pack advertisement must draw from the write pool: a saturated read pool must not shed it"
-        );
-        // Write pool saturated, read pool free: the receive-pack advertisement SHEDS,
-        // proving it now consumes the write pool (not the read pool).
+        // Advert pool saturated (read + write free): the receive-pack advert SHEDS,
+        // proving it is bound to the dedicated advert pool.
         assert_eq!(
-            advert_status(&pool, 8, 0, "git-receive-pack").await,
+            advert_status(&pool, 8, 8, 0, "git-receive-pack").await,
             StatusCode::SERVICE_UNAVAILABLE,
-            "receive-pack advertisement draws from the write pool, so a saturated write pool sheds it 503"
+            "receive-pack advertisement draws from the dedicated advert pool: a saturated advert pool sheds it 503"
+        );
+        // WRITE pool saturated (advert + read free): the advert SURVIVES. This is the
+        // reservation — an advert flood can never occupy a permit the authenticated
+        // push POST relies on at admission.
+        assert_ne!(
+            advert_status(&pool, 8, 0, 8, "git-receive-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement must NOT draw from the write pool: a saturated write pool must not shed it"
+        );
+        // Read pool saturated (advert + write free): the advert SURVIVES (never on the read pool).
+        assert_ne!(
+            advert_status(&pool, 0, 8, 8, "git-receive-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement must not draw from the read pool"
         );
         // Read pool saturated: the upload-pack advertisement still SHEDS (unchanged).
         assert_eq!(
-            advert_status(&pool, 0, 8, "git-upload-pack").await,
+            advert_status(&pool, 0, 8, 8, "git-upload-pack").await,
             StatusCode::SERVICE_UNAVAILABLE,
             "upload-pack advertisement stays on the read pool: a saturated read pool sheds it 503"
         );
-        // Write pool saturated, read pool free: the upload-pack advertisement is
-        // UNAFFECTED, proving reads never touch the write pool in either direction.
+        // Write + advert pools saturated, read free: the upload-pack advertisement is
+        // UNAFFECTED, proving reads never touch either write-side pool.
         assert_ne!(
-            advert_status(&pool, 8, 0, "git-upload-pack").await,
+            advert_status(&pool, 8, 0, 0, "git-upload-pack").await,
             StatusCode::SERVICE_UNAVAILABLE,
-            "upload-pack advertisement never touches the write pool"
+            "upload-pack advertisement never touches the write or advert pool"
         );
     }
 

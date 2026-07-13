@@ -97,11 +97,19 @@ pub struct AppState {
     /// Bounds concurrent `git-receive-pack` (push) operations, a pool separate
     /// from `git_read_semaphore` so an anonymous READ flood can never shed an
     /// authenticated push (#174). Sized by `max_concurrent_git_pushes`. Drawn from
-    /// by the `git-receive-pack` POST (owner-gated) and the receive-pack `info/refs`
-    /// advertisement (anon-reachable); the advertisement is additionally bounded per
-    /// source by `git_push_advert_per_caller` so no single source can monopolize this
-    /// pool and shed pushes.
+    /// by the `git-receive-pack` POST (owner-gated) ONLY. The anon-reachable
+    /// receive-pack `info/refs` advertisement draws from the SEPARATE
+    /// `git_push_advert_semaphore` below, never this pool, so a multi-source flood
+    /// of push-handshake advertisements can never occupy a permit an authenticated
+    /// POST needs at admission (#174).
     pub git_write_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent anon-reachable `git-receive-pack` `info/refs`
+    /// advertisements — a pool SEPARATE from `git_write_semaphore` so adverts (which
+    /// hold a permit across `acquire_fresh` + `info/refs`) can never consume a slot
+    /// the authenticated POST relies on. A per-source flood can at worst exhaust this
+    /// advert pool (each source also capped by `git_push_advert_per_caller` and the
+    /// per-IP push rate limiter), and the reserved POST pool is untouched (#174).
+    pub git_push_advert_semaphore: Arc<tokio::sync::Semaphore>,
     /// Per-caller concurrency sub-cap on the read pool: each caller (keyed on the
     /// resolved source IP, #174 U1) may hold at most `max_concurrent_reads_per_caller`
     /// in-flight read ops, so one caller cannot monopolize `git_read_semaphore`
