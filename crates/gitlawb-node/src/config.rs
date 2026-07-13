@@ -243,24 +243,25 @@ pub struct Config {
     /// cap is a different axis (500 connections each fan out to git +
     /// pack-objects + threads). Size below the process budget with headroom.
     ///
-    /// This is the READ pool (`git_read_semaphore`): upload-pack and both info/refs
-    /// advertisements. The authenticated push POST draws from a separate write pool
-    /// (`max_concurrent_git_pushes`) that anonymous reads can never reach, and each
-    /// caller is additionally bounded by `max_concurrent_reads_per_caller`, so an
-    /// anonymous flood cannot shed the actual push nor monopolize reads (#174). (The
-    /// receive-pack advertisement itself shares the read pool; a shed advertisement
-    /// is a cheap retryable GET, and the write POST it precedes always has capacity.)
+    /// This is the READ pool (`git_read_semaphore`): upload-pack and the UPLOAD-PACK
+    /// `info/refs` advertisement only. The authenticated push POST draws from a
+    /// separate write pool (`max_concurrent_git_pushes`) that anonymous reads can
+    /// never reach, and each read caller is additionally bounded by
+    /// `max_concurrent_reads_per_caller`, so an anonymous flood cannot shed the actual
+    /// push nor monopolize reads (#174). The anon-reachable RECEIVE-PACK `info/refs`
+    /// advertisement draws from its OWN dedicated pool (sized like the write pool but
+    /// disjoint), so an advertisement flood can never occupy a permit the
+    /// authenticated push POST needs at admission (#174).
     ///
     /// A permit is held for the whole op. Every git subprocess that STREAMS is
     /// duration-bounded and reaps its process group on disconnect: upload-pack,
     /// receive-pack, and both info/refs advertisements run under
     /// `git_service_timeout_secs` with `process_group(0)` teardown, and the
-    /// withheld-blob (`upload_pack_excluding`) pack-objects stage runs on the async
-    /// side under the same teardown (#174 closed the two duration/cancellation gaps
-    /// this comment previously tracked). The one remaining blocking stage is the
-    /// `rev-list` object enumeration in the withheld-blob path — a bounded walk that
-    /// terminates, run off the async runtime; it is not process-group-reaped on
-    /// disconnect, so a stuck rev-list can still hold its slot until git exits.
+    /// withheld-blob (`upload_pack_excluding`) pack-objects stage plus the push-side
+    /// candidate-discovery children (`rev-list` / `cat-file`) now run under the same
+    /// bounded runner with process-group teardown, so a stuck git child no longer
+    /// holds its slot indefinitely (#174 closed the duration/cancellation gaps this
+    /// comment previously tracked).
     ///
     /// Default: 128. Must be between 1 and 1_048_576; the ceiling keeps the value
     /// well under tokio's `Semaphore` permit limit so an oversized value is a
@@ -273,10 +274,14 @@ pub struct Config {
     )]
     pub max_concurrent_git_ops: usize,
 
-    /// Maximum number of concurrent `git-receive-pack` (push) operations. Pushes
-    /// draw from this dedicated pool, separate from `max_concurrent_git_ops`
-    /// (reads), so a flood of anonymous reads cannot shed an authenticated push at
-    /// admission (#174). Beyond this a push sheds a clean 503 + Retry-After.
+    /// Maximum number of concurrent `git-receive-pack` (push) operations. The
+    /// authenticated push POST draws from this dedicated pool, separate from
+    /// `max_concurrent_git_ops` (reads), so a flood of anonymous reads cannot shed an
+    /// authenticated push at admission (#174). The anon-reachable receive-pack
+    /// `info/refs` advertisement runs in a SEPARATE pool of the same size (derived
+    /// from this knob), disjoint from this one, so an advertisement flood cannot
+    /// occupy a POST's slot either (#174). Beyond this a push sheds a clean 503 +
+    /// Retry-After.
     ///
     /// Default: 32. Must be between 1 and 1_048_576 (the ceiling keeps the value
     /// under tokio's `Semaphore` permit limit so an oversized value is a clean CLI
@@ -289,16 +294,17 @@ pub struct Config {
     )]
     pub max_concurrent_git_pushes: usize,
 
-    /// Maximum concurrent read operations (`upload-pack` and the `info/refs`
-    /// advertisements) a single caller may hold at once, so one caller cannot
-    /// monopolize the `max_concurrent_git_ops` read pool (#174). Callers are keyed
-    /// per-DID when signed, else per-source-IP. IMPORTANT: the per-source-IP key is
-    /// only as granular as `GITLAWB_TRUSTED_PROXY`. Left unset (the default), a node
-    /// behind an edge/NAT keys all anonymous callers on the edge IP, so this cap
-    /// collapses to a single global anonymous cap rather than per-client. Set
-    /// `GITLAWB_TRUSTED_PROXY` to key on the real client; a known high-fanout caller
-    /// (a CI fleet behind one NAT) should authenticate for a per-DID budget or the
-    /// operator raises this. Over-cap for a caller sheds a clean 503 + Retry-After.
+    /// Maximum concurrent read operations (`upload-pack` and the upload-pack
+    /// `info/refs` advertisement) a single caller may hold at once, so one caller
+    /// cannot monopolize the `max_concurrent_git_ops` read pool (#174). Callers are
+    /// keyed on the RESOLVED SOURCE IP, never the DID — a signature does not move a
+    /// caller off this cap, so an authenticated client cannot mint DIDs to escape it.
+    /// IMPORTANT: the source-IP key is only as granular as `GITLAWB_TRUSTED_PROXY`.
+    /// Left unset (the default), a node behind an edge/NAT keys all callers on the
+    /// edge IP, so this cap collapses to a single global cap rather than per-client.
+    /// Set `GITLAWB_TRUSTED_PROXY` to key on the real client; a high-fanout caller (a
+    /// CI fleet behind one NAT) then needs the operator to raise this. Over-cap for a
+    /// caller sheds a clean 503 + Retry-After.
     ///
     /// Default: 16. Must be between 1 and 1_048_576.
     #[arg(
