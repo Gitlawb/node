@@ -605,4 +605,104 @@ mod tests {
             "an exhausted IP must be braked with 429 before auth runs, not leak to 401"
         );
     }
+
+    // ── Adversarial TrustedProxy verification through the middleware (U5) ──
+    // These complement the client_key unit tests above by driving hostile
+    // headers through rate_limit_by_ip on a real router: the property under test
+    // is that the *bucket key* cannot be rotated by a spoofer.
+
+    async fn post_with(
+        router: &axum::Router,
+        peer: SocketAddr,
+        hdrs: &[(&str, &str)],
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let mut b = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/repos");
+        for (k, v) in hdrs {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(axum::body::Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn xff_spoofed_leftmost_hop_cannot_rotate_bucket() {
+        // XForwardedFor mode, budget 1. A spoofer varies the client-controlled
+        // leftmost hop every request but the trusted proxy always appends the
+        // same rightmost hop. All requests must key to the rightmost hop, so the
+        // second is braked despite a fresh leftmost value.
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::XForwardedFor,
+        });
+        let p1: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let p2: SocketAddr = "10.0.0.2:1".parse().unwrap();
+        // First request passes the brake, reaches (failing) auth.
+        assert_eq!(
+            post_with(&router, p1, &[("x-forwarded-for", "9.9.9.1, 203.0.113.5")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Different leftmost + different socket peer, SAME rightmost trusted hop:
+        // braked, because the key is the rightmost hop, not the spoofed value.
+        assert_eq!(
+            post_with(&router, p2, &[("x-forwarded-for", "9.9.9.2, 203.0.113.5")]).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a spoofer varying the leftmost XFF hop must not rotate its bucket key"
+        );
+    }
+
+    #[tokio::test]
+    async fn xff_distinct_real_clients_get_distinct_buckets() {
+        // Distinct trusted (rightmost) hops are distinct clients: neither throttles
+        // the other, so a busy legitimate client cannot starve a different one.
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::XForwardedFor,
+        });
+        let peer: SocketAddr = "10.0.0.9:1".parse().unwrap();
+        assert_eq!(
+            post_with(
+                &router,
+                peer,
+                &[("x-forwarded-for", "1.1.1.1, 203.0.113.5")]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_with(
+                &router,
+                peer,
+                &[("x-forwarded-for", "1.1.1.1, 203.0.113.6")]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "a different trusted client hop must get its own bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_trusted_header_collapses_to_socket_peer() {
+        // The documented fallback: in a trusted-proxy mode, a request with no
+        // forwarded header keys on the socket peer. Behind a real edge every
+        // request shares the proxy's socket, so they collapse onto one bucket —
+        // asserted here by name so any change to this behavior is deliberate.
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::XForwardedFor,
+        });
+        let proxy: SocketAddr = "172.16.0.1:1".parse().unwrap();
+        assert_eq!(
+            post_with(&router, proxy, &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_with(&router, proxy, &[]).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "with no trusted header, requests fall back to the socket peer key (collapse)"
+        );
+    }
 }
