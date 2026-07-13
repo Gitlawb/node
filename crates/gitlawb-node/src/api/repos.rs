@@ -2922,4 +2922,46 @@ mod tests {
             "/graphql/ws must not be behind the write brake"
         );
     }
+
+    // Adoption floor, per group: with an un-exhausted bucket, a write to EVERY
+    // braked group passes the brake (reaches auth/handler), not 429. Guards each
+    // group's grant path, not just the star representative.
+    #[sqlx::test]
+    async fn every_write_group_passes_under_limit(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.write_rate_limiter =
+            crate::rate_limit::RateLimiter::new(100, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let peer: SocketAddr = "203.0.113.160:7000".parse().unwrap();
+
+        let router = crate::server::build_router(state);
+        for (method, uri) in [
+            (Method::PUT, "/api/v1/repos/o/r/star"),
+            (Method::POST, "/graphql"),
+            (Method::POST, "/api/v1/repos/o/r/issues/1/comments"),
+            (Method::POST, "/api/v1/tasks"),
+            (Method::POST, "/api/v1/repos/o/r/bounties"),
+            (Method::PUT, "/api/v1/profile"),
+        ] {
+            let mut req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"{ __typename }"}"#))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            assert_ne!(
+                router.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "under-limit write to {uri} must pass the brake, not 429"
+            );
+        }
+    }
 }
