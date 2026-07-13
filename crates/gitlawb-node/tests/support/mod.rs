@@ -3,4 +3,7 @@
 //! node spawner (U3).
 
 pub mod assert;
+// U1 deny-bearing route registry; fields consumed by U2/U3 as they land.
+#[allow(dead_code)]
+pub mod routes;
 pub mod signing;
