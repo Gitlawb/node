@@ -99,8 +99,24 @@ where
 /// `store::list_refs`. A repo whose on-disk path is missing or unreadable is
 /// treated as having an unknown, non-empty ref count so it is NOT selected — the
 /// tool fails closed and never deletes on a read error.
+///
+/// Critically, a `0` count must come from THIS exact bare repo and never from
+/// git's upward repository discovery. `git for-each-ref` runs with the repo path
+/// as its cwd and no explicit `--git-dir`, so if the path exists but is not
+/// itself a git dir, git walks parent directories for a `.git` — and `repos_dir`
+/// may live inside the operator's own git checkout. That would read a DIFFERENT
+/// repo's refs (possibly `0`) and delete a real repo. We defend by requiring the
+/// bare-repo markers (`HEAD` file + `objects/` dir) before trusting any count;
+/// anything else fails closed (treated non-empty, skipped).
 fn on_disk_ref_count(repos_dir: &Path, repo: &RepoRecord) -> usize {
     let path = store::repo_disk_path(repos_dir, &repo.owner_did, &repo.name);
+    if !path.join("HEAD").is_file() || !path.join("objects").is_dir() {
+        // Not a bare git repo at the exact expected path. Do NOT trust a ref
+        // count that git discovery could have read from a parent repository.
+        warn!(repo = %repo.id, path = %path.display(),
+            "purge-spam: path is not a bare git repo — treating as non-empty (skipped)");
+        return 1;
+    }
     match store::list_refs(&path) {
         Ok(refs) => refs.len(),
         Err(e) => {
@@ -465,5 +481,49 @@ mod db_tests {
             .args(["worktree", "remove", "--force", "_seed"])
             .current_dir(bare)
             .status();
+    }
+
+    /// A `0` ref count must come only from a real bare repo at the exact path,
+    /// never from git discovery walking up to a parent `.git`. Load-bearing: the
+    /// tempdir root is itself a git repo (zero refs), so a naive `for-each-ref`
+    /// run from a child non-git dir would discover it and report 0 — the delete-a-
+    /// real-repo fail-open. The marker check must make that path fail closed.
+    #[test]
+    fn nongit_path_fails_closed_even_under_a_git_ancestor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Make the tempdir root a git repo with zero refs (the discovery trap).
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+
+        let repo = rec("t-x", SPAM_BURST_TARGET_DID, "spam1");
+        let path = store::repo_disk_path(tmp.path(), &repo.owner_did, &repo.name);
+
+        // (a) Path exists as a plain (non-git) directory under the git ancestor.
+        // Without the marker guard, git discovery reads the ancestor's 0 refs and
+        // this repo would be deleted. It must fail closed (>=1, skipped).
+        std::fs::create_dir_all(&path).unwrap();
+        assert_eq!(
+            on_disk_ref_count(tmp.path(), &repo),
+            1,
+            "a non-git dir under a git ancestor must fail closed, not read the ancestor's refs"
+        );
+
+        // (b) A real empty bare repo at the same path reads 0 — a genuine candidate.
+        std::fs::remove_dir_all(&path).unwrap();
+        store::init_bare(&path).unwrap();
+        assert_eq!(on_disk_ref_count(tmp.path(), &repo), 0);
+    }
+
+    /// The exclusion gate and the target scope must never overlap: if the burst
+    /// target were ever set to an excluded DID, the gate would fail to protect it.
+    #[test]
+    fn target_did_is_never_excluded() {
+        assert!(
+            !EXCLUDED_DIDS.contains(&SPAM_BURST_TARGET_DID),
+            "the purge target must never be an excluded (protected) DID"
+        );
     }
 }
