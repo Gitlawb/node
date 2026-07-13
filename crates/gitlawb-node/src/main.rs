@@ -1,3 +1,4 @@
+mod admin;
 mod api;
 mod arweave;
 mod auth;
@@ -69,6 +70,12 @@ async fn main() -> Result<()> {
         .init();
 
     let mut config = Config::parse();
+
+    // Admin subcommands run out-of-band and exit, never starting the node. The
+    // no-subcommand path below is the unchanged daemon startup.
+    if let Some(command) = config.command.clone() {
+        return run_admin_command(command, &config).await;
+    }
 
     // Merge the embedded seed list of public network nodes into the runtime
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
@@ -584,6 +591,24 @@ async fn main() -> Result<()> {
     serve_result?;
     info!("clean exit");
     Ok(())
+}
+
+/// Dispatch an admin subcommand. Connects the database directly (no server, no
+/// p2p, no metrics) and runs the requested tool to completion, then exits.
+async fn run_admin_command(command: config::Command, config: &Config) -> Result<()> {
+    match command {
+        config::Command::PurgeSpam { execute } => {
+            let acquire_timeout = std::time::Duration::from_secs(config.db_acquire_timeout_secs);
+            let db = Db::connect(
+                &config.database_url,
+                config.db_max_connections,
+                acquire_timeout,
+            )
+            .await
+            .context("connecting to database for purge-spam")?;
+            admin::run_purge_spam(&db, &config.repos_dir, execute).await
+        }
+    }
 }
 
 fn spawn_shutdown_signal(tx: watch::Sender<bool>) {

@@ -1,9 +1,28 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+/// Optional admin subcommands. When none is given, the binary runs the node
+/// daemon as before — the default (no-subcommand) startup path is unchanged.
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Dry-run (default) or, with --execute, delete empty spam-burst repos owned
+    /// by the known burst DID. Never touches the hard-excluded DIDs, and verifies
+    /// each repo is empty (zero git refs) per repo before selecting it.
+    PurgeSpam {
+        /// Actually delete the candidates. Omit for a dry-run that prints the
+        /// candidate list and deletes nothing.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+    },
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gitlawb-node", about = "gitlawb node daemon", version)]
 pub struct Config {
+    /// Admin subcommand to run instead of the node daemon. Absent = run the node.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Directory where bare git repositories are stored
     #[arg(long, env = "GITLAWB_REPOS_DIR", default_value = "./data/repos")]
     pub repos_dir: PathBuf,
