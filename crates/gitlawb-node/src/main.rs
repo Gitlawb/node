@@ -307,6 +307,27 @@ async fn main() -> Result<()> {
         tracing::warn!("GITLAWB_CREATE_RATE_LIMIT=0 — per-IP creation rate limiting disabled");
     }
 
+    // Per-IP brake for the authenticated non-creation write surface (issue/PR
+    // comments, labels, stars, merges, protect, replicas, visibility, tasks,
+    // bounties, profile, GraphQL mutations). Its own bucket, separate from the
+    // creation brake, so a write flood cannot drain the creation budget and vice
+    // versa (same rationale as the sync_trigger / peer_write split). Sized above
+    // any legitimate per-IP write rate — real agent automation makes many small
+    // writes per hour. GITLAWB_WRITE_RATE_LIMIT overrides; 0 disables. Bounded
+    // key set — the key is a client-influenced IP.
+    let write_limit = std::env::var("GITLAWB_WRITE_RATE_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(600);
+    let write_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        write_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if write_limit == 0 {
+        tracing::warn!("GITLAWB_WRITE_RATE_LIMIT=0 — per-IP write rate limiting disabled");
+    }
+
     // Push-path flood brake: max git-receive-pack requests per client IP per
     // hour (counts both the info/refs advertisement and the push POST). Sized
     // for heavy agent automation while still stopping flood traffic (the June
@@ -373,6 +394,7 @@ async fn main() -> Result<()> {
         repo_store,
         rate_limiter,
         create_ip_rate_limiter,
+        write_rate_limiter,
         push_rate_limiter,
         push_limiter_trust,
         sync_trigger_rate_limiter,

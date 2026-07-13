@@ -111,7 +111,17 @@ pub fn build_router(state: AppState) -> Router {
     .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
     .layer(axum::Extension(create_ip_limiter));
 
-    // ── Write routes — require HTTP Signature (no rate limit) ─────────────
+    // ── Write routes — require HTTP Signature + per-IP write brake ────────
+    // Same per-IP flood defense as the creation routes, on its own `write`
+    // bucket (see `AppState::write_rate_limiter`). Per-DID is deliberately not
+    // paired (a DID farm never trips it; busy legitimate agents would false-
+    // positive). The bundled visibility GET is a read that also draws from the
+    // write bucket — harmless, since the bucket is sized far above any legit
+    // per-IP read rate.
+    let write_ip_limiter = rate_limit::IpRateLimiter {
+        limiter: state.write_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
     let write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -181,7 +191,9 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::delete(agents::deregister_agent),
             ),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(write_ip_limiter.clone()));
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.

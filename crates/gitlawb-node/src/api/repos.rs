@@ -2625,4 +2625,80 @@ mod tests {
             "repo creation must be IP-throttled before signature verification"
         );
     }
+
+    #[sqlx::test]
+    async fn write_route_is_rate_limited_by_ip(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Tiny write bucket, keyed on the socket peer (no trusted proxy).
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.88:7000".parse().unwrap();
+        // Exhaust this peer's single-request write budget up front.
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        // A write_routes sink (star). The IP brake is outermost, so the 429
+        // fires before auth/handler — the path only needs to match.
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/repos/someowner/somerepo/star")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let status = router.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a write_routes sink must be IP-throttled before signature verification"
+        );
+    }
+
+    // KTD-1: the write bucket is separate from the creation bucket, so a write
+    // flood must not consume the creation budget (and vice versa).
+    #[sqlx::test]
+    async fn write_flood_does_not_drain_creation_budget(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Exhaust the write bucket for this peer; leave the creation bucket ample.
+        state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.create_ip_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1000, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.99:7000".parse().unwrap();
+        assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        // Creation from the same peer must NOT be 429 — its bucket is untouched.
+        // (It fails later on missing signature; the point is it is not throttled.)
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/repos")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"legit","is_public":true}"#))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let status = router.oneshot(req).await.unwrap().status();
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an exhausted write bucket must not throttle repo creation (separate buckets)"
+        );
+    }
 }
