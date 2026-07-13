@@ -91,8 +91,9 @@ pub enum Expect {
     Deny(u16),
     /// Owner-gate twin: the owner reaches the handler, so NOT 403.
     Not403,
-    /// Read-gate twin: an authorized read returns 2xx (optionally containing a token).
-    Ok2xx(Option<String>),
+    /// Read-gate twin: an authorized read returns a non-empty 2xx (an empty 2xx
+    /// would be a denial rendered as success).
+    Ok2xx,
 }
 
 /// A single request to drive against the node.
@@ -171,7 +172,7 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
                     body,
                     signer: Signer::Owner,
                     json,
-                    expect: Expect::Ok2xx(None),
+                    expect: Expect::Ok2xx,
                 },
                 Reach::SiblingPublic(sibling) => Probe {
                     label: format!("{} read-reachability twin (sibling public)", row.handler),
@@ -180,7 +181,7 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
                     body,
                     signer: Signer::Anon,
                     json,
-                    expect: Expect::Ok2xx(None),
+                    expect: Expect::Ok2xx,
                 },
                 Reach::None => panic!(
                     "read-gate row {} {} has no Reach twin (U1 consistency should have caught this)",
@@ -267,7 +268,7 @@ mod tests {
         );
         assert!(ps[0].path.contains("public/a.txt"), "{{*path}} substituted");
         assert_eq!(ps[1].signer, Signer::Owner);
-        assert!(matches!(ps[1].expect, Expect::Ok2xx(_)));
+        assert!(matches!(ps[1].expect, Expect::Ok2xx));
     }
 
     #[test]
@@ -285,5 +286,50 @@ mod tests {
         assert_eq!(ps.len(), 1);
         assert_eq!(ps[0].signer, Signer::Anon);
         assert!(matches!(ps[0].expect, Expect::Deny(401)));
+    }
+
+    #[test]
+    fn read_gate_sibling_public_twin_reads_the_sibling_path_anon() {
+        let row = Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/blob/secret/x.txt",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_blob",
+            body: None,
+            needs: &[],
+            reach: Reach::SiblingPublic("/api/v1/repos/{owner}/{repo}/blob/{*path}"),
+        };
+        let ps = probes_for(&row, &fx());
+        assert_eq!(ps.len(), 2);
+        // Hostile: anon on the withheld path -> 404.
+        assert_eq!(ps[0].signer, Signer::Anon);
+        assert!(matches!(ps[0].expect, Expect::Deny(404)));
+        assert!(ps[0].path.ends_with("/blob/secret/x.txt"));
+        // Twin: anon on the sibling PUBLIC path -> non-empty 2xx (proves the 404
+        // is path-scoped withholding, not a blanket refusal).
+        assert_eq!(ps[1].signer, Signer::Anon);
+        assert!(matches!(ps[1].expect, Expect::Ok2xx));
+        assert!(
+            ps[1].path.contains("public/a.txt"),
+            "sibling template's {{*path}} is filled from the fixture content path"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "has no Reach twin")]
+    fn read_gate_row_without_a_reach_twin_panics() {
+        // A read-gate row with Reach::None is a registry bug the U1 consistency
+        // test rejects; if one slips through, the probe generator must fail loud
+        // rather than silently emit a hostile probe with no positive twin.
+        let row = Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/issues",
+            gate: GateClass::ReadGate,
+            handler: "issues::list_issues",
+            body: None,
+            needs: &[],
+            reach: Reach::None,
+        };
+        let _ = probes_for(&row, &fx());
     }
 }

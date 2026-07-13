@@ -514,19 +514,19 @@ async fn deny_bearing_registry_denies_hostile_and_admits_authorized(pool: sqlx::
                         "owner-reachability twin must reach the handler (not 403): {ctx}"
                     );
                 }
-                Expect::Ok2xx(token) => {
+                Expect::Ok2xx => {
                     twins_driven += 1;
                     assert!(
                         status.is_success(),
                         "read-reachability twin must be 2xx, got {status}: {ctx}"
                     );
-                    if let Some(tok) = token {
-                        let body = resp.text().await.unwrap_or_default();
-                        assert!(
-                            body.contains(tok),
-                            "read twin 2xx body missing expected token {tok:?}: {ctx}"
-                        );
-                    }
+                    // A 2xx with an empty body is a denial rendered as success:
+                    // the authorized read must actually return the resource.
+                    let body = resp.bytes().await.unwrap_or_default();
+                    assert!(
+                        !body.is_empty(),
+                        "read-reachability twin returned an empty 2xx body (denial-as-success?): {ctx}"
+                    );
                 }
             }
         }
@@ -795,6 +795,15 @@ mod completeness {
         // are helpers, not mounted handlers, so drop them.
         owner_marked.remove("require_owner");
         owner_marked.remove("require_repo_owner");
+
+        // Non-vacuous floor: if the marker scan silently found nothing (a parser
+        // regression), the orphan loop below would pass by checking zero handlers.
+        // The tree has 10 owner-marker handlers today; 6 trips only on a real break.
+        assert!(
+            owner_marked.len() >= 6,
+            "owner-gate marker scan found only {} handlers — the scan likely broke",
+            owner_marked.len()
+        );
 
         for h in &owner_marked {
             assert!(
