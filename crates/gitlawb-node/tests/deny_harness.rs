@@ -624,3 +624,184 @@ async fn additional_owner_gates_reject_non_owner(pool: sqlx::PgPool) {
         );
     }
 }
+
+// ── U4: completeness cross-check (no DB) — the registry cannot silently drift ──
+//
+// The runtime sweep (U3) only proves the routes it is HANDED. This guard, a pure
+// source scrape, keeps that hand-off honest against `server.rs`: no registry row
+// points at a route that no longer mounts (stale row), and no owner-gated mount
+// escapes the registry (orphan). It complements — does not duplicate — the
+// in-crate `authz_guard` egress guard (`src/api/mod.rs`), which proves every
+// repo-scoped API handler is *gated*; this proves the deny-bearing ones are
+// *driven*, and it reaches the non-API git mounts `authz_guard` never sees.
+mod completeness {
+    use std::collections::HashSet;
+
+    use super::deny_bearing_routes;
+    use crate::support::routes::GateClass;
+
+    /// Every `.route("<path>", <method>(<handler>)…)` mount in `src`, as
+    /// (METHOD, path). Multiline-aware: most mounts put the path on the line after
+    /// `.route(`, so a per-line scan false-greens. Walks balanced parens from each
+    /// `.route(` so chained and multi-method (`put().delete().get()`) mounts are
+    /// all captured.
+    fn scrape_mounts(src: &str) -> Vec<(String, String)> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(rel) = src[i..].find(".route(") {
+            let open = i + rel + ".route(".len();
+            let mut depth = 1i32;
+            let mut j = open;
+            while j < src.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let call = &src[open..j.saturating_sub(1)];
+            i = j;
+            // The path is the first string literal in the call.
+            let Some(qs) = call.find('"') else { continue };
+            let Some(qe) = call[qs + 1..].find('"') else {
+                continue;
+            };
+            let path = &call[qs + 1..qs + 1 + qe];
+            for m in ["get", "post", "put", "delete", "patch"] {
+                let needle = format!("{m}(");
+                let mut k = 0;
+                while let Some(mrel) = call[k..].find(&needle) {
+                    let at = k + mrel;
+                    // Reject a match that is the tail of a longer ident (e.g. the
+                    // `get(` inside `budget(`): the char before must be a boundary.
+                    let boundary = call[..at]
+                        .chars()
+                        .last()
+                        .map(|c| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(true);
+                    if boundary {
+                        out.push((m.to_uppercase(), path.to_string()));
+                    }
+                    k = at + needle.len();
+                }
+            }
+        }
+        out
+    }
+
+    /// Names of `fn`s in `src` whose body contains any `marker`. The body is the
+    /// slice from a fn's `(` to the next top-level fn declaration — the same
+    /// boundary set `authz_guard::fn_body` uses — so a marker can't leak across
+    /// into the next handler.
+    fn handlers_with_marker(src: &str, markers: &[&str]) -> HashSet<String> {
+        let decls = [
+            "\npub async fn ",
+            "\npub(crate) async fn ",
+            "\nasync fn ",
+            "\npub(crate) fn ",
+            "\npub fn ",
+            "\nfn ",
+        ];
+        // Ordered start offsets of every fn declaration.
+        let mut starts: Vec<usize> = Vec::new();
+        for d in decls {
+            let mut k = 0;
+            while let Some(r) = src[k..].find(d) {
+                starts.push(k + r + 1); // +1: skip the leading '\n'
+                k = k + r + d.len();
+            }
+        }
+        starts.sort_unstable();
+        let mut out = HashSet::new();
+        for (idx, &s) in starts.iter().enumerate() {
+            let end = starts.get(idx + 1).copied().unwrap_or(src.len());
+            let seg = &src[s..end];
+            // The name is the ident after this decl's `fn ` (handles `pub(crate)`,
+            // whose own `(` would otherwise be mistaken for the arg list).
+            let Some(fnpos) = seg.find("fn ") else {
+                continue;
+            };
+            let name: String = seg[fnpos + 3..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            if markers.iter().any(|m| seg.contains(m)) {
+                out.insert(name);
+            }
+        }
+        out
+    }
+
+    fn short_handler(h: &str) -> &str {
+        h.rsplit("::").next().unwrap_or(h)
+    }
+
+    #[test]
+    fn deny_registry_is_not_stale_and_owner_gates_are_all_driven() {
+        let server = include_str!("../src/server.rs");
+        let mounts: HashSet<(String, String)> = scrape_mounts(server).into_iter().collect();
+
+        // Scraper-integrity floor: if the parser silently stopped finding mounts,
+        // the anti-stale check below would pass vacuously. The tree has ~95 mounts.
+        assert!(
+            mounts.len() >= 90,
+            "mount scrape found only {} routes — the parser likely broke (floor 90)",
+            mounts.len()
+        );
+
+        // ANTI-STALE: every deny-bearing row must still point at a live mount, so a
+        // renamed/removed route can't leave a row that the sweep drives against a
+        // 404 and calls a passing deny.
+        for row in deny_bearing_routes() {
+            assert!(
+                mounts.contains(&(row.method.to_string(), row.path.to_string())),
+                "stale registry row: {} {} is not mounted in server.rs (renamed or removed?)",
+                row.method,
+                row.path
+            );
+        }
+
+        // ORPHAN GUARD: every handler carrying an unambiguous owner-gate marker
+        // (`require_repo_owner` / `require_owner`) must be a registry owner-gate
+        // row, so a newly added owner-gated mutation cannot escape the runtime
+        // sweep. The api dir is read at test time (like authz_guard's completeness
+        // scan) so a brand-new module is covered too. `did_matches` is deliberately
+        // NOT a marker here: it is shared with the signer-self bucket and would
+        // misclassify; close_pr/close_issue/protect are already covered as rows.
+        let registry_owner_handlers: HashSet<&str> = deny_bearing_routes()
+            .iter()
+            .filter(|r| r.gate == GateClass::OwnerGate)
+            .map(|r| short_handler(r.handler))
+            .collect();
+
+        let api_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/api");
+        let mut owner_marked: HashSet<String> = HashSet::new();
+        for entry in std::fs::read_dir(api_dir).expect("read api dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let src = std::fs::read_to_string(&path).expect("read api file");
+                owner_marked.extend(handlers_with_marker(
+                    &src,
+                    &["require_repo_owner(", "require_owner("],
+                ));
+            }
+        }
+        // The gate helpers' own definition lines contain the marker string; they
+        // are helpers, not mounted handlers, so drop them.
+        owner_marked.remove("require_owner");
+        owner_marked.remove("require_repo_owner");
+
+        for h in &owner_marked {
+            assert!(
+                registry_owner_handlers.contains(h.as_str()),
+                "handler `{h}` carries an owner-gate marker but is not an owner-gate \
+                 row in deny_bearing_routes() — add it so the runtime sweep drives its 403"
+            );
+        }
+    }
+}
