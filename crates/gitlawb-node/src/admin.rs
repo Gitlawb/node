@@ -40,9 +40,15 @@ pub struct Candidate {
     pub ref_count: usize,
 }
 
-/// Whether a DID is on the hard exclusion list.
+/// Whether a DID is on the hard exclusion list. Compared under did:key
+/// normalization (the same convention the repos table and every ownership check
+/// use), so an excluded identity stored in either `did:key:z6…` or bare `z6…`
+/// form is protected regardless of the form the exclusion constant is written in.
 fn is_excluded(owner_did: &str) -> bool {
-    EXCLUDED_DIDS.contains(&owner_did)
+    let owner_key = crate::db::normalize_owner_key(owner_did);
+    EXCLUDED_DIDS
+        .iter()
+        .any(|d| crate::db::normalize_owner_key(d) == owner_key)
 }
 
 /// Pure candidate selector — the security core, isolated from disk and DB so the
@@ -73,8 +79,11 @@ where
         if is_excluded(&repo.owner_did) {
             continue;
         }
-        // Scope to the named burst only.
-        if repo.owner_did != target_did {
+        // Scope to the named burst only, under did:key normalization so a burst
+        // row stored in either did:key or bare form is matched consistently.
+        if crate::db::normalize_owner_key(&repo.owner_did)
+            != crate::db::normalize_owner_key(target_did)
+        {
             continue;
         }
         // Per-repo empty check.
@@ -524,6 +533,32 @@ mod db_tests {
         assert!(
             !EXCLUDED_DIDS.contains(&SPAM_BURST_TARGET_DID),
             "the purge target must never be an excluded (protected) DID"
+        );
+    }
+
+    /// Exclusion is normalization-consistent: an excluded identity stored in the
+    /// bare short form (as mirror upserts write it) is still excluded, even though
+    /// the exclusion constants are full did:key form — and an empty repo it owns
+    /// is never selected.
+    #[test]
+    fn short_form_excluded_did_is_still_protected() {
+        let short = crate::db::normalize_owner_key(EXCLUDED_DIDS[1]); // bare z6MkqRz…
+        assert_ne!(
+            short, EXCLUDED_DIDS[1],
+            "fixture must actually be short form"
+        );
+        assert!(
+            is_excluded(short),
+            "short-form of an excluded DID must be excluded"
+        );
+
+        // An empty repo owned by the short-form excluded DID is spared even though
+        // its ref signature (0) otherwise matches the burst.
+        let empty_excluded_short = rec("x-short", short, "spam");
+        let cands = select_spam_candidates(&[empty_excluded_short], SPAM_BURST_TARGET_DID, |_| 0);
+        assert!(
+            cands.is_empty(),
+            "an empty repo owned by a short-form excluded DID must never be a candidate"
         );
     }
 }

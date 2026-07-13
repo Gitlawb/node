@@ -23,15 +23,23 @@ pub struct Config {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Directory where bare git repositories are stored
-    #[arg(long, env = "GITLAWB_REPOS_DIR", default_value = "./data/repos")]
+    /// Directory where bare git repositories are stored. `global` so it can
+    /// follow a subcommand (e.g. `gitlawb-node purge-spam --repos-dir …`).
+    #[arg(
+        long,
+        env = "GITLAWB_REPOS_DIR",
+        default_value = "./data/repos",
+        global = true
+    )]
     pub repos_dir: PathBuf,
 
-    /// PostgreSQL connection URL (Supabase or any Postgres instance)
+    /// PostgreSQL connection URL (Supabase or any Postgres instance). `global` so
+    /// admin subcommands accept it in either position.
     #[arg(
         long,
         env = "DATABASE_URL",
-        default_value = "postgresql://localhost/gitlawb"
+        default_value = "postgresql://localhost/gitlawb",
+        global = true
     )]
     pub database_url: String,
 
