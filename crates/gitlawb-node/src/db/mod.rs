@@ -1259,6 +1259,35 @@ impl Db {
             .await?;
         Ok(())
     }
+
+    /// Every repo row owned by exactly `owner_did` (an exact `owner_did` match, no
+    /// did:key normalization and no dedup) so a caller enumerating one DID's repos
+    /// sees every physical row. Backs the `purge-spam` admin tool, whose selection
+    /// then applies its own per-repo empty check and exclusion gate. Ordered by
+    /// `id` for a stable candidate listing.
+    pub async fn list_repos_by_owner_did(&self, owner_did: &str) -> Result<Vec<RepoRecord>> {
+        let rows = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE owner_did = $1 ORDER BY id",
+        )
+        .bind(owner_did)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Delete a single repo row by its primary key `id`. Returns the number of
+    /// rows removed (0 if no such repo). Operates on one repo at a time by design:
+    /// the `purge-spam` tool deletes a vetted candidate list per-repo, never a
+    /// blanket "delete all repos of owner X".
+    pub async fn delete_repo_by_id(&self, id: &str) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM repos WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 // ── Agents / Trust ────────────────────────────────────────────────────────────
