@@ -348,21 +348,14 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
         },
-        // DEFERRED read-gate rows (each verified to gate on "/", but the owner
-        // 2xx twin needs a seeded sub-entity the fixture does not yet create, so
-        // they land with the fixture expansion that seeds them):
-        //   get_issue/{id}, get_pr/{number}, get_pr_diff, list_issue_comments,
-        //   list_reviews, list_comments (need a seeded issue/PR),
-        //   get_cert/{id} (cert), get_bounty/{id} (bounty), get_encrypted_blob/
-        //   {oid} (encrypted blob). Path-scoped get_tree/{*path} needs a seeded
-        //   sub-directory. The git smart-HTTP reads (git_info_refs,
-        //   git_upload_pack, ?service= query) and ipfs::get_by_cid are covered by
-        //   the existing U7/U8/anon_ipfs cases in deny_harness.rs.
-        // EXCLUDED (not 404-deny reads): list_repos, list_federated_repos,
-        //   list_all_bounties, list_ref_updates (global list-FILTER: 200 with the
-        //   unreadable rows removed, never a 404); list_webhooks,
-        //   list_protected_branches, list_replicas (KNOWN_UNGATED, api/mod.rs);
-        //   list_visibility (owner-gate 403, already in the owner-gate tranche).
+        // The read-gate handlers NOT driven here (deferred GET reads, read-gating
+        // mutations, git smart-HTTP reads, the content-addressed read, and the
+        // global list-filters) are no longer tracked by free-text prose: they are
+        // ENFORCED in deny_harness.rs's `READ_GATE_NOT_DRIVEN` allowlist, which the
+        // `every_read_gate_handler_is_driven_or_explicitly_allowlisted` guard checks
+        // against a live scan of every read-gate marker in src/api. That is the
+        // single source of truth — adding/removing a driven read row here without
+        // updating the allowlist trips the guard.
     ]
 }
 

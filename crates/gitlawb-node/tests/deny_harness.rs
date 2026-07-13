@@ -503,8 +503,13 @@ async fn deny_bearing_registry_denies_hostile_and_admits_authorized(pool: sqlx::
                         "hostile probe must deny with {code}, got {status}: {ctx}"
                     );
                     // INV-8 shape guard: rechecks the status and that the body is
-                    // neither an empty-200-as-success nor carrying withheld data.
-                    assert_denied(resp, *code, &[]).await;
+                    // neither an empty-200-as-success nor carrying withheld data. The
+                    // probe's `withheld` tokens (the private repo's secret bytes and
+                    // blob OID on read-gate probes) are passed through, so a 404 that
+                    // spilled the private content fails here instead of being counted
+                    // as a clean denial.
+                    let tokens: Vec<&str> = probe.withheld.iter().map(String::as_str).collect();
+                    assert_denied(resp, *code, &tokens).await;
                 }
                 Expect::Not403 => {
                     twins_driven += 1;
@@ -737,8 +742,125 @@ mod completeness {
         out
     }
 
+    /// Like [`handlers_with_marker`] but selects handlers whose body satisfies a
+    /// PREDICATE rather than a substring — used for the inline owner-gate
+    /// did_matches idiom (F3), whose "first arg is the caller, second is
+    /// owner_did" shape a plain substring cannot express. Same fn-segmentation as
+    /// `handlers_with_marker` so a match cannot leak across into the next handler.
+    fn handlers_matching(src: &str, pred: fn(&str) -> bool) -> HashSet<String> {
+        let decls = [
+            "\npub async fn ",
+            "\npub(crate) async fn ",
+            "\nasync fn ",
+            "\npub(crate) fn ",
+            "\npub fn ",
+            "\nfn ",
+        ];
+        let mut starts: Vec<usize> = Vec::new();
+        for d in decls {
+            let mut k = 0;
+            while let Some(r) = src[k..].find(d) {
+                starts.push(k + r + 1);
+                k = k + r + d.len();
+            }
+        }
+        starts.sort_unstable();
+        let mut out = HashSet::new();
+        for (idx, &s) in starts.iter().enumerate() {
+            let end = starts.get(idx + 1).copied().unwrap_or(src.len());
+            let seg = &src[s..end];
+            let Some(fnpos) = seg.find("fn ") else {
+                continue;
+            };
+            let name: String = seg[fnpos + 3..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            if pred(seg) {
+                out.insert(name);
+            }
+        }
+        out
+    }
+
     fn short_handler(h: &str) -> &str {
         h.rsplit("::").next().unwrap_or(h)
+    }
+
+    /// Like [`handlers_with_marker`] but ignores markers that appear only inside a
+    /// full-line `//` comment. The owner-gate markers never show up in prose, but
+    /// the read-gate markers (`authorize_repo_read(` / `visibility_check(`) do:
+    /// several docstrings and a test comment name them (repos.rs's
+    /// `owner_push_rejection` / `dedupe_canonical_repos` regions, the fork
+    /// docstring), and a raw `contains` would misattribute those to the nearest
+    /// preceding fn and force a phantom non-handler onto the read-gate allowlist.
+    /// Mirrors `authz_guard::fn_body`'s comment-stripping so the scan sees code,
+    /// not prose.
+    fn handlers_with_code_marker(src: &str, markers: &[&str]) -> HashSet<String> {
+        let stripped: String = src
+            .lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        handlers_with_marker(&stripped, markers)
+    }
+
+    /// True when `body` contains an INLINE owner-gate `did_matches` call: one
+    /// whose FIRST arg is the caller (`caller` / `&caller` / `&auth.0`) AND whose
+    /// SECOND arg is `&record.owner_did`. That two-arg shape is the discriminator
+    /// (F3): `require_owner`/`require_repo_owner` are the named markers, but
+    /// protect_branch / unprotect_branch owner-gate with this raw idiom instead, so
+    /// a plain marker misses them and a future owner-only handler using the same
+    /// pattern could slip past the registry while U4 stayed green.
+    ///
+    /// It must NOT fire on the signer-self / author forms that share the helper:
+    /// register_replica's `did_matches(replica_did, &record.owner_did)` (first arg
+    /// is the replica, not the caller — signer-self by design), close_pr's
+    /// `did_matches(&auth.0, &pr.author_did)`, and the bounty/task self forms
+    /// (`&bounty.creator_did`, delegator/assignee dids). Whitespace and newlines
+    /// inside the arg list are tolerated so a reformatted call still matches.
+    fn has_owner_did_matches(body: &str) -> bool {
+        let bytes = body.as_bytes();
+        let mut i = 0;
+        while let Some(rel) = body[i..].find("did_matches(") {
+            let open = i + rel + "did_matches(".len();
+            // Walk to the matching close paren, splitting the top-level args on the
+            // first depth-0 comma (there are exactly two args).
+            let mut depth = 1i32;
+            let mut comma: Option<usize> = None;
+            let mut j = open;
+            while j < body.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b',' if depth == 1 && comma.is_none() => comma = Some(j),
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j;
+            let close = j.saturating_sub(1);
+            let Some(comma) = comma else { continue };
+            let arg1 = body[open..comma].split_whitespace().collect::<String>();
+            let arg2 = body[comma + 1..close]
+                .split_whitespace()
+                .collect::<String>();
+            let caller_first = arg1 == "caller" || arg1 == "&caller" || arg1 == "&auth.0";
+            let owner_second = arg2 == "&record.owner_did";
+            if caller_first && owner_second {
+                return true;
+            }
+        }
+        false
     }
 
     #[test]
@@ -766,13 +888,18 @@ mod completeness {
             );
         }
 
-        // ORPHAN GUARD: every handler carrying an unambiguous owner-gate marker
-        // (`require_repo_owner` / `require_owner`) must be a registry owner-gate
+        // ORPHAN GUARD: every handler that owner-gates must be a registry owner-gate
         // row, so a newly added owner-gated mutation cannot escape the runtime
         // sweep. The api dir is read at test time (like authz_guard's completeness
-        // scan) so a brand-new module is covered too. `did_matches` is deliberately
-        // NOT a marker here: it is shared with the signer-self bucket and would
-        // misclassify; close_pr/close_issue/protect are already covered as rows.
+        // scan) so a brand-new module is covered too. Two owner-gate shapes are
+        // recognized:
+        //   (1) the named markers `require_repo_owner(` / `require_owner(`, and
+        //   (2) the INLINE `did_matches(caller, &record.owner_did)` idiom (F3) that
+        //       protect_branch / unprotect_branch use instead of a named helper.
+        // Only the SECOND-arg-is-owner_did form of did_matches is treated as an
+        // owner gate; the signer-self / author forms (register_replica's
+        // did_matches(replica_did, …), close_pr's did_matches(&auth.0, &author_did))
+        // are deliberately NOT matched, so they don't false-orphan.
         let registry_owner_handlers: HashSet<&str> = deny_bearing_routes()
             .iter()
             .filter(|r| r.gate == GateClass::OwnerGate)
@@ -789,13 +916,23 @@ mod completeness {
                     &src,
                     &["require_repo_owner(", "require_owner("],
                 ));
+                // Fold in the inline did_matches-owner idiom (F3).
+                owner_marked.extend(handlers_matching(&src, has_owner_did_matches));
             }
         }
-        // The gate helpers' own definition lines contain the marker string; they
-        // are helpers, not mounted handlers, so drop them.
+        // The gate helpers' own definitions carry the owner-gate idiom (the named
+        // marker string, and visibility::require_owner's body is itself a
+        // `did_matches(caller, &record.owner_did)` check); they are helpers, not
+        // mounted handlers, so drop them.
         owner_marked.remove("require_owner");
         owner_marked.remove("require_repo_owner");
-
+        // git_receive_pack also carries the inline did_matches-owner idiom, but for
+        // a SECONDARY gate: its branch-protection push check (repos.rs), not a
+        // whole-handler owner gate. It IS already a registry row — driven for its
+        // 401 signature deny (SignatureRequired class), not a 403 — so it is not an
+        // owner-gate orphan. Drop it so the owner-orphan assert (which only knows
+        // the OwnerGate rows) does not misflag a route that is already swept.
+        owner_marked.remove("git_receive_pack");
         // Non-vacuous floor: if the marker scan silently found nothing (a parser
         // regression), the orphan loop below would pass by checking zero handlers.
         // The tree has 10 owner-marker handlers today; 6 trips only on a real break.
@@ -810,6 +947,290 @@ mod completeness {
                 registry_owner_handlers.contains(h.as_str()),
                 "handler `{h}` carries an owner-gate marker but is not an owner-gate \
                  row in deny_bearing_routes() — add it so the runtime sweep drives its 403"
+            );
+        }
+    }
+
+    /// READ-GATE ORPHAN GUARD (F1). The owner-gate orphan guard above stops an
+    /// owner-gated mount from escaping the sweep; this is its read-gate twin. Every
+    /// handler carrying a read-gate marker (`authorize_repo_read(` /
+    /// `visibility_check(` — the two markers repos.rs/issues.rs/pulls.rs/
+    /// bounties.rs/certs.rs/labels.rs/changelog.rs/events.rs/encrypted.rs/stars.rs/
+    /// visibility.rs all use, verified there is no third) must be EITHER a
+    /// `ReadGate` row in `deny_bearing_routes()` (driven for its 404) OR an explicit
+    /// entry in `READ_GATE_NOT_DRIVEN` with a reason. That enumerated allowlist
+    /// REPLACES the old free-text "DEFERRED / EXCLUDED" prose in routes.rs: it is
+    /// now enforced code, so removing or bypassing the read gate on any of these
+    /// endpoints (or adding a brand-new read-gated handler) trips this instead of
+    /// leaving the real-node sweep silently green. The api dir is read at test time,
+    /// like the owner scan, so a new module is covered too.
+    #[test]
+    fn every_read_gate_handler_is_driven_or_explicitly_allowlisted() {
+        // Read-gate handlers NOT driven as a ReadGate row, each with the reason it
+        // is out of the runtime 404 sweep. This is the enforced form of the prose
+        // that used to live at routes.rs:351-365; a handler leaving the sweep must
+        // be moved here with a reason, never silently.
+        //
+        // Reasons fall into a few honest classes, so a reviewer can see WHY a
+        // read-gated endpoint is not driven for its 404 rather than trusting a name.
+        const READ_GATE_NOT_DRIVEN: &[(&str, &str)] = &[
+            // Deferred GET reads: verified to read-gate on "/", but the owner-2xx
+            // twin needs a seeded sub-entity the fixture does not yet create, so
+            // they land with the fixture expansion that seeds them.
+            (
+                "get_issue",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            ("get_pr", "deferred: owner-2xx twin needs seeded sub-entity"),
+            (
+                "get_pr_diff",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            (
+                "list_issue_comments",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            (
+                "list_reviews",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            (
+                "list_comments",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            (
+                "get_cert",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            (
+                "get_bounty",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            (
+                "get_encrypted_blob",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            // Path-scoped get_tree/{*path} needs a seeded sub-directory for its twin.
+            (
+                "get_tree",
+                "deferred: owner-2xx twin needs seeded sub-entity",
+            ),
+            // Read-gates but is a mutation, not a 404-deny GET: create/write paths
+            // that call authorize_repo_read on the caller before mutating. Their
+            // owner-gate/author behaviour is covered by the mutation authz guard in
+            // src/api/mod.rs, not this GET-read sweep.
+            (
+                "create_review",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "create_comment",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "create_pr",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "create_issue",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "create_issue_comment",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "create_bounty",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "claim_bounty",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "fork_repo",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "star_repo",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            (
+                "unstar_repo",
+                "read-gates but is a mutation, not a 404-deny GET",
+            ),
+            // Content-addressed read: its 404 deny + no-leak is already driven by
+            // the U5b/U8 anon_ipfs/clone cases in this file.
+            ("get_by_cid", "covered by U5b/U8 anon_ipfs/clone cases"),
+            // Git smart-HTTP reads: their withheld-subtree 404/exclusion is driven
+            // by the U7/U8 real-clone cases, not the API GET sweep.
+            (
+                "git_info_refs",
+                "git smart-HTTP read: covered by U7/U8 clone cases",
+            ),
+            (
+                "git_upload_pack",
+                "git smart-HTTP read: covered by U7/U8 clone cases",
+            ),
+            // Global list-FILTER: returns 200 with unreadable rows removed, never a
+            // 404, so it is not a deny-bearing read at all (matches the EXCLUDED
+            // class the prose called out).
+            (
+                "list_all_bounties",
+                "global list-filter: 200 with unreadable rows removed, never 404",
+            ),
+            // Repo-root GET reads that gate on "/" but are not yet driven as rows.
+            // They COULD be driven (no sub-entity needed); left out for now with an
+            // explicit reason rather than a silent omission — the whole point of the
+            // guard is that this decision is forced and reviewable.
+            (
+                "get_star_status",
+                "repo-root read: not yet driven as a ReadGate row",
+            ),
+            (
+                "get_icaptcha_proof",
+                "repo-root read: not yet driven as a ReadGate row",
+            ),
+            (
+                "replicate_encrypted_blobs",
+                "repo-root read: not yet driven as a ReadGate row",
+            ),
+        ];
+
+        let driven_read_handlers: HashSet<&str> = deny_bearing_routes()
+            .iter()
+            .filter(|r| r.gate == GateClass::ReadGate)
+            .map(|r| short_handler(r.handler))
+            .collect();
+        let allowlisted: HashSet<&str> = READ_GATE_NOT_DRIVEN.iter().map(|(h, _)| *h).collect();
+
+        let api_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/api");
+        let mut read_marked: HashSet<String> = HashSet::new();
+        for entry in std::fs::read_dir(api_dir).expect("read api dir") {
+            let path = entry.expect("dir entry").path();
+            // Skip api/mod.rs: it holds the gate HELPERS themselves
+            // (`authorize_repo_read`, `visibility_check`, `require_repo_owner`, …),
+            // not mounted route handlers — every mounted read handler lives in a
+            // sibling module (repos.rs, issues.rs, …). Scanning mod.rs would attach
+            // the marker to helper definitions and force phantom allowlist entries.
+            if path.file_name().is_some_and(|f| f == "mod.rs") {
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                let src = std::fs::read_to_string(&path).expect("read api file");
+                // Comment-stripped scan: the read-gate markers appear in several
+                // docstrings, and a raw scan would allowlist phantom non-handlers.
+                read_marked.extend(handlers_with_code_marker(
+                    &src,
+                    &["authorize_repo_read(", "visibility_check("],
+                ));
+            }
+        }
+        // The read-gate helper `visibility_check` is re-declared/aliased in
+        // visibility.rs's own use-path; drop the helper name if the scan attaches
+        // the marker to it (it is a helper, not a mounted handler) — the mirror of
+        // the owner scan dropping require_owner / require_repo_owner.
+        read_marked.remove("authorize_repo_read");
+        read_marked.remove("visibility_check");
+
+        // Non-vacuous floor: the tree has 41 read-gate-marked handlers today. If the
+        // marker scan silently found far fewer, the orphan loop below would pass by
+        // checking almost nothing; 30 trips only on a real parser break.
+        assert!(
+            read_marked.len() >= 30,
+            "read-gate marker scan found only {} handlers — the scan likely broke (floor 30)",
+            read_marked.len()
+        );
+
+        for h in &read_marked {
+            let name = h.as_str();
+            assert!(
+                driven_read_handlers.contains(name) || allowlisted.contains(name),
+                "handler `{name}` carries a read-gate marker but is neither a ReadGate \
+                 row in deny_bearing_routes() nor in READ_GATE_NOT_DRIVEN — drive its \
+                 404 or add it to the allowlist with a reason"
+            );
+        }
+
+        // Staleness: every allowlist entry must still be a real read-gate handler,
+        // so a rename/removal can't leave a dead exemption that masks a future gap.
+        for (name, _reason) in READ_GATE_NOT_DRIVEN {
+            assert!(
+                read_marked.contains(*name),
+                "READ_GATE_NOT_DRIVEN lists `{name}`, which no longer carries a \
+                 read-gate marker (renamed, removed, or gate dropped?) — update the list"
+            );
+        }
+    }
+
+    // ── F3 unit tests: the inline owner-gate did_matches discriminator ───────────
+    //
+    // These pin `has_owner_did_matches` against the EXACT real bodies (positive and
+    // negative), so the two-arg discriminator can't silently regress into matching
+    // the signer-self / author forms that share the helper.
+
+    #[test]
+    fn has_owner_did_matches_catches_the_protect_branch_owner_idiom() {
+        // protect.rs:28 form: first arg the caller, second `&record.owner_did`.
+        let body = "let caller = &auth.0;\n\
+                    if !crate::api::did_matches(caller, &record.owner_did) {\n\
+                        return Err(AppError::Forbidden(\"only the owner\".into()));\n\
+                    }";
+        assert!(
+            has_owner_did_matches(body),
+            "the protect_branch owner idiom must be recognized"
+        );
+    }
+
+    #[test]
+    fn has_owner_did_matches_catches_the_auth0_owner_form() {
+        // The `&auth.0` first-arg spelling (repos.rs's branch-protection check),
+        // tolerating a newline before the second arg.
+        let body =
+            "if x\n    && !crate::api::did_matches(&auth.0,\n        &record.owner_did)\n    {";
+        assert!(
+            has_owner_did_matches(body),
+            "the &auth.0 / owner_did form must be recognized across a newline"
+        );
+    }
+
+    #[test]
+    fn has_owner_did_matches_ignores_register_replica_signer_self() {
+        // replicas.rs:52: FIRST arg is `replica_did`, NOT the caller — signer-self
+        // by design. The second arg is owner_did, so a naive "second arg is
+        // owner_did" check would wrongly flag it. It must NOT match.
+        let body = "if crate::api::did_matches(replica_did, &record.owner_did) {\n\
+                        // the signer is registering itself as a replica\n\
+                    }";
+        assert!(
+            !has_owner_did_matches(body),
+            "register_replica's signer-self did_matches must NOT be treated as an owner gate"
+        );
+    }
+
+    #[test]
+    fn has_owner_did_matches_ignores_close_pr_author_form() {
+        // pulls.rs:277: caller-first but SECOND arg is `&pr.author_did`, not
+        // owner_did — the owner-or-author close gate. Must NOT match as owner-only.
+        let body = "let is_author = crate::api::did_matches(&auth.0, &pr.author_did);";
+        assert!(
+            !has_owner_did_matches(body),
+            "close_pr's author did_matches must NOT be treated as an owner gate"
+        );
+    }
+
+    #[test]
+    fn has_owner_did_matches_ignores_bounty_and_task_self_forms() {
+        // bounties.rs / tasks.rs: caller-first, but the second arg is a
+        // creator/delegator/assignee did, never owner_did.
+        for body in [
+            "if !crate::api::did_matches(&auth.0, &bounty.creator_did) {",
+            "if !crate::api::did_matches(&auth.0, &body.delegator_did) {",
+            "if !crate::api::did_matches(&auth.0, &body.assignee_did) {",
+        ] {
+            assert!(
+                !has_owner_did_matches(body),
+                "self/author did_matches form must NOT be treated as an owner gate: {body}"
             );
         }
     }
