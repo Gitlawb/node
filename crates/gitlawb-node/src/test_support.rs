@@ -85,6 +85,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         // Generous — no test drives the handler-level shed (git_permit is unit-tested).
         git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
         git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
             8,
@@ -273,15 +274,15 @@ mod tests {
     }
 
     /// PR3 (#62) receive-pack sibling of the info/refs shed test: the early shed
-    /// selects the WRITE pool for a git-receive-pack advertisement (phase one of a
-    /// push, #174 U2), so an exhausted write pool sheds the advert with 503 before
-    /// any DB/disk work — even while the read pool is free (only the write pool is
-    /// zeroed here). Flip the pool selection to the read pool, or remove the
-    /// early-shed block, and this goes red.
+    /// selects the dedicated ADVERT pool for a git-receive-pack advertisement (#174),
+    /// so an exhausted advert pool sheds the advert with 503 before any DB/disk work
+    /// — while the write pool (reserved for authenticated POSTs) is left free here.
+    /// Flip the pool selection back to the write pool, or remove the early-shed
+    /// block, and this goes red.
     #[tokio::test]
-    async fn git_info_refs_receive_pack_sheds_with_503_when_write_pool_exhausted() {
+    async fn git_info_refs_receive_pack_sheds_with_503_when_advert_pool_exhausted() {
         let mut state = test_state_lazy();
-        state.git_write_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        state.git_push_advert_semaphore = Arc::new(tokio::sync::Semaphore::new(0));
 
         let router = Router::new()
             .route(
@@ -299,7 +300,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "an exhausted WRITE pool must shed the receive-pack advertisement with 503 before touching the DB"
+            "an exhausted ADVERT pool must shed the receive-pack advertisement with 503 before touching the DB"
         );
         assert_eq!(
             resp.headers()
