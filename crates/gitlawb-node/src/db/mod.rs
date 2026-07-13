@@ -1260,20 +1260,24 @@ impl Db {
         Ok(())
     }
 
-    /// Every repo row owned by exactly `owner_did` (an exact `owner_did` match, no
-    /// did:key normalization and no dedup) so a caller enumerating one DID's repos
-    /// sees every physical row. Backs the `purge-spam` admin tool, whose selection
-    /// then applies its own per-repo empty check and exclusion gate. Ordered by
-    /// `id` for a stable candidate listing.
+    /// Every repo row whose owner resolves to `owner_did` under did:key
+    /// normalization, so `did:key:z6…` and bare `z6…` rows of the same identity
+    /// both match (mirroring how ownership is resolved everywhere else via
+    /// `OWNER_KEY_CASE_SQL` / the `idx_repos_owner_key_name` index). No dedup, so a
+    /// caller enumerating one DID's repos sees every physical row. Backs the
+    /// `purge-spam` admin tool, whose selection then applies its own per-repo empty
+    /// check and exclusion gate (both normalization-consistent). Ordered by `id`.
     pub async fn list_repos_by_owner_did(&self, owner_did: &str) -> Result<Vec<RepoRecord>> {
-        let rows = sqlx::query(
+        let sql = format!(
             "SELECT id, name, owner_did, description, is_public, default_branch,
                     created_at, updated_at, disk_path, forked_from, machine_id
-             FROM repos WHERE owner_did = $1 ORDER BY id",
-        )
-        .bind(owner_did)
-        .fetch_all(&self.pool)
-        .await?;
+             FROM repos WHERE {key} = $1 ORDER BY id",
+            key = OWNER_KEY_CASE_SQL
+        );
+        let rows = sqlx::query(&sql)
+            .bind(normalize_owner_key(owner_did))
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.into_iter().map(row_to_repo).collect())
     }
 
