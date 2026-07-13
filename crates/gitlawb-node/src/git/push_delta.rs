@@ -746,4 +746,60 @@ mod tests {
             "a hung git must make list_all_objects error out, not hang"
         );
     }
+
+    /// #174 finding 2: the DELTA-path children — `peeled_object_type` (cat-file),
+    /// `rev_list_delta` (rev-list) — and `list_all_objects_with_type` (cat-file) are
+    /// the remaining candidate-discovery execs (the common push path). Each must
+    /// return within the watchdog budget on a hung git rather than block and pin the
+    /// write permit. Revert any one to a bare `Command::output()` and its arm blocks
+    /// past the recv budget (RED).
+    #[cfg(unix)]
+    #[test]
+    fn delta_path_exec_fns_time_out_on_a_hung_git() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::TempDir::new().unwrap();
+        // Fake git hangs on BOTH cat-file and rev-list (bounded 30s so a broken
+        // test can't leak a permanent orphan or wedge the suite).
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in\n  cat-file|rev-list) i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done ;;\n  *) : ;;\nesac\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+        let path = dir.path().to_path_buf();
+
+        // Run `f` on a thread and require it to RETURN (not block) within 10s.
+        fn returns_within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            rx.recv_timeout(Duration::from_secs(10)).expect(
+                "a delta-path exec fn must return within the watchdog budget, not block on a hung git",
+            )
+        }
+        let dl = || Instant::now() + Duration::from_millis(150);
+        let sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let (p, g, d) = (path.clone(), git_bin.clone(), dl());
+        assert!(
+            returns_within(move || peeled_object_type(&p, sha, &g, d)).is_none(),
+            "peeled_object_type must time out to None on a hung cat-file"
+        );
+        let (p, g, d) = (path.clone(), git_bin.clone(), dl());
+        assert!(
+            returns_within(move || rev_list_delta(&p, &[sha], &[], &g, d)).is_err(),
+            "rev_list_delta must error out on a hung rev-list"
+        );
+        let (p, g, d) = (path.clone(), git_bin.clone(), dl());
+        assert!(
+            returns_within(move || list_all_objects_with_type(&p, &g, d)).is_err(),
+            "list_all_objects_with_type must error out on a hung cat-file"
+        );
+    }
 }
