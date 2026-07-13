@@ -11,6 +11,8 @@ mod support;
 use std::process::Command;
 
 use support::assert::assert_denied;
+use support::probe::{probes_for, Expect, Fixture, Probe, Signer};
+use support::routes::deny_bearing_routes;
 use support::signing::signed_request;
 
 use gitlawb_core::cid::Cid;
@@ -403,6 +405,142 @@ async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
     assert!(
         listing.contains(&public_oid),
         "public blob {public_oid} must be present (withhold is subtree-scoped); listing:\n{listing}"
+    );
+}
+
+// ── U3: drive the whole deny-bearing route registry over the real stack ───────
+
+/// Send one [`Probe`] against the running node, signing as the probe's identity.
+/// Anon requests are unsigned; Owner/Stranger requests carry a real RFC-9421
+/// signature for the fixture's owner / stranger keypair.
+async fn send_probe(
+    client: &reqwest::Client,
+    base_url: &str,
+    fixture: &Fixture,
+    probe: &Probe,
+) -> reqwest::Response {
+    let rb = match probe.signer {
+        Signer::Anon => client
+            .request(probe.method.clone(), format!("{base_url}{}", probe.path))
+            .body(probe.body.clone()),
+        Signer::Owner => signed_request(
+            client,
+            probe.method.clone(),
+            base_url,
+            &probe.path,
+            probe.body.clone(),
+            &fixture.owner,
+        ),
+        Signer::Stranger => signed_request(
+            client,
+            probe.method.clone(),
+            base_url,
+            &probe.path,
+            probe.body.clone(),
+            &fixture.stranger,
+        ),
+    };
+    let rb = if probe.json {
+        rb.header("content-type", "application/json")
+    } else {
+        rb
+    };
+    rb.send().await.unwrap_or_else(|e| {
+        panic!(
+            "probe failed to send: {} [{} {}]: {e}",
+            probe.label, probe.method, probe.path
+        )
+    })
+}
+
+/// Walk every deny-bearing route (U1 registry), expand each into its hostile
+/// probe plus positive twin (U2), and drive them against a real node: the
+/// hostile request must return the exact deny status and leak nothing, and the
+/// twin must reach the handler (owner-gate: not 403; read-gate: 2xx). This is
+/// the runtime discharge of INV-1/INV-2/INV-8 across the whole registry, not one
+/// hand-written case at a time.
+///
+/// Terminal anti-vacuous-green invariant: exactly one hostile probe per row is
+/// driven and the count equals the registry size, so a row that silently
+/// produced no probe fails here instead of the sweep passing by testing nothing.
+#[sqlx::test]
+async fn deny_bearing_registry_denies_hostile_and_admits_authorized(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    // A bounded timeout so a wedged route fails the suite rather than hanging it.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let fixture = Fixture::seed(&node).await;
+
+    let rows = deny_bearing_routes();
+    assert!(
+        !rows.is_empty(),
+        "deny-bearing route registry is empty — nothing to sweep"
+    );
+
+    let mut hostile_driven = 0usize;
+    let mut twins_driven = 0usize;
+
+    for row in rows {
+        let probes = probes_for(row, &fixture);
+        assert!(
+            !probes.is_empty(),
+            "row {} {} produced no probes",
+            row.method,
+            row.path
+        );
+        for probe in &probes {
+            let ctx = format!("{} [{} {}]", probe.label, probe.method, probe.path);
+            let resp = send_probe(&client, &node.base_url, &fixture, probe).await;
+            let status = resp.status();
+            match &probe.expect {
+                Expect::Deny(code) => {
+                    hostile_driven += 1;
+                    assert_eq!(
+                        status.as_u16(),
+                        *code,
+                        "hostile probe must deny with {code}, got {status}: {ctx}"
+                    );
+                    // INV-8 shape guard: rechecks the status and that the body is
+                    // neither an empty-200-as-success nor carrying withheld data.
+                    assert_denied(resp, *code, &[]).await;
+                }
+                Expect::Not403 => {
+                    twins_driven += 1;
+                    assert_ne!(
+                        status.as_u16(),
+                        403,
+                        "owner-reachability twin must reach the handler (not 403): {ctx}"
+                    );
+                }
+                Expect::Ok2xx(token) => {
+                    twins_driven += 1;
+                    assert!(
+                        status.is_success(),
+                        "read-reachability twin must be 2xx, got {status}: {ctx}"
+                    );
+                    if let Some(tok) = token {
+                        let body = resp.text().await.unwrap_or_default();
+                        assert!(
+                            body.contains(tok),
+                            "read twin 2xx body missing expected token {tok:?}: {ctx}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        hostile_driven,
+        rows.len(),
+        "expected exactly one hostile probe per deny-bearing row ({} rows), drove {hostile_driven}",
+        rows.len()
+    );
+    assert!(
+        twins_driven >= 1,
+        "no positive twins were driven — the reachability proof is missing"
     );
 }
 

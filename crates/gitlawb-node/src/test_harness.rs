@@ -26,7 +26,7 @@ use uuid::Uuid;
 use gitlawb_core::identity::Keypair;
 
 use crate::config::Config;
-use crate::db::{Db, RepoRecord, VisibilityMode};
+use crate::db::{Db, PullRequest, RepoRecord, VisibilityMode};
 use crate::rate_limit::{RateLimiter, TrustedProxy};
 use crate::state::AppState;
 
@@ -167,6 +167,41 @@ impl TestNode {
         };
         self.db.create_repo(&record).await.expect("seed repo");
         record.id
+    }
+
+    /// Seed an open PR `number` in `repo_id`, authored by `author_did`. The
+    /// author-or-owner close gate (`close_pr`) loads the PR *before* it runs, so a
+    /// deny-prober row for `.../pulls/{number}/close` needs the PR to exist or a
+    /// stranger gets a 404 (absent entity) instead of the 403 the gate emits.
+    pub async fn seed_pr(&self, repo_id: &str, number: i64, author_did: &str) {
+        let now = Utc::now().to_rfc3339();
+        let pr = PullRequest {
+            id: Uuid::new_v4().to_string(),
+            repo_id: repo_id.to_string(),
+            number,
+            title: "seed pr".to_string(),
+            body: None,
+            author_did: author_did.to_string(),
+            source_branch: "feature".to_string(),
+            target_branch: "main".to_string(),
+            status: "open".to_string(),
+            merged_by_did: None,
+            merged_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.db.create_pr(&pr).await.expect("seed pr");
+    }
+
+    /// Seed issue `issue_id` (a git-ref JSON blob authored by `author_did`) in the
+    /// repo's bare on-disk store. Like [`Self::seed_pr`], the `close_issue`
+    /// owner-or-author gate loads the issue before it runs, so the deny-prober row
+    /// for `.../issues/{id}/close` needs the issue present to reach the 403.
+    pub fn seed_issue(&self, owner_did: &str, name: &str, issue_id: &str, author_did: &str) {
+        let slug = owner_did.replace([':', '/'], "_");
+        let bare = self.repos_dir.join(&slug).join(format!("{name}.git"));
+        let json = format!(r#"{{"author":"{author_did}"}}"#);
+        crate::git::issues::create_issue(&bare, issue_id, &json).expect("seed issue");
     }
 
     /// Add a path-scoped visibility rule restricting `path_glob` to

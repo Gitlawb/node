@@ -24,6 +24,8 @@ pub struct Fixture {
     /// Public repo: owner-gate rows run against this so the stranger reaches the
     /// owner gate rather than a hidden-repo 404.
     pub public_repo: String,
+    /// The public repo's id, needed to seed the PR the close-gate rows require.
+    pub public_repo_id: String,
     /// Private repo (is_public=false) with seeded content: read-gate rows run
     /// against this so an anon caller gets the existence-hiding 404 and the owner
     /// twin gets 2xx.
@@ -40,18 +42,34 @@ impl Fixture {
         let content_path = "public/a.txt".to_string();
 
         let pub_repo = "prober-pub";
-        node.seed_repo(&owner_did, pub_repo, true).await;
-        node.seed_bare_repo(&owner_did, pub_repo, &[("public/a.txt", "pub content")], "sha1");
+        let public_repo_id = node.seed_repo(&owner_did, pub_repo, true).await;
+        node.seed_bare_repo(
+            &owner_did,
+            pub_repo,
+            &[("public/a.txt", "pub content")],
+            "sha1",
+        );
+        // The author-or-owner close gates load the PR/issue before they run, so
+        // the `.../pulls/1/close` and `.../issues/1/close` rows need entity #1 to
+        // exist (owner-authored) or a stranger 404s (absent) instead of 403.
+        node.seed_pr(&public_repo_id, 1, &owner_did).await;
+        node.seed_issue(&owner_did, pub_repo, "1", &owner_did);
 
         let priv_repo = "prober-priv";
         node.seed_repo(&owner_did, priv_repo, false).await;
-        node.seed_bare_repo(&owner_did, priv_repo, &[("public/a.txt", "priv content")], "sha1");
+        node.seed_bare_repo(
+            &owner_did,
+            priv_repo,
+            &[("public/a.txt", "priv content")],
+            "sha1",
+        );
 
         Fixture {
             owner,
             stranger,
             owner_did,
             public_repo: pub_repo.to_string(),
+            public_repo_id,
             private_repo: priv_repo.to_string(),
             content_path,
         }
@@ -198,6 +216,7 @@ mod tests {
             stranger: Keypair::generate(),
             owner_did: "did:key:zOWNER".to_string(),
             public_repo: "prober-pub".to_string(),
+            public_repo_id: "pub-id".to_string(),
             private_repo: "prober-priv".to_string(),
             content_path: "public/a.txt".to_string(),
         }
@@ -219,7 +238,10 @@ mod tests {
         assert_eq!(ps[0].signer, Signer::Stranger);
         assert!(ps[0].json);
         assert!(matches!(ps[0].expect, Expect::Deny(403)));
-        assert!(ps[0].path.contains("prober-pub"), "owner-gate uses the public repo");
+        assert!(
+            ps[0].path.contains("prober-pub"),
+            "owner-gate uses the public repo"
+        );
         assert_eq!(ps[1].signer, Signer::Owner);
         assert!(matches!(ps[1].expect, Expect::Not403));
     }
@@ -239,7 +261,10 @@ mod tests {
         assert_eq!(ps.len(), 2);
         assert_eq!(ps[0].signer, Signer::Anon);
         assert!(matches!(ps[0].expect, Expect::Deny(404)));
-        assert!(ps[0].path.contains("prober-priv"), "read-gate uses the private repo");
+        assert!(
+            ps[0].path.contains("prober-priv"),
+            "read-gate uses the private repo"
+        );
         assert!(ps[0].path.contains("public/a.txt"), "{{*path}} substituted");
         assert_eq!(ps[1].signer, Signer::Owner);
         assert!(matches!(ps[1].expect, Expect::Ok2xx(_)));
