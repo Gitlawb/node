@@ -118,11 +118,17 @@ where
 /// bare-repo markers (`HEAD` file + `objects/` dir) before trusting any count;
 /// anything else fails closed (treated non-empty, skipped).
 fn on_disk_ref_count(repos_dir: &Path, repo: &RepoRecord) -> usize {
-    let path = store::repo_disk_path(repos_dir, &repo.owner_did, &repo.name);
+    ref_count_on_disk(repos_dir, &repo.owner_did, &repo.name)
+}
+
+/// Core of [`on_disk_ref_count`], keyed on owner+name so the execute path can
+/// re-verify emptiness right before deleting (using only a [`Candidate`]).
+fn ref_count_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> usize {
+    let path = store::repo_disk_path(repos_dir, owner_did, name);
     if !path.join("HEAD").is_file() || !path.join("objects").is_dir() {
         // Not a bare git repo at the exact expected path. Do NOT trust a ref
         // count that git discovery could have read from a parent repository.
-        warn!(repo = %repo.id, path = %path.display(),
+        warn!(path = %path.display(),
             "purge-spam: path is not a bare git repo — treating as non-empty (skipped)");
         return 1;
     }
@@ -131,11 +137,34 @@ fn on_disk_ref_count(repos_dir: &Path, repo: &RepoRecord) -> usize {
         Err(e) => {
             // Fail closed: an unreadable repo is not provably empty, so keep it
             // out of the candidate set (report it as one ref so it's excluded).
-            warn!(repo = %repo.id, path = %path.display(), err = %e,
+            warn!(path = %path.display(), err = %e,
                 "purge-spam: could not read refs — treating as non-empty (skipped)");
             1
         }
     }
+}
+
+/// Split selected candidates into (delete, skip) by a fresh emptiness re-check,
+/// so a repo that gained a ref between selection and deletion (a TOCTOU push)
+/// is never deleted. Pure over the `recheck` closure so the skip branch is
+/// directly testable; the CLI wires the real on-disk re-check.
+fn partition_for_delete<F>(
+    candidates: &[Candidate],
+    mut recheck: F,
+) -> (Vec<&Candidate>, Vec<&Candidate>)
+where
+    F: FnMut(&Candidate) -> usize,
+{
+    let mut to_delete = Vec::new();
+    let mut to_skip = Vec::new();
+    for c in candidates {
+        if recheck(c) == 0 {
+            to_delete.push(c);
+        } else {
+            to_skip.push(c);
+        }
+    }
+    (to_delete, to_skip)
 }
 
 /// Run the `purge-spam` admin subcommand.
@@ -189,20 +218,44 @@ pub async fn run_purge_spam(db: &Db, repos_dir: &Path, execute: bool) -> Result<
         return Ok(());
     }
 
+    // Re-verify emptiness immediately before deleting: a push may have landed
+    // between selection and now (TOCTOU). Anything no longer empty is skipped,
+    // never deleted.
+    let (to_delete, to_skip) = partition_for_delete(&candidates, |c| {
+        ref_count_on_disk(&repos_dir, &c.owner_did, &c.name)
+    });
+    for c in &to_skip {
+        warn!(repo = %c.id, "purge-spam: repo no longer empty at delete time — skipped (TOCTOU)");
+    }
+
     // Execute: delete per-repo, never a single blanket "delete all of owner X".
+    // A per-repo failure warns and continues rather than aborting the batch.
     let mut deleted = 0u64;
-    for c in &candidates {
+    for c in &to_delete {
         match db.delete_repo_by_id(&c.id).await {
+            Ok(0) => {
+                warn!(repo = %c.id, "purge-spam: repo row already gone — nothing to delete");
+            }
             Ok(n) => {
                 deleted += n;
-                info!(repo = %c.id, rows = n, "purge-spam: deleted repo row");
+                // Remove the now-orphaned on-disk bare repo (empty, so cheap) so
+                // the DB row and disk stay consistent.
+                let path = store::repo_disk_path(&repos_dir, &c.owner_did, &c.name);
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    warn!(repo = %c.id, path = %path.display(), err = %e,
+                        "purge-spam: deleted DB row but could not remove on-disk repo dir");
+                }
+                info!(repo = %c.id, rows = n, "purge-spam: deleted repo row + on-disk dir");
             }
             Err(e) => {
-                warn!(repo = %c.id, err = %e, "purge-spam: failed to delete repo row");
+                warn!(repo = %c.id, err = %e, "purge-spam: failed to delete repo row — continuing");
             }
         }
     }
-    println!("purge-spam: deleted {deleted} repo row(s).");
+    println!(
+        "purge-spam: deleted {deleted} repo row(s), skipped {} (no longer empty).",
+        to_skip.len()
+    );
     Ok(())
 }
 
@@ -349,6 +402,30 @@ mod tests {
         let got = select_spam_candidates(&repos, EXCLUDED_CONTENT, refs_by_id(&[]));
         assert!(got.is_empty(), "exclusion must win even on an empty repo");
     }
+
+    // TOCTOU: a candidate that gained a ref between selection and the pre-delete
+    // re-check must be skipped, not deleted; the rest of the batch still deletes.
+    #[test]
+    fn partition_for_delete_skips_repos_no_longer_empty() {
+        let cand = |id: &str| Candidate {
+            id: id.into(),
+            owner_did: "o".into(),
+            name: id.into(),
+            ref_count: 0,
+        };
+        let cands = vec![cand("still-empty"), cand("now-nonempty")];
+        // Re-check reports the second repo as no longer empty.
+        let (to_delete, to_skip) =
+            partition_for_delete(&cands, |c| usize::from(c.id == "now-nonempty"));
+        assert_eq!(
+            to_delete.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["still-empty"]
+        );
+        assert_eq!(
+            to_skip.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["now-nonempty"]
+        );
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +538,51 @@ mod db_tests {
             .await
             .unwrap()
             .is_some());
+    }
+
+    // Execute removes the on-disk bare repo dir too, so the DB row and disk stay
+    // consistent (no orphaned empty git dir left behind).
+    #[sqlx::test]
+    async fn execute_removes_the_on_disk_repo_dir(pool: PgPool) {
+        let db = db(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let empty = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&empty).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &empty.owner_did, &empty.name);
+        store::init_bare(&path).unwrap();
+        assert!(path.exists(), "precondition: on-disk repo exists");
+
+        run_purge_spam(&db, tmp.path(), true).await.unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_none(),
+            "DB row deleted"
+        );
+        assert!(!path.exists(), "on-disk bare repo dir must be removed too");
+    }
+
+    // The DB query normalizes did:key form (OWNER_KEY_CASE_SQL), so a burst repo
+    // stored in SHORT (bare) form is still found when querying by the full-form
+    // target DID — the SQL side of the normalization fix.
+    #[sqlx::test]
+    async fn list_repos_by_owner_did_matches_short_form(pool: PgPool) {
+        let db = db(pool).await;
+        let short = crate::db::normalize_owner_key(SPAM_BURST_TARGET_DID);
+        assert_ne!(short, SPAM_BURST_TARGET_DID, "fixture must be short form");
+        let repo = rec("short-owned", short, "spam");
+        db.create_repo(&repo).await.unwrap();
+
+        let rows = db
+            .list_repos_by_owner_did(SPAM_BURST_TARGET_DID)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter().any(|r| r.id == "short-owned"),
+            "a short-form burst row must be found when querying by the full-form target"
+        );
     }
 
     /// Create a single commit + ref in a bare repo via a throwaway worktree, so the
