@@ -115,7 +115,7 @@ async fn fail_closed_full_scan_objects(
         let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
             &disk_path, &git_bin, timeout, &rules, is_public, &owner_did,
         )?;
-        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path)?;
+        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path, &git_bin, std::time::Instant::now() + timeout)?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
             candidates, &allowed, &all_blobs,
         ))
@@ -1264,6 +1264,8 @@ pub async fn git_receive_pack(
             disk_path.clone(),
             new_tips,
             old_tips,
+            state.git_bin.clone(),
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
         )
         .await;
         if pin_set.full_scan {

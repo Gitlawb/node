@@ -42,7 +42,7 @@ const WATCHDOG_TERM_GRACE: Duration = Duration::from_secs(1);
 /// drive the teardown in tests without mutating the process-global PATH;
 /// `stdin_bytes` feeds children that read stdin (empty for the arg-only children).
 #[cfg(unix)]
-fn run_bounded_git(
+pub(crate) fn run_bounded_git(
     git_bin: &str,
     args: &[&str],
     repo_path: &Path,
@@ -171,7 +171,7 @@ fn run_bounded_git(
 /// the Unix version's signature and result semantics so every caller compiles on all
 /// targets (#174).
 #[cfg(not(unix))]
-fn run_bounded_git(
+pub(crate) fn run_bounded_git(
     git_bin: &str,
     args: &[&str],
     repo_path: &Path,
@@ -1235,7 +1235,12 @@ esac\n";
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
-        let all_blobs = crate::git::push_delta::all_blob_oids(&work).unwrap();
+        let all_blobs = crate::git::push_delta::all_blob_oids(
+            &work,
+            "git",
+            std::time::Instant::now() + std::time::Duration::from_secs(600),
+        )
+        .unwrap();
         assert!(
             all_blobs.contains(&dangling_oid),
             "precondition: the dangling blob is in the all-objects universe"
