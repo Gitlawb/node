@@ -154,6 +154,98 @@ fn run_bounded_git(
     Ok(out)
 }
 
+/// Non-Unix fallback for [`run_bounded_git`]. Windows and other non-Unix targets
+/// have no process-group teardown (`process_group(0)` / `kill(-pgid)` are Unix-only),
+/// so this bounds a single child on its own: threads feed stdin and drain stderr
+/// while the main thread drains stdout, and a watchdog thread kills the child at the
+/// deadline (which closes stdout and unblocks the drain). The child is shared with
+/// the watchdog behind a mutex that the main thread does NOT hold while draining, so
+/// the watchdog can always acquire it to kill. Best-effort — it reaps only the direct
+/// child, not a descendant group — which is why the hardened, group-aware path above
+/// is gated to Unix, the only target the served node actually runs on (the Windows
+/// release binary is best-effort / `continue-on-error` in CI). Kept in lockstep with
+/// the Unix version's signature and result semantics so every caller compiles on all
+/// targets (#174).
+#[cfg(not(unix))]
+fn run_bounded_git(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    use std::io::{Read, Write};
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let label = args.first().copied().unwrap_or("git");
+    let mut child = std::process::Command::new(git_bin)
+        .args(args)
+        .current_dir(repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn git {label}"))?;
+
+    let mut stdin = child.stdin.take();
+    let input = stdin_bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut s) = stdin.take() {
+            let _ = s.write_all(&input);
+        }
+    });
+    let mut stderr = child.stderr.take().context("git stderr was not piped")?;
+    let err_reader = std::thread::spawn(move || {
+        let mut err = Vec::new();
+        let _ = stderr.read_to_end(&mut err);
+        err
+    });
+    let mut stdout = child.stdout.take().context("git stdout was not piped")?;
+
+    // Share the child with the watchdog. The main thread drains stdout WITHOUT
+    // holding this lock, so the watchdog can always acquire it to kill on timeout;
+    // killing closes stdout and unblocks the drain below.
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let watchdog = {
+        let child = child.clone();
+        std::thread::spawn(move || -> bool {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            match done_rx.recv_timeout(wait) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => false,
+                Err(RecvTimeoutError::Timeout) => {
+                    if let Ok(mut c) = child.lock() {
+                        let _ = c.kill();
+                    }
+                    true
+                }
+            }
+        })
+    };
+
+    let mut out = Vec::new();
+    let read_result = stdout.read_to_end(&mut out);
+    // The drain has returned (child exited or was killed), so taking the lock here
+    // cannot deadlock against the watchdog.
+    let status = child
+        .lock()
+        .expect("git child mutex poisoned")
+        .wait()
+        .context("git wait failed")?;
+    let _ = done_tx.send(());
+    let killed = watchdog.join().unwrap_or(false);
+    let err = err_reader.join().unwrap_or_default();
+    let _ = writer.join();
+    read_result.context("failed to read git stdout")?;
+    if killed && !status.success() {
+        return Err(crate::git::smart_http::GitServiceTimeout.into());
+    }
+    if !status.success() {
+        anyhow::bail!("git {label} failed: {}", String::from_utf8_lossy(&err));
+    }
+    Ok(out)
+}
+
 /// Fail closed unless every ref ultimately resolves to a commit (a ref pointing
 /// directly at a blob or tree, or an annotated tag — even a nested one — of such
 /// an object is refused). `git rev-list --all` silently *skips* such refs, but
