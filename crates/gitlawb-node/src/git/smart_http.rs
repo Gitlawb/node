@@ -1160,6 +1160,61 @@ mod tests {
         );
     }
 
+    /// True when `err` is the transient ETXTBSY exec race a freshly-written fake
+    /// `git` hits under fork-storm load — a concurrent worker forked while this
+    /// file's write fd was still open, so `execve` sees it as busy (the same race
+    /// `fake_git_run_with_pids` retries). Deliberately narrow: only this raw-OS
+    /// error is retried, so a wrong error *type* (e.g. a missing async bound
+    /// surfacing as anything other than `GitServiceTimeout`) still fails loudly at
+    /// the caller's assertion instead of being swallowed. `spawn()?` propagates the
+    /// `io::Error` with no context, so it survives as the anyhow root.
+    #[cfg(unix)]
+    fn is_transient_exec_race(err: &anyhow::Error) -> bool {
+        // ETXTBSY == 26 on Linux and the BSDs/macOS; std has no stable ErrorKind.
+        err.downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(26)
+    }
+
+    /// Drive `build_filtered_pack` under a per-attempt watchdog, retrying ONLY the
+    /// transient ETXTBSY exec race and returning the terminal error for the caller
+    /// to classify. Every attempt keeps its own outer `tokio::time::timeout`, so a
+    /// MISSING async bound — the regression the `build_filtered_pack_times_out_*`
+    /// tests guard — still trips the watchdog loudly on every attempt: the retry
+    /// can only absorb a fast exec failure, never a hang (a hang never returns, so
+    /// it can never reach the retry decision).
+    #[cfg(unix)]
+    async fn build_filtered_pack_or_exec_race_retry(
+        git_bin: &str,
+        repo_path: &std::path::Path,
+        withheld: &HashSet<String>,
+        stage_timeout: Duration,
+    ) -> anyhow::Error {
+        for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                build_filtered_pack(git_bin, repo_path, withheld, stage_timeout),
+            )
+            .await
+            .expect(
+                "build_filtered_pack must return within the watchdog — the git stage \
+                 must be timeout-bounded, not an uncancellable spawn_blocking",
+            );
+            let err = result.expect_err("a hung git stage must return an error, not hang");
+            if is_transient_exec_race(&err) {
+                // Fresh-fake-git ETXTBSY: back off (growing) so a bursty fork-pressure
+                // spike subsides before retrying, per fake_git_run_with_pids.
+                tokio::time::sleep(Duration::from_millis(FAKE_GIT_BACKOFF_STEP_MS * (i + 1))).await;
+                continue;
+            }
+            return err;
+        }
+        panic!(
+            "fake git kept hitting ETXTBSY after {FAKE_GIT_RETRY_ATTEMPTS} attempts \
+             (persistent exec failure, not a transient parallel-runner miss)"
+        );
+    }
+
     // Dropping the request future mid-flight (client disconnect) must SIGTERM the
     // whole group so git AND its pack-objects grandchild die together. Goes RED
     // if `process_group(0)` or the guard-arming is removed: without its own
@@ -1314,21 +1369,15 @@ mod tests {
         let git_bin = write_fake_git(tmp.path(), body);
         let withheld = HashSet::new();
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            build_filtered_pack(
-                git_bin.to_str().unwrap(),
-                tmp.path(),
-                &withheld,
-                Duration::from_millis(200),
-            ),
+        // Retry only the transient ETXTBSY exec race (see the helper); the
+        // per-attempt watchdog keeps the missing-bound regression loud.
+        let err = build_filtered_pack_or_exec_race_retry(
+            git_bin.to_str().unwrap(),
+            tmp.path(),
+            &withheld,
+            Duration::from_millis(200),
         )
-        .await
-        .expect(
-            "build_filtered_pack must return within the watchdog — the pack-objects \
-             stage must be timeout-bounded, not an uncancellable spawn_blocking",
-        );
-        let err = result.expect_err("a hung pack-objects must return an error, not hang");
+        .await;
         assert!(
             err.downcast_ref::<GitServiceTimeout>().is_some(),
             "a hung pack-objects must abort with GitServiceTimeout, got: {err}"
@@ -1352,21 +1401,15 @@ mod tests {
         let git_bin = write_fake_git(tmp.path(), body);
         let withheld = HashSet::new();
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            build_filtered_pack(
-                git_bin.to_str().unwrap(),
-                tmp.path(),
-                &withheld,
-                Duration::from_millis(200),
-            ),
+        // Retry only the transient ETXTBSY exec race (see the helper); the
+        // per-attempt watchdog keeps the missing-bound regression loud.
+        let err = build_filtered_pack_or_exec_race_retry(
+            git_bin.to_str().unwrap(),
+            tmp.path(),
+            &withheld,
+            Duration::from_millis(200),
         )
-        .await
-        .expect(
-            "build_filtered_pack must return within the watchdog — the rev-list \
-             stage must be timeout-bounded, not an uncancellable spawn_blocking",
-        );
-        let err = result.expect_err("a hung rev-list must return an error, not hang");
+        .await;
         assert!(
             err.downcast_ref::<GitServiceTimeout>().is_some(),
             "a hung rev-list must abort with GitServiceTimeout, got: {err}"
