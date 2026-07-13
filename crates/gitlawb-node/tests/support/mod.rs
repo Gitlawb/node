@@ -3,6 +3,9 @@
 //! node spawner (U3).
 
 pub mod assert;
+// U2 fixture state matrix + per-gate-class probe generators; driven by U3.
+#[allow(dead_code)]
+pub mod probe;
 // U1 deny-bearing route registry; fields consumed by U2/U3 as they land.
 #[allow(dead_code)]
 pub mod routes;
