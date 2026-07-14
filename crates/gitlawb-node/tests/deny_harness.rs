@@ -951,6 +951,77 @@ mod completeness {
     use super::deny_bearing_routes;
     use crate::support::routes::{GateClass, Principal};
 
+    /// The CLOSED set of structural reasons a read-gate handler may sit out of the
+    /// runtime 404 sweep (#195, U4/R4). This replaces the free-text `reason`
+    /// strings the old allowlist carried: a "deferred / needs seeding" prose excuse
+    /// no longer type-checks. Every `READ_GATE_NOT_DRIVEN` entry must name one of
+    /// these variants, so a reviewer sees a STRUCTURAL class (why the read is not a
+    /// drivable 404-deny GET), never a soft deferral that hides an undriven private
+    /// read. A drivable GET (the nine U3 reads) cannot be parked here because none
+    /// of these classes fits it — and the driven-not-relabeled assertion below
+    /// makes that a hard failure rather than a judgment call.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NotDrivenReason {
+        /// A create/write path that read-gates the caller before mutating, not a
+        /// 404-deny GET. Its owner/author behaviour is covered by the mutation
+        /// authz guard in `src/api/mod.rs`, not this GET-read sweep.
+        ReadGatingMutation,
+        /// A git smart-HTTP read (`info/refs`, `git-upload-pack`): its
+        /// withheld-subtree 404/exclusion is driven by the U7/U8 real-clone cases,
+        /// not the API GET sweep.
+        GitSmartHttpRead,
+        /// A content-addressed read (`/ipfs/{cid}`): its 404 deny + no-leak is
+        /// driven by the U5b/U8 anon_ipfs/clone cases in this file.
+        ContentAddressedRead,
+        /// A global list-FILTER: returns 200 with unreadable rows removed, never a
+        /// 404, so it is not a deny-bearing read at all.
+        GlobalListFilter,
+        /// The owner-2xx twin needs a live external dependency the harness lacks:
+        /// `get_encrypted_blob` reads through `ipfs_pin::cat` with no harness stub,
+        /// so it cannot be driven as a 2xx twin here. An honest exclusion, not a
+        /// deferral (#195, KTD-5).
+        ExternalDependencyUnavailable,
+    }
+
+    /// Read-gate handlers NOT driven as a `ReadGate` row, each carrying a CLOSED
+    /// structural reason ([`NotDrivenReason`]) — never free-text. This is the
+    /// enforced form of the prose that used to live in routes.rs; a handler leaving
+    /// the sweep must be moved here under a structural class, never with a soft
+    /// "deferred / needs seeding" excuse (which no longer type-checks).
+    ///
+    /// Single source of truth: both the marker-scan guard
+    /// (`every_read_gate_handler_is_driven_or_explicitly_allowlisted`) and the
+    /// route-table cross-check (`mounted_repo_gets_are_driven_excused_or_declared_public`)
+    /// read this, so the two cannot drift.
+    ///
+    /// get_issue / get_pr / get_pr_diff / list_issue_comments / list_reviews /
+    /// list_comments / get_cert / get_bounty / get_tree are DRIVEN as real ReadGate
+    /// rows in deny_bearing_routes() (#195, U3); the driven-not-relabeled assertion
+    /// bars any of them from being quietly re-parked here.
+    const READ_GATE_NOT_DRIVEN: &[(&str, NotDrivenReason)] = &[
+        // Owner-2xx twin needs a live IPFS backend (`ipfs_pin::cat`) the harness has
+        // no stub for — an honest external-dependency exclusion (#195, KTD-5).
+        ("get_encrypted_blob", NotDrivenReason::ExternalDependencyUnavailable),
+        // Read-gates but is a mutation, not a 404-deny GET.
+        ("create_review", NotDrivenReason::ReadGatingMutation),
+        ("create_comment", NotDrivenReason::ReadGatingMutation),
+        ("create_pr", NotDrivenReason::ReadGatingMutation),
+        ("create_issue", NotDrivenReason::ReadGatingMutation),
+        ("create_issue_comment", NotDrivenReason::ReadGatingMutation),
+        ("create_bounty", NotDrivenReason::ReadGatingMutation),
+        ("claim_bounty", NotDrivenReason::ReadGatingMutation),
+        ("fork_repo", NotDrivenReason::ReadGatingMutation),
+        ("star_repo", NotDrivenReason::ReadGatingMutation),
+        ("unstar_repo", NotDrivenReason::ReadGatingMutation),
+        // Content-addressed read: driven by the U5b/U8 anon_ipfs/clone cases.
+        ("get_by_cid", NotDrivenReason::ContentAddressedRead),
+        // Git smart-HTTP reads: driven by the U7/U8 real-clone cases.
+        ("git_info_refs", NotDrivenReason::GitSmartHttpRead),
+        ("git_upload_pack", NotDrivenReason::GitSmartHttpRead),
+        // Global list-FILTER: 200 with unreadable rows removed, never a 404.
+        ("list_all_bounties", NotDrivenReason::GlobalListFilter),
+    ];
+
     /// Every `.route("<path>", <method>(<handler>)…)` mount in `src`, as
     /// (METHOD, path). Multiline-aware: most mounts put the path on the line after
     /// `.route(`, so a per-line scan false-greens. Walks balanced parens from each
@@ -1283,91 +1354,9 @@ mod completeness {
     /// like the owner scan, so a new module is covered too.
     #[test]
     fn every_read_gate_handler_is_driven_or_explicitly_allowlisted() {
-        // Read-gate handlers NOT driven as a ReadGate row, each with the reason it
-        // is out of the runtime 404 sweep. This is the enforced form of the prose
-        // that used to live at routes.rs:351-365; a handler leaving the sweep must
-        // be moved here with a reason, never silently.
-        //
-        // Reasons fall into a few honest classes, so a reviewer can see WHY a
-        // read-gated endpoint is not driven for its 404 rather than trusting a name.
-        const READ_GATE_NOT_DRIVEN: &[(&str, &str)] = &[
-            // get_issue / get_pr / get_pr_diff / list_issue_comments / list_reviews /
-            // list_comments / get_cert / get_bounty / get_tree are now DRIVEN as real
-            // ReadGate rows in deny_bearing_routes() (#195, U3), each with a per-read
-            // withheld marker; they were removed from this allowlist when they landed.
-            //
-            // get_encrypted_blob stays: its owner-2xx twin needs a live IPFS backend
-            // (`ipfs_pin::cat`) the harness has no stub for, so it cannot be driven as
-            // a 2xx twin here. U4 moves it to a structural external-dependency class.
-            (
-                "get_encrypted_blob",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
-            // Read-gates but is a mutation, not a 404-deny GET: create/write paths
-            // that call authorize_repo_read on the caller before mutating. Their
-            // owner-gate/author behaviour is covered by the mutation authz guard in
-            // src/api/mod.rs, not this GET-read sweep.
-            (
-                "create_review",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "create_comment",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "create_pr",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "create_issue",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "create_issue_comment",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "create_bounty",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "claim_bounty",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "fork_repo",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "star_repo",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            (
-                "unstar_repo",
-                "read-gates but is a mutation, not a 404-deny GET",
-            ),
-            // Content-addressed read: its 404 deny + no-leak is already driven by
-            // the U5b/U8 anon_ipfs/clone cases in this file.
-            ("get_by_cid", "covered by U5b/U8 anon_ipfs/clone cases"),
-            // Git smart-HTTP reads: their withheld-subtree 404/exclusion is driven
-            // by the U7/U8 real-clone cases, not the API GET sweep.
-            (
-                "git_info_refs",
-                "git smart-HTTP read: covered by U7/U8 clone cases",
-            ),
-            (
-                "git_upload_pack",
-                "git smart-HTTP read: covered by U7/U8 clone cases",
-            ),
-            // Global list-FILTER: returns 200 with unreadable rows removed, never a
-            // 404, so it is not a deny-bearing read at all (matches the EXCLUDED
-            // class the prose called out).
-            (
-                "list_all_bounties",
-                "global list-filter: 200 with unreadable rows removed, never 404",
-            ),
-        ];
+        // The allowlist is the module-level `READ_GATE_NOT_DRIVEN` (single source of
+        // truth, shared with the route-table cross-check). Its entries carry a closed
+        // `NotDrivenReason`, so a soft "deferred" excuse cannot be added.
 
         let driven_read_handlers: HashSet<&str> = deny_bearing_routes()
             .iter()
@@ -1433,6 +1422,222 @@ mod completeness {
                  read-gate marker (renamed, removed, or gate dropped?) — update the list"
             );
         }
+
+        // DRIVEN-NOT-RELABELED (#195, U4/R5). The nine reads U3 drove must each be a
+        // driven `ReadGate` row AND absent from `READ_GATE_NOT_DRIVEN`, so none can
+        // be quietly re-parked under a mislabeled structural reason. A structural
+        // class (mutation / git / content-addressed / list-filter / external-dep)
+        // does not fit any of these nine, but a reviewer could still mistype one in;
+        // this makes that a hard failure rather than a judgment call. Together with
+        // the closed `NotDrivenReason` enum, a drivable private read cannot leave the
+        // sweep: either the class does not compile, or this assertion fires.
+        const U3_DRIVEN_READS: &[&str] = &[
+            "get_issue",
+            "get_pr",
+            "get_pr_diff",
+            "list_issue_comments",
+            "list_reviews",
+            "list_comments",
+            "get_cert",
+            "get_bounty",
+            "get_tree",
+        ];
+        for name in U3_DRIVEN_READS {
+            assert!(
+                driven_read_handlers.contains(name),
+                "U3 drove `{name}` as a private read, but it is no longer a ReadGate \
+                 row in deny_bearing_routes() — a driven read was dropped or renamed"
+            );
+            assert!(
+                !allowlisted.contains(name),
+                "`{name}` is a U3-driven private read but was re-parked in \
+                 READ_GATE_NOT_DRIVEN — a drivable 404-deny GET may not be excused \
+                 under a structural reason; drive it, do not relabel it"
+            );
+        }
+    }
+
+    /// The repo-scoped GET mounts the [`scrape_mounts`] route-table walk does NOT
+    /// treat as read-gated — genuinely public repo listings that fetch the repo and
+    /// return metadata WITHOUT an `authorize_repo_read` / `visibility_check` call
+    /// (verified in their handlers). They carry no read gate, so the cross-check
+    /// below must not demand they be driven or structurally excused. Keyed by path
+    /// (the unit `scrape_mounts` yields) so a new gate added to one of these later
+    /// still surfaces via the marker scan; this list only says "no gate today".
+    const PUBLIC_REPO_GETS: &[&str] = &[
+        "/api/v1/repos/{owner}/{repo}/hooks", // list_webhooks
+        "/api/v1/repos/{owner}/{repo}/branches/protected", // list_protected_branches
+        "/api/v1/repos/{owner}/{repo}/replicas", // list_replicas
+    ];
+
+    /// True for a mounted path that is scoped to a single repo — the API form
+    /// `/api/v1/repos/{owner}/{repo}/…` and the bare git form `/{owner}/{repo}/…`.
+    /// These are the paths whose GET, if read-gated, must be driven or excused; a
+    /// collection/global path (`/api/v1/repos`, `/api/v1/bounties`, `/api/v1/agents`
+    /// …) is out of scope for the repo-read cross-check.
+    fn is_repo_scoped_path(path: &str) -> bool {
+        if let Some(rest) = path.strip_prefix("/api/v1/repos/") {
+            // `.../{owner}/{repo}/…` — at least owner + repo + a trailing segment,
+            // and NOT the `/api/v1/repos/federated` or bare `/api/v1/repos` forms
+            // (those have no `{owner}` placeholder).
+            return rest.starts_with("{owner}/{repo}/");
+        }
+        // Bare git form: `/{owner}/{repo}/info/refs` etc. It is repo-scoped when the
+        // first two segments are the owner/repo placeholders.
+        let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        segs.len() >= 3 && segs[0] == "{owner}" && segs[1] == "{repo}"
+    }
+
+    /// Extract the handler name from a single `.route("path", …get(handler)…)` mount
+    /// body: the last `::`-tail ident inside the FIRST routing-method call for the
+    /// requested HTTP method. Returns `None` if the method is not mounted on this
+    /// route. Reuses the same balanced-paren mount slice `scrape_mounts` walks.
+    fn handler_for_mount(call: &str, method: &str) -> Option<String> {
+        let needle = format!("{}(", method.to_lowercase());
+        let mut k = 0;
+        while let Some(rel) = call[k..].find(&needle) {
+            let at = k + rel;
+            let boundary = call[..at]
+                .chars()
+                .last()
+                .map(|c| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(true);
+            if boundary {
+                // The handler is the first path-expression after `get(`; take up to
+                // the closing `)` and keep the final `::`-segment ident.
+                let inner_start = at + needle.len();
+                let inner = &call[inner_start..];
+                let end = inner.find([')', ',']).unwrap_or(inner.len());
+                let expr = inner[..end].trim();
+                let name: String = expr
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(expr)
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    return Some(name);
+                }
+            }
+            k = at + needle.len();
+        }
+        None
+    }
+
+    /// Like [`scrape_mounts`] but also captures the handler name, so a mounted
+    /// (METHOD, path) can be resolved to its handler for the read-gate cross-check.
+    /// Same balanced-paren walk as `scrape_mounts`.
+    fn scrape_mounts_with_handler(src: &str) -> Vec<(String, String, String)> {
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(rel) = src[i..].find(".route(") {
+            let open = i + rel + ".route(".len();
+            let mut depth = 1i32;
+            let mut j = open;
+            while j < src.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let call = &src[open..j.saturating_sub(1)];
+            i = j;
+            let Some(qs) = call.find('"') else { continue };
+            let Some(qe) = call[qs + 1..].find('"') else {
+                continue;
+            };
+            let path = &call[qs + 1..qs + 1 + qe];
+            for m in ["get", "post", "put", "delete", "patch"] {
+                let needle = format!("{m}(");
+                let mut k = 0;
+                while let Some(mrel) = call[k..].find(&needle) {
+                    let at = k + mrel;
+                    let boundary = call[..at]
+                        .chars()
+                        .last()
+                        .map(|c| !(c.is_alphanumeric() || c == '_'))
+                        .unwrap_or(true);
+                    if boundary {
+                        if let Some(h) = handler_for_mount(call, m) {
+                            out.push((m.to_uppercase(), path.to_string(), h));
+                        }
+                    }
+                    k = at + needle.len();
+                }
+            }
+        }
+        out
+    }
+
+    /// SCRAPE-MOUNTS CROSS-CHECK (#195, U4/R5, INV-21b). The read-gate orphan guard
+    /// above derives its required set from a SOURCE-MARKER scan of `src/api`; this
+    /// derives it instead from the MOUNTED ROUTE TABLE (`server.rs`). Every mounted
+    /// repo-scoped GET must be EITHER a driven `ReadGate` row, OR a deny-bearing GET
+    /// of another class already in the registry (`list_visibility` is an owner-gated
+    /// GET), OR structurally excused in `READ_GATE_NOT_DRIVEN`, OR a declared public
+    /// repo-GET (`PUBLIC_REPO_GETS`). A mounted repo-GET that is none of these fails
+    /// HERE — which catches a read that gates via a helper the marker scan does not
+    /// recognize: it would still be mounted, so it must be classified rather than
+    /// slipping past silently.
+    #[test]
+    fn mounted_repo_gets_are_driven_excused_or_declared_public() {
+        let server = include_str!("../src/server.rs");
+        let mounts = scrape_mounts_with_handler(server);
+
+        // Integrity floor: the handler-aware walk must find roughly as many mounts
+        // as the plain scrape; if it collapsed, the cross-check would pass vacuously.
+        assert!(
+            mounts.len() >= 90,
+            "handler-aware mount scrape found only {} routes — the parser likely broke (floor 90)",
+            mounts.len()
+        );
+
+        // Every path that is a driven ReadGate row, and every deny-bearing GET path
+        // of any class (so the owner-gated `list_visibility` GET is accounted for).
+        let driven_read_paths: HashSet<&str> = deny_bearing_routes()
+            .iter()
+            .filter(|r| r.gate == GateClass::ReadGate)
+            .map(|r| r.path)
+            .collect();
+        let deny_bearing_get_paths: HashSet<&str> = deny_bearing_routes()
+            .iter()
+            .filter(|r| r.method == "GET")
+            .map(|r| r.path)
+            .collect();
+        let excused_handlers: HashSet<&str> =
+            READ_GATE_NOT_DRIVEN.iter().map(|(h, _)| *h).collect();
+        let public_paths: HashSet<&str> = PUBLIC_REPO_GETS.iter().copied().collect();
+
+        let mut repo_gets_seen = 0usize;
+        for (method, path, handler) in &mounts {
+            if method != "GET" || !is_repo_scoped_path(path) {
+                continue;
+            }
+            repo_gets_seen += 1;
+            let classified = driven_read_paths.contains(path.as_str())
+                || deny_bearing_get_paths.contains(path.as_str())
+                || excused_handlers.contains(handler.as_str())
+                || public_paths.contains(path.as_str());
+            assert!(
+                classified,
+                "mounted repo-scoped GET `{path}` (handler `{handler}`) is neither a \
+                 driven ReadGate row, a deny-bearing GET row, structurally excused in \
+                 READ_GATE_NOT_DRIVEN, nor a declared public repo-GET — classify it \
+                 (it may gate via a helper the source-marker scan does not recognize)"
+            );
+        }
+
+        // Non-vacuous floor: the tree mounts well over a dozen repo-scoped GETs; if
+        // the filter found almost none, the loop above proved nothing.
+        assert!(
+            repo_gets_seen >= 15,
+            "found only {repo_gets_seen} mounted repo-scoped GETs — the path filter \
+             or the scrape likely broke (floor 15)"
+        );
     }
 
     // ── F3 unit tests: the inline owner-gate did_matches discriminator ───────────
