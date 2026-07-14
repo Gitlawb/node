@@ -1044,6 +1044,43 @@ async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Persist a just-created identity key, removing the file if the write failed
+/// (#194, F1). `create_new` makes the inode appear before the PEM is flushed, so a
+/// failed `write_all` (ENOSPC/EIO/quota) leaves an empty or partial PEM behind;
+/// every later start would then take the `exists()` branch and re-parse that
+/// corrupt file forever, exiting `invalid PEM key` instead of regenerating. Remove
+/// it on failure so the next start starts clean.
+fn write_key_or_cleanup(path: &std::path::Path, write_result: std::io::Result<()>) -> Result<()> {
+    write_result.map_err(|e| {
+        // Best-effort: if removal also fails there is nothing more to do, and the
+        // original write error is the one worth surfacing.
+        let _ = std::fs::remove_file(path);
+        anyhow::Error::new(e).context(format!("failed to write key to {}", path.display()))
+    })
+}
+
+/// Verify an identity key file is not world/group-readable (#194, F2). A `chmod`
+/// that failed or silently no-op'd (read-only mount, ACL mismatch) must not leave
+/// a readable private key in use, so this is checked after any tightening attempt
+/// and fails closed rather than logging a normal "loaded identity" path.
+#[cfg(unix)]
+fn ensure_key_mode_0600(path: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("stat identity key {}", path.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        anyhow::bail!(
+            "identity key {} has mode {mode:o}, expected 0600 — refusing to use a \
+             world/group-readable private key",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
     let key_path = config.resolved_key_path();
 
@@ -1056,9 +1093,17 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(meta) = std::fs::metadata(path) {
                 if meta.permissions().mode() & 0o777 != 0o600 {
-                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    // Do NOT silently ignore a failed tighten (#194, F2): surface it
+                    // so a key we cannot secure is not read and used exposed.
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                        .with_context(|| {
+                            format!("could not tighten identity key {} to 0600", path.display())
+                        })?;
                 }
             }
+            // Verify the key is actually 0600 before using it — a chmod that
+            // succeeded-but-no-op'd (some mounts) still leaves it exposed.
+            ensure_key_mode_0600(path)?;
         }
         let pem = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read key from {}", path.display()))?;
@@ -1119,9 +1164,9 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
         {
             Ok(mut f) => {
                 // The file is 0600 from creation, so the PEM is never
-                // world-readable, even momentarily.
-                f.write_all(pem.as_bytes())
-                    .with_context(|| format!("failed to write key to {}", key_path.display()))?;
+                // world-readable, even momentarily. On a failed write, remove the
+                // empty/partial file so a later start regenerates (#194, F1).
+                write_key_or_cleanup(&key_path, f.write_all(pem.as_bytes()))?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // A concurrent start won the race and wrote the identity; load
@@ -1143,8 +1188,9 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
             .open(&key_path)
         {
             Ok(mut f) => {
-                f.write_all(pem.as_bytes())
-                    .with_context(|| format!("failed to write key to {}", key_path.display()))?;
+                // On a failed write, remove the empty/partial file so a later
+                // start regenerates instead of re-parsing it forever (#194, F1).
+                write_key_or_cleanup(&key_path, f.write_all(pem.as_bytes()))?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return load_racing(&key_path);
@@ -1330,6 +1376,69 @@ mod identity_key_tests {
         assert!(
             dids.iter().all(|d| d == first),
             "all concurrent starts must converge on one identity, got: {dids:?}"
+        );
+    }
+
+    /// #194 (F1): a failed write of a just-created key file removes it, so a later
+    /// start regenerates instead of re-parsing an empty/partial PEM forever and
+    /// wedging on `invalid PEM key`. RED without the `remove_file` in
+    /// `write_key_or_cleanup`: the partial file survives the error.
+    #[test]
+    fn failed_write_removes_the_partial_key_file() {
+        use super::write_key_or_cleanup;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        std::fs::write(&key_path, b"partial-pem").expect("seed partial file");
+        assert!(key_path.exists());
+
+        let err = std::io::Error::other("simulated ENOSPC");
+        let r = write_key_or_cleanup(&key_path, Err(err));
+        assert!(r.is_err(), "the write error must propagate");
+        assert!(
+            !key_path.exists(),
+            "a failed first write must not leave a partial key file to wedge later starts"
+        );
+    }
+
+    /// A successful write leaves the file in place (the common case).
+    #[test]
+    fn successful_write_keeps_the_key_file() {
+        use super::write_key_or_cleanup;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        std::fs::write(&key_path, b"good-pem").expect("seed file");
+        assert!(write_key_or_cleanup(&key_path, Ok(())).is_ok());
+        assert!(
+            key_path.exists(),
+            "a successful write leaves the file in place"
+        );
+    }
+
+    /// #194 (F2): a loose (world/group-readable) key that cannot be tightened is
+    /// rejected fail-closed rather than read and used exposed; a 0600 key is
+    /// accepted. RED without `ensure_key_mode_0600`: a 0644 key is used silently.
+    #[test]
+    fn loose_key_mode_is_rejected_not_used() {
+        use super::ensure_key_mode_0600;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        std::fs::write(&key_path, b"key").expect("seed file");
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen perms");
+        let err = ensure_key_mode_0600(&key_path)
+            .expect_err("a world/group-readable key must be rejected")
+            .to_string();
+        assert!(
+            err.contains("644"),
+            "the failure must name the exposed mode: {err}"
+        );
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("tighten perms");
+        assert!(
+            ensure_key_mode_0600(&key_path).is_ok(),
+            "a 0600 key must be accepted"
         );
     }
 }
