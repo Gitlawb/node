@@ -460,4 +460,19 @@ mod tests {
         assert!(matches!(check.state, CheckState::Ok));
         assert!(check.detail.contains("up to date"));
     }
+
+    #[tokio::test]
+    async fn test_check_version_http_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .with_status(403)
+            .create_async()
+            .await;
+
+        let check = check_version("0.1.0", &server.url()).await;
+        assert!(matches!(check.state, CheckState::Ok));
+        assert!(check.detail.contains("GitHub API returned HTTP 403"));
+    }
 }
+
