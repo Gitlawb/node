@@ -70,9 +70,12 @@ jobs:
             const changedRust = names.some(n => n.startsWith("crates/") && n.endsWith(".rs"));
             // A test can live in a tests/ dir, a *_test.rs file, or (the common Rust
             // pattern) an inline #[test] / #[cfg(test)] block added inside the source file.
+            // Async tests use a namespaced attribute (#[tokio::test], #[async_std::test],
+            // ...) rather than the bare #[test], so match any attribute ending in ::test]
+            // too, not just the exact #[test] / #[cfg(test) forms.
             const addsInlineTest = files.some(f =>
               f.filename.endsWith(".rs") && f.patch &&
-              /^\+.*#\[(test\]|cfg\(test\))/m.test(f.patch));
+              /^\+.*(#\[test\]|#\[cfg\(test\)|::test\])/m.test(f.patch));
             const touchedTests =
               names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
             if (changedRust && !touchedTests) want.add("needs-tests");
