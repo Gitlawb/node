@@ -30,6 +30,10 @@ pub struct Fixture {
     /// against this so an anon caller gets the existence-hiding 404 and the owner
     /// twin gets 2xx.
     pub private_repo: String,
+    /// The private repo's internal id (UUID). A read-gate denial body must never
+    /// echo it: a 404 that serializes the private record's internal id has leaked
+    /// repository metadata just as much as the blob content (#195, F4).
+    pub private_repo_id: String,
     /// A seeded blob path present in both repos, for `{*path}` reads.
     pub content_path: String,
     /// The DISTINCTIVE secret bytes seeded into the private repo's blob. A
@@ -71,7 +75,7 @@ impl Fixture {
         // (full + short) is withheld too — a 404 naming the object's id has leaked
         // its existence just as much as its bytes.
         let private_secret = "TOPSECRET-PRIVREAD-U3".to_string();
-        node.seed_repo(&owner_did, priv_repo, false).await;
+        let private_repo_id = node.seed_repo(&owner_did, priv_repo, false).await;
         let priv_oids = node.seed_bare_repo(
             &owner_did,
             priv_repo,
@@ -88,6 +92,7 @@ impl Fixture {
             public_repo: pub_repo.to_string(),
             public_repo_id,
             private_repo: priv_repo.to_string(),
+            private_repo_id,
             content_path,
             private_secret,
             private_blob_oid,
@@ -184,24 +189,43 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
         }
         GateClass::ReadGate => {
             let path = fill(row.path, fixture, &fixture.private_repo);
-            let mut v = vec![Probe {
-                label: format!("{} read-gate hostile", row.handler),
-                method: method.clone(),
-                path: path.clone(),
-                body: body.clone(),
-                signer: Signer::Anon,
-                json,
-                expect: Expect::Deny(404),
-                // INV-8: the private repo's blob and its OID are actually seeded
-                // here, so the 404 body must echo neither the secret content nor the
-                // blob OID (full or short). An empty withheld list would let a 404
-                // that spilled the private content pass as a clean denial.
-                withheld: vec![
-                    fixture.private_secret.clone(),
-                    fixture.private_blob_oid.clone(),
-                    fixture.private_blob_oid_short.clone(),
-                ],
-            }];
+            // INV-8: the private repo's blob and its OID are actually seeded here, so
+            // the 404 body must echo neither the secret content nor the blob OID
+            // (full or short) nor the private repo's internal id (#195, F4). An empty
+            // withheld list would let a 404 that spilled the private content pass as
+            // a clean denial.
+            let withheld = vec![
+                fixture.private_secret.clone(),
+                fixture.private_blob_oid.clone(),
+                fixture.private_blob_oid_short.clone(),
+                fixture.private_repo_id.clone(),
+            ];
+            let mut v = vec![
+                Probe {
+                    label: format!("{} read-gate hostile (anon)", row.handler),
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                    signer: Signer::Anon,
+                    json,
+                    expect: Expect::Deny(404),
+                    withheld: withheld.clone(),
+                },
+                // #195 (F1): a signed NON-READER must also get the existence-hiding
+                // 404 — a signature is not access (INV-12). Without this probe, a
+                // regression that treats any valid signature as authorized would leak
+                // the private repo while the anon probe stayed green.
+                Probe {
+                    label: format!("{} read-gate hostile (signed non-reader)", row.handler),
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                    signer: Signer::Stranger,
+                    json,
+                    expect: Expect::Deny(404),
+                    withheld: withheld.clone(),
+                },
+            ];
             // Positive twin: prove the 404 is the gate, not an absent entity.
             let twin = match row.reach {
                 Reach::ReaderReads => Probe {
@@ -265,6 +289,7 @@ mod tests {
             public_repo: "prober-pub".to_string(),
             public_repo_id: "pub-id".to_string(),
             private_repo: "prober-priv".to_string(),
+            private_repo_id: "priv-repo-uuid-0BADF00D".to_string(),
             content_path: "public/a.txt".to_string(),
             private_secret: "TOPSECRET-PRIVREAD-U3".to_string(),
             private_blob_oid: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
@@ -303,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn read_gate_row_yields_anon_404_and_positive_twin() {
+    fn read_gate_row_yields_anon_and_stranger_404_and_positive_twin() {
         let row = Row {
             method: "GET",
             path: "/api/v1/repos/{owner}/{repo}/blob/{*path}",
@@ -315,9 +340,17 @@ mod tests {
         };
         let f = fx();
         let ps = probes_for(&row, &f);
-        assert_eq!(ps.len(), 2);
+        // anon hostile, signed-stranger hostile (#195 F1), owner twin.
+        assert_eq!(ps.len(), 3);
         assert_eq!(ps[0].signer, Signer::Anon);
         assert!(matches!(ps[0].expect, Expect::Deny(404)));
+        // #195 (F1): the signed non-reader hostile must also expect a 404 no-leak.
+        assert_eq!(ps[1].signer, Signer::Stranger);
+        assert!(matches!(ps[1].expect, Expect::Deny(404)));
+        assert!(
+            !ps[1].withheld.is_empty(),
+            "the signed-stranger hostile must carry the same withheld tokens"
+        );
         assert!(
             ps[0].path.contains("prober-priv"),
             "read-gate uses the private repo"
@@ -342,11 +375,11 @@ mod tests {
             ps[0].withheld.contains(&f.private_blob_oid_short),
             "the short blob OID prefix must be a withheld token"
         );
-        assert_eq!(ps[1].signer, Signer::Owner);
-        assert!(matches!(ps[1].expect, Expect::Ok2xx));
+        assert_eq!(ps[2].signer, Signer::Owner);
+        assert!(matches!(ps[2].expect, Expect::Ok2xx));
         // The granted twin returns the content, so it withholds nothing.
         assert!(
-            ps[1].withheld.is_empty(),
+            ps[2].withheld.is_empty(),
             "the granted read twin must not carry withheld tokens"
         );
     }
@@ -385,17 +418,22 @@ mod tests {
             reach: Reach::SiblingPublic("/api/v1/repos/{owner}/{repo}/blob/{*path}"),
         };
         let ps = probes_for(&row, &fx());
-        assert_eq!(ps.len(), 2);
+        // anon hostile, signed-stranger hostile (#195 F1), sibling-public twin.
+        assert_eq!(ps.len(), 3);
         // Hostile: anon on the withheld path -> 404.
         assert_eq!(ps[0].signer, Signer::Anon);
         assert!(matches!(ps[0].expect, Expect::Deny(404)));
         assert!(ps[0].path.ends_with("/blob/secret/x.txt"));
+        // Signed non-reader on the withheld path -> 404 too.
+        assert_eq!(ps[1].signer, Signer::Stranger);
+        assert!(matches!(ps[1].expect, Expect::Deny(404)));
+        assert!(ps[1].path.ends_with("/blob/secret/x.txt"));
         // Twin: anon on the sibling PUBLIC path -> non-empty 2xx (proves the 404
         // is path-scoped withholding, not a blanket refusal).
-        assert_eq!(ps[1].signer, Signer::Anon);
-        assert!(matches!(ps[1].expect, Expect::Ok2xx));
+        assert_eq!(ps[2].signer, Signer::Anon);
+        assert!(matches!(ps[2].expect, Expect::Ok2xx));
         assert!(
-            ps[1].path.contains("public/a.txt"),
+            ps[2].path.contains("public/a.txt"),
             "sibling template's {{*path}} is filled from the fixture content path"
         );
     }
@@ -439,6 +477,20 @@ mod tests {
         assert!(
             r.unwrap_err().contains(&f.private_secret),
             "the failure must name the leaked secret token"
+        );
+
+        // #195 (F4): a 404 that serialized the private repo's internal id (UUID) is
+        // a repository-metadata leak and must be flagged too — proving the UUID is a
+        // load-bearing withheld token, not just the blob content.
+        let leaking_meta = format!(r#"{{"error":"repo {} not found"}}"#, f.private_repo_id);
+        let rm = check_denied(404, &leaking_meta, 404, &tokens);
+        assert!(
+            rm.is_err(),
+            "a 404 body echoing the private repo id must be flagged: {rm:?}"
+        );
+        assert!(
+            rm.unwrap_err().contains(&f.private_repo_id),
+            "the failure must name the leaked private repo id token"
         );
 
         // A clean 404 (no private tokens) with the same tokens passes: the tokens do

@@ -226,6 +226,36 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
         },
+        // #195 (F2): repo-root reads that gate on "/" — driven as real ReadGate rows
+        // rather than source-only exemptions, so a runtime bypass that keeps the
+        // authorize_repo_read/visibility_check marker but leaks is caught.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/star",
+            gate: GateClass::ReadGate,
+            handler: "stars::get_star_status",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/icaptcha-proof",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_icaptcha_proof",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate",
+            gate: GateClass::ReadGate,
+            handler: "encrypted::replicate_encrypted_blobs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+        },
         Row {
             method: "GET",
             path: "/api/v1/repos/{owner}/{repo}/commits",

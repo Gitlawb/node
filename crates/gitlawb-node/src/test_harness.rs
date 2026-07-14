@@ -169,6 +169,16 @@ impl TestNode {
         record.id
     }
 
+    /// Mark `branch` as protected on `repo_id`, so a non-owner push to it is
+    /// rejected by the branch-protection gate (used by the deny-prober's
+    /// protected-push probe — #195, F3).
+    pub async fn seed_protected_branch(&self, repo_id: &str, branch: &str, created_by: &str) {
+        self.db
+            .protect_branch(repo_id, branch, created_by)
+            .await
+            .expect("seed protected branch");
+    }
+
     /// Seed an open PR `number` in `repo_id`, authored by `author_did`. The
     /// author-or-owner close gate (`close_pr`) loads the PR *before* it runs, so a
     /// deny-prober row for `.../pulls/{number}/close` needs the PR to exist or a

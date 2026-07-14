@@ -12,7 +12,7 @@ use std::process::Command;
 
 use support::assert::assert_denied;
 use support::probe::{probes_for, Expect, Fixture, Probe, Signer};
-use support::routes::deny_bearing_routes;
+use support::routes::{deny_bearing_routes, GateClass};
 use support::signing::signed_request;
 
 use gitlawb_core::cid::Cid;
@@ -111,6 +111,79 @@ async fn unsigned_receive_pack_is_denied(pool: sqlx::PgPool) {
     // No repo was seeded, so there are no OIDs to leak; the assertion still
     // enforces the 4xx-and-not-empty-200 INV-8 shape.
     assert_denied(resp, 401, &[]).await;
+}
+
+/// Build a minimal git-receive-pack request body: one ref-update pkt-line for
+/// `refs/heads/<branch>` (dummy 40-hex old/new SHAs — the branch-protection gate
+/// only reads the ref NAME) plus a flush. Enough to reach the ref-update parse
+/// and the protection gate, not a real pack.
+fn receive_pack_update_body(branch: &str) -> Vec<u8> {
+    let old = "0".repeat(40);
+    let new = "1".repeat(40);
+    let line = format!("{old} {new} refs/heads/{branch}\0report-status\n");
+    let pkt = format!("{:04x}{line}", line.len() + 4);
+    let mut body = pkt.into_bytes();
+    body.extend_from_slice(b"0000");
+    body
+}
+
+/// #195 (F3): a signed NON-OWNER pushing to a PROTECTED branch is forbidden (403)
+/// by the branch-protection gate (`repos.rs`), and the owner pushing to the same
+/// branch is NOT blocked (control). git_receive_pack's registry row only drives the
+/// unsigned-401 signature path, so without this probe inverting the 403 leaves the
+/// sweep AND the completeness scan green. Drives the 403 so the gate can't rot.
+#[sqlx::test]
+async fn signed_stranger_protected_branch_push_is_forbidden(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = reqwest::Client::new();
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+    let stranger = Keypair::generate();
+
+    let repo_id = node.seed_repo(&owner_did, "protrepo", true).await;
+    node.seed_protected_branch(&repo_id, "main", &owner_did)
+        .await;
+
+    let path = format!("/{owner_did}/protrepo/git-receive-pack");
+    let body = receive_pack_update_body("main");
+
+    // Signed non-owner -> 403 branch protection; the denial leaks no repo internals.
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &path,
+        body.clone(),
+        &stranger,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "a signed non-owner push to a protected branch must be forbidden (403)"
+    );
+    assert_denied(resp, 403, &[repo_id.as_str()]).await;
+
+    // Owner control: the owner is NOT blocked by branch protection (it may fail
+    // later on the dummy pack, but must not be the 403 the stranger got).
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &path,
+        body,
+        &owner,
+    )
+    .send()
+    .await
+    .expect("request sends");
+    assert_ne!(
+        resp.status().as_u16(),
+        403,
+        "the owner must not be blocked by their own branch protection (control)"
+    );
 }
 
 // ── U5(b): INV-8/INV-2 — anonymous /ipfs/{cid} of a withheld blob is denied ──
@@ -479,7 +552,16 @@ async fn deny_bearing_registry_denies_hostile_and_admits_authorized(pool: sqlx::
         "deny-bearing route registry is empty — nothing to sweep"
     );
 
+    // #195 (F1): every read-gate row is now probed by a signed non-reader too, so a
+    // dropped stranger probe must fail loudly rather than being absorbed into the
+    // total. Count the read-gate rows and the stranger hostiles separately.
+    let readgate_rows = rows
+        .iter()
+        .filter(|r| matches!(r.gate, GateClass::ReadGate))
+        .count();
+
     let mut hostile_driven = 0usize;
+    let mut readgate_stranger_driven = 0usize;
     let mut twins_driven = 0usize;
 
     for row in rows {
@@ -497,6 +579,11 @@ async fn deny_bearing_registry_denies_hostile_and_admits_authorized(pool: sqlx::
             match &probe.expect {
                 Expect::Deny(code) => {
                     hostile_driven += 1;
+                    // A signed-stranger 404 is the read-gate signed-non-reader probe
+                    // (owner-gate strangers are 403, signature hostiles are anon 401).
+                    if probe.signer == Signer::Stranger && *code == 404 {
+                        readgate_stranger_driven += 1;
+                    }
                     assert_eq!(
                         status.as_u16(),
                         *code,
@@ -537,11 +624,18 @@ async fn deny_bearing_registry_denies_hostile_and_admits_authorized(pool: sqlx::
         }
     }
 
+    // One anon hostile per row, plus one signed-stranger hostile per read-gate row.
     assert_eq!(
         hostile_driven,
-        rows.len(),
-        "expected exactly one hostile probe per deny-bearing row ({} rows), drove {hostile_driven}",
+        rows.len() + readgate_rows,
+        "expected one anon hostile per row ({} rows) plus one signed-stranger hostile per read-gate row ({readgate_rows}), drove {hostile_driven}",
         rows.len()
+    );
+    // #195 (F1): every read-gate row must be probed by a signed non-reader — a
+    // dropped stranger probe fails HERE rather than silently reducing coverage.
+    assert_eq!(
+        readgate_stranger_driven, readgate_rows,
+        "every read-gate row must drive a signed-non-reader 404 probe ({readgate_rows} rows), drove {readgate_stranger_driven}"
     );
     assert!(
         twins_driven >= 1,
@@ -928,10 +1022,13 @@ mod completeness {
         owner_marked.remove("require_repo_owner");
         // git_receive_pack also carries the inline did_matches-owner idiom, but for
         // a SECONDARY gate: its branch-protection push check (repos.rs), not a
-        // whole-handler owner gate. It IS already a registry row — driven for its
-        // 401 signature deny (SignatureRequired class), not a 403 — so it is not an
-        // owner-gate orphan. Drop it so the owner-orphan assert (which only knows
-        // the OwnerGate rows) does not misflag a route that is already swept.
+        // whole-handler owner gate. Its 403 is DRIVEN by the dedicated
+        // `signed_stranger_protected_branch_push_is_forbidden` test (#195, F3) — a
+        // signed non-owner push to a protected branch, with an owner control — so
+        // inverting the gate goes RED there. It is therefore not an owner-gate
+        // orphan (the OwnerGate registry rows can't carry the protected-branch
+        // substrate); drop it so the owner-orphan assert does not misflag a route
+        // whose owner gate is already driven.
         owner_marked.remove("git_receive_pack");
         // Non-vacuous floor: if the marker scan silently found nothing (a parser
         // regression), the orphan loop below would pass by checking zero handlers.
@@ -1078,22 +1175,6 @@ mod completeness {
             (
                 "list_all_bounties",
                 "global list-filter: 200 with unreadable rows removed, never 404",
-            ),
-            // Repo-root GET reads that gate on "/" but are not yet driven as rows.
-            // They COULD be driven (no sub-entity needed); left out for now with an
-            // explicit reason rather than a silent omission — the whole point of the
-            // guard is that this decision is forced and reviewable.
-            (
-                "get_star_status",
-                "repo-root read: not yet driven as a ReadGate row",
-            ),
-            (
-                "get_icaptcha_proof",
-                "repo-root read: not yet driven as a ReadGate row",
-            ),
-            (
-                "replicate_encrypted_blobs",
-                "repo-root read: not yet driven as a ReadGate row",
             ),
         ];
 
