@@ -27,12 +27,15 @@ fn pkt(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn unique_dir(tag: &str) -> PathBuf {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("gitlawb-u7-{}-{}-{}", tag, std::process::id(), n));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A server+clone fixture rooted in a single RAII temp dir (#192, F3). The
+/// `TempDir` removes the whole tree on drop — including while unwinding from a
+/// failed assertion, timeout, or panic — so a failing test never leaves real git
+/// repos behind, and the randomized root name cannot collide with or poison a
+/// later run the way the old pid/counter names could.
+struct Repos {
+    server: PathBuf,
+    clone: PathBuf,
+    _tmp: tempfile::TempDir,
 }
 
 /// Run git in `dir` with deterministic identity/config, asserting success.
@@ -255,39 +258,79 @@ fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Outpu
         None => helper_dir.clone().into_os_string(),
     };
 
-    let mut child = Command::new("git")
-        .args(["-c", "protocol.version=2"])
+    let mut cmd = Command::new("git");
+    cmd.args(["-c", "protocol.version=2"])
         .arg("-C")
         .arg(clone)
         .args(["fetch", "origin", "main"])
         .env("PATH", path_env)
         .env("GITLAWB_NODE", node_url)
-        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch")
+        .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch");
+    run_bounded(cmd, Duration::from_secs(30))
+}
+
+/// Spawn `cmd`, draining stdout and stderr CONCURRENTLY on reader threads while
+/// enforcing `timeout`. Returns `(completed_before_deadline, Output)` (#192, F2).
+///
+/// The concurrent drain is the whole point: polling `try_wait` without reading lets
+/// a child that writes more than an OS pipe buffer (~64 KiB) block on the full pipe
+/// before it exits, so the deadline would trip on pipe backpressure and report a
+/// false "deadlock signature" even while the child is making progress. Draining
+/// continuously makes the deadline measure a real hang only.
+fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Output) {
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn git fetch");
+        .expect("spawn child");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(_status) = child.try_wait().unwrap() {
-            let out = child.wait_with_output().unwrap();
-            return (true, out);
+    let mut out_pipe = child.stdout.take().expect("stdout piped");
+    let mut err_pipe = child.stderr.take().expect("stderr piped");
+    let out_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out_pipe.read_to_end(&mut b);
+        b
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err_pipe.read_to_end(&mut b);
+        b
+    });
+
+    let deadline = Instant::now() + timeout;
+    let completed = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
-            return (false, out); // timed out: the deadlock signature
+            let _ = child.kill(); // closes the pipes so the readers finish
+            break false; // timed out: the real deadlock signature
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+
+    // The child has exited (or been killed), so the pipes are closed and the reader
+    // threads run to completion. Reap the child and collect the drained output.
+    let status = child.wait().expect("reap child");
+    let stdout = out_reader.join().expect("stdout reader");
+    let stderr = err_reader.join().expect("stderr reader");
+    (
+        completed,
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+    )
 }
 
 /// Build a server repo with a shared history deep enough to force multi-round
 /// negotiation (>~32 haves), plus a clone of it, then advance the server so the
 /// fetch has something to negotiate. Returns (server, clone).
-fn build_divergent_repos(shared_commits: usize) -> (PathBuf, PathBuf) {
-    let server = unique_dir("server");
+fn build_divergent_repos(shared_commits: usize) -> Repos {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let server = tmp.path().join("server");
+    std::fs::create_dir_all(&server).unwrap();
     git(&server, &["init", "-q"]);
     std::fs::write(server.join("base.txt"), b"base").unwrap();
     git(&server, &["add", "."]);
@@ -306,7 +349,7 @@ fn build_divergent_repos(shared_commits: usize) -> (PathBuf, PathBuf) {
         );
     }
 
-    let clone = unique_dir("clone");
+    let clone = tmp.path().join("clone");
     // Clone over file:// so the clone shares the full history.
     let status = Command::new("git")
         .args(["clone", "-q"])
@@ -344,7 +387,11 @@ fn build_divergent_repos(shared_commits: usize) -> (PathBuf, PathBuf) {
             "gitlawb://did:key:zTESTOWNER/myrepo",
         ],
     );
-    (server, clone)
+    Repos {
+        server,
+        clone,
+        _tmp: tmp,
+    }
 }
 
 /// Matrix item 7, bridging half: a real multi-round `git fetch` through the
@@ -353,7 +400,10 @@ fn build_divergent_repos(shared_commits: usize) -> (PathBuf, PathBuf) {
 /// one round would fail this), and produces a correct object graph.
 #[test]
 fn real_git_multi_round_fetch_completes() {
-    let (server, clone) = build_divergent_repos(50);
+    // `repos` owns the RAII temp dir; keep it in scope so cleanup runs on drop,
+    // including while unwinding from any assertion below (#192, F3).
+    let repos = build_divergent_repos(50);
+    let (server, clone) = (repos.server.clone(), repos.clone.clone());
     let shim = start_shim(server.clone(), ShimMode::Normal);
 
     let (completed, out) = fetch_with_helper(&clone, &shim.base_url);
@@ -383,8 +433,63 @@ fn real_git_multi_round_fetch_completes() {
         "FETCH_HEAD must match the server tip"
     );
     git(&clone, &["fsck", "--full"]);
+    // No manual cleanup: `repos` drops here (or on unwind) and removes the tree.
+}
 
-    cleanup(&[server, clone]);
+/// #192 (F3): a panic (any unwind) mid-test still removes the repos. The old
+/// success-only `cleanup()` ran after the assertions, so a failing test leaked real
+/// git repos; the RAII `TempDir` drops during unwind instead. Load-bearing: the
+/// path exists inside the closure and must be gone once the panic has unwound past
+/// the guard — a non-RAII cleanup would leave it behind.
+#[test]
+fn repos_are_cleaned_up_on_unwind() {
+    let captured = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+    let c = captured.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let repos = build_divergent_repos(1);
+        assert!(
+            repos._tmp.path().exists(),
+            "temp dir exists during the test"
+        );
+        *c.lock().unwrap() = Some(repos._tmp.path().to_path_buf());
+        panic!("simulated mid-test failure");
+    }));
+    assert!(result.is_err(), "the closure panicked as designed");
+    let path = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("captured the temp path");
+    assert!(
+        !path.exists(),
+        "the RAII temp dir must be removed on unwind, not leaked: {}",
+        path.display()
+    );
+}
+
+/// #192 (F2): `run_bounded` must DRAIN a child that emits more than an OS pipe
+/// buffer, not deadlock. A child writing ~140 KiB to BOTH stdout and stderr and
+/// then exiting must complete within the deadline. Under a `try_wait`-only harness
+/// (no concurrent drain) the child blocks on the full pipe, the deadline trips, and
+/// `completed` is false — the exact false "deadlock signature" F2 fixes. Reverting
+/// the concurrent drain to poll-then-read turns this test RED (completed=false).
+#[test]
+fn run_bounded_drains_large_output_without_deadlock() {
+    // seq 1..=25000 is ~140 KiB on each stream — well past a ~64 KiB pipe buffer.
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg("seq 1 25000; seq 1 25000 1>&2");
+    let (completed, out) = run_bounded(cmd, Duration::from_secs(10));
+    assert!(
+        completed,
+        "a child emitting >64 KiB must be drained and complete, not deadlock (F2)"
+    );
+    assert!(out.status.success(), "the child exited cleanly");
+    assert!(
+        out.stdout.len() > 64 * 1024 && out.stderr.len() > 64 * 1024,
+        "both streams exceeded a pipe buffer (stdout={}, stderr={})",
+        out.stdout.len(),
+        out.stderr.len()
+    );
 }
 
 /// Matrix item 7, withheld half (the Withheld-Path Decision gate): the node's
@@ -394,7 +499,10 @@ fn real_git_multi_round_fetch_completes() {
 /// this test captures the break mode that the decision's remedy addresses.
 #[test]
 fn real_git_withheld_shaped_first_post() {
-    let (server, clone) = build_divergent_repos(50);
+    // `repos` owns the RAII temp dir; keep it in scope so cleanup runs on drop,
+    // including while unwinding from any assertion below (#192, F3).
+    let repos = build_divergent_repos(50);
+    let (server, clone) = (repos.server.clone(), repos.clone.clone());
     let shim = start_shim(server.clone(), ShimMode::WithheldFirstPost);
 
     let (completed, out) = fetch_with_helper(&clone, &shim.base_url);
@@ -426,11 +534,5 @@ fn real_git_withheld_shaped_first_post() {
         );
     }
 
-    cleanup(&[server, clone]);
-}
-
-fn cleanup(dirs: &[PathBuf]) {
-    for d in dirs {
-        let _ = std::fs::remove_dir_all(d);
-    }
+    // No manual cleanup: `repos` drops here (or on unwind) and removes the tree.
 }

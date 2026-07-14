@@ -604,13 +604,17 @@ fn negotiate_upload_pack<R: Read>(
                 body.extend_from_slice(b"0000");
                 false
             }
-            // A `done` round is final. A nonempty EOF-terminated batch is treated
-            // as final too (a test-shim convenience; a real pipe ends a fetch with
-            // `done`, and a genuine mid-negotiation EOF means git aborted).
-            RoundEnd::Done | RoundEnd::Eof => {
+            // Only a real `done` pkt finalizes the stateless request.
+            RoundEnd::Done => {
                 body.extend_from_slice(b"0009done\n");
                 true
             }
+            // A nonempty batch terminated by EOF (no flush, no done) means git
+            // ABORTED mid-negotiation (#192, F1). Terminate WITHOUT POSTing:
+            // synthesizing a `done` here would make the node generate and stream a
+            // full pack — signed, for a private fetch — to a client that has gone
+            // away. The accumulated haves are discarded; there is no one to serve.
+            RoundEnd::Eof => return Ok(()),
         };
 
         post_pack_round(client, post_url, service, signing_key, body, stdout)?;
@@ -2012,40 +2016,40 @@ mod tests {
         );
     }
 
-    /// G3: a nonempty have-batch terminated by EOF (no flush, no done) is POSTed as
-    /// the final round, with a `done` terminator appended.
+    /// G3 (#192, F1): a nonempty have-batch terminated by EOF (no flush, no done)
+    /// means git ABORTED mid-negotiation. The helper must terminate WITHOUT POSTing
+    /// — synthesizing a `done` and sending it would make the node generate and
+    /// stream a full pack (signed, for a private fetch) to a client that has gone
+    /// away. Only a real `done` pkt finalizes the stateless request. RED before the
+    /// fix (the folded `Done | Eof` arm POSTs a synthetic done → 2 requests), GREEN
+    /// after (only the info/refs GET, no upload-pack POST).
     #[test]
-    fn nonempty_eof_batch_posts_as_final_round() {
-        let (base_url, server) = serve_http(vec![
-            TestResponse {
-                request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
-                status: "200 OK",
-                body: "0000",
-            },
-            TestResponse {
-                request_line: "POST /zOwner/myrepo/git-upload-pack",
-                status: "200 OK",
-                body: "0008NAK\nPACKfake",
-            },
-        ]);
+    fn nonempty_eof_batch_aborts_without_posting() {
+        // Only the info/refs GET is served (serve_http accepts exactly N conns). The
+        // fixed helper makes exactly that one request and stops. The pre-fix code
+        // additionally POSTs the synthetic done; that POST hits the now-closed
+        // listener and errors, so handle_connect returns Err and the `.expect` below
+        // fires — the RED. The fixed code returns Ok with one recorded request.
+        let (base_url, server) = serve_http(vec![TestResponse {
+            request_line: "GET /zOwner/myrepo/info/refs?service=git-upload-pack",
+            status: "200 OK",
+            body: "0000",
+        }]);
         let repo_base = format!("{base_url}/zOwner/myrepo");
         let mut stdin_bytes = Vec::new();
         stdin_bytes.extend_from_slice(&want_line(&"a".repeat(40)));
         stdin_bytes.extend_from_slice(b"0000");
         stdin_bytes.extend_from_slice(&pkt(&format!("have {}\n", "1".repeat(40))));
-        // No trailing flush or done: the stream just ends (EOF) after the have.
+        // No trailing flush or done: the stream just ends (EOF) after the have —
+        // git aborted the negotiation.
         let mut stdin = io::Cursor::new(stdin_bytes);
         handle_connect(&repo_base, "git-upload-pack", None, &mut stdin)
-            .expect("nonempty EOF batch should POST as a final round");
+            .expect("an aborted (EOF) negotiation is a clean no-op, not an error");
         let requests = server.join().unwrap();
         assert_eq!(
             requests.len(),
-            2,
-            "one POST for the EOF-terminated final round"
-        );
-        assert!(
-            request_body(&requests[1]).ends_with(b"0009done\n"),
-            "an EOF-terminated final round is sent with a done terminator"
+            1,
+            "an aborted EOF must NOT trigger an upload-pack POST (only the info/refs GET)"
         );
     }
 
