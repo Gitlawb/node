@@ -374,6 +374,191 @@ async fn withheld_path_blob_read_is_denied(pool: sqlx::PgPool) {
     );
 }
 
+// ── U3: get_pr_diff SECOND (per-path) gate — a diff touching a withheld path ──
+
+/// Build a git v0 receive-pack body creating `refs/heads/<branch>` at a fresh
+/// commit that adds `files` on top of the existing `main`, force-updating main to
+/// a deterministic base so `<branch>` shares history with main. Returns the body
+/// bytes plus the new feature tip. Shells out to the local `git`.
+fn build_branch_push_body(
+    server_main_tip: &str,
+    branch: &str,
+    files: &[(&str, &str)],
+) -> Vec<u8> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let work = std::env::temp_dir().join(format!(
+        "gl-u3-prdiff-{}-{}",
+        std::process::id(),
+        server_main_tip
+    ));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).unwrap();
+    let run = |args: &[&str]| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&work)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["config", "user.email", "t@t"]);
+    run(&["config", "user.name", "t"]);
+    std::fs::write(work.join("base.txt"), "prdiff base").unwrap();
+    run(&["add", "base.txt"]);
+    run(&["commit", "-q", "-m", "base"]);
+    let new_main = run(&["rev-parse", "HEAD"]);
+    run(&["checkout", "-q", "-b", branch]);
+    for (p, c) in files {
+        let full = work.join(p);
+        if let Some(parent) = full.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&full, c).unwrap();
+        run(&["add", p]);
+    }
+    run(&["commit", "-q", "-m", "feature"]);
+    let feature_tip = run(&["rev-parse", "HEAD"]);
+
+    let mut child = Command::new("git")
+        .args(["pack-objects", "--stdout", "--revs"])
+        .current_dir(&work)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_ref()
+        .unwrap()
+        .write_all(format!("{new_main}\n{feature_tip}\n").as_bytes())
+        .unwrap();
+    let pack = child.wait_with_output().unwrap().stdout;
+
+    let zero = "0".repeat(server_main_tip.len());
+    let l1 = format!("{server_main_tip} {new_main} refs/heads/main\0report-status\n");
+    let l2 = format!("{zero} {feature_tip} refs/heads/{branch}\n");
+    let mut body: Vec<u8> = Vec::new();
+    body.extend(format!("{:04x}{l1}", l1.len() + 4).into_bytes());
+    body.extend(format!("{:04x}{l2}", l2.len() + 4).into_bytes());
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&pack);
+    let _ = std::fs::remove_dir_all(&work);
+    body
+}
+
+/// get_pr_diff has a SECOND, path-scoped gate after the repo-root read: it
+/// iterates the diff's touched paths and 404s if any is withheld (pulls.rs
+/// visibility_check loop). On a PUBLIC repo with a `/secret/**` withhold rule and a
+/// PR whose diff touches `secret/x.txt`, an anon caller PASSES the public repo-root
+/// gate but must be DENIED by the per-path gate (404), leaking neither the withheld
+/// content nor its OID; the owner sees the full diff. This drives the per-path gate
+/// the private-repo registry row cannot reach (there, the root gate fires first for
+/// every non-owner), so reverting the visibility_check Deny-return turns this RED.
+#[sqlx::test]
+async fn get_pr_diff_withheld_path_is_denied(pool: sqlx::PgPool) {
+    let node = spawn_node(pool).await;
+    let client = reqwest::Client::new();
+    let owner = Keypair::generate();
+    let owner_did = owner.did().to_string();
+
+    let repo_id = node.seed_repo(&owner_did, "prdiff-repo", true).await;
+    let oids = node.seed_bare_repo(
+        &owner_did,
+        "prdiff-repo",
+        &[("public/a.txt", "public seed")],
+        "sha1",
+    );
+    node.withhold_path(&repo_id, "/secret/**", &[], &owner_did)
+        .await;
+
+    // Push a `feature` branch whose diff vs main touches the withheld secret path.
+    let body = build_branch_push_body(
+        &oids["HEAD"],
+        "feature",
+        &[("secret/x.txt", "TOPSECRET-PRDIFF-PATH")],
+    );
+    let push = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &format!("/{owner_did}/prdiff-repo/git-receive-pack"),
+        body,
+        &owner,
+    )
+    .header("content-type", "application/x-git-receive-pack-request")
+    .send()
+    .await
+    .expect("push sends");
+    assert_eq!(push.status().as_u16(), 200, "owner push must land");
+
+    // Open a PR main <- feature (as owner, a reader of the public repo).
+    let create = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &format!("/api/v1/repos/{owner_did}/prdiff-repo/pulls"),
+        br#"{"title":"prdiff","source_branch":"feature","target_branch":"main"}"#.to_vec(),
+        &owner,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("create PR sends");
+    assert_eq!(create.status().as_u16(), 201, "PR create must return 201");
+    let pr: serde_json::Value = create.json().await.unwrap();
+    let number = pr["number"].as_i64().expect("PR number");
+
+    // Anon PASSES the public repo-root gate, then the per-path gate DENIES the diff
+    // (it touches the withheld secret path): 404, leaking no content or OID.
+    let secret_oid = oids
+        .get("secret/x.txt")
+        .cloned()
+        .unwrap_or_default(); // seed_bare_repo didn't seed it; the pushed one is unknown here.
+    let resp = client
+        .get(format!(
+            "{}/api/v1/repos/{owner_did}/prdiff-repo/pulls/{number}/diff",
+            node.base_url
+        ))
+        .send()
+        .await
+        .expect("anon diff read sends");
+    let mut withheld = vec!["TOPSECRET-PRDIFF-PATH"];
+    if !secret_oid.is_empty() {
+        withheld.push(secret_oid.as_str());
+    }
+    assert_denied(resp, 404, &withheld).await;
+
+    // Owner sees the full diff (the per-path gate admits the reader).
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &format!("/api/v1/repos/{owner_did}/prdiff-repo/pulls/{number}/diff"),
+        Vec::new(),
+        &owner,
+    )
+    .send()
+    .await
+    .expect("owner diff read sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "owner must see the full PR diff (per-path gate admits the reader)"
+    );
+    assert!(
+        resp.text().await.unwrap().contains("TOPSECRET-PRDIFF-PATH"),
+        "the owner's diff returns the touched file content"
+    );
+}
+
 // ── U8: INV-2 — an anonymous clone/fetch excludes withheld subtree blobs ──────
 
 /// The replication/clone surface, the one `oneshot` cannot serve: a public repo
@@ -1106,45 +1291,16 @@ mod completeness {
         // Reasons fall into a few honest classes, so a reviewer can see WHY a
         // read-gated endpoint is not driven for its 404 rather than trusting a name.
         const READ_GATE_NOT_DRIVEN: &[(&str, &str)] = &[
-            // Deferred GET reads: verified to read-gate on "/", but the owner-2xx
-            // twin needs a seeded sub-entity the fixture does not yet create, so
-            // they land with the fixture expansion that seeds them.
-            (
-                "get_issue",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
-            ("get_pr", "deferred: owner-2xx twin needs seeded sub-entity"),
-            (
-                "get_pr_diff",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
-            (
-                "list_issue_comments",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
-            (
-                "list_reviews",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
-            (
-                "list_comments",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
-            (
-                "get_cert",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
-            (
-                "get_bounty",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
+            // get_issue / get_pr / get_pr_diff / list_issue_comments / list_reviews /
+            // list_comments / get_cert / get_bounty / get_tree are now DRIVEN as real
+            // ReadGate rows in deny_bearing_routes() (#195, U3), each with a per-read
+            // withheld marker; they were removed from this allowlist when they landed.
+            //
+            // get_encrypted_blob stays: its owner-2xx twin needs a live IPFS backend
+            // (`ipfs_pin::cat`) the harness has no stub for, so it cannot be driven as
+            // a 2xx twin here. U4 moves it to a structural external-dependency class.
             (
                 "get_encrypted_blob",
-                "deferred: owner-2xx twin needs seeded sub-entity",
-            ),
-            // Path-scoped get_tree/{*path} needs a seeded sub-directory for its twin.
-            (
-                "get_tree",
                 "deferred: owner-2xx twin needs seeded sub-entity",
             ),
             // Read-gates but is a mutation, not a 404-deny GET: create/write paths

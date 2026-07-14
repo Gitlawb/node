@@ -94,6 +94,21 @@ pub enum IdSource {
     /// whole record before reading its author, so the author arm needs the
     /// complete record.
     IssueId,
+    /// `{id}` -> the fixture's seeded PRIVATE-repo issue id (UUID). Distinct from
+    /// `IssueId` (the public-repo close-gate issue): the get_issue /
+    /// list_issue_comments read-gate rows run against the PRIVATE repo, so their
+    /// `{id}` must be an issue that actually exists there (#195, F2/U3).
+    PrivIssueId,
+    /// `{id}` -> the fixture's seeded PRIVATE-repo bounty id (UUID). get_bounty is
+    /// NOT repo-scoped in its path (`/api/v1/bounties/{id}`) but read-gates on the
+    /// bounty's own repo; the bounty is seeded against the private repo so anon /
+    /// stranger get the existence-hiding 404 and the owner gets 2xx (#195, U3).
+    PrivBountyId,
+    /// `{id}` -> the fixture's seeded ref-certificate id (UUID), issued by a real
+    /// owner push to the private repo. get_cert read-gates the private repo on "/"
+    /// then fetches the cert by id, so the owner-2xx twin needs a real cert whose
+    /// repo_id is the private repo's (#195, U3).
+    CertId,
 }
 
 /// One deny-bearing route. `path` is a template with `{owner}`/`{repo}`/`{id}`
@@ -495,6 +510,132 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             path: "/api/v1/repos/{owner}/{repo}/encrypted-blobs",
             gate: GateClass::ReadGate,
             handler: "encrypted::list_encrypted_blobs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+        },
+        // #195 (F2, U3): sub-entity reads that gate on "/" (the private repo) but
+        // require the entity to EXIST at the request path for the owner-2xx twin.
+        // Each carries its own distinctive marker (seeded in probe.rs) added to the
+        // per-read withheld set, so a 404 that echoes THAT read's private content
+        // (issue title, PR title, cert signature, bounty title) fails — a status-
+        // only 404 check would be vacuous. These were source-only exemptions in
+        // READ_GATE_NOT_DRIVEN before; they are now driven as real ReadGate rows.
+        // get_issue: id-keyed by the seeded PRIVATE issue (marker in its title).
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/issues/{id}",
+            gate: GateClass::ReadGate,
+            handler: "issues::get_issue",
+            body: None,
+            needs: &["priv_issue_id"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::PrivIssueId,
+        },
+        // list_issue_comments: parent issue must exist (private); child list may be
+        // empty — an empty `{"comments":[]}` is a non-empty 2xx body.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/issues/{id}/comments",
+            gate: GateClass::ReadGate,
+            handler: "issues::list_issue_comments",
+            body: None,
+            needs: &["priv_issue_id"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::PrivIssueId,
+        },
+        // get_pr: the seeded PRIVATE PR #1 (marker in its title).
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}",
+            gate: GateClass::ReadGate,
+            handler: "pulls::get_pr",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+        },
+        // get_pr_diff: the PRIVATE PR #1 has a real `feature` source branch with a
+        // marker file, so branch_diff_names(main, feature) is NON-EMPTY and the
+        // owner twin returns a real diff (a bail!/500 if the source ref were
+        // missing). The per-path visibility_check Deny-return is additionally
+        // driven by the hand-written get_pr_diff_withheld_path_is_denied test.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+            gate: GateClass::ReadGate,
+            handler: "pulls::get_pr_diff",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+        },
+        // list_reviews / list_comments: parent PR #1 must exist (private); child
+        // lists may be empty.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews",
+            gate: GateClass::ReadGate,
+            handler: "pulls::list_reviews",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments",
+            gate: GateClass::ReadGate,
+            handler: "pulls::list_comments",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+        },
+        // get_cert: id-keyed by a real ref-certificate issued by an owner push to
+        // the private repo (marker: the cert's own signature/ref content).
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/certs/{id}",
+            gate: GateClass::ReadGate,
+            handler: "certs::get_cert",
+            body: None,
+            needs: &["cert_id"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::CertId,
+        },
+        // get_bounty: NOT repo-scoped in its path, read-gates on the bounty's repo.
+        // Seeded against the PRIVATE repo (marker in its title), id-keyed.
+        Row {
+            method: "GET",
+            path: "/api/v1/bounties/{id}",
+            gate: GateClass::ReadGate,
+            handler: "bounties::get_bounty",
+            body: None,
+            needs: &["priv_bounty_id"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::PrivBountyId,
+        },
+        // get_tree (path-scoped): genuinely ADDITIONAL to get_tree_root (Q1). Root
+        // gates on "/"; get_tree gates on the REQUESTED subtree (N3,
+        // authorize_repo_read(&gate_path)), a distinct path-scoped Deny surface. The
+        // {*path} fills to the private content path, so a non-reader is denied the
+        // subtree listing and the owner gets a non-empty 2xx.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/tree/{*path}",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_tree",
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,

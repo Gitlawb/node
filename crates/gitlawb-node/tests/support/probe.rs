@@ -38,6 +38,23 @@ pub struct Fixture {
     /// The id (UUID) of the seeded issue (authored by `author`), filled into the
     /// `close_issue` row's `{id}` placeholder (IdSource::IssueId).
     pub issue_id: String,
+    /// The id (UUID) of an issue seeded in the PRIVATE repo (marker in its title),
+    /// filled into the get_issue / list_issue_comments read-gate rows
+    /// (IdSource::PrivIssueId). Distinct from `issue_id` (the public close issue).
+    pub priv_issue_id: String,
+    /// The id (UUID) of a bounty seeded against the PRIVATE repo (marker in its
+    /// title), filled into the get_bounty read-gate row (IdSource::PrivBountyId).
+    pub priv_bounty_id: String,
+    /// The id (UUID) of a ref-certificate issued by a real owner push to the
+    /// private repo, filled into the get_cert read-gate row (IdSource::CertId).
+    pub cert_id: String,
+    /// Per-read secret markers seeded into the private sub-entities (issue title,
+    /// PR title, cert signature, bounty title). Each read's own marker is added to
+    /// that read's withheld set so a 404 leaking THAT read's private content fails
+    /// (#195, R3/KTD-4). A union is used so every seeded marker is withheld from
+    /// every read-gate hostile — a per-read withheld token, never a status-only
+    /// 404 check.
+    pub priv_markers: Vec<String>,
     /// Public repo: owner-gate rows run against this so the stranger reaches the
     /// owner gate rather than a hidden-repo 404.
     pub public_repo: String,
@@ -132,6 +149,50 @@ impl Fixture {
         );
         let private_blob_oid = priv_oids["public/a.txt"].clone();
         let private_blob_oid_short = private_blob_oid[..12].to_string();
+        // The private repo's current `main` commit tip, needed as the `old` oid of
+        // the ref-update that force-points main at the deterministic push below.
+        let private_main_tip = priv_oids["HEAD"].clone();
+
+        // #195 (F2/U3): seed the private sub-entities the deferred reads return, each
+        // carrying its OWN distinctive marker so the per-read leak assertion is
+        // load-bearing. All are seeded as the OWNER (the only reader of the private
+        // repo), so anon/stranger get the existence-hiding 404 and the owner twin
+        // gets a 2xx that actually returns the entity.
+        //
+        // A real owner push to the private repo advances a `feature` branch with a
+        // marker file (so get_pr_diff's branch_diff_names(main, feature) is
+        // NON-EMPTY) AND issues a ref-certificate (get_cert). Do it first so the PR's
+        // source branch exists before create_pr and the cert id is captured.
+        let pr_diff_marker = "TOPSECRET-PRDIFF-U3".to_string();
+        let cert_id = seed_private_push_and_cert(
+            node,
+            &owner,
+            &owner_did,
+            priv_repo,
+            &private_main_tip,
+            &private_secret,
+            &private_blob_oid,
+            &pr_diff_marker,
+        )
+        .await;
+
+        let issue_marker = "TOPSECRET-ISSUE-U3".to_string();
+        let priv_issue_id =
+            seed_private_issue(node, &owner, &owner_did, priv_repo, &issue_marker).await;
+
+        let pr_marker = "TOPSECRET-PRTITLE-U3".to_string();
+        seed_private_pr(node, &owner, &owner_did, priv_repo, &pr_marker).await;
+
+        let bounty_marker = "TOPSECRET-BOUNTY-U3".to_string();
+        let priv_bounty_id =
+            seed_private_bounty(node, &owner, &owner_did, priv_repo, &bounty_marker).await;
+
+        let priv_markers = vec![
+            issue_marker,
+            pr_marker,
+            pr_diff_marker,
+            bounty_marker,
+        ];
 
         Fixture {
             owner,
@@ -145,6 +206,10 @@ impl Fixture {
             claimant_did,
             bounty_id,
             issue_id,
+            priv_issue_id,
+            priv_bounty_id,
+            cert_id,
+            priv_markers,
             public_repo: pub_repo.to_string(),
             public_repo_id,
             private_repo: priv_repo.to_string(),
@@ -271,6 +336,263 @@ async fn seed_disputable_bounty(
     bounty_id
 }
 
+/// Seed an issue in the PRIVATE repo (as the owner, the only reader) whose title
+/// carries `marker`, and return its id. get_issue returns the whole IssueRecord,
+/// so a 404 that echoes the title has leaked private content; the marker is added
+/// to the withheld set.
+async fn seed_private_issue(
+    node: &TestNode,
+    owner: &Keypair,
+    owner_did: &str,
+    repo: &str,
+    marker: &str,
+) -> String {
+    use super::signing::signed_request;
+
+    let client = reqwest::Client::new();
+    let path = format!("/api/v1/repos/{owner_did}/{repo}/issues");
+    let body = format!(r#"{{"title":"{marker}"}}"#).into_bytes();
+    let resp = signed_request(&client, reqwest::Method::POST, &node.base_url, &path, body, owner)
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .expect("create private issue sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "seeding: private issue create must return 201 (owner reads its own private repo)"
+    );
+    let created: serde_json::Value = resp.json().await.expect("issue create returns JSON");
+    created["id"]
+        .as_str()
+        .expect("created private issue carries an id")
+        .to_string()
+}
+
+/// Seed a PR in the PRIVATE repo (as the owner) with `marker` in its title and
+/// `feature` as its source branch (which the prior push created). get_pr returns
+/// the whole PullRequest and get_pr_diff a real non-empty diff, so both the title
+/// marker and the diff marker are withheld. Lands at PR number 1 (first PR).
+async fn seed_private_pr(
+    node: &TestNode,
+    owner: &Keypair,
+    owner_did: &str,
+    repo: &str,
+    marker: &str,
+) {
+    use super::signing::signed_request;
+
+    let client = reqwest::Client::new();
+    let path = format!("/api/v1/repos/{owner_did}/{repo}/pulls");
+    let body = format!(
+        r#"{{"title":"{marker}","source_branch":"feature","target_branch":"main"}}"#
+    )
+    .into_bytes();
+    let resp = signed_request(&client, reqwest::Method::POST, &node.base_url, &path, body, owner)
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .expect("create private PR sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "seeding: private PR create must return 201 (owner reads its own private repo)"
+    );
+    let created: serde_json::Value = resp.json().await.expect("PR create returns JSON");
+    assert_eq!(
+        created["number"].as_i64(),
+        Some(1),
+        "seeded private PR must be number 1 (the read-gate rows fill {{number}} = 1)"
+    );
+}
+
+/// Seed a bounty against the PRIVATE repo (as the owner) with `marker` in its
+/// title, and return its id. get_bounty read-gates the bounty's own repo, so
+/// anon/stranger get a 404 while the owner gets the bounty JSON (title marker
+/// withheld from the 404).
+async fn seed_private_bounty(
+    node: &TestNode,
+    owner: &Keypair,
+    owner_did: &str,
+    repo: &str,
+    marker: &str,
+) -> String {
+    use super::signing::signed_request;
+
+    let client = reqwest::Client::new();
+    let path = format!("/api/v1/repos/{owner_did}/{repo}/bounties");
+    let body = format!(r#"{{"title":"{marker}","amount":1}}"#).into_bytes();
+    let resp = signed_request(&client, reqwest::Method::POST, &node.base_url, &path, body, owner)
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .expect("create private bounty sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "seeding: private bounty create must return 201 (owner reads its own private repo)"
+    );
+    let created: serde_json::Value = resp.json().await.expect("bounty create returns JSON");
+    created["id"]
+        .as_str()
+        .expect("created private bounty carries an id")
+        .to_string()
+}
+
+/// Point the PRIVATE repo's `main` at a deterministic commit and add a `feature`
+/// branch (a marker file on top of it) via a real owner git-receive-pack push,
+/// which also makes the node issue a ref-certificate. Returns the issued cert's
+/// id, read back from the owner's list_certs.
+///
+/// seed_bare_repo's `main` tip is non-deterministic (its commit dates are ambient),
+/// so we cannot build a `feature` that descends from it without the parent objects.
+/// Instead we push a full (non-thin) history: a fresh `main` commit and `feature`
+/// on top, force-updating the served `main` (the ref-update carries the server's
+/// current tip as its `old` oid; receive.denyNonFastForwards is off by default, so
+/// the non-fast-forward update applies). After the push, `feature` descends from
+/// the new `main`, so get_pr_diff's `git diff main...feature` has a merge base and
+/// returns the marker file. The push is signed as the owner (require_signature) and,
+/// on a non-protected branch of an owner-owned repo, lands cleanly and issues a cert.
+#[allow(clippy::too_many_arguments)]
+async fn seed_private_push_and_cert(
+    node: &TestNode,
+    owner: &Keypair,
+    owner_did: &str,
+    repo: &str,
+    server_main_tip: &str,
+    blob_contents: &str,
+    expected_blob_oid: &str,
+    marker_file_contents: &str,
+) -> String {
+    use super::signing::signed_request;
+    use std::process::Command;
+
+    let work = std::env::temp_dir().join(format!(
+        "gl-u3-certpush-{}-{}",
+        std::process::id(),
+        server_main_tip
+    ));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("create cert-push workdir");
+    let run = |args: &[&str], cwd: &std::path::Path| -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    run(&["init", "-q", "-b", "main"], &work);
+    run(&["config", "user.email", "t@t"], &work);
+    run(&["config", "user.name", "t"], &work);
+    // Keep `public/a.txt` (the seeded blob) on the new main so the get_blob /
+    // get_tree owner twins still resolve it — the blob OID depends only on content,
+    // so preserving the bytes preserves `private_blob_oid`.
+    std::fs::create_dir_all(work.join("public")).expect("mk public dir");
+    std::fs::write(work.join("public/a.txt"), blob_contents).expect("seed blob file");
+    run(&["add", "public/a.txt"], &work);
+    run(&["commit", "-q", "-m", "u3 main"], &work);
+    let new_main = run(&["rev-parse", "HEAD"], &work);
+    let new_blob = run(&["rev-parse", "HEAD:public/a.txt"], &work);
+    assert_eq!(
+        new_blob, expected_blob_oid,
+        "the pushed public/a.txt blob OID must equal the fixture's private_blob_oid"
+    );
+
+    // feature = new main + a marker file.
+    run(&["checkout", "-q", "-b", "feature"], &work);
+    std::fs::write(work.join("feature.txt"), marker_file_contents).expect("seed marker file");
+    run(&["add", "feature.txt"], &work);
+    run(&["commit", "-q", "-m", "feature commit"], &work);
+    let feature_tip = run(&["rev-parse", "HEAD"], &work);
+
+    // Full (non-thin) pack of both branches' objects — the server keeps its old
+    // main objects but needs all of the new ones since feature does not descend
+    // from the server's current main.
+    let pack = {
+        let out = Command::new("git")
+            .args(["pack-objects", "--stdout", "--revs"])
+            .current_dir(&work)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn pack-objects");
+        use std::io::Write;
+        out.stdin
+            .as_ref()
+            .expect("pack-objects stdin")
+            .write_all(format!("{new_main}\n{feature_tip}\n").as_bytes())
+            .expect("write revs");
+        let done = out.wait_with_output().expect("pack-objects completes");
+        assert!(done.status.success(), "pack-objects must succeed");
+        done.stdout
+    };
+
+    // git v0 receive-pack body: two ref-update pkt-lines — force-update main
+    // (old = the server's current tip) and create feature — the first carrying the
+    // capabilities after a NUL, a flush, then the packfile.
+    let zero = "0".repeat(server_main_tip.len());
+    let l1 = format!("{server_main_tip} {new_main} refs/heads/main\0report-status\n");
+    let l2 = format!("{zero} {feature_tip} refs/heads/feature\n");
+    let mut body: Vec<u8> = Vec::new();
+    body.extend(format!("{:04x}{l1}", l1.len() + 4).into_bytes());
+    body.extend(format!("{:04x}{l2}", l2.len() + 4).into_bytes());
+    body.extend_from_slice(b"0000");
+    body.extend_from_slice(&pack);
+
+    let client = reqwest::Client::new();
+    let push_path = format!("/{owner_did}/{repo}/git-receive-pack");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &push_path,
+        body,
+        owner,
+    )
+    .header("content-type", "application/x-git-receive-pack-request")
+    .send()
+    .await
+    .expect("receive-pack push sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "seeding: owner push to a non-protected feature branch must return 200 so a cert issues"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+
+    // Read the issued cert id back from the owner's list_certs on the private repo.
+    let certs_path = format!("/api/v1/repos/{owner_did}/{repo}/certs");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::GET,
+        &node.base_url,
+        &certs_path,
+        Vec::new(),
+        owner,
+    )
+    .send()
+    .await
+    .expect("list_certs sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "seeding: owner list_certs must return 200"
+    );
+    let listed: serde_json::Value = resp.json().await.expect("list_certs returns JSON");
+    listed["certificates"][0]["id"]
+        .as_str()
+        .expect("a ref-certificate must have been issued by the push")
+        .to_string()
+}
+
 /// Who signs a probe request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signer {
@@ -341,6 +663,9 @@ fn fill(path: &str, fixture: &Fixture, repo: &str, id_source: IdSource) -> Strin
         IdSource::Fixed => "1",
         IdSource::BountyId => fixture.bounty_id.as_str(),
         IdSource::IssueId => fixture.issue_id.as_str(),
+        IdSource::PrivIssueId => fixture.priv_issue_id.as_str(),
+        IdSource::PrivBountyId => fixture.priv_bounty_id.as_str(),
+        IdSource::CertId => fixture.cert_id.as_str(),
     };
     path.replace("{owner}", &fixture.owner_did)
         .replace("{repo}", repo)
@@ -426,12 +751,19 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
             // (full or short) nor the private repo's internal id (#195, F4). An empty
             // withheld list would let a 404 that spilled the private content pass as
             // a clean denial.
-            let withheld = vec![
+            // #195 (R3/KTD-4): the fixed blob-scoped withheld set PLUS every seeded
+            // sub-entity marker. The new reads (get_issue/get_pr/get_pr_diff/get_cert
+            // /get_bounty and the list rows off them) return their OWN private
+            // content, whose markers are NOT in the blob set — a 404 that leaks an
+            // issue title or PR diff must fail, so the per-read markers are withheld
+            // from every read-gate hostile. A status-only 404 check would be vacuous.
+            let mut withheld = vec![
                 fixture.private_secret.clone(),
                 fixture.private_blob_oid.clone(),
                 fixture.private_blob_oid_short.clone(),
                 fixture.private_repo_id.clone(),
             ];
+            withheld.extend(fixture.priv_markers.iter().cloned());
             let mut v = vec![
                 Probe {
                     label: format!("{} read-gate hostile (anon)", row.handler),
@@ -530,6 +862,15 @@ pub mod tests_support {
             claimant,
             bounty_id: "bounty-uuid-1234".to_string(),
             issue_id: "issue-uuid-1234".to_string(),
+            priv_issue_id: "priv-issue-uuid-1234".to_string(),
+            priv_bounty_id: "priv-bounty-uuid-1234".to_string(),
+            cert_id: "cert-uuid-1234".to_string(),
+            priv_markers: vec![
+                "TOPSECRET-ISSUE-U3".to_string(),
+                "TOPSECRET-PRTITLE-U3".to_string(),
+                "TOPSECRET-PRDIFF-U3".to_string(),
+                "TOPSECRET-BOUNTY-U3".to_string(),
+            ],
             owner: Keypair::generate(),
             stranger: Keypair::generate(),
             owner_did: "did:key:zOWNER".to_string(),
