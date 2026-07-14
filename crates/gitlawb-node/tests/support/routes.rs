@@ -520,7 +520,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
         // require the entity to EXIST at the request path for the owner-2xx twin.
         // Each carries its own distinctive marker (seeded in probe.rs) added to the
         // per-read withheld set, so a 404 that echoes THAT read's private content
-        // (issue title, PR title, cert signature, bounty title) fails — a status-
+        // (issue title, PR title, PR diff, bounty title) fails — a status-
         // only 404 check would be vacuous. These were source-only exemptions in
         // READ_GATE_NOT_DRIVEN before; they are now driven as real ReadGate rows.
         // get_issue: id-keyed by the seeded PRIVATE issue (marker in its title).
@@ -601,7 +601,10 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             id_source: IdSource::Fixed,
         },
         // get_cert: id-keyed by a real ref-certificate issued by an owner push to
-        // the private repo (marker: the cert's own signature/ref content).
+        // the private repo. No cert-content marker is seeded: get_cert read-gates
+        // the repo on "/" and 404s a non-reader BEFORE fetching the cert, so cert
+        // fields cannot reach the deny body — the repo-scoped tokens (private_repo_id,
+        // private_secret) plus the status check carry the no-leak assertion here.
         Row {
             method: "GET",
             path: "/api/v1/repos/{owner}/{repo}/certs/{id}",
@@ -777,6 +780,28 @@ mod tests {
                     r.method, r.path, arm
                 );
             }
+
+            // The twins' signers must be DISTINCT and number the declared arms. The
+            // per-arm any() check above is satisfied by a single twin when two arms
+            // map to the same Signer (a signer_for_principal collision), so without
+            // this a wrong mapping would pass with one arm silently untested.
+            let mut twin_signers: Vec<Signer> = ps
+                .iter()
+                .filter(|p| matches!(p.expect, Expect::Not403))
+                .map(|p| p.signer)
+                .collect();
+            twin_signers.sort_by_key(|s| format!("{s:?}"));
+            twin_signers.dedup();
+            assert_eq!(
+                twin_signers.len(),
+                r.principals.len(),
+                "multi-principal row {} {} emits twins with {} DISTINCT signers but declares {} arms \
+                 (Principal->Signer collision?)",
+                r.method,
+                r.path,
+                twin_signers.len(),
+                r.principals.len(),
+            );
         }
         assert!(
             checked >= 3,

@@ -49,7 +49,7 @@ pub struct Fixture {
     /// private repo, filled into the get_cert read-gate row (IdSource::CertId).
     pub cert_id: String,
     /// Per-read secret markers seeded into the private sub-entities (issue title,
-    /// PR title, cert signature, bounty title). Each read's own marker is added to
+    /// PR title, PR diff, bounty title). Each read's own marker is added to
     /// that read's withheld set so a 404 leaking THAT read's private content fails
     /// (#195, R3/KTD-4). A union is used so every seeded marker is withheld from
     /// every read-gate hostile — a per-read withheld token, never a status-only
