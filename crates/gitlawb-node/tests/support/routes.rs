@@ -22,6 +22,13 @@ pub enum GateClass {
     /// `require_repo_owner` / `require_owner` / inline `did_matches(caller, owner)`
     /// -> `AppError::Forbidden` == 403. Probed with a validly-signed non-owner.
     OwnerGate,
+    /// A 403 gate with MORE THAN ONE authorizing principal (owner-OR-author,
+    /// creator-OR-claimant, …). Probed with a validly-signed stranger (403) plus
+    /// one Not403 twin per declared arm (`Row.principals`), so reverting ANY
+    /// single arm turns that arm's twin RED. A single-arm `OwnerGate` cannot
+    /// express this: it tests one identity, so the untested arm is invisible
+    /// (#195, F1).
+    MultiPrincipalGate,
     /// `authorize_repo_read` / `visibility_check` -> `RepoNotFound` == 404
     /// (existence-hiding). Probed with a non-reader against a private/withheld
     /// target. A 404 alone is ambiguous (a missing entity also 404s), so every
@@ -34,11 +41,26 @@ pub enum GateClass {
 impl GateClass {
     pub fn expected_status(self) -> u16 {
         match self {
-            GateClass::OwnerGate => 403,
+            GateClass::OwnerGate | GateClass::MultiPrincipalGate => 403,
             GateClass::ReadGate => 404,
             GateClass::SignatureRequired => 401,
         }
     }
+}
+
+/// An authorizing principal (arm) of a multi-principal 403 gate. Each maps to a
+/// distinct fixture identity in `probe.rs` so reverting one arm cannot silently
+/// re-collapse onto another (the original bug seeded `author == owner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    /// The repo owner (`require_repo_owner` / `did_matches(caller, owner)`).
+    Owner,
+    /// The PR/issue author (`did_matches(caller, author_did)`).
+    Author,
+    /// The bounty creator (`did_matches(caller, creator_did)`).
+    Creator,
+    /// The bounty claimant (`did_matches(caller, claimant_did)`).
+    Claimant,
 }
 
 /// How a read-gate row's positive twin proves the 404 is the gate and not a
@@ -55,6 +77,23 @@ pub enum Reach {
     /// the 404 is path-scoped withholding, not a blanket/absent 404. Mirrors the
     /// existing U7/U8/anon_ipfs cases in `tests/deny_harness.rs`.
     SiblingPublic(&'static str),
+}
+
+/// How a row's `{id}` placeholder is filled. Most id-keyed paths use a fixed
+/// seed id (`"1"`), but some entities are keyed by a UUID minted at seed time
+/// (a bounty, a cert), so the fixture must inject the captured id per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdSource {
+    /// `{id}` -> the fixed seed id `"1"` (static-template entities seeded at #1).
+    Fixed,
+    /// `{id}` -> the fixture's seeded disputable bounty id (UUID).
+    BountyId,
+    /// `{id}` -> the fixture's seeded issue id (UUID). The issue is stored as a
+    /// full git-JSON `IssueRecord` (authored by the fixture author), which a
+    /// bare `{"author":..}` seed cannot satisfy — close_issue deserializes the
+    /// whole record before reading its author, so the author arm needs the
+    /// complete record.
+    IssueId,
 }
 
 /// One deny-bearing route. `path` is a template with `{owner}`/`{repo}`/`{id}`
@@ -75,9 +114,16 @@ pub struct Row {
     pub needs: &'static [&'static str],
     /// Positive-twin strategy for read-gate rows.
     pub reach: Reach,
+    /// For `MultiPrincipalGate` rows, the authorizing arms this gate must drive
+    /// (one Not403 twin each). Empty for every other class — only meaningful for
+    /// `MultiPrincipalGate`, and the consistency test enforces that pairing.
+    pub principals: &'static [Principal],
+    /// How the `{id}` placeholder is filled for this row (see [`IdSource`]).
+    pub id_source: IdSource,
 }
 
 const NO_ENTITY: &[&str] = &[];
+const NO_PRINCIPAL: &[Principal] = &[];
 
 /// The deny-bearing route set. Owner-gate and signature-required tranches are
 /// fully verified against their handlers this session; the read-gate tranche is
@@ -94,24 +140,47 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: &["pr_number"],
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
+        // #195 (F1): close_pr / close_issue are owner-OR-author gates (pulls.rs:276,
+        // issues.rs:255). A plain OwnerGate tests only the owner arm, so reverting
+        // the author arm is invisible. MultiPrincipalGate drives BOTH arms.
         Row {
             method: "POST",
             path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/close",
-            gate: GateClass::OwnerGate,
+            gate: GateClass::MultiPrincipalGate,
             handler: "pulls::close_pr",
             body: None,
             needs: &["pr_number"],
             reach: Reach::None,
+            principals: &[Principal::Owner, Principal::Author],
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "POST",
             path: "/api/v1/repos/{owner}/{repo}/issues/{id}/close",
-            gate: GateClass::OwnerGate,
+            gate: GateClass::MultiPrincipalGate,
             handler: "issues::close_issue",
             body: None,
             needs: &["issue_id"],
             reach: Reach::None,
+            principals: &[Principal::Owner, Principal::Author],
+            id_source: IdSource::IssueId,
+        },
+        // #195 (F1): dispute_bounty is creator-OR-claimant (bounties.rs:425). Not
+        // repo-scoped: it gates on the bounty's creator/claimant, so the row is
+        // id-keyed by the seeded disputable bounty's UUID (IdSource::BountyId).
+        Row {
+            method: "POST",
+            path: "/api/v1/bounties/{id}/dispute",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "bounties::dispute_bounty",
+            body: None,
+            needs: &["bounty_id"],
+            reach: Reach::None,
+            principals: &[Principal::Creator, Principal::Claimant],
+            id_source: IdSource::BountyId,
         },
         Row {
             method: "POST",
@@ -121,6 +190,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: Some(r#"{"url":"https://e.example/h","events":["*"]}"#),
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "DELETE",
@@ -130,6 +201,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "POST",
@@ -139,6 +212,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: Some(r#"{"label":"bug"}"#),
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "DELETE",
@@ -148,6 +223,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "POST",
@@ -157,6 +234,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "DELETE",
@@ -166,6 +245,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "PUT",
@@ -175,6 +256,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: Some(r#"{"path_glob":"/","reader_dids":[]}"#),
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "DELETE",
@@ -184,6 +267,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: Some(r#"{"path_glob":"/"}"#),
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         // list_visibility is a 403 owner-gate despite being a GET (calls
         // require_owner); the /visibility mount chains put+delete+get, all gated.
@@ -195,6 +280,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         // ── Signature-required (401) — verified: git write route wrapped by the
         //    require_signature layer (add_auth_layers in server.rs). ─────────────
@@ -206,6 +293,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         // ── Read-gate (404) — verified: each handler calls
         //    authorize_repo_read / visibility_check on "/" which returns
@@ -225,6 +314,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         // #195 (F2): repo-root reads that gate on "/" — driven as real ReadGate rows
         // rather than source-only exemptions, so a runtime bypass that keeps the
@@ -237,6 +328,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -246,6 +339,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -255,6 +350,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -264,6 +361,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -273,6 +372,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         // Path-scoped read: get_blob gates on "/{path}" (repos.rs:390). The
         // fully-private fixture repo denies any path to anon (404); the owner
@@ -287,6 +388,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -296,6 +399,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -305,6 +410,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -314,6 +421,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -323,6 +432,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -332,6 +443,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -341,6 +454,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -350,6 +465,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -359,6 +476,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -368,6 +487,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         Row {
             method: "GET",
@@ -377,6 +498,8 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             body: None,
             needs: NO_ENTITY,
             reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
         },
         // The read-gate handlers NOT driven here (deferred GET reads, read-gating
         // mutations, git smart-HTTP reads, the content-addressed read, and the
@@ -437,6 +560,86 @@ mod tests {
                     r.path
                 ),
             }
+
+            // `principals` is meaningful ONLY on MultiPrincipalGate rows: it must
+            // be non-empty there (a gate with no declared arm drives nothing) and
+            // empty everywhere else (a stray arm set on a non-multi row is a bug).
+            match r.gate {
+                GateClass::MultiPrincipalGate => assert!(
+                    !r.principals.is_empty(),
+                    "multi-principal row {} {} declares no authorizing arms",
+                    r.method,
+                    r.path
+                ),
+                _ => assert!(
+                    r.principals.is_empty(),
+                    "non-multi-principal row {} {} must not declare arms",
+                    r.method,
+                    r.path
+                ),
+            }
         }
+    }
+
+    /// STRUCTURAL enforcement (#195, F1): every `MultiPrincipalGate` row's
+    /// generator output must carry exactly one Not403 twin PER declared arm plus
+    /// the single stranger hostile, so a row that registered an arm but never
+    /// emits its twin (the vacuous-guard failure) fails HERE rather than in a
+    /// runtime sweep nobody re-runs. Invokes `probes_for` directly — the same
+    /// generator the real sweep drives — so the two cannot drift.
+    #[test]
+    fn multi_principal_rows_emit_one_twin_per_arm() {
+        use crate::support::probe::{probes_for, tests_support::fx, Expect, Signer};
+
+        let fixture = fx();
+        let mut checked = 0usize;
+        for r in deny_bearing_routes() {
+            if r.gate != GateClass::MultiPrincipalGate {
+                continue;
+            }
+            checked += 1;
+            let ps = probes_for(r, &fixture);
+
+            let hostile = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Stranger && matches!(p.expect, Expect::Deny(403)))
+                .count();
+            assert_eq!(
+                hostile, 1,
+                "multi-principal row {} {} must drive exactly one stranger-403 hostile, drove {hostile}",
+                r.method, r.path
+            );
+
+            let twins = ps
+                .iter()
+                .filter(|p| matches!(p.expect, Expect::Not403))
+                .count();
+            assert_eq!(
+                twins,
+                r.principals.len(),
+                "multi-principal row {} {} declares {} arms but emits {twins} Not403 twins",
+                r.method,
+                r.path,
+                r.principals.len(),
+            );
+
+            // Each declared arm maps to a distinct signer, and every twin's signer
+            // is one of the declared arms (no phantom / wrong-arm twin).
+            for arm in r.principals {
+                let want = crate::support::probe::signer_for_principal(*arm);
+                let present = ps
+                    .iter()
+                    .any(|p| p.signer == want && matches!(p.expect, Expect::Not403));
+                assert!(
+                    present,
+                    "multi-principal row {} {} declares arm {:?} but emits no Not403 twin for it",
+                    r.method, r.path, arm
+                );
+            }
+        }
+        assert!(
+            checked >= 3,
+            "expected at least the three known multi-principal rows, checked {checked}"
+        );
     }
 }

@@ -14,13 +14,30 @@
 use gitlawb_core::identity::Keypair;
 use gitlawb_node::test_harness::TestNode;
 
-use super::routes::{GateClass, Reach, Row};
+use super::routes::{GateClass, IdSource, Principal, Reach, Row};
 
 /// A seeded two-repo state matrix plus the owner and stranger identities.
 pub struct Fixture {
     pub owner: Keypair,
     pub stranger: Keypair,
+    /// The PR/issue author — distinct from owner and stranger — so the
+    /// owner-OR-author close gates (#195, F1) drive their author arm with an
+    /// identity that is NOT the owner (the original bug seeded author == owner).
+    pub author: Keypair,
+    /// The bounty creator, distinct from every other identity.
+    pub creator: Keypair,
+    /// The bounty claimant, distinct from every other identity.
+    pub claimant: Keypair,
     pub owner_did: String,
+    pub author_did: String,
+    pub creator_did: String,
+    pub claimant_did: String,
+    /// The id (UUID) of the seeded disputable bounty, filled into the
+    /// `dispute_bounty` row's `{id}` placeholder (IdSource::BountyId).
+    pub bounty_id: String,
+    /// The id (UUID) of the seeded issue (authored by `author`), filled into the
+    /// `close_issue` row's `{id}` placeholder (IdSource::IssueId).
+    pub issue_id: String,
     /// Public repo: owner-gate rows run against this so the stranger reaches the
     /// owner gate rather than a hidden-repo 404.
     pub public_repo: String,
@@ -52,6 +69,16 @@ impl Fixture {
         let owner = Keypair::generate();
         let owner_did = owner.did().to_string();
         let stranger = Keypair::generate();
+        // #195 (F1): distinct identities for each authorizing arm of the
+        // multi-principal gates. All four must differ from owner and stranger and
+        // from each other, or an arm silently collapses onto another and reverting
+        // it stays invisible (the original author == owner bug).
+        let author = Keypair::generate();
+        let author_did = author.did().to_string();
+        let creator = Keypair::generate();
+        let creator_did = creator.did().to_string();
+        let claimant = Keypair::generate();
+        let claimant_did = claimant.did().to_string();
         let content_path = "public/a.txt".to_string();
 
         let pub_repo = "prober-pub";
@@ -63,10 +90,31 @@ impl Fixture {
             "sha1",
         );
         // The author-or-owner close gates load the PR/issue before they run, so
-        // the `.../pulls/1/close` and `.../issues/1/close` rows need entity #1 to
-        // exist (owner-authored) or a stranger 404s (absent) instead of 403.
-        node.seed_pr(&public_repo_id, 1, &owner_did).await;
-        node.seed_issue(&owner_did, pub_repo, "1", &owner_did);
+        // the close rows need the entity to exist. Seed both authored by `author`
+        // (NOT the owner) so the author arm is granted by a non-owner identity and
+        // reverting either arm is observable. The PR seeds via the DB (author_did
+        // is a real column). The issue is seeded over HTTP as `author` (below):
+        // close_issue deserializes the WHOLE git-JSON IssueRecord before reading
+        // its author, so a bare `{"author":..}` DB-seed fails to deserialize and
+        // the author falls back to None — the author arm would then 403.
+        node.seed_pr(&public_repo_id, 1, &author_did).await;
+        let issue_id = seed_authored_issue(node, &owner_did, pub_repo, &author).await;
+
+        // Seed a DISPUTABLE bounty (status "claimed", creator + claimant set) so the
+        // dispute_bounty creator/claimant arms reach their auth check. dispute_bounty
+        // gates on creator/claimant, NOT the repo, so the bounty is created on the
+        // public repo (both signers can read it). Seeded over HTTP through the real
+        // handlers — create (creator) then claim (claimant) — because the DB seam is
+        // private to TestNode and a test-only seed method would be a src/ change.
+        let bounty_id = seed_disputable_bounty(
+            node,
+            &owner_did,
+            pub_repo,
+            &creator,
+            &creator_did,
+            &claimant,
+        )
+        .await;
 
         let priv_repo = "prober-priv";
         // Seed the private blob with an UNMISTAKABLE marker (not "priv content"),
@@ -88,7 +136,15 @@ impl Fixture {
         Fixture {
             owner,
             stranger,
+            author,
+            creator,
+            claimant,
             owner_did,
+            author_did,
+            creator_did,
+            claimant_did,
+            bounty_id,
+            issue_id,
             public_repo: pub_repo.to_string(),
             public_repo_id,
             private_repo: priv_repo.to_string(),
@@ -101,12 +157,144 @@ impl Fixture {
     }
 }
 
+/// Seed an issue authored by `author` through the real `create_issue` handler
+/// and return its minted UUID id. Written as a full git-JSON `IssueRecord` (the
+/// handler serializes the whole record), so `close_issue`'s deserialize-then-read
+/// author path finds the author — which a bare-field DB seed cannot satisfy.
+async fn seed_authored_issue(
+    node: &TestNode,
+    owner_did: &str,
+    repo: &str,
+    author: &Keypair,
+) -> String {
+    use super::signing::signed_request;
+
+    let client = reqwest::Client::new();
+    let path = format!("/api/v1/repos/{owner_did}/{repo}/issues");
+    let body = br#"{"title":"prober close issue"}"#.to_vec();
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &path,
+        body,
+        author,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("create issue sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "seeding: issue create must return 201 (author can read the public repo)"
+    );
+    let created: serde_json::Value = resp.json().await.expect("issue create returns JSON");
+    created["id"]
+        .as_str()
+        .expect("created issue carries an id")
+        .to_string()
+}
+
+/// Seed a bounty in the `claimed` state (creator + claimant set) so the
+/// dispute_bounty creator/claimant arms reach their auth check, and return its id.
+///
+/// Driven through the real HTTP handlers rather than the DB: `create_bounty` mints
+/// a UUID id we read back from the response, and `claim_bounty` sets the claimant.
+/// Both read-gate the (public) repo, which the creator/claimant can read. The
+/// bounty lands `status = "claimed"`; because its deadline has not been exceeded,
+/// a creator/claimant dispute returns 400 (not 403) after passing auth — which is
+/// still a Not403 twin — while a stranger is denied 403 at the auth check first.
+async fn seed_disputable_bounty(
+    node: &TestNode,
+    owner_did: &str,
+    repo: &str,
+    creator: &Keypair,
+    creator_did: &str,
+    claimant: &Keypair,
+) -> String {
+    use super::signing::signed_request;
+
+    let client = reqwest::Client::new();
+
+    // create_bounty (creator) -> 201 with the minted BountyRecord (carries the id).
+    let create_path = format!("/api/v1/repos/{owner_did}/{repo}/bounties");
+    let body = br#"{"title":"prober dispute bounty","amount":1}"#.to_vec();
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &create_path,
+        body,
+        creator,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("create bounty sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "seeding: bounty create must return 201 (creator can read the public repo)"
+    );
+    let created: serde_json::Value = resp.json().await.expect("bounty create returns JSON");
+    let bounty_id = created["id"]
+        .as_str()
+        .expect("created bounty carries an id")
+        .to_string();
+    assert_eq!(
+        created["creator_did"].as_str(),
+        Some(creator_did),
+        "seeded bounty creator must be the fixture creator"
+    );
+
+    // claim_bounty (claimant) -> 200, status becomes "claimed", claimant recorded.
+    let claim_path = format!("/api/v1/bounties/{bounty_id}/claim");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &claim_path,
+        br#"{}"#.to_vec(),
+        claimant,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("claim bounty sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "seeding: bounty claim must return 200 (claimant can read the public repo)"
+    );
+
+    bounty_id
+}
+
 /// Who signs a probe request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signer {
     Anon,
     Owner,
     Stranger,
+    /// The PR/issue author arm of a multi-principal close gate.
+    Author,
+    /// The bounty creator arm of dispute_bounty.
+    Creator,
+    /// The bounty claimant arm of dispute_bounty.
+    Claimant,
+}
+
+/// The signer identity that grants a given multi-principal arm. The runtime sweep
+/// resolves each to its fixture keypair; the structural consistency test uses it
+/// to confirm every declared arm has a twin signed by ITS identity.
+pub fn signer_for_principal(p: Principal) -> Signer {
+    match p {
+        Principal::Owner => Signer::Owner,
+        Principal::Author => Signer::Author,
+        Principal::Creator => Signer::Creator,
+        Principal::Claimant => Signer::Claimant,
+    }
 }
 
 /// What a probe expects.
@@ -142,11 +330,22 @@ pub struct Probe {
 
 /// Substitute path-template placeholders from the fixture. `repo` is the public
 /// repo for owner-gate rows and the private repo for read-gate rows.
-fn fill(path: &str, fixture: &Fixture, repo: &str) -> String {
+///
+/// `id_source` selects what `{id}` resolves to: `Fixed` uses the static seed id
+/// `"1"` (entities seeded at #1), while a per-row source such as `BountyId`
+/// injects a UUID minted at seed time. This is the general id-threading hook U3
+/// reuses for the other id-keyed reads (a cert id, etc.): add an `IdSource`
+/// variant + fixture field and map it here.
+fn fill(path: &str, fixture: &Fixture, repo: &str, id_source: IdSource) -> String {
+    let id = match id_source {
+        IdSource::Fixed => "1",
+        IdSource::BountyId => fixture.bounty_id.as_str(),
+        IdSource::IssueId => fixture.issue_id.as_str(),
+    };
     path.replace("{owner}", &fixture.owner_did)
         .replace("{repo}", repo)
         .replace("{number}", "1")
-        .replace("{id}", "1")
+        .replace("{id}", id)
         .replace("{label}", "bug")
         .replace("{branch}", "main")
         .replace("{*path}", &fixture.content_path)
@@ -161,7 +360,7 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
 
     match row.gate {
         GateClass::OwnerGate => {
-            let path = fill(row.path, fixture, &fixture.public_repo);
+            let path = fill(row.path, fixture, &fixture.public_repo, row.id_source);
             vec![
                 Probe {
                     label: format!("{} owner-gate hostile", row.handler),
@@ -187,8 +386,41 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
                 },
             ]
         }
+        GateClass::MultiPrincipalGate => {
+            // #195 (F1): a single stranger-403 hostile plus one Not403 twin PER
+            // declared arm. Each arm is signed by ITS distinct fixture identity, so
+            // reverting any single arm in the handler turns that arm's twin RED
+            // while the others (and the stranger 403) stay green.
+            let path = fill(row.path, fixture, &fixture.public_repo, row.id_source);
+            let mut v = vec![Probe {
+                label: format!("{} multi-principal hostile (stranger)", row.handler),
+                method: method.clone(),
+                path: path.clone(),
+                body: body.clone(),
+                signer: Signer::Stranger,
+                json,
+                expect: Expect::Deny(403),
+                // The gate fires before returning any entity; nothing private is
+                // seeded to leak on this substrate.
+                withheld: Vec::new(),
+            }];
+            for arm in row.principals {
+                let signer = signer_for_principal(*arm);
+                v.push(Probe {
+                    label: format!("{} arm twin ({:?})", row.handler, arm),
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: body.clone(),
+                    signer,
+                    json,
+                    expect: Expect::Not403,
+                    withheld: Vec::new(),
+                });
+            }
+            v
+        }
         GateClass::ReadGate => {
-            let path = fill(row.path, fixture, &fixture.private_repo);
+            let path = fill(row.path, fixture, &fixture.private_repo, row.id_source);
             // INV-8: the private repo's blob and its OID are actually seeded here, so
             // the 404 body must echo neither the secret content nor the blob OID
             // (full or short) nor the private repo's internal id (#195, F4). An empty
@@ -243,7 +475,7 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
                 Reach::SiblingPublic(sibling) => Probe {
                     label: format!("{} read-reachability twin (sibling public)", row.handler),
                     method,
-                    path: fill(sibling, fixture, &fixture.private_repo),
+                    path: fill(sibling, fixture, &fixture.private_repo, row.id_source),
                     body,
                     signer: Signer::Anon,
                     json,
@@ -259,7 +491,7 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
             v
         }
         GateClass::SignatureRequired => {
-            let path = fill(row.path, fixture, &fixture.public_repo);
+            let path = fill(row.path, fixture, &fixture.public_repo, row.id_source);
             vec![Probe {
                 label: format!("{} signature-required hostile", row.handler),
                 method,
@@ -276,13 +508,28 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
     }
 }
 
+/// A DB-less `Fixture` for the pure-generator unit tests (here and the structural
+/// consistency test in `routes.rs`). No node is seeded, so the identities are
+/// generated keypairs with placeholder repo/secret metadata; only the arm DIDs
+/// and the injected `{id}` matter to `probes_for`. Shared so both test modules
+/// build the same shape.
 #[cfg(test)]
-mod tests {
+pub mod tests_support {
     use super::*;
-    use crate::support::routes::{GateClass, Reach, Row};
 
-    fn fx() -> Fixture {
+    pub fn fx() -> Fixture {
+        let author = Keypair::generate();
+        let creator = Keypair::generate();
+        let claimant = Keypair::generate();
         Fixture {
+            author_did: author.did().to_string(),
+            creator_did: creator.did().to_string(),
+            claimant_did: claimant.did().to_string(),
+            author,
+            creator,
+            claimant,
+            bounty_id: "bounty-uuid-1234".to_string(),
+            issue_id: "issue-uuid-1234".to_string(),
             owner: Keypair::generate(),
             stranger: Keypair::generate(),
             owner_did: "did:key:zOWNER".to_string(),
@@ -296,6 +543,14 @@ mod tests {
             private_blob_oid_short: "deadbeefdead".to_string(),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::routes::{GateClass, Reach, Row};
+
+    use super::tests_support::fx;
 
     #[test]
     fn owner_gate_row_yields_stranger_403_and_owner_twin() {
@@ -307,6 +562,8 @@ mod tests {
             body: Some(r#"{"path_glob":"/"}"#),
             needs: &[],
             reach: Reach::None,
+            principals: &[],
+            id_source: crate::support::routes::IdSource::Fixed,
         };
         let ps = probes_for(&row, &fx());
         assert_eq!(ps.len(), 2);
@@ -337,6 +594,8 @@ mod tests {
             body: None,
             needs: &[],
             reach: Reach::ReaderReads,
+            principals: &[],
+            id_source: crate::support::routes::IdSource::Fixed,
         };
         let f = fx();
         let ps = probes_for(&row, &f);
@@ -394,6 +653,8 @@ mod tests {
             body: None,
             needs: &[],
             reach: Reach::None,
+            principals: &[],
+            id_source: crate::support::routes::IdSource::Fixed,
         };
         let ps = probes_for(&row, &fx());
         assert_eq!(ps.len(), 1);
@@ -416,6 +677,8 @@ mod tests {
             body: None,
             needs: &[],
             reach: Reach::SiblingPublic("/api/v1/repos/{owner}/{repo}/blob/{*path}"),
+            principals: &[],
+            id_source: crate::support::routes::IdSource::Fixed,
         };
         let ps = probes_for(&row, &fx());
         // anon hostile, signed-stranger hostile (#195 F1), sibling-public twin.
@@ -455,6 +718,8 @@ mod tests {
             body: None,
             needs: &[],
             reach: Reach::ReaderReads,
+            principals: &[],
+            id_source: crate::support::routes::IdSource::Fixed,
         };
         let f = fx();
         let ps = probes_for(&row, &f);
@@ -516,6 +781,8 @@ mod tests {
             body: None,
             needs: &[],
             reach: Reach::None,
+            principals: &[],
+            id_source: crate::support::routes::IdSource::Fixed,
         };
         let _ = probes_for(&row, &fx());
     }

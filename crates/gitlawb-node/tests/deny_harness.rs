@@ -512,6 +512,33 @@ async fn send_probe(
             probe.body.clone(),
             &fixture.stranger,
         ),
+        // #195 (F1): each multi-principal arm signs with its own distinct fixture
+        // identity, so reverting one arm in the handler turns only that arm's twin
+        // RED.
+        Signer::Author => signed_request(
+            client,
+            probe.method.clone(),
+            base_url,
+            &probe.path,
+            probe.body.clone(),
+            &fixture.author,
+        ),
+        Signer::Creator => signed_request(
+            client,
+            probe.method.clone(),
+            base_url,
+            &probe.path,
+            probe.body.clone(),
+            &fixture.creator,
+        ),
+        Signer::Claimant => signed_request(
+            client,
+            probe.method.clone(),
+            base_url,
+            &probe.path,
+            probe.body.clone(),
+            &fixture.claimant,
+        ),
     };
     let rb = if probe.json {
         rb.header("content-type", "application/json")
@@ -737,7 +764,7 @@ mod completeness {
     use std::collections::HashSet;
 
     use super::deny_bearing_routes;
-    use crate::support::routes::GateClass;
+    use crate::support::routes::{GateClass, Principal};
 
     /// Every `.route("<path>", <method>(<handler>)…)` mount in `src`, as
     /// (METHOD, path). Multiline-aware: most mounts put the path on the line after
@@ -994,9 +1021,17 @@ mod completeness {
         // owner gate; the signer-self / author forms (register_replica's
         // did_matches(replica_did, …), close_pr's did_matches(&auth.0, &author_did))
         // are deliberately NOT matched, so they don't false-orphan.
+        // A handler satisfies the owner marker if it is a plain OwnerGate row OR a
+        // MultiPrincipalGate row that declares the Owner arm (#195, F1: close_pr /
+        // close_issue owner-gate via require_repo_owner but are owner-OR-author, so
+        // they register as MultiPrincipalGate — their owner arm is still driven).
         let registry_owner_handlers: HashSet<&str> = deny_bearing_routes()
             .iter()
-            .filter(|r| r.gate == GateClass::OwnerGate)
+            .filter(|r| {
+                r.gate == GateClass::OwnerGate
+                    || (r.gate == GateClass::MultiPrincipalGate
+                        && r.principals.contains(&Principal::Owner))
+            })
             .map(|r| short_handler(r.handler))
             .collect();
 
