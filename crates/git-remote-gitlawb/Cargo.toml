@@ -19,3 +19,4 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 mockito = "1"
+tempfile = "3"
