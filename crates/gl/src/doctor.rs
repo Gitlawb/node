@@ -343,6 +343,13 @@ async fn check_version(current: &'static str, github_api_base: &str) -> Check {
         Err(_) => return Check::pass("version", format!("v{current} (offline — could not check)")),
     };
 
+    if !resp.status().is_success() {
+        return Check::pass(
+            "version",
+            format!("v{current} (GitHub API returned HTTP {})", resp.status()),
+        );
+    }
+
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(_) => return Check::pass("version", format!("v{current} (invalid response)")),
@@ -451,5 +458,6 @@ mod tests {
 
         let check = check_version("0.1.0", &server.url()).await;
         assert!(matches!(check.state, CheckState::Ok));
+        assert!(check.detail.contains("up to date"));
     }
 }
