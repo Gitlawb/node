@@ -380,11 +380,7 @@ async fn withheld_path_blob_read_is_denied(pool: sqlx::PgPool) {
 /// commit that adds `files` on top of the existing `main`, force-updating main to
 /// a deterministic base so `<branch>` shares history with main. Returns the body
 /// bytes plus the new feature tip. Shells out to the local `git`.
-fn build_branch_push_body(
-    server_main_tip: &str,
-    branch: &str,
-    files: &[(&str, &str)],
-) -> Vec<u8> {
+fn build_branch_push_body(server_main_tip: &str, branch: &str, files: &[(&str, &str)]) -> Vec<u8> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -518,10 +514,7 @@ async fn get_pr_diff_withheld_path_is_denied(pool: sqlx::PgPool) {
 
     // Anon PASSES the public repo-root gate, then the per-path gate DENIES the diff
     // (it touches the withheld secret path): 404, leaking no content or OID.
-    let secret_oid = oids
-        .get("secret/x.txt")
-        .cloned()
-        .unwrap_or_default(); // seed_bare_repo didn't seed it; the pushed one is unknown here.
+    let secret_oid = oids.get("secret/x.txt").cloned().unwrap_or_default(); // seed_bare_repo didn't seed it; the pushed one is unknown here.
     let resp = client
         .get(format!(
             "{}/api/v1/repos/{owner_did}/prdiff-repo/pulls/{number}/diff",
@@ -1001,7 +994,10 @@ mod completeness {
     const READ_GATE_NOT_DRIVEN: &[(&str, NotDrivenReason)] = &[
         // Owner-2xx twin needs a live IPFS backend (`ipfs_pin::cat`) the harness has
         // no stub for — an honest external-dependency exclusion (#195, KTD-5).
-        ("get_encrypted_blob", NotDrivenReason::ExternalDependencyUnavailable),
+        (
+            "get_encrypted_blob",
+            NotDrivenReason::ExternalDependencyUnavailable,
+        ),
         // Read-gates but is a mutation, not a 404-deny GET.
         ("create_review", NotDrivenReason::ReadGatingMutation),
         ("create_comment", NotDrivenReason::ReadGatingMutation),

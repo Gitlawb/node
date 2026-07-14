@@ -187,12 +187,7 @@ impl Fixture {
         let priv_bounty_id =
             seed_private_bounty(node, &owner, &owner_did, priv_repo, &bounty_marker).await;
 
-        let priv_markers = vec![
-            issue_marker,
-            pr_marker,
-            pr_diff_marker,
-            bounty_marker,
-        ];
+        let priv_markers = vec![issue_marker, pr_marker, pr_diff_marker, bounty_marker];
 
         Fixture {
             owner,
@@ -352,11 +347,18 @@ async fn seed_private_issue(
     let client = reqwest::Client::new();
     let path = format!("/api/v1/repos/{owner_did}/{repo}/issues");
     let body = format!(r#"{{"title":"{marker}"}}"#).into_bytes();
-    let resp = signed_request(&client, reqwest::Method::POST, &node.base_url, &path, body, owner)
-        .header("content-type", "application/json")
-        .send()
-        .await
-        .expect("create private issue sends");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &path,
+        body,
+        owner,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("create private issue sends");
     assert_eq!(
         resp.status().as_u16(),
         201,
@@ -384,15 +386,21 @@ async fn seed_private_pr(
 
     let client = reqwest::Client::new();
     let path = format!("/api/v1/repos/{owner_did}/{repo}/pulls");
-    let body = format!(
-        r#"{{"title":"{marker}","source_branch":"feature","target_branch":"main"}}"#
+    let body =
+        format!(r#"{{"title":"{marker}","source_branch":"feature","target_branch":"main"}}"#)
+            .into_bytes();
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &path,
+        body,
+        owner,
     )
-    .into_bytes();
-    let resp = signed_request(&client, reqwest::Method::POST, &node.base_url, &path, body, owner)
-        .header("content-type", "application/json")
-        .send()
-        .await
-        .expect("create private PR sends");
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("create private PR sends");
     assert_eq!(
         resp.status().as_u16(),
         201,
@@ -422,11 +430,18 @@ async fn seed_private_bounty(
     let client = reqwest::Client::new();
     let path = format!("/api/v1/repos/{owner_did}/{repo}/bounties");
     let body = format!(r#"{{"title":"{marker}","amount":1}}"#).into_bytes();
-    let resp = signed_request(&client, reqwest::Method::POST, &node.base_url, &path, body, owner)
-        .header("content-type", "application/json")
-        .send()
-        .await
-        .expect("create private bounty sends");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &path,
+        body,
+        owner,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("create private bounty sends");
     assert_eq!(
         resp.status().as_u16(),
         201,
