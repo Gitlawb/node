@@ -2336,8 +2336,9 @@ impl Db {
         Ok(())
     }
 
-    /// Resolve the trusted display `owner_did` for a ref-update row, guarding
-    /// against a forged peer-supplied wire value.
+    /// Resolve the trusted display `owner_did` for every ref-update row in a page,
+    /// issuing at most one query per *unique* local repo so the cost scales with
+    /// the number of distinct repos in the page rather than the page size.
     ///
     /// The stored `owner_did` (and the `repo` slug) arrive over gossipsub or the
     /// unsigned peer-notify HTTP path, so neither is trusted. This method binds
@@ -2358,32 +2359,82 @@ impl Db {
     ///   cross-method slug collision cannot synthesize the wrong owner. When no
     ///   unique local repo proves the owner, `None` is returned.
     ///
+    /// # P2 mirror-only fallback
+    ///
+    /// Mirror-only repos store their owner as the bare normalized key (no DID
+    /// method prefix).  When a validated wire DID carries a full prefix (e.g.
+    /// `did:key:z…`) and the matching repo is a mirror, the full wire value is
+    /// returned so the API contract preserves the DID method for these rows.
+    ///
     /// The slug must be `"{owner}/{name}"`; a slug without a `/` cannot be
     /// attributed and yields `None`.
-    pub async fn resolve_ref_update_owner_did(
+    pub async fn resolve_ref_update_owner_dids(
         &self,
-        slug: &str,
-        wire_owner_did: Option<&str>,
-    ) -> Result<Option<String>> {
-        let Some((owner_part, name)) = slug.rsplit_once('/') else {
-            return Ok(None);
-        };
-
-        let repo = self.get_repo(owner_part, name).await?;
-
-        match (wire_owner_did, repo) {
-            // P1: trusted only when the wire DID matches the canonical owner of
-            // the local repo the slug names.
-            (Some(wire), Some(repo))
-                if normalize_owner_key(wire) == normalize_owner_key(&repo.owner_did) =>
-            {
-                Ok(Some(repo.owner_did))
-            }
-            // P3: legacy None row, attributed via an exact unique local match.
-            (None, Some(repo)) => Ok(Some(repo.owner_did)),
-            // Anything else (mismatch, or no proven local owner) is untrusted.
-            _ => Ok(None),
+        rows: &[(&str, Option<&str>)],
+    ) -> Result<Vec<Option<String>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
         }
+
+        // ── 1.  Collect unique lookup keys ────────────────────────────────
+        let mut slug_parts: Vec<Option<String>> = Vec::with_capacity(rows.len());
+        // Keys are stored as `format!("{normalized_key}\0{name}")` for cheap
+        // HashMap lookup.
+        let mut unique_keys: Vec<String> = Vec::new();
+
+        for (slug, _wire) in rows {
+            if let Some((owner_part, name)) = slug.rsplit_once('/') {
+                let normalized = normalize_owner_key(owner_part);
+                let key = format!("{normalized}\0{name}");
+                if !unique_keys.contains(&key) {
+                    unique_keys.push(key.clone());
+                }
+                slug_parts.push(Some(key));
+            } else {
+                slug_parts.push(None);
+            }
+        }
+
+        // ── 2.  Fetch all matching repos (one query per unique key) ──────
+        // The keys are typically few (1–20 for a 200-row page), so per-key
+        // queries are far cheaper than one per event row.
+        let mut repo_map: std::collections::HashMap<String, RepoRecord> =
+            std::collections::HashMap::new();
+        for key in &unique_keys {
+            let Some((owner_part, name)) = key.split_once('\0') else {
+                continue;
+            };
+            if let Some(repo) = self.get_repo(owner_part, name).await? {
+                repo_map.insert(key.clone(), repo);
+            }
+        }
+
+        // ── 3.  Resolve every input row ──────────────────────────────────
+        let mut results = Vec::with_capacity(rows.len());
+        for (i, (_slug, wire_owner_did)) in rows.iter().enumerate() {
+            let Some(repo) = slug_parts[i].as_ref().and_then(|k| repo_map.get(k)) else {
+                results.push(None);
+                continue;
+            };
+
+            match (wire_owner_did, repo) {
+                (Some(wire), repo)
+                    if normalize_owner_key(wire) == normalize_owner_key(&repo.owner_did) =>
+                {
+                    if repo.id.contains('/') && *wire != repo.owner_did {
+                        results.push(Some((*wire).to_string()));
+                    } else {
+                        results.push(Some(repo.owner_did.clone()));
+                    }
+                }
+                (None, _) => {
+                    results.push(Some(repo.owner_did.clone()));
+                }
+                _ => results.push(None),
+            }
+        }
+
+        Ok(results)
     }
 
     /// One page of ref updates (newest first), optionally scoped to one repo.

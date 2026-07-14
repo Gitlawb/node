@@ -77,13 +77,21 @@ impl QueryRoot {
         // feed: the stored wire value is untrusted, so it is echoed only when it
         // matches the canonical owner of the local repo the slug names (#P1);
         // legacy None rows are attributed via an exact unique local match (#P3).
-        let mut resolved = Vec::with_capacity(updates.len());
-        for u in updates {
-            let owner_did = db
-                .resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())
-                .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-            resolved.push(RefUpdateType {
+        // The batch resolver issues at most one query per distinct local repo
+        // rather than one per event row (#P2).
+        let pairs: Vec<(&str, Option<&str>)> = updates
+            .iter()
+            .map(|u| (u.repo.as_str(), u.owner_did.as_deref()))
+            .collect();
+        let owner_dids = db
+            .resolve_ref_update_owner_dids(&pairs)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+
+        let resolved: Vec<RefUpdateType> = updates
+            .into_iter()
+            .zip(owner_dids)
+            .map(|(u, owner_did)| RefUpdateType {
                 repo: u.repo,
                 ref_name: u.ref_name,
                 old_sha: u.old_sha,
@@ -92,8 +100,8 @@ impl QueryRoot {
                 node_did: u.node_did,
                 timestamp: u.timestamp,
                 owner_did,
-            });
-        }
+            })
+            .collect();
         Ok(resolved)
     }
 

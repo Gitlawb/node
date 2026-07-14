@@ -143,18 +143,22 @@ pub async fn list_ref_updates(
     // only when it matches the canonical owner of the local repo the slug
     // names (#P1); legacy None rows are attributed via an exact unique local
     // match (#P3). Both surfaces share this resolver so they cannot drift.
-    let owner_dids: Vec<serde_json::Value> = futures::future::join_all(updates.iter().map(|u| {
-        state
-            .db
-            .resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())
-    }))
-    .await
-    .into_iter()
-    .map(|r| {
-        r.map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
-            .unwrap_or(serde_json::Value::Null)
-    })
-    .collect();
+    // The batch resolver issues at most one query per distinct local repo
+    // rather than one per event row (#P2).
+    let raw_dids: Vec<Option<String>> = state
+        .db
+        .resolve_ref_update_owner_dids(
+            &updates
+                .iter()
+                .map(|u| (u.repo.as_str(), u.owner_did.as_deref()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+    let owner_dids: Vec<serde_json::Value> = raw_dids
+        .into_iter()
+        .map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
+        .collect();
 
     let events: Vec<serde_json::Value> = updates
         .iter()
@@ -264,18 +268,19 @@ pub async fn list_repo_events(
     // them.
     let gossip_updates =
         collect_visible_ref_updates(&state.db, Some(&repo_id_str), limit, caller).await?;
-    let gossip_owner_dids: Vec<serde_json::Value> =
-        futures::future::join_all(gossip_updates.iter().map(|u| {
-            state
-                .db
-                .resolve_ref_update_owner_did(&u.repo, u.owner_did.as_deref())
-        }))
-        .await
+    let gossip_raw: Vec<Option<String>> = state
+        .db
+        .resolve_ref_update_owner_dids(
+            &gossip_updates
+                .iter()
+                .map(|u| (u.repo.as_str(), u.owner_did.as_deref()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+    let gossip_owner_dids: Vec<serde_json::Value> = gossip_raw
         .into_iter()
-        .map(|r| {
-            r.map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
-                .unwrap_or(serde_json::Value::Null)
-        })
+        .map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
         .collect();
 
     let gossip_events: Vec<serde_json::Value> = gossip_updates
