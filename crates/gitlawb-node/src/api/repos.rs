@@ -717,7 +717,7 @@ fn acquire_read_caller_permit(
         Some(k) => match limiter.try_acquire(k) {
             Some(p) => Ok(Some(p)),
             None => {
-                tracing::warn!(repo = %repo, caller = %k, handler, "per-caller read cap reached; shedding with 503");
+                tracing::warn!(repo = %repo, caller = %k, handler, "per-caller cap reached; shedding with 503");
                 Err(AppError::Overloaded(
                     "git service at capacity for this caller, retry shortly".into(),
                 ))
@@ -1033,15 +1033,32 @@ pub async fn git_receive_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Extension(auth): Extension<AuthenticatedDid>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    let name = smart_http_repo_name(&repo)?;
+    // Per-source write sub-cap (#174 P1-d): before the global write permit so one
+    // source IP cannot occupy the whole write pool via many slow authenticated pushes
+    // and 503 every other source. Owner enforcement defaults off, so any valid did:key
+    // is accepted (auth != authz), and the 600/hour push limiter bounds arrival RATE,
+    // not in-flight concurrency — so without this a single host minting disposable DIDs
+    // saturates the pool. Keyed on the resolved source IP, NEVER the signed DID (a DID
+    // farm defeats a DID key); no resolvable key -> global write pool only.
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+    let _caller_permit = acquire_read_caller_permit(
+        &state.git_write_per_caller,
+        caller_key.as_deref(),
+        name,
+        "receive-pack",
+    )?;
     // Shed with a 503 before spawning git when the concurrency cap is saturated.
     // Pushes draw from the dedicated WRITE pool, separate from reads, so a flood of
-    // anonymous reads cannot shed an authenticated push (#174). Acquired at the very
-    // top so it wraps the write-guard below (and precedes the Tigris acquire_write,
-    // bounding concurrent fresh acquires — INV-10); held for the whole op.
+    // anonymous reads cannot shed an authenticated push (#174). Taken after the
+    // per-source cap above so one source cannot occupy global slots it would be
+    // sub-cap-denied for; still before the Tigris acquire_write, bounding concurrent
+    // fresh acquires (INV-10); held for the whole op.
     let _permit = git_permit(&state.git_write_semaphore)?;
-    let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "receive-pack request");
     let record = state
         .db
@@ -3604,6 +3621,82 @@ mod tests {
                 libc::kill(p, libc::SIGKILL);
             }
         }
+    }
+
+    /// #174 U4 (P1-d, RED-before/GREEN-after): the authenticated receive-pack POST
+    /// carries a per-source WRITE sub-cap so one source IP cannot monopolize the write
+    /// pool with many slow pushes (owner enforcement defaults off, so disposable DIDs
+    /// are free). Global write pool has capacity; the source is pre-held at its single
+    /// write slot. A push from THAT source sheds (Overloaded/503) — which also proves
+    /// the PeerAddr+HeaderMap extractors resolve a key (without them the key is None and
+    /// the cap is inert, never shedding). A push from a DIFFERENT source is NOT shed by
+    /// the cap. Called directly so the test needs no signed request; the handler is
+    /// where the cap lives. Remove the `git_write_per_caller` acquire and the capped
+    /// source no longer sheds (RED).
+    #[sqlx::test]
+    async fn receive_pack_per_source_write_cap_sheds_capped_source_not_others(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Global write pool has capacity; the per-source cap is 1.
+        state.git_write_semaphore = Arc::new(Semaphore::new(4));
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6rp4wr", "rp4", "/tmp/rp4-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let did = "did:key:z6MkReceivePackWriteCapProofDidAAAAAAAAAA";
+        let capped: SocketAddr = "203.0.113.44:5000".parse().unwrap();
+        let other: SocketAddr = "203.0.113.45:5000".parse().unwrap();
+
+        // Pin the capped source at its single write slot.
+        let _slot = state
+            .git_write_per_caller
+            .try_acquire(&capped.ip().to_string())
+            .expect("first write slot for the capped source IP");
+
+        // A push from the capped source must shed on the per-source write cap even with
+        // global write capacity free. The shed also proves the source-IP key resolved
+        // via the extractors (an inert None key would fall through to Ok(None)).
+        let capped_result = git_receive_pack(
+            State(state.clone()),
+            Path(("z6rp4wr".to_string(), "rp4".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(capped)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            matches!(capped_result, Err(AppError::Overloaded(_))),
+            "a source at its per-source write cap must shed (Overloaded/503) with global \
+             pool capacity free; got {capped_result:?}"
+        );
+
+        // A push from a DIFFERENT source must NOT be shed by the per-source cap — it
+        // proceeds past admission (and fails later on the nonexistent repo, which is not
+        // an Overloaded error).
+        let other_result = git_receive_pack(
+            State(state.clone()),
+            Path(("z6rp4wr".to_string(), "rp4".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(other)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            !matches!(other_result, Err(AppError::Overloaded(_))),
+            "a different source must not be shed by the per-source write cap while the \
+             capped source holds its slot; got {other_result:?}"
+        );
     }
 
     /// #174 SC2 (per-source key, U1): the per-caller read sub-cap keys on the

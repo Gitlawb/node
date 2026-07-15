@@ -123,6 +123,13 @@ pub struct AppState {
     /// a fraction of `max_concurrent_git_pushes`, so filling the write pool takes many
     /// distinct source IPs (each also braked by the per-IP push rate limiter).
     pub git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency,
+    /// Per-source concurrency sub-cap on the authenticated `git-receive-pack` POST:
+    /// each source IP may hold at most a small share of `git_write_semaphore`, so one
+    /// host minting disposable `did:key` identities cannot open enough slow pushes to
+    /// monopolize the write pool and 503 every other source's push (#174 P1-d). Keyed
+    /// on the resolved source IP (never the DID — a DID farm defeats a DID key). Sized
+    /// like `git_push_advert_per_caller`, a fraction of `max_concurrent_git_pushes`.
+    pub git_write_per_caller: crate::rate_limit::PerCallerConcurrency,
     /// The `git` executable the served-git withheld-blob walk spawns. Production is
     /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
     /// process-group teardown in handler tests without mutating the process-global
