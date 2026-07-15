@@ -141,6 +141,33 @@ pub struct AppState {
     /// on the resolved source IP (never the DID — a DID farm defeats a DID key). Sized
     /// like `git_push_advert_per_caller`, a fraction of `max_concurrent_git_pushes`.
     pub git_write_per_caller: crate::rate_limit::PerCallerConcurrency,
+    /// Bounds concurrent `GET /ipfs/{cid}` visibility-walk requests. The public
+    /// `/ipfs/{cid}` route runs `allowed_blob_set_for_caller_bounded` in
+    /// `spawn_blocking` (a full-history git walk) with NO served-git admission of its
+    /// own; without this a permissionless caller fans out concurrent walks past every
+    /// git pool, exhausting the blocking pool + PIDs (#174 P1-3). A request acquires a
+    /// permit before the repo loop and holds it for the whole request (across every
+    /// `spawn_blocking` walk), so the slot reflects real thread occupancy — a tokio
+    /// walk-timeout cannot free it while the blocking work still runs. A pool of its
+    /// own (`max_concurrent_ipfs_walks`), NOT a git pool: distinct cost center + public
+    /// surface, so anonymous /ipfs traffic can never shed an authenticated git op.
+    pub git_ipfs_walk_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Per-source concurrency sub-cap on the `/ipfs/{cid}` walk pool: each source
+    /// (keyed on the resolved source IP, never the DID — `/ipfs` admits any `did:key`
+    /// unthrottled, so a DID key would be free to mint around) may hold at most
+    /// `ipfs_walk_per_source` in-flight walk slots, so one source cannot monopolize
+    /// `git_ipfs_walk_semaphore` (#174 P1-3). A request with no resolvable key is
+    /// bounded by the global pool only, never this sub-cap. The key map is bounded
+    /// (`with_default_max_keys`, reject-before-insert) so a source-key farm cannot grow
+    /// it (INV-15).
+    pub git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency,
+    /// Per-client-IP rate limiter for `GET /ipfs/{cid}`. The route is publicly
+    /// reachable and each request can drive a full-history git walk, so it carries a
+    /// per-IP flood brake in addition to the concurrency cap above — a rate limit
+    /// bounds request *rate*, the semaphore bounds concurrent slow holds (different
+    /// axes). Keyed on the resolved client IP via `push_limiter_trust`. Layered on the
+    /// `/ipfs` route via `rate_limit_by_ip`.
+    pub ipfs_rate_limiter: RateLimiter,
     /// The `git` executable the served-git withheld-blob walk spawns. Production is
     /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
     /// process-group teardown in handler tests without mutating the process-global

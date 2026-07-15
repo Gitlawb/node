@@ -335,6 +335,66 @@ pub struct Config {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
     pub max_concurrent_reads_per_caller: usize,
+
+    /// Maximum number of concurrent `GET /ipfs/{cid}` requests that may run their
+    /// visibility walk at once. The publicly-reachable `/ipfs/{cid}` route runs
+    /// `allowed_blob_set_for_caller_bounded` in `spawn_blocking` — a full-history
+    /// git walk (up to `git_service_timeout_secs`) — for each candidate repo. It
+    /// draws from THIS pool, not any served-git pool: a distinct public cost center
+    /// on a distinct surface, so sharing a git pool would let anonymous /ipfs
+    /// traffic shed authenticated git ops (the auth-boundary trap). A permit is
+    /// held for the whole request (across the repo loop) so it reflects real
+    /// blocking-thread occupancy, not merely the tokio wait. Beyond this the request
+    /// sheds a clean 503 + Retry-After. Must be between 1 and 1_048_576; the ceiling
+    /// keeps the value under tokio's `Semaphore` permit limit so an oversized value
+    /// is a clean CLI error rather than a boot-time panic. Default: 32.
+    #[arg(
+        long,
+        env = "GITLAWB_MAX_CONCURRENT_IPFS_WALKS",
+        default_value_t = 32,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub max_concurrent_ipfs_walks: usize,
+
+    /// Maximum concurrent `/ipfs/{cid}` walk requests a single source may hold at
+    /// once, so one source cannot monopolize `max_concurrent_ipfs_walks` (#174).
+    /// Callers are keyed on the RESOLVED SOURCE IP (`client_key`/`GITLAWB_TRUSTED_PROXY`),
+    /// never the DID — `/ipfs` accepts any `did:key` via `optional_signature` with no
+    /// admission step, so keying on the DID would let one host mint disposable DIDs to
+    /// multiply its budget. A request with no resolvable key (no trusted header, no
+    /// peer) is bounded by the global pool only, never this sub-cap. Over-cap sheds a
+    /// clean 503 + Retry-After. Must be between 1 and 1_048_576. Default: 4.
+    #[arg(
+        long,
+        env = "GITLAWB_IPFS_WALK_PER_SOURCE",
+        default_value_t = 4,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub ipfs_walk_per_source: usize,
+
+    /// Upper bound on the number of candidate repos a single `/ipfs/{cid}` request
+    /// will walk before giving up (returning the opaque 404). The handler already
+    /// short-circuits the moment it serves the object, but a CID that is present in
+    /// (or path-gated out of) many repos could otherwise serialize one full-history
+    /// walk per repo inside a single held admission slot. Capping the count bounds
+    /// the worst-case work one request can pin its slot with. Must be between 1 and
+    /// 1_048_576. Default: 64.
+    #[arg(
+        long,
+        env = "GITLAWB_IPFS_MAX_REPOS_WALKED",
+        default_value_t = 64,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub ipfs_max_repos_walked: usize,
+
+    /// Per-client-IP rate limit for `GET /ipfs/{cid}`, in requests per hour. The
+    /// route is publicly reachable (`optional_signature`) and each request can drive
+    /// a full-history git walk, so it carries a per-IP flood brake in addition to the
+    /// concurrency cap above (a rate limit bounds request *rate*, the semaphore
+    /// bounds concurrent slow holds — different axes). Keyed on the resolved client
+    /// IP via `GITLAWB_TRUSTED_PROXY`. `0` disables. Default: 600.
+    #[arg(long, env = "GITLAWB_IPFS_RATE_LIMIT", default_value_t = 600)]
+    pub ipfs_rate_limit: usize,
 }
 
 impl Config {
@@ -425,6 +485,66 @@ mod tests {
             Config::parse_from(["gitlawb-node", "--max-concurrent-git-pushes", "1048576"])
                 .max_concurrent_git_pushes,
             1_048_576
+        );
+    }
+
+    #[test]
+    fn max_concurrent_ipfs_walks_defaults_and_rejects_out_of_range() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).max_concurrent_ipfs_walks,
+            32
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--max-concurrent-ipfs-walks", "4"])
+                .max_concurrent_ipfs_walks,
+            4
+        );
+        // 0 permits would shed every /ipfs walk with a 503; clap must reject it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--max-concurrent-ipfs-walks", "0"]).is_err()
+        );
+        // Above the ceiling would panic tokio's Semaphore::new at boot; clap rejects it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--max-concurrent-ipfs-walks", "1048577"])
+                .is_err()
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--max-concurrent-ipfs-walks", "1048576"])
+                .max_concurrent_ipfs_walks,
+            1_048_576
+        );
+    }
+
+    #[test]
+    fn ipfs_walk_per_source_defaults_and_rejects_out_of_range() {
+        assert_eq!(Config::parse_from(["gitlawb-node"]).ipfs_walk_per_source, 4);
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--ipfs-walk-per-source", "2"])
+                .ipfs_walk_per_source,
+            2
+        );
+        // 0 would shed every /ipfs walk from a keyed source; clap must reject it.
+        assert!(Config::try_parse_from(["gitlawb-node", "--ipfs-walk-per-source", "0"]).is_err());
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--ipfs-walk-per-source", "1048577"]).is_err()
+        );
+    }
+
+    #[test]
+    fn ipfs_max_repos_walked_defaults_and_rejects_out_of_range() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).ipfs_max_repos_walked,
+            64
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "8"])
+                .ipfs_max_repos_walked,
+            8
+        );
+        // 0 would walk no repos (serve nothing); clap must reject it.
+        assert!(Config::try_parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "0"]).is_err());
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "1048577"]).is_err()
         );
     }
 
