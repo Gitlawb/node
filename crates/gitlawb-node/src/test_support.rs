@@ -92,6 +92,12 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
             8,
         ),
         git_write_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
+        // Generous — a test that drives the /ipfs walk shed overrides these directly.
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
+            16,
+        ),
+        ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         git_bin: "git".to_string(),
     }
 }

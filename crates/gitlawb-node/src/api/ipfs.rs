@@ -58,6 +58,11 @@ pub async fn get_by_cid(
     Path(cid_str): Path<String>,
     State(state): State<AppState>,
     auth: Option<Extension<AuthenticatedDid>>,
+    // Per-source keying for the walk concurrency sub-cap. Infallible extractors
+    // (mirror the git handlers in `repos.rs`): `PeerAddr` yields `None` under
+    // `oneshot` with no `ConnectInfo`, and the header map falls back per `client_key`.
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    req_headers: HeaderMap,
 ) -> Result<Response> {
     // 1. Decode the CID and extract the SHA-256 digest
     let cid = CidGeneric::<64>::from_str(&cid_str)
@@ -75,6 +80,36 @@ pub async fn get_by_cid(
     let sha256_hex = hex::encode(mh.digest());
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let caller_owned = caller.map(|c| c.to_string());
+
+    // Bounded walk admission (#174 P1-3), taken before any DB/git work so a flood sheds
+    // cheaply. The per-repo `spawn_blocking` walk below is a full-history git walk with
+    // no served-git admission of its own; a permissionless caller could otherwise fan
+    // out concurrent walks past every git pool, exhausting the blocking pool + PIDs.
+    // Acquire the global permit (and, for a resolvable source, the per-source
+    // sub-permit) ONCE here and hold BOTH for the whole request — across every
+    // `spawn_blocking` walk in the loop below — so the slot reflects real blocking-thread
+    // occupancy (a tokio walk-timeout cannot free it while the blocking work still runs)
+    // and one request cannot open more than its share of concurrent walks. On
+    // unavailability shed a clean 503. The per-source key is the resolved source IP
+    // (`client_key`), never the DID (`/ipfs` admits any `did:key` unthrottled, so a DID
+    // key would be free to mint around); a `None` key (no trusted header, no peer) is
+    // bounded by the global pool only, never the per-source sub-cap.
+    let _ipfs_walk_permit = state
+        .git_ipfs_walk_semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            tracing::warn!("/ipfs walk concurrency cap reached; shedding request with 503");
+            AppError::Overloaded("ipfs service at capacity, retry shortly".into())
+        })?;
+    let source_key = crate::rate_limit::client_key(&req_headers, peer, state.push_limiter_trust);
+    let _ipfs_caller_permit = match &source_key {
+        Some(ip) => Some(state.git_ipfs_walk_per_caller.try_acquire(ip).ok_or_else(|| {
+            tracing::warn!(key = %ip, "/ipfs per-source walk cap reached; shedding request with 503");
+            AppError::Overloaded("ipfs service at capacity for this source, retry shortly".into())
+        })?),
+        None => None,
+    };
 
     // 2. Search all repos for an object with this SHA-256
     let repos = state
@@ -104,6 +139,11 @@ pub async fn get_by_cid(
     // deny entry (#126).
     let mut allowed_memo: HashMap<String, HashSet<String>> = HashMap::new();
 
+    // Cap the number of candidate repos one request walks (it already short-circuits on
+    // serve): a CID present in — or path-gated out of — many repos must not serialize an
+    // unbounded number of full-history walks inside the single held admission slot.
+    let mut repos_walked: usize = 0;
+
     for repo in &repos {
         // Repo-level read gate against THIS row's own rules (KTD2a).
         let rules: &[crate::db::VisibilityRule] = rules_by_repo
@@ -113,6 +153,19 @@ pub async fn get_by_cid(
         if visibility_check(rules, repo.is_public, &repo.owner_did, caller, "/") == Decision::Deny {
             continue;
         }
+
+        // Loop bound (#174 P1-3): once this request has walked its cap of candidate
+        // repos (each a git subprocess, up to a full-history walk), stop and fall
+        // through to the opaque 404 rather than serialize an unbounded number under the
+        // single held admission slot.
+        if repos_walked >= state.config.ipfs_max_repos_walked {
+            tracing::warn!(
+                cap = state.config.ipfs_max_repos_walked,
+                "/ipfs request hit the per-request repo-walk cap; stopping the scan"
+            );
+            break;
+        }
+        repos_walked += 1;
 
         // Bound the per-repo acquire under `git_acquire_timeout_secs`: this loop shares
         // the P1-2 stall vector (a hung Tigris HEAD/GET on one repo would otherwise
@@ -248,4 +301,642 @@ pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json:
         "pins": pins,
         "count": pins.len(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    //! #174 P1-3 (U3): the public `GET /ipfs/{cid}` walk carries bounded CONCURRENCY
+    //! admission (a global pool + per-source sub-cap) held through the `spawn_blocking`
+    //! walk, plus a per-IP route rate limit. These are handler-layer proofs: mount the
+    //! real handler/router, drive one request, assert the exact 503 shed, then name the
+    //! mutation that turns each RED. The per-source key resolves an IP only (`Some(ip)`
+    //! vs `None`), never a DID — both arms are driven so neither is vacuous.
+
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Router;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+    use tower::ServiceExt;
+
+    /// A router mounting the real `get_by_cid` on `/ipfs/{cid}` with `optional_signature`,
+    /// matching production wiring for the extractors (`PeerAddr` reads `ConnectInfo`).
+    fn ipfs_router(state: crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/ipfs/{cid}",
+                axum::routing::get(crate::api::ipfs::get_by_cid),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state)
+    }
+
+    /// A syntactically valid CIDv1(raw, sha2-256) string the handler decodes past its
+    /// CID/hash-code validation, so the request reaches the walk admission (not a 400).
+    fn valid_cid() -> String {
+        gitlawb_core::cid::Cid::from_git_object_bytes(b"blob 5\0hello")
+            .as_str()
+            .to_string()
+    }
+
+    fn get_cid(cid: &str, peer: Option<SocketAddr>) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/ipfs/{cid}"))
+            .body(Body::empty())
+            .unwrap();
+        if let Some(p) = peer {
+            req.extensions_mut().insert(ConnectInfo(p));
+        }
+        req
+    }
+
+    /// Shed at capacity: an exhausted `git_ipfs_walk_semaphore` sheds a `/ipfs/{cid}`
+    /// request with 503 BEFORE any DB/git walk (the acquire is the first thing after CID
+    /// validation), so a lazy DB-free state suffices — exactly like the served-git shed
+    /// tests. MUTATION (RED): delete the `git_ipfs_walk_semaphore` acquire in
+    /// `get_by_cid` and the request no longer sheds here (it falls through to the DB /
+    /// walk and returns something other than 503).
+    #[tokio::test]
+    async fn get_by_cid_sheds_with_503_when_walk_pool_exhausted() {
+        let mut state = crate::test_support::test_state_lazy();
+        // Global /ipfs walk pool exhausted; per-source cap permissive so only the global
+        // pool can shed. Route rate limit is applied as a layer in production, not here.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(0));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted /ipfs walk pool must shed the request with 503"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the 503 shed must carry Retry-After"
+        );
+    }
+
+    /// Per-source sub-cap, the `Some(ip)` arm: with per-source = 1 and the source pinned
+    /// at its single slot, a request from THAT source sheds 503 (global pool has room),
+    /// while a request from a DIFFERENT source is NOT shed by the cap (it proceeds past
+    /// admission). Pinning proves the `PeerAddr`/`HeaderMap` extractors resolved the key
+    /// — an inert `None` key would never shed on the per-source cap. MUTATION (RED):
+    /// delete the `git_ipfs_walk_per_caller` acquire and the capped source no longer
+    /// sheds.
+    #[tokio::test]
+    async fn get_by_cid_per_source_cap_sheds_same_source_admits_other() {
+        let mut state = crate::test_support::test_state_lazy();
+        // Global pool has room; the per-source cap is 1.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(8));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let capped: SocketAddr = "203.0.113.20:5000".parse().unwrap();
+        let other: SocketAddr = "203.0.113.21:5000".parse().unwrap();
+
+        // Pin the capped source at its single walk slot.
+        let _slot = state
+            .git_ipfs_walk_per_caller
+            .try_acquire(&capped.ip().to_string())
+            .expect("first walk slot for the capped source IP");
+
+        let cid = valid_cid();
+        // The capped source sheds on the per-source cap even with global capacity free.
+        let resp = ipfs_router(state.clone())
+            .oneshot(get_cid(&cid, Some(capped)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its per-source /ipfs walk cap must shed 503 with global capacity free"
+        );
+
+        // A DIFFERENT source is NOT shed by the per-source cap: it clears admission and
+        // proceeds (then errors on the lazy DB, which is not a 503).
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid, Some(other)))
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a different source must not be shed by the per-source cap"
+        );
+    }
+
+    /// The `None`-key arm: a request with no resolvable source key (no trusted-proxy
+    /// header, no `ConnectInfo`) is bounded by the GLOBAL pool only, never the per-source
+    /// sub-cap. With the global pool exhausted it still sheds 503 (the counterpart to the
+    /// `Some(ip)` arm above, so neither arm is vacuous).
+    #[tokio::test]
+    async fn get_by_cid_none_key_arm_sheds_on_global_pool() {
+        let mut state = crate::test_support::test_state_lazy();
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(0));
+        // Per-source cap permissive so only the global pool can shed.
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        // No ConnectInfo + no trusted header -> client_key resolves None.
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a None-key request must still shed 503 on the exhausted GLOBAL /ipfs walk pool"
+        );
+    }
+
+    /// Map self-bound (INV-15): the `/ipfs` per-source map is a `PerCallerConcurrency`
+    /// built via `with_default_max_keys`, so a distinct-source-key flood cannot grow it
+    /// past the cap and a rejected key never allocates (reject-before-insert). Mirrors
+    /// `per_caller_concurrency_map_is_self_bounding_and_reject_before_insert` for the
+    /// pool U3 adds.
+    #[tokio::test]
+    async fn ipfs_walk_per_caller_map_is_self_bounding_and_reject_before_insert() {
+        let lim = crate::rate_limit::PerCallerConcurrency::new(4, 3);
+        // Acquire+drop a flood of distinct keys — the map self-empties (a key is removed
+        // the instant its in-flight count hits zero).
+        for i in 0..50 {
+            let _p = lim.try_acquire(&format!("src{i}"));
+        }
+        assert_eq!(
+            lim.tracked_keys(),
+            0,
+            "an acquire+drop flood of distinct sources leaves the /ipfs map empty"
+        );
+        // Reject-before-insert: hold max_keys distinct sources, then a new one sheds
+        // without growing the map.
+        let held: Vec<_> = (0..3)
+            .map(|i| lim.try_acquire(&format!("h{i}")).unwrap())
+            .collect();
+        assert_eq!(
+            lim.tracked_keys(),
+            3,
+            "three distinct sources held concurrently"
+        );
+        assert!(
+            lim.try_acquire("h3").is_none(),
+            "a new source key at max_keys is rejected"
+        );
+        assert_eq!(
+            lim.tracked_keys(),
+            3,
+            "the rejected key did not allocate an entry (reject-before-insert)"
+        );
+        drop(held);
+    }
+
+    /// Retain-through-blocking (R3, the load-bearing async property): the walk
+    /// admission is held until the `spawn_blocking` walk actually RETURNS, not when a
+    /// tokio timeout fires. With the global pool at size 1, drive a request until its
+    /// walk (a fake git that hangs on `rev-list`) is in flight; the slot must stay held
+    /// (`available_permits() == 0`) and a replacement from a DIFFERENT source must shed
+    /// 503 for as long as the blocking walk runs — even though the request future is
+    /// only `.await`ing the blocking join. When the blocking walk ends the permit frees
+    /// and a replacement is admitted. The permit lives INSIDE the handler across the
+    /// blocking `.await`; move it out (drop before the walk) and the replacement would
+    /// be admitted while the walk still burns a blocking thread (the bug this guards).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_walk_permit_held_through_blocking_walk(pool: sqlx::PgPool) {
+        use std::process::Command;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let revlist_pid = tmp.path().join("revlist.pid");
+        // Fake git for the /ipfs WALK only (object_type/read_object_content use the real
+        // `git`, so the object must genuinely exist below). Empty refs (so
+        // assert_all_refs_are_commits returns Ok without the peel), `rev-parse` resolves,
+        // and `rev-list` records its pid then sleeps ~6s so the walk BLOCKS
+        // deterministically. The sleep bounds the walk so a broken fix cannot wedge the
+        // suite.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               for-each-ref) : ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               rev-list) echo $$ > \"{}\"; sleep 6 ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            revlist_pid.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        // Isolate the global walk pool at size 1; per-source cap permissive so only the
+        // held global permit can shed the replacement.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let owner = "z6ipfs1";
+        let name = "ip1";
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // The exact bare path the handler's `acquire` resolves. Build a REAL SHA-256 bare
+        // repo there with a committed blob under `src/`, so real `git cat-file -t <cid
+        // digest>` classifies it as a blob (the CID digest IS the sha256 object id in
+        // object-format=sha256) and the handler reaches the path-scoped walk branch.
+        let bare = state
+            .repo_store
+            .acquire(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/secret.txt"), b"ipfs walk retain proof\n").unwrap();
+        run(
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+            &work,
+        );
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "src/secret.txt"], &work);
+        run(&["commit", "-q", "-m", "seed"], &work);
+        run(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            tmp.path(),
+        );
+        // The blob's SHA-256 object id (= the CID's digest); build the CID from it.
+        let oid = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD:src/secret.txt"])
+                .current_dir(&work)
+                .output()
+                .expect("git rev-parse runs");
+            assert!(out.status.success(), "rev-parse failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let oid_bytes = gitlawb_core::cid::sha256_hex_to_bytes(&oid).unwrap();
+        let cid = gitlawb_core::cid::Cid::from_sha256_bytes(&oid_bytes)
+            .as_str()
+            .to_string();
+        // Precondition: real git classifies the object as a blob (so the handler reaches
+        // the walk branch, not an early `continue`).
+        assert_eq!(
+            crate::git::store::object_type(&bare, &oid)
+                .unwrap()
+                .as_deref(),
+            Some("blob"),
+            "the seeded sha256 blob must exist so the handler reaches the walk"
+        );
+        // A path-scoped rule so has_path_scoped_rule() is true (the walk branch) without
+        // denying the "/" gate on the public repo.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "src/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkU3IpfsReaderAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one walk slot before the request"
+        );
+
+        let router = ipfs_router(state);
+        let make_req = |peer: SocketAddr| {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/ipfs/{cid}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let peer: SocketAddr = "203.0.113.81:5000".parse().unwrap();
+        let mut fut = Box::pin(router.clone().oneshot(make_req(peer)));
+        // Drive until the fake git's rev-list records its pid — the walk is now in the
+        // blocking pool and the request future is `.await`ing its join, holding the walk
+        // permit. Stop polling the instant the future completes (re-polling a completed
+        // oneshot panics).
+        let mut walk_pid: Option<i32> = None;
+        let mut early = None;
+        for _ in 0..500 {
+            let done = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&revlist_pid)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                walk_pid = Some(p);
+                break;
+            }
+            if let Ok(resp) = done {
+                early = Some(resp.map(|r| r.status()));
+                break;
+            }
+        }
+        let pid = walk_pid
+            .unwrap_or_else(|| panic!("the fake git rev-list must have spawned; early: {early:?}"));
+        // Reap the sleeping child on drop so a RED run leaks no orphan.
+        struct ReapOnDrop(i32);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapOnDrop(pid);
+
+        // Load-bearing: while the blocking walk runs, the slot is HELD and a replacement
+        // from a DIFFERENT source sheds 503 — proving the permit is retained across the
+        // spawn_blocking join, not freed by a tokio timeout.
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the walk slot must be held while the spawn_blocking walk runs"
+        );
+        let peer2: SocketAddr = "203.0.113.82:5000".parse().unwrap();
+        let resp = router.clone().oneshot(make_req(peer2)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a replacement must shed 503 while the prior request's blocking walk still runs"
+        );
+
+        // Drop the in-flight request; the detached blocking walk keeps running (a
+        // spawn_blocking cannot be cancelled), but on the fix the permit is a handler
+        // local, so dropping the future releases it once the blocking join is abandoned.
+        // Either way, kill the sleeping child so the slot frees promptly and poll for
+        // recovery — the point already proven above is that the slot stayed held for the
+        // duration of the blocking work.
+        drop(fut);
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let mut freed = false;
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "once the blocking walk ends the walk permit must free the global slot"
+        );
+    }
+
+    /// Loop bound (cap N): one `/ipfs/{cid}` request against a CID present in many repos
+    /// must not serialize an unbounded number of full-history walks. With
+    /// `ipfs_max_repos_walked = 1` and TWO public, path-scoped repos both carrying the
+    /// blob at the requested CID, the handler walks only the FIRST candidate then stops
+    /// (the second is cut by the cap), so the fake git's `rev-list` (one per walk) runs
+    /// exactly once. MUTATION (RED): remove the `repos_walked >= cap` break and both
+    /// repos are walked (count 2).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_caps_repos_walked_per_request(pool: sqlx::PgPool) {
+        use std::process::Command;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let walk_log = tmp.path().join("walks.log");
+        // Fake git for the WALK: empty refs, `rev-parse` resolves, and each `rev-list`
+        // appends one line to a log (so the number of walks == the line count) and exits
+        // with EMPTY output (the allowed-set is empty, so every repo path-gates to a
+        // `continue` and the request 404s after walking). object_type uses the REAL git,
+        // so the seeded blob below must genuinely exist.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               for-each-ref) : ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               rev-list) echo walk >> \"{}\" ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            walk_log.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // The bound under test: walk at most one candidate repo per request.
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_max_repos_walked = 1;
+        state.config = Arc::new(cfg);
+
+        // Seed TWO public repos, each with the SAME blob (same content -> same sha256 OID
+        // -> same CID) under a path-scoped rule, so both are walk candidates for one CID.
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let mut oid = String::new();
+        for (i, name) in ["ipa", "ipb"].iter().enumerate() {
+            let owner = "z6ipfsN";
+            state
+                .db
+                .upsert_mirror_repo(owner, name, &format!("/unused-{name}"), None, false)
+                .await
+                .unwrap();
+            let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+            let bare = state
+                .repo_store
+                .acquire(&rec.owner_did, &rec.name)
+                .await
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&bare);
+            std::fs::create_dir_all(&bare).unwrap();
+            let work = tmp.path().join(format!("work{i}"));
+            std::fs::create_dir_all(work.join("src")).unwrap();
+            // Identical content in both repos -> identical sha256 blob OID -> one CID.
+            std::fs::write(work.join("src/secret.txt"), b"loop bound proof\n").unwrap();
+            run(
+                &["init", "-q", "--object-format=sha256", "-b", "main"],
+                &work,
+            );
+            run(&["config", "user.email", "t@t"], &work);
+            run(&["config", "user.name", "t"], &work);
+            run(&["add", "src/secret.txt"], &work);
+            run(&["commit", "-q", "-m", "seed"], &work);
+            run(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    work.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                tmp.path(),
+            );
+            if oid.is_empty() {
+                let out = Command::new("git")
+                    .args(["rev-parse", "HEAD:src/secret.txt"])
+                    .current_dir(&work)
+                    .output()
+                    .expect("git rev-parse runs");
+                oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+            state
+                .db
+                .set_visibility_rule(
+                    &rec.id,
+                    "src/**",
+                    crate::db::VisibilityMode::B,
+                    &["did:key:z6MkU3IpfsReaderBBBBBBBBBBBBBBBBBBBBBBBB".to_string()],
+                    &rec.owner_did,
+                )
+                .await
+                .unwrap();
+        }
+        let oid_bytes = gitlawb_core::cid::sha256_hex_to_bytes(&oid).unwrap();
+        let cid = gitlawb_core::cid::Cid::from_sha256_bytes(&oid_bytes)
+            .as_str()
+            .to_string();
+
+        let peer: SocketAddr = "203.0.113.90:5000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/ipfs/{cid}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = ipfs_router(state).oneshot(req).await.unwrap();
+        // The empty allowed-set path-gates both repos to a `continue`, so a 404; the
+        // point is HOW MANY walks ran to get there.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let walks = std::fs::read_to_string(&walk_log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            walks, 1,
+            "with the per-request repo-walk cap at 1, only the first candidate repo is \
+             walked (the second is cut by the cap), so exactly one walk runs; got {walks}"
+        );
+    }
+
+    /// Route rate limit is WIRED (not a silent no-op): the production `build_router`
+    /// attaches an `IpRateLimiter` extension to the `/ipfs/{cid}` route, so a per-IP
+    /// flood is braked with 429. A bare `rate_limit_by_ip` layer with no extension does
+    /// nothing, so this proves the extension is attached. Drive it through the real
+    /// router with a tight limiter (1/hr): the second request from the same IP is 429.
+    /// MUTATION (RED): drop the `axum::Extension(ipfs_limiter)` layer in `server.rs` and
+    /// the second request is no longer braked (it reaches the handler, 404, not 429).
+    #[sqlx::test]
+    async fn ipfs_route_ip_rate_limit_is_attached(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool).await;
+        // Tight per-IP /ipfs bucket so the second request from one IP trips 429.
+        state.ipfs_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, std::time::Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let router = crate::server::build_router(state);
+        let cid = valid_cid();
+        let make = |peer: SocketAddr| {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/ipfs/{cid}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+        let peer: SocketAddr = "203.0.113.99:5000".parse().unwrap();
+
+        // First request from this IP passes the brake and reaches the handler (404 — no
+        // such object anywhere), debiting the single-slot bucket.
+        let resp = router.clone().oneshot(make(peer)).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the first /ipfs request from an IP must pass the rate brake"
+        );
+        // Second request from the SAME IP is braked with 429 — proving the limiter
+        // extension is attached (a bare no-op layer would let it through to 404).
+        let resp = router.clone().oneshot(make(peer)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an exhausted per-IP /ipfs bucket must brake with 429 — the IpRateLimiter \
+             extension must be attached to the route"
+        );
+        // A DIFFERENT IP still has its own budget (independent bucket).
+        let other: SocketAddr = "203.0.113.100:5000".parse().unwrap();
+        let resp = router.oneshot(make(other)).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a different IP must not be braked by another IP's exhausted bucket"
+        );
+    }
 }
