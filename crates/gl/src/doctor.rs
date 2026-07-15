@@ -475,4 +475,3 @@ mod tests {
         assert!(check.detail.contains("GitHub API returned HTTP 403"));
     }
 }
-
