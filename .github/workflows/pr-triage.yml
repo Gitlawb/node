@@ -77,68 +77,84 @@ jobs:
             // comments, strings) doesn't count, require cfg(test) to close before accepting
             // it as a test gate, and allow the whitespace Rust permits around :: and cfg(.
             const testAttrRe =
-              /^[ \t]*#[ \t]*\[[ \t]*(cfg[ \t]*\([ \t]*test[ \t]*\)|[\w-]+([ \t]*::[ \t]*[\w-]+)*[ \t]*::[ \t]*test\b|test\b)/;
+              /#[ \s]*\[[ \s]*(?:cfg[ \s]*\([ \s]*test[ \s]*\)|(?:[\w-]+(?:[ \s]*::[ \s]*[\w-]+)*[ \s]*::[ \s]*)?test\b[ \s]*[\]\()])/g;
 
-            // Strip comments and string contents from a line of Rust, carrying lexical
-            // state (open block comment / raw string / normal string) across calls so a
-            // token opened on an earlier line is honored on this one.
-            function stripRustLine(content, state) {
+            // Strip comments and string contents from a file of Rust, carrying lexical
+            // state (open block comment / raw string / normal string) and tracking
+            // original line mapping.
+            function stripRustFile(fileContent) {
               let stripped = "";
-              let i = 0;
-              while (i < content.length) {
-                if (state.blockComment) {
-                  if (content.slice(i, i + 2) === "*/") {
-                    state.blockComment = false;
-                    i += 2;
+              const lineMap = [];
+              const state = { blockCommentDepth: 0, rawStringDelim: null, inNormalString: false };
+              const lines = fileContent.split("\n");
+
+              for (let lineNo = 1; lineNo <= lines.length; lineNo++) {
+                const content = lines[lineNo - 1];
+                let i = 0;
+                while (i < content.length) {
+                  if (state.blockCommentDepth > 0) {
+                    if (content.slice(i, i + 2) === "*/") {
+                      state.blockCommentDepth--;
+                      i += 2;
+                    } else if (content.slice(i, i + 2) === "/*") {
+                      state.blockCommentDepth++;
+                      i += 2;
+                    } else {
+                      i += 1;
+                    }
+                  } else if (state.rawStringDelim) {
+                    const len = state.rawStringDelim.length;
+                    if (content.slice(i, i + len) === state.rawStringDelim) {
+                      state.rawStringDelim = null;
+                      i += len;
+                    } else {
+                      i += 1;
+                    }
+                  } else if (state.inNormalString) {
+                    if (content[i] === "\\") {
+                      i += 2;
+                    } else if (content[i] === '"') {
+                      state.inNormalString = false;
+                      i += 1;
+                    } else {
+                      i += 1;
+                    }
                   } else {
+                    if (content.slice(i, i + 2) === "//") {
+                      break; // skip rest of line
+                    }
+                    if (content.slice(i, i + 2) === "/*") {
+                      state.blockCommentDepth = 1;
+                      i += 2;
+                      continue;
+                    }
+                    const charMatch = content.slice(i).match(/^'(?:[^'\\]|\\.)'/);
+                    if (charMatch) {
+                      i += charMatch[0].length;
+                      continue;
+                    }
+                    const rawMatch = content.slice(i).match(/^r(#*)"/);
+                    if (rawMatch) {
+                      state.rawStringDelim = '"' + rawMatch[1];
+                      i += rawMatch[0].length;
+                      continue;
+                    }
+                    if (content[i] === '"') {
+                      state.inNormalString = true;
+                      i += 1;
+                      continue;
+                    }
+                    stripped += content[i];
+                    lineMap.push(lineNo);
                     i += 1;
                   }
-                } else if (state.rawStringDelim) {
-                  if (content.slice(i, i + state.rawStringDelim.length) === state.rawStringDelim) {
-                    i += state.rawStringDelim.length;
-                    state.rawStringDelim = null;
-                  } else {
-                    i += 1;
-                  }
-                } else if (state.inNormalString) {
-                  if (content[i] === "\\") {
-                    i += 2;
-                  } else if (content[i] === '"') {
-                    state.inNormalString = false;
-                    i += 1;
-                  } else {
-                    i += 1;
-                  }
-                } else {
-                  if (content.slice(i, i + 2) === "//") {
-                    break;
-                  }
-                  if (content.slice(i, i + 2) === "/*") {
-                    state.blockComment = true;
-                    i += 2;
-                    continue;
-                  }
-                  const charMatch = content.slice(i).match(/^'(?:[^'\\]|\\.)'/);
-                  if (charMatch) {
-                    i += charMatch[0].length;
-                    continue;
-                  }
-                  const rawMatch = content.slice(i).match(/^r(#*)"/);
-                  if (rawMatch) {
-                    state.rawStringDelim = '"' + rawMatch[1];
-                    i += rawMatch[0].length;
-                    continue;
-                  }
-                  if (content[i] === '"') {
-                    state.inNormalString = true;
-                    i += 1;
-                    continue;
-                  }
-                  stripped += content[i];
-                  i += 1;
+                }
+                if (lineNo < lines.length) {
+                  stripped += "\n";
+                  lineMap.push(lineNo);
                 }
               }
-              return stripped;
+              return { stripped, lineMap };
             }
 
             // New-file line numbers touched by "+" lines in a unified diff patch.
@@ -167,11 +183,23 @@ jobs:
             // raw string opened earlier in the file. Lex the complete head-version file
             // instead, in file order, and only test the lines the diff actually added.
             let addsInlineTest = false;
+            let contentFetchCount = 0;
             for (const f of files) {
               if (addsInlineTest) break;
               if (!f.filename.endsWith(".rs") || !f.patch) continue;
-              const added = addedLineNumbers(f.patch);
-              if (added.size === 0) continue;
+
+              // Pre-filter: only fetch and parse file contents if the patch actually adds
+              // something that looks like a potential test attribute or cfg gate.
+              const patchHasPotentialTest = f.patch.split("\n").some(line =>
+                line.startsWith("+") && !line.startsWith("+++") &&
+                (line.toLowerCase().includes("test") || line.toLowerCase().includes("cfg"))
+              );
+              if (!patchHasPotentialTest) continue;
+
+              if (contentFetchCount >= 15) {
+                throw new Error("PR is too large: exceeded maximum number of file content fetches (15) for inline test analysis.");
+              }
+              contentFetchCount++;
 
               let fileContent;
               try {
@@ -180,17 +208,28 @@ jobs:
                 });
                 fileContent = Buffer.from(res.data.content, "base64").toString("utf8");
               } catch (e) {
-                continue; // e.g. file since deleted; nothing to lex
+                if (e.status === 404) {
+                  continue; // file since deleted; nothing to lex
+                }
+                throw new Error(`Failed to fetch content for ${f.filename}: ${e.message || e}`);
               }
 
-              const state = { blockComment: false, rawStringDelim: null, inNormalString: false };
-              const lines = fileContent.split("\n");
-              for (let lineNo = 1; lineNo <= lines.length; lineNo++) {
-                const stripped = stripRustLine(lines[lineNo - 1], state);
-                if (added.has(lineNo) && testAttrRe.test(stripped)) {
-                  addsInlineTest = true;
-                  break;
+              const added = addedLineNumbers(f.patch);
+              if (added.size === 0) continue;
+
+              const { stripped, lineMap } = stripRustFile(fileContent);
+              let match;
+              testAttrRe.lastIndex = 0;
+              while ((match = testAttrRe.exec(stripped)) !== null) {
+                const start = match.index;
+                const end = testAttrRe.lastIndex;
+                for (let k = start; k < end; k++) {
+                  if (added.has(lineMap[k])) {
+                    addsInlineTest = true;
+                    break;
+                  }
                 }
+                if (addsInlineTest) break;
               }
             }
             const touchedTests =
