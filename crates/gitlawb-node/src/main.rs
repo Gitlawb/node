@@ -625,10 +625,35 @@ async fn run_admin_command(command: config::Command, config: &Config) -> Result<
             )
             .await
             .context("connecting to database for purge-spam")?;
-            // Lock-only RepoStore (no Tigris): purge takes the per-repo advisory
-            // lock to exclude a live push, but never downloads/uploads archives.
-            let repo_store =
-                git::repo_store::RepoStore::new(config.repos_dir.clone(), None, db.pool().clone());
+            // Build the object store so purge is authoritative against remote
+            // state: the emptiness recheck consults the archive (not just
+            // possibly-stale local disk) and a successful purge deletes the
+            // archive too. When no bucket is configured this stays None and purge
+            // is local-only, exactly as before.
+            let object_store: Option<std::sync::Arc<dyn git::tigris::ObjectStore>> = if config
+                .tigris_bucket
+                .is_empty()
+            {
+                None
+            } else {
+                match git::tigris::TigrisClient::new(&config.tigris_bucket).await {
+                    Ok(client) => Some(std::sync::Arc::new(client)),
+                    Err(e) => {
+                        // Fail closed: without the configured store we cannot
+                        // do the authoritative recheck, and a local-only purge
+                        // on a Tigris deployment is the stale-view delete this
+                        // guards against. Refuse to run rather than fall back.
+                        anyhow::bail!(
+                                "purge-spam: GITLAWB_TIGRIS_BUCKET is set but the object-store client failed to initialize ({e}); refusing to run a local-only purge on a Tigris deployment"
+                            );
+                    }
+                }
+            };
+            let repo_store = git::repo_store::RepoStore::new(
+                config.repos_dir.clone(),
+                object_store,
+                db.pool().clone(),
+            );
             admin::run_purge_spam(&db, &repo_store, &config.repos_dir, execute)
                 .await
                 .map(|_| ())

@@ -22,8 +22,7 @@ pub trait ObjectStore: Send + Sync {
     async fn upload(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()>;
     /// Download and extract a repo archive to local disk.
     async fn download(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()>;
-    /// Delete a repo archive. (Wired into purge-spam in U3.)
-    #[allow(dead_code)]
+    /// Delete a repo archive.
     async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()>;
 }
 

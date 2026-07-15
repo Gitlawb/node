@@ -43,9 +43,17 @@ pub struct PurgeSummary {
     pub skipped_not_empty: usize,
     /// Candidates skipped because a live writer held the per-repo lock.
     pub skipped_locked: usize,
+    /// Candidates skipped because the object store could not be consulted for the
+    /// authoritative emptiness recheck (fail-closed: never delete on a store
+    /// error rather than risk deleting a repo with live remote refs).
+    pub skipped_store_error: usize,
     /// Rows deleted whose on-disk dir removal FAILED (or was refused by the
     /// containment guard) — DB/disk drift the operator must reconcile.
     pub disk_failed: usize,
+    /// Rows+dirs deleted whose object-store archive removal FAILED — the archive
+    /// survives and could be re-downloaded into a later same-owner/name repo, so
+    /// this is tracked separately and never folded into a clean success.
+    pub archive_failed: usize,
 }
 
 /// A repo selected for purge, with the evidence that qualified it.
@@ -297,8 +305,21 @@ pub async fn run_purge_spam(
                 continue;
             }
         };
+        // Refresh the local copy from the authoritative object store (if any)
+        // before the recheck: on a Tigris deployment the admin node's local disk
+        // can be stale, so an emptiness check against local alone could delete a
+        // repo that has live remote refs. Fail closed on any store error — never
+        // delete on an unverified view.
+        if let Err(e) = repo_store.refresh_from_archive(&c.owner_did, &c.name).await {
+            warn!(repo = %c.id, err = %e,
+                "purge-spam: could not consult the object store — skipped (fail-closed)");
+            summary.skipped_store_error += 1;
+            guard.release().await;
+            continue;
+        }
         // Authoritative recheck UNDER the lock: a ref that landed before we locked
-        // makes the repo non-empty, so it must not be deleted.
+        // (or that the object-store refresh surfaced) makes the repo non-empty, so
+        // it must not be deleted.
         if ref_count_on_disk(&repos_dir, &c.owner_did, &c.name) != 0 {
             warn!(repo = %c.id, "purge-spam: repo no longer empty under lock — skipped (TOCTOU)");
             summary.skipped_not_empty += 1;
@@ -332,6 +353,15 @@ pub async fn run_purge_spam(
                 } else {
                     info!(repo = %c.id, rows = n, "purge-spam: deleted repo row + on-disk dir");
                 }
+                // Delete the object-store archive too (a no-op when no store is
+                // configured), else it survives and can be downloaded into a
+                // later repo created with the same owner/name. Counted separately
+                // so a surviving archive never reads as a clean success.
+                if let Err(e) = repo_store.delete_archive(&c.owner_did, &c.name).await {
+                    warn!(repo = %c.id, err = %e,
+                        "purge-spam: deleted row + dir but could not delete the object-store archive");
+                    summary.archive_failed += 1;
+                }
             }
             Err(e) => {
                 warn!(repo = %c.id, err = %e, "purge-spam: failed to delete repo row — continuing");
@@ -340,8 +370,13 @@ pub async fn run_purge_spam(
         guard.release().await;
     }
     println!(
-        "purge-spam: deleted {} repo row(s); skipped {} (no longer empty), {} (locked by a live writer); {} on-disk removal(s) failed.",
-        summary.deleted, summary.skipped_not_empty, summary.skipped_locked, summary.disk_failed
+        "purge-spam: deleted {} repo row(s); skipped {} (no longer empty), {} (locked by a live writer), {} (object store unreachable); {} on-disk removal(s) failed, {} archive removal(s) failed.",
+        summary.deleted,
+        summary.skipped_not_empty,
+        summary.skipped_locked,
+        summary.skipped_store_error,
+        summary.disk_failed,
+        summary.archive_failed
     );
     Ok(summary)
 }
@@ -978,5 +1013,241 @@ mod db_tests {
             cands.is_empty(),
             "an empty repo owned by a short-form excluded DID must never be a candidate"
         );
+    }
+
+    // ── Tigris-authoritative purge (P1b) ───────────────────────────────────
+
+    /// In-test object store. `download` materializes a bare repo with (or
+    /// without) a ref so the purge tool's authoritative recheck can be driven
+    /// without a live bucket; error flags exercise the fail-closed and
+    /// archive-delete-failure paths.
+    struct FakeStore {
+        has_archive: bool,
+        archive_has_refs: bool,
+        fail_recheck: bool,
+        fail_delete: bool,
+        deleted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::git::tigris::ObjectStore for FakeStore {
+        async fn exists(&self, _owner: &str, _repo: &str) -> Result<bool> {
+            if self.fail_recheck {
+                anyhow::bail!("fake object store unreachable");
+            }
+            Ok(self.has_archive)
+        }
+        async fn upload(&self, _owner: &str, _repo: &str, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        async fn download(&self, _owner: &str, _repo: &str, local_path: &Path) -> Result<()> {
+            if self.fail_recheck {
+                anyhow::bail!("fake object store unreachable");
+            }
+            // Materialize the authoritative archive on local disk so
+            // ref_count_on_disk reflects remote state.
+            let _ = std::fs::remove_dir_all(local_path);
+            store::init_bare(local_path).unwrap();
+            if self.archive_has_refs {
+                seed_one_ref(local_path);
+            }
+            Ok(())
+        }
+        async fn delete(&self, _owner: &str, _repo: &str) -> Result<()> {
+            self.deleted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_delete {
+                anyhow::bail!("fake object store delete failed");
+            }
+            Ok(())
+        }
+    }
+
+    fn store_backed(
+        repos_dir: &Path,
+        pool: &PgPool,
+        fake: FakeStore,
+    ) -> crate::git::repo_store::RepoStore {
+        crate::git::repo_store::RepoStore::new(
+            repos_dir.to_path_buf(),
+            Some(std::sync::Arc::new(fake)),
+            pool.clone(),
+        )
+    }
+
+    fn fake(
+        has_archive: bool,
+        archive_has_refs: bool,
+        fail_recheck: bool,
+        fail_delete: bool,
+    ) -> (FakeStore, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let deleted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            FakeStore {
+                has_archive,
+                archive_has_refs,
+                fail_recheck,
+                fail_delete,
+                deleted: deleted.clone(),
+            },
+            deleted,
+        )
+    }
+
+    // A locally-empty repo whose authoritative archive HAS refs (pushed via
+    // another machine) must NOT be purged on the stale-local view. Load-bearing:
+    // RED on the Tigris-blind purge (deletes it), GREEN once the recheck
+    // consults the object store.
+    #[sqlx::test]
+    async fn purge_skips_repo_with_remote_refs_when_local_empty(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-remote", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
+        store::init_bare(&path).unwrap();
+        assert_eq!(
+            store::list_refs(&path).unwrap().len(),
+            0,
+            "local starts empty"
+        );
+
+        let (f, _deleted) = fake(true, true, false, false);
+        let repo_store = store_backed(tmp.path(), &pool, f);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_some(),
+            "a repo with live remote refs must not be purged on a stale-local view"
+        );
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.skipped_not_empty, 1);
+    }
+
+    // A genuinely-empty repo (empty archive) is deleted AND its archive removed,
+    // else the archive can be re-downloaded into a later same-name repo.
+    // Load-bearing: RED on the Tigris-blind purge (archive survives), GREEN once
+    // the delete wires the archive removal.
+    #[sqlx::test]
+    async fn purge_deletes_archive_on_successful_delete(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
+        store::init_bare(&path).unwrap();
+
+        let (f, deleted) = fake(true, false, false, false);
+        let repo_store = store_backed(tmp.path(), &pool, f);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a genuinely-empty repo is deleted"
+        );
+        assert!(
+            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "the object-store archive must be deleted on a successful purge"
+        );
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.archive_failed, 0);
+    }
+
+    // An unreachable object store during the recheck must fail closed (skip),
+    // never delete on an unverified view. Load-bearing: RED on the Tigris-blind
+    // purge (deletes), GREEN once the recheck consults (and fails closed on) the
+    // store.
+    #[sqlx::test]
+    async fn purge_fails_closed_when_store_unreachable(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
+        store::init_bare(&path).unwrap();
+
+        let (f, _deleted) = fake(true, false, true, false);
+        let repo_store = store_backed(tmp.path(), &pool, f);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_some(),
+            "must not delete when the object store is unreachable (fail-closed)"
+        );
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.skipped_store_error, 1);
+    }
+
+    // An archive-delete failure after the row+dir are removed is counted
+    // separately, never folded into a clean success.
+    #[sqlx::test]
+    async fn purge_archive_delete_failure_counted_separately(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
+        store::init_bare(&path).unwrap();
+
+        let (f, deleted) = fake(true, false, false, true);
+        let repo_store = store_backed(tmp.path(), &pool, f);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the row+dir are still deleted"
+        );
+        assert!(deleted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(
+            summary.archive_failed, 1,
+            "a surviving archive must be counted, not reported as clean success"
+        );
+    }
+
+    // R7: with no object store configured (single-machine), an empty repo is
+    // deleted exactly as before and nothing touches an archive.
+    #[sqlx::test]
+    async fn purge_tigris_disabled_deletes_empty_unchanged(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
+        store::init_bare(&path).unwrap();
+
+        let repo_store = test_store(tmp.path(), &pool); // Tigris = None
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(db
+            .get_repo(SPAM_BURST_TARGET_DID, "spam1")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(summary.skipped_store_error, 0);
+        assert_eq!(summary.archive_failed, 0);
     }
 }

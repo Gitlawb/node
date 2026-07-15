@@ -341,6 +341,34 @@ impl RepoStore {
 
         Ok((owner_slug, local_path))
     }
+
+    /// Refresh the local copy from the authoritative object-store archive so an
+    /// emptiness recheck reflects remote state (used by purge-spam on a Tigris
+    /// deployment, where the admin node's local disk can be stale). Downloads
+    /// the archive over the local path when it exists; a no-op when no object
+    /// store is configured (single-machine). Errors propagate so the caller can
+    /// fail closed rather than delete on a stale-local view.
+    pub async fn refresh_from_archive(&self, owner_did: &str, repo_name: &str) -> Result<()> {
+        let Some(ref store) = self.object_store else {
+            return Ok(());
+        };
+        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
+        if store.exists(&owner_slug, repo_name).await? {
+            store.download(&owner_slug, repo_name, &local_path).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete the object-store archive for a repo. A no-op when no object store
+    /// is configured. Used by purge-spam so a deleted repo's archive cannot be
+    /// downloaded into a later repo created with the same owner/name.
+    pub async fn delete_archive(&self, owner_did: &str, repo_name: &str) -> Result<()> {
+        let Some(ref store) = self.object_store else {
+            return Ok(());
+        };
+        let (owner_slug, _local_path) = self.local_path(owner_did, repo_name)?;
+        store.delete(&owner_slug, repo_name).await
+    }
 }
 
 /// Strict allowlist validator for `owner_did` and `repo_name`.
