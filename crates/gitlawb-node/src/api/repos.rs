@@ -637,21 +637,37 @@ pub async fn git_info_refs(
 
     // For receive-pack (push), download the latest from Tigris so the client
     // sees the same refs that acquire_write() will operate on.
-    let disk_path = if service == "git-receive-pack" {
-        state
-            .repo_store
-            .acquire_fresh(&record.owner_did, &record.name)
-            .await
-    } else {
-        state
-            .repo_store
-            .acquire(&record.owner_did, &record.name)
-            .await
-    }
-    .map_err(|e| {
-        tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
-        AppError::Git(e.to_string())
-    })?;
+    //
+    // Bound the acquire under `git_acquire_timeout_secs`: the concurrency permit is
+    // already held above, and `git_service_timeout_secs` only starts once git spawns,
+    // so an un-deadlined acquire (a hung Tigris HEAD/GET here) pins the permit until
+    // the pool drains (#174 P1-2). On expiry the handler-local `_permit`/`_caller_permit`
+    // drop on the early return (the AdmissionGuard is not built until after acquire),
+    // so the shed frees the slot; return a bounded 503.
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let acquire_fut = async {
+        if service == "git-receive-pack" {
+            state
+                .repo_store
+                .acquire_fresh(&record.owner_did, &record.name)
+                .await
+        } else {
+            state
+                .repo_store
+                .acquire(&record.owner_did, &record.name)
+                .await
+        }
+    };
+    let disk_path = tokio::time::timeout(acquire_deadline, acquire_fut)
+        .await
+        .map_err(|_elapsed| {
+            tracing::warn!(repo = %name, service = %service, "repo acquire timed out; shedding with 503");
+            AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+        })?
+        .map_err(|e| {
+            tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
+            AppError::Git(e.to_string())
+        })?;
 
     // Move the admission permits into the guard so they release only after the spawned
     // git process group is confirmed reaped, on complete/timeout/disconnect — not the
@@ -842,11 +858,21 @@ pub async fn git_upload_pack(
     // exec (INV-10).
     let _permit = git_permit(&state.git_read_semaphore)?;
 
-    let disk_path = state
-        .repo_store
-        .acquire(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+    // Bound the acquire under `git_acquire_timeout_secs` so a hung Tigris HEAD/GET
+    // cannot pin the read permit indefinitely (#174 P1-2). The permit is a handler
+    // local here (moved into the AdmissionGuard only below, once git is spawned), so
+    // the early return on timeout drops it and frees the slot; shed a bounded 503.
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let disk_path = tokio::time::timeout(
+        acquire_deadline,
+        state.repo_store.acquire(&record.owner_did, &record.name),
+    )
+    .await
+    .map_err(|_elapsed| {
+        tracing::warn!(repo = %name, "repo acquire timed out; shedding with 503");
+        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+    })?
+    .map_err(|e| AppError::Git(e.to_string()))?;
     let body_len = body.len();
 
     // No path-scoped rule can withhold an individual blob, and the whole-repo
@@ -1179,14 +1205,31 @@ pub async fn git_receive_pack(
     }
 
     tracing::debug!(repo = %name, "acquiring write lock");
-    let guard = state
-        .repo_store
-        .acquire_write(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| {
-            tracing::error!(repo = %name, err = %e, "acquire_write failed");
-            AppError::Git(e.to_string())
-        })?;
+    // Bound the write acquire under `git_acquire_timeout_secs`. acquire_write's
+    // advisory-lock loop already caps at ~60s, but its per-iteration
+    // `pg_try_advisory_lock().fetch_one(&pool)` can block indefinitely on a hung /
+    // exhausted Postgres pool (so the 60-count never advances) — and the write permit
+    // is held the whole time, draining the pool (#174 P1-2). The outer
+    // `tokio::time::timeout` cancels a mid-sleep/mid-`fetch_one` future, so it bounds
+    // both the loop and a hung iteration without any repo_store.rs change (KTD3). The
+    // permit is a handler local here (moved into the AdmissionGuard only after this),
+    // so the early return on timeout drops it and frees the slot; shed a bounded 503.
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let guard = tokio::time::timeout(
+        acquire_deadline,
+        state
+            .repo_store
+            .acquire_write(&record.owner_did, &record.name),
+    )
+    .await
+    .map_err(|_elapsed| {
+        tracing::warn!(repo = %name, "acquire_write timed out; shedding with 503");
+        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+    })?
+    .map_err(|e| {
+        tracing::error!(repo = %name, err = %e, "acquire_write failed");
+        AppError::Git(e.to_string())
+    })?;
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
@@ -1197,8 +1240,14 @@ pub async fn git_receive_pack(
     // The handler keeps no copy. This is independent of the write-lock `guard.release`
     // below: admission tracks the git process lifetime, the write lock tracks the repo.
     let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
-    let receive_result =
-        smart_http::receive_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await;
+    let receive_result = smart_http::receive_pack(
+        &state.git_bin,
+        &disk_path,
+        body,
+        git_timeout,
+        Some(admission),
+    )
+    .await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
@@ -3761,7 +3810,11 @@ mod tests {
             .unwrap();
 
         let sem = state.git_read_semaphore.clone();
-        assert_eq!(sem.available_permits(), 1, "one read slot before the request");
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one read slot before the request"
+        );
 
         let router = crate::server::build_router(state);
         let make_req = |peer: SocketAddr| {
@@ -3988,6 +4041,198 @@ mod tests {
             !matches!(other_result, Err(AppError::Overloaded(_))),
             "a different source must not be shed by the per-source write cap while the \
              capped source holds its slot; got {other_result:?}"
+        );
+    }
+
+    /// #174 U2 (P1-2, RED-before/GREEN-after): the storage-acquisition phase is bounded
+    /// by `git_acquire_timeout_secs`, so a stalled backend releases the admission permit
+    /// and sheds a 503 instead of pinning the pool. The permit is taken BEFORE
+    /// `acquire_write`, whose advisory-lock loop can spin ~60s (and whose per-iteration
+    /// `pg_try_advisory_lock` can block indefinitely on a hung pool), so without the
+    /// `tokio::time::timeout` wrapper the permit is held far past the deadline.
+    ///
+    /// Real stall (no `RepoStore` trait to fake): hold the SAME session-level advisory
+    /// lock `acquire_write` derives (`advisory_lock_key(owner_slug, repo_name)`, where
+    /// `owner_slug = owner_did.replace([':','/'], "_")`) on a second pooled connection,
+    /// so the handler's `pg_try_advisory_lock` returns false every iteration and the loop
+    /// must retry against the deadline. `git_acquire_timeout_secs = 2`; the request must
+    /// return 503 (Overloaded) at ~2s (NOT ~59s), and the write permit must be released
+    /// (`available_permits()` recovers to full once the shed returns). Covers R2.
+    ///
+    /// Load-bearing / mutation: remove the `tokio::time::timeout` wrapper on
+    /// `acquire_write` and the loop runs to ~59s with the permit held the whole time —
+    /// the `< DEADLINE_CEILING` timing assertion goes RED (observed ~59s) and the permit
+    /// stays pinned past the deadline. Restore to return GREEN.
+    #[sqlx::test]
+    async fn receive_pack_acquire_deadline_sheds_and_releases_permit(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        // Reproduce acquire_write's session-level advisory-lock key exactly so the
+        // second-connection lock collides with the handler's pg_try_advisory_lock
+        // (repo_store.rs: advisory_lock_key over owner_slug then repo_name).
+        fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            owner_slug.hash(&mut hasher);
+            repo_name.hash(&mut hasher);
+            hasher.finish() as i64
+        }
+
+        let owner = "z6acqdead";
+        let name = "acq1";
+        // owner_slug as local_path() computes it from the record's owner_did. The
+        // mirror row stores the short owner as owner_did, so slug == owner (no ':'/'/').
+        let owner_slug = owner.replace([':', '/'], "_");
+        let lock_key = advisory_lock_key(&owner_slug, name);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        // Isolate the write pool at size 1 so available_permits() cleanly reports
+        // held (0) vs released (1). Per-source cap + trust permissive so only the
+        // write pool / acquire path can gate.
+        state.git_write_semaphore = Arc::new(Semaphore::new(1));
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Short acquire deadline: the fix must shed here, well before acquire_write's
+        // ~59s advisory-lock loop would bail on its own.
+        const ACQUIRE_TIMEOUT_SECS: u64 = 2;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = ACQUIRE_TIMEOUT_SECS;
+        // Keep the git-service timeout large so the deadline under test is the acquire
+        // one, not git execution (which is never reached on the stalled path anyway).
+        cfg.git_service_timeout_secs = 600;
+        state.config = std::sync::Arc::new(cfg);
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6acqdead-acq1", None, false)
+            .await
+            .unwrap();
+
+        // Hold the advisory lock on a dedicated pooled connection (a distinct session),
+        // so the handler's pg_try_advisory_lock($lock_key) returns false every iteration
+        // and acquire_write's real loop must retry against the deadline. Released when
+        // this connection drops at end of test.
+        let mut lock_conn = pool
+            .acquire()
+            .await
+            .expect("second connection for the lock");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("hold the advisory lock on the second connection");
+
+        let did = "did:key:z6MkAcquireDeadlineProofDidAAAAAAAAAAAAAAAA";
+        let peer: SocketAddr = "203.0.113.61:5000".parse().unwrap();
+
+        let sem = state.git_write_semaphore.clone();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one write slot before the request"
+        );
+
+        // Drive the authenticated push in the background so we can observe the permit is
+        // held while acquire_write stalls, then that it is released on the shed.
+        let state_for_task = state.clone();
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            git_receive_pack(
+                State(state_for_task),
+                Path((owner.to_string(), name.to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(peer)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            )
+            .await
+        });
+
+        // The handler takes the write permit BEFORE acquire_write, so once it is stalled
+        // in the advisory-lock loop the pool reports 0 available. Wait for that to prove
+        // the permit is genuinely held during the stall (and the request really reached
+        // acquire_write, not an earlier reject).
+        let mut held = false;
+        for _ in 0..200 {
+            if sem.available_permits() == 0 {
+                held = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            held,
+            "the write permit must be held while acquire_write stalls on the advisory lock"
+        );
+
+        // The bounded acquire deadline must shed with 503 (Overloaded), NOT wait out the
+        // ~59s advisory-lock loop. Ceiling is comfortably above the 2s deadline + task
+        // scheduling but far below 59s, so a RED run (no wrapper -> ~59s) fails here.
+        const DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(20);
+        let result = tokio::time::timeout(
+            DEADLINE_CEILING + std::time::Duration::from_secs(10),
+            handle,
+        )
+        .await
+        .expect("the handler must return within the ceiling — a hang means the acquire deadline is missing (RED)")
+        .expect("the receive-pack task must not panic");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(AppError::Overloaded(_))),
+            "a stalled acquire_write must shed with Overloaded/503 at the acquire deadline; \
+             got {result:?}"
+        );
+        assert!(
+            elapsed < DEADLINE_CEILING,
+            "the shed must land at ~{ACQUIRE_TIMEOUT_SECS}s (the acquire deadline), not ~59s \
+             (the advisory-lock loop). Observed {elapsed:?}; without the timeout wrapper this \
+             is ~59s (RED)"
+        );
+
+        // Permit release on expiry: the Overloaded return drops the handler-local permit,
+        // so the isolated write pool must recover to full. A leaked permit here means the
+        // pool drains under a stalled backend (the #174 P1-2 bug).
+        let mut freed = false;
+        for _ in 0..200 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            freed,
+            "on the acquire-deadline shed the write permit must be released; the pool did \
+             not recover to full (permit leaked)"
+        );
+
+        // Follow-up admits once the contended lock is released: release the second-conn
+        // lock, then a fresh push proceeds PAST admission (it fails later on the
+        // nonexistent on-disk repo, which is NOT an Overloaded/503). Proves the freed
+        // slot is usable, not merely counted.
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("release the advisory lock");
+        let followup = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.62:5000".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            !matches!(followup, Err(AppError::Overloaded(_))),
+            "once the lock frees, a follow-up push must admit past the (recovered) write \
+             pool and acquire; got {followup:?}"
         );
     }
 

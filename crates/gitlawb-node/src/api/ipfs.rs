@@ -114,9 +114,24 @@ pub async fn get_by_cid(
             continue;
         }
 
-        let repo_path = match state.repo_store.acquire(&repo.owner_did, &repo.name).await {
-            Ok(p) => p,
-            Err(_) => continue,
+        // Bound the per-repo acquire under `git_acquire_timeout_secs`: this loop shares
+        // the P1-2 stall vector (a hung Tigris HEAD/GET on one repo would otherwise
+        // block the whole /ipfs request). On expiry keep the existing fail-closed skip —
+        // never serve an un-acquired repo; a public copy (if any) still gets its turn.
+        let acquire_deadline =
+            std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+        let repo_path = match tokio::time::timeout(
+            acquire_deadline,
+            state.repo_store.acquire(&repo.owner_did, &repo.name),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) => continue,
+            Err(_elapsed) => {
+                tracing::warn!(repo = %repo.name, "repo acquire timed out during /ipfs walk; skipping repo");
+                continue;
+            }
         };
 
         // Check whether the object exists in this repo before any expensive
