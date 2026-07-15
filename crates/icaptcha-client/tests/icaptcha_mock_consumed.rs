@@ -8,23 +8,46 @@
 //! see a request that ALSO leaks the DID / answer / API key to `DEFAULT_URL` or
 //! any other origin (a different host the mock never observes). To make the
 //! "no live call" half of the guard load-bearing, the test blackholes every
-//! non-loopback destination: `NO_PROXY` lets the loopback mock through while
-//! `ALL_PROXY` routes any other host to a closed port, so the client contacting
+//! non-loopback destination: `NO_PROXY` lets the loopback mock through while a
+//! closed proxy port routes any other host nowhere, so the client contacting
 //! anything but the injected mock fails the request instead of silently
 //! succeeding. Point `cfg.url` at `DEFAULT_URL` and this test goes RED.
+//!
+//! `ALL_PROXY` alone is NOT enough: reqwest honors the scheme-specific
+//! `HTTPS_PROXY` / `https_proxy` (and the http equivalents) OVER `ALL_PROXY`, so
+//! a runner with a working `HTTPS_PROXY` in its environment would route an https
+//! leak to `DEFAULT_URL` (which is https) through that proxy while the loopback
+//! mock is still consumed and this test stayed green. So we blackhole the
+//! scheme-specific variables too. No restore is needed: this file has a single
+//! `#[test]`, so it runs in its own process and the override never races a
+//! sibling test.
 
 use icaptcha_client::{obtain_proof, Challenge, IcaptchaCfg};
 
 #[test]
 fn obtain_proof_consumes_the_mocked_service_and_makes_no_live_call() {
     // Blackhole every non-loopback origin: the loopback mock bypasses the proxy
-    // (NO_PROXY), any other host is forced through a closed port (ALL_PROXY) and
-    // fails. reqwest reads these at client-build time, and obtain_proof builds
-    // its client fresh, so this bounds the transport for the whole flow. This
-    // test binary runs a single test in its own process, so the global env is
-    // not racing a sibling test.
+    // (NO_PROXY); any other host is forced through a closed port and fails.
+    // reqwest reads these at client-build time, and obtain_proof builds its
+    // client fresh, so this bounds the transport for the whole flow.
+    //
+    // Set the scheme-specific vars too (both cases), not just ALL_PROXY: reqwest
+    // gives HTTPS_PROXY/https_proxy precedence over ALL_PROXY for https URLs, so
+    // an ALL_PROXY-only blackhole leaves an https leak to DEFAULT_URL open on a
+    // runner whose environment already has a working HTTPS_PROXY.
+    let blackhole = "http://127.0.0.1:1";
     std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
-    std::env::set_var("ALL_PROXY", "http://127.0.0.1:1");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost");
+    for var in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        std::env::set_var(var, blackhole);
+    }
 
     let mut server = mockito::Server::new();
 
