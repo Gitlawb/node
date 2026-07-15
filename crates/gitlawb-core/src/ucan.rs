@@ -358,6 +358,24 @@ mod tests {
     }
 
     #[test]
+    fn can_honors_action_wildcard() {
+        let issuer = Keypair::generate();
+        let audience = Keypair::generate().did();
+
+        let ucan = Ucan::issue(
+            &issuer,
+            audience,
+            vec![Capability::new("gitlawb://repos/test/repo", "*")],
+            None,
+        )
+        .unwrap();
+
+        assert!(ucan.can("gitlawb://repos/test/repo", caps::GIT_PUSH));
+        assert!(ucan.can("gitlawb://repos/test/repo", caps::PR_MERGE));
+        assert!(!ucan.can("gitlawb://repos/other/repo", caps::GIT_PUSH));
+    }
+
+    #[test]
     fn bootstrap_ucan() {
         let issuer = Keypair::generate();
         let audience = Keypair::generate().did();
