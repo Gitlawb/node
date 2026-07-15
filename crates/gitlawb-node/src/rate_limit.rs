@@ -130,6 +130,24 @@ impl RateLimiter {
             !w.timestamps.is_empty()
         });
     }
+
+    /// Test-only: insert a fully-expired entry (no live timestamps) that the next
+    /// `cleanup()` must reclaim. Models a key whose window has aged out, without
+    /// depending on wall-clock sleeps or a short window. Used cross-module by the
+    /// AppState cleanup guard test (H2).
+    #[cfg(test)]
+    pub(crate) async fn insert_reclaimable_for_test(&self, key: &str) {
+        self.state
+            .lock()
+            .await
+            .insert(key.to_string(), Window { timestamps: vec![] });
+    }
+
+    /// Test-only: number of distinct keys currently tracked.
+    #[cfg(test)]
+    pub(crate) async fn tracked_keys(&self) -> usize {
+        self.state.lock().await.len()
+    }
 }
 
 pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {

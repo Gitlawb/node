@@ -437,22 +437,17 @@ async fn main() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let rl = state.rate_limiter.clone();
-        let create_ip_rl = state.create_ip_rate_limiter.clone();
-        let push_rl = state.push_rate_limiter.clone();
-        let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
-        let peer_write_rl = state.peer_write_rate_limiter.clone();
+        // Clone the whole state so the sweep uses AppState::cleanup_rate_limiters
+        // (the single source of truth that reaps EVERY limiter, including
+        // write_rate_limiter) rather than a hand-maintained list that can omit one.
+        let state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        rl.cleanup().await;
-                        create_ip_rl.cleanup().await;
-                        push_rl.cleanup().await;
-                        sync_trigger_rl.cleanup().await;
-                        peer_write_rl.cleanup().await;
+                        state.cleanup_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
