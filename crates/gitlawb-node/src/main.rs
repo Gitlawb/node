@@ -601,7 +601,14 @@ async fn run_admin_command(command: config::Command, config: &Config) -> Result<
             )
             .await
             .context("connecting to database for purge-spam")?;
-            admin::run_purge_spam(&db, &config.repos_dir, execute).await
+            // Lock-only RepoStore (no Tigris): purge takes the per-repo advisory
+            // lock to exclude a live push, but never downloads/uploads archives.
+            let repo_store = git::repo_store::RepoStore::new(
+                config.repos_dir.clone(),
+                None,
+                db.pool().clone(),
+            );
+            admin::run_purge_spam(&db, &repo_store, &config.repos_dir, execute).await
         }
     }
 }

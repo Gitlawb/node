@@ -207,6 +207,35 @@ impl RepoStore {
         })
     }
 
+    /// Try to acquire ONLY the per-repo advisory lock, non-blocking, with no
+    /// Tigris I/O — the lightweight counterpart to [`acquire_write`](Self::acquire_write)
+    /// for out-of-band admin ops (purge-spam) that must mutually exclude a live
+    /// push during a destructive delete but never download/re-upload the repo.
+    ///
+    /// Returns `Some(guard)` if the lock was free, `None` if another writer holds
+    /// it (so the caller can skip rather than block). The guard holds a dedicated
+    /// pooled connection for its whole lifetime, so the lock lives on that one
+    /// connection and `release()` unlocks it on the SAME connection — a plain
+    /// pool query could unlock on a different connection and silently fail.
+    pub async fn try_lock_repo(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
+        let (owner_slug, _local) = self.local_path(owner_did, repo_name)?;
+        let lock_key = advisory_lock_key(&owner_slug, repo_name);
+        let mut conn = self.pool.acquire().await.context("acquiring lock connection")?;
+        let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(lock_key)
+            .fetch_one(&mut *conn)
+            .await
+            .context("try advisory lock")?;
+        if !row.0 {
+            return Ok(None);
+        }
+        Ok(Some(RepoLockGuard { conn, lock_key }))
+    }
+
     /// Initialize a new bare repo on local disk and upload to Tigris.
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
@@ -388,6 +417,25 @@ impl RepoWriteGuard {
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.lock_key)
             .execute(&self.pool)
+            .await;
+    }
+}
+
+/// Lock-only guard from [`RepoStore::try_lock_repo`]. Holds the Postgres advisory
+/// lock (and the dedicated connection it lives on) until `release()`. No Tigris
+/// I/O — unlike [`RepoWriteGuard`], releasing does NOT upload anything.
+pub struct RepoLockGuard {
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    lock_key: i64,
+}
+
+impl RepoLockGuard {
+    /// Release the advisory lock on the same connection that took it, then return
+    /// the connection to the pool.
+    pub async fn release(mut self) {
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(self.lock_key)
+            .execute(&mut *self.conn)
             .await;
     }
 }

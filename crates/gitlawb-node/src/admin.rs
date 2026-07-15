@@ -194,7 +194,12 @@ where
 /// applies the exclusion gate, prints one dry-run row per candidate with owner +
 /// ref-count evidence, and — only when `execute` is true — deletes the DB row of
 /// each candidate one at a time. Dry-run (the default) deletes nothing.
-pub async fn run_purge_spam(db: &Db, repos_dir: &Path, execute: bool) -> Result<()> {
+pub async fn run_purge_spam(
+    db: &Db,
+    repo_store: &crate::git::repo_store::RepoStore,
+    repos_dir: &Path,
+    execute: bool,
+) -> Result<()> {
     let repos_dir: PathBuf = repos_dir.to_path_buf();
     let rows = db
         .list_repos_by_owner_did(SPAM_BURST_TARGET_DID)
@@ -252,7 +257,32 @@ pub async fn run_purge_spam(db: &Db, repos_dir: &Path, execute: bool) -> Result<
     // Execute: delete per-repo, never a single blanket "delete all of owner X".
     // A per-repo failure warns and continues rather than aborting the batch.
     let mut deleted = 0u64;
+    let mut skipped_locked = 0usize;
     for c in &to_delete {
+        // Hold the per-repo advisory lock across the FINAL emptiness recheck and
+        // the delete, so a concurrent receive-pack cannot land a ref in the window
+        // between recheck and delete (M4). A repo currently locked by a live writer
+        // is skipped, never force-deleted out from under the push.
+        let guard = match repo_store.try_lock_repo(&c.owner_did, &c.name).await {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                warn!(repo = %c.id, "purge-spam: repo is locked by a live writer — skipped");
+                skipped_locked += 1;
+                continue;
+            }
+            Err(e) => {
+                warn!(repo = %c.id, err = %e, "purge-spam: could not acquire repo lock — skipped");
+                skipped_locked += 1;
+                continue;
+            }
+        };
+        // Authoritative recheck UNDER the lock: a ref that landed before we locked
+        // makes the repo non-empty, so it must not be deleted.
+        if ref_count_on_disk(&repos_dir, &c.owner_did, &c.name) != 0 {
+            warn!(repo = %c.id, "purge-spam: repo no longer empty under lock — skipped (TOCTOU)");
+            guard.release().await;
+            continue;
+        }
         match db.delete_repo_by_id(&c.id).await {
             Ok(0) => {
                 warn!(repo = %c.id, "purge-spam: repo row already gone — nothing to delete");
@@ -279,9 +309,10 @@ pub async fn run_purge_spam(db: &Db, repos_dir: &Path, execute: bool) -> Result<
                 warn!(repo = %c.id, err = %e, "purge-spam: failed to delete repo row — continuing");
             }
         }
+        guard.release().await;
     }
     println!(
-        "purge-spam: deleted {deleted} repo row(s), skipped {} (no longer empty).",
+        "purge-spam: deleted {deleted} repo row(s), skipped {} (no longer empty), {skipped_locked} (locked by a live writer).",
         to_skip.len()
     );
     Ok(())
@@ -463,10 +494,16 @@ mod db_tests {
     use chrono::Utc;
     use sqlx::PgPool;
 
-    async fn db(pool: PgPool) -> Db {
-        let db = Db::for_testing(pool);
+    async fn db(pool: &PgPool) -> Db {
+        let db = Db::for_testing(pool.clone());
         db.run_migrations().await.unwrap();
         db
+    }
+
+    /// Lock-only RepoStore over a test pool + repos_dir (no Tigris), for the purge
+    /// callers that now take the advisory lock (M4).
+    fn test_store(repos_dir: &Path, pool: &PgPool) -> crate::git::repo_store::RepoStore {
+        crate::git::repo_store::RepoStore::for_testing(repos_dir.to_path_buf(), pool.clone())
     }
 
     fn rec(id: &str, owner: &str, name: &str) -> RepoRecord {
@@ -498,7 +535,7 @@ mod db_tests {
     // which is fine here: the assertion is that dry-run mutates no rows regardless.
     #[sqlx::test]
     async fn dry_run_deletes_nothing(pool: PgPool) {
-        let db = db(pool).await;
+        let db = db(&pool).await;
         for r in [
             rec("t-empty", SPAM_BURST_TARGET_DID, "spam1"),
             rec("t-nonempty", SPAM_BURST_TARGET_DID, "real"),
@@ -513,7 +550,8 @@ mod db_tests {
 
         // Empty repos dir: no repo exists on disk, so nothing is provably empty.
         let tmp = tempfile::TempDir::new().unwrap();
-        run_purge_spam(&db, tmp.path(), false).await.unwrap();
+        let store = test_store(tmp.path(), &pool);
+        run_purge_spam(&db, &store, tmp.path(), false).await.unwrap();
 
         let after = count_rows(&db).await;
         assert_eq!(after, before, "dry-run must not delete any repo rows");
@@ -524,7 +562,7 @@ mod db_tests {
     // repo. This exercises the DB wiring end-to-end with a real empty repo on disk.
     #[sqlx::test]
     async fn execute_deletes_only_the_empty_target_repo_on_disk(pool: PgPool) {
-        let db = db(pool).await;
+        let db = db(&pool).await;
         let tmp = tempfile::TempDir::new().unwrap();
 
         // One empty target repo (real bare repo, zero refs) and one target repo
@@ -548,7 +586,8 @@ mod db_tests {
         assert_eq!(store::list_refs(&empty_path).unwrap().len(), 0);
         assert!(!store::list_refs(&refs_path).unwrap().is_empty());
 
-        run_purge_spam(&db, tmp.path(), true).await.unwrap();
+        let repo_store = test_store(tmp.path(), &pool);
+        run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
 
         // Only the empty target repo row is gone.
         assert!(db
@@ -572,7 +611,7 @@ mod db_tests {
     // consistent (no orphaned empty git dir left behind).
     #[sqlx::test]
     async fn execute_removes_the_on_disk_repo_dir(pool: PgPool) {
-        let db = db(pool).await;
+        let db = db(&pool).await;
         let tmp = tempfile::TempDir::new().unwrap();
         let empty = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
         db.create_repo(&empty).await.unwrap();
@@ -580,7 +619,8 @@ mod db_tests {
         store::init_bare(&path).unwrap();
         assert!(path.exists(), "precondition: on-disk repo exists");
 
-        run_purge_spam(&db, tmp.path(), true).await.unwrap();
+        let repo_store = test_store(tmp.path(), &pool);
+        run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
 
         assert!(
             db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
@@ -592,6 +632,52 @@ mod db_tests {
         assert!(!path.exists(), "on-disk bare repo dir must be removed too");
     }
 
+    // U4 (M4): a repo whose per-repo advisory lock is held by a live writer must be
+    // SKIPPED by purge, not deleted out from under the push. Holds the lock via the
+    // same RepoStore (a separate pooled connection), runs execute, and asserts the
+    // row + on-disk dir survive; once the writer releases, purge deletes it.
+    #[sqlx::test]
+    async fn locked_repo_is_skipped_not_deleted(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let empty = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&empty).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &empty.owner_did, &empty.name);
+        store::init_bare(&path).unwrap();
+
+        let repo_store = test_store(tmp.path(), &pool);
+        // A live writer holds the per-repo advisory lock.
+        let held = repo_store
+            .try_lock_repo(&empty.owner_did, &empty.name)
+            .await
+            .unwrap()
+            .expect("lock should be free initially");
+
+        run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
+
+        // Locked → skipped: both the row and the on-disk dir survive.
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_some(),
+            "a repo locked by a live writer must NOT be deleted"
+        );
+        assert!(path.exists(), "on-disk dir must survive while locked");
+
+        // Once the writer releases, the empty repo is deleted (the lock was the
+        // only thing protecting it — baseline both ways).
+        held.release().await;
+        run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_none(),
+            "once unlocked, the empty repo is deleted"
+        );
+    }
+
     // U1 (M3): a burst-owned row whose NAME traverses out of repos_dir must never
     // cause a delete OUTSIDE repos_dir. Adversarial must-not: a real empty bare repo
     // planted as a "victim" beside repos_dir is reachable from repos_dir/<slug>/ via
@@ -600,7 +686,7 @@ mod db_tests {
     // delete the victim. The name validator must reject it so the victim survives.
     #[sqlx::test]
     async fn traversal_name_cannot_delete_a_repo_outside_repos_dir(pool: PgPool) {
-        let db = db(pool).await;
+        let db = db(&pool).await;
         let root = tempfile::TempDir::new().unwrap();
         let repos_dir = root.path().join("repos");
         std::fs::create_dir_all(&repos_dir).unwrap();
@@ -625,7 +711,8 @@ mod db_tests {
         );
 
         db.create_repo(&evil).await.unwrap();
-        run_purge_spam(&db, &repos_dir, true).await.unwrap();
+        let repo_store = test_store(&repos_dir, &pool);
+        run_purge_spam(&db, &repo_store, &repos_dir, true).await.unwrap();
 
         assert!(
             victim.join("HEAD").is_file(),
@@ -638,7 +725,7 @@ mod db_tests {
     // target DID — the SQL side of the normalization fix.
     #[sqlx::test]
     async fn list_repos_by_owner_did_matches_short_form(pool: PgPool) {
-        let db = db(pool).await;
+        let db = db(&pool).await;
         let short = crate::db::normalize_owner_key(SPAM_BURST_TARGET_DID);
         assert_ne!(short, SPAM_BURST_TARGET_DID, "fixture must be short form");
         let repo = rec("short-owned", short, "spam");
