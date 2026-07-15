@@ -608,7 +608,9 @@ async fn run_admin_command(command: config::Command, config: &Config) -> Result<
                 None,
                 db.pool().clone(),
             );
-            admin::run_purge_spam(&db, &repo_store, &config.repos_dir, execute).await
+            admin::run_purge_spam(&db, &repo_store, &config.repos_dir, execute)
+                .await
+                .map(|_| ())
         }
     }
 }
