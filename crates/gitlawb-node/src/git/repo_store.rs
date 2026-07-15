@@ -324,7 +324,7 @@ fn validate_owner_did(owner_did: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_repo_name(repo_name: &str) -> Result<()> {
+pub(crate) fn validate_repo_name(repo_name: &str) -> Result<()> {
     if repo_name.is_empty() {
         anyhow::bail!("repo_name is empty");
     }
