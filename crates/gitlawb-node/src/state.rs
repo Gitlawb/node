@@ -121,6 +121,16 @@ pub struct AppState {
     /// walk must not hold a foreground write slot, and a handler already holding a
     /// write permit that needed a second would self-deadlock at pool size 1.
     pub git_encrypt_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds the OUTSTANDING post-push encryption-task set by per-repo coalescing
+    /// (#174 P2-2). `git_encrypt_semaphore` caps *active* walks; this caps how many
+    /// detached tasks *spawn and park* on that semaphore's `acquire_owned().await`.
+    /// Before spawning a per-push encryption task, the receive-pack handler consults
+    /// this set: if the repo already has a task in flight it coalesces (skips the
+    /// duplicate spawn) rather than parking a new unbounded waiter. Coalescing only
+    /// delays a duplicate walk — it never drops the withheld-blob recovery copy, which
+    /// `2a54c15` deliberately kept fail-closed (there is no reconciliation sweep to
+    /// re-derive a dropped copy). See [`EncryptInflight`].
+    pub encrypt_inflight: EncryptInflight,
     /// Per-caller concurrency sub-cap on the read pool: each caller (keyed on the
     /// resolved source IP, #174 U1) may hold at most `max_concurrent_reads_per_caller`
     /// in-flight read ops, so one caller cannot monopolize `git_read_semaphore`
@@ -201,5 +211,91 @@ impl AppState {
     #[allow(dead_code)] // used by tests and any future handler that wants to short-circuit
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
+    }
+}
+
+/// Bounds the OUTSTANDING post-push encryption-task set by per-repo coalescing
+/// (#174 P2-2). Each successful path-scoped push `tokio::spawn`s a DETACHED task that
+/// parks on `git_encrypt_semaphore.acquire_owned().await` (which DEFERS when the pool
+/// is full rather than shedding — `2a54c15` kept it fail-closed so the withheld-blob
+/// recovery copy is never dropped). The semaphore caps *active* walks, but nothing
+/// capped how many detached tasks *spawn and park* on that await: N rapid pushes to a
+/// repo spawn N parked tasks, each holding cloned object lists/rules/paths/keys — an
+/// unbounded outstanding set.
+///
+/// This tracks the repo keys with an in-flight encryption task. Before spawning, the
+/// handler calls [`try_begin`](Self::try_begin): if a task for the repo is already
+/// in-flight it returns `None` and the handler SKIPS spawning a duplicate (coalesce —
+/// the newer push's objects are covered by the pending/next walk over the same repo's
+/// history). This bounds the outstanding set to <=1 pending task per repo WITHOUT
+/// dropping work: coalescing only delays a duplicate walk, it never sheds the recovery
+/// copy (there is no reconciliation sweep, so a *dropped* job would be lost forever).
+///
+/// The returned [`EncryptInflightGuard`] is moved into the detached task and removes
+/// the repo key on drop — on normal completion, error, OR panic (Drop runs on unwind)
+/// — so one crashed walk can never permanently lock a repo out of future recovery
+/// copies.
+#[derive(Clone, Default)]
+pub struct EncryptInflight {
+    // std::sync::Mutex: only ever held for O(1) HashSet insert/remove in a sync
+    // context (right before `tokio::spawn`, and in the guard's Drop) — never across
+    // an await, so a std Mutex is correct and cheaper than a tokio one.
+    repos: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl EncryptInflight {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Try to begin an encryption task for `repo_id`. Returns `Some(guard)` if no task
+    /// for the repo was in-flight (the caller should spawn), or `None` if one already
+    /// is (the caller should COALESCE — skip spawning a duplicate). The guard releases
+    /// the repo key on drop.
+    pub fn try_begin(&self, repo_id: &str) -> Option<EncryptInflightGuard> {
+        let mut set = self.repos.lock().expect("encrypt_inflight mutex poisoned");
+        if set.insert(repo_id.to_string()) {
+            Some(EncryptInflightGuard {
+                repos: Arc::clone(&self.repos),
+                repo_id: repo_id.to_string(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Number of repos with an in-flight encryption task. Test/metrics observability;
+    /// the bound under saturation is `len() <= number of distinct repos`, i.e. at most
+    /// one task per repo.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.repos
+            .lock()
+            .expect("encrypt_inflight mutex poisoned")
+            .len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// RAII guard removing a repo key from [`EncryptInflight`] when the detached
+/// encryption task finishes (drop on completion, error, or panic-unwind). Move-only —
+/// there is no reason to clone a guard, and cloning would double-remove.
+pub struct EncryptInflightGuard {
+    repos: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    repo_id: String,
+}
+
+impl Drop for EncryptInflightGuard {
+    fn drop(&mut self) {
+        // A poisoned lock (a prior panic while holding it) still lets us take the inner
+        // set via into_inner-on-guard; but poisoning here is not expected because the
+        // only critical sections are the O(1) ops above. Remove best-effort.
+        if let Ok(mut set) = self.repos.lock() {
+            set.remove(&self.repo_id);
+        }
     }
 }
