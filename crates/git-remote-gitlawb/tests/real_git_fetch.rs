@@ -269,6 +269,63 @@ fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Outpu
     run_bounded(cmd, Duration::from_secs(30))
 }
 
+/// A synthetic non-success `ExitStatus` used only on the unix timeout path, where
+/// `reap_group` has already consumed the child and the later `wait` returns ECHILD.
+/// The timeout branch already reports `completed == false`, so the exact status is
+/// not load-bearing; a killed/nonzero placeholder preserves the `Output` contract.
+#[cfg(unix)]
+fn exited_status() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    // Encode "terminated by SIGKILL" (signal 9), matching the group teardown.
+    std::process::ExitStatus::from_raw(libc::SIGKILL)
+}
+
+#[cfg(not(unix))]
+fn exited_status() -> std::process::ExitStatus {
+    // Non-unix never takes the reap-then-ECHILD path; a real `wait` always succeeds
+    // there, so this is unreachable in practice. Spawn a trivially-failing process
+    // to synthesize a nonzero status without an unstable constructor.
+    Command::new("cmd")
+        .args(["/C", "exit 1"])
+        .status()
+        .expect("synthesize exit status")
+}
+
+/// Tear down the child's whole process group on the timeout path (INV-22).
+///
+/// With `process_group(0)` the child is its own group leader, so pgid == child pid.
+/// SIGTERM the group, poll for ESRCH (every member gone) with a SIGKILL escalation
+/// after a short grace, then a hard cap so a wedged process can never block the
+/// caller unboundedly. Finally reap the leader so it does not linger as a zombie.
+/// This closes ALL inherited pipe write-ends (leader AND the git-remote-gitlawb
+/// descendant) so the reader joins in `run_bounded` return promptly.
+#[cfg(unix)]
+fn reap_group(child: &mut std::process::Child) {
+    let pgid = child.id() as i32;
+    // SAFETY: kill(2) takes only integers and borrows no Rust memory; ESRCH on an
+    // already-gone group is ignored below via the kill(-pgid, 0) probe.
+    unsafe {
+        libc::kill(-pgid, libc::SIGTERM);
+    }
+    for step in 0..100u32 {
+        // SAFETY: kill(-pgid, 0) only probes group liveness; no memory is touched.
+        // A nonzero return means ESRCH — every member of the group has exited.
+        if unsafe { libc::kill(-pgid, 0) } != 0 {
+            break;
+        }
+        if step == 20 {
+            // ~200ms SIGTERM grace elapsed; force the group down. Fires exactly once.
+            // SAFETY: same as above — integer-only kill, no borrowed memory.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // ~1s hard cap total; reap the leader (best-effort) so it is not left a zombie.
+    let _ = child.wait();
+}
+
 /// Spawn `cmd`, draining stdout and stderr CONCURRENTLY on reader threads while
 /// enforcing `timeout`. Returns `(completed_before_deadline, Output)` (#192, F2).
 ///
@@ -278,11 +335,19 @@ fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Outpu
 /// false "deadlock signature" even while the child is making progress. Draining
 /// continuously makes the deadline measure a real hang only.
 fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Output) {
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn child");
+    // Run the child in its own process group so the whole fetch tree (git plus the
+    // git-remote-gitlawb helper it spawns) can be torn down together on the timeout
+    // path. Without this, killing only the leader leaves the helper alive, holding
+    // the stderr pipe write-end until its own ~300s HTTP timeout, so the reader
+    // joins below block far past the deadline instead of returning promptly (INV-22).
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn child");
 
     let mut out_pipe = child.stdout.take().expect("stdout piped");
     let mut err_pipe = child.stderr.take().expect("stderr piped");
@@ -303,6 +368,15 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
             break true;
         }
         if Instant::now() >= deadline {
+            // Tear down the WHOLE group, not just the leader: the git-remote-gitlawb
+            // helper is a descendant that inherited the stdout/stderr pipe write-ends,
+            // so killing only `child` leaves those ends open and the reader joins wait
+            // on the helper's ~300s HTTP timeout instead of returning at the deadline.
+            // Signalling the group closes every write-end so the readers finish
+            // promptly (INV-22, mirrors gitlawb-node/src/git/smart_http.rs).
+            #[cfg(unix)]
+            reap_group(&mut child);
+            #[cfg(not(unix))]
             let _ = child.kill(); // closes the pipes so the readers finish
             break false; // timed out: the real deadlock signature
         }
@@ -310,8 +384,13 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
     };
 
     // The child has exited (or been killed), so the pipes are closed and the reader
-    // threads run to completion. Reap the child and collect the drained output.
-    let status = child.wait().expect("reap child");
+    // threads run to completion. Reap the child and collect the drained output. On
+    // the unix timeout path `reap_group` already reaped the leader, so `wait` here
+    // returns ECHILD; tolerate that and report the killed status the loop observed.
+    let status = child.wait().unwrap_or_else(|_| {
+        debug_assert!(!completed, "clean-exit path must still be reapable here");
+        exited_status()
+    });
     let stdout = out_reader.join().expect("stdout reader");
     let stderr = err_reader.join().expect("stderr reader");
     (
@@ -527,6 +606,18 @@ fn real_git_withheld_shaped_first_post() {
         // not a helper defect (the helper forwarded and terminated cleanly). The
         // Withheld-Path Decision's remedy owns the fix; this branch documents the
         // observed break so a regression in the assumption is visible in CI.
+        //
+        // Guard the path this test claims to record (INV-21): the nonzero exit is
+        // only the withheld rejection if the helper actually reached the shim and
+        // sent the withheld-shaped POST. A failure BEFORE the first POST — a broken
+        // advertisement, helper lookup, or connection — must not masquerade as the
+        // expected rejection, or a regression that never hits the shim would pass.
+        assert!(
+            posts >= 1,
+            "fetch failed with 0 POSTs to the shim: a pre-POST failure (broken \
+             advertisement / helper lookup / connection) is NOT the withheld \
+             rejection this test records. git stderr:\n{stderr}"
+        );
         eprintln!(
             "WITHHELD-PATH NOTE (#117): real git did NOT accept a NAK+pack mid-negotiation \
              (observed {posts} POST(s)). Per the Withheld-Path Decision this routes to a node-side \
@@ -535,4 +626,37 @@ fn real_git_withheld_shaped_first_post() {
     }
 
     // No manual cleanup: `repos` drops here (or on unwind) and removes the tree.
+}
+
+/// #192 (F1, INV-22): on the timeout path `run_bounded` must tear down the WHOLE
+/// process group, not just the leader. The leader here backgrounds a descendant
+/// (`sleep 10 &`) that inherits the stderr pipe write-end and then `exec`s another
+/// `sleep 10`, so the leader itself is long-lived too. With a 1s deadline the
+/// timeout fires; if only the leader were killed, the surviving background
+/// descendant would keep the pipe open and the reader joins would block for the
+/// descendant's full ~10s lifetime. Signalling the group closes every write-end,
+/// so `run_bounded` returns promptly. Reverting the fix to a leader-only
+/// `child.kill()` turns this RED (elapsed ~10s, the assert below fires).
+#[cfg(unix)]
+#[test]
+fn run_bounded_reaps_descendants_holding_the_pipe() {
+    let mut cmd = Command::new("sh");
+    // Background a descendant that inherits the pipe FDs and outlives the leader,
+    // then exec another long sleep so the leader is not the only thing to reap.
+    cmd.arg("-c").arg("sleep 10 & exec sleep 10");
+
+    let start = Instant::now();
+    let (completed, _out) = run_bounded(cmd, Duration::from_secs(1));
+    let elapsed = start.elapsed();
+
+    assert!(
+        !completed,
+        "the leader outlived the 1s deadline, so run_bounded must report a timeout"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "reader joins blocked on a surviving descendant instead of the deadline: \
+         elapsed={elapsed:?} (expected <4s; a leader-only kill leaves the \
+         backgrounded `sleep 10` holding the stderr pipe for its full lifetime)"
+    );
 }
