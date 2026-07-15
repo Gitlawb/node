@@ -3304,6 +3304,7 @@ version = "0.5.1"
 dependencies = [
  "anyhow",
  "gitlawb-core",
+ "libc",
  "mockito",
  "reqwest",
  "tempfile",

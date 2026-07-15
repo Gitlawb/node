@@ -20,3 +20,6 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 mockito = "1"
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
