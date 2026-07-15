@@ -1081,63 +1081,133 @@ fn ensure_key_mode_0600(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of an atomic key publish.
+enum KeyPublish {
+    /// We created the key file; it now holds the complete PEM.
+    Won,
+    /// Another concurrent start already created it; ours was discarded.
+    Lost,
+}
+
+/// Wall-clock budget for reading a key another start may still be publishing.
+/// The atomic publish (`publish_key_atomically`) means a *present* key file is
+/// always complete, so this normally succeeds on the first read; the deadline
+/// only covers cross-host cache lag. It is a wall-clock budget, NOT a fixed
+/// retry count, so a slow/stalled filesystem cannot starve a losing start after
+/// an arbitrarily short (~100ms) window (#194).
+const KEY_RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Load an already-provisioned identity key. On Unix, defensively tighten looser
+/// permissions to 0600 (do NOT reject a loose key — that would break existing
+/// deployments; just narrow them), then verify the mode is actually 0600.
+fn load_existing_key(path: &std::path::Path) -> Result<Keypair> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.permissions().mode() & 0o777 != 0o600 {
+                // Do NOT silently ignore a failed tighten (#194, F2): surface it
+                // so a key we cannot secure is not read and used exposed.
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| {
+                        format!("could not tighten identity key {} to 0600", path.display())
+                    })?;
+            }
+        }
+        // Verify the key is actually 0600 before using it — a chmod that
+        // succeeded-but-no-op'd (some mounts) still leaves it exposed.
+        ensure_key_mode_0600(path)?;
+    }
+    let pem = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read key from {}", path.display()))?;
+    let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+    info!(path = %path.display(), "loaded existing identity");
+    Ok(kp)
+}
+
+/// Load a key another concurrent start may still be publishing, polling until it
+/// parses or `KEY_RACE_DEADLINE` elapses. An already-provisioned key parses on
+/// the first attempt with no sleep.
+fn load_racing_key(path: &std::path::Path) -> Result<Keypair> {
+    let deadline = std::time::Instant::now() + KEY_RACE_DEADLINE;
+    let mut last_err;
+    loop {
+        match load_existing_key(path) {
+            Ok(kp) => return Ok(kp),
+            Err(e) => last_err = e,
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(last_err);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// Publish `pem` to `final_path` atomically: write the full bytes to a sibling
+/// temp file, then `hard_link` the temp into place. `hard_link` is atomic and
+/// fails if `final_path` already exists, which gives three guarantees at once:
+///   (a) the final path only ever appears with COMPLETE content — a concurrent
+///       reader never observes an empty/half-written key, unlike a
+///       `create_new`+`write_all` that exposes an empty inode before the PEM is
+///       flushed (#194);
+///   (b) a lost race never clobbers the winner — exactly one publisher links;
+///   (c) a crashed publisher leaves only the temp, never a partial final that
+///       would wedge every later start on `invalid PEM key`.
+/// `before_link` is a no-op in production; tests use it to widen the
+/// post-write / pre-link window deterministically.
+fn publish_key_atomically(
+    final_path: &std::path::Path,
+    pem: &[u8],
+    before_link: &dyn Fn(),
+) -> Result<KeyPublish> {
+    use std::io::Write;
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.pem");
+    // Unique per call (process-global counter) so concurrent publishers never
+    // collide on the temp name; `create_new` below is the backstop.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{stem}.tmp.{}.{seq}", std::process::id()));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("create temp key {}", tmp.display()))?;
+    // On a failed write, remove the temp so nothing partial is ever linked (#194, F1).
+    write_key_or_cleanup(&tmp, f.write_all(pem))?;
+    drop(f);
+
+    before_link();
+
+    let linked = std::fs::hard_link(&tmp, final_path);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(KeyPublish::Won),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(KeyPublish::Lost),
+        Err(e) => Err(e)
+            .with_context(|| format!("link identity key into place at {}", final_path.display())),
+    }
+}
+
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
     let key_path = config.resolved_key_path();
 
-    // Load an already-provisioned key. On Unix, defensively tighten looser
-    // permissions to 0600 (do NOT reject a loose key — that would break
-    // existing deployments; just narrow them).
-    fn load_existing(path: &std::path::Path) -> Result<Keypair> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path) {
-                if meta.permissions().mode() & 0o777 != 0o600 {
-                    // Do NOT silently ignore a failed tighten (#194, F2): surface it
-                    // so a key we cannot secure is not read and used exposed.
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                        .with_context(|| {
-                            format!("could not tighten identity key {} to 0600", path.display())
-                        })?;
-                }
-            }
-            // Verify the key is actually 0600 before using it — a chmod that
-            // succeeded-but-no-op'd (some mounts) still leaves it exposed.
-            ensure_key_mode_0600(path)?;
-        }
-        let pem = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read key from {}", path.display()))?;
-        let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
-        info!(path = %path.display(), "loaded existing identity");
-        Ok(kp)
-    }
-
-    // Load a key another concurrent start may still be writing. `create_new`
-    // makes the inode appear before its PEM is flushed, so a race loser — or a
-    // fast-path `exists()` that caught the winner mid-write — can momentarily
-    // read an empty/partial file. Retry briefly until it parses rather than
-    // crashing the boot. Bounded (~100ms); an already-provisioned key parses on
-    // the first attempt with no sleep.
-    fn load_racing(path: &std::path::Path) -> Result<Keypair> {
-        let mut last_err = None;
-        for _ in 0..50 {
-            match load_existing(path) {
-                Ok(kp) => return Ok(kp),
-                Err(e) => {
-                    last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| {
-            anyhow::anyhow!("key at {} unreadable after create race", path.display())
-        }))
-    }
-
     // Fast path for the common already-provisioned case (still race-safe: a
-    // concurrently-writing winner is handled by the retry inside `load_racing`).
+    // concurrently-publishing winner is handled by the retry in load_racing_key).
     if key_path.exists() {
-        return load_racing(&key_path);
+        return load_racing_key(&key_path);
     }
 
     let kp = Keypair::generate();
@@ -1149,61 +1219,15 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Create atomically. `create_new` fails if the file already exists, which
-    // closes the exists()->write TOCTOU: a lost race deterministically loads
-    // the winner's key instead of overwriting it.
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&key_path)
-        {
-            Ok(mut f) => {
-                // The file is 0600 from creation, so the PEM is never
-                // world-readable, even momentarily. On a failed write, remove the
-                // empty/partial file so a later start regenerates (#194, F1).
-                write_key_or_cleanup(&key_path, f.write_all(pem.as_bytes()))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A concurrent start won the race and wrote the identity; load
-                // theirs rather than propagating the error or overwriting.
-                return load_racing(&key_path);
-            }
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to create key at {}", key_path.display()));
-            }
+    // Publish atomically: the final path only ever appears complete, and a lost
+    // race loads the winner's key rather than overwriting it.
+    match publish_key_atomically(&key_path, pem.as_bytes(), &|| {})? {
+        KeyPublish::Won => {
+            info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
+            Ok(kp)
         }
+        KeyPublish::Lost => load_racing_key(&key_path),
     }
-    #[cfg(not(unix))]
-    {
-        use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&key_path)
-        {
-            Ok(mut f) => {
-                // On a failed write, remove the empty/partial file so a later
-                // start regenerates instead of re-parsing it forever (#194, F1).
-                write_key_or_cleanup(&key_path, f.write_all(pem.as_bytes()))?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return load_racing(&key_path);
-            }
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to create key at {}", key_path.display()));
-            }
-        }
-    }
-
-    info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
-    Ok(kp)
 }
 
 #[cfg(test)]
@@ -1269,9 +1293,123 @@ mod gossip_ssrf_tests {
 
 #[cfg(all(test, unix))]
 mod identity_key_tests {
-    use super::{load_or_create_keypair, Config};
+    use super::{
+        load_or_create_keypair, load_racing_key, publish_key_atomically, Config, KeyPublish,
+        Keypair,
+    };
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
+
+    // #194 (P2): the racing loader must wait out a SLOW winner on a meaningful
+    // wall-clock deadline, not give up after an arbitrary ~100ms window. Simulate
+    // a winner that only publishes the key after 250ms (past the old 100ms budget)
+    // and assert the loader waits it out instead of failing with `invalid PEM key`.
+    // RED with the old `for _ in 0..50` (2ms) fixed-count loop.
+    #[test]
+    fn load_racing_key_waits_out_a_slow_winner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        let writer_path = key_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            publish_key_atomically(&writer_path, pem.as_bytes(), &|| {}).expect("publish");
+        });
+
+        let started = std::time::Instant::now();
+        let kp = load_racing_key(&key_path)
+            .expect("racing load must wait out the slow winner, not fail");
+        let waited = started.elapsed();
+        writer.join().expect("writer joins");
+
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "loader should have waited for the ~250ms-slow winner, only waited {waited:?}"
+        );
+        assert!(
+            !format!("{}", kp.did()).is_empty(),
+            "loaded the published key"
+        );
+    }
+
+    // #194 (P2): the atomic publish preserves the single-winner no-clobber
+    // guarantee — a second publish of a DIFFERENT key must lose and leave the
+    // winner's key untouched — and it cleans up its temp files.
+    #[test]
+    fn publish_wins_then_second_publish_loses_without_clobbering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem_a = Keypair::generate().to_pem().expect("pem a");
+        let pem_b = Keypair::generate().to_pem().expect("pem b");
+        assert_ne!(pem_a.as_str(), pem_b.as_str(), "fixtures must differ");
+
+        let out = publish_key_atomically(&key_path, pem_a.as_bytes(), &|| {}).expect("publish a");
+        assert!(matches!(out, KeyPublish::Won), "first publish wins");
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap().as_str(),
+            pem_a.as_str(),
+            "final holds the full PEM"
+        );
+
+        let out = publish_key_atomically(&key_path, pem_b.as_bytes(), &|| {}).expect("publish b");
+        assert!(matches!(out, KeyPublish::Lost), "second publish loses");
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap().as_str(),
+            pem_a.as_str(),
+            "the winner's key must NOT be clobbered by a losing publish"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files must be cleaned up, found {leftovers:?}"
+        );
+    }
+
+    // #194 (P2, the core of jatmn's option b): while a winner is between writing
+    // its temp and linking it into place, a reader watching the FINAL path must
+    // see it absent or COMPLETE — never empty/partial. RED with a
+    // create_new(final)+write approach, which exposes an empty final for the whole
+    // write window.
+    #[test]
+    fn publish_never_exposes_a_partial_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = std::sync::Arc::new(dir.path().join("identity.pem"));
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        let wp = key_path.clone();
+        let writer = std::thread::spawn(move || {
+            // Hold the post-write / pre-link window open for 200ms.
+            publish_key_atomically(&wp, pem.as_bytes(), &|| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            })
+            .expect("publish");
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let mut saw_complete = false;
+        while std::time::Instant::now() < deadline {
+            if key_path.exists() {
+                let body = std::fs::read_to_string(&*key_path).unwrap_or_default();
+                assert!(
+                    Keypair::from_pem(&body).is_ok(),
+                    "final key observed in a partial/empty state: {body:?}"
+                );
+                saw_complete = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        writer.join().expect("writer joins");
+        assert!(
+            saw_complete,
+            "reader should have observed the completed key within the window"
+        );
+    }
 
     // A freshly created identity key must be 0600 immediately, with no
     // world-readable disclosure window (the atomic create_new(...).mode(0o600)
@@ -1340,10 +1478,10 @@ mod identity_key_tests {
 
     // The create-race arm the single-threaded tests skip (they enter via the
     // `exists()` fast path). N concurrent starts on ONE fresh path must converge
-    // on a single identity: the `create_new` losers hit `AlreadyExists` and load
-    // the winner's key rather than overwriting it. RED: revert the write to a
-    // plain `fs::write` (no `create_new`) and each thread returns its own
-    // freshly generated key, so the DIDs diverge.
+    // on a single identity: the atomic publish links exactly one winner and the
+    // losers hit `AlreadyExists` and load the winner's key rather than overwriting
+    // it. RED: replace the atomic publish with a plain `fs::write` and each thread
+    // returns its own freshly generated key, so the DIDs diverge.
     #[test]
     fn concurrent_starts_converge_on_one_identity() {
         let dir = tempfile::tempdir().expect("tempdir");
