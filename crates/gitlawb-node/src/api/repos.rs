@@ -515,6 +515,16 @@ pub async fn git_info_refs(
     let service = query
         .service
         .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
+    // Reject an unsupported service BEFORE taking a read slot or doing any DB/Tigris
+    // work (#174 P2-1). git_info_refs otherwise treats everything that is not
+    // git-receive-pack as a read op, so an unauthenticated `?service=anything` to a
+    // public repo would consume a read permit and the visibility/Tigris work before
+    // validate_service rejected it downstream in smart_http.
+    if service != "git-upload-pack" && service != "git-receive-pack" {
+        return Err(AppError::BadRequest(format!(
+            "unsupported git service: {service}"
+        )));
+    }
     // #62 cheap pre-DB load shed: if the pool this service draws from is already
     // saturated, shed with 503 before any DB/disk work. Best-effort (holds no
     // permit); the authoritative hold is `git_permit` below, after the per-source
@@ -3115,6 +3125,47 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "receive-pack advertisement must be throttled before the Tigris acquire"
+        );
+    }
+
+    /// #174 P2-1: an unsupported `?service=` must be rejected with 400 BEFORE taking a
+    /// read slot or doing DB/Tigris work. Isolate it: exhaust the read pool so a read
+    /// op WOULD shed 503 at the pre-DB check — a garbage service must still return 400
+    /// (validation runs first), proving `?service=anything` cannot consume the read
+    /// pool. Removing the validation makes this 503 (RED).
+    #[sqlx::test]
+    async fn info_refs_rejects_unsupported_service_before_the_read_slot(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo("z6svcowner", "svc", "/tmp/svc", None, false)
+            .await
+            .unwrap();
+        // Exhaust the read pool: a read op would shed 503 at the pre-DB check.
+        state.git_read_semaphore = Arc::new(Semaphore::new(0));
+
+        let router = crate::server::build_router(state);
+        let peer: SocketAddr = "203.0.113.90:7000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6svcowner/svc/info/refs?service=git-explode")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let status = router.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unsupported ?service= must be 400 before the read-pool shed, not 503"
         );
     }
 
