@@ -183,6 +183,27 @@ pub struct Config {
     )]
     pub git_service_timeout_secs: u64,
 
+    /// Maximum wall-clock time the storage-acquisition phase of a served git
+    /// operation may run before the request is shed with a 503, in seconds. This
+    /// bounds `RepoStore::{acquire,acquire_fresh,acquire_write}` — the Tigris
+    /// HEAD/GET on a read/advert acquire and the advisory-lock retry loop (incl. a
+    /// per-iteration `pg_try_advisory_lock` that can block on a hung Postgres pool)
+    /// on a write acquire. A concurrency permit is taken BEFORE this phase, and
+    /// `git_service_timeout_secs` only starts once git spawns, so without this the
+    /// acquire phase is unbounded: a stalled backend pins the permit and drains the
+    /// pool until every later request 503s. On expiry the permit is released and a
+    /// bounded 503 + Retry-After is returned (fail-closed). Kept separate from
+    /// `git_service_timeout_secs` because acquisition and git execution are distinct
+    /// cost centers — one shared budget would let a slow acquire starve git. Must be
+    /// positive; set it very large to effectively disable the bound. Default: 30s.
+    #[arg(
+        long,
+        env = "GITLAWB_GIT_ACQUIRE_TIMEOUT_SECS",
+        default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub git_acquire_timeout_secs: u64,
+
     /// Maximum connections in the PostgreSQL pool. This is a cap, not a floor
     /// (connections open lazily). Size against the database server's
     /// max_connections, remembering admin tooling opens its own pool.
