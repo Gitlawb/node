@@ -286,8 +286,10 @@ async fn main() -> Result<()> {
         None
     };
 
+    let object_store =
+        tigris.map(|t| std::sync::Arc::new(t) as std::sync::Arc<dyn git::tigris::ObjectStore>);
     let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
+        git::repo_store::RepoStore::new(config.repos_dir.clone(), object_store, db.pool().clone());
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.

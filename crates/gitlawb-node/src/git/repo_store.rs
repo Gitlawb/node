@@ -18,17 +18,17 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::store;
-use super::tigris::TigrisClient;
+use super::tigris::ObjectStore;
 
-/// Centralized repo storage: local disk cache + optional Tigris backend.
+/// Centralized repo storage: local disk cache + optional object-store backend.
 #[derive(Clone)]
 pub struct RepoStore {
     repos_dir: PathBuf,
-    tigris: Option<TigrisClient>,
+    object_store: Option<Arc<dyn ObjectStore>>,
     /// Shared Postgres pool for advisory locks.
     pool: PgPool,
-    /// Tracks repos already confirmed to exist in Tigris — avoids redundant
-    /// HEAD checks and background uploads for repos we've already migrated.
+    /// Tracks repos already confirmed to exist in the object store — avoids
+    /// redundant HEAD checks and background uploads for repos we've migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -37,16 +37,20 @@ impl RepoStore {
     pub fn for_testing(repos_dir: PathBuf, pool: PgPool) -> Self {
         Self {
             repos_dir,
-            tigris: None,
+            object_store: None,
             pool,
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
-    pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, pool: PgPool) -> Self {
+    pub fn new(
+        repos_dir: PathBuf,
+        object_store: Option<Arc<dyn ObjectStore>>,
+        pool: PgPool,
+    ) -> Self {
         Self {
             repos_dir,
-            tigris,
+            object_store,
             pool,
             migrated: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -63,7 +67,7 @@ impl RepoStore {
         if local_path.exists() {
             // Lazy migration: if Tigris is enabled and we haven't confirmed this
             // repo is in Tigris yet, check and upload in the background.
-            if let Some(ref tigris) = self.tigris {
+            if let Some(ref tigris) = self.object_store {
                 let key = format!("{owner_slug}/{repo_name}");
                 let already_migrated = self.migrated.lock().await.contains(&key);
                 if !already_migrated {
@@ -99,7 +103,7 @@ impl RepoStore {
         }
 
         // Try downloading from Tigris
-        if let Some(ref tigris) = self.tigris {
+        if let Some(ref tigris) = self.object_store {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "cache miss — downloading from tigris");
                 tigris
@@ -127,7 +131,7 @@ impl RepoStore {
     pub async fn acquire_fresh(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
-        if let Some(ref tigris) = self.tigris {
+        if let Some(ref tigris) = self.object_store {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
                 if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
@@ -193,7 +197,7 @@ impl RepoStore {
 
         // Always download the latest from Tigris before writing.
         // Local disk may be stale if another machine pushed since our last access.
-        if let Some(ref tigris) = self.tigris {
+        if let Some(ref tigris) = self.object_store {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
                 if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
@@ -216,7 +220,7 @@ impl RepoStore {
             local_path,
             lock_key,
             conn,
-            tigris: self.tigris.clone(),
+            object_store: self.object_store.clone(),
         })
     }
 
@@ -260,7 +264,7 @@ impl RepoStore {
         store::init_bare(&local_path).context("initializing bare repo")?;
 
         // Upload to Tigris in background
-        if let Some(ref tigris) = self.tigris {
+        if let Some(ref tigris) = self.object_store {
             let tigris = tigris.clone();
             let owner_slug = owner_slug.clone();
             let repo_name = repo_name.to_string();
@@ -278,7 +282,7 @@ impl RepoStore {
     /// Upload a repo to Tigris after a write operation (push, merge, fork, etc.).
     /// Call this after any operation that modifies the git repo on disk.
     pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) {
-        if let Some(ref tigris) = self.tigris {
+        if let Some(ref tigris) = self.object_store {
             let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
                 Ok(p) => p,
                 Err(e) => {
@@ -405,7 +409,7 @@ pub struct RepoWriteGuard {
     /// and so a concurrent `try_lock_repo` cannot be handed this connection and
     /// reentrantly re-grab the lock.
     conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
-    tigris: Option<TigrisClient>,
+    object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl RepoWriteGuard {
@@ -422,7 +426,7 @@ impl RepoWriteGuard {
     pub async fn release(mut self, success: bool) {
         // Upload to Tigris only on success.
         if success {
-            if let Some(ref tigris) = self.tigris {
+            if let Some(ref tigris) = self.object_store {
                 if let Err(e) = tigris
                     .upload(&self.owner_slug, &self.repo_name, &self.local_path)
                     .await
