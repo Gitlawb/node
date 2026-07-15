@@ -224,7 +224,11 @@ impl RepoStore {
     ) -> Result<Option<RepoLockGuard>> {
         let (owner_slug, _local) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
-        let mut conn = self.pool.acquire().await.context("acquiring lock connection")?;
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquiring lock connection")?;
         let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&mut *conn)

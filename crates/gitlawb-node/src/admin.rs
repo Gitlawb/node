@@ -581,8 +581,7 @@ mod db_tests {
         // no-candidate early return and the `if !execute { return }` guard is never
         // exercised with candidates present — the L10 gap this test now closes.
         let tmp = tempfile::TempDir::new().unwrap();
-        let target_dir =
-            store::repo_disk_path(tmp.path(), SPAM_BURST_TARGET_DID, "spam1");
+        let target_dir = store::repo_disk_path(tmp.path(), SPAM_BURST_TARGET_DID, "spam1");
         store::init_bare(&target_dir).unwrap();
         assert_eq!(
             store::list_refs(&target_dir).unwrap().len(),
@@ -591,7 +590,9 @@ mod db_tests {
         );
 
         let store = test_store(tmp.path(), &pool);
-        let summary = run_purge_spam(&db, &store, tmp.path(), false).await.unwrap();
+        let summary = run_purge_spam(&db, &store, tmp.path(), false)
+            .await
+            .unwrap();
 
         // A candidate existed, but dry-run deletes nothing — DB row and on-disk dir
         // both survive. RED if the `if !execute` guard is removed.
@@ -641,7 +642,9 @@ mod db_tests {
         assert!(!store::list_refs(&refs_path).unwrap().is_empty());
 
         let repo_store = test_store(tmp.path(), &pool);
-        run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
+        run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
 
         // Only the empty target repo row is gone.
         assert!(db
@@ -674,7 +677,9 @@ mod db_tests {
         assert!(path.exists(), "precondition: on-disk repo exists");
 
         let repo_store = test_store(tmp.path(), &pool);
-        run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
+        run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
 
         assert!(
             db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
@@ -707,7 +712,9 @@ mod db_tests {
             .unwrap()
             .expect("lock should be free initially");
 
-        run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
+        run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
 
         // Locked → skipped: both the row and the on-disk dir survive.
         assert!(
@@ -722,7 +729,9 @@ mod db_tests {
         // Once the writer releases, the empty repo is deleted (the lock was the
         // only thing protecting it — baseline both ways).
         held.release().await;
-        run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
+        run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
         assert!(
             db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
                 .await
@@ -752,7 +761,9 @@ mod db_tests {
         std::fs::set_permissions(&slug_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let repo_store = test_store(tmp.path(), &pool);
-        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
 
         // Restore perms so TempDir cleanup works regardless of assertion outcome.
         std::fs::set_permissions(&slug_dir, orig).unwrap();
@@ -769,7 +780,10 @@ mod db_tests {
                 .is_none(),
             "DB row is gone (delete succeeded)"
         );
-        assert!(path.exists(), "on-disk dir survived the failed removal (drift)");
+        assert!(
+            path.exists(),
+            "on-disk dir survived the failed removal (drift)"
+        );
     }
 
     // U1 (M3): a burst-owned row whose NAME traverses out of repos_dir must never
@@ -806,7 +820,9 @@ mod db_tests {
 
         db.create_repo(&evil).await.unwrap();
         let repo_store = test_store(&repos_dir, &pool);
-        run_purge_spam(&db, &repo_store, &repos_dir, true).await.unwrap();
+        run_purge_spam(&db, &repo_store, &repos_dir, true)
+            .await
+            .unwrap();
 
         assert!(
             victim.join("HEAD").is_file(),
@@ -922,7 +938,10 @@ mod db_tests {
         // A genuine path inside repos_dir passes.
         let inside = repos_dir.join("real.git");
         std::fs::create_dir_all(&inside).unwrap();
-        assert!(path_within(&inside, &repos_dir), "an in-root path must pass");
+        assert!(
+            path_within(&inside, &repos_dir),
+            "an in-root path must pass"
+        );
     }
 
     /// The exclusion gate and the target scope must never overlap: if the burst

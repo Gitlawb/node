@@ -3664,7 +3664,11 @@ mod dedup_db_tests {
         sqlx::query(
             "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
              VALUES ($1, 'refs/heads/main', '1', 'cid', 'n', '2026-01-01T00:00:00Z')",
-        ).bind(&slug).execute(db.pool()).await.unwrap();
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO pull_requests (id, repo_id, number, title, author_did, source_branch, target_branch, created_at, updated_at)
              VALUES ('pr1', 'rid-cascade', 1, 't', 'a', 'b', 'main', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
@@ -3672,7 +3676,10 @@ mod dedup_db_tests {
         sqlx::query(
             "INSERT INTO pr_reviews (id, pr_id, reviewer_did, status, created_at)
              VALUES ('rev1', 'pr1', 'r', 'approved', '2026-01-01T00:00:00Z')",
-        ).execute(db.pool()).await.unwrap();
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
 
         let removed = db.delete_repo_by_id("rid-cascade").await.unwrap();
         assert_eq!(removed, 1, "parent repo row deleted");
@@ -3685,7 +3692,12 @@ mod dedup_db_tests {
                 .unwrap()
         }
         assert_eq!(
-            count(&db, "SELECT COUNT(*) FROM ref_certificates WHERE repo_id=$1", "rid-cascade").await,
+            count(
+                &db,
+                "SELECT COUNT(*) FROM ref_certificates WHERE repo_id=$1",
+                "rid-cascade"
+            )
+            .await,
             0,
             "repo_id-keyed child (ref_certificates) must be deleted"
         );
@@ -3695,7 +3707,12 @@ mod dedup_db_tests {
             "slug-keyed child (branch_cids) must be deleted"
         );
         assert_eq!(
-            count(&db, "SELECT COUNT(*) FROM pull_requests WHERE repo_id=$1", "rid-cascade").await,
+            count(
+                &db,
+                "SELECT COUNT(*) FROM pull_requests WHERE repo_id=$1",
+                "rid-cascade"
+            )
+            .await,
             0,
             "pull_requests must be deleted"
         );
