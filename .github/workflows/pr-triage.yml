@@ -72,12 +72,80 @@ jobs:
             // pattern) an inline #[test] / #[cfg(test)] block added inside the source file.
             // Async tests use a namespaced attribute (#[tokio::test], #[async_std::test],
             // possibly with args like #[tokio::test(flavor = ...)]) rather than the bare
-            // #[test]. Anchor to a leading #[ so ::test in ordinary code (indexing,
-            // comments, strings) doesn't count, and end on \b so both ::test] and
-            // ::test(...) match.
-            const addsInlineTest = files.some(f =>
-              f.filename.endsWith(".rs") && f.patch &&
-              /^\+\s*#\[\s*(cfg\(\s*test|[\w-]+(::[\w-]+)*::test|test)\b/m.test(f.patch));
+            // #[test]. Anchor to a leading #[ (horizontal whitespace only, so the attribute
+            // itself must be on the added line) so ::test in ordinary code (indexing,
+            // comments, strings) doesn't count, require cfg(test) to close before accepting
+            // it as a test gate, and allow the whitespace Rust permits around :: and cfg(.
+            const testAttrRe =
+              /^[ \t]*#[ \t]*\[[ \t]*(cfg[ \t]*\([ \t]*test[ \t]*\)|[\w-]+([ \t]*::[ \t]*[\w-]+)*[ \t]*::[ \t]*test\b|test\b)/;
+            const addsInlineTest = files.some(f => {
+              if (!f.filename.endsWith(".rs") || !f.patch) return false;
+              const state = { blockComment: false, rawStringDelim: null, inNormalString: false };
+              return f.patch.split("\n").some(line => {
+                if (line.startsWith("+++") || line.startsWith("---")) return false;
+                const isAdded = line.startsWith("+");
+                if (!isAdded && !line.startsWith(" ")) return false; // skip removed lines/hunk headers
+                const content = line.slice(1);
+
+                let stripped = "";
+                let i = 0;
+                while (i < content.length) {
+                  if (state.blockComment) {
+                    if (content.slice(i, i + 2) === "*/") {
+                      state.blockComment = false;
+                      i += 2;
+                    } else {
+                      i += 1;
+                    }
+                  } else if (state.rawStringDelim) {
+                    if (content.slice(i, i + state.rawStringDelim.length) === state.rawStringDelim) {
+                      state.rawStringDelim = null;
+                      i += state.rawStringDelim.length;
+                    } else {
+                      i += 1;
+                    }
+                  } else if (state.inNormalString) {
+                    if (content[i] === "\\") {
+                      i += 2;
+                    } else if (content[i] === '"') {
+                      state.inNormalString = false;
+                      i += 1;
+                    } else {
+                      i += 1;
+                    }
+                  } else {
+                    if (content.slice(i, i + 2) === "//") {
+                      break;
+                    }
+                    if (content.slice(i, i + 2) === "/*") {
+                      state.blockComment = true;
+                      i += 2;
+                      continue;
+                    }
+                    const charMatch = content.slice(i).match(/^'(?:[^'\\]|\\.)'/);
+                    if (charMatch) {
+                      i += charMatch[0].length;
+                      continue;
+                    }
+                    const rawMatch = content.slice(i).match(/^r(#*)"/);
+                    if (rawMatch) {
+                      state.rawStringDelim = '"' + rawMatch[1];
+                      i += rawMatch[0].length;
+                      continue;
+                    }
+                    if (content[i] === '"') {
+                      state.inNormalString = true;
+                      i += 1;
+                      continue;
+                    }
+                    stripped += content[i];
+                    i += 1;
+                  }
+                }
+
+                return isAdded && testAttrRe.test(stripped);
+              });
+            });
             const touchedTests =
               names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
             if (changedRust && !touchedTests) want.add("needs-tests");
