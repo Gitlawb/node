@@ -576,13 +576,39 @@ mod db_tests {
         let before = count_rows(&db).await;
         assert_eq!(before, 5);
 
-        // Empty repos dir: no repo exists on disk, so nothing is provably empty.
+        // Materialize a REAL empty bare repo for the empty target so it is a genuine
+        // purge candidate. Without an on-disk candidate, run_purge_spam hits the
+        // no-candidate early return and the `if !execute { return }` guard is never
+        // exercised with candidates present — the L10 gap this test now closes.
         let tmp = tempfile::TempDir::new().unwrap();
-        let store = test_store(tmp.path(), &pool);
-        run_purge_spam(&db, &store, tmp.path(), false).await.unwrap();
+        let target_dir =
+            store::repo_disk_path(tmp.path(), SPAM_BURST_TARGET_DID, "spam1");
+        store::init_bare(&target_dir).unwrap();
+        assert_eq!(
+            store::list_refs(&target_dir).unwrap().len(),
+            0,
+            "precondition: the candidate is a real empty bare repo"
+        );
 
+        let store = test_store(tmp.path(), &pool);
+        let summary = run_purge_spam(&db, &store, tmp.path(), false).await.unwrap();
+
+        // A candidate existed, but dry-run deletes nothing — DB row and on-disk dir
+        // both survive. RED if the `if !execute` guard is removed.
+        assert_eq!(summary.deleted, 0, "dry-run must delete no rows");
         let after = count_rows(&db).await;
         assert_eq!(after, before, "dry-run must not delete any repo rows");
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the candidate row must survive a dry-run"
+        );
+        assert!(
+            target_dir.exists(),
+            "dry-run must not remove the on-disk repo dir"
+        );
     }
 
     // The DB accessor lists exactly the target DID's rows (exact owner match), and
