@@ -41,6 +41,31 @@ const WATCHDOG_TERM_GRACE: Duration = Duration::from_secs(1);
 /// the serve handler maps it to 504. `git_bin` is injectable so a fake `git` can
 /// drive the teardown in tests without mutating the process-global PATH;
 /// `stdin_bytes` feeds children that read stdin (empty for the arg-only children).
+/// Returns true if `pid` (a process-group leader we spawned) has terminated, WITHOUT
+/// reaping it. `waitid(..., WNOWAIT)` reports the exit state but leaves the child
+/// waitable, so the caller's later `child.wait()` still collects the status and the
+/// pid/pgid stays live until then — which is what keeps the watchdog's `kill(-pgid)`
+/// teardown from ever racing a recycled pgid. Used to distinguish "the child actually
+/// exited" from "the child merely closed stdout" after the drain returns (#174 P1-a).
+#[cfg(unix)]
+fn child_terminated_without_reaping(pid: i32) -> bool {
+    // SAFETY: waitid writes only into the zeroed siginfo and borrows no Rust memory;
+    // WNOWAIT leaves the child unreaped, WNOHANG makes the probe non-blocking.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // rc == 0 with si_pid == 0 means "no state change yet" (still running); a non-zero
+    // si_pid means the child has entered a waitable, exited state. EINTR/other errors
+    // (rc != 0) are treated as "not yet terminated" and the caller re-polls.
+    rc == 0 && unsafe { info.si_pid() } != 0
+}
+
 #[cfg(unix)]
 pub(crate) fn run_bounded_git(
     git_bin: &str,
@@ -132,14 +157,28 @@ pub(crate) fn run_bounded_git(
     // is unreachable in userspace (no signal reaps a D-state process) and matches the
     // async `reap_group_on_timeout`, which likewise only warns and gives up there.
     let read_result = stdout.read_to_end(&mut out);
-    // The drain has returned: either the child exited on its own, or the watchdog's
-    // teardown closed its pipes. Tell the watchdog the drain is done, then WAIT for it
-    // to return BEFORE reaping the leader. On the timeout path the watchdog runs the
-    // full SIGTERM -> grace -> SIGKILL teardown; joining it before `child.wait()` keeps
-    // the leader's pid unreaped while every `kill(-pgid)` fires (so the pgid can't be
-    // recycled), and guarantees a SIGTERM-ignoring group member has already been
-    // SIGKILLed rather than left running past the deadline (finding 3, #174).
-    let _ = done_tx.send(());
+    // The drain has returned, but that only means all stdout write ends are closed —
+    // NOT that the child has exited. A group member, or the leader itself, can close
+    // stdout and keep running; standing the watchdog down on the drain alone (as the
+    // old code did) would then let `child.wait()` block forever on that live child,
+    // past the deadline, pinning the walk thread and its permit (finding P1-a, #174).
+    // So stand the watchdog down only once the child has ACTUALLY terminated, detected
+    // WITHOUT reaping (waitid + WNOWAIT) so the leader's pid stays unreaped and its
+    // pgid un-recycled until the watchdog finishes and we join it below. Past the
+    // deadline the watchdog owns the teardown, so we stop polling and let it run the
+    // full SIGTERM -> grace -> SIGKILL; joining it before `child.wait()` keeps every
+    // `kill(-pgid)` firing while the pid is still unreaped and guarantees a
+    // stdout-closing-then-hanging member has been SIGKILLed rather than left running.
+    loop {
+        if child_terminated_without_reaping(pgid) {
+            let _ = done_tx.send(());
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let killed = watchdog.join().unwrap_or(false);
     let status = child.wait().context("git wait failed")?;
     let err = err_reader.join().unwrap_or_default();
@@ -902,6 +941,67 @@ esac\n";
             "a SIGTERM-ignoring descendant (pid {desc}) must be SIGKILLed even after the leader exits cleanly, not orphaned"
         );
     }
+
+    /// #174 U1 (P1-a, RED-before/GREEN-after): the group LEADER closes its own
+    /// stdout/stderr BEFORE the deadline and then keeps running. On the pre-fix code
+    /// the stdout drain returns EOF early, `done_tx.send` stands the watchdog down
+    /// before it ever fires (`recv` gets `Ok` -> `false`, no kill), and `child.wait()`
+    /// then blocks on the still-alive leader — pinning the walk thread and its read/
+    /// write permit past the deadline, bypassing GITLAWB_GIT_SERVICE_TIMEOUT_SECS.
+    /// This is distinct from the descendant case above: there the leader sleeps until
+    /// the deadline so the watchdog DOES time out; here the drain-EOF races ahead of
+    /// the deadline. The fix keeps the watchdog armed until the child is actually
+    /// reaped, so the deadline SIGTERM still fires and the call returns within budget.
+    /// A pre-fix build blocks on `child.wait()` past the recv budget (RED).
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_git_reaps_a_leader_that_closes_stdout_then_hangs() {
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new().unwrap();
+        // rev-list records its (leader) pid, closes stdout+stderr so the drain EOFs
+        // immediately, then sleeps without trapping TERM. `sleep 30` bounds the worst
+        // case so a RED run cannot wedge the suite; the recv budget fires first.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo $$ > leader.pid; exec 1>&- 2>&-; sleep 30 ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = tmp.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_bounded_git(
+                &git_bin,
+                &["rev-list"],
+                &path,
+                b"",
+                Instant::now() + Duration::from_millis(100),
+            ));
+        });
+        let out = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "run_bounded_git must return within the watchdog budget when the leader closes stdout then hangs, not block on child.wait()",
+        );
+        assert!(
+            out.is_err(),
+            "a leader killed at the deadline (no TERM trap) is a timeout, not a success: {out:?}"
+        );
+        let pid: i32 = std::fs::read_to_string(tmp.path().join("leader.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..300 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Kill it regardless so a RED run leaks no orphan.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(
+            gone,
+            "the hung leader (pid {pid}) must be killed and reaped at the deadline, not left running"
+        );
+    }
+
     use crate::db::VisibilityMode;
     use chrono::Utc;
     use std::process::Command;
