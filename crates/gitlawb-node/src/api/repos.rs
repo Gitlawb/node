@@ -819,9 +819,16 @@ pub async fn git_upload_pack(
     let resp = if !visibility_pack::has_path_scoped_rule(&rules) {
         smart_http::upload_pack(&disk_path, body, git_timeout).await
     } else {
-        // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
-        // that off the async worker thread.
-        let withheld = {
+        // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep that
+        // off the async worker thread. Move BOTH admission permits INTO the blocking
+        // task so they are held for the walk's real duration: spawn_blocking cannot be
+        // cancelled, so on a client disconnect the handler future drops but the walk
+        // keeps running — and now so do its permits, released only when the walk
+        // finishes rather than the instant the future drops (#174 P1-b). On success the
+        // task hands the permits back so the serve phase below keeps them; on a
+        // dropped future the returned tuple (with the permits) is discarded only when
+        // the blocking task completes, so admission tracks the real git work.
+        let (withheld, _permit, _caller_permit) = {
             let path = disk_path.clone();
             let rules = rules.clone();
             let owner_did = record.owner_did.clone();
@@ -829,7 +836,7 @@ pub async fn git_upload_pack(
             let is_public = record.is_public;
             let git_bin = state.git_bin.clone();
             tokio::task::spawn_blocking(move || {
-                visibility_pack::withheld_blob_oids_bounded(
+                let withheld = visibility_pack::withheld_blob_oids_bounded(
                     &path,
                     &git_bin,
                     git_timeout,
@@ -837,14 +844,15 @@ pub async fn git_upload_pack(
                     is_public,
                     &owner_did,
                     caller_owned.as_deref(),
-                )
+                );
+                (withheld, _permit, _caller_permit)
             })
             .await
             .map_err(|e| AppError::Git(e.to_string()))?
-            // A walk that hit its deadline carries GitServiceTimeout; map it to 504
-            // like the smart_http paths, not a generic 500 (#174 U3).
-            .map_err(|e| git_service_app_error(&e))?
         };
+        // A walk that hit its deadline carries GitServiceTimeout; map it to 504 like
+        // the smart_http paths, not a generic 500 (#174 U3).
+        let withheld = withheld.map_err(|e| git_service_app_error(&e))?;
 
         if withheld.is_empty() {
             smart_http::upload_pack(&disk_path, body, git_timeout).await
@@ -3454,6 +3462,148 @@ mod tests {
             body.contains("for this caller"),
             "the per-source cap is an independent brake: with global capacity free, the capped source must still shed with the caller-cap body, got {body}"
         );
+    }
+
+    /// #174 U3 (P1-b, RED-before/GREEN-after): a client disconnect during the
+    /// path-scoped withheld-blob walk must NOT release the read admission while the
+    /// uncancellable `spawn_blocking` walk is still running. The handler takes the
+    /// global read permit, enters the walk (a fake git hangs on rev-list), then the
+    /// request future is dropped mid-walk. With both permits moved into the blocking
+    /// task the global slot stays occupied until the walk finishes; on the pre-fix code
+    /// the handler-local permits drop on future-drop and the slot frees instantly (RED),
+    /// letting disconnect-spam exceed the cap while real git work keeps running.
+    #[sqlx::test]
+    async fn upload_pack_permit_held_through_walk_after_disconnect(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let revlist_pid = tmp.path().join("revlist.pid");
+        // Fake git: resolve refs fast, hang on rev-list (recording its pid first). The
+        // ~6s sleep bounds the walk so a broken fix cannot wedge the suite.
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo $$ > \"{}\" ; sleep 6 ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n",
+            revlist_pid.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        // Root the repo store at this test's TempDir so the bare repo is isolated per
+        // run (the default for_testing store uses a fixed /tmp path that would collide
+        // across runs).
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.git_read_semaphore = Arc::new(Semaphore::new(1));
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let owner = "z6up3rd";
+        let name = "up3";
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // Real bare repo at the path acquire() computes, so the handler reaches the walk.
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        // A path-scoped rule so has_path_scoped_rule() is true (the walk path) without
+        // denying the "/" gate for the public repo.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "src/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkU3ReaderAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+
+        let sem = state.git_read_semaphore.clone();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one read slot before the request"
+        );
+
+        let router = crate::server::build_router(state);
+        let peer: SocketAddr = "203.0.113.77:5000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{owner}/{name}/git-upload-pack"))
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let mut fut = Box::pin(router.oneshot(req));
+        // Drive until the walk's rev-list starts (its pidfile appears) — i.e. the
+        // request is inside the spawn_blocking walk, holding the global read permit.
+        let mut in_walk = false;
+        for _ in 0..500 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if revlist_pid.exists() {
+                in_walk = true;
+                break;
+            }
+        }
+        assert!(
+            in_walk,
+            "the walk's rev-list must start (request reached the spawn_blocking walk)"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the read slot is held while the walk runs"
+        );
+
+        // Client disconnect: drop the request future mid-walk.
+        drop(fut);
+
+        // Load-bearing: the slot must STAY held while the uncancellable walk runs. On
+        // the pre-fix code the handler-local permits drop here and the slot frees at
+        // once (RED).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "on disconnect the read admission must be held until the spawn_blocking walk \
+             finishes, not released the instant the future drops (P1-b)"
+        );
+
+        // Cleanup: let the walk finish so the slot releases and no blocking task leaks.
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if let Some(p) = std::fs::read_to_string(&revlist_pid)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            unsafe {
+                libc::kill(p, libc::SIGKILL);
+            }
+        }
     }
 
     /// #174 SC2 (per-source key, U1): the per-caller read sub-cap keys on the
