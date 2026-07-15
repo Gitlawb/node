@@ -77,4 +77,14 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
         "P1-e bypass: the bounded recipients walk must be invoked only inside \
          withheld_recipients_gated; a new call site bypasses the encrypt-walk admission cap"
     );
+
+    // U4 / P2-2: the detached post-push encryption task must be gated by the per-repo
+    // coalescing set (`encrypt_inflight.try_begin`) so the OUTSTANDING parked-task set is
+    // bounded to <=1 per repo. Removing the gate lets N rapid pushes spawn N parked
+    // waiters (the unbounded set U4 closed); the semaphore only caps active walks.
+    assert!(
+        repos.contains("state.encrypt_inflight.try_begin"),
+        "U4/P2-2 gate missing: the detached post-push encryption spawn must consult \
+         encrypt_inflight.try_begin to coalesce per repo (bound the outstanding-task set)"
+    );
 }
