@@ -161,54 +161,73 @@ impl RepoStore {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
-        // Pin a dedicated connection for the guard's whole lifetime so the
-        // session-scoped advisory lock lives on ONE connection and `release`
-        // unlocks it on that SAME connection. A plain `&self.pool` query returns
-        // its connection to the pool between calls, which (a) leaves the lock on
-        // an idle connection `release`'s unlock never reaches, and (b) lets
-        // `try_lock_repo`'s `pool.acquire()` be handed that idle connection and
-        // reentrantly re-grab the lock. Mirrors `RepoLockGuard`.
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .context("acquiring write-lock connection")?;
-
-        // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
-        // to avoid blocking indefinitely on stale locks from crashed connections.
-        let mut acquired = false;
-        for attempt in 0..60 {
-            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-                .bind(lock_key)
-                .fetch_one(&mut *conn)
-                .await
-                .context("trying advisory lock")?;
-            if row.0 {
-                acquired = true;
-                break;
+        // Acquire the advisory lock on a DEDICATED connection, held for the
+        // guard's whole lifetime so the session-scoped lock lives on ONE
+        // connection and `release` unlocks it on that SAME connection, and so a
+        // concurrent `try_lock_repo`'s `pool.acquire()` cannot be handed the
+        // lock-owning connection and reentrantly re-grab it. Mirrors
+        // `RepoLockGuard`. Use pg_try_advisory_lock with retry to avoid blocking
+        // indefinitely on a stale lock from a crashed connection.
+        //
+        // Between FAILED attempts the connection is returned to the pool (the
+        // `drop` below) so a writer spinning on a contended repo does NOT hold a
+        // pool connection through the retry backoff — holding one per spinner
+        // would starve the shared pool under a same-repo write burst. Only the
+        // WINNING attempt keeps its connection (the lock lives on it).
+        let mut conn = {
+            let mut acquired = None;
+            for attempt in 0..60 {
+                let mut c = self
+                    .pool
+                    .acquire()
+                    .await
+                    .context("acquiring write-lock connection")?;
+                let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+                    .bind(lock_key)
+                    .fetch_one(&mut *c)
+                    .await
+                    .context("trying advisory lock")?;
+                if row.0 {
+                    acquired = Some(c);
+                    break;
+                }
+                drop(c);
+                if attempt < 59 {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
             }
-            if attempt < 59 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            match acquired {
+                Some(c) => c,
+                None => anyhow::bail!(
+                    "could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}"
+                ),
             }
-        }
-        if !acquired {
-            anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
-        }
+        };
 
-        // Always download the latest from Tigris before writing.
+        // Always download the latest from the object store before writing.
         // Local disk may be stale if another machine pushed since our last access.
-        if let Some(ref tigris) = self.object_store {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
+        if let Some(ref store) = self.object_store {
+            if store.exists(&owner_slug, repo_name).await.unwrap_or(false) {
+                debug!(repo = %repo_name, "write acquire: downloading latest from object store");
+                if let Err(e) = store.download(&owner_slug, repo_name, &local_path).await {
                     // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
-                    // Tigris archive must not block a write when a valid local copy
+                    // archive must not block a write when a valid local copy
                     // exists — release(success) will re-upload a good archive.
                     if local_path.exists() {
                         warn!(repo = %repo_name, err = %e,
-                            "write acquire: tigris download failed — falling back to local copy");
+                            "write acquire: object-store download failed — falling back to local copy");
                     } else {
-                        return Err(e).context("downloading repo from tigris for write");
+                        // Unlock on the pinned connection before bailing, else the
+                        // advisory lock orphans on it: the guard is not constructed
+                        // yet (so its release never runs), and sqlx does not release
+                        // session locks when a connection returns to the pool — the
+                        // lock would block every future write to this repo until the
+                        // pool reaps the connection.
+                        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                            .bind(lock_key)
+                            .execute(&mut *conn)
+                            .await;
+                        return Err(e).context("downloading repo from object store for write");
                     }
                 }
             }
@@ -721,6 +740,37 @@ mod tests {
             after.is_some(),
             "lock must be free once the writer releases it"
         );
+        after.unwrap().release().await;
+    }
+
+    // The exclusion is real ACROSS sessions, not just the reentrant
+    // same-connection case: on a multi-connection pool the writer pins its
+    // connection, so `try_lock_repo`'s `pool.acquire()` gets a DIFFERENT
+    // connection whose `pg_try_advisory_lock` correctly observes the lock held
+    // -> Ok(None). This is the actual production topology (writer and purge on
+    // different sessions), and it also catches a pin-but-don't-actually-lock
+    // regression that the single-connection test (which passes via a
+    // pool-exhaustion Err) cannot distinguish from a real held lock.
+    #[sqlx::test]
+    async fn acquire_write_guard_excludes_try_lock_across_connections(pool: PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::for_testing(tmp.path().to_path_buf(), pool);
+        let owner = "did:key:z6MkCrossConnExclusionAAAAAAAAAAAAAAAAAAAAA";
+        let name = "xconn";
+
+        let guard = store.acquire_write(owner, name).await.unwrap();
+
+        // A second, distinct pooled connection must see the lock held.
+        let contended = store.try_lock_repo(owner, name).await.unwrap();
+        assert!(
+            contended.is_none(),
+            "a live acquire_write guard must exclude try_lock_repo on a different \
+             connection (Ok(None)); Ok(Some) would mean the lock is not held"
+        );
+
+        guard.release(true).await;
+        let after = store.try_lock_repo(owner, name).await.unwrap();
+        assert!(after.is_some(), "lock is free after release");
         after.unwrap().release().await;
     }
 }
