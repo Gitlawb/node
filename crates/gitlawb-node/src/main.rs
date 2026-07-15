@@ -301,10 +301,7 @@ async fn main() -> Result<()> {
     // capped regardless of how many identities it mints. Sized well above any
     // legitimate per-IP creation rate; GITLAWB_CREATE_RATE_LIMIT overrides, 0
     // disables. Bounded key set — the key is a client-influenced IP.
-    let create_limit = std::env::var("GITLAWB_CREATE_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(120);
+    let create_limit = rate_limit_from_env("GITLAWB_CREATE_RATE_LIMIT", 120);
     let create_ip_rate_limiter = rate_limit::RateLimiter::new_bounded(
         create_limit,
         std::time::Duration::from_secs(3600),
@@ -322,10 +319,7 @@ async fn main() -> Result<()> {
     // any legitimate per-IP write rate — real agent automation makes many small
     // writes per hour. GITLAWB_WRITE_RATE_LIMIT overrides; 0 disables. Bounded
     // key set — the key is a client-influenced IP.
-    let write_limit = std::env::var("GITLAWB_WRITE_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(600);
+    let write_limit = rate_limit_from_env("GITLAWB_WRITE_RATE_LIMIT", 600);
     let write_rate_limiter = rate_limit::RateLimiter::new_bounded(
         write_limit,
         std::time::Duration::from_secs(3600),
@@ -340,10 +334,7 @@ async fn main() -> Result<()> {
     // for heavy agent automation while still stopping flood traffic (the June
     // 2026 attack pushed several times per second per IP). GITLAWB_PUSH_RATE_LIMIT
     // overrides; 0 disables. Bounded key set — the key is a client-influenced IP.
-    let push_limit = std::env::var("GITLAWB_PUSH_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(600);
+    let push_limit = rate_limit_from_env("GITLAWB_PUSH_RATE_LIMIT", 600);
     let push_rate_limiter = rate_limit::RateLimiter::new_bounded(
         push_limit,
         std::time::Duration::from_secs(3600),
@@ -586,6 +577,37 @@ async fn main() -> Result<()> {
     serve_result?;
     info!("clean exit");
     Ok(())
+}
+
+/// Pure resolver for a usize rate-limit env value. Returns `(resolved, invalid)`:
+/// an absent or empty value resolves to `default` and is NOT invalid; a non-empty
+/// value that fails to parse resolves to `default` and IS invalid (so the caller
+/// warns rather than silently disabling the intended, usually stricter, brake).
+fn resolve_rate_limit(raw: Option<&str>, default: usize) -> (usize, bool) {
+    match raw.map(str::trim) {
+        None | Some("") => (default, false),
+        Some(t) => match t.parse::<usize>() {
+            Ok(n) => (n, false),
+            Err(_) => (default, true),
+        },
+    }
+}
+
+/// Read a rate-limit env var, warning on a present-but-unparseable value. A typo
+/// like `GITLAWB_WRITE_RATE_LIMIT=5O` must not silently revert to the default and
+/// leave the operator believing a stricter cap is in force.
+fn rate_limit_from_env(var: &str, default: usize) -> usize {
+    let raw = std::env::var(var).ok();
+    let (value, invalid) = resolve_rate_limit(raw.as_deref(), default);
+    if invalid {
+        tracing::warn!(
+            var,
+            value = raw.as_deref().unwrap_or(""),
+            default,
+            "invalid rate-limit value — using default; the intended brake is NOT applied"
+        );
+    }
+    value
 }
 
 /// Dispatch an admin subcommand. Connects the database directly (no server, no
@@ -1072,6 +1094,40 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
         info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
         Ok(kp)
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_env_tests {
+    use super::resolve_rate_limit;
+
+    #[test]
+    fn absent_uses_default_without_warning() {
+        assert_eq!(resolve_rate_limit(None, 600), (600, false));
+    }
+
+    #[test]
+    fn empty_or_whitespace_uses_default_without_warning() {
+        assert_eq!(resolve_rate_limit(Some(""), 600), (600, false));
+        assert_eq!(resolve_rate_limit(Some("   "), 600), (600, false));
+    }
+
+    #[test]
+    fn valid_value_parses() {
+        assert_eq!(resolve_rate_limit(Some("50"), 600), (50, false));
+        assert_eq!(resolve_rate_limit(Some(" 50 "), 600), (50, false));
+        // 0 is a VALID value (disables the brake); the ==0 warning is handled
+        // separately at the call site. It must NOT be flagged invalid here.
+        assert_eq!(resolve_rate_limit(Some("0"), 600), (0, false));
+    }
+
+    #[test]
+    fn present_but_unparseable_defaults_and_flags_invalid() {
+        // The L8 case: a fat-fingered stricter cap ("5O", letter O) must default
+        // AND be flagged so the caller warns, not silently disable the brake.
+        assert_eq!(resolve_rate_limit(Some("5O"), 600), (600, true));
+        assert_eq!(resolve_rate_limit(Some("abc"), 600), (600, true));
+        assert_eq!(resolve_rate_limit(Some("-1"), 600), (600, true));
     }
 }
 
