@@ -157,13 +157,26 @@ impl RepoStore {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
+        // Pin a dedicated connection for the guard's whole lifetime so the
+        // session-scoped advisory lock lives on ONE connection and `release`
+        // unlocks it on that SAME connection. A plain `&self.pool` query returns
+        // its connection to the pool between calls, which (a) leaves the lock on
+        // an idle connection `release`'s unlock never reaches, and (b) lets
+        // `try_lock_repo`'s `pool.acquire()` be handed that idle connection and
+        // reentrantly re-grab the lock. Mirrors `RepoLockGuard`.
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquiring write-lock connection")?;
+
         // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
         // to avoid blocking indefinitely on stale locks from crashed connections.
         let mut acquired = false;
         for attempt in 0..60 {
             let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_key)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *conn)
                 .await
                 .context("trying advisory lock")?;
             if row.0 {
@@ -202,7 +215,7 @@ impl RepoStore {
             repo_name: repo_name.to_string(),
             local_path,
             lock_key,
-            pool: self.pool.clone(),
+            conn,
             tigris: self.tigris.clone(),
         })
     }
@@ -387,7 +400,11 @@ pub struct RepoWriteGuard {
     repo_name: String,
     pub local_path: PathBuf,
     lock_key: i64,
-    pool: PgPool,
+    /// Dedicated pooled connection the advisory lock lives on. Held for the
+    /// guard's lifetime so `release` unlocks on the SAME session that locked,
+    /// and so a concurrent `try_lock_repo` cannot be handed this connection and
+    /// reentrantly re-grab the lock.
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
     tigris: Option<TigrisClient>,
 }
 
@@ -402,7 +419,7 @@ impl RepoWriteGuard {
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(self, success: bool) {
+    pub async fn release(mut self, success: bool) {
         // Upload to Tigris only on success.
         if success {
             if let Some(ref tigris) = self.tigris {
@@ -417,10 +434,11 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
-        // Release advisory lock
+        // Release the advisory lock on the SAME connection that took it, then
+        // the connection returns to the pool on drop.
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(self.lock_key)
-            .execute(&self.pool)
+            .execute(&mut *self.conn)
             .await;
     }
 }
@@ -613,5 +631,64 @@ mod tests {
                 "owner_did={bad:?} must be rejected"
             );
         }
+    }
+
+    // ── advisory-lock mutual exclusion (P1a) ────────────────────────────────
+
+    // A live `acquire_write` guard must exclude a concurrent `try_lock_repo`
+    // (the purge path) on the same repo. This is load-bearing for the purge
+    // tool's M4 mutual exclusion.
+    //
+    // The pool MUST be single-connection. `try_lock_repo`'s own return is the
+    // only observable that exposes the bug (it acquires through the pool), and
+    // it is only deterministic when the writer's connection is the ONLY one, so
+    // `try_lock_repo`'s `pool.acquire()` is forced onto it:
+    //   * Pre-fix, `acquire_write` locks via `.fetch_one(&self.pool)` and returns
+    //     the lock-owning connection to the pool. `try_lock_repo` re-acquires
+    //     that same connection and `pg_try_advisory_lock` re-locks it
+    //     reentrantly -> Ok(Some) (RED). (On a multi-connection pool the reentrant
+    //     grab is non-deterministic: `acquire` may hand back a different idle
+    //     connection, so the bug hides — verified by execution.)
+    //   * Post-fix, `acquire_write` pins the connection, so `try_lock_repo`'s
+    //     `pool.acquire()` cannot get one and times out -> Err. Either way the
+    //     fix guarantees try_lock does NOT reentrantly grab the held lock.
+    #[sqlx::test]
+    async fn acquire_write_guard_blocks_try_lock(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        let pool = pool_opts
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::for_testing(tmp.path().to_path_buf(), pool);
+        let owner = "did:key:z6MkWriterLockOwnerAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "locktest";
+
+        // A live writer holds the per-repo advisory lock.
+        let guard = store.acquire_write(owner, name).await.unwrap();
+
+        // The purge path must NOT reentrantly acquire the same lock while held.
+        // Pre-fix: Ok(Some) (reentrant grab). Post-fix: Err (connection pinned).
+        // The invariant is "not Ok(Some)".
+        let contended = store.try_lock_repo(owner, name).await;
+        assert!(
+            !matches!(contended, Ok(Some(_))),
+            "try_lock_repo must not reentrantly acquire a lock a live acquire_write \
+             guard holds (got Ok(Some) — the reentrant-grab bug)"
+        );
+
+        // After the writer releases (on its pinned connection), the lock is free
+        // and the single connection is back in the pool.
+        guard.release(true).await;
+        let after = store.try_lock_repo(owner, name).await.unwrap();
+        assert!(
+            after.is_some(),
+            "lock must be free once the writer releases it"
+        );
+        after.unwrap().release().await;
     }
 }
