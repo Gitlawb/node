@@ -1286,10 +1286,77 @@ impl Db {
     /// the `purge-spam` tool deletes a vetted candidate list per-repo, never a
     /// blanket "delete all repos of owner X".
     pub async fn delete_repo_by_id(&self, id: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+
+        // Resolve the row's identity so the `repo`-slug-keyed children (keyed on
+        // `normalize_owner_key(owner)/name`, not `repos.id`) can be matched. Absent
+        // row → nothing to delete; commit the empty tx and report 0.
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT owner_did, name FROM repos WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((owner_did, name)) = row else {
+            tx.commit().await?;
+            return Ok(0);
+        };
+        let slug = format!("{}/{}", normalize_owner_key(&owner_did), name);
+
+        // Grandchildren first: PR reviews/comments key on pr_id, so delete them
+        // before the parent PRs vanish.
+        for table in ["pr_reviews", "pr_comments"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE pr_id IN (SELECT id FROM pull_requests WHERE repo_id = $1)"
+            ))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Direct children keyed on repos.id.
+        for table in [
+            "push_events",
+            "ref_certificates",
+            "pull_requests",
+            "webhooks",
+            "agent_tasks",
+            "protected_branches",
+            "repo_stars",
+            "repo_replicas",
+            "repo_labels",
+            "visibility_rules",
+            "encrypted_blobs",
+            "repo_icaptcha_proofs",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE repo_id = $1"))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // Children keyed on the derived `owner_short/name` slug rather than the id.
+        for table in [
+            "branch_cids",
+            "sync_queue",
+            "received_ref_updates",
+            "arweave_anchors",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE repo = $1"))
+                .bind(&slug)
+                .execute(&mut *tx)
+                .await?;
+        }
+        // NOTE: `bounties` (financial: amount/wallet/tx_hash) and `issue_comments`
+        // (no issues table to map issue_id → repo) are deliberately NOT cascaded
+        // here — dropping money records or unmappable rows on a repo delete would
+        // be wrong. They are left intact by design.
+
         let result = sqlx::query("DELETE FROM repos WHERE id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+
+        tx.commit().await?;
         Ok(result.rows_affected())
     }
 }
@@ -3568,6 +3635,75 @@ mod dedup_db_tests {
             forked_from: None,
             machine_id: None,
         }
+    }
+
+    /// U2 (M7): deleting a repo must not orphan its child rows. Seeds one child in
+    /// a `repo_id`-keyed table (ref_certificates), one in a `repo`-slug-keyed table
+    /// (branch_cids), and a PR with a grandchild review (`pr_id`-keyed). Before the
+    /// transactional cascade these all survive `delete_repo_by_id` (RED); after, the
+    /// row and every child are gone (GREEN).
+    #[sqlx::test]
+    async fn delete_repo_by_id_removes_child_rows(pool: PgPool) {
+        let db = db(pool).await;
+        let owner = "did:key:z6MkChildOwnerFixtureForCascadeDelete";
+        let repo = rec(
+            "rid-cascade",
+            owner,
+            "victim",
+            "d",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&repo).await.unwrap();
+        let slug = format!("{}/victim", crate::db::normalize_owner_key(owner));
+
+        sqlx::query(
+            "INSERT INTO ref_certificates (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ('rc1', 'rid-cascade', 'refs/heads/main', '0', '1', 'p', 'n', 'sig', '2026-01-01T00:00:00Z')",
+        ).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
+             VALUES ($1, 'refs/heads/main', '1', 'cid', 'n', '2026-01-01T00:00:00Z')",
+        ).bind(&slug).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO pull_requests (id, repo_id, number, title, author_did, source_branch, target_branch, created_at, updated_at)
+             VALUES ('pr1', 'rid-cascade', 1, 't', 'a', 'b', 'main', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        ).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO pr_reviews (id, pr_id, reviewer_did, status, created_at)
+             VALUES ('rev1', 'pr1', 'r', 'approved', '2026-01-01T00:00:00Z')",
+        ).execute(db.pool()).await.unwrap();
+
+        let removed = db.delete_repo_by_id("rid-cascade").await.unwrap();
+        assert_eq!(removed, 1, "parent repo row deleted");
+
+        async fn count(db: &Db, sql: &str, arg: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(arg)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        }
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM ref_certificates WHERE repo_id=$1", "rid-cascade").await,
+            0,
+            "repo_id-keyed child (ref_certificates) must be deleted"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM branch_cids WHERE repo=$1", &slug).await,
+            0,
+            "slug-keyed child (branch_cids) must be deleted"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM pull_requests WHERE repo_id=$1", "rid-cascade").await,
+            0,
+            "pull_requests must be deleted"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM pr_reviews WHERE pr_id=$1", "pr1").await,
+            0,
+            "PR grandchild (pr_reviews) must be deleted with its parent PR"
+        );
     }
 
     /// The canonical `did:key:` row and the short-owner mirror row of one logical
