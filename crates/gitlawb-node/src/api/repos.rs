@@ -653,8 +653,14 @@ pub async fn git_info_refs(
         AppError::Git(e.to_string())
     })?;
 
+    // Move the admission permits into the guard so they release only after the spawned
+    // git process group is confirmed reaped, on complete/timeout/disconnect — not the
+    // instant a disconnect drops this future while the detached reaper is still tearing
+    // the group down (#174 P1-a). The handler keeps no copy: `_permit`/`_caller_permit`
+    // are moved in, so admission tracks the real process lifetime.
+    let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-    smart_http::info_refs("git", &service, &disk_path, git_timeout)
+    smart_http::info_refs("git", &service, &disk_path, git_timeout, Some(admission))
         .await
         .map_err(|e| {
             let app = git_service_app_error(&e);
@@ -848,7 +854,12 @@ pub async fn git_upload_pack(
     // withheld walk and serve the pack directly.
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     let resp = if !visibility_pack::has_path_scoped_rule(&rules) {
-        smart_http::upload_pack(&disk_path, body, git_timeout).await
+        // Plain (non-path-scoped) serve: move both admission permits into the guard so
+        // they release only after the spawned git group is reaped, on
+        // complete/timeout/disconnect — not the instant a disconnect drops this future
+        // (#174 P1-a). The handler keeps no copy.
+        let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+        smart_http::upload_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await
     } else {
         // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep that
         // off the async worker thread. Move BOTH admission permits INTO the blocking
@@ -886,9 +897,17 @@ pub async fn git_upload_pack(
         let withheld = withheld.map_err(|e| git_service_app_error(&e))?;
 
         if withheld.is_empty() {
-            smart_http::upload_pack(&disk_path, body, git_timeout).await
+            // No blobs to withhold: serve the plain pack, moving the permits returned by
+            // the walk into the guard so admission tracks the served git group's reap
+            // (the walk already held them per be0cdd6; this hands them to the serve).
+            let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+            smart_http::upload_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await
         } else {
             tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
+            // upload_pack_excluding runs its own rev-list/pack-objects (both pass `None`
+            // admission internally); the walk's permits stay handler-locals held across
+            // this serve, as be0cdd6 established, and drop when the handler returns.
+            let _hold = (_permit, _caller_permit);
             smart_http::upload_pack_excluding(&disk_path, body, &withheld, git_timeout).await
         }
     }
@@ -1172,7 +1191,14 @@ pub async fn git_receive_pack(
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-    let receive_result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
+    // Move both admission permits into the guard so they release only after the spawned
+    // receive-pack process group is reaped, on complete/timeout/disconnect — not the
+    // instant a disconnect drops this future while the detached reaper runs (#174 P1-a).
+    // The handler keeps no copy. This is independent of the write-lock `guard.release`
+    // below: admission tracks the git process lifetime, the write lock tracks the repo.
+    let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+    let receive_result =
+        smart_http::receive_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
@@ -3652,6 +3678,241 @@ mod tests {
                 libc::kill(p, libc::SIGKILL);
             }
         }
+    }
+
+    /// #174 U1 (P1-a, plain-spawn residual, RED-before/GREEN-after): on the PLAIN
+    /// (non-path-scoped) upload-pack path a client disconnect must NOT release the
+    /// global read admission while the detached process-group reaper is still tearing
+    /// down a git group that ignores SIGTERM. The `be0cdd6` fix moved permits into the
+    /// path-scoped `spawn_blocking` walk; this closes the residual plain path, where the
+    /// permits were handler-locals that dropped the instant the future was dropped.
+    ///
+    /// Isolate the GLOBAL pool: read pool = 1, per-source cap + rate limiter permissive,
+    /// so the only thing that can shed a replacement is the leaked global permit. Drive
+    /// the handler until git spawns, disconnect, then assert the global slot stays held
+    /// (`available_permits() == 0`) AND a replacement sheds 503 while the group is alive;
+    /// after the reaper SIGKILLs+reaps the group the slot frees and a replacement is no
+    /// longer shed by the global cap. On the pre-fix code the handler-local permit drops
+    /// on future-drop and the slot frees at once (RED).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn upload_pack_plain_permit_held_through_group_reap_after_disconnect(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descfile = tmp.path().join("desc.pid");
+        // Fake git for the plain upload-pack path (invoked as `git upload-pack
+        // --stateless-rpc <repo>`). It forks a descendant that TRAPS SIGTERM, records its
+        // pid, and loops ~20s, then `wait`s — so on disconnect the group leader dies on
+        // the reaper's SIGTERM but the descendant survives until the reaper escalates to
+        // SIGKILL, keeping the group alive (ESRCH not reached) across the observation
+        // window. Bounded so a broken fix leaks no permanent orphan.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               upload-pack)\n\
+                 sh -c 'trap \"\" TERM; echo $$ > \"{}\"; i=0; while [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done' &\n\
+                 wait ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            descfile.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        // Isolate the global read pool: size 1; per-source cap + rate limiter permissive
+        // so only the leaked global permit can shed the replacement.
+        state.git_read_semaphore = Arc::new(Semaphore::new(1));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let owner = "z6up1st";
+        let name = "up1";
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // Real bare repo at the path acquire() computes, so the handler reaches the
+        // spawn. No path-scoped rule -> the PLAIN serve branch (this test's target).
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+
+        let sem = state.git_read_semaphore.clone();
+        assert_eq!(sem.available_permits(), 1, "one read slot before the request");
+
+        let router = crate::server::build_router(state);
+        let make_req = |peer: SocketAddr| {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{owner}/{name}/git-upload-pack"))
+                .body(Body::from(&b"0000"[..]))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let peer: SocketAddr = "203.0.113.71:5000".parse().unwrap();
+        let mut fut = Box::pin(router.clone().oneshot(make_req(peer)));
+        // Drive until git spawns (the descendant records its pid) — the request is
+        // inside the plain serve, holding the global read permit. Stop polling the
+        // instant the future completes (re-polling a completed oneshot panics); read the
+        // descfile first so a spawn that recorded its pid then returned is still caught.
+        let mut spawned: Option<i32> = None;
+        let mut early = None;
+        for _ in 0..500 {
+            let done = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&descfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                spawned = Some(p);
+                break;
+            }
+            if let Ok(resp) = done {
+                early = Some(resp.map(|r| r.status()));
+                break;
+            }
+        }
+        let desc = spawned
+            .unwrap_or_else(|| panic!("the fake git must have spawned; early finish: {early:?}"));
+        // Kill the descendant regardless of outcome so a RED run leaks no orphan.
+        struct ReapOnDrop(i32);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapOnDrop(desc);
+        assert!(
+            unsafe { libc::kill(desc, 0) == 0 },
+            "descendant should be running before the disconnect"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the read slot is held while the git op runs"
+        );
+
+        // Client disconnect: drop the request future. The detached reaper now owns the
+        // AdmissionGuard and will not drop it until the group is ESRCH-confirmed reaped.
+        drop(fut);
+
+        // Load-bearing: the slot must STAY held while the SIGTERM-ignoring group is still
+        // alive. On the pre-fix code the handler-local permit drops here and the slot
+        // frees at once (RED). Check quickly (before the reaper's ~2s SIGKILL escalation).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            unsafe { libc::kill(desc, 0) == 0 },
+            "the SIGTERM-ignoring descendant must still be alive during the hold window"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "on disconnect the read admission must be HELD until the process group is \
+             reaped, not released the instant the future drops (P1-a)"
+        );
+        // A replacement request from a DIFFERENT source must shed 503 — the only pool
+        // that can shed it is the leaked global permit (per-source cap is permissive).
+        let peer2: SocketAddr = "203.0.113.72:5000".parse().unwrap();
+        let resp = router.clone().oneshot(make_req(peer2)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "while the prior group is still alive the held global permit must shed a \
+             replacement with 503"
+        );
+
+        // After the reaper SIGKILLs + reaps the group the AdmissionGuard drops and the
+        // slot frees. Poll for recovery.
+        let mut freed = false;
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "once the reaper confirms the group gone the admission guard must drop and \
+             free the global slot"
+        );
+        // A replacement is now no longer shed by the global cap (it proceeds past
+        // admission; it then fails downstream on the fake git, which is not a 503).
+        let peer3: SocketAddr = "203.0.113.73:5000".parse().unwrap();
+        let resp = router.oneshot(make_req(peer3)).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "after the group is reaped the freed slot must admit a replacement"
+        );
+    }
+
+    /// #174 U1 (P1-a): the `None`-key arm — a request with no resolvable source key
+    /// (no trusted-proxy header, no peer) is bounded by the GLOBAL read pool only, never
+    /// a per-source cap. With the global read pool exhausted such a request still sheds
+    /// 503, proving the plain path admits/sheds on the global pool for the `None` arm
+    /// (the counterpart to the `Some(ip)` arm above). Complements the resolver-arm rule:
+    /// neither arm is vacuous.
+    #[tokio::test]
+    async fn upload_pack_plain_none_key_arm_sheds_on_global_pool() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::Router;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state_lazy();
+        // Global read pool exhausted; per-source cap permissive so only the global pool
+        // can shed. No ConnectInfo + no trusted header -> read_caller_key resolves None.
+        state.git_read_semaphore = Arc::new(Semaphore::new(0));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-upload-pack",
+                axum::routing::post(crate::api::repos::git_upload_pack),
+            )
+            .with_state(state);
+        // No ConnectInfo extension and no XFF header: the caller key is None.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/alice/repo.git/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a None-key request must still shed 503 on the exhausted GLOBAL read pool"
+        );
     }
 
     /// #174 U4 (P1-d, RED-before/GREEN-after): the authenticated receive-pack POST

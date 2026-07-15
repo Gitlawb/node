@@ -10,6 +10,40 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
+/// Owns the served-git admission permits (global + per-source) for the lifetime of
+/// the work they admitted, so admission is released only when that work is truly
+/// done — not the instant the handler future drops on a client disconnect.
+///
+/// A move-only wrapper: no methods beyond construction and `Drop`. The handler
+/// MOVEs its permits in and keeps no copy (a retained copy would drop early and
+/// release admission the moment the future is dropped, defeating the guard). It is
+/// threaded into `drive_git_child`, whose [`KillGroupOnDrop`] moves it into the
+/// detached reaper on disconnect, so both permits drop only after the process group
+/// is confirmed reaped (`kill(-pgid,0)==ESRCH`) rather than while the group is still
+/// alive holding PIDs past the concurrency cap (#174 P1-a, plain-spawn residual).
+///
+/// The `be0cdd6` path-scoped upload-pack walk already applies this discipline by
+/// moving its permits into the `spawn_blocking`; this generalizes it to the plain
+/// (non-path-scoped) `info_refs` / `run_git_service` spawn paths.
+pub struct AdmissionGuard {
+    // Boxed so the concrete permit types stay private to the caller (repos.rs) — the
+    // guard only needs to hold them and drop them, never inspect them. `Send +
+    // 'static` so the guard can move into the detached reaper task.
+    _global: Option<Box<dyn Send + 'static>>,
+    _caller: Option<Box<dyn Send + 'static>>,
+}
+
+impl AdmissionGuard {
+    /// Take ownership of the global permit and an optional per-caller permit. Both are
+    /// erased to `Box<dyn Send>` — the guard's only job is to hold them until it drops.
+    pub fn new(global: impl Send + 'static, caller: Option<impl Send + 'static>) -> Self {
+        Self {
+            _global: Some(Box::new(global)),
+            _caller: caller.map(|c| Box::new(c) as Box<dyn Send + 'static>),
+        }
+    }
+}
+
 /// Handle `GET /:owner/:repo/info/refs?service=git-upload-pack`
 /// or `?service=git-receive-pack`
 ///
@@ -26,6 +60,7 @@ pub async fn info_refs(
     service: &str,
     repo_path: &Path,
     timeout: Duration,
+    admission: Option<AdmissionGuard>,
 ) -> Result<Response> {
     validate_service(service)?;
 
@@ -36,7 +71,8 @@ pub async fn info_refs(
         .arg("--advertise-refs")
         .arg(repo_path);
     // No request body — advertise-refs does not read stdin.
-    let stdout = drive_git_child(command, Bytes::new(), timeout, "advertise-refs").await?;
+    let stdout =
+        drive_git_child(command, Bytes::new(), timeout, "advertise-refs", admission).await?;
 
     let content_type = format!("application/x-{service}-advertisement");
 
@@ -61,12 +97,21 @@ pub async fn info_refs(
 /// Serves pack data for a clone or fetch. This is stateless — the entire
 /// negotiation happens in a single request/response.
 pub async fn upload_pack(
+    git_bin: &str,
     repo_path: &Path,
     request_body: Bytes,
     timeout: Duration,
+    admission: Option<AdmissionGuard>,
 ) -> Result<Response> {
-    let output =
-        run_git_service("git", "git-upload-pack", repo_path, request_body, timeout).await?;
+    let output = run_git_service(
+        git_bin,
+        "git-upload-pack",
+        repo_path,
+        request_body,
+        timeout,
+        admission,
+    )
+    .await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -80,12 +125,21 @@ pub async fn upload_pack(
 /// Accepts a push. The caller MUST verify HTTP Signature auth before
 /// calling this function.
 pub async fn receive_pack(
+    git_bin: &str,
     repo_path: &Path,
     request_body: Bytes,
     timeout: Duration,
+    admission: Option<AdmissionGuard>,
 ) -> Result<Response> {
-    let output =
-        run_git_service("git", "git-receive-pack", repo_path, request_body, timeout).await?;
+    let output = run_git_service(
+        git_bin,
+        "git-receive-pack",
+        repo_path,
+        request_body,
+        timeout,
+        admission,
+    )
+    .await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -120,6 +174,12 @@ struct KillGroupOnDrop {
     // own SIGCHLD-driven orphan reaper.
     child: Option<tokio::process::Child>,
     pgid: Option<i32>,
+    // The global + per-source admission permits for this op, if any. On the plain
+    // (non-path-scoped) spawn paths repos.rs moves its permits in here so admission is
+    // released only when the group is confirmed reaped, on every exit — complete,
+    // timeout, or client-disconnect (#174 P1-a). The rev-list/pack-objects
+    // visibility-walk callers hold no admission and pass `None`.
+    admission: Option<AdmissionGuard>,
 }
 
 #[cfg(unix)]
@@ -131,17 +191,25 @@ impl KillGroupOnDrop {
 
     /// Disarm on the success/timeout path: the body has already reaped the child (its
     /// `wait()` returned, or `reap_group_on_timeout` ran), so drop the handle and clear
-    /// the pgid, leaving the guard's Drop a no-op.
-    fn disarm(&mut self) {
+    /// the pgid, leaving the guard's Drop a no-op. Returns the admission guard so the
+    /// caller drops it at the earliest provably-free point (the group is already reaped
+    /// on both callers of this) rather than at end-of-bookkeeping.
+    fn disarm(&mut self) -> Option<AdmissionGuard> {
         self.pgid = None;
         self.child = None;
+        self.admission.take()
     }
 }
 
 #[cfg(unix)]
 impl Drop for KillGroupOnDrop {
     fn drop(&mut self) {
+        // Move any admission guard out first so it travels with the reaper (or drops
+        // here on the no-child / no-runtime fallback), never before the group is gone.
+        let admission = self.admission.take();
         let (Some(mut child), Some(pgid)) = (self.child.take(), self.pgid) else {
+            // Nothing to reap (already disarmed); dropping `admission` here is correct —
+            // the group is already gone.
             return;
         };
         // A sync Drop cannot await, so launch a detached reaper that owns the child and
@@ -154,6 +222,13 @@ impl Drop for KillGroupOnDrop {
             Ok(handle) => {
                 handle.spawn(async move {
                     reap_group_on_timeout(&mut child).await;
+                    // Release admission only now: the group is ESRCH-confirmed gone (or
+                    // hit the ~4s D-state hard cap, past which nothing in userspace can
+                    // free the PIDs anyway). Holding the permits until here is what
+                    // stops disconnect-spam from admitting replacements while the prior
+                    // group is still alive (#174 P1-a). `admission` is moved in and
+                    // dropped when this closure ends.
+                    drop(admission);
                 });
             }
             Err(_) => {
@@ -162,6 +237,9 @@ impl Drop for KillGroupOnDrop {
                 unsafe {
                     libc::kill(-pgid, libc::SIGTERM);
                 }
+                // No runtime to await the reap; drop admission best-effort after the
+                // synchronous signal (the fallback path is not on the hot request path).
+                drop(admission);
             }
         }
     }
@@ -246,13 +324,14 @@ async fn run_git_service(
     repo_path: &Path,
     input: Bytes,
     timeout: Duration,
+    admission: Option<AdmissionGuard>,
 ) -> Result<Vec<u8>> {
     let mut command = Command::new(git_bin);
     command
         .arg(service_to_command(service))
         .arg("--stateless-rpc")
         .arg(repo_path);
-    drive_git_child(command, input, timeout, service).await
+    drive_git_child(command, input, timeout, service, admission).await
 }
 
 /// Drive a spawned git child under `timeout` with process-group teardown, returning
@@ -267,6 +346,7 @@ async fn drive_git_child(
     input: Bytes,
     timeout: Duration,
     what: &str,
+    admission: Option<AdmissionGuard>,
 ) -> Result<Vec<u8>> {
     command
         .stdin(Stdio::piped())
@@ -300,7 +380,12 @@ async fn drive_git_child(
     let mut group_guard = KillGroupOnDrop {
         child: Some(child),
         pgid,
+        admission,
     };
+    // On non-unix there is no process-group teardown, so hold the admission guard here
+    // for the child's whole interaction; it drops when this function returns.
+    #[cfg(not(unix))]
+    let _admission = admission;
 
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -339,18 +424,21 @@ async fn drive_git_child(
             // The join runs all arms to completion, so the child is reaped: disarm
             // before surfacing any interaction error (a read/wait error), else the
             // guard's drop would reap an already-reaped child / signal a reused pgid.
+            // Dropping the returned admission guard here releases the permits at the
+            // earliest provably-free point on the success path (the op finished).
             #[cfg(unix)]
-            group_guard.disarm();
+            drop(group_guard.disarm());
             result?
         }
         Err(_elapsed) => {
             // Timeout: tear the whole group down and reap it before returning so a
             // caller releasing a write lock can't race a still-live git. Then disarm
-            // the (now redundant) guard so its drop can't hit a reused pgid.
+            // the (now redundant) guard so its drop can't hit a reused pgid. The
+            // returned admission guard drops here, AFTER the group is confirmed reaped.
             #[cfg(unix)]
             {
                 reap_group_on_timeout(group_guard.child_mut()).await;
-                group_guard.disarm();
+                drop(group_guard.disarm());
             }
             #[cfg(not(unix))]
             {
@@ -415,7 +503,9 @@ async fn rev_list_keep(
     command
         .args(["rev-list", "--objects", "--all"])
         .current_dir(repo_path);
-    let stdout = drive_git_child(command, Bytes::new(), timeout, "rev-list").await?;
+    // The visibility-walk callers intentionally hold no admission permit (their
+    // admission is governed elsewhere), so pass `None` (#174 KTD2).
+    let stdout = drive_git_child(command, Bytes::new(), timeout, "rev-list", None).await?;
     let mut keep = Vec::new();
     for line in String::from_utf8_lossy(&stdout).lines() {
         let oid = line.split_whitespace().next().unwrap_or("");
@@ -464,6 +554,8 @@ pub async fn build_filtered_pack(
         Bytes::from(data),
         deadline.saturating_duration_since(Instant::now()),
         "pack-objects",
+        // Visibility-walk pack build: no admission permit here (#174 KTD2).
+        None,
     )
     .await
 }
@@ -736,7 +828,7 @@ mod tests {
         axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
     ) -> Response {
         let service = q.get("service").cloned().unwrap_or_default();
-        info_refs("git", &service, &st.repo, Duration::from_secs(30))
+        info_refs("git", &service, &st.repo, Duration::from_secs(30), None)
             .await
             .unwrap()
     }
@@ -1021,6 +1113,7 @@ mod tests {
             let _guard = KillGroupOnDrop {
                 child: Some(child),
                 pgid: Some(pid),
+                admission: None,
             };
         }
 
@@ -1078,6 +1171,7 @@ mod tests {
             let _guard = KillGroupOnDrop {
                 child: Some(child),
                 pgid: Some(pid),
+                admission: None,
             };
         }
 
@@ -1114,6 +1208,7 @@ mod tests {
             let mut guard = KillGroupOnDrop {
                 child: Some(child),
                 pgid: Some(pid),
+                admission: None,
             };
             guard.disarm();
         } // disarmed -> no reaper, no kill
@@ -1320,6 +1415,7 @@ mod tests {
                     tmp.path(),
                     Bytes::new(),
                     Duration::from_secs(60),
+                    None,
                 ));
 
                 // Advance the future a slice at a time until the fake records its
@@ -1421,6 +1517,7 @@ mod tests {
             tmp.path(),
             Bytes::new(),
             Duration::from_secs(60),
+            None,
         ));
         // Drive the future a slice at a time until the descendant records its pid.
         let mut desc: Option<i32> = None;
@@ -1482,6 +1579,7 @@ mod tests {
                 "git-upload-pack",
                 tmp.path(),
                 Duration::from_millis(200),
+                None,
             ),
         )
         .await
@@ -1589,6 +1687,7 @@ mod tests {
                 tmp.path(),
                 Bytes::new(),
                 Duration::from_secs(60),
+                None,
             )
         })
         .await;
@@ -1633,6 +1732,7 @@ mod tests {
                 tmp.path(),
                 Bytes::new(),
                 Duration::from_secs(60),
+                None,
             )
         })
         .await;
@@ -1683,6 +1783,7 @@ mod tests {
                     tmp.path(),
                     Bytes::new(),
                     git_timeout,
+                    None,
                 ),
             )
         })
@@ -1757,6 +1858,7 @@ mod tests {
                     tmp.path(),
                     Bytes::new(),
                     git_timeout,
+                    None,
                 ),
             )
         })
@@ -1794,6 +1896,7 @@ mod tests {
                 tmp.path(),
                 Bytes::new(),
                 Duration::from_millis(200),
+                None,
             ),
         )
         .await;
@@ -1834,6 +1937,7 @@ mod tests {
             tmp.path(),
             big,
             Duration::from_secs(60),
+            None,
         )
         .await;
 
