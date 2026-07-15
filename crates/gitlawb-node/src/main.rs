@@ -389,6 +389,12 @@ async fn main() -> Result<()> {
         git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.max_concurrent_git_pushes,
         )),
+        // Bounds concurrent detached post-push encryption walks, sized from the push
+        // pool (no separate knob — Q1): completed pushes cannot outnumber active
+        // encryption walks past this (#174 P1-e).
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
         git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             config.max_concurrent_reads_per_caller,
         ),
