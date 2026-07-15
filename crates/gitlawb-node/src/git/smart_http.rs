@@ -108,24 +108,60 @@ pub async fn receive_pack(
 /// `wait_with_output()` returns, so a request that completed cleanly never signals.
 #[cfg(unix)]
 struct KillGroupOnDrop {
+    // Holds the child + its pgid while armed. The interaction drives the child through
+    // `child_mut()`; the success/timeout paths call `disarm` once they have reaped it.
+    // On drop — a client disconnect that drops the whole request future — the guard
+    // launches a detached reaper that OWNS the child and runs the full
+    // SIGTERM -> grace -> SIGKILL -> reap sequence (`reap_group_on_timeout`), as strong
+    // as the timeout path, so a SIGTERM-ignoring group member is SIGKILLed and reaped
+    // rather than left running until EPIPE to accumulate past the concurrency cap
+    // (#174 P1-c). Owning the tokio `Child` in the reaper (rather than a raw
+    // `waitpid(-pgid)`) keeps a single reaper of the leader, so it never races tokio's
+    // own SIGCHLD-driven orphan reaper.
+    child: Option<tokio::process::Child>,
     pgid: Option<i32>,
 }
 
 #[cfg(unix)]
 impl KillGroupOnDrop {
+    /// The child, while armed. The interaction drives stdin/stdout/`wait` through this.
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child.as_mut().expect("child present while armed")
+    }
+
+    /// Disarm on the success/timeout path: the body has already reaped the child (its
+    /// `wait()` returned, or `reap_group_on_timeout` ran), so drop the handle and clear
+    /// the pgid, leaving the guard's Drop a no-op.
     fn disarm(&mut self) {
         self.pgid = None;
+        self.child = None;
     }
 }
 
 #[cfg(unix)]
 impl Drop for KillGroupOnDrop {
     fn drop(&mut self) {
-        if let Some(pgid) = self.pgid {
-            // SAFETY: kill(2) takes only integer arguments and borrows no Rust
-            // memory. Signalling a stale group just returns ESRCH, which we ignore.
-            unsafe {
-                libc::kill(-pgid, libc::SIGTERM);
+        let (Some(mut child), Some(pgid)) = (self.child.take(), self.pgid) else {
+            return;
+        };
+        // A sync Drop cannot await, so launch a detached reaper that owns the child and
+        // runs the same teardown as the timeout path (TERM -> grace -> SIGKILL -> reap
+        // the whole group). Owning the tokio `Child` means this task is the sole reaper
+        // of the leader, so it cannot race tokio's orphan reaper. Prefer the current
+        // runtime handle; if dropped outside a runtime, fall back to a best-effort
+        // synchronous SIGTERM so the group is at least signalled.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    reap_group_on_timeout(&mut child).await;
+                });
+            }
+            Err(_) => {
+                // SAFETY: kill(2) takes only integers and borrows no Rust memory;
+                // ESRCH on an already-gone group is ignored.
+                unsafe {
+                    libc::kill(-pgid, libc::SIGTERM);
+                }
             }
         }
     }
@@ -244,20 +280,28 @@ async fn drive_git_child(
 
     let mut child = command.spawn()?;
 
-    // Arm the group-kill guard for the lifetime of the request. With
-    // process_group(0) the child is its own group leader, so pgid == its pid.
-    // This fires on a client disconnect (the whole future is dropped mid-request).
-    #[cfg(unix)]
-    let mut group_guard = KillGroupOnDrop {
-        pgid: child.id().map(|id| id as i32),
-    };
-
-    // Own the pipes so `child` stays reap-able after a timeout: wait_with_output
-    // would consume it, but on timeout we must actively reap the group before
-    // returning (see reap_group_on_timeout).
+    // Own the pipes so the child stays reap-able: wait_with_output would consume it,
+    // but on a timeout we must actively reap the group first (see
+    // reap_group_on_timeout), and on a disconnect the guard's detached reaper does.
+    // Take the pipes before the child moves into the guard below.
     let mut stdin = child.stdin.take();
     let mut stdout = child.stdout.take().context("git stdout was not piped")?;
     let mut stderr = child.stderr.take().context("git stderr was not piped")?;
+
+    // Arm the group-kill guard for the lifetime of the request. With process_group(0)
+    // the child is its own group leader, so pgid == its pid. On a client disconnect
+    // (the whole future is dropped mid-request) the guard's Drop launches a detached
+    // reaper that OWNS the child and runs the full TERM/grace/SIGKILL/reap — as strong
+    // as the timeout path below (#174 P1-c). The guard owns the child; the interaction
+    // drives it through `child_mut()`.
+    #[cfg(unix)]
+    let pgid = child.id().map(|id| id as i32);
+    #[cfg(unix)]
+    let mut group_guard = KillGroupOnDrop {
+        child: Some(child),
+        pgid,
+    };
+
     let mut out = Vec::new();
     let mut err = Vec::new();
 
@@ -274,11 +318,15 @@ async fn drive_git_child(
                 None => Ok(()),
             }
         };
+        #[cfg(unix)]
+        let child_ref = group_guard.child_mut();
+        #[cfg(not(unix))]
+        let child_ref = &mut child;
         let (write_result, r_out, r_err, status) = tokio::join!(
             write,
             stdout.read_to_end(&mut out),
             stderr.read_to_end(&mut err),
-            child.wait(),
+            child_ref.wait(),
         );
         r_out?;
         r_err?;
@@ -290,7 +338,7 @@ async fn drive_git_child(
         Ok(result) => {
             // The join runs all arms to completion, so the child is reaped: disarm
             // before surfacing any interaction error (a read/wait error), else the
-            // guard's drop would fire SIGTERM on the reaped, possibly-reused pgid.
+            // guard's drop would reap an already-reaped child / signal a reused pgid.
             #[cfg(unix)]
             group_guard.disarm();
             result?
@@ -301,7 +349,7 @@ async fn drive_git_child(
             // the (now redundant) guard so its drop can't hit a reused pgid.
             #[cfg(unix)]
             {
-                reap_group_on_timeout(&mut child).await;
+                reap_group_on_timeout(group_guard.child_mut()).await;
                 group_guard.disarm();
             }
             #[cfg(not(unix))]
@@ -960,23 +1008,36 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn kill_group_guard_terminates_child_on_drop() {
-        let mut child = tokio::process::Command::new("sleep")
+        let child = tokio::process::Command::new("sleep")
             .arg("300")
             .process_group(0)
             .spawn()
             .unwrap();
-        let pgid = child.id().map(|id| id as i32);
+        let pid = child.id().unwrap() as i32;
 
         {
-            let _guard = KillGroupOnDrop { pgid };
-        } // guard drops here -> SIGTERM to the group
+            // The guard owns the child; on drop its detached reaper TERM/grace/KILL/
+            // reaps the group (a plain sleep dies on the first SIGTERM).
+            let _guard = KillGroupOnDrop {
+                child: Some(child),
+                pgid: Some(pid),
+            };
+        }
 
-        use std::os::unix::process::ExitStatusExt;
-        let status = child.wait().await.unwrap();
-        assert_eq!(
-            status.signal(),
-            Some(libc::SIGTERM),
-            "child must be terminated by SIGTERM via its process group"
+        let mut gone = false;
+        for _ in 0..300 {
+            if !alive(pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        assert!(
+            gone,
+            "child must be terminated and reaped via its process group on guard drop"
         );
     }
 
@@ -994,9 +1055,10 @@ mod tests {
             .process_group(0)
             .spawn()
             .unwrap();
-        let pgid = child.id().map(|id| id as i32);
+        let pid = child.id().unwrap() as i32;
 
-        // Read the backgrounded grandchild's pid from the first stdout line.
+        // Read the backgrounded grandchild's pid from the first stdout line, before
+        // the child moves into the guard.
         let mut stdout = child.stdout.take().unwrap();
         let mut buf = Vec::new();
         loop {
@@ -1011,19 +1073,24 @@ mod tests {
         assert!(alive(grandchild), "grandchild should be running");
 
         {
-            let _guard = KillGroupOnDrop { pgid };
-        } // group SIGTERM reaches sh AND the sleep grandchild
+            // The guard owns the child; on drop the detached reaper group-kills sh AND
+            // the sleep grandchild.
+            let _guard = KillGroupOnDrop {
+                child: Some(child),
+                pgid: Some(pid),
+            };
+        }
 
-        let _ = child.wait().await; // reap sh
-
-        // The grandchild reparents to init and is reaped; poll until it's gone.
         let mut gone = false;
-        for _ in 0..200 {
+        for _ in 0..300 {
             if !alive(grandchild) {
                 gone = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        unsafe {
+            libc::kill(grandchild, libc::SIGKILL);
         }
         assert!(
             gone,
@@ -1036,27 +1103,31 @@ mod tests {
     async fn kill_group_guard_disarmed_does_not_kill() {
         // A request that completed cleanly disarms the guard; dropping it must not
         // signal anything.
-        let mut child = tokio::process::Command::new("sleep")
+        let child = tokio::process::Command::new("sleep")
             .arg("300")
             .process_group(0)
             .spawn()
             .unwrap();
+        let pid = child.id().unwrap() as i32;
 
         {
             let mut guard = KillGroupOnDrop {
-                pgid: child.id().map(|id| id as i32),
+                child: Some(child),
+                pgid: Some(pid),
             };
             guard.disarm();
-        } // disarmed -> no kill
+        } // disarmed -> no reaper, no kill
 
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "disarmed guard must not kill the child"
-        );
+        // Give any erroneously-spawned reaper a chance to run, then assert alive.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(alive(pid), "disarmed guard must not kill the child");
 
-        // Clean up the still-running child.
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        // Clean up the still-running child (disarm dropped the handle, so reap by pid).
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(pid, &mut status, 0);
+        }
     }
 
     // ── #62 PR1: end-to-end teardown wiring through run_git_service ─────────
@@ -1317,6 +1388,76 @@ mod tests {
             gone,
             "grandchild must be torn down via the process group on future-drop \
              (proves run_git_service sets process_group(0) and arms the guard)"
+        );
+    }
+
+    /// #174 U2 (P1-c, RED-before/GREEN-after): on a client disconnect the teardown must
+    /// be as strong as the timeout path — a group member that IGNORES SIGTERM is still
+    /// SIGKILLed and reaped, not left running to accumulate past the concurrency cap.
+    /// The old `KillGroupOnDrop::drop` sent a lone SIGTERM with no escalation or reap,
+    /// so a SIGTERM-ignoring descendant survived the disconnect (RED). The fix launches
+    /// a detached reaper owning the child that runs the full TERM/grace/SIGKILL/reap.
+    /// This is distinct from the well-behaved-grandchild test above, whose `sleep` dies
+    /// on the first SIGTERM.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_git_service_sigkills_a_sigterm_ignoring_child_on_disconnect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descfile = tmp.path().join("desc.pid");
+        // Leader (dies on the group SIGTERM) spawns a descendant that traps SIGTERM,
+        // records its own pid, and loops ~30s (bounded so a RED run leaks no permanent
+        // orphan; the assertion fires well before then).
+        let body = format!(
+            "#!/bin/sh\n\
+             sh -c 'trap \"\" TERM; echo $$ > \"{}\"; i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done' &\n\
+             wait\n",
+            descfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let mut fut = Box::pin(run_git_service(
+            git_bin.to_str().unwrap(),
+            "git-upload-pack",
+            tmp.path(),
+            Bytes::new(),
+            Duration::from_secs(60),
+        ));
+        // Drive the future a slice at a time until the descendant records its pid.
+        let mut desc: Option<i32> = None;
+        for _ in 0..500 {
+            let _ = tokio::time::timeout(Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&descfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                desc = Some(p);
+                break;
+            }
+        }
+        let desc = desc.expect("the fake leader must have spawned and recorded a descendant");
+        let _cleanup = ReapOnPanic(vec![desc]);
+        assert!(alive(desc), "descendant should be running before the drop");
+
+        // Client disconnect: drop the request future. The guard's detached reaper must
+        // escalate SIGTERM -> SIGKILL and reap the SIGTERM-ignoring descendant.
+        drop(fut);
+
+        let mut gone = false;
+        for _ in 0..500 {
+            if !alive(desc) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Kill regardless so a RED run leaks no orphan.
+        unsafe {
+            libc::kill(desc, libc::SIGKILL);
+        }
+        assert!(
+            gone,
+            "a SIGTERM-ignoring descendant (pid {desc}) must be SIGKILLed and reaped on \
+             disconnect, not left running (old KillGroupOnDrop sent SIGTERM only)"
         );
     }
 
