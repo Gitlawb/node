@@ -727,6 +727,37 @@ fn acquire_read_caller_permit(
     }
 }
 
+/// Acquire an encryption-walk admission permit, then run the bounded withheld-blob
+/// recipients walk. Blocks (defers) when `git_encrypt_semaphore` is full rather than
+/// shedding — the walk is background so added latency is fine, and dropping it would
+/// lose the withheld-blob recovery copy (#174 P1-e). Bounds the number of concurrent
+/// post-push encryption walks so N fast completed pushes cannot spawn N concurrent
+/// full-history git walks. Mirrors the original `spawn_blocking(...).await` return
+/// shape so the caller's `Ok(Ok(recipients))` match is unchanged.
+async fn withheld_recipients_gated(
+    encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
+    repo_path: std::path::PathBuf,
+    git_bin: String,
+    timeout: std::time::Duration,
+    rules: Vec<crate::db::VisibilityRule>,
+    is_public: bool,
+    owner_did: String,
+) -> std::result::Result<
+    anyhow::Result<std::collections::HashMap<String, std::collections::BTreeSet<String>>>,
+    tokio::task::JoinError,
+> {
+    let _permit = encrypt_sem
+        .acquire_owned()
+        .await
+        .expect("git_encrypt_semaphore is never closed");
+    tokio::task::spawn_blocking(move || {
+        crate::git::visibility_pack::withheld_blob_recipients_bounded(
+            &repo_path, &git_bin, timeout, &rules, is_public, &owner_did,
+        )
+    })
+    .await
+}
+
 /// Map an error from a `smart_http` git service call to the right `AppError`:
 /// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
 /// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
@@ -1329,6 +1360,7 @@ pub async fn git_receive_pack(
         let repo_name = record.name.clone();
         let enc_git_bin = state.git_bin.clone();
         let enc_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let encrypt_sem = state.git_encrypt_semaphore.clone();
         tokio::spawn(async move {
             let pinned = crate::ipfs_pin::pin_new_objects(
                 &ipfs_api,
@@ -1351,19 +1383,18 @@ pub async fn git_receive_pack(
             // the has_path_scoped_rule gate on the other two withheld-walk sites.
             if let Some(rules) = rules_for_enc.filter(|r| visibility_pack::has_path_scoped_rule(r))
             {
-                let p = repo_path_clone.clone();
-                let owner = owner_did.clone();
-                let git_bin = enc_git_bin.clone();
-                let recip = tokio::task::spawn_blocking(move || {
-                    crate::git::visibility_pack::withheld_blob_recipients_bounded(
-                        &p,
-                        &git_bin,
-                        enc_timeout,
-                        &rules,
-                        is_public,
-                        &owner,
-                    )
-                })
+                // Bound the number of concurrent post-push encryption walks (#174 P1-e):
+                // acquire an admission permit before the full-history walk, deferring
+                // when the pool is full rather than shedding the recovery pin.
+                let recip = withheld_recipients_gated(
+                    encrypt_sem.clone(),
+                    repo_path_clone.clone(),
+                    enc_git_bin.clone(),
+                    enc_timeout,
+                    rules,
+                    is_public,
+                    owner_did.clone(),
+                )
                 .await;
                 if let Ok(Ok(recipients)) = recip {
                     let delta = crate::encrypted_pin::encrypt_and_pin(
@@ -3696,6 +3727,87 @@ mod tests {
             !matches!(other_result, Err(AppError::Overloaded(_))),
             "a different source must not be shed by the per-source write cap while the \
              capped source holds its slot; got {other_result:?}"
+        );
+    }
+
+    /// #174 U5 (P1-e, RED-before/GREEN-after): the post-push encryption walk acquires a
+    /// `git_encrypt_semaphore` permit before running, so completed pushes cannot spawn
+    /// unbounded concurrent full-history walks. With the pool exhausted the gated walk
+    /// must DEFER (block on admission) and NOT run its rev-list; on the pre-fix code
+    /// (no acquire) the walk runs regardless of the pool (RED). It defers rather than
+    /// sheds — releasing the permit lets the SAME walk run and pin (durability stays
+    /// fail-closed). Exercises the gating seam directly; the detached push task calls
+    /// this exact helper.
+    #[tokio::test]
+    async fn encrypt_walk_defers_when_pool_exhausted() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("revlist.ran");
+        // Fake git records when rev-list runs (the walk's first git call).
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo ran > \"{}\" ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+        let git_bin = git_path.to_str().unwrap().to_string();
+        let owner = "did:key:z6MkEncWalkOwnerAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+
+        // Exhaust the pool: hold its only permit so a gated walk must defer.
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.clone().acquire_owned().await.unwrap();
+
+        // Blocked: the gated walk must NOT complete or run rev-list while exhausted.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            withheld_recipients_gated(
+                sem.clone(),
+                tmp.path().to_path_buf(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+                Vec::new(),
+                true,
+                owner.clone(),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the encryption walk must defer (block on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the walk's rev-list must not run while its admission permit is unavailable (P1-e)"
+        );
+
+        // Release admission: the SAME walk now runs (defer, not shed) — rev-list fires.
+        drop(held);
+        let ran = withheld_recipients_gated(
+            sem,
+            tmp.path().to_path_buf(),
+            git_bin,
+            Duration::from_secs(5),
+            Vec::new(),
+            true,
+            owner,
+        )
+        .await;
+        assert!(
+            ran.is_ok(),
+            "with a permit the walk runs and joins: {ran:?}"
+        );
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred walk runs its rev-list"
         );
     }
 

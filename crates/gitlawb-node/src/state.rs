@@ -110,6 +110,17 @@ pub struct AppState {
     /// advert pool (each source also capped by `git_push_advert_per_caller` and the
     /// per-IP push rate limiter), and the reserved POST pool is untouched (#174).
     pub git_push_advert_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds concurrent post-push encrypt-then-pin history walks. Each successful
+    /// path-scoped push releases its handler write permit and then runs a DETACHED
+    /// full-history walk (`withheld_blob_recipients_bounded`) to seal withheld blobs;
+    /// without a cap, N fast pushes spawn N concurrent full-history git walks past
+    /// `max_concurrent_git_pushes` (which only bounds the in-handler phase). The walk
+    /// acquires a permit here and DEFERS (blocks) when the pool is full rather than
+    /// shedding — the work is background and dropping it would lose the recovery copy
+    /// (#174 P1-e). A pool of its own, not `git_write_semaphore`: a long background
+    /// walk must not hold a foreground write slot, and a handler already holding a
+    /// write permit that needed a second would self-deadlock at pool size 1.
+    pub git_encrypt_semaphore: Arc<tokio::sync::Semaphore>,
     /// Per-caller concurrency sub-cap on the read pool: each caller (keyed on the
     /// resolved source IP, #174 U1) may hold at most `max_concurrent_reads_per_caller`
     /// in-flight read ops, so one caller cannot monopolize `git_read_semaphore`
