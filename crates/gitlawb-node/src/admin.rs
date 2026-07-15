@@ -124,6 +124,16 @@ fn on_disk_ref_count(repos_dir: &Path, repo: &RepoRecord) -> usize {
 /// Core of [`on_disk_ref_count`], keyed on owner+name so the execute path can
 /// re-verify emptiness right before deleting (using only a [`Candidate`]).
 fn ref_count_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> usize {
+    // Fail closed on an unsafe repo name BEFORE building any on-disk path. A
+    // peer-mirror row (which skips API name validation) can carry a `../` name;
+    // `repo_disk_path` would join it verbatim and resolve OUTSIDE `repos_dir`,
+    // pointing this "empty" check — and later the delete — at an unrelated repo.
+    // Reject it here so such a row is never a candidate (treated non-empty).
+    if let Err(e) = crate::git::repo_store::validate_repo_name(name) {
+        warn!(name = %name, err = %e,
+            "purge-spam: unsafe repo name — treating as non-empty (skipped)");
+        return 1;
+    }
     let path = store::repo_disk_path(repos_dir, owner_did, name);
     if !path.join("HEAD").is_file() || !path.join("objects").is_dir() {
         // Not a bare git repo at the exact expected path. Do NOT trust a ref
@@ -141,6 +151,17 @@ fn ref_count_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> usize {
                 "purge-spam: could not read refs — treating as non-empty (skipped)");
             1
         }
+    }
+}
+
+/// Whether `path` resolves canonically inside `root`. Both are canonicalized so
+/// symlinks and `..` segments are fully resolved before the containment test; a
+/// path that does not exist (or a root that cannot be canonicalized) fails closed
+/// to `false`. Used as the last gate before a destructive `remove_dir_all`.
+fn path_within(path: &Path, root: &Path) -> bool {
+    match (std::fs::canonicalize(path), std::fs::canonicalize(root)) {
+        (Ok(p), Ok(r)) => p.starts_with(&r),
+        _ => false,
     }
 }
 
@@ -239,9 +260,16 @@ pub async fn run_purge_spam(db: &Db, repos_dir: &Path, execute: bool) -> Result<
             Ok(n) => {
                 deleted += n;
                 // Remove the now-orphaned on-disk bare repo (empty, so cheap) so
-                // the DB row and disk stay consistent.
+                // the DB row and disk stay consistent. Belt-and-suspenders: assert
+                // the resolved path is canonically INSIDE repos_dir before any
+                // remove_dir_all, so a symlinked slug dir or any residual traversal
+                // can never delete outside the repo root (the name is already
+                // validated at selection; this guards the destructive op itself).
                 let path = store::repo_disk_path(&repos_dir, &c.owner_did, &c.name);
-                if let Err(e) = std::fs::remove_dir_all(&path) {
+                if !path_within(&path, &repos_dir) {
+                    warn!(repo = %c.id, path = %path.display(),
+                        "purge-spam: on-disk path escapes repos_dir — refusing to remove");
+                } else if let Err(e) = std::fs::remove_dir_all(&path) {
                     warn!(repo = %c.id, path = %path.display(), err = %e,
                         "purge-spam: deleted DB row but could not remove on-disk repo dir");
                 }
@@ -564,6 +592,47 @@ mod db_tests {
         assert!(!path.exists(), "on-disk bare repo dir must be removed too");
     }
 
+    // U1 (M3): a burst-owned row whose NAME traverses out of repos_dir must never
+    // cause a delete OUTSIDE repos_dir. Adversarial must-not: a real empty bare repo
+    // planted as a "victim" beside repos_dir is reachable from repos_dir/<slug>/ via
+    // a `../../victim` name; because the traversed path IS a real bare repo, the
+    // marker check passes and the candidate is selected — then remove_dir_all would
+    // delete the victim. The name validator must reject it so the victim survives.
+    #[sqlx::test]
+    async fn traversal_name_cannot_delete_a_repo_outside_repos_dir(pool: PgPool) {
+        let db = db(pool).await;
+        let root = tempfile::TempDir::new().unwrap();
+        let repos_dir = root.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        // The burst DID's own slug dir must exist for the OS to resolve the `..`
+        // segments (a burst that owns any normal repo already has this dir).
+        let slug = SPAM_BURST_TARGET_DID.replace([':', '/'], "_");
+        std::fs::create_dir_all(repos_dir.join(&slug)).unwrap();
+
+        // Victim: a real empty bare repo OUTSIDE repos_dir (sibling under root).
+        let victim = root.path().join("victim.git");
+        store::init_bare(&victim).unwrap();
+        assert!(victim.join("HEAD").is_file(), "victim precondition");
+
+        // Sanity: the evil name resolves from repos_dir/<slug>/ onto the victim.
+        let evil = rec("evil", SPAM_BURST_TARGET_DID, "../../victim");
+        let traversed = store::repo_disk_path(&repos_dir, &evil.owner_did, &evil.name);
+        assert_eq!(
+            std::fs::canonicalize(&traversed).unwrap(),
+            std::fs::canonicalize(&victim).unwrap(),
+            "test setup: the evil name must resolve onto the victim"
+        );
+
+        db.create_repo(&evil).await.unwrap();
+        run_purge_spam(&db, &repos_dir, true).await.unwrap();
+
+        assert!(
+            victim.join("HEAD").is_file(),
+            "a repo OUTSIDE repos_dir must never be deleted via a traversal name"
+        );
+    }
+
     // The DB query normalizes did:key form (OWNER_KEY_CASE_SQL), so a burst repo
     // stored in SHORT (bare) form is still found when querying by the full-form
     // target DID — the SQL side of the normalization fix.
@@ -646,6 +715,33 @@ mod db_tests {
         std::fs::remove_dir_all(&path).unwrap();
         store::init_bare(&path).unwrap();
         assert_eq!(on_disk_ref_count(tmp.path(), &repo), 0);
+    }
+
+    /// The belt-and-suspenders containment gate (`path_within`) must reject a path
+    /// that resolves outside repos_dir even when the *name* itself is innocuous —
+    /// e.g. the owner slug dir is a symlink pointing elsewhere. Layer 1 (name
+    /// validation) can't see this; only the canonical-containment check catches it.
+    #[test]
+    fn path_within_rejects_symlink_escape() {
+        let root = tempfile::TempDir::new().unwrap();
+        let repos_dir = root.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        // A real dir outside repos_dir, and a symlink INTO repos_dir that targets it.
+        let outside = root.path().join("outside.git");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = repos_dir.join("evil.git");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        // The name is innocuous, but the path resolves outside repos_dir.
+        assert!(
+            !path_within(&link, &repos_dir),
+            "a symlink escaping repos_dir must fail the containment gate"
+        );
+        // A genuine path inside repos_dir passes.
+        let inside = repos_dir.join("real.git");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(path_within(&inside, &repos_dir), "an in-root path must pass");
     }
 
     /// The exclusion gate and the target scope must never overlap: if the burst
