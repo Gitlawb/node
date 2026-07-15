@@ -399,6 +399,13 @@ async fn main() -> Result<()> {
         git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             (config.max_concurrent_git_pushes / 8).max(1),
         ),
+        // Per-source cap on the authenticated receive-pack POST, sized like the advert
+        // cap: one source IP can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct source IPs, each also rate-limited
+        // (#174 P1-d).
+        git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            (config.max_concurrent_git_pushes / 8).max(1),
+        ),
         git_bin: "git".to_string(),
     };
 
