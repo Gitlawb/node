@@ -29,6 +29,25 @@ pub const EXCLUDED_DIDS: &[&str] = &[
     "did:key:z6MkqRzACJ5iCDdkiymAPK3gq18z2iecZHeAuUyW6JnwRfoM",
 ];
 
+/// Outcome tally of a `run_purge_spam` execute pass. Returned so the DB-delete
+/// count is never conflated with full success: `disk_failed` records repos whose
+/// row was deleted but whose on-disk dir could not be removed (or escaped the
+/// repos_dir containment check), so an operator sees the DB/disk drift instead of
+/// a clean "N deleted" summary.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PurgeSummary {
+    /// Repo rows actually deleted from the DB.
+    pub deleted: u64,
+    /// Candidates skipped because they were no longer empty (pre-filter or the
+    /// authoritative recheck under the lock).
+    pub skipped_not_empty: usize,
+    /// Candidates skipped because a live writer held the per-repo lock.
+    pub skipped_locked: usize,
+    /// Rows deleted whose on-disk dir removal FAILED (or was refused by the
+    /// containment guard) — DB/disk drift the operator must reconcile.
+    pub disk_failed: usize,
+}
+
 /// A repo selected for purge, with the evidence that qualified it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -199,7 +218,7 @@ pub async fn run_purge_spam(
     repo_store: &crate::git::repo_store::RepoStore,
     repos_dir: &Path,
     execute: bool,
-) -> Result<()> {
+) -> Result<PurgeSummary> {
     let repos_dir: PathBuf = repos_dir.to_path_buf();
     let rows = db
         .list_repos_by_owner_did(SPAM_BURST_TARGET_DID)
@@ -220,7 +239,7 @@ pub async fn run_purge_spam(
 
     if candidates.is_empty() {
         println!("purge-spam: no empty spam-burst repos found for {SPAM_BURST_TARGET_DID}");
-        return Ok(());
+        return Ok(PurgeSummary::default());
     }
 
     println!(
@@ -241,7 +260,7 @@ pub async fn run_purge_spam(
             "purge-spam: dry-run — nothing deleted. Re-run with --execute to delete the {} candidate(s).",
             candidates.len()
         );
-        return Ok(());
+        return Ok(PurgeSummary::default());
     }
 
     // Re-verify emptiness immediately before deleting: a push may have landed
@@ -256,8 +275,10 @@ pub async fn run_purge_spam(
 
     // Execute: delete per-repo, never a single blanket "delete all of owner X".
     // A per-repo failure warns and continues rather than aborting the batch.
-    let mut deleted = 0u64;
-    let mut skipped_locked = 0usize;
+    let mut summary = PurgeSummary {
+        skipped_not_empty: to_skip.len(),
+        ..PurgeSummary::default()
+    };
     for c in &to_delete {
         // Hold the per-repo advisory lock across the FINAL emptiness recheck and
         // the delete, so a concurrent receive-pack cannot land a ref in the window
@@ -267,12 +288,12 @@ pub async fn run_purge_spam(
             Ok(Some(g)) => g,
             Ok(None) => {
                 warn!(repo = %c.id, "purge-spam: repo is locked by a live writer — skipped");
-                skipped_locked += 1;
+                summary.skipped_locked += 1;
                 continue;
             }
             Err(e) => {
                 warn!(repo = %c.id, err = %e, "purge-spam: could not acquire repo lock — skipped");
-                skipped_locked += 1;
+                summary.skipped_locked += 1;
                 continue;
             }
         };
@@ -280,6 +301,7 @@ pub async fn run_purge_spam(
         // makes the repo non-empty, so it must not be deleted.
         if ref_count_on_disk(&repos_dir, &c.owner_did, &c.name) != 0 {
             warn!(repo = %c.id, "purge-spam: repo no longer empty under lock — skipped (TOCTOU)");
+            summary.skipped_not_empty += 1;
             guard.release().await;
             continue;
         }
@@ -288,22 +310,28 @@ pub async fn run_purge_spam(
                 warn!(repo = %c.id, "purge-spam: repo row already gone — nothing to delete");
             }
             Ok(n) => {
-                deleted += n;
+                summary.deleted += n;
                 // Remove the now-orphaned on-disk bare repo (empty, so cheap) so
                 // the DB row and disk stay consistent. Belt-and-suspenders: assert
                 // the resolved path is canonically INSIDE repos_dir before any
                 // remove_dir_all, so a symlinked slug dir or any residual traversal
                 // can never delete outside the repo root (the name is already
                 // validated at selection; this guards the destructive op itself).
+                // A disk-removal failure is counted separately, NOT folded into the
+                // deleted total, so the summary never reports a clean success while
+                // an on-disk dir survives (DB/disk drift the operator must fix).
                 let path = store::repo_disk_path(&repos_dir, &c.owner_did, &c.name);
                 if !path_within(&path, &repos_dir) {
                     warn!(repo = %c.id, path = %path.display(),
                         "purge-spam: on-disk path escapes repos_dir — refusing to remove");
+                    summary.disk_failed += 1;
                 } else if let Err(e) = std::fs::remove_dir_all(&path) {
                     warn!(repo = %c.id, path = %path.display(), err = %e,
                         "purge-spam: deleted DB row but could not remove on-disk repo dir");
+                    summary.disk_failed += 1;
+                } else {
+                    info!(repo = %c.id, rows = n, "purge-spam: deleted repo row + on-disk dir");
                 }
-                info!(repo = %c.id, rows = n, "purge-spam: deleted repo row + on-disk dir");
             }
             Err(e) => {
                 warn!(repo = %c.id, err = %e, "purge-spam: failed to delete repo row — continuing");
@@ -312,10 +340,10 @@ pub async fn run_purge_spam(
         guard.release().await;
     }
     println!(
-        "purge-spam: deleted {deleted} repo row(s), skipped {} (no longer empty), {skipped_locked} (locked by a live writer).",
-        to_skip.len()
+        "purge-spam: deleted {} repo row(s); skipped {} (no longer empty), {} (locked by a live writer); {} on-disk removal(s) failed.",
+        summary.deleted, summary.skipped_not_empty, summary.skipped_locked, summary.disk_failed
     );
-    Ok(())
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -676,6 +704,46 @@ mod db_tests {
                 .is_none(),
             "once unlocked, the empty repo is deleted"
         );
+    }
+
+    // U5 (M6): a repo whose DB row is deleted but whose on-disk removal FAILS must
+    // be counted in `disk_failed`, never folded into a clean "deleted" success —
+    // else the summary reports success while the on-disk dir survives (DB/disk
+    // drift). Forces the failure by making the parent (slug) dir read-only.
+    #[sqlx::test]
+    async fn disk_removal_failure_is_counted_not_reported_as_success(pool: PgPool) {
+        use std::os::unix::fs::PermissionsExt;
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let empty = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&empty).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &empty.owner_did, &empty.name);
+        store::init_bare(&path).unwrap();
+
+        // Read-only parent (slug) dir: remove_dir_all cannot unlink the repo dir.
+        let slug_dir = path.parent().unwrap().to_path_buf();
+        let orig = std::fs::metadata(&slug_dir).unwrap().permissions();
+        std::fs::set_permissions(&slug_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let repo_store = test_store(tmp.path(), &pool);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true).await.unwrap();
+
+        // Restore perms so TempDir cleanup works regardless of assertion outcome.
+        std::fs::set_permissions(&slug_dir, orig).unwrap();
+
+        assert_eq!(summary.deleted, 1, "the DB row was deleted");
+        assert_eq!(
+            summary.disk_failed, 1,
+            "a failed on-disk removal must be counted, not reported as clean success"
+        );
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_none(),
+            "DB row is gone (delete succeeded)"
+        );
+        assert!(path.exists(), "on-disk dir survived the failed removal (drift)");
     }
 
     // U1 (M3): a burst-owned row whose NAME traverses out of repos_dir must never
