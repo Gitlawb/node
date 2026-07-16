@@ -924,24 +924,46 @@ pub async fn git_receive_pack(
     }
 
     tracing::debug!(repo = %name, "acquiring write lock");
-    let guard = state
-        .repo_store
-        .acquire_write(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| {
-            tracing::error!(repo = %name, err = %e, "acquire_write failed");
-            AppError::Git(e.to_string())
-        })?;
-    let disk_path = guard.path().to_path_buf();
-    tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-    let receive_result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
 
-    // Always release the advisory lock — even on error — to prevent stale locks
-    // from blocking subsequent pushes. Only upload to Tigris when the push
-    // succeeded; uploading a half-applied repo would propagate corruption.
-    guard.release(receive_result.is_ok()).await;
+    // Detach the acquire → receive-pack → release core from THIS handler future.
+    // The pack `body` is already fully buffered, so the spawned task is
+    // self-contained: a client disconnect drops the handler future but does NOT
+    // cancel the task, so a fully-received push still completes server-side —
+    // applies the pack, uploads, and releases the lock in order. What a
+    // disconnect forgoes is the cancellable post-push bookkeeping below, not the
+    // push itself. (KTD-3, R3.)
+    let repo_store = state.repo_store.clone();
+    let owner_did = record.owner_did.clone();
+    let repo_name = record.name.clone();
+    let receive_result = tokio::spawn(async move {
+        let guard = repo_store
+            .acquire_write(&owner_did, &repo_name)
+            .await
+            .map_err(|e| {
+                tracing::error!(repo = %repo_name, err = %e, "acquire_write failed");
+                AppError::Git(e.to_string())
+            })?;
+        let disk_path = guard.path().to_path_buf();
+        tracing::debug!(repo = %repo_name, path = %disk_path.display(), "running git receive-pack");
+        let result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
+        // Always release the advisory lock — even on error — to prevent stale
+        // locks from blocking subsequent pushes. Only upload to Tigris when the
+        // push succeeded; uploading a half-applied repo would propagate corruption.
+        guard.release(result.is_ok()).await;
+        Ok::<_, AppError>(result)
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(repo = %name, err = %e, "receive-pack task panicked");
+        AppError::Internal(anyhow::anyhow!("receive-pack task failed: {e}"))
+    })??;
+
+    // Recompute the on-disk path for the post-push tail below — the guard that
+    // exposed it now lives inside the detached task. Identical to the path
+    // acquire_write resolved (repos_dir/owner_slug/name.git).
+    let disk_path = store::repo_disk_path(&state.config.repos_dir, &record.owner_did, &record.name);
 
     let result = receive_result.map_err(|e| {
         let app = git_service_app_error(&e);
@@ -2576,6 +2598,165 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "receive-pack advertisement must be throttled before the Tigris acquire"
+        );
+    }
+
+    // U2/R3/AE1: a fully-received push must complete server-side even when the
+    // client disconnects during the apply. The pack is buffered before the
+    // handler runs, so the acquire→receive→release core is detached from the
+    // handler future; dropping that future (the disconnect) must NOT cancel the
+    // push. A sleeping pre-receive hook creates a deterministic mid-apply window;
+    // dropping the handler during it kills the git group on the inline (pre-fix)
+    // code but not on the detached code, so the hook completes and the ref lands
+    // only after the fix. RED pre-fix (marker + ref absent), GREEN after.
+    #[sqlx::test]
+    async fn fully_received_push_completes_after_client_disconnect(pool: sqlx::PgPool) {
+        use axum::extract::{Path as AxPath, State};
+        use axum::Extension;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+
+        let owner = "z6u2pushowner";
+        let name = "u2push";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let bare = repos_dir
+            .path()
+            .join(&owner_slug)
+            .join(format!("{name}.git"));
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
+            .await
+            .unwrap();
+
+        // Helper: run git, asserting success.
+        fn git(args: &[&str], dir: &std::path::Path) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        // Build a commit in a scratch working repo.
+        let work = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q", "-b", "main", "."], work.path());
+        git(&["config", "user.email", "t@t"], work.path());
+        git(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "hi").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c"], work.path());
+        let oid = git(&["rev-parse", "HEAD"], work.path());
+
+        // Server bare repo: has the object (from the clone) but no refs/heads/main,
+        // so the push is a create satisfiable with an empty pack.
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &work.path().to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "clone --bare failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git(
+            &[
+                "-C",
+                &bare.to_string_lossy(),
+                "update-ref",
+                "-d",
+                "refs/heads/main",
+            ],
+            work.path(),
+        );
+
+        // Sleeping pre-receive hook — the mid-apply window; writes a marker at the
+        // end so we can see the git child ran to completion.
+        let marker = repos_dir.path().join("hook_ran.marker");
+        let hook = bare.join("hooks").join("pre-receive");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ncat >/dev/null\nsleep 2\necho done > '{}'\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Receive-pack POST body: create refs/heads/main -> oid, plus an empty pack.
+        let zero = "0".repeat(40);
+        let cmd = format!("{zero} {oid} refs/heads/main\0report-status\n");
+        let mut body = Vec::new();
+        let len = cmd.len() + 4;
+        body.extend_from_slice(format!("{len:04x}").as_bytes());
+        body.extend_from_slice(cmd.as_bytes());
+        body.extend_from_slice(b"0000");
+        let pack = Command::new("git")
+            .args([
+                "-C",
+                &bare.to_string_lossy(),
+                "pack-objects",
+                "--stdout",
+                "-q",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            pack.status.success(),
+            "pack-objects failed: {}",
+            String::from_utf8_lossy(&pack.stderr)
+        );
+        body.extend_from_slice(&pack.stdout);
+        let body = Bytes::from(body);
+
+        // Drive the handler, then DROP it mid-hook (the "client disconnect").
+        let handler = super::git_receive_pack(
+            State(state.clone()),
+            AxPath((owner.to_string(), format!("{name}.git"))),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            body,
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(800), handler).await;
+
+        // Wait past the hook's sleep so a surviving (detached) push can finish.
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+
+        let ref_present = bare.join("refs/heads/main").exists()
+            || std::fs::read_to_string(bare.join("packed-refs"))
+                .unwrap_or_default()
+                .contains("refs/heads/main");
+        assert!(
+            marker.exists(),
+            "pre-receive hook must run to completion despite the client disconnect (detached push)"
+        );
+        assert!(
+            ref_present,
+            "refs/heads/main must be created after a fully-received push despite client disconnect"
         );
     }
 

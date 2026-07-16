@@ -1044,4 +1044,50 @@ mod tests {
             guard.release(true).await;
         }
     }
+
+    // OQ1: settle whether a guard abandoned inside a detached task when the
+    // tokio runtime tears down panics in Drop. `PoolConnection::drop` spawns a
+    // task (both the close_on_drop path and the normal return path), and
+    // `rt::spawn` panics via `missing_rt` if no runtime handle is current. U2
+    // makes receive-pack a detached task that graceful shutdown does not drain,
+    // so at process exit such a task can be dropped mid-flight holding a guard.
+    // This drops a real runtime with a parked guard-holding task and asserts the
+    // process survives (a panic-in-Drop during unwind would abort the binary).
+    #[test]
+    fn guard_drop_during_runtime_shutdown_does_not_panic() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return, // no DB configured — skip (mirrors sqlx::test gating)
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let ready = std::sync::Arc::new(tokio::sync::Notify::new());
+        let ready2 = ready.clone();
+        rt.block_on(async move {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&url)
+                .await
+                .unwrap();
+            let tmp = tempfile::TempDir::new().unwrap();
+            let store = RepoStore::new(tmp.path().to_path_buf(), None, pool);
+            tokio::spawn(async move {
+                let _guard = store
+                    .acquire_write("did:key:z6MkOQ1ShutdownAAAAAAAAAAAAAAAAAAAAAAAAA", "oq1")
+                    .await
+                    .unwrap();
+                ready2.notify_one();
+                // Park forever holding the guard.
+                std::future::pending::<()>().await;
+            });
+            ready.notified().await;
+        });
+        // Drop the runtime while the detached task is parked holding the guard:
+        // the task is cancelled, dropping the guard during runtime teardown. Its
+        // Drop must not panic. Reaching the end of the test proves it didn't.
+        drop(rt);
+    }
 }
