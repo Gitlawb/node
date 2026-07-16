@@ -17,7 +17,6 @@ pub struct RegisterArgs {
     #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
     pub node: String,
 
-    /// Pre-obtained iCaptcha proof token to send on the first request.
     #[arg(long, env = "GITLAWB_ICAPTCHA_PROOF")]
     pub icaptcha_proof: Option<String>,
 
@@ -54,17 +53,10 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
         "model": args.model,
     }))?;
 
-    let resp = if args.icaptcha_proof.is_some() {
-        client
-            .post_with_proof("/api/register", &body, args.icaptcha_proof.as_deref())
-            .await
-            .context("failed to send registration request (check --icaptcha-proof value)")?
-    } else {
-        client
-            .post("/api/register", &body)
-            .await
-            .context("failed to connect to node")?
-    };
+    let resp = client
+        .post_with_proof("/api/register", &body, args.icaptcha_proof.as_deref())
+        .await
+        .context("failed to connect to node")?;
 
     let status = resp.status();
     let payload: Value = resp.json().await.context("invalid JSON response")?;

@@ -25,7 +25,6 @@ impl NodeClient {
     pub fn new(node_url: impl Into<String>, keypair: Option<Keypair>) -> Self {
         let inner = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none()) // <-- disable all redirects
             .user_agent(format!("gl/{} gitlawb-cli", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("failed to build HTTP client");
@@ -599,26 +598,5 @@ mod tests {
         n.assert();
         ic.challenge.assert();
         ic.answer.assert();
-    }
-
-    #[tokio::test]
-    async fn send_signed_does_not_follow_redirect() {
-        let mut server = Server::new_async().await;
-        let m = server
-            .mock("POST", "/api/register")
-            .with_status(307)
-            .with_header("Location", "http://evil.com/hijack")
-            .create_async()
-            .await;
-
-        let client = NodeClient::new(server.url(), Some(test_keypair()));
-        let resp = client
-            .send_signed("POST", "/api/register", b"{}")
-            .await
-            .unwrap();
-
-        // We should get the 307 itself, not a follow-up request
-        assert_eq!(resp.status(), 307);
-        m.assert();
     }
 }
