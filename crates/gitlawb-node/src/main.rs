@@ -303,15 +303,7 @@ async fn main() -> Result<()> {
     // capped regardless of how many identities it mints. Sized well above any
     // legitimate per-IP creation rate; GITLAWB_CREATE_RATE_LIMIT overrides, 0
     // disables. Bounded key set — the key is a client-influenced IP.
-    let create_limit = rate_limit_from_env("GITLAWB_CREATE_RATE_LIMIT", 120);
-    let create_ip_rate_limiter = rate_limit::RateLimiter::new_bounded(
-        create_limit,
-        std::time::Duration::from_secs(3600),
-        200_000,
-    );
-    if create_limit == 0 {
-        tracing::warn!("GITLAWB_CREATE_RATE_LIMIT=0 — per-IP creation rate limiting disabled");
-    }
+    let create_ip_rate_limiter = build_ip_limiter("GITLAWB_CREATE_RATE_LIMIT", 120, "creation");
 
     // Per-IP brake for the authenticated non-creation write surface (issue/PR
     // comments, labels, stars, merges, protect, replicas, visibility, tasks,
@@ -321,30 +313,14 @@ async fn main() -> Result<()> {
     // any legitimate per-IP write rate — real agent automation makes many small
     // writes per hour. GITLAWB_WRITE_RATE_LIMIT overrides; 0 disables. Bounded
     // key set — the key is a client-influenced IP.
-    let write_limit = rate_limit_from_env("GITLAWB_WRITE_RATE_LIMIT", 600);
-    let write_rate_limiter = rate_limit::RateLimiter::new_bounded(
-        write_limit,
-        std::time::Duration::from_secs(3600),
-        200_000,
-    );
-    if write_limit == 0 {
-        tracing::warn!("GITLAWB_WRITE_RATE_LIMIT=0 — per-IP write rate limiting disabled");
-    }
+    let write_rate_limiter = build_ip_limiter("GITLAWB_WRITE_RATE_LIMIT", 600, "write");
 
     // Push-path flood brake: max git-receive-pack requests per client IP per
     // hour (counts both the info/refs advertisement and the push POST). Sized
     // for heavy agent automation while still stopping flood traffic (the June
     // 2026 attack pushed several times per second per IP). GITLAWB_PUSH_RATE_LIMIT
     // overrides; 0 disables. Bounded key set — the key is a client-influenced IP.
-    let push_limit = rate_limit_from_env("GITLAWB_PUSH_RATE_LIMIT", 600);
-    let push_rate_limiter = rate_limit::RateLimiter::new_bounded(
-        push_limit,
-        std::time::Duration::from_secs(3600),
-        200_000,
-    );
-    if push_limit == 0 {
-        tracing::warn!("GITLAWB_PUSH_RATE_LIMIT=0 — per-IP push rate limiting disabled");
-    }
+    let push_rate_limiter = build_ip_limiter("GITLAWB_PUSH_RATE_LIMIT", 600, "push");
 
     // Which forwarded header the edge is trusted to set. Default None (trust
     // nothing, key on the socket peer). Fly nodes set GITLAWB_TRUSTED_PROXY=fly;
@@ -352,7 +328,7 @@ async fn main() -> Result<()> {
     let push_limiter_trust = rate_limit::TrustedProxy::from_env_value(
         &std::env::var("GITLAWB_TRUSTED_PROXY").unwrap_or_default(),
     );
-    tracing::info!(trust = ?push_limiter_trust, push_limit, "push rate limiter configured");
+    tracing::info!(trust = ?push_limiter_trust, "push rate limiter trust configured");
 
     // Peer-sync flood brakes, keyed on the resolved client IP (per-DID is useless
     // here — a did:key farm self-registers). Two buckets so an unsigned notify
@@ -610,6 +586,22 @@ fn rate_limit_from_env(var: &str, default: usize) -> usize {
         );
     }
     value
+}
+
+/// Build a bounded per-client-IP rate limiter from an env var: resolve the limit
+/// (honoring the present-but-unparseable warning in `rate_limit_from_env`), build
+/// the limiter with the shared 1-hour window and 200k-key cap, and warn when the
+/// limit is 0 (disabled). Collapses the identical create/write/push setup.
+fn build_ip_limiter(var: &str, default: usize, label: &str) -> rate_limit::RateLimiter {
+    let limit = rate_limit_from_env(var, default);
+    let limiter =
+        rate_limit::RateLimiter::new_bounded(limit, std::time::Duration::from_secs(3600), 200_000);
+    if limit == 0 {
+        tracing::warn!("{var}=0 — per-IP {label} rate limiting disabled");
+    } else {
+        tracing::info!(%var, limit, "per-IP {label} rate limiter configured");
+    }
+    limiter
 }
 
 /// Dispatch an admin subcommand. Connects the database directly (no server, no
