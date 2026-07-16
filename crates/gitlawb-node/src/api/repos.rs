@@ -2807,14 +2807,35 @@ mod tests {
         );
     }
 
+    // Shared request driver for the per-IP write-brake tests below: build a
+    // request with the given method/uri/headers/body, attach the socket peer as
+    // ConnectInfo (what the IP limiter keys on), send it through the router, and
+    // return the status. Mirrors post_from/post_with in rate_limit.rs.
+    async fn send_from(
+        router: &axum::Router,
+        method: axum::http::Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: axum::body::Body,
+        peer: std::net::SocketAddr,
+    ) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        let mut b = axum::http::Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(body).unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
     #[sqlx::test]
     async fn write_route_is_rate_limited_by_ip(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         // Tiny write bucket, keyed on the socket peer (no trusted proxy).
@@ -2828,14 +2849,15 @@ mod tests {
         let router = crate::server::build_router(state);
         // A write_routes sink (star). The IP brake is outermost, so the 429
         // fires before auth/handler — the path only needs to match.
-        let mut req = Request::builder()
-            .method(Method::PUT)
-            .uri("/api/v1/repos/someowner/somerepo/star")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(ConnectInfo(peer));
-
-        let status = router.oneshot(req).await.unwrap().status();
+        let status = send_from(
+            &router,
+            Method::PUT,
+            "/api/v1/repos/someowner/somerepo/star",
+            &[],
+            Body::empty(),
+            peer,
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::TOO_MANY_REQUESTS,
@@ -2848,11 +2870,9 @@ mod tests {
     #[sqlx::test]
     async fn write_flood_does_not_drain_creation_budget(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         // Exhaust the write bucket for this peer; leave the creation bucket ample.
@@ -2869,29 +2889,31 @@ mod tests {
         // Anchor the test: prove the write bucket is genuinely drained at the
         // router (a write sink from this peer 429s) so the creation assertion
         // below cannot pass vacuously on some unrelated non-429 status.
-        let mut wreq = Request::builder()
-            .method(Method::PUT)
-            .uri("/api/v1/repos/someowner/somerepo/star")
-            .body(Body::empty())
-            .unwrap();
-        wreq.extensions_mut().insert(ConnectInfo(peer));
         assert_eq!(
-            router.clone().oneshot(wreq).await.unwrap().status(),
+            send_from(
+                &router,
+                Method::PUT,
+                "/api/v1/repos/someowner/somerepo/star",
+                &[],
+                Body::empty(),
+                peer,
+            )
+            .await,
             StatusCode::TOO_MANY_REQUESTS,
             "write bucket must be drained for this peer (test precondition)"
         );
 
         // Creation from the same peer must NOT be 429 — its bucket is untouched.
         // (It fails later on missing signature; the point is it is not throttled.)
-        let mut req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/repos")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"name":"legit","is_public":true}"#))
-            .unwrap();
-        req.extensions_mut().insert(ConnectInfo(peer));
-
-        let status = router.oneshot(req).await.unwrap().status();
+        let status = send_from(
+            &router,
+            Method::POST,
+            "/api/v1/repos",
+            &[("content-type", "application/json")],
+            Body::from(r#"{"name":"legit","is_public":true}"#),
+            peer,
+        )
+        .await;
         assert_ne!(
             status,
             StatusCode::TOO_MANY_REQUESTS,
@@ -2903,11 +2925,9 @@ mod tests {
     #[sqlx::test]
     async fn graphql_post_is_rate_limited_by_ip(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
@@ -2917,15 +2937,15 @@ mod tests {
         assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
 
         let router = crate::server::build_router(state);
-        let mut req = Request::builder()
-            .method(Method::POST)
-            .uri("/graphql")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"query":"{ __typename }"}"#))
-            .unwrap();
-        req.extensions_mut().insert(ConnectInfo(peer));
-
-        let status = router.oneshot(req).await.unwrap().status();
+        let status = send_from(
+            &router,
+            Method::POST,
+            "/graphql",
+            &[("content-type", "application/json")],
+            Body::from(r#"{"query":"{ __typename }"}"#),
+            peer,
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::TOO_MANY_REQUESTS,
@@ -2938,11 +2958,9 @@ mod tests {
     #[sqlx::test]
     async fn issue_comment_is_rate_limited_by_ip(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
@@ -2952,15 +2970,15 @@ mod tests {
         assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
 
         let router = crate::server::build_router(state);
-        let mut req = Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/repos/someowner/somerepo/issues/1/comments")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"body":"flood"}"#))
-            .unwrap();
-        req.extensions_mut().insert(ConnectInfo(peer));
-
-        let status = router.oneshot(req).await.unwrap().status();
+        let status = send_from(
+            &router,
+            Method::POST,
+            "/api/v1/repos/someowner/somerepo/issues/1/comments",
+            &[("content-type", "application/json")],
+            Body::from(r#"{"body":"flood"}"#),
+            peer,
+        )
+        .await;
         assert_eq!(
             status,
             StatusCode::TOO_MANY_REQUESTS,
@@ -2974,11 +2992,9 @@ mod tests {
     #[sqlx::test]
     async fn under_limit_write_is_not_throttled(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         // Ample budget; bucket NOT exhausted.
@@ -2988,14 +3004,16 @@ mod tests {
         let peer: SocketAddr = "203.0.113.150:7000".parse().unwrap();
 
         let router = crate::server::build_router(state);
-        let mut req = Request::builder()
-            .method(Method::PUT)
-            .uri("/api/v1/repos/someowner/somerepo/star")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(ConnectInfo(peer));
         assert_ne!(
-            router.oneshot(req).await.unwrap().status(),
+            send_from(
+                &router,
+                Method::PUT,
+                "/api/v1/repos/someowner/somerepo/star",
+                &[],
+                Body::empty(),
+                peer,
+            )
+            .await,
             StatusCode::TOO_MANY_REQUESTS,
             "an under-limit write must pass the brake, not be 429'd"
         );
@@ -3006,11 +3024,9 @@ mod tests {
     #[sqlx::test]
     async fn write_rate_limit_zero_disables_the_brake(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         state.write_rate_limiter = crate::rate_limit::RateLimiter::new(0, Duration::from_secs(60));
@@ -3019,14 +3035,16 @@ mod tests {
 
         let router = crate::server::build_router(state);
         for _ in 0..5 {
-            let mut req = Request::builder()
-                .method(Method::PUT)
-                .uri("/api/v1/repos/someowner/somerepo/star")
-                .body(Body::empty())
-                .unwrap();
-            req.extensions_mut().insert(ConnectInfo(peer));
             assert_ne!(
-                router.clone().oneshot(req).await.unwrap().status(),
+                send_from(
+                    &router,
+                    Method::PUT,
+                    "/api/v1/repos/someowner/somerepo/star",
+                    &[],
+                    Body::empty(),
+                    peer,
+                )
+                .await,
                 StatusCode::TOO_MANY_REQUESTS,
                 "a 0 write limit must disable the brake"
             );
@@ -3038,11 +3056,9 @@ mod tests {
     #[sqlx::test]
     async fn task_bounty_profile_writes_are_rate_limited(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
@@ -3056,15 +3072,16 @@ mod tests {
             (Method::POST, "/api/v1/repos/o/r/bounties"),
             (Method::PUT, "/api/v1/profile"),
         ] {
-            let mut req = Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .unwrap();
-            req.extensions_mut().insert(ConnectInfo(peer));
             assert_eq!(
-                router.clone().oneshot(req).await.unwrap().status(),
+                send_from(
+                    &router,
+                    method,
+                    uri,
+                    &[("content-type", "application/json")],
+                    Body::from("{}"),
+                    peer,
+                )
+                .await,
                 StatusCode::TOO_MANY_REQUESTS,
                 "write group {uri} must be IP-throttled by the write brake"
             );
@@ -3076,11 +3093,9 @@ mod tests {
     #[sqlx::test]
     async fn graphql_ws_is_not_braked(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         state.write_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
@@ -3089,16 +3104,18 @@ mod tests {
         assert!(state.write_rate_limiter.check(&peer.ip().to_string()).await);
 
         let router = crate::server::build_router(state);
-        let mut req = Request::builder()
-            .method(Method::GET)
-            .uri("/graphql/ws")
-            .body(Body::empty())
-            .unwrap();
-        req.extensions_mut().insert(ConnectInfo(peer));
         // Not a real ws upgrade, so the subscription service rejects it with some
         // non-429 status; the point is the write brake never sees it.
         assert_ne!(
-            router.oneshot(req).await.unwrap().status(),
+            send_from(
+                &router,
+                Method::GET,
+                "/graphql/ws",
+                &[],
+                Body::empty(),
+                peer
+            )
+            .await,
             StatusCode::TOO_MANY_REQUESTS,
             "/graphql/ws must not be behind the write brake"
         );
@@ -3110,11 +3127,9 @@ mod tests {
     #[sqlx::test]
     async fn every_write_group_passes_under_limit(pool: sqlx::PgPool) {
         use axum::body::Body;
-        use axum::extract::ConnectInfo;
-        use axum::http::{Method, Request, StatusCode};
+        use axum::http::{Method, StatusCode};
         use std::net::SocketAddr;
         use std::time::Duration;
-        use tower::ServiceExt;
 
         let mut state = crate::test_support::test_state(pool).await;
         state.write_rate_limiter =
@@ -3131,15 +3146,16 @@ mod tests {
             (Method::POST, "/api/v1/repos/o/r/bounties"),
             (Method::PUT, "/api/v1/profile"),
         ] {
-            let mut req = Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(Body::from(r#"{"query":"{ __typename }"}"#))
-                .unwrap();
-            req.extensions_mut().insert(ConnectInfo(peer));
             assert_ne!(
-                router.clone().oneshot(req).await.unwrap().status(),
+                send_from(
+                    &router,
+                    method,
+                    uri,
+                    &[("content-type", "application/json")],
+                    Body::from(r#"{"query":"{ __typename }"}"#),
+                    peer,
+                )
+                .await,
                 StatusCode::TOO_MANY_REQUESTS,
                 "under-limit write to {uri} must pass the brake, not 429"
             );
