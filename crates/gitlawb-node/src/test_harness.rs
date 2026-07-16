@@ -249,9 +249,9 @@ impl TestNode {
         object_format: &str,
     ) -> std::collections::HashMap<String, String> {
         let run = |args: &[&str], cwd: &std::path::Path| {
-            // allow-unbounded-git: test-harness-only fixture seeding, feature-gated
-            // out of the production binary; runs local git against a tempdir inside
-            // a test's own lifetime, never on a request path holding a permit.
+            // Test-harness-only fixture seeding, feature-gated out of the production
+            // binary; runs local git against a tempdir inside a test's own lifetime.
+            // allow-unbounded-git: test-only seeding, never on a request path holding a permit
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(cwd)
