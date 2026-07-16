@@ -323,6 +323,13 @@ impl RepoStore {
         self.upload_locked(owner_did, repo_name, true).await;
     }
 
+    /// Whether an object store is configured. Used by purge-spam to decide
+    /// whether a repo with no local copy can be a remote-unverified candidate
+    /// (its emptiness verified under the lock after a refresh) versus fail-closed.
+    pub fn has_object_store(&self) -> bool {
+        self.object_store.is_some()
+    }
+
     /// Upload the local repo to the object store while holding the per-repo
     /// advisory lock, then release. The lock serializes the PUT against a
     /// concurrent `purge-spam` that deletes the repo (row + dir + archive) under

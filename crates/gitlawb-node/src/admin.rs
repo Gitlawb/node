@@ -54,6 +54,10 @@ pub struct PurgeSummary {
     /// survives and could be re-downloaded into a later same-owner/name repo, so
     /// this is tracked separately and never folded into a clean success.
     pub archive_failed: usize,
+    /// Candidates with no local copy, admitted only because an object store is
+    /// configured (emptiness decided under the lock at execute time). Reported so
+    /// the dry-run can surface them distinctly from locally-verified candidates.
+    pub remote_unverified: usize,
 }
 
 /// A repo selected for purge, with the evidence that qualified it.
@@ -62,9 +66,14 @@ pub struct Candidate {
     pub id: String,
     pub owner_did: String,
     pub name: String,
-    /// Number of git refs found on disk. Always 0 for a selected candidate — kept
-    /// as explicit evidence in the dry-run output rather than an implicit "empty".
+    /// Number of git refs found on disk. 0 for a locally-verified empty candidate;
+    /// also 0 for a remote-unverified one whose emptiness is decided under the lock.
     pub ref_count: usize,
+    /// True when the repo has no local copy and was admitted only because an object
+    /// store is configured. Its emptiness has NOT been verified — the execute path
+    /// must refresh from the archive and recheck UNDER the per-repo lock before any
+    /// delete; the dry-run lists it distinctly and never touches it.
+    pub remote_unverified: bool,
 }
 
 /// Whether a DID is on the hard exclusion list. Compared under did:key
@@ -82,23 +91,29 @@ fn is_excluded(owner_did: &str) -> bool {
 /// exclusion + empty logic is directly testable.
 ///
 /// `repos` is the raw row set to consider (the caller supplies the target DID's
-/// rows). `ref_count_of` returns the number of git refs for a given repo; the CLI
-/// wires the real on-disk ref source, tests inject precomputed counts.
+/// rows). `local_refs_of` returns `Some(n)` when a local bare repo exists (n
+/// refs) and `None` when there is no local copy; the CLI wires the real on-disk
+/// source, tests inject precomputed states. `store_configured` gates whether a
+/// missing-local repo may be admitted.
 ///
 /// A repo qualifies ONLY if, PER REPO:
 ///   1. its owner is NOT on the exclusion list (gate evaluated FIRST), AND
 ///   2. its owner is exactly the target burst DID, AND
-///   3. it is verified empty — `ref_count_of` returns 0.
+///   3. EITHER it is locally verified empty (`Some(0)`), OR it has no local copy
+///      (`None`) AND an object store is configured — in which case it is admitted
+///      as remote-unverified and its emptiness is decided under the lock later.
 ///
-/// The exclusion gate is checked before the empty check so that an empty repo
-/// owned by an excluded DID is dropped regardless of its ref signature.
+/// The exclusion gate is checked before everything so an empty repo owned by an
+/// excluded DID is dropped regardless of its ref signature. A missing-local repo
+/// with no object store fails closed (skipped).
 pub fn select_spam_candidates<F>(
     repos: &[RepoRecord],
     target_did: &str,
-    mut ref_count_of: F,
+    store_configured: bool,
+    mut local_refs_of: F,
 ) -> Vec<Candidate>
 where
-    F: FnMut(&RepoRecord) -> usize,
+    F: FnMut(&RepoRecord) -> Option<usize>,
 {
     let mut out = Vec::new();
     for repo in repos {
@@ -113,16 +128,28 @@ where
         {
             continue;
         }
-        // Per-repo empty check.
-        let ref_count = ref_count_of(repo);
-        if ref_count != 0 {
-            continue;
-        }
+        // `local_refs_of` is `Some(n)` when a local bare repo exists and `None`
+        // when it does not. A local empty repo (Some(0)) is a verified candidate;
+        // a local non-empty repo is skipped; a missing local copy is a candidate
+        // ONLY when an object store is configured (its emptiness is then decided
+        // authoritatively under the lock after refresh), else it fails closed.
+        let remote_unverified = match local_refs_of(repo) {
+            Some(0) => false,
+            Some(_) => continue,
+            None => {
+                if store_configured {
+                    true
+                } else {
+                    continue;
+                }
+            }
+        };
         out.push(Candidate {
             id: repo.id.clone(),
             owner_did: repo.owner_did.clone(),
             name: repo.name.clone(),
-            ref_count,
+            ref_count: 0,
+            remote_unverified,
         });
     }
     out
@@ -144,12 +171,40 @@ where
 /// repo's refs (possibly `0`) and delete a real repo. We defend by requiring the
 /// bare-repo markers (`HEAD` file + `objects/` dir) before trusting any count;
 /// anything else fails closed (treated non-empty, skipped).
-fn on_disk_ref_count(repos_dir: &Path, repo: &RepoRecord) -> usize {
-    ref_count_on_disk(repos_dir, &repo.owner_did, &repo.name)
+/// Local ref state for selection: `Some(n)` when a local bare repo exists (n
+/// refs), `None` when there is no local copy. `None` is what lets selection
+/// distinguish a missing-local repo (a remote-unverified candidate when a store
+/// is configured) from a one-ref repo — both of which `ref_count_on_disk`
+/// collapses to a non-zero count. An unsafe name or an unreadable repo fails
+/// closed to `Some(1)` so it is skipped, never admitted as remote-unverified.
+fn local_refs_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> Option<usize> {
+    // Fail closed on an unsafe repo name BEFORE building any on-disk path (a
+    // peer-mirror row can carry a `../` name). Report it as non-empty so it is
+    // never a candidate — never as missing (which could admit it remote-unverified).
+    if let Err(e) = crate::git::repo_store::validate_repo_name(name) {
+        warn!(name = %name, err = %e,
+            "purge-spam: unsafe repo name — treating as non-empty (skipped)");
+        return Some(1);
+    }
+    let path = store::repo_disk_path(repos_dir, owner_did, name);
+    if !path.join("HEAD").is_file() || !path.join("objects").is_dir() {
+        // No local bare repo at the expected path.
+        return None;
+    }
+    match store::list_refs(&path) {
+        Ok(refs) => Some(refs.len()),
+        Err(e) => {
+            warn!(path = %path.display(), err = %e,
+                "purge-spam: could not read refs — treating as non-empty (skipped)");
+            Some(1)
+        }
+    }
 }
 
-/// Core of [`on_disk_ref_count`], keyed on owner+name so the execute path can
-/// re-verify emptiness right before deleting (using only a [`Candidate`]).
+/// Ref count keyed on owner+name (returns 1 for a missing/unsafe/unreadable
+/// repo — fail closed), used by the execute path to re-verify emptiness right
+/// before deleting (using only a [`Candidate`]) and, after `refresh_from_archive`
+/// downloads a remote-unverified candidate, to decide its emptiness under the lock.
 fn ref_count_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> usize {
     // Fail closed on an unsafe repo name BEFORE building any on-disk path. A
     // peer-mirror row (which skips API name validation) can carry a `../` name;
@@ -233,9 +288,16 @@ pub async fn run_purge_spam(
         .await
         .context("listing repos for the spam-burst target DID")?;
 
-    let candidates = select_spam_candidates(&rows, SPAM_BURST_TARGET_DID, |repo| {
-        on_disk_ref_count(&repos_dir, repo)
-    });
+    // A repo with no local copy is admitted as a remote-unverified candidate
+    // only when an object store is configured — its emptiness is then decided
+    // under the lock after refresh_from_archive. Without a store, missing-local
+    // fails closed (skipped), preserving the wrong-machine safety rule.
+    let store_configured = repo_store.has_object_store();
+    let candidates =
+        select_spam_candidates(&rows, SPAM_BURST_TARGET_DID, store_configured, |repo| {
+            local_refs_on_disk(&repos_dir, &repo.owner_did, &repo.name)
+        });
+    let remote_unverified_count = candidates.iter().filter(|c| c.remote_unverified).count();
 
     info!(
         target = SPAM_BURST_TARGET_DID,
@@ -257,25 +319,39 @@ pub async fn run_purge_spam(
         if execute { "EXECUTE" } else { "dry-run" }
     );
     for c in &candidates {
+        let marker = if c.remote_unverified {
+            " [remote-only, emptiness verified under lock at execute]"
+        } else {
+            ""
+        };
         println!(
-            "  {} owner={} name={} refs={}",
+            "  {} owner={} name={} refs={}{marker}",
             c.id, c.owner_did, c.name, c.ref_count
         );
     }
 
     if !execute {
         println!(
-            "purge-spam: dry-run — nothing deleted. Re-run with --execute to delete the {} candidate(s).",
+            "purge-spam: dry-run — nothing deleted ({remote_unverified_count} remote-only, verified under lock only on --execute). Re-run with --execute to delete the {} candidate(s).",
             candidates.len()
         );
-        return Ok(PurgeSummary::default());
+        return Ok(PurgeSummary {
+            remote_unverified: remote_unverified_count,
+            ..PurgeSummary::default()
+        });
     }
 
     // Re-verify emptiness immediately before deleting: a push may have landed
-    // between selection and now (TOCTOU). Anything no longer empty is skipped,
-    // never deleted.
+    // between selection and now (TOCTOU). A remote-unverified candidate has no
+    // local copy yet, so `ref_count_on_disk` would report it non-empty and drop
+    // it here — pass it straight through instead; the authoritative emptiness
+    // check for it happens under the lock in the execute loop after refresh.
     let (to_delete, to_skip) = partition_for_delete(&candidates, |c| {
-        ref_count_on_disk(&repos_dir, &c.owner_did, &c.name)
+        if c.remote_unverified {
+            0
+        } else {
+            ref_count_on_disk(&repos_dir, &c.owner_did, &c.name)
+        }
     });
     for c in &to_skip {
         warn!(repo = %c.id, "purge-spam: repo no longer empty at delete time — skipped (TOCTOU)");
@@ -284,6 +360,7 @@ pub async fn run_purge_spam(
     // Execute: delete per-repo, never a single blanket "delete all of owner X".
     // A per-repo failure warns and continues rather than aborting the batch.
     let mut summary = PurgeSummary {
+        remote_unverified: remote_unverified_count,
         skipped_not_empty: to_skip.len(),
         ..PurgeSummary::default()
     };
@@ -408,12 +485,15 @@ mod tests {
     }
 
     /// Ref counts keyed by repo id; anything absent defaults to 0 (empty).
-    fn refs_by_id<'a>(map: &'a [(&'a str, usize)]) -> impl Fn(&RepoRecord) -> usize + 'a {
+    fn refs_by_id<'a>(map: &'a [(&'a str, usize)]) -> impl Fn(&RepoRecord) -> Option<usize> + 'a {
+        // A local bare repo exists for every test row (Some), with `n` refs.
         move |r: &RepoRecord| {
-            map.iter()
-                .find(|(id, _)| *id == r.id)
-                .map(|(_, n)| *n)
-                .unwrap_or(0)
+            Some(
+                map.iter()
+                    .find(|(id, _)| *id == r.id)
+                    .map(|(_, n)| *n)
+                    .unwrap_or(0),
+            )
         }
     }
 
@@ -421,7 +501,7 @@ mod tests {
     #[test]
     fn empty_target_repo_is_a_candidate() {
         let repos = vec![repo("t-empty", TARGET, "spam1")];
-        let got = select_spam_candidates(&repos, TARGET, refs_by_id(&[]));
+        let got = select_spam_candidates(&repos, TARGET, false, refs_by_id(&[]));
         assert_eq!(got.len(), 1, "empty target repo must be selected");
         assert_eq!(got[0].id, "t-empty");
         assert_eq!(got[0].owner_did, TARGET);
@@ -439,7 +519,7 @@ mod tests {
             repo("t-empty", TARGET, "spam1"),
             repo("t-nonempty", TARGET, "real"),
         ];
-        let got = select_spam_candidates(&repos, TARGET, refs_by_id(&[("t-nonempty", 3)]));
+        let got = select_spam_candidates(&repos, TARGET, false, refs_by_id(&[("t-nonempty", 3)]));
         let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
         assert!(ids.contains(&"t-empty"), "empty target repo still selected");
         assert!(
@@ -458,14 +538,14 @@ mod tests {
     #[test]
     fn empty_excluded_content_repo_is_absent() {
         let repos = vec![repo("x-content", EXCLUDED_CONTENT, "anything")];
-        let got = select_spam_candidates(&repos, EXCLUDED_CONTENT, refs_by_id(&[]));
+        let got = select_spam_candidates(&repos, EXCLUDED_CONTENT, false, refs_by_id(&[]));
         assert!(
             got.is_empty(),
             "an empty repo owned by the excluded content DID must be excluded even \
              if that DID were the target, got {got:?}"
         );
         // And of course it is also absent when the real burst DID is the target.
-        let got = select_spam_candidates(&repos, TARGET, refs_by_id(&[]));
+        let got = select_spam_candidates(&repos, TARGET, false, refs_by_id(&[]));
         assert!(got.is_empty());
     }
 
@@ -475,13 +555,13 @@ mod tests {
     #[test]
     fn empty_intern_repo_is_absent() {
         let repos = vec![repo("x-intern", EXCLUDED_INTERN, "mirror")];
-        let got = select_spam_candidates(&repos, EXCLUDED_INTERN, refs_by_id(&[]));
+        let got = select_spam_candidates(&repos, EXCLUDED_INTERN, false, refs_by_id(&[]));
         assert!(
             got.is_empty(),
             "an empty repo owned by the intern/mirror-bot DID must be excluded even \
              if that DID were the target, got {got:?}"
         );
-        let got = select_spam_candidates(&repos, TARGET, refs_by_id(&[]));
+        let got = select_spam_candidates(&repos, TARGET, false, refs_by_id(&[]));
         assert!(got.is_empty());
     }
 
@@ -490,7 +570,7 @@ mod tests {
     #[test]
     fn empty_unrelated_repo_is_absent() {
         let repos = vec![repo("u-empty", UNRELATED, "whatever")];
-        let got = select_spam_candidates(&repos, TARGET, refs_by_id(&[]));
+        let got = select_spam_candidates(&repos, TARGET, false, refs_by_id(&[]));
         assert!(
             got.is_empty(),
             "an empty repo owned by a non-target DID must not be selected, got {got:?}"
@@ -507,7 +587,7 @@ mod tests {
             repo("x-intern", EXCLUDED_INTERN, "b"),   // excluded, empty → out
             repo("u-empty", UNRELATED, "c"),          // wrong owner → out
         ];
-        let got = select_spam_candidates(&repos, TARGET, refs_by_id(&[("t-nonempty", 2)]));
+        let got = select_spam_candidates(&repos, TARGET, false, refs_by_id(&[("t-nonempty", 2)]));
         assert_eq!(
             got.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["t-empty"],
@@ -521,7 +601,7 @@ mod tests {
     #[test]
     fn exclusion_gate_precedes_empty_check() {
         let repos = vec![repo("collision", EXCLUDED_CONTENT, "spam1")];
-        let got = select_spam_candidates(&repos, EXCLUDED_CONTENT, refs_by_id(&[]));
+        let got = select_spam_candidates(&repos, EXCLUDED_CONTENT, false, refs_by_id(&[]));
         assert!(got.is_empty(), "exclusion must win even on an empty repo");
     }
 
@@ -534,6 +614,7 @@ mod tests {
             owner_did: "o".into(),
             name: id.into(),
             ref_count: 0,
+            remote_unverified: false,
         };
         let cands = vec![cand("still-empty"), cand("now-nonempty")];
         // Re-check reports the second repo as no longer empty.
@@ -934,19 +1015,30 @@ mod db_tests {
         let path = store::repo_disk_path(tmp.path(), &repo.owner_did, &repo.name);
 
         // (a) Path exists as a plain (non-git) directory under the git ancestor.
-        // Without the marker guard, git discovery reads the ancestor's 0 refs and
-        // this repo would be deleted. It must fail closed (>=1, skipped).
+        // Without the marker guard, git discovery would read the ancestor's 0
+        // refs and this repo would be deleted. local_refs_on_disk must report no
+        // local repo (None) WITHOUT running list_refs — never the ancestor's 0.
+        // None is skipped unless a store is configured, and the under-lock
+        // recheck (ref_count_on_disk) fails closed on the same markers regardless.
         std::fs::create_dir_all(&path).unwrap();
         assert_eq!(
-            on_disk_ref_count(tmp.path(), &repo),
+            local_refs_on_disk(tmp.path(), &repo.owner_did, &repo.name),
+            None,
+            "a non-git dir under a git ancestor must report no local repo, not read the ancestor's refs"
+        );
+        assert_eq!(
+            ref_count_on_disk(tmp.path(), &repo.owner_did, &repo.name),
             1,
-            "a non-git dir under a git ancestor must fail closed, not read the ancestor's refs"
+            "the under-lock recheck must also fail closed on a non-git dir"
         );
 
-        // (b) A real empty bare repo at the same path reads 0 — a genuine candidate.
+        // (b) A real empty bare repo at the same path reads Some(0) — a candidate.
         std::fs::remove_dir_all(&path).unwrap();
         store::init_bare(&path).unwrap();
-        assert_eq!(on_disk_ref_count(tmp.path(), &repo), 0);
+        assert_eq!(
+            local_refs_on_disk(tmp.path(), &repo.owner_did, &repo.name),
+            Some(0)
+        );
     }
 
     /// The belt-and-suspenders containment gate (`path_within`) must reject a path
@@ -1008,7 +1100,12 @@ mod db_tests {
         // An empty repo owned by the short-form excluded DID is spared even though
         // its ref signature (0) otherwise matches the burst.
         let empty_excluded_short = rec("x-short", short, "spam");
-        let cands = select_spam_candidates(&[empty_excluded_short], SPAM_BURST_TARGET_DID, |_| 0);
+        let cands = select_spam_candidates(
+            &[empty_excluded_short],
+            SPAM_BURST_TARGET_DID,
+            false,
+            |_| Some(0),
+        );
         assert!(
             cands.is_empty(),
             "an empty repo owned by a short-form excluded DID must never be a candidate"
@@ -1223,6 +1320,126 @@ mod db_tests {
             summary.archive_failed, 1,
             "a surviving archive must be counted, not reported as clean success"
         );
+    }
+
+    // AE3/R4: a repo that exists ONLY as an object-store archive (no local copy)
+    // with an EMPTY archive is reached, refreshed under the lock, and deleted
+    // (row + dir + archive). Pre-U4 a missing-local row was never a candidate
+    // (treated non-empty, skipped) -> RED; admitting it remote-unverified -> GREEN.
+    #[sqlx::test]
+    async fn purge_deletes_remote_only_empty_archive(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-remote-empty", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+        // NO local repo — it exists only as an archive.
+        let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
+        assert!(!path.exists(), "no local copy — remote-only");
+
+        let (f, deleted) = fake(true, false, false, false); // archive exists, empty
+        let repo_store = store_backed(tmp.path(), &pool, f);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a remote-only empty archive must be reached and deleted"
+        );
+        assert!(
+            deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "the archive must be deleted too"
+        );
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(
+            summary.remote_unverified, 1,
+            "the candidate was admitted as remote-unverified"
+        );
+    }
+
+    // AE4/R4: a remote-only archive that turns out to HAVE refs is refreshed under
+    // the lock and then skipped — never deleted on the missing-local view.
+    #[sqlx::test]
+    async fn purge_skips_remote_only_archive_with_refs(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-remote-refs", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+        let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
+        assert!(!path.exists());
+
+        let (f, _deleted) = fake(true, true, false, false); // archive exists, HAS refs
+        let repo_store = store_backed(tmp.path(), &pool, f);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_some(),
+            "a remote-only archive with refs must be refreshed and skipped, not deleted"
+        );
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.skipped_not_empty, 1);
+    }
+
+    // AE5/R5: no local copy AND no archive — the candidate is admitted (a store is
+    // configured) but the under-lock recheck finds nothing and fails closed.
+    #[sqlx::test]
+    async fn purge_skips_remote_unverified_with_no_archive(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-missing-both", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+
+        let (f, _deleted) = fake(false, false, false, false); // NO archive
+        let repo_store = store_backed(tmp.path(), &pool, f);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_some(),
+            "missing local AND no archive must fail closed (not deleted)"
+        );
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(
+            summary.skipped_not_empty, 1,
+            "skipped by the authoritative under-lock recheck"
+        );
+    }
+
+    // R5: with NO object store, a repo with no local copy is not even a candidate
+    // (the missing-local admission is gated on a configured store).
+    #[sqlx::test]
+    async fn purge_storeless_missing_local_is_not_a_candidate(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-nolocal", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+        // Storeless RepoStore, no local repo on disk.
+        let repo_store = test_store(tmp.path(), &pool);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_some(),
+            "storeless + missing-local must fail closed — never a candidate"
+        );
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(summary.remote_unverified, 0);
     }
 
     // R7: with no object store configured (single-machine), an empty repo is
