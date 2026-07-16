@@ -404,7 +404,8 @@ fn build_branch_push_body(server_main_tip: &str, branch: &str, files: &[(&str, &
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
-    run(&["init", "-q", "-b", "main"]);
+    // Pin sha1 to match the served fixture repo; init.defaultObjectFormat=sha256 breaks the ref update.
+    run(&["init", "-q", "-b", "main", "--object-format=sha1"]);
     run(&["config", "user.email", "t@t"]);
     run(&["config", "user.name", "t"]);
     std::fs::write(work.join("base.txt"), "prdiff base").unwrap();
@@ -829,11 +830,13 @@ async fn deny_bearing_registry_denies_hostile_and_admits_authorized(pool: sqlx::
         }
     }
 
-    // One anon hostile per row, plus one signed-stranger hostile per read-gate row.
+    // One hostile per row (a signed stranger for the 403 gates, including the
+    // #195 N2 status-gated bounty rows; anon for the signature and read-gate
+    // rows), plus the EXTRA signed-stranger 404 each read-gate row drives.
     assert_eq!(
         hostile_driven,
         rows.len() + readgate_rows,
-        "expected one anon hostile per row ({} rows) plus one signed-stranger hostile per read-gate row ({readgate_rows}), drove {hostile_driven}",
+        "expected one hostile per row ({} rows) plus one signed-stranger hostile per read-gate row ({readgate_rows}), drove {hostile_driven}",
         rows.len()
     );
     // #195 (F1): every read-gate row must be probed by a signed non-reader — a

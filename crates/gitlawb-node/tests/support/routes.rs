@@ -22,12 +22,14 @@ pub enum GateClass {
     /// `require_repo_owner` / `require_owner` / inline `did_matches(caller, owner)`
     /// -> `AppError::Forbidden` == 403. Probed with a validly-signed non-owner.
     OwnerGate,
-    /// A 403 gate with MORE THAN ONE authorizing principal (owner-OR-author,
-    /// creator-OR-claimant, …). Probed with a validly-signed stranger (403) plus
-    /// one Not403 twin per declared arm (`Row.principals`), so reverting ANY
-    /// single arm turns that arm's twin RED. A single-arm `OwnerGate` cannot
-    /// express this: it tests one identity, so the untested arm is invisible
-    /// (#195, F1).
+    /// A 403 gate with ONE OR MORE NAMED authorizing principals (owner-OR-author,
+    /// creator-OR-claimant, claimant-only, …). Probed with a validly-signed
+    /// stranger (403) plus one Not403 twin per declared arm (`Row.principals`),
+    /// so reverting ANY single arm turns that arm's twin RED (#195, F1).
+    /// `OwnerGate` is the owner-arm special case; a single-arm gate whose
+    /// principal is NOT the repo owner (submit_bounty's claimant-only check,
+    /// approve/cancel's creator-only check) belongs here, because the point is
+    /// that the arms are DECLARED and each one gets its own twin (#195, N2).
     MultiPrincipalGate,
     /// `authorize_repo_read` / `visibility_check` -> `RepoNotFound` == 404
     /// (existence-hiding). Probed with a non-reader against a private/withheld
@@ -109,6 +111,22 @@ pub enum IdSource {
     /// then fetches the cert by id, so the owner-2xx twin needs a real cert whose
     /// repo_id is the private repo's (#195, U3).
     CertId,
+    /// `{id}` -> the fixture's bounty seeded in status "claimed" (#195, N2).
+    /// submit_bounty checks status BEFORE auth (bounties.rs:294), so the stranger
+    /// only reaches the claimant 403 gate on a bounty that is already "claimed";
+    /// the claimant twin then consumes that status (claimed -> submitted), so the
+    /// row needs its own bounty.
+    ClaimedBountyId,
+    /// `{id}` -> the fixture's bounty driven to status "submitted" (#195, N2).
+    /// approve_bounty's status check fires before its creator gate
+    /// (bounties.rs:334), so only a "submitted" bounty reaches the 403; the
+    /// creator twin consumes it (submitted -> completed).
+    SubmittedBountyId,
+    /// `{id}` -> the fixture's bounty left in status "open" (#195, N2).
+    /// cancel_bounty's status check fires before its creator gate
+    /// (bounties.rs:381), so only an "open" bounty reaches the 403; the creator
+    /// twin consumes it (open -> cancelled).
+    OpenBountyId,
 }
 
 /// One deny-bearing route. `path` is a template with `{owner}`/`{repo}`/`{id}`
@@ -196,6 +214,52 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Creator, Principal::Claimant],
             id_source: IdSource::BountyId,
+        },
+        // #195 (N2): submit/approve/cancel each 403 a non-claimant/non-creator, but
+        // their STATUS check fires before the auth check, so each row gets its own
+        // bounty seeded in the gate-reaching status (claimed / submitted / open).
+        // The sweep drives probes in emission order (hostile first, probes_for),
+        // so the stranger 403 fires while the bounty still holds that status; the
+        // arm twin then consumes it (submit: claimed -> submitted, approve:
+        // submitted -> completed, cancel: open -> cancelled), which is why the
+        // rows cannot share a bounty with each other or with dispute_bounty.
+        Row {
+            method: "POST",
+            path: "/api/v1/bounties/{id}/submit",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "bounties::submit_bounty",
+            // pr_id is a free-text column (no FK); any string clears serde and
+            // the UPDATE. The gate fires before the value is used.
+            body: Some(r#"{"pr_id":"1"}"#),
+            needs: &["claimed_bounty_id"],
+            reach: Reach::None,
+            principals: &[Principal::Claimant],
+            id_source: IdSource::ClaimedBountyId,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/bounties/{id}/approve",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "bounties::approve_bounty",
+            // ApproveBountyRequest's only field (tx_hash) is Option, so an empty
+            // JSON object clears the Json extractor; a missing body would 4xx at
+            // the extractor, before the gate under test.
+            body: Some(r#"{}"#),
+            needs: &["submitted_bounty_id"],
+            reach: Reach::None,
+            principals: &[Principal::Creator],
+            id_source: IdSource::SubmittedBountyId,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/bounties/{id}/cancel",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "bounties::cancel_bounty",
+            body: None,
+            needs: &["open_bounty_id"],
+            reach: Reach::None,
+            principals: &[Principal::Creator],
+            id_source: IdSource::OpenBountyId,
         },
         Row {
             method: "POST",
@@ -804,8 +868,9 @@ mod tests {
             );
         }
         assert!(
-            checked >= 3,
-            "expected at least the three known multi-principal rows, checked {checked}"
+            checked >= 6,
+            "expected at least the six known multi-principal rows (close_pr, \
+             close_issue, dispute/submit/approve/cancel bounty), checked {checked}"
         );
     }
 }

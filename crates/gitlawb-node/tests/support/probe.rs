@@ -35,6 +35,18 @@ pub struct Fixture {
     /// The id (UUID) of the seeded disputable bounty, filled into the
     /// `dispute_bounty` row's `{id}` placeholder (IdSource::BountyId).
     pub bounty_id: String,
+    /// #195 (N2): one bounty per status-gated bounty mutation row. submit/approve/
+    /// cancel check the bounty's STATUS before their 403 auth gate, so the stranger
+    /// hostile only exercises the gate against a bounty in the gate-reaching
+    /// status, and each row's authorized twin CONSUMES that status; the rows
+    /// cannot share a bounty. This one stays "claimed" (create + claim) for the
+    /// submit_bounty row (IdSource::ClaimedBountyId).
+    pub claimed_bounty_id: String,
+    /// Driven to "submitted" (create + claim + submit) for the approve_bounty row
+    /// (IdSource::SubmittedBountyId).
+    pub submitted_bounty_id: String,
+    /// Left "open" (create only) for the cancel_bounty row (IdSource::OpenBountyId).
+    pub open_bounty_id: String,
     /// The id (UUID) of the seeded issue (authored by `author`), filled into the
     /// `close_issue` row's `{id}` placeholder (IdSource::IssueId).
     pub issue_id: String,
@@ -123,13 +135,50 @@ impl Fixture {
         // public repo (both signers can read it). Seeded over HTTP through the real
         // handlers — create (creator) then claim (claimant) — because the DB seam is
         // private to TestNode and a test-only seed method would be a src/ change.
-        let bounty_id = seed_disputable_bounty(
+        let bounty_id = seed_bounty_at_stage(
             node,
             &owner_did,
             pub_repo,
             &creator,
-            &creator_did,
             &claimant,
+            "prober dispute bounty",
+            BountyStage::Claimed,
+        )
+        .await;
+
+        // #195 (N2): submit/approve/cancel check the bounty's STATUS before their
+        // 403 auth gate, so each row gets its OWN bounty in the gate-reaching
+        // status (claimed / submitted / open); the authorized twins consume that
+        // status, so the rows cannot share a bounty with each other or with the
+        // disputable one above.
+        let claimed_bounty_id = seed_bounty_at_stage(
+            node,
+            &owner_did,
+            pub_repo,
+            &creator,
+            &claimant,
+            "prober submit bounty",
+            BountyStage::Claimed,
+        )
+        .await;
+        let submitted_bounty_id = seed_bounty_at_stage(
+            node,
+            &owner_did,
+            pub_repo,
+            &creator,
+            &claimant,
+            "prober approve bounty",
+            BountyStage::Submitted,
+        )
+        .await;
+        let open_bounty_id = seed_bounty_at_stage(
+            node,
+            &owner_did,
+            pub_repo,
+            &creator,
+            &claimant,
+            "prober cancel bounty",
+            BountyStage::Open,
         )
         .await;
 
@@ -200,6 +249,9 @@ impl Fixture {
             creator_did,
             claimant_did,
             bounty_id,
+            claimed_bounty_id,
+            submitted_bounty_id,
+            open_bounty_id,
             issue_id,
             priv_issue_id,
             priv_bounty_id,
@@ -256,22 +308,38 @@ async fn seed_authored_issue(
         .to_string()
 }
 
-/// Seed a bounty in the `claimed` state (creator + claimant set) so the
-/// dispute_bounty creator/claimant arms reach their auth check, and return its id.
+/// How far along its lifecycle a seeded bounty is driven, expressed as the real
+/// API transitions that get it there. Each status-gated bounty row needs the
+/// status its handler's pre-auth check demands (#195, N2): cancel needs "open",
+/// submit (and dispute) need "claimed", approve needs "submitted".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BountyStage {
+    /// `create_bounty` only: status "open".
+    Open,
+    /// create + claim: status "claimed" (creator + claimant set).
+    Claimed,
+    /// create + claim + submit: status "submitted".
+    Submitted,
+}
+
+/// Seed a bounty on the (public) repo, drive it to `stage`, and return its id.
 ///
-/// Driven through the real HTTP handlers rather than the DB: `create_bounty` mints
-/// a UUID id we read back from the response, and `claim_bounty` sets the claimant.
-/// Both read-gate the (public) repo, which the creator/claimant can read. The
-/// bounty lands `status = "claimed"`; because its deadline has not been exceeded,
-/// a creator/claimant dispute returns 400 (not 403) after passing auth — which is
-/// still a Not403 twin — while a stranger is denied 403 at the auth check first.
-async fn seed_disputable_bounty(
+/// Driven through the real HTTP handlers rather than the DB: `create_bounty`
+/// (creator) mints a UUID id we read back from the response, `claim_bounty`
+/// (claimant) sets the claimant, `submit_bounty` (claimant) records a PR id.
+/// All read-gate the (public) repo, which the creator/claimant can read, and the
+/// claim/submit transitions pass their own auth gates as the claimant. A Claimed
+/// bounty's deadline has not been exceeded, so a creator/claimant dispute returns
+/// 400 (not 403) after passing auth, which is still a Not403 twin, while a
+/// stranger is denied 403 at the auth check first.
+async fn seed_bounty_at_stage(
     node: &TestNode,
     owner_did: &str,
     repo: &str,
     creator: &Keypair,
-    creator_did: &str,
     claimant: &Keypair,
+    title: &str,
+    stage: BountyStage,
 ) -> String {
     use super::signing::signed_request;
 
@@ -279,7 +347,7 @@ async fn seed_disputable_bounty(
 
     // create_bounty (creator) -> 201 with the minted BountyRecord (carries the id).
     let create_path = format!("/api/v1/repos/{owner_did}/{repo}/bounties");
-    let body = br#"{"title":"prober dispute bounty","amount":1}"#.to_vec();
+    let body = format!(r#"{{"title":"{title}","amount":1}}"#).into_bytes();
     let resp = signed_request(
         &client,
         reqwest::Method::POST,
@@ -302,11 +370,15 @@ async fn seed_disputable_bounty(
         .as_str()
         .expect("created bounty carries an id")
         .to_string();
+    let creator_did = creator.did().to_string();
     assert_eq!(
         created["creator_did"].as_str(),
-        Some(creator_did),
+        Some(creator_did.as_str()),
         "seeded bounty creator must be the fixture creator"
     );
+    if stage == BountyStage::Open {
+        return bounty_id;
+    }
 
     // claim_bounty (claimant) -> 200, status becomes "claimed", claimant recorded.
     let claim_path = format!("/api/v1/bounties/{bounty_id}/claim");
@@ -326,6 +398,30 @@ async fn seed_disputable_bounty(
         resp.status().as_u16(),
         200,
         "seeding: bounty claim must return 200 (claimant can read the public repo)"
+    );
+    if stage == BountyStage::Claimed {
+        return bounty_id;
+    }
+
+    // submit_bounty (claimant) -> 200, status becomes "submitted". pr_id is a
+    // free-text column; the seed value only needs to clear serde.
+    let submit_path = format!("/api/v1/bounties/{bounty_id}/submit");
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &submit_path,
+        br#"{"pr_id":"1"}"#.to_vec(),
+        claimant,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("submit bounty sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "seeding: bounty submit must return 200 (the claimant passes the submit gate)"
     );
 
     bounty_id
@@ -503,7 +599,8 @@ async fn seed_private_push_and_cert(
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
 
-    run(&["init", "-q", "-b", "main"], &work);
+    // Pin sha1 to match the served fixture repo; init.defaultObjectFormat=sha256 skews the OIDs.
+    run(&["init", "-q", "-b", "main", "--object-format=sha1"], &work);
     run(&["config", "user.email", "t@t"], &work);
     run(&["config", "user.name", "t"], &work);
     // Keep `public/a.txt` (the seeded blob) on the new main so the get_blob /
@@ -681,6 +778,11 @@ fn fill(path: &str, fixture: &Fixture, repo: &str, id_source: IdSource) -> Strin
         IdSource::PrivIssueId => fixture.priv_issue_id.as_str(),
         IdSource::PrivBountyId => fixture.priv_bounty_id.as_str(),
         IdSource::CertId => fixture.cert_id.as_str(),
+        // #195 (N2): the status-gated bounty mutations, each keyed to the bounty
+        // seeded in its gate-reaching status.
+        IdSource::ClaimedBountyId => fixture.claimed_bounty_id.as_str(),
+        IdSource::SubmittedBountyId => fixture.submitted_bounty_id.as_str(),
+        IdSource::OpenBountyId => fixture.open_bounty_id.as_str(),
     };
     path.replace("{owner}", &fixture.owner_did)
         .replace("{repo}", repo)
@@ -876,6 +978,9 @@ pub mod tests_support {
             creator,
             claimant,
             bounty_id: "bounty-uuid-1234".to_string(),
+            claimed_bounty_id: "claimed-bounty-uuid-1234".to_string(),
+            submitted_bounty_id: "submitted-bounty-uuid-1234".to_string(),
+            open_bounty_id: "open-bounty-uuid-1234".to_string(),
             issue_id: "issue-uuid-1234".to_string(),
             priv_issue_id: "priv-issue-uuid-1234".to_string(),
             priv_bounty_id: "priv-bounty-uuid-1234".to_string(),
