@@ -71,10 +71,11 @@ impl RepoStore {
                 let key = format!("{owner_slug}/{repo_name}");
                 let already_migrated = self.migrated.lock().await.contains(&key);
                 if !already_migrated {
+                    let store = self.clone();
                     let tigris = tigris.clone();
+                    let did = owner_did.to_string();
                     let slug = owner_slug.clone();
                     let name = repo_name.to_string();
-                    let path = local_path.clone();
                     let migrated = Arc::clone(&self.migrated);
                     tokio::spawn(async move {
                         // Check if already in Tigris before uploading
@@ -84,8 +85,10 @@ impl RepoStore {
                             }
                             Ok(false) => {
                                 info!(repo = %name, "migrating local repo to tigris");
-                                if let Err(e) = tigris.upload(&slug, &name, &path).await {
-                                    warn!(repo = %name, err = %e, "lazy migration to tigris failed");
+                                // Upload under the per-repo lock so it can't race
+                                // a purge. If it skipped (lock contended or dir
+                                // gone), do NOT mark migrated — retry next acquire.
+                                if !store.upload_locked(&did, &name, false).await {
                                     return;
                                 }
                                 info!(repo = %name, "lazy migration to tigris complete");
@@ -290,41 +293,121 @@ impl RepoStore {
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
-        let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
+        let (_owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         store::init_bare(&local_path).context("initializing bare repo")?;
 
-        // Upload to Tigris in background
-        if let Some(ref tigris) = self.object_store {
-            let tigris = tigris.clone();
-            let owner_slug = owner_slug.clone();
-            let repo_name = repo_name.to_string();
-            let path = local_path.clone();
+        // Upload to the object store in the background, UNDER the per-repo lock
+        // so the PUT can't race a purge. Skips on contention; a skipped init
+        // upload self-heals — the first write's release re-uploads the state.
+        if self.object_store.is_some() {
+            let store = self.clone();
+            let did = owner_did.to_string();
+            let name = repo_name.to_string();
             tokio::spawn(async move {
-                if let Err(e) = tigris.upload(&owner_slug, &repo_name, &path).await {
-                    warn!(repo = %repo_name, err = %e, "failed to upload new repo to tigris");
-                }
+                store.upload_locked(&did, &name, false).await;
             });
         }
 
         Ok(local_path)
     }
 
-    /// Upload a repo to Tigris after a write operation (push, merge, fork, etc.).
-    /// Call this after any operation that modifies the git repo on disk.
+    /// Upload a repo to Tigris after a write operation (fork, etc.). Call this
+    /// after any operation that modifies the git repo on disk. Uploads UNDER the
+    /// per-repo advisory lock so the PUT cannot race a concurrent purge (which
+    /// deletes the repo under the same lock) and resurrect a deleted archive.
+    /// Waits (bounded) for the lock — a skipped fork upload would have no later
+    /// retry; in practice the fork target's lock is uncontended (its DB row is
+    /// created after this upload).
     pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) {
-        if let Some(ref tigris) = self.object_store {
-            let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(repo = %repo_name, err = %e, "rejected unsafe path in release_after_write");
-                    return;
+        self.upload_locked(owner_did, repo_name, true).await;
+    }
+
+    /// Upload the local repo to the object store while holding the per-repo
+    /// advisory lock, then release. The lock serializes the PUT against a
+    /// concurrent `purge-spam` that deletes the repo (row + dir + archive) under
+    /// the same lock, so an in-flight upload cannot resurrect a just-deleted
+    /// archive. Re-checks the local dir exists UNDER the lock — a purge removes
+    /// the dir under its lock, so a post-purge uploader finds it gone and skips.
+    /// Returns true iff a PUT was performed. A no-op when no store is configured.
+    ///
+    /// `wait`: fork's foreground upload waits (bounded) for the lock; the
+    /// background migration/init uploads pass `false` and skip on contention —
+    /// they self-heal (lazy migration retries on the next `acquire`, init's
+    /// state is re-uploaded by the first write's release).
+    async fn upload_locked(&self, owner_did: &str, repo_name: &str, wait: bool) -> bool {
+        let Some(ref store) = self.object_store else {
+            return false;
+        };
+        let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(repo = %repo_name, err = %e, "rejected unsafe path before object-store upload");
+                return false;
+            }
+        };
+        let guard = if wait {
+            match self.lock_repo_blocking(owner_did, repo_name).await {
+                Ok(Some(g)) => g,
+                Ok(None) => {
+                    warn!(repo = %repo_name, "object-store upload skipped — repo lock still held after retry");
+                    return false;
                 }
-            };
-            if let Err(e) = tigris.upload(&owner_slug, repo_name, &local_path).await {
-                warn!(repo = %repo_name, err = %e, "failed to upload repo to tigris after write");
+                Err(e) => {
+                    warn!(repo = %repo_name, err = %e, "object-store upload skipped — could not acquire repo lock");
+                    return false;
+                }
+            }
+        } else {
+            match self.try_lock_repo(owner_did, repo_name).await {
+                Ok(Some(g)) => g,
+                Ok(None) => {
+                    debug!(repo = %repo_name, "object-store upload skipped — repo locked by a live writer");
+                    return false;
+                }
+                Err(e) => {
+                    warn!(repo = %repo_name, err = %e, "object-store upload skipped — could not acquire repo lock");
+                    return false;
+                }
+            }
+        };
+        // Re-check under the lock: a purge removes the on-disk dir under its lock,
+        // so a post-purge uploader must find it gone and NOT recreate the archive.
+        if !local_path.exists() {
+            warn!(repo = %repo_name, "object-store upload skipped — local repo dir gone under lock (purged?)");
+            guard.release().await;
+            return false;
+        }
+        let uploaded = match store.upload(&owner_slug, repo_name, &local_path).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(repo = %repo_name, err = %e, "failed to upload repo to object store");
+                false
+            }
+        };
+        guard.release().await;
+        uploaded
+    }
+
+    /// Bounded-wait lock-only acquire — the fork foreground upload's counterpart
+    /// to `acquire_write`'s spin, without any object-store I/O. Retries
+    /// `try_lock_repo` with short backoff. In practice the fork target's lock is
+    /// uncontended (its DB row is created after the upload), so this returns on
+    /// the first attempt.
+    async fn lock_repo_blocking(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
+        for attempt in 0..30 {
+            if let Some(g) = self.try_lock_repo(owner_did, repo_name).await? {
+                return Ok(Some(g));
+            }
+            if attempt < 29 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
+        Ok(None)
     }
 
     /// Compute the local disk path and owner slug for a repo.
@@ -830,17 +913,21 @@ mod tests {
     // post-lock await for the cancellation test), and `upload()` records its
     // calls. Serves U1's reorder test and U3's serialization tests.
     struct GatedStore {
-        exists: bool,
+        // `exists` is dynamic so a delete() flips it false and an upload() flips
+        // it true — lets U3's resurrect test assert a deleted archive stays gone.
+        exists: std::sync::Arc<std::sync::atomic::AtomicBool>,
         download_gate: Option<std::sync::Arc<tokio::sync::Notify>>,
         uploads: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        deletes: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     }
 
     impl GatedStore {
         fn new(exists: bool) -> Self {
             Self {
-                exists,
+                exists: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(exists)),
                 download_gate: None,
                 uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                deletes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -848,13 +935,14 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::git::tigris::ObjectStore for GatedStore {
         async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
-            Ok(self.exists)
+            Ok(self.exists.load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn upload(&self, o: &str, r: &str, _p: &std::path::Path) -> anyhow::Result<()> {
             self.uploads
                 .lock()
                 .unwrap()
                 .push((o.to_string(), r.to_string()));
+            self.exists.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         async fn download(&self, _o: &str, _r: &str, _p: &std::path::Path) -> anyhow::Result<()> {
@@ -863,7 +951,13 @@ mod tests {
             }
             Ok(())
         }
-        async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
+        async fn delete(&self, o: &str, r: &str) -> anyhow::Result<()> {
+            self.deletes
+                .lock()
+                .unwrap()
+                .push((o.to_string(), r.to_string()));
+            self.exists
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1089,5 +1183,163 @@ mod tests {
         // the task is cancelled, dropping the guard during runtime teardown. Its
         // Drop must not panic. Reaching the end of the test proves it didn't.
         drop(rt);
+    }
+
+    // ── U3: archive uploads serialize under the per-repo lock (R7, R8, R9) ───
+
+    fn repo_dir_of(repos_dir: &std::path::Path, owner: &str, name: &str) -> std::path::PathBuf {
+        repos_dir
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"))
+    }
+
+    // R7/R8/AE6: init's background upload must SKIP while a live writer holds the
+    // repo lock. Pre-fix (unlocked upload) it PUTs regardless -> RED.
+    #[sqlx::test]
+    async fn init_upload_skips_while_repo_locked(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ts = GatedStore::new(false);
+        let uploads = ts.uploads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkInitSkipAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "initskip";
+
+        let held = store.try_lock_repo(owner, name).await.unwrap().unwrap();
+        store.init(owner, name).await.unwrap();
+        // Let the spawned upload attempt-and-skip.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "init's background upload must skip while the repo is locked by a live writer"
+        );
+        held.release().await;
+    }
+
+    // R8/AE6: fork's foreground upload (release_after_write) WAITS for the lock
+    // rather than skipping, then PUTs once after it frees. Pre-fix it PUTs
+    // immediately while the lock is held -> RED on the "still empty" assert.
+    #[sqlx::test]
+    async fn release_after_write_waits_then_uploads_after_lock_frees(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ts = GatedStore::new(false);
+        let uploads = ts.uploads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkForkWaitAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "forkwait";
+        let slug = owner.replace([':', '/'], "_");
+        std::fs::create_dir_all(repo_dir_of(tmp.path(), owner, name)).unwrap();
+
+        let held = store.try_lock_repo(owner, name).await.unwrap().unwrap();
+        let store2 = store.clone();
+        let owner2 = owner.to_string();
+        let name2 = name.to_string();
+        let h = tokio::spawn(async move { store2.release_after_write(&owner2, &name2).await });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "fork upload must wait (not skip) while the repo lock is held"
+        );
+
+        held.release().await;
+        h.await.unwrap();
+        let ups = uploads.lock().unwrap();
+        assert_eq!(
+            ups.len(),
+            1,
+            "fork upload must PUT exactly once after the lock frees"
+        );
+        assert_eq!(ups[0], (slug, name.to_string()));
+    }
+
+    // R9/AE6: after a purge deletes the archive AND removes the on-disk dir under
+    // the lock, a late upload (that lost the race) must NOT resurrect the archive
+    // — it finds the dir gone under the lock and skips. Pre-fix (no dir recheck)
+    // it re-PUTs and revives the archive -> RED.
+    #[sqlx::test]
+    async fn upload_does_not_resurrect_a_purged_archive(pool: sqlx::PgPool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ts = GatedStore::new(false);
+        let uploads = ts.uploads.clone();
+        let deletes = ts.deletes.clone();
+        let exists = ts.exists.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkResurrectAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "resurrect";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        store.release_after_write(owner, name).await;
+        assert!(exists.load(SeqCst), "archive exists after the first upload");
+        assert_eq!(uploads.lock().unwrap().len(), 1);
+
+        // Simulate a purge: delete the archive and remove the on-disk dir.
+        store.delete_archive(owner, name).await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(deletes.lock().unwrap().len(), 1, "archive delete recorded");
+        assert!(!exists.load(SeqCst), "archive is deleted by the purge");
+
+        // A late upload attempt must find the dir gone and skip, not resurrect.
+        store.release_after_write(owner, name).await;
+        assert!(
+            !exists.load(SeqCst),
+            "a purged archive must stay deleted — the upload found no dir and skipped"
+        );
+        assert_eq!(
+            uploads.lock().unwrap().len(),
+            1,
+            "no second PUT after the repo dir was purged"
+        );
+    }
+
+    // Negative: an uncontended fork upload PUTs exactly once (the lock is free).
+    #[sqlx::test]
+    async fn uncontended_release_after_write_uploads_once(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ts = GatedStore::new(false);
+        let uploads = ts.uploads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkUncontendedAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "uncontended";
+        std::fs::create_dir_all(repo_dir_of(tmp.path(), owner, name)).unwrap();
+
+        store.release_after_write(owner, name).await;
+        assert_eq!(
+            uploads.lock().unwrap().len(),
+            1,
+            "an uncontended fork upload must PUT exactly once"
+        );
     }
 }
