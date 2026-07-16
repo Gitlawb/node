@@ -4,7 +4,9 @@
 //! (INV-1/INV-2/INV-8). Requires `--features test-harness`.
 //!
 //! Each `#[sqlx::test]` gets an ephemeral per-test database; `spawn_node` runs
-//! the schema migrations and serves the real router on `127.0.0.1:0`.
+//! the schema migrations and serves the real router on `127.0.0.1:0`. Every
+//! test ends with `node.shutdown().await` so the serve task is joined and the
+//! pool closed before sqlx's `DROP DATABASE` cleanup runs.
 
 mod support;
 
@@ -63,6 +65,8 @@ async fn signed_receive_pack_clears_signature_layer(pool: sqlx::PgPool) {
         401,
         "a valid signature must clear require_signature; got 401"
     );
+
+    node.shutdown().await;
 }
 
 /// Tampering the body after signing invalidates the content-digest, so the
@@ -95,6 +99,8 @@ async fn tampered_body_after_signing_is_rejected(pool: sqlx::PgPool) {
         400,
         "a body that no longer matches its content-digest must be rejected"
     );
+
+    node.shutdown().await;
 }
 
 // ── U5(a): INV-8 — an unsigned push is denied and leaks nothing ──────────────
@@ -118,6 +124,8 @@ async fn unsigned_receive_pack_is_denied(pool: sqlx::PgPool) {
     // No repo was seeded, so there are no OIDs to leak; the assertion still
     // enforces the 4xx-and-not-empty-200 INV-8 shape.
     assert_denied(resp, 401, &[]).await;
+
+    node.shutdown().await;
 }
 
 // ── U5(b): INV-8/INV-2 — anonymous /ipfs/{cid} of a withheld blob is denied ──
@@ -186,6 +194,8 @@ async fn anon_ipfs_read_of_withheld_blob_is_denied(pool: sqlx::PgPool) {
         resp.text().await.unwrap().contains("public bytes U5b"),
         "the public blob content is returned"
     );
+
+    node.shutdown().await;
 }
 
 // ── U6: INV-1 — a validly signed NON-owner mutation is owner-gated (403) ──────
@@ -244,6 +254,8 @@ async fn wrong_owner_visibility_put_is_forbidden(pool: sqlx::PgPool) {
         "owner's signed visibility PUT must reach the handler, got {}",
         resp.status()
     );
+
+    node.shutdown().await;
 }
 
 // ── U7: INV-2 — a read over a withheld path is denied and leaks nothing ───────
@@ -306,6 +318,8 @@ async fn withheld_path_blob_read_is_denied(pool: sqlx::PgPool) {
         resp.text().await.unwrap().contains("hello public"),
         "the public blob content is returned"
     );
+
+    node.shutdown().await;
 }
 
 // ── U8: INV-2 — an anonymous clone/fetch excludes withheld subtree blobs ──────
@@ -410,6 +424,8 @@ async fn anon_clone_excludes_withheld_subtree_blobs(pool: sqlx::PgPool) {
         listing.contains(&public_oid),
         "public blob {public_oid} must be present (withhold is subtree-scoped); listing:\n{listing}"
     );
+
+    node.shutdown().await;
 }
 
 // ── Additional INV-1 owner-gates over the real stack (fan-out of U6) ──────────
@@ -491,4 +507,48 @@ async fn additional_owner_gates_reject_non_owner(pool: sqlx::PgPool) {
             "owner must reach {method} {path} (got 403)"
         );
     }
+
+    node.shutdown().await;
+}
+
+// ── Teardown: shutdown() joins the serve task and closes the pool ─────────────
+
+/// `shutdown()` must join the detached serve task and close the pool before
+/// returning. RED condition: with drop-only teardown the pool clones held by
+/// the still-running server are open when the test future returns, so
+/// `#[sqlx::test]`'s `DROP DATABASE` cleanup fails (sqlx prints and ignores
+/// it), leaking per-test databases and flaking under parallel execution. The
+/// `observer` clone shares the pool's inner, so `is_closed()` here is exactly
+/// the state sqlx cleanup will see.
+#[sqlx::test]
+async fn shutdown_joins_server_and_closes_pool(pool: sqlx::PgPool) {
+    let observer = pool.clone();
+
+    let node = spawn_node(pool).await;
+    let base_url = node.base_url.clone();
+    let client = bounded_client();
+
+    // One real request so at least one server connection (and its keep-alive)
+    // has existed; graceful shutdown must close it, not wait on it.
+    client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await
+        .expect("probe request sends");
+
+    node.shutdown().await;
+
+    assert!(
+        observer.is_closed(),
+        "shutdown() must close the pool before the test returns, or sqlx's \
+         DROP DATABASE cleanup races the server's open connections"
+    );
+    // The serve task was joined, not merely signalled: a fresh request to the
+    // old address must fail to connect.
+    let after = client.get(format!("{base_url}/health")).send().await;
+    assert!(
+        after.is_err(),
+        "the server must be gone after shutdown(); got {:?} instead",
+        after.map(|r| r.status())
+    );
 }

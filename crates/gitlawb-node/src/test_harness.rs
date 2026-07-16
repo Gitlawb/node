@@ -30,8 +30,12 @@ use crate::db::{Db, RepoRecord, VisibilityMode};
 use crate::rate_limit::{RateLimiter, TrustedProxy};
 use crate::state::AppState;
 
-/// A running node bound to an ephemeral port. Dropping it signals graceful
-/// shutdown and removes the temporary repository directory.
+/// A running node bound to an ephemeral port. End every test with
+/// [`TestNode::shutdown`]: it joins the serve task and closes the pool, so
+/// `#[sqlx::test]`'s `DROP DATABASE` cleanup (which runs the moment the test
+/// future returns) never races the server's still-open connections. Dropping
+/// without it only signals shutdown and removes the temp repository directory,
+/// a best-effort fallback for tests that panic before reaching teardown.
 pub struct TestNode {
     /// Base URL of the running node, e.g. `http://127.0.0.1:54321`.
     pub base_url: String,
@@ -43,13 +47,23 @@ pub struct TestNode {
     /// the integration crate seeds through the methods below rather than
     /// naming `Db`/`RepoRecord` directly.
     db: Arc<Db>,
+    /// The detached `axum::serve` task, joined by [`Self::shutdown`]. `None`
+    /// once taken, so the `Drop` fallback never overlaps a completed teardown.
+    server: Option<tokio::task::JoinHandle<()>>,
+    /// A clone of the served pool, kept so [`Self::shutdown`] can close it
+    /// (sqlx pool clones share one inner, so closing this closes the clones
+    /// inside `AppState`/`Db` too).
+    pool: PgPool,
 }
 
 impl Drop for TestNode {
     fn drop(&mut self) {
-        // Flip the shared shutdown signal so the serve task exits, then remove
-        // the temp repos dir. Both are best-effort: a test that already failed
-        // should not panic again in teardown.
+        // Best-effort fallback for tests that panic before reaching
+        // [`TestNode::shutdown`]: flip the shared shutdown signal so the serve
+        // task exits, then remove the temp repos dir. Drop cannot await, so it
+        // cannot join the server or close the pool; a test that already failed
+        // should not panic again in teardown. Both actions are idempotent, so
+        // running after `shutdown()` is harmless.
         let _ = self.shutdown_tx.send(true);
         let _ = std::fs::remove_dir_all(&self.repos_dir);
     }
@@ -113,7 +127,7 @@ pub async fn spawn_node(pool: PgPool) -> TestNode {
     let repos_dir = unique_repos_dir();
     std::fs::create_dir_all(&repos_dir).expect("create temp repos dir");
 
-    let state = build_state(db.clone(), pool, repos_dir.clone());
+    let state = build_state(db.clone(), pool.clone(), repos_dir.clone());
     let node_did = state.node_did.to_string();
     let shutdown_tx = state.shutdown_tx.clone();
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -125,7 +139,7 @@ pub async fn spawn_node(pool: PgPool) -> TestNode {
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("read bound addr");
 
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         let _ = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -142,10 +156,36 @@ pub async fn spawn_node(pool: PgPool) -> TestNode {
         shutdown_tx,
         repos_dir,
         db,
+        server: Some(server),
+        pool,
     }
 }
 
 impl TestNode {
+    /// Graceful async teardown: signal shutdown, join the serve task, close
+    /// the pool, remove the temp repos dir. Call this at the end of every
+    /// test. `#[sqlx::test]` issues `DROP DATABASE` as soon as the test
+    /// future returns, so the server (which owns pool clones inside
+    /// `AppState`/`Db`) must be gone and the pool closed before then, or the
+    /// cleanup fails and leaks per-test databases. A serve task that does not
+    /// exit within 10s panics loudly: a wedged graceful shutdown must fail
+    /// the test, not hang CI.
+    ///
+    /// When `self` drops on return, `Drop` re-sends the signal and re-removes
+    /// the dir; both are idempotent, and the serve handle was already taken,
+    /// so the overlap is harmless.
+    pub async fn shutdown(mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.server.take() {
+            tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .expect("serve task must exit within 10s of the shutdown signal (wedged graceful shutdown)")
+                .expect("serve task must not panic");
+        }
+        self.pool.close().await;
+        let _ = std::fs::remove_dir_all(&self.repos_dir);
+    }
+
     /// Insert a repo owned by `owner_did` and return its repo id. Mirrors
     /// `test_support::seed_repo` (the `disk_path` field is unused by the
     /// integration path — `RepoStore` computes the on-disk path from
@@ -209,6 +249,9 @@ impl TestNode {
         object_format: &str,
     ) -> std::collections::HashMap<String, String> {
         let run = |args: &[&str], cwd: &std::path::Path| {
+            // allow-unbounded-git: test-harness-only fixture seeding, feature-gated
+            // out of the production binary; runs local git against a tempdir inside
+            // a test's own lifetime, never on a request path holding a permit.
             let out = std::process::Command::new("git")
                 .args(args)
                 .current_dir(cwd)

@@ -1097,6 +1097,14 @@ enum KeyPublish {
 /// an arbitrarily short (~100ms) window (#194).
 const KEY_RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Bounded number of temp-file names a publish will try before giving up.
+/// Attempt 0 is the deterministic `.{stem}.tmp.{pid}.0`, so a stale temp left
+/// by a crashed prior start with the same PID (a restarted container is
+/// commonly PID 1 again) is skipped rather than wedging the restart (#194).
+/// 64 names is far more than any plausible pile-up of stale temps plus live
+/// concurrent publishers.
+const KEY_TEMP_ATTEMPTS: u32 = 64;
+
 /// Load an already-provisioned identity key. On Unix, defensively tighten looser
 /// permissions to 0600 (do NOT reject a loose key — that would break existing
 /// deployments; just narrow them), then verify the mode is actually 0600.
@@ -1152,7 +1160,10 @@ fn load_racing_key(path: &std::path::Path) -> Result<Keypair> {
 ///       flushed (#194);
 ///   (b) a lost race never clobbers the winner — exactly one publisher links;
 ///   (c) a crashed publisher leaves only the temp, never a partial final that
-///       would wedge every later start on `invalid PEM key`.
+///       would wedge every later start on `invalid PEM key`;
+///   (d) durability: the PEM bytes are fsynced before the name appears and the
+///       namespace change is fsynced (on Unix) before success is reported, so a
+///       power crash cannot leave a durable-but-truncated final key (#194).
 /// `before_link` is a no-op in production; tests use it to widen the
 /// post-write / pre-link window deterministically.
 fn publish_key_atomically(
@@ -1169,24 +1180,50 @@ fn publish_key_atomically(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.pem");
-    // Unique per call (process-global counter) so concurrent publishers never
-    // collide on the temp name; `create_new` below is the backstop.
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{stem}.tmp.{}.{seq}", std::process::id()));
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    // Pick the temp name with a bounded per-call retry, not a process-global
+    // counter: a counter is only unique within one process (two containers
+    // sharing a volume can both run as PID 1), and a crash between the temp
+    // write and its cleanup leaves the old name behind, so a single
+    // deterministic name would fail `create_new` on every restart until an
+    // operator deleted it (#194). `AlreadyExists` means either such a stale
+    // temp or a live concurrent publisher's temp; the two are indistinguishable,
+    // so never delete a temp this call did not create (unlinking a live one
+    // between its write and its hard_link would fail that healthy start), just
+    // skip to the next name. Consequence: a crashed start leaks at most one
+    // 0600 temp file, which later starts skip.
+    let mut opened = None;
+    for attempt in 0..KEY_TEMP_ATTEMPTS {
+        let tmp = dir.join(format!(".{stem}.tmp.{}.{attempt}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&tmp) {
+            Ok(f) => {
+                opened = Some((tmp, f));
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("create temp key {}", tmp.display())),
+        }
     }
-    let mut f = opts
-        .open(&tmp)
-        .with_context(|| format!("create temp key {}", tmp.display()))?;
-    // On a failed write, remove the temp so nothing partial is ever linked (#194, F1).
-    write_key_or_cleanup(&tmp, f.write_all(pem))?;
+    let Some((tmp, mut f)) = opened else {
+        anyhow::bail!(
+            "all {KEY_TEMP_ATTEMPTS} temp key names .{stem}.tmp.{}.* in {} are taken; \
+             remove the stale temp files and restart",
+            std::process::id(),
+            dir.display()
+        );
+    };
+    // On a failed write OR fsync, remove the temp so nothing partial is ever
+    // linked (#194). The fsync makes the PEM bytes durable BEFORE the name can
+    // appear: without it a power crash after the link could leave a durable
+    // final name over truncated bytes, wedging every later start.
+    write_key_or_cleanup(&tmp, f.write_all(pem).and_then(|()| f.sync_all()))?;
     drop(f);
 
     before_link();
@@ -1194,7 +1231,22 @@ fn publish_key_atomically(
     let linked = std::fs::hard_link(&tmp, final_path);
     let _ = std::fs::remove_file(&tmp);
     match linked {
-        Ok(()) => Ok(KeyPublish::Won),
+        Ok(()) => {
+            // Fsync the parent directory so the link (and the temp unlink) are
+            // durable before success is reported (#194). Skipped on non-Unix,
+            // where opening a directory fails. On fsync failure do NOT remove
+            // the final file: it is complete and data-synced, a concurrent
+            // loser may already have loaded it, and a later start loads it via
+            // the exists() path.
+            #[cfg(unix)]
+            {
+                std::fs::File::open(dir)
+                    .with_context(|| format!("open key directory {} to fsync", dir.display()))?
+                    .sync_all()
+                    .with_context(|| format!("fsync key directory {}", dir.display()))?;
+            }
+            Ok(KeyPublish::Won)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(KeyPublish::Lost),
         Err(e) => Err(e)
             .with_context(|| format!("link identity key into place at {}", final_path.display())),
@@ -1295,7 +1347,7 @@ mod gossip_ssrf_tests {
 mod identity_key_tests {
     use super::{
         load_or_create_keypair, load_racing_key, publish_key_atomically, Config, KeyPublish,
-        Keypair,
+        Keypair, KEY_TEMP_ATTEMPTS,
     };
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
@@ -1408,6 +1460,71 @@ mod identity_key_tests {
         assert!(
             saw_complete,
             "reader should have observed the completed key within the window"
+        );
+    }
+
+    // #194: a temp file left by a crash between the temp write and its cleanup
+    // must not wedge the restart. A restarted container commonly runs as PID 1
+    // again, so the first name tried collides with the stale one; the publish
+    // must skip it and still win with the complete PEM. RED with a single
+    // deterministic temp name: `create_new` fails AlreadyExists and the node
+    // never starts until an operator deletes the temp.
+    #[test]
+    fn publish_recovers_from_a_stale_crashed_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        // The crashed prior start's leftover: the deterministic attempt-0 name,
+        // 0600, holding a partial write.
+        let stale = dir
+            .path()
+            .join(format!(".identity.pem.tmp.{}.0", std::process::id()));
+        std::fs::write(&stale, b"partial-").expect("seed stale temp");
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600))
+            .expect("stale temp perms");
+
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {})
+            .expect("publish must recover from a stale temp, not wedge the start");
+        assert!(matches!(out, KeyPublish::Won), "publish wins");
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap().as_str(),
+            pem.as_str(),
+            "final holds the complete PEM, not the stale partial"
+        );
+    }
+
+    // #194: temp-name probing is bounded. With every candidate name taken the
+    // publish must return a clear error naming the directory and prefix (not
+    // hang or spin) and must not create the final path. Together with the
+    // stale-temp test this runs the exhaustion branch both ways.
+    #[test]
+    fn publish_errors_when_all_temp_names_are_taken() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        for attempt in 0..KEY_TEMP_ATTEMPTS {
+            let tmp = dir.path().join(format!(
+                ".identity.pem.tmp.{}.{attempt}",
+                std::process::id()
+            ));
+            std::fs::write(&tmp, b"taken").expect("seed taken temp");
+        }
+
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}) {
+            Err(e) => e,
+            Ok(_) => panic!("publish must fail when every temp name is taken"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!(".identity.pem.tmp.{}", std::process::id()))
+                && msg.contains(&dir.path().display().to_string()),
+            "the error must name the temp prefix and directory: {msg}"
+        );
+        assert!(
+            !key_path.exists(),
+            "an exhausted publish must not create or modify the final key"
         );
     }
 
