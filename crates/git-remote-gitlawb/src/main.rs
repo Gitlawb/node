@@ -310,30 +310,14 @@ fn handle_connect<R: Read>(
         return Ok(());
     }
 
-    tracing::debug!("POST {post_url} ({} bytes)", request_body.len());
-    let req = build_pack_post_request(&client, &post_url, service, &request_body, signing_key);
-
-    // Attach the body after signing so the pack bytes are moved, not cloned —
-    // packs can be large and the clone doubled peak memory on push.
-    let pack_resp = req
-        .body(request_body)
-        .send()
-        .with_context(|| format!("POST {post_url}"))?;
-
-    if !pack_resp.status().is_success() {
-        let status = pack_resp.status();
-        let body = read_error_body(pack_resp);
-        let path = format!("/{service}");
-        bail!("{}", http_error_message("POST", &path, status, &body, None));
-    }
-
-    let pack_bytes = pack_resp.bytes().context("reading pack response")?;
-    tracing::debug!("pack response: {} bytes from node", pack_bytes.len());
-
-    stdout.write_all(&pack_bytes)?;
-    stdout.flush()?;
-
-    Ok(())
+    post_pack_round(
+        &client,
+        &post_url,
+        service,
+        signing_key,
+        request_body,
+        &mut stdout,
+    )
 }
 
 // ── Smart-protocol request builders ───────────────────────────────────────────

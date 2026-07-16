@@ -282,9 +282,11 @@ fn exited_status() -> std::process::ExitStatus {
 
 #[cfg(not(unix))]
 fn exited_status() -> std::process::ExitStatus {
-    // Non-unix never takes the reap-then-ECHILD path; a real `wait` always succeeds
-    // there, so this is unreachable in practice. Spawn a trivially-failing process
-    // to synthesize a nonzero status without an unstable constructor.
+    // Non-unix has no ECHILD analog: a Windows `wait` is handle-based, so even
+    // after `reap_tree` has already reaped the leader on the timeout path, the
+    // later `wait` in `run_bounded` succeeds again against the still-open handle.
+    // This stays unreachable in practice; spawn a trivially-failing process to
+    // synthesize a nonzero status without an unstable constructor.
     Command::new("cmd")
         .args(["/C", "exit 1"])
         .status()
@@ -323,6 +325,30 @@ fn reap_group(child: &mut std::process::Child) {
         std::thread::sleep(Duration::from_millis(10));
     }
     // ~1s hard cap total; reap the leader (best-effort) so it is not left a zombie.
+    let _ = child.wait();
+}
+
+/// Tear down the child's whole process tree on the timeout path (INV-22): the
+/// non-unix counterpart of `reap_group`.
+///
+/// `taskkill /T /F` walks the parent-pid tree from the leader and force-kills
+/// every member, so ALL inherited pipe write-ends (leader AND the
+/// git-remote-gitlawb descendant) are closed and the reader joins in
+/// `run_bounded` return promptly instead of waiting out the helper's ~300s HTTP
+/// timeout. taskkill ships in System32 on every supported Windows, which avoids
+/// both a windows-only dev-dependency (a Job Object binding) and `unsafe` in
+/// test code. Known caveat: /T resolves the parent-pid tree at invocation time,
+/// which is sufficient for this harness because git and the helper are both
+/// still alive (blocked, not exiting) at the deadline. The `child.kill()` below
+/// is a best-effort leader-only fallback for the taskkill-unavailable case;
+/// finally reap the leader so it does not linger, mirroring `reap_group`'s
+/// contract.
+#[cfg(not(unix))]
+fn reap_tree(child: &mut std::process::Child) {
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &child.id().to_string()])
+        .output();
+    let _ = child.kill();
     let _ = child.wait();
 }
 
@@ -368,16 +394,17 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
             break true;
         }
         if Instant::now() >= deadline {
-            // Tear down the WHOLE group, not just the leader: the git-remote-gitlawb
+            // Tear down the WHOLE tree, not just the leader: the git-remote-gitlawb
             // helper is a descendant that inherited the stdout/stderr pipe write-ends,
             // so killing only `child` leaves those ends open and the reader joins wait
             // on the helper's ~300s HTTP timeout instead of returning at the deadline.
-            // Signalling the group closes every write-end so the readers finish
-            // promptly (INV-22, mirrors gitlawb-node/src/git/smart_http.rs).
+            // Taking down every member (the unix group signal, the windows taskkill
+            // tree kill) closes every write-end so the readers finish promptly
+            // (INV-22, mirrors gitlawb-node/src/git/smart_http.rs).
             #[cfg(unix)]
             reap_group(&mut child);
             #[cfg(not(unix))]
-            let _ = child.kill(); // closes the pipes so the readers finish
+            reap_tree(&mut child);
             break false; // timed out: the real deadlock signature
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -401,6 +428,81 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
             stderr,
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// Self-exec fixtures (#192 review, portability of the run_bounded tests).
+//
+// The harness tests below need child processes with controlled behavior: a bulk
+// writer and a pipe-holding descendant tree. Spawning `sh` for these breaks the
+// shipped x86_64-pc-windows-msvc target, where neither `sh` nor `seq` is a
+// guaranteed dependency; the one executable guaranteed present on every target
+// is this test binary itself. Each fixture is an `#[ignore]`d test that no-ops
+// unless its GL_TEST_FIXTURE mode is set, so normal `cargo test` runs skip them
+// and even an explicit `--ignored` run without the env var does nothing.
+// `fixture_command` builds the re-invocation: the positional libtest filter
+// plus `--exact` selects exactly one test, `--ignored` opts into it, and
+// `--nocapture` keeps libtest from interposing on the streams.
+// ---------------------------------------------------------------------------
+
+/// Build a Command that re-invokes this test binary to run one fixture test.
+fn fixture_command(fixture_test: &str, mode: &str) -> Command {
+    let mut cmd = Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.args([fixture_test, "--exact", "--ignored", "--nocapture"])
+        .env("GL_TEST_FIXTURE", mode);
+    cmd
+}
+
+/// Fixture: write ~136 KiB of numbered lines to BOTH stdout and stderr, then
+/// exit 0. Direct handle writes (not println!) so libtest output capture cannot
+/// swallow the bytes. The harness noise libtest prints ("running 1 test", the
+/// result line) also lands on stdout; the caller's >64 KiB assertions are
+/// insensitive to it.
+#[test]
+#[ignore = "self-exec fixture: only runs under GL_TEST_FIXTURE=emit"]
+fn fixture_emit_large_output() {
+    if std::env::var("GL_TEST_FIXTURE").ok().as_deref() != Some("emit") {
+        return;
+    }
+    let mut payload = Vec::with_capacity(160 * 1024);
+    for i in 1..=25_000u32 {
+        writeln!(payload, "{i}").expect("write to Vec");
+    }
+    std::io::stdout().write_all(&payload).expect("write stdout");
+    std::io::stderr().write_all(&payload).expect("write stderr");
+}
+
+/// Fixture: sleep 10s while holding whatever stdio handles were inherited.
+#[test]
+#[ignore = "self-exec fixture: only runs under GL_TEST_FIXTURE=sleep"]
+fn fixture_sleep() {
+    if std::env::var("GL_TEST_FIXTURE").ok().as_deref() != Some("sleep") {
+        return;
+    }
+    std::thread::sleep(Duration::from_secs(10));
+}
+
+/// Fixture: spawn a grandchild (`fixture_sleep`) whose stdio is inherited, so a
+/// DESCENDANT holds the caller's pipe write-ends, then stay alive 10s so the
+/// leader is long-lived too. This mirrors the retired
+/// `sh -c "sleep 10 & exec sleep 10"` shape: one leader plus one descendant,
+/// both holding the pipes well past any deadline the caller sets.
+#[test]
+#[ignore = "self-exec fixture: only runs under GL_TEST_FIXTURE=hold"]
+fn fixture_hold_pipe_with_descendant() {
+    if std::env::var("GL_TEST_FIXTURE").ok().as_deref() != Some("hold") {
+        return;
+    }
+    // Stdio is inherited by default, so the grandchild holds the same pipe
+    // write-ends the caller handed this leader.
+    let mut grandchild = fixture_command("fixture_sleep", "sleep")
+        .spawn()
+        .expect("spawn grandchild fixture");
+    std::thread::sleep(Duration::from_secs(10));
+    // Reap on the natural-exit path (both sleeps are 10s, so this returns almost
+    // immediately). Under the harness the whole tree is killed at the deadline,
+    // long before this line runs.
+    let _ = grandchild.wait();
 }
 
 /// Build a server repo with a shared history deep enough to force multi-round
@@ -547,16 +649,16 @@ fn repos_are_cleaned_up_on_unwind() {
 }
 
 /// #192 (F2): `run_bounded` must DRAIN a child that emits more than an OS pipe
-/// buffer, not deadlock. A child writing ~140 KiB to BOTH stdout and stderr and
+/// buffer, not deadlock. A child writing ~136 KiB to BOTH stdout and stderr and
 /// then exiting must complete within the deadline. Under a `try_wait`-only harness
 /// (no concurrent drain) the child blocks on the full pipe, the deadline trips, and
 /// `completed` is false — the exact false "deadlock signature" F2 fixes. Reverting
 /// the concurrent drain to poll-then-read turns this test RED (completed=false).
 #[test]
 fn run_bounded_drains_large_output_without_deadlock() {
-    // seq 1..=25000 is ~140 KiB on each stream — well past a ~64 KiB pipe buffer.
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg("seq 1 25000; seq 1 25000 1>&2");
+    // The emit fixture writes ~136 KiB per stream, well past a ~64 KiB pipe
+    // buffer (self-exec, not `sh -c seq`: portable to the shipped windows target).
+    let cmd = fixture_command("fixture_emit_large_output", "emit");
     let (completed, out) = run_bounded(cmd, Duration::from_secs(10));
     assert!(
         completed,
@@ -629,21 +731,20 @@ fn real_git_withheld_shaped_first_post() {
 }
 
 /// #192 (F1, INV-22): on the timeout path `run_bounded` must tear down the WHOLE
-/// process group, not just the leader. The leader here backgrounds a descendant
-/// (`sleep 10 &`) that inherits the stderr pipe write-end and then `exec`s another
-/// `sleep 10`, so the leader itself is long-lived too. With a 1s deadline the
-/// timeout fires; if only the leader were killed, the surviving background
-/// descendant would keep the pipe open and the reader joins would block for the
-/// descendant's full ~10s lifetime. Signalling the group closes every write-end,
-/// so `run_bounded` returns promptly. Reverting the fix to a leader-only
-/// `child.kill()` turns this RED (elapsed ~10s, the assert below fires).
-#[cfg(unix)]
+/// process tree, not just the leader. The hold fixture spawns a grandchild that
+/// inherits the pipe write-ends and sleeps 10s, and the leader stays alive 10s
+/// too. With a 1s deadline the timeout fires; if only the leader were killed,
+/// the surviving grandchild would keep the pipes open and the reader joins would
+/// block for its full ~10s lifetime. Tearing down every member closes every
+/// write-end, so `run_bounded` returns promptly. This runs on every target, so
+/// the unix group signal and the windows taskkill tree kill are each covered on
+/// the platform where they compile. Reverting either teardown to a leader-only
+/// `child.kill()` turns this RED there (elapsed ~10s, the assert below fires).
 #[test]
 fn run_bounded_reaps_descendants_holding_the_pipe() {
-    let mut cmd = Command::new("sh");
-    // Background a descendant that inherits the pipe FDs and outlives the leader,
-    // then exec another long sleep so the leader is not the only thing to reap.
-    cmd.arg("-c").arg("sleep 10 & exec sleep 10");
+    // A long-lived leader plus a pipe-holding descendant (the self-exec
+    // replacement for `sh -c "sleep 10 & exec sleep 10"`).
+    let cmd = fixture_command("fixture_hold_pipe_with_descendant", "hold");
 
     let start = Instant::now();
     let (completed, _out) = run_bounded(cmd, Duration::from_secs(1));
@@ -657,6 +758,6 @@ fn run_bounded_reaps_descendants_holding_the_pipe() {
         elapsed < Duration::from_secs(4),
         "reader joins blocked on a surviving descendant instead of the deadline: \
          elapsed={elapsed:?} (expected <4s; a leader-only kill leaves the \
-         backgrounded `sleep 10` holding the stderr pipe for its full lifetime)"
+         grandchild fixture holding the pipes for its full lifetime)"
     );
 }
