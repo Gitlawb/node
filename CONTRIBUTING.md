@@ -54,6 +54,7 @@ Smart contracts live in a separate repo: [github.com/Gitlawb/contracts](https://
 3. **No breaking changes without discussion.** Open an issue first for protocol-level changes.
 4. **Conventional commits.** Use `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`. Releases are automated by [release-please](https://github.com/googleapis/release-please) — your commit prefixes drive the next version bump.
 5. **Format and lint.** Run `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` before submitting. CI will reject anything that fails these.
+6. **Security-surface rules.** [`AGENTS.md`](AGENTS.md) carries the authorization invariants PRs most often break; it is written for coding agents and humans alike, so read it before touching endpoints, visibility, or migrations.
 
 ## What gets merged, what gets closed
 
