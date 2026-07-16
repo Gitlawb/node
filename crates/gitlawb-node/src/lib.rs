@@ -1443,7 +1443,15 @@ mod identity_key_tests {
             .expect("publish");
         });
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        // Poll until the final path appears (bounded by a generous deadline:
+        // the publish now fsyncs the temp and the directory, so under parallel
+        // suite load the link can land well after the writer's 200ms hold).
+        // Every observation of an existing final must parse; the first
+        // complete observation ends the test, since a linked-complete final
+        // cannot become partial afterwards. The partial assertion still runs
+        // BEFORE the break, so a publish that exposes an empty/partial final
+        // during the write window is caught on the first poll that sees it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut saw_complete = false;
         while std::time::Instant::now() < deadline {
             if key_path.exists() {
@@ -1453,13 +1461,14 @@ mod identity_key_tests {
                     "final key observed in a partial/empty state: {body:?}"
                 );
                 saw_complete = true;
+                break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         writer.join().expect("writer joins");
         assert!(
             saw_complete,
-            "reader should have observed the completed key within the window"
+            "reader should have observed the completed key within the deadline"
         );
     }
 
