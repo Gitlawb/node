@@ -182,10 +182,14 @@ impl IntoResponse for AppError {
         }));
 
         let mut resp = (status, body).into_response();
-        // Overloaded advertises when to retry. It rides the shared tail above for
-        // its body/status, so the header is attached here rather than in a bespoke
-        // early return — keeping the variant handled in exactly one place.
-        if matches!(self, AppError::Overloaded(_)) {
+        // Both retryable 503s advertise when to retry: Overloaded (capacity shed) and
+        // SearchIncomplete (a bounded CID search cut short by a cap — retry may complete
+        // it). They ride the shared tail above for body/status, so the header is attached
+        // here rather than in bespoke early returns, keeping each variant handled once.
+        if matches!(
+            self,
+            AppError::Overloaded(_) | AppError::SearchIncomplete(_)
+        ) {
             resp.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
                 axum::http::HeaderValue::from_static("1"),
