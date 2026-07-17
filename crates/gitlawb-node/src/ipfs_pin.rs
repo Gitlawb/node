@@ -175,7 +175,11 @@ pub async fn pin_new_objects(
                 if let Err(e) = db.record_pin_source(&sha, repo_id).await {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
                 }
-                pinned.push((sha, raw_cid));
+                // Return the provider Hash (not the resolver key), mirroring the pinata
+                // twin's contract: the DB `cid` is the raw resolver key (recorded above),
+                // the returned value is the provider CID. Here the return is consumed only
+                // for logging, but keeping the twins structurally identical avoids drift.
+                pinned.push((sha, cid));
             }
             Ok(_) => {}
             Err(e) => {
