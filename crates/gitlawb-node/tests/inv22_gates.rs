@@ -87,4 +87,37 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
         "U4/P2-2 gate missing: the detached post-push encryption spawn must consult \
          encrypt_inflight.try_begin to coalesce per repo (bound the outstanding-task set)"
     );
+
+    // F4: every post-receive scan helper acquires a `git_encrypt_semaphore` permit
+    // BEFORE its spawn_blocking git walk, so a push burst cannot accumulate unbounded
+    // concurrent scans once the write permit is released. Structural check: within each
+    // helper the first `acquire_owned` precedes the first `spawn_blocking`. Removing a
+    // gate pushes the next `acquire_owned` occurrence past the helper's own
+    // `spawn_blocking` (or off the end of the file), turning the assertion red.
+    let push_delta = src("git/push_delta.rs");
+    for (file_src, file, helper) in [
+        (&repos, "api/repos.rs", "fn replication_withheld_set"),
+        (&repos, "api/repos.rs", "fn fail_closed_full_scan_objects"),
+        (
+            &push_delta,
+            "git/push_delta.rs",
+            "fn resolve_candidates_for_push",
+        ),
+    ] {
+        let start = file_src
+            .find(helper)
+            .unwrap_or_else(|| panic!("{file}: `{helper}` not found"));
+        let tail = &file_src[start..];
+        let acquire = tail.find("acquire_owned").unwrap_or_else(|| {
+            panic!("F4 gate missing: {file} `{helper}` no longer acquires a scan permit")
+        });
+        let spawn = tail.find("spawn_blocking").unwrap_or_else(|| {
+            panic!("{file}: `{helper}` lost its spawn_blocking walk — update this guard")
+        });
+        assert!(
+            acquire < spawn,
+            "F4 gate bypassed: {file} `{helper}` must acquire its git_encrypt_semaphore \
+             permit BEFORE dispatching the blocking git scan"
+        );
+    }
 }

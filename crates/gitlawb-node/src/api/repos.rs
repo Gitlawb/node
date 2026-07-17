@@ -39,7 +39,15 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// `withheld` is `None`, so an unvetted push neither replicates blobs nor
 /// announces. Returning both keeps the gate's announce decision a single
 /// source rather than recomputing it at each call site.
+///
+/// The walk arm runs under a `git_encrypt_semaphore` admission permit (#174 F4):
+/// by the time the receive-pack tail calls this, the handler's write permit has
+/// already been released (receive_pack's AdmissionGuard drops when the git group
+/// is reaped), so without the gate a burst of completed pushes accumulates
+/// unbounded concurrent full-history walks. `encrypt_sem` is threaded in so the
+/// no-walk fast paths (not announceable; no path-scoped rule) never touch it.
 async fn replication_withheld_set(
+    encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
     rules: Option<Vec<crate::db::VisibilityRule>>,
     owner_did: &str,
     is_public: bool,
@@ -66,7 +74,31 @@ async fn replication_withheld_set(
         // that off the async worker thread.
         Some(rules) => {
             let owner_did = owner_did.to_string();
+            // Scan admission (#174 F4): DEFER (await), never shed — dropping the
+            // walk would skip the vetting and fail the push's replication closed
+            // for no reason. Accepted residuals, stated honestly: (1) the park
+            // wait is queue-depth multiplied — post-receive tails are no longer
+            // admission-bounded once the write permit is released, so N landed
+            // pushes can queue N walks and the last waits N walk-durations;
+            // (2) a client-timeout disconnect while parked HERE drops the
+            // handler future and silently loses this push's replication work —
+            // the encrypt_inflight coalescing requeue does NOT cover it, because
+            // this park precedes the `try_begin` spawn gate.
+            let parked = std::time::Instant::now();
+            let permit = encrypt_sem
+                .acquire_owned()
+                .await
+                .expect("git_encrypt_semaphore is never closed");
+            tracing::debug!(
+                repo = %disk_path.display(),
+                queue_wait_ms = parked.elapsed().as_millis() as u64,
+                "post-push withheld walk admitted to the scan pool"
+            );
             tokio::task::spawn_blocking(move || {
+                // The permit lives inside the blocking closure: a started walk
+                // always completes holding it (a disconnect cannot cancel
+                // spawn_blocking or leak the permit mid-walk).
+                let _permit = permit;
                 crate::git::visibility_pack::withheld_blob_oids_bounded(
                     &disk_path, &git_bin, timeout, &rules, is_public, &owner_did, None,
                 )
@@ -102,7 +134,15 @@ async fn replication_withheld_set(
 /// non-blobs plus allowed blobs. Any error in either walk (or a task panic)
 /// pins nothing this push, mirroring the degraded-path shape of
 /// `replication_withheld_set`.
+///
+/// Always walks (there is no no-git arm), so the whole blocking scan runs under
+/// one `git_encrypt_semaphore` admission permit (#174 F4) — see
+/// `replication_withheld_set`'s acquire for the defer rationale and the honest
+/// residuals (queue-depth-multiplied park wait; a disconnect while parked loses
+/// this push's replication work, uncovered by the coalescing requeue).
+#[allow(clippy::too_many_arguments)]
 async fn fail_closed_full_scan_objects(
+    encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
     disk_path: std::path::PathBuf,
     rules: Vec<crate::db::VisibilityRule>,
     is_public: bool,
@@ -111,7 +151,20 @@ async fn fail_closed_full_scan_objects(
     git_bin: String,
     timeout: std::time::Duration,
 ) -> Vec<String> {
+    // Scan admission (#174 F4): DEFER, never shed; the permit moves into the
+    // closure so a started scan always completes holding it.
+    let parked = std::time::Instant::now();
+    let permit = encrypt_sem
+        .acquire_owned()
+        .await
+        .expect("git_encrypt_semaphore is never closed");
+    tracing::debug!(
+        repo = %disk_path.display(),
+        queue_wait_ms = parked.elapsed().as_millis() as u64,
+        "post-push fail-closed full scan admitted to the scan pool"
+    );
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+        let _permit = permit;
         let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
             &disk_path, &git_bin, timeout, &rules, is_public, &owner_did,
         )?;
@@ -1385,6 +1438,7 @@ pub async fn git_receive_pack(
     // never leaks.
     let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
     let (announce, withheld) = replication_withheld_set(
+        state.git_encrypt_semaphore.clone(),
         rules_opt.clone(),
         &record.owner_did,
         record.is_public,
@@ -1413,6 +1467,7 @@ pub async fn git_receive_pack(
             .filter(|s| s != ZERO_SHA)
             .collect();
         let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+            state.git_encrypt_semaphore.clone(),
             disk_path.clone(),
             new_tips,
             old_tips,
@@ -1422,6 +1477,7 @@ pub async fn git_receive_pack(
         .await;
         if pin_set.full_scan {
             fail_closed_full_scan_objects(
+                state.git_encrypt_semaphore.clone(),
                 disk_path.clone(),
                 rules_opt.clone().unwrap_or_default(),
                 record.is_public,
@@ -2286,6 +2342,7 @@ mod tests {
 
         // Private: no rules at all.
         let (announce, _) = replication_withheld_set(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             None,
             OWNER_DID,
             false,
@@ -2298,6 +2355,7 @@ mod tests {
 
         // Private: empty rule set, is_public=false → still not listable at root.
         let (announce, _) = replication_withheld_set(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             Some(vec![]),
             OWNER_DID,
             false,
@@ -2310,6 +2368,7 @@ mod tests {
 
         // Public: empty rule set, is_public=true → listable at root, announces.
         let (announce, _) = replication_withheld_set(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             Some(vec![]),
             OWNER_DID,
             true,
@@ -2441,6 +2500,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             replication_withheld_set(
+                std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
                 rules,
                 OWNER_DID,
                 true,
@@ -4632,6 +4692,469 @@ mod tests {
         assert!(
             marker.exists(),
             "once admission is available the deferred walk runs its rev-list"
+        );
+    }
+
+    /// F4 defer proof 1: `replication_withheld_set`'s WALK arm acquires a
+    /// `git_encrypt_semaphore` permit before its spawn_blocking git walk, deferring
+    /// (never shedding) when the pool is exhausted — while its no-walk fast paths
+    /// (no path-scoped rule; not announceable) complete WITHOUT touching the pool.
+    /// On ungated code the walk runs regardless of a zero-permit pool (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replication_walk_defers_when_scan_pool_exhausted() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("git.ran");
+        // Fake git records ANY invocation (the walk's first call is rev-parse), then
+        // behaves well enough for a successful empty walk: HEAD probe succeeds,
+        // rev-list lists no commits.
+        let body = format!(
+            "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let scoped_rules = || Some(vec![vis_rule("/secret/**", &[])]);
+
+        // Zero-permit pool: every gated walk must park forever.
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(0));
+
+        // Fast path A (negative arm): announceable, NO path-scoped rule -> zero git
+        // work, must complete immediately without acquiring from the empty pool.
+        let fast = tokio::time::timeout(
+            Duration::from_millis(500),
+            replication_withheld_set(
+                sem.clone(),
+                Some(vec![]),
+                OWNER_DID,
+                true,
+                tmp.path().to_path_buf(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the no-path-scoped-rule fast path must not park on the scan pool");
+        assert_eq!(fast, (true, Some(std::collections::HashSet::new())));
+
+        // Fast path B (negative arm): not announceable (no rules) -> zero git work,
+        // must complete immediately without acquiring.
+        let fast = tokio::time::timeout(
+            Duration::from_millis(500),
+            replication_withheld_set(
+                sem.clone(),
+                None,
+                OWNER_DID,
+                false,
+                tmp.path().to_path_buf(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the not-announceable fast path must not park on the scan pool");
+        assert_eq!(fast, (false, None));
+        assert!(!marker.exists(), "the fast paths must spawn no git at all");
+
+        // Walk arm with the pool exhausted: must DEFER (park), spawning no git.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            replication_withheld_set(
+                sem.clone(),
+                scoped_rules(),
+                OWNER_DID,
+                true,
+                tmp.path().to_path_buf(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the withheld walk must defer (park on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the withheld walk's git must not spawn while its admission permit is unavailable (F4)"
+        );
+
+        // Release admission: the SAME walk now runs (defer, not shed) and succeeds.
+        sem.add_permits(1);
+        let ran = replication_withheld_set(
+            sem,
+            scoped_rules(),
+            OWNER_DID,
+            true,
+            tmp.path().to_path_buf(),
+            git_bin,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred withheld walk runs its git"
+        );
+        assert_eq!(
+            ran,
+            (true, Some(std::collections::HashSet::new())),
+            "the released walk completes and vets the (empty) withheld set"
+        );
+    }
+
+    /// F4 defer proof 3: `fail_closed_full_scan_objects` ALWAYS walks, so its
+    /// spawn_blocking is always admission-gated: with the pool exhausted it defers
+    /// and spawns no git; with a permit the same call runs. Ungated it runs
+    /// regardless (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_scan_pin_walk_defers_when_scan_pool_exhausted() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("git.ran");
+        let body = format!(
+            "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let candidates = vec!["3333333333333333333333333333333333333333".to_string()];
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(0));
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            fail_closed_full_scan_objects(
+                sem.clone(),
+                tmp.path().to_path_buf(),
+                vec![vis_rule("/secret/**", &[])],
+                true,
+                OWNER_DID.to_string(),
+                candidates.clone(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the fail-closed full scan must defer (park on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the full scan's git must not spawn while its admission permit is unavailable (F4)"
+        );
+
+        // Release admission: the SAME scan now runs (defer, not shed).
+        sem.add_permits(1);
+        let _objs = fail_closed_full_scan_objects(
+            sem,
+            tmp.path().to_path_buf(),
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            OWNER_DID.to_string(),
+            candidates,
+            git_bin,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred full scan runs its git"
+        );
+    }
+
+    /// Shared fixture for the F4 handler-layer tests: a state whose repo_store and
+    /// git_bin point at the given tempdir/fake-git, plus a seeded on-disk repo,
+    /// optionally with a path-scoped rule (so the post-receive walks actually run).
+    #[cfg(unix)]
+    async fn f4_state_with_repo(
+        pool: sqlx::PgPool,
+        tmp: &std::path::Path,
+        git_bin: &str,
+        owner: &str,
+        name: &str,
+        path_scoped: bool,
+    ) -> AppState {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.git_bin = git_bin.to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        if path_scoped {
+            state
+                .db
+                .set_visibility_rule(
+                    &rec.id,
+                    "/secret/**",
+                    crate::db::VisibilityMode::B,
+                    &["did:key:z6MkF4ReaderAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                    &rec.owner_did,
+                )
+                .await
+                .unwrap();
+        }
+        state
+    }
+
+    /// A pkt-line receive-pack body carrying one branch-create ref update, so the
+    /// handler's post-receive tail resolves a non-empty new-tip set (the delta
+    /// scan's git stages run).
+    fn ref_update_body(new_sha: &str) -> axum::body::Bytes {
+        let line = format!("{ZERO_SHA} {new_sha} refs/heads/main");
+        axum::body::Bytes::from(format!("{:04x}{}0000", line.len() + 4, line))
+    }
+
+    /// F4 scenario 2 — push-burst bound at the handler layer: with a scan pool of
+    /// ONE, two concurrent pushes to two path-scoped repos never have more than one
+    /// scan's git alive at a time (an atomic mkdir lock in the fake git detects any
+    /// overlap), and BOTH pushes still succeed 200 — defer, not shed. Two distinct
+    /// repos on purpose: the per-repo advisory write lock must not be what
+    /// serializes the scans.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_burst_scans_serialized_and_both_pushes_succeed(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lockdir = tmp.path().join("scan.lock");
+        let ranfile = tmp.path().join("scan.ran");
+        let overlap = tmp.path().join("scan.overlap");
+        // receive-pack succeeds instantly; every candidate-scan git op (cat-file /
+        // rev-list / ls-tree) holds an atomic mkdir lock for 150ms — a second scan
+        // process alive at the same instant records an overlap.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               receive-pack) cat > /dev/null 2>/dev/null ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               cat-file|rev-list|ls-tree)\n\
+                 if mkdir \"{lock}\" 2>/dev/null; then\n\
+                   echo 1 >> \"{ran}\"\n\
+                   sleep 0.15\n\
+                   rmdir \"{lock}\"\n\
+                 else\n\
+                   echo 1 >> \"{over}\"\n\
+                 fi\n\
+                 if [ \"$1\" = cat-file ]; then echo commit; fi ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            lock = lockdir.display(),
+            ran = ranfile.display(),
+            over = overlap.display(),
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f4burst1", "b1", true).await;
+        // Second path-scoped repo on the same state/store.
+        state
+            .db
+            .upsert_mirror_repo("z6f4burst2", "b2", "/unused-z6f4burst2-b2", None, false)
+            .await
+            .unwrap();
+        let rec2 = state
+            .db
+            .get_repo("z6f4burst2", "b2")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .repo_store
+            .init(&rec2.owner_did, &rec2.name)
+            .await
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &rec2.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkF4ReaderAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec2.owner_did,
+            )
+            .await
+            .unwrap();
+        // Scan pool of ONE: at most one post-receive walk may run at a time.
+        state.git_encrypt_semaphore = Arc::new(Semaphore::new(1));
+
+        let did = "did:key:z6MkF4BurstPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+        let new_sha = "1111111111111111111111111111111111111111";
+        let push = |owner: &'static str, name: &'static str, peer: &'static str| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                git_receive_pack(
+                    State(state),
+                    Path((owner.to_string(), name.to_string())),
+                    Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
+                    axum::http::HeaderMap::new(),
+                    ref_update_body(new_sha),
+                )
+                .await
+            })
+        };
+
+        let (a, b) = (
+            push("z6f4burst1", "b1", "203.0.113.71:5000"),
+            push("z6f4burst2", "b2", "203.0.113.72:5000"),
+        );
+        let a = tokio::time::timeout(std::time::Duration::from_secs(60), a)
+            .await
+            .expect("push A must complete — a scan gate must defer, never wedge")
+            .expect("push A task must not panic");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(60), b)
+            .await
+            .expect("push B must complete — a scan gate must defer, never wedge")
+            .expect("push B task must not panic");
+        let a = a.expect("push A must succeed");
+        let b = b.expect("push B must succeed");
+        assert_eq!(a.status(), 200, "push A lands 200 despite scan contention");
+        assert_eq!(b.status(), 200, "push B lands 200 despite scan contention");
+
+        // Let the detached recipients walks drain through the same pool before
+        // reading the detector files.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert!(
+            !overlap.exists(),
+            "with a scan pool of 1, no two scans' git may ever be alive at once \
+             (found overlap records: {:?})",
+            std::fs::read_to_string(&overlap).unwrap_or_default()
+        );
+        let ran = std::fs::read_to_string(&ranfile).unwrap_or_default();
+        assert!(
+            ran.lines().count() >= 6,
+            "both pushes' scans must actually have run (withheld walk + delta probe + \
+             delta rev-list each); got {} runs",
+            ran.lines().count()
+        );
+    }
+
+    /// F4 scenario 3 — fast-path non-acquisition at the handler layer: a push to a
+    /// public repo with NO path-scoped rules does zero post-receive git scanning
+    /// (the withheld short-circuit; a deletion-free flush-only body resolves no new
+    /// tips), so it must complete 200 even with the scan pool at ZERO permits.
+    /// A gate that wrongly captured a no-walk path would park this push forever.
+    /// Note: `resolve_candidates_for_push` spawns git for ANY non-empty new-tip set
+    /// (the per-tip cat-file probe), so the genuinely git-free negative arm is the
+    /// no-ref-update body, not a branch-create push.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_no_scan_fast_path_completes_with_zero_scan_permits(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("scan.ran");
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  receive-pack) cat > /dev/null 2>/dev/null ;;\n  cat-file|rev-list|ls-tree) echo 1 >> \"{}\" ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f4fast", "f1", false).await;
+        state.git_encrypt_semaphore = Arc::new(Semaphore::new(0));
+
+        let peer: SocketAddr = "203.0.113.73:5000".parse().unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            git_receive_pack(
+                State(state),
+                Path(("z6f4fast".to_string(), "f1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(
+                    "did:key:z6MkF4FastPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                )),
+                crate::rate_limit::PeerAddr(Some(peer)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            ),
+        )
+        .await
+        .expect("a no-scan push must not park on the (empty) scan pool")
+        .expect("the push must succeed");
+        assert_eq!(resp.status(), 200);
+        assert!(
+            !marker.exists(),
+            "the no-walk fast paths must spawn no scan git at all"
+        );
+    }
+
+    /// F4 scenario 4 — landed-push-never-fails: a push whose post-receive walk must
+    /// park (pool held elsewhere) DEFERS and then returns the receive-pack success
+    /// once admission frees; contention never converts the landed push into a 5xx.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_landed_push_defers_on_scan_contention_never_errors(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "#!/bin/sh\ncase \"$1\" in\n  receive-pack) cat > /dev/null 2>/dev/null ;;\n  rev-parse) echo deadbeef ;;\n  cat-file) echo commit ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f4park", "p1", true).await;
+        let sem = Arc::new(Semaphore::new(1));
+        state.git_encrypt_semaphore = sem.clone();
+        // The test holds the pool's only permit: the push's withheld walk must park.
+        let held = sem.clone().acquire_owned().await.unwrap();
+
+        let peer: SocketAddr = "203.0.113.74:5000".parse().unwrap();
+        let mut handle = tokio::spawn(git_receive_pack(
+            State(state),
+            Path(("z6f4park".to_string(), "p1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(
+                "did:key:z6MkF4ParkPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            )),
+            crate::rate_limit::PeerAddr(Some(peer)),
+            axum::http::HeaderMap::new(),
+            ref_update_body("2222222222222222222222222222222222222222"),
+        ));
+
+        // Parked, not errored: the handler must NOT complete while the pool is held.
+        let parked = tokio::time::timeout(std::time::Duration::from_millis(700), &mut handle).await;
+        assert!(
+            parked.is_err(),
+            "the post-receive walk must defer while the scan pool is held; got {parked:?}"
+        );
+
+        // Release admission: the SAME push now finishes with the receive-pack 200.
+        drop(held);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("the deferred push must complete once admission frees")
+            .expect("the push task must not panic")
+            .expect("contention must never convert a landed push into an error");
+        assert_eq!(
+            resp.status(),
+            200,
+            "the response is the receive-pack success, not a contention 5xx"
         );
     }
 
