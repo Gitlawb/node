@@ -55,10 +55,18 @@ use crate::visibility::{visibility_check, Decision};
 /// repo reached a VERDICT — visibility deny, probe-says-absent, walk-gate deny,
 /// or served. A candidate skipped WITHOUT a verdict (acquire failure/timeout,
 /// probe error, walk failure/panic, content-read error, or truncation by
-/// `ipfs_max_repos_walked` / `ipfs_max_repo_visits`) taints the scan, and a
+/// `ipfs_max_repos_walked` / `ipfs_max_repo_visits` /
+/// `ipfs_request_budget_secs`) taints the scan, and a
 /// tainted scan that found nothing sheds a retryable 503 + Retry-After naming
 /// the truncation sources — existing content is never misreported absent
 /// because of unrelated repos or transient faults.
+///
+/// Request budget (F3): one absolute clock (`ipfs_request_budget_secs`) spans
+/// the whole admitted request. No stage (acquire, probe, walk, content read)
+/// starts once it is exhausted, and the acquire wait and walk deadline are
+/// clamped to the remainder, so an admitted request cannot hold its scarce walk
+/// slot past the budget plus the in-flight stage's kill/reap slack and one
+/// unclamped probe subprocess.
 ///
 /// Scope: this closes the direct unauthenticated scan, including the dangling
 /// case. A stale-public mirror row still serves withheld content (tracked
@@ -89,6 +97,19 @@ pub async fn get_by_cid(
     let sha256_hex = hex::encode(mh.digest());
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let caller_owned = caller.map(|c| c.to_string());
+
+    // One absolute budget bounds this request's whole acquire+walk lifetime (F3),
+    // captured before admission so the clock covers everything the walk permit
+    // holds. Each stage below (acquire, probe, walk, read) starts only while
+    // budget remains, and the acquire wait + walk deadline run clamped to the
+    // remainder, so an admitted request cannot hold its scarce walk slot for
+    // hours by drawing a fresh per-stage timeout every iteration. The budget
+    // NEVER aborts a running spawn_blocking walk: the clamped git deadline
+    // inside the walk is what ends it (a tokio timeout around the walk future
+    // would free the walk permit while the blocking thread still runs, the
+    // exact hole the held permit closes).
+    let request_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.ipfs_request_budget_secs);
 
     // Bounded walk admission (#174 P1-3), taken before any DB/git work so a flood sheds
     // cheaply. The per-repo `spawn_blocking` walk below is a full-history git walk with
@@ -161,6 +182,16 @@ pub async fn get_by_cid(
         }
     }
 
+    // Remaining request budget (F3), or None once exhausted. A stage is never
+    // started with zero remaining; the probe and read subprocesses carry no
+    // internal duration clamp, so the check before them is their entire bound
+    // (documented overshoot: at most one unclamped cat-file plus the in-flight
+    // clamped stage's kill/reap slack).
+    fn budget_remaining(deadline: std::time::Instant) -> Option<std::time::Duration> {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        (!left.is_zero()).then_some(left)
+    }
+
     // Cap on EXPENSIVE walks only (F2): counts the repos that actually require the
     // full-history `allowed_blob_set_for_caller_bounded` walk (a path-scoped blob),
     // checked immediately before the spawn_blocking below. Cheap probe-only visits
@@ -185,6 +216,21 @@ pub async fn get_by_cid(
             continue;
         }
 
+        // Budget gate for the acquire stage (F3): once the request budget is
+        // exhausted the scan STOPS, leaving this and every later candidate
+        // unproven (taint, never a false 404). Checked ahead of the visit
+        // bookkeeping so an unstarted acquire is not counted as a visit.
+        let Some(budget_left) = budget_remaining(request_deadline) else {
+            tracing::warn!(
+                repo = %repo.name,
+                budget_secs = state.config.ipfs_request_budget_secs,
+                "/ipfs request budget exhausted before the repo acquire \
+                 (GITLAWB_IPFS_REQUEST_BUDGET_SECS); stopping the scan without a verdict"
+            );
+            taint(&mut truncated_by, "budget");
+            break;
+        };
+
         // Visit ceiling (F2): bound the acquire+probe cost class. Stopping here
         // leaves the remaining candidates unproven, so the scan is truncated.
         if repos_visited >= state.config.ipfs_max_repo_visits {
@@ -202,9 +248,13 @@ pub async fn get_by_cid(
         // the P1-2 stall vector (a hung Tigris HEAD/GET on one repo would otherwise
         // block the whole /ipfs request). On expiry keep the fail-closed skip — never
         // serve an un-acquired repo; a public copy (if any) still gets its turn — but
-        // the repo got no verdict, so the skip taints the scan.
-        let acquire_deadline =
-            std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+        // the repo got no verdict, so the skip taints the scan. Clamped to the
+        // remaining request budget (F3) so per-repo acquires cannot each draw a
+        // fresh full timeout past it.
+        let acquire_deadline = std::cmp::min(
+            std::time::Duration::from_secs(state.config.git_acquire_timeout_secs),
+            budget_left,
+        );
         let repo_path = match tokio::time::timeout(
             acquire_deadline,
             state.repo_store.acquire(&repo.owner_did, &repo.name),
@@ -223,6 +273,18 @@ pub async fn get_by_cid(
                 continue;
             }
         };
+
+        // Budget gate for the probe stage (F3). The probe subprocess has no
+        // internal duration clamp, so this pre-start check is its entire bound.
+        if budget_remaining(request_deadline).is_none() {
+            tracing::warn!(
+                repo = %repo.name,
+                "/ipfs request budget exhausted before the object-type probe; \
+                 stopping the scan without a verdict"
+            );
+            taint(&mut truncated_by, "budget");
+            break;
+        }
 
         // Check whether the object exists in this repo before any expensive
         // reachability walk. This prevents random-CID spray from triggering
@@ -244,6 +306,21 @@ pub async fn get_by_cid(
         let path_scoped = has_path_scoped_rule(rules);
         if path_scoped && obj_type == "blob" {
             if !allowed_memo.contains_key(&repo.id) {
+                // Budget gate for the walk stage (F3): a walk is never STARTED
+                // with zero remaining (probed-present is not a serve), and a
+                // started walk runs its git children under a deadline clamped
+                // to the remainder (the min below), so a walk can never
+                // complete past the budget.
+                let Some(budget_left) = budget_remaining(request_deadline) else {
+                    tracing::warn!(
+                        repo = %repo.name,
+                        budget_secs = state.config.ipfs_request_budget_secs,
+                        "/ipfs request budget exhausted before the visibility walk \
+                         (GITLAWB_IPFS_REQUEST_BUDGET_SECS); stopping the scan without a verdict"
+                    );
+                    taint(&mut truncated_by, "budget");
+                    break;
+                };
                 // Walk cap (F2), checked at the one site that actually spends a walk:
                 // on exhaustion skip THIS repo without a verdict and KEEP scanning —
                 // later candidates may still reach a cheap probe-only verdict (a plain
@@ -265,8 +342,10 @@ pub async fn get_by_cid(
                 let owner = repo.owner_did.clone();
                 let caller_for_walk = caller_owned.clone();
                 let git_bin = state.git_bin.clone();
-                let walk_timeout =
-                    std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+                let walk_timeout = std::cmp::min(
+                    std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                    budget_left,
+                );
                 // Full-history walk shells out to git — keep it off the async runtime,
                 // bounded and reaped like the served-git ops (#174).
                 let walk = tokio::task::spawn_blocking(move || {
@@ -308,6 +387,21 @@ pub async fn get_by_cid(
             if !in_allowed {
                 continue;
             }
+        }
+
+        // Budget gate for the content-read stage (F3): the read subprocess is
+        // unclamped, so it never starts past the budget. Tainting instead of
+        // serving keeps the terminal arm honest and the stop unconditional; the
+        // retryable 503 tells the caller to come back rather than letting an
+        // over-budget request keep spending.
+        if budget_remaining(request_deadline).is_none() {
+            tracing::warn!(
+                repo = %repo.name,
+                "/ipfs request budget exhausted before the content read; \
+                 stopping the scan without a verdict"
+            );
+            taint(&mut truncated_by, "budget");
+            break;
         }
 
         // Now that we've passed the gate, read the content. A failed read after a
@@ -973,6 +1067,400 @@ mod tests {
             StatusCode::NOT_FOUND,
             "an anonymous caller denied by every repo gets a complete-scan 404 — a deny \
              is a verdict and must not visit, taint, or 503"
+        );
+    }
+
+    /// F3 budget expiry mid-loop: one absolute request budget
+    /// (`ipfs_request_budget_secs`) bounds the whole admitted scan; per-repo
+    /// stages may not each draw a fresh timeout past it. Budget 1s, per-iteration
+    /// acquire timeout 2s; the NEWER row is a Tigris-backed ghost (no local copy,
+    /// non-routable endpoint) whose acquire stalls, the OLDER row is a plain
+    /// public repo carrying the blob. The ghost's acquire runs clamped to the ~1s
+    /// remainder and times out; at the next repo the budget gate sees zero
+    /// remaining, taints "budget", and STOPS the scan, so the blob repo is never
+    /// visited (a visit would probe the healthy public copy and serve 200, which
+    /// the 503 assertion rules out) and the shed names the budget. Without the
+    /// budget the acquire would time out at its own 2s, the scan would continue,
+    /// and the buried blob would serve 200 (the recorded RED). MUTATION (RED):
+    /// remove the `request_deadline` capture (or make the remaining budget
+    /// infinite) and this serves 200 again.
+    #[sqlx::test]
+    async fn get_by_cid_request_budget_expiry_stops_scan_with_503(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Seed the blob repo through a LOCAL-ONLY store first, so seeding never
+        // consults the (deliberately unreachable) Tigris endpoint.
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(repos_dir.clone(), pool.clone());
+        let (_, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6f3budget",
+            "buried",
+            b"budget expiry proof\n",
+        )
+        .await;
+        // Swap in a Tigris-backed store over the SAME repos_dir (the seeded bare
+        // repo stays a fast local hit) and add a NEWER ghost row with no local
+        // copy: its acquire consults the non-routable endpoint and stalls
+        // (endpoint-pinned test client, no AWS_* env reads; 10.255.255.1 hangs).
+        let tigris = crate::git::tigris::TigrisClient::for_testing_with_endpoint(
+            "test-bucket",
+            "http://10.255.255.1:9000",
+        )
+        .await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+        state
+            .db
+            .upsert_mirror_repo("z6f3budget", "ghost", "/unused-ghost", None, false)
+            .await
+            .unwrap();
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_request_budget_secs = 1;
+        cfg.git_acquire_timeout_secs = 2;
+        state.config = Arc::new(cfg);
+
+        let peer: SocketAddr = "203.0.113.70:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid_for_oid(&oid), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an exhausted request budget must stop the scan with a retryable 503; \
+             scanning on into the later public blob repo would have served 200"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the budget-truncation 503 must carry Retry-After"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("budget"),
+            "the truncation body must name the budget taint so the operator can \
+             map the shed to GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+        );
+    }
+
+    /// F3 clamped walk at expiry: a walk that starts with little budget left runs
+    /// its git children under `min(git_service_timeout_secs, remaining)`, so the
+    /// clamp (not any tokio-level abort) is what ends it and a walk can never
+    /// complete past the budget. Budget 2s, service timeout at its 600s default,
+    /// fake walk git that sleeps 8s: the walk STARTS (pid file), the walk permit
+    /// stays held while the blocking walk runs (`available_permits == 0`), the
+    /// clamped deadline SIGTERM/SIGKILLs the child group at ~2s remaining (the
+    /// response lands after the ~1s watchdog grace, far before the 8s sleep, and
+    /// the recorded pid is already dead: a tokio abort would have left it
+    /// running), the log shows the walk started but never completed, and the
+    /// request sheds the terminal budget-truncated 503 without ever reaching the
+    /// OLDER public copy of the same blob (which would have served 200). After
+    /// the response the permit is free: the spawn_blocking closure genuinely
+    /// returned. MUTATION (RED): drop the `min` clamp on `walk_timeout` and the
+    /// walk runs its full 8s sleep (elapsed and log-completion assertions fail).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_budget_clamps_walk_deadline_and_holds_permit(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let walk_log = tmp.path().join("walks.log");
+        let revlist_pid = tmp.path().join("revlist.pid");
+        // Fake git for the WALK only: `rev-list` records its pid and a start
+        // marker, sleeps far past the budget, then records a done marker. Under
+        // the clamped walk deadline the whole process group is torn down mid
+        // sleep, so "done" never appears. The 8s sleep also bounds a RED run.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               for-each-ref) : ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               rev-list) echo $$ > \"{pid}\"; echo start >> \"{log}\"; sleep 8; echo done >> \"{log}\" ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            pid = revlist_pid.display(),
+            log = walk_log.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Global walk pool of 1 so the held permit is observable; per-source cap
+        // permissive so only the global pool matters.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        let mut cfg = (*state.config).clone();
+        // The budget is the ONLY thing that can end this walk early: the service
+        // timeout stays at its generous 600s default.
+        cfg.ipfs_request_budget_secs = 2;
+        state.config = Arc::new(cfg);
+
+        // Older row: a plain public copy of the same blob, which must never be
+        // reached. Newer row: path-scoped, so its blob costs the clamped walk.
+        let content = b"budget walk clamp proof\n";
+        let (_, oid) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f3clamp", "pubcopy", content).await;
+        let (walk_id, _) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f3clamp", "gated", content).await;
+        state
+            .db
+            .set_visibility_rule(
+                &walk_id,
+                "src/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkU3IpfsReaderDDDDDDDDDDDDDDDDDDDDDDDD".to_string()],
+                "z6f3clamp",
+            )
+            .await
+            .unwrap();
+
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        let router = ipfs_router(state);
+        let started = std::time::Instant::now();
+        let peer: SocketAddr = "203.0.113.71:5000".parse().unwrap();
+        let mut fut = Box::pin(router.oneshot(get_cid(&cid_for_oid(&oid), Some(peer))));
+
+        // Drive until the fake git's rev-list records its pid: the walk is now in
+        // the blocking pool and the request future is `.await`ing its join. Stop
+        // polling the instant the future completes (re-polling would panic).
+        let mut walk_pid: Option<i32> = None;
+        let mut early = None;
+        for _ in 0..500 {
+            let done = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&revlist_pid)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                walk_pid = Some(p);
+                break;
+            }
+            if let Ok(resp) = done {
+                early = Some(resp.map(|r| r.status()));
+                break;
+            }
+        }
+        let pid = walk_pid.unwrap_or_else(|| {
+            panic!(
+                "the budget-clamped walk must have STARTED (nonzero remaining); early: {early:?}"
+            )
+        });
+        // Reap the sleeping child on drop so a RED run leaks no orphan.
+        struct ReapOnDrop(i32);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapOnDrop(pid);
+
+        // While the blocking walk runs the permit is HELD: the budget never frees
+        // a slot whose blocking thread is still burning.
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the walk permit must stay held while the budget-clamped walk runs"
+        );
+
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(20), &mut fut)
+            .await
+            .expect("the clamped walk deadline must end the request; it never hung")
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a budget-clamped walk that could not finish leaves no verdict: 503, not 404/200"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("budget"),
+            "the terminal shed must name the budget taint; got: {body}"
+        );
+        // Deadline-killed at ~remaining, not run to completion: the response
+        // lands at ~budget + the watchdog's kill/reap slack, well before the 8s
+        // sleep could have finished.
+        assert!(
+            elapsed < std::time::Duration::from_secs(7),
+            "the clamped git deadline must end the walk at ~remaining; got {elapsed:?}"
+        );
+        // The child group is already dead AT response time: the clamp killed it.
+        // (A tokio-level abort of the walk future would have answered while the
+        // blocking thread and its child still ran.)
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "the walk's git child must be reaped by the clamped deadline before the response"
+        );
+        let log = std::fs::read_to_string(&walk_log).unwrap_or_default();
+        assert!(
+            log.contains("start"),
+            "the walk must have started (the budget gate passed with remaining > 0)"
+        );
+        assert!(
+            !log.contains("done"),
+            "the walk must never complete past the budget; the clamp kills it mid-run"
+        );
+        // The spawn_blocking closure returned and the handler finished: the
+        // permit is free again (held through the blocking run, no longer).
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the walk permit must free once the blocking walk genuinely returns"
+        );
+    }
+
+    /// F3 expiry between probe and walk: an object PROBED PRESENT in a
+    /// path-scoped repo is still not served once the budget is gone; the
+    /// walk-stage gate taints and stops before any walk starts. The probe is
+    /// stalled past the 1s budget while still SUCCEEDING via a FIFO at
+    /// `objects/info/alternates`: real `git cat-file -t` blocks opening it at
+    /// odb setup until a plain OS thread feeds it an empty alternates list at
+    /// ~2s, after which the probe finds the genuine loose object and reports
+    /// "blob". The walk-needing repo thus reaches the walk gate with zero
+    /// remaining: 503 naming the budget, never a 404 (the walk-gate deny of the
+    /// fake git's empty allowed-set would have been a verdict) and never a
+    /// serve, and the fake-git walk log stays EMPTY (no walk ever started).
+    /// MUTATION (RED): drop the walk-stage budget gate and this decays to the
+    /// walked 404 with one logged walk.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_budget_expiry_between_probe_and_walk_sheds_503(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let walk_log = tmp.path().join("walks.log");
+        state.git_bin = walk_logging_fake_git(tmp.path(), &walk_log);
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_request_budget_secs = 1;
+        state.config = Arc::new(cfg);
+
+        let (repo_id, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6f3probe",
+            "gated",
+            b"probe-then-expire proof\n",
+        )
+        .await;
+        state
+            .db
+            .set_visibility_rule(
+                &repo_id,
+                "src/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkU3IpfsReaderEEEEEEEEEEEEEEEEEEEEEEEE".to_string()],
+                "z6f3probe",
+            )
+            .await
+            .unwrap();
+
+        // Stall the REAL-git probe past the budget while still letting it
+        // succeed: `objects/info/alternates` as a FIFO blocks cat-file's odb
+        // setup until a writer appears. The feeder thread supplies an EMPTY
+        // alternates list (open + close, no bytes) after 2s, so the probe then
+        // resolves the genuine loose object. Non-blocking open with retries so
+        // a handler that never probes cannot wedge the feeder forever.
+        let rec = state
+            .db
+            .get_repo("z6f3probe", "gated")
+            .await
+            .unwrap()
+            .unwrap();
+        let bare = state
+            .repo_store
+            .acquire(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        let fifo = bare.join("objects").join("info").join("alternates");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) },
+            0,
+            "mkfifo(objects/info/alternates) must succeed"
+        );
+        let feeder = std::thread::spawn(move || {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            for _ in 0..300 {
+                if std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                    .is_ok()
+                {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let peer: SocketAddr = "203.0.113.72:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid_for_oid(&oid), Some(peer)))
+            .await
+            .unwrap();
+        feeder.join().unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "probed-present with the budget gone must shed the truncation 503: \
+             never the walked 404, never a serve"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("budget"),
+            "the shed must name the budget taint; got: {body}"
+        );
+        let walks = std::fs::read_to_string(&walk_log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            walks, 0,
+            "no walk may START once the budget is exhausted, even for a probed-present object"
         );
     }
 
