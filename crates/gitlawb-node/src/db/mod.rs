@@ -2379,6 +2379,25 @@ impl Db {
             .collect())
     }
 
+    /// Whether `pin_repo_sources` is at the `MAX_PIN_SOURCES` cap for this oid, i.e.
+    /// the provenance source set returned by [`Self::pin_sources_for_oid`] may be
+    /// INCOMPLETE. `record_pin_source` stops inserting at exactly `MAX_PIN_SOURCES`
+    /// rows and drops later sources silently, so a full table is the only observable
+    /// signal that a servable source (e.g. a later public pinner) may have been
+    /// dropped. `get_by_cid` uses this to decide whether a provenance miss should fall
+    /// back to the bounded legacy scan (which gates every repo through the real
+    /// visibility gate and so finds a dropped public source) rather than 404 — closing
+    /// the pin-source griefing hole where 16 attacker sources bury a public one. `>=`
+    /// (not `==`) is defensive against any future overshoot.
+    pub async fn pin_sources_at_cap(&self, sha256_hex: &str) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1")
+                .bind(sha256_hex)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count >= MAX_PIN_SOURCES)
+    }
+
     pub async fn record_encrypted_blob(
         &self,
         repo_id: &str,

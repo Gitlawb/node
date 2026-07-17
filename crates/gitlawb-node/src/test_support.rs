@@ -2450,6 +2450,129 @@ mod tests {
         );
     }
 
+    /// U1 (grok round-4 P1): `pin_sources_at_cap` flips exactly at `MAX_PIN_SOURCES`.
+    /// It is the signal `get_by_cid` uses to decide a provenance miss may be hiding a
+    /// dropped servable source and must fall back to the bounded scan.
+    #[sqlx::test]
+    async fn pin_sources_at_cap_flips_at_max(pool: PgPool) {
+        let state = test_state(pool).await;
+        let cap = crate::db::MAX_PIN_SOURCES;
+        assert!(
+            !state.db.pin_sources_at_cap("atcapoid").await.unwrap(),
+            "an oid with no pin_repo_sources rows is not at cap"
+        );
+        for i in 0..(cap - 1) {
+            state
+                .db
+                .record_pin_source("atcapoid", &format!("r-{i:02}"))
+                .await
+                .unwrap();
+        }
+        assert!(
+            !state.db.pin_sources_at_cap("atcapoid").await.unwrap(),
+            "one below MAX_PIN_SOURCES is not at cap"
+        );
+        state
+            .db
+            .record_pin_source("atcapoid", "r-last")
+            .await
+            .unwrap();
+        assert!(
+            state.db.pin_sources_at_cap("atcapoid").await.unwrap(),
+            "exactly MAX_PIN_SOURCES rows is at cap"
+        );
+    }
+
+    /// U2 (grok round-4 P1, load-bearing): the pin-source GRIEFING hole. A private
+    /// first-pinner denies anon; an attacker fills the whole `MAX_PIN_SOURCES` source
+    /// window with deny-anon sources BEFORE a legitimate public repo pins the same
+    /// object, so the public repo's `record_pin_source` no-ops (cap full) and it is
+    /// buried — present in NO provenance record. The resolver's provenance set is then
+    /// {private + 16 attacker}, all deny anon. Because the set is at_cap (may hide a
+    /// dropped source), the handler falls back to the bounded legacy scan, which gates
+    /// every repo through the real gate and finds the buried PUBLIC copy → 200.
+    /// MUTATION (RED): remove the `at_cap` fallback edge in `get_by_cid` and the buried
+    /// public object 404s forever.
+    #[sqlx::test]
+    async fn ipfs_cid_buried_public_source_still_serves_via_scan_fallback(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["privfirst", "pubburied"]);
+        let priv_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("privfirst.git");
+        let pub_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pubburied.git");
+
+        // Private repo pins FIRST — owns the first-pinner provenance, denies anon.
+        let mut priv_repo = seed_repo(&owner_did, "privfirst");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private first-pinner");
+        let cid = pin_cid_for_repo(&priv_bare, &fx.public_oid, &state.db, &priv_repo.id).await;
+
+        // Attacker fills the ENTIRE MAX_PIN_SOURCES window with deny-anon (non-existent)
+        // sources BEFORE the public repo registers, so the cap is full.
+        let cap = crate::db::MAX_PIN_SOURCES;
+        for i in 0..cap {
+            state
+                .db
+                .record_pin_source(&fx.public_oid, &format!("00-attacker-{i:02}"))
+                .await
+                .expect("attacker source");
+        }
+
+        // A PUBLIC repo pushes the SAME object through the real pin path. Already pinned
+        // (skip branch), so it only tries record_pin_source — which NO-OPS because the
+        // cap is full. The public repo is thus buried: not the first-pinner, not in
+        // pin_repo_sources.
+        let pub_repo = seed_repo(&owner_did, "pubburied"); // public, no rule
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public buried source");
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        crate::ipfs_pin::pin_new_objects(
+            &server.url(),
+            &pub_bare,
+            vec![fx.public_oid.clone()],
+            &state.db,
+            &pub_repo.id,
+        )
+        .await;
+        m.assert_async().await; // /add NOT called (already pinned)
+
+        // The buried public object must STILL serve: the provenance set is at_cap and
+        // all-deny, so the handler falls back to the bounded scan, which finds pubburied.
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a public source buried by a full attacker source window must still serve via the bounded scan fallback (F1)"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the served body is the buried public object's bytes"
+        );
+    }
+
     /// #173 (jatmn round 8, F1 — bound, R2): the per-object source set is capped at
     /// `MAX_PIN_SOURCES` so an adversary pushing one object from many repos cannot make
     /// resolution O(repos). Recording the same oid from `MAX_PIN_SOURCES + 3` distinct

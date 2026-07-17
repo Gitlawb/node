@@ -246,15 +246,77 @@ pub async fn get_by_cid(
             .pin_sources_for_oid(sha256_hex)
             .await
             .map_err(AppError::Internal)?;
-        if sources.is_empty() {
-            // F3 (#173, INV-10/INV-15): the legacy NULL-provenance scan builds an
-            // O(repos) preload (repos + rules + quarantine) BEFORE gate_and_serve's
-            // per-probe brake can bite, so a throttled source could still force O(repos)
-            // DB work on every replay. Peek the per-IP limiter WITHOUT consuming a token:
-            // an already-throttled source is shed here, before the preload runs. The
+        // Provenance fast-path: try each recorded source repo through the SAME gate
+        // (bounded to first-pinner + MAX_PIN_SOURCES). Empty for a legacy NULL-provenance
+        // pin. The first source that authorizes serves — no scan fan-out on the common
+        // path.
+        for repo_id in &sources {
+            let repo = match state
+                .db
+                .get_repo_by_id(repo_id)
+                .await
+                .map_err(AppError::Internal)?
+            {
+                Some(r) => r,
+                // A source repo is gone: skip it; a later source or the scan fallback
+                // below may still resolve.
+                None => continue,
+            };
+            let quarantined = state
+                .db
+                .is_repo_quarantined(repo_id)
+                .await
+                .map_err(AppError::Internal)?;
+            let rules_map = state
+                .db
+                .list_visibility_rules_for_repos(std::slice::from_ref(repo_id))
+                .await
+                .map_err(AppError::Internal)?;
+            let rules = rules_map.get(repo_id).map(Vec::as_slice).unwrap_or(&[]);
+            match gate_and_serve(
+                &state,
+                &repo,
+                rules,
+                quarantined,
+                sha256_hex,
+                &rctx,
+                &mut walk,
+                false,
+            )
+            .await
+            {
+                GateOutcome::Served(resp) => return Ok(resp),
+                GateOutcome::Throttled => {
+                    throttled = true;
+                    continue;
+                }
+                GateOutcome::Skip => continue,
+            }
+        }
+
+        // Bounded legacy-scan fallback. Run it when the provenance set could not have
+        // served the caller AND may be INCOMPLETE:
+        //   - empty  -> a legacy NULL-provenance pin (recorded before provenance existed), or
+        //   - at_cap -> `record_pin_source` stops inserting at MAX_PIN_SOURCES and drops
+        //               later sources SILENTLY, so a full table may hide a servable source
+        //               (e.g. a later PUBLIC pinner buried by 16 attacker sources — the
+        //               pin-source griefing hole). The scan gates every repo through the
+        //               real per-caller gate, so it finds that copy.
+        // A non-empty, non-full set is COMPLETE (every recorded source was just tried), so
+        // skip the scan and let the tail 404 — ordinary denials never fan out to O(repos)
+        // (INV-10 / F3). The at_cap query runs only on a provenance MISS (we return above
+        // on Served), so it never costs the serve path.
+        let needs_scan = sources.is_empty()
+            || state
+                .db
+                .pin_sources_at_cap(sha256_hex)
+                .await
+                .map_err(AppError::Internal)?;
+        if needs_scan {
+            // F3 (#173, INV-10/INV-15): peek the per-IP limiter WITHOUT consuming a token
+            // so an already-throttled source is shed BEFORE the O(repos) preload; the
             // consuming per-probe charge inside gate_and_serve is left UNCHANGED (it is
-            // load-bearing for the across-request bound), so this adds no double-charge —
-            // a non-consuming peek plus the existing per-probe charge, never two charges.
+            // load-bearing for the across-request bound), so this adds no double-charge.
             if let Some(key) =
                 crate::rate_limit::client_key(rctx.headers, rctx.peer, state.push_limiter_trust)
             {
@@ -263,9 +325,7 @@ pub async fn get_by_cid(
                     continue;
                 }
             }
-            // Legacy pin (recorded before provenance existed): fall back to the repo
-            // scan, gating each repo through the SAME gate. Load the scan context
-            // once, lazily.
+            // Load the scan context once, lazily (shared across oid candidates).
             if scan_ctx.is_none() {
                 #[cfg(test)]
                 bump_preload_queries();
@@ -307,51 +367,6 @@ pub async fn get_by_cid(
                     // keep scanning for a later walk-free copy (#173 review, F-C).
                     GateOutcome::Throttled => throttled = true,
                     GateOutcome::Skip => {}
-                }
-            }
-        } else {
-            for repo_id in &sources {
-                let repo = match state
-                    .db
-                    .get_repo_by_id(repo_id)
-                    .await
-                    .map_err(AppError::Internal)?
-                {
-                    Some(r) => r,
-                    // A source repo is gone: skip this source. Do NOT fall back to the
-                    // scan (that would reopen the fan-out); a later source or oid
-                    // candidate may still resolve.
-                    None => continue,
-                };
-                let quarantined = state
-                    .db
-                    .is_repo_quarantined(repo_id)
-                    .await
-                    .map_err(AppError::Internal)?;
-                let rules_map = state
-                    .db
-                    .list_visibility_rules_for_repos(std::slice::from_ref(repo_id))
-                    .await
-                    .map_err(AppError::Internal)?;
-                let rules = rules_map.get(repo_id).map(Vec::as_slice).unwrap_or(&[]);
-                match gate_and_serve(
-                    &state,
-                    &repo,
-                    rules,
-                    quarantined,
-                    sha256_hex,
-                    &rctx,
-                    &mut walk,
-                    false, // provenance path: bounded source set, no scan fan-out
-                )
-                .await
-                {
-                    GateOutcome::Served(resp) => return Ok(resp),
-                    GateOutcome::Throttled => {
-                        throttled = true;
-                        continue;
-                    }
-                    GateOutcome::Skip => continue,
                 }
             }
         }
