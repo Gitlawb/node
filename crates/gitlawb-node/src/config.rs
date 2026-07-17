@@ -372,13 +372,17 @@ pub struct Config {
     )]
     pub ipfs_walk_per_source: usize,
 
-    /// Upper bound on the number of candidate repos a single `/ipfs/{cid}` request
-    /// will walk before giving up (returning the opaque 404). The handler already
-    /// short-circuits the moment it serves the object, but a CID that is present in
-    /// (or path-gated out of) many repos could otherwise serialize one full-history
-    /// walk per repo inside a single held admission slot. Capping the count bounds
-    /// the worst-case work one request can pin its slot with. Must be between 1 and
-    /// 1_048_576. Default: 64.
+    /// Upper bound on the number of EXPENSIVE visibility walks
+    /// (`allowed_blob_set_for_caller_bounded`, a full-history git walk in a
+    /// blocking thread) a single `/ipfs/{cid}` request may run. Only a blob in a
+    /// path-scoped repo costs a walk, so the cap counts exactly those candidates
+    /// — cheap probe-only visits are bounded by `ipfs_max_repo_visits` instead
+    /// (counting them here would starve a plain public copy past the cap out of
+    /// its 200). On exhaustion the walk-needing repo is skipped WITHOUT a verdict
+    /// and the scan continues; if the request then finds the object nowhere it
+    /// sheds a retryable 503 + Retry-After rather than misreport existing content
+    /// absent with a 404. The handler still short-circuits the moment it serves.
+    /// Must be between 1 and 1_048_576. Default: 64.
     #[arg(
         long,
         env = "GITLAWB_IPFS_MAX_REPOS_WALKED",
@@ -386,6 +390,24 @@ pub struct Config {
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
     pub ipfs_max_repos_walked: usize,
+
+    /// Ceiling on the number of repos a single `/ipfs/{cid}` request may VISIT —
+    /// pass the repo-level visibility gate into the acquire + `cat-file` probe.
+    /// Each visit costs a `RepoStore::acquire` (on a Tigris cache miss that is a
+    /// full repo-archive download from object storage, so the worst-case
+    /// object-store fetch count for one request equals this ceiling) plus a git
+    /// probe subprocess. On exhaustion the scan STOPS — unlike
+    /// `ipfs_max_repos_walked`, which skips just the walk-needing repo, there is
+    /// no cheaper way to keep scanning — and the request sheds a retryable 503 +
+    /// Retry-After rather than a false 404. Must be between 1 and 1_048_576.
+    /// Default: 1024.
+    #[arg(
+        long,
+        env = "GITLAWB_IPFS_MAX_REPO_VISITS",
+        default_value_t = 1024,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub ipfs_max_repo_visits: usize,
 
     /// Per-client-IP rate limit for `GET /ipfs/{cid}`, in requests per hour. The
     /// route is publicly reachable (`optional_signature`) and each request can drive
@@ -545,6 +567,24 @@ mod tests {
         assert!(Config::try_parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "0"]).is_err());
         assert!(
             Config::try_parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "1048577"]).is_err()
+        );
+    }
+
+    #[test]
+    fn ipfs_max_repo_visits_defaults_and_rejects_out_of_range() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).ipfs_max_repo_visits,
+            1024
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--ipfs-max-repo-visits", "8"])
+                .ipfs_max_repo_visits,
+            8
+        );
+        // 0 would visit no repos (serve nothing); clap must reject it.
+        assert!(Config::try_parse_from(["gitlawb-node", "--ipfs-max-repo-visits", "0"]).is_err());
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--ipfs-max-repo-visits", "1048577"]).is_err()
         );
     }
 
