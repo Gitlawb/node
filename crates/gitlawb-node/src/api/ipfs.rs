@@ -50,7 +50,15 @@ use crate::visibility::{visibility_check, Decision};
 /// serves on the first repo that grants them, so reaching it requires being
 /// denied by this many path-scoped repos first, which real traffic effectively
 /// never does. Tunable if that assumption stops holding.
-pub(crate) const MAX_HISTORY_WALKS_PER_REQUEST: u32 = 16;
+///
+/// Kept at `MAX_PIN_SOURCES + 1` so the ceiling can never truncate a request
+/// BEFORE its whole bounded provenance source set (first-pinner + up to
+/// `MAX_PIN_SOURCES` additional) has been tried: an authorizing public source that
+/// sorts after `MAX_PIN_SOURCES` path-scoped denials must still be reached and
+/// served, not falsely 503'd as a truncated search. The legacy scan's fan-out is
+/// separately bounded by `MAX_LEGACY_PROBES_PER_REQUEST`, so widening this by one
+/// does not loosen that path.
+pub(crate) const MAX_HISTORY_WALKS_PER_REQUEST: u32 = crate::db::MAX_PIN_SOURCES as u32 + 1;
 
 /// Hard per-request ceiling on how many legacy (NULL-provenance) repositories
 /// the CID resolver's scan fallback may PROBE (`acquire` + `git cat-file -t`).
