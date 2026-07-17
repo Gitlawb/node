@@ -409,6 +409,32 @@ pub struct Config {
     )]
     pub ipfs_max_repo_visits: usize,
 
+    /// Absolute wall-clock budget for one admitted `GET /ipfs/{cid}` request's
+    /// acquire+walk lifetime, in seconds. `max_concurrent_ipfs_walks` bounds how
+    /// MANY requests hold walk slots; this bounds how LONG one admitted request
+    /// may keep its slot. Without it, each repo iteration draws a fresh
+    /// `git_acquire_timeout_secs` and each expensive walk a fresh
+    /// `git_service_timeout_secs`, so one request scanning many repos could hold
+    /// a scarce walk slot for hours. Every stage (acquire, `cat-file` probe,
+    /// visibility walk, content read) starts only while budget remains, and the
+    /// acquire wait and walk deadline are clamped to `min(their own timeout,
+    /// remaining budget)`; a stage is never started with zero remaining. On
+    /// exhaustion the scan stops without a verdict and the request sheds a
+    /// retryable 503 + Retry-After rather than a false 404. Residual overshoot
+    /// past the budget is bounded by the kill/reap slack of the one in-flight
+    /// clamped stage (the walk watchdog's SIGTERM grace + SIGKILL settle) plus
+    /// the `object_type` / `read_object_content` probe subprocesses, which are
+    /// budget-checked before they start but carry no internal duration clamp.
+    /// Must be positive. Default: 600s (10 min), matching
+    /// `git_service_timeout_secs` so a single full-length walk still fits.
+    #[arg(
+        long,
+        env = "GITLAWB_IPFS_REQUEST_BUDGET_SECS",
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub ipfs_request_budget_secs: u64,
+
     /// Per-client-IP rate limit for `GET /ipfs/{cid}`, in requests per hour. The
     /// route is publicly reachable (`optional_signature`) and each request can drive
     /// a full-history git walk, so it carries a per-IP flood brake in addition to the
@@ -585,6 +611,24 @@ mod tests {
         assert!(Config::try_parse_from(["gitlawb-node", "--ipfs-max-repo-visits", "0"]).is_err());
         assert!(
             Config::try_parse_from(["gitlawb-node", "--ipfs-max-repo-visits", "1048577"]).is_err()
+        );
+    }
+
+    #[test]
+    fn ipfs_request_budget_secs_defaults_to_600_and_rejects_zero() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).ipfs_request_budget_secs,
+            600
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--ipfs-request-budget-secs", "30"])
+                .ipfs_request_budget_secs,
+            30
+        );
+        // 0 would expire every /ipfs request at its first stage (unconditional
+        // 503); clap must reject it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--ipfs-request-budget-secs", "0"]).is_err()
         );
     }
 
