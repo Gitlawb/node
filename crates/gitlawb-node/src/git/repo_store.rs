@@ -152,7 +152,13 @@ impl RepoStore {
     }
 
     /// Take a write lock (Postgres advisory lock), ensure repo is local, return guard.
-    /// The lock prevents concurrent writes to the same repo across machines.
+    ///
+    /// # Cross-machine guarantee
+    ///
+    /// When multiple nodes share a single Postgres database (the shared-Postgres
+    /// deployment model), this lock prevents concurrent writes to the same repo
+    /// across machines. The lock has no effect across separate Postgres instances
+    /// (federated per-node-DB topology).
     pub async fn acquire_write(&self, owner_did: &str, repo_name: &str) -> Result<RepoWriteGuard> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
@@ -393,12 +399,19 @@ impl RepoWriteGuard {
 }
 
 /// Compute a stable i64 hash for a Postgres advisory lock key.
+///
+/// Uses SHA-256 (not `DefaultHasher`) so the same `(owner_slug, repo_name)`
+/// produces the same `i64` key across every Rust toolchain version, operating
+/// system, and machine — the algorithm is frozen by the SHA-2 standard rather
+/// than by a std-internal implementation detail.
 fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    owner_slug.hash(&mut hasher);
-    repo_name.hash(&mut hasher);
-    hasher.finish() as i64
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(owner_slug.as_bytes());
+    hasher.update(b":");
+    hasher.update(repo_name.as_bytes());
+    let digest = hasher.finalize();
+    i64::from_le_bytes(digest[..8].try_into().expect("sha256 output is >= 8 bytes"))
 }
 
 #[cfg(test)]
@@ -561,5 +574,26 @@ mod tests {
                 "owner_did={bad:?} must be rejected"
             );
         }
+    }
+
+    // ── advisory_lock_key stability ─────────────────────────────────────────
+
+    #[test]
+    fn advisory_lock_key_is_stable() {
+        // Golden value: SHA-256("did_key_...:<repo_name>")[..8] as i64 little-endian.
+        // If this test fails, the hashing algorithm has changed — the new key
+        // must be backward-compatible or the rollout planned accordingly.
+        let key = advisory_lock_key(
+            "did_key_z6MkqDnb7Siv3Cwj7pGJq4T5EsUisECqR8KpnDLwcaZq5TPr",
+            "hello",
+        );
+        assert_eq!(key, -6680856138670956537_i64);
+    }
+
+    #[test]
+    fn advisory_lock_key_differs_for_different_inputs() {
+        let a = advisory_lock_key("owner_a", "repo_a");
+        let b = advisory_lock_key("owner_b", "repo_b");
+        assert_ne!(a, b);
     }
 }
