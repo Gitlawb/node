@@ -159,7 +159,15 @@ pub async fn pin_new_objects(
         // Pin to IPFS
         match pin_git_object(ipfs_api, &sha, &data).await {
             Ok(cid) if !cid.is_empty() => {
-                if let Err(e) = db.record_pinned_cid(&sha, &cid, Some(repo_id)).await {
+                // The resolver key (`pinned_cids.cid`) must be the locally-computed
+                // raw-content CID, never the provider Hash: Kubo returns a dag-pb/UnixFS
+                // root for objects above its block size, which does not hash the raw
+                // content, so `GET /ipfs/{provider_cid}` would resolve then fail the F2
+                // integrity check (list-then-404). The serve path reads bytes from git and
+                // verifies them against the requested CID, so the raw CID is the correct
+                // key. Mirrors the pinata twin, which already records the raw CID.
+                let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&data).to_string();
+                if let Err(e) = db.record_pinned_cid(&sha, &raw_cid, Some(repo_id)).await {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinned CID in DB");
                 }
                 // F1 (#173 round 8): also record the first pinner in pin_repo_sources so
@@ -167,7 +175,7 @@ pub async fn pin_new_objects(
                 if let Err(e) = db.record_pin_source(&sha, repo_id).await {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
                 }
-                pinned.push((sha, cid));
+                pinned.push((sha, raw_cid));
             }
             Ok(_) => {}
             Err(e) => {
