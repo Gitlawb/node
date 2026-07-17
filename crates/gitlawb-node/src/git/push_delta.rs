@@ -282,14 +282,47 @@ pub struct PinCandidateSet {
 /// it can never leak because the withheld/fail-closed filter still runs on
 /// whatever set is returned. `full_scan` rides on the returned set so the caller
 /// knows when the dangling-inclusive filter is required.
+///
+/// `scan_sem` is the post-receive scan admission pool (`git_encrypt_semaphore`,
+/// #174 F4): both git-spawning stages — the per-tip `cat-file` probe + delta
+/// rev-list, and the full-scan fallback — run under ONE permit held for the
+/// whole blocking scan. The deletion-only fast path (no new tips) spawns no git
+/// and never parks.
 pub async fn resolve_candidates_for_push(
+    scan_sem: std::sync::Arc<tokio::sync::Semaphore>,
     repo_path: PathBuf,
     new_tips: Vec<String>,
     old_tips: Vec<String>,
     git_bin: String,
     timeout: Duration,
 ) -> PinCandidateSet {
+    // No-git fast path: a deletion-only push resolves to an empty delta without
+    // spawning any git child, so it must not park on the scan pool. The
+    // kill-switch disqualifies it — forcing the full scan spawns git.
+    if new_tips.is_empty() && !force_full_scan() {
+        tracing::info!(delta = 0usize, repo = %repo_path.display(), "pin candidate set from push delta");
+        return PinCandidateSet {
+            candidates: Vec::new(),
+            full_scan: false,
+        };
+    }
+    // Scan admission (#174 F4): DEFER (await), never shed — a dropped scan would
+    // silently under-pin this push. The permit moves into the blocking closure so
+    // a started scan always completes holding it. Residuals as documented at
+    // `replication_withheld_set`'s acquire: park wait is queue-depth multiplied,
+    // and a client disconnect while parked loses this push's replication work.
+    let parked = Instant::now();
+    let permit = scan_sem
+        .acquire_owned()
+        .await
+        .expect("git_encrypt_semaphore is never closed");
+    tracing::debug!(
+        repo = %repo_path.display(),
+        queue_wait_ms = parked.elapsed().as_millis() as u64,
+        "pin-candidate scan admitted to the scan pool"
+    );
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         // ONE shared deadline for the whole scan, per jatmn ("the same deadline").
         let deadline = Instant::now() + timeout;
         let new_refs: Vec<&str> = new_tips.iter().map(String::as_str).collect();
@@ -547,6 +580,7 @@ mod tests {
         let c1 = repo.commit_file("a.txt", "one\n");
         let c2 = repo.commit_file("b.txt", "two\n");
         let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             repo.path.clone(),
             vec![c2.clone()],
             vec![c1.clone()],
@@ -576,6 +610,7 @@ mod tests {
             .into_iter()
             .collect();
         let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             repo.path.clone(),
             vec![blob],
             vec![],
@@ -586,6 +621,127 @@ mod tests {
         assert!(set.full_scan, "non-commit tip is signalled as a full scan");
         let got: HashSet<String> = set.candidates.into_iter().collect();
         assert_eq!(got, all, "non-commit tip falls back to full repo scan");
+    }
+
+    /// F4 defer proof 2: `resolve_candidates_for_push`'s git stages (the per-tip
+    /// cat-file type probe + delta rev-list, and the full-scan fallback) run under a
+    /// scan-admission permit: with a zero-permit pool the call parks and spawns no
+    /// git; once a permit is available the SAME call runs (defer, not shed). On
+    /// ungated code the git runs regardless of the pool (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_candidates_defers_when_scan_pool_exhausted() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("git.ran");
+        // Fake git records ANY invocation; cat-file reports a commit tip so the
+        // delta stage proceeds, rev-list yields an empty delta.
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  cat-file) echo commit ;;\n  *) : ;;\nesac\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+        let tip = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(0));
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            resolve_candidates_for_push(
+                sem.clone(),
+                dir.path().to_path_buf(),
+                vec![tip.clone()],
+                vec![],
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the pin-candidate scan must defer (park on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the scan's git must not spawn while its admission permit is unavailable (F4)"
+        );
+
+        // Release admission: the SAME scan now runs (defer, not shed).
+        sem.add_permits(1);
+        let set = resolve_candidates_for_push(
+            sem,
+            dir.path().to_path_buf(),
+            vec![tip],
+            vec![],
+            git_bin,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred scan runs its git"
+        );
+        assert!(!set.full_scan, "commit tip + empty rev-list is a delta");
+        assert!(set.candidates.is_empty());
+    }
+
+    /// F4 fast-path negative arm: a deletion-only push (no new tips, kill-switch
+    /// off) computes its empty delta without spawning ANY git child, so it must
+    /// complete without acquiring from the scan pool — even at zero permits. The
+    /// per-tip cat-file probe means every push with a non-empty new tip DOES spawn
+    /// git, so this is the only genuinely git-free stage.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_candidates_no_git_fast_path_skips_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("git.ran");
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho ran >> \"{}\"\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let set = tokio::time::timeout(
+            Duration::from_millis(500),
+            resolve_candidates_for_push(
+                Arc::new(Semaphore::new(0)),
+                dir.path().to_path_buf(),
+                vec![],
+                vec!["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()],
+                fake.to_str().unwrap().to_string(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the no-new-tips fast path must not park on the scan pool");
+        assert_eq!(
+            set,
+            PinCandidateSet {
+                candidates: Vec::new(),
+                full_scan: false
+            }
+        );
+        assert!(!marker.exists(), "the fast path must spawn no git at all");
     }
 
     #[test]

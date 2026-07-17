@@ -110,14 +110,20 @@ pub struct AppState {
     /// advert pool (each source also capped by `git_push_advert_per_caller` and the
     /// per-IP push rate limiter), and the reserved POST pool is untouched (#174).
     pub git_push_advert_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Bounds concurrent post-push encrypt-then-pin history walks. Each successful
-    /// path-scoped push releases its handler write permit and then runs a DETACHED
-    /// full-history walk (`withheld_blob_recipients_bounded`) to seal withheld blobs;
-    /// without a cap, N fast pushes spawn N concurrent full-history git walks past
-    /// `max_concurrent_git_pushes` (which only bounds the in-handler phase). The walk
-    /// acquires a permit here and DEFERS (blocks) when the pool is full rather than
-    /// shedding — the work is background and dropping it would lose the recovery copy
-    /// (#174 P1-e). A pool of its own, not `git_write_semaphore`: a long background
+    /// Bounds concurrent post-receive git scans. Each successful push releases its
+    /// handler write permit the moment receive-pack's git group is reaped, then runs
+    /// up to four scans over the repo: the anonymous withheld walk
+    /// (`replication_withheld_set`), the pin-candidate scan
+    /// (`resolve_candidates_for_push`), the fail-closed full scan
+    /// (`fail_closed_full_scan_objects`), and the DETACHED encrypt-then-pin walk
+    /// (`withheld_blob_recipients_bounded`). Without a cap, N fast pushes spawn N
+    /// concurrent full-history git walks past `max_concurrent_git_pushes` (which only
+    /// bounds the in-handler receive-pack phase) — #174 P1-e closed the detached walk,
+    /// F4 closed the other three. Each scan acquires ONE permit here per walk and
+    /// DEFERS (blocks) when the pool is full rather than shedding — dropping the work
+    /// would lose the recovery copy or silently under-pin the push. No-walk fast
+    /// paths (not announceable, no path-scoped rule, deletion-only push) never touch
+    /// the pool. A pool of its own, not `git_write_semaphore`: a long background
     /// walk must not hold a foreground write slot, and a handler already holding a
     /// write permit that needed a second would self-deadlock at pool size 1.
     pub git_encrypt_semaphore: Arc<tokio::sync::Semaphore>,
