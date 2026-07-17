@@ -1473,6 +1473,7 @@ pub async fn git_receive_pack(
                         &repo_path_clone,
                         object_list_ipfs,
                         &db_clone,
+                        &repo_id,
                     )
                     .await;
                     if !pinned.is_empty() {
@@ -1573,6 +1574,7 @@ pub async fn git_receive_pack(
         let pinata_upload_url = state.config.pinata_upload_url.clone();
         let repo_path_clone = disk_path.clone();
         let db_clone = state.db.clone();
+        let repo_id = record.id.clone();
         let http_client = Arc::clone(&state.http_client);
         let node_did_str = state.node_did.to_string();
         let repo_slug = format!(
@@ -1603,6 +1605,7 @@ pub async fn git_receive_pack(
                     &repo_path_clone,
                     object_list_pinata,
                     &db_clone,
+                    &repo_id,
                 )
                 .await
             } else {

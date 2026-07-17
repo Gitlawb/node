@@ -648,6 +648,477 @@ pub fn allowed_blob_set_for_caller_bounded(
     Ok(allowed)
 }
 
+/// The reachable-commit enumeration for the LENIENT walks (the `/ipfs/{cid}` tree
+/// gate and the commit/tag reachability set): bounded `git rev-list --all [HEAD]`
+/// under the caller's shared `deadline`, deliberately WITHOUT
+/// `assert_all_refs_are_commits`. That guard fail-closes a repo's whole walk when
+/// any ref peels to a non-commit (an annotated tag of a tree is pushable through
+/// receive-pack), which would 404 every reachable tree/commit/tag CID here for a
+/// legitimate reader. `rev-list --all` skips such refs cleanly, so the commit set
+/// stays complete; an object reachable only via such a ref is simply excluded —
+/// correctly fail-closed. Fails closed on a rev-list error.
+///
+/// Safe ONLY for a caller whose output feeds a fail-closed allow-list where absence
+/// = withhold: a tolerant walk there over-withholds, never leaks. NOT safe for a
+/// serve/replication filter, where a missed reachable object under-withholds —
+/// those go through `blob_paths`, which runs the guard first.
+fn reachable_commit_oids(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<Vec<String>> {
+    // The HEAD probe is a bounded `git rev-parse --verify HEAD` (a clean exit means
+    // HEAD resolves), matching `blob_paths`. When HEAD does not resolve (unborn
+    // branch on an empty repo) `--all` alone yields nothing, which is correct.
+    let head_resolves = run_bounded_git(
+        git_bin,
+        &["rev-parse", "--verify", "HEAD"],
+        repo_path,
+        b"",
+        deadline,
+    )
+    .is_ok();
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head_resolves {
+        rev_args.push("HEAD");
+    }
+    let out = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Every `(oid, "/repo/relative/path", kind)` triple reachable from the given
+/// `commits` — the shared ls-tree seam the tree walk filters (`kind == "tree"`).
+/// One bounded `git ls-tree -rzt` per commit under the caller's shared `deadline`:
+/// `-rzt` is byte-identical to `-rz` for blob records and additionally emits the
+/// tree object for each directory at its own path. `kind` is git's object-type
+/// string ("blob", "tree", or "commit" for a gitlink). The commit's ROOT tree is
+/// not emitted by `ls-tree` (it lists entries *under* a tree); `tree_paths` adds
+/// it. Triples are de-duplicated across commits and paths carry a leading "/" to
+/// match the glob form of visibility rules ("/secret/**").
+///
+/// Fails closed: if any tree walk fails — or a path is not valid UTF-8 — it
+/// returns an error so the caller aborts rather than producing a partial
+/// (under-withheld) set.
+fn object_paths(
+    repo_path: &Path,
+    git_bin: &str,
+    commits: &[String],
+    deadline: Instant,
+) -> Result<HashSet<(String, String, String)>> {
+    let mut out: HashSet<(String, String, String)> = HashSet::new();
+    for commit in commits {
+        let listing_out = run_bounded_git(
+            git_bin,
+            &["ls-tree", "-rzt", commit],
+            repo_path,
+            b"",
+            deadline,
+        )?;
+        // `-z` NUL-delimits records and emits paths raw; plain `git ls-tree -r`
+        // C-quotes any path with non-ASCII or special bytes (e.g. café.txt becomes
+        // "secret/caf\303\251.txt"), and that quoted literal would not match a
+        // visibility rule like "/secret/**", under-withholding the object. The TAB
+        // field separator survives `-z`, so the per-record parse is unchanged.
+        //
+        // Parse strictly: a lossy decode would replace an invalid byte in a denied
+        // path (e.g. a non-UTF-8 directory name) with U+FFFD, and the mangled string
+        // would no longer match its deny rule — the same under-withholding class, one
+        // layer down. Fail closed instead so the caller aborts rather than leaks.
+        let Ok(listing_stdout) = std::str::from_utf8(&listing_out) else {
+            anyhow::bail!(
+                "git ls-tree -rzt {commit} returned a non-UTF-8 path; \
+                 refusing to produce a partial (under-withheld) set"
+            );
+        };
+        for record in listing_stdout.split('\0') {
+            // "<mode> <kind> <oid>\t<path>"
+            let Some((meta, path)) = record.split_once('\t') else {
+                continue;
+            };
+            let mut parts = meta.split_whitespace();
+            let _mode = parts.next();
+            let kind = parts.next();
+            let oid = parts.next();
+            if let (Some(kind), Some(oid)) = (kind, oid) {
+                out.insert((oid.to_string(), format!("/{path}"), kind.to_string()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Root tree oid of every reachable commit, at "/". `ls-tree` never emits a commit's
+/// own root tree (it lists entries *under* a tree), so it is added explicitly here.
+/// Resolved in ONE bounded `git log --no-walk --format=%T --stdin` pass over the
+/// shared commit set — not a per-commit `rev-parse` — so a tree-set walk costs the
+/// same subprocess order as the blob walk. The commit oids go on STDIN, not argv: a
+/// long history has tens of thousands of reachable commits, and passing them all as
+/// arguments overflows ARG_MAX so `git log` fails to spawn — which the caller treats
+/// as a walk error and fail-closed 404s an authorized reader of a reachable/root
+/// tree (#173 P2). `run_bounded_git` drains stdout concurrently with the stdin
+/// write, so a large history cannot deadlock the pipes. A commit whose root tree git
+/// cannot resolve fails the pass (bail), failing closed.
+fn root_tree_pairs(
+    repo_path: &Path,
+    git_bin: &str,
+    commits: &[String],
+    deadline: Instant,
+) -> Result<HashSet<(String, String)>> {
+    if commits.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut buf = String::with_capacity(commits.len() * 65);
+    for c in commits {
+        buf.push_str(c);
+        buf.push('\n');
+    }
+    let out = run_bounded_git(
+        git_bin,
+        &["log", "--no-walk=unsorted", "--format=%T", "--stdin"],
+        repo_path,
+        buf.as_bytes(),
+        deadline,
+    )?;
+    let mut set = HashSet::new();
+    for line in String::from_utf8_lossy(&out).lines() {
+        let oid = line.trim();
+        if !oid.is_empty() {
+            set.insert((oid.to_string(), "/".to_string()));
+        }
+    }
+    Ok(set)
+}
+
+/// Every `(tree_oid, "/path")` pair reachable in `repo_path`: the `kind == "tree"`
+/// slice of [`object_paths`] (subtree trees at their directory paths) PLUS every
+/// reachable commit's root tree at "/" (see [`root_tree_pairs`]). Computes the
+/// reachable-commit set ONCE (leniently — see [`reachable_commit_oids`]; the tree
+/// allowed-set feeds ONLY the `/ipfs/{cid}` tree gate, where absence = fail-closed
+/// 404) and drives both the ls-tree walk and the root-tree pass from it, so the two
+/// cannot diverge and neither re-enumerates. The tree analog of [`blob_paths`],
+/// bounded by the same shared `deadline`.
+fn tree_paths(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<HashSet<(String, String)>> {
+    let commits = reachable_commit_oids(repo_path, git_bin, deadline)?;
+    let mut out: HashSet<(String, String)> = object_paths(repo_path, git_bin, &commits, deadline)?
+        .into_iter()
+        .filter(|(_, _, kind)| kind == "tree")
+        .map(|(oid, path, _)| (oid, path))
+        .collect();
+    out.extend(root_tree_pairs(repo_path, git_bin, &commits, deadline)?);
+    Ok(out)
+}
+
+/// The OIDs from a `(oid, "/path")` listing that visibility ALLOWS `caller` at some
+/// path — the shared inner loop of the blob and tree allowed-sets. An oid reachable
+/// at an allowed path is kept even when also reachable at a denied one.
+fn allowed_set_from_pairs<'a>(
+    pairs: impl IntoIterator<Item = &'a (String, String)>,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> HashSet<String> {
+    pairs
+        .into_iter()
+        .filter(|(_, path)| {
+            visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow
+        })
+        .map(|(oid, _)| oid.clone())
+        .collect()
+}
+
+/// Reachable tree OIDs that visibility ALLOWS `caller` at some path — the tree
+/// analog of [`allowed_blob_set_for_caller`]. `GET /ipfs/{cid}` gates tree objects
+/// with this so the CID surface matches `get_tree`: a tree reachable only at a
+/// withheld path is absent from the set and 404'd; the root tree ("/") and any tree
+/// on the path to an allowed subtree are present. Fails closed on a
+/// dangling/unreachable tree (never enumerated by the reachable walk, so never in
+/// the set — the #126 geometry, for trees). A tree reachable at an allowed path is
+/// included even when also reachable at a withheld one (its structure is visible to
+/// this caller elsewhere).
+#[cfg(test)]
+pub fn allowed_tree_set_for_caller(
+    repo_path: &Path,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Result<HashSet<String>> {
+    allowed_tree_set_for_caller_bounded(
+        repo_path,
+        "git",
+        WALK_TIMEOUT,
+        rules,
+        is_public,
+        owner_did,
+        caller,
+    )
+}
+
+/// [`allowed_tree_set_for_caller`] with an injectable `git_bin` and walk `timeout`,
+/// for the `GET /ipfs/{cid}` tree gate. One deadline spans the whole walk (the HEAD
+/// probe, rev-list, every per-commit ls-tree, and the root-tree pass), matching
+/// `blob_paths`, so a slow or hung walk is bounded as a unit while the handler holds
+/// its /ipfs walk permit (#174 F5).
+pub fn allowed_tree_set_for_caller_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    timeout: Duration,
+    rules: &[VisibilityRule],
+    is_public: bool,
+    owner_did: &str,
+    caller: Option<&str>,
+) -> Result<HashSet<String>> {
+    let deadline = Instant::now() + timeout;
+    Ok(allowed_set_from_pairs(
+        &tree_paths(repo_path, git_bin, deadline)?,
+        rules,
+        is_public,
+        owner_did,
+        caller,
+    ))
+}
+
+/// Object bound for the annotated-tag reachability walk (#173, jatmn tag fan-out).
+/// A path-scoped pinned-CID request drives this walk while holding one per-request
+/// and one per-IP walk slot, so the total tag work must be finite regardless of how
+/// many tag refs the repo has. 8192 is far past any real repo's annotated-tag count
+/// (the Linux kernel has a few hundred), yet finite: a repo beyond it fails closed
+/// (Err), matching this function's fail-closed-on-any-git-error contract, rather than
+/// truncating silently (which would under-withhold a still-reachable tag object).
+const MAX_TAG_OBJECTS: usize = 8192;
+
+/// Walk the annotated-tag chains rooted at `seeds`, inserting every tag object they
+/// pass through into `set`. A tag whose target is itself a tag (tag-of-a-tag)
+/// discovers the inner tag, which is walked in a later round.
+///
+/// #173 (jatmn): the tag inspection is BATCHED, not one process per tag. Each round
+/// feeds every not-yet-inspected tag oid to a SINGLE `git cat-file --batch` child on
+/// stdin and reads back framed `<oid> <type> <size>\n<contents>\n` records, so the
+/// number of child processes is bounded by the tag-chain DEPTH (rounds), not the tag
+/// COUNT. Oids go on stdin, never argv, so a large tag set cannot overflow ARG_MAX.
+/// The child runs through [`run_bounded_git`], which drains stdout concurrently with
+/// the stdin write (subsuming #173's F4 writer-thread drain — a round large enough to
+/// fill both pipes cannot deadlock) and tears the child down at `deadline`, so a hung
+/// cat-file cannot pin the caller's /ipfs walk permit (#174 F5). Total tag objects
+/// inspected are capped at `max_tag_objects`; exceeding it is an error (fail closed),
+/// not a silent truncation. Takes the bound as a parameter so a test can drive a tiny
+/// value while the caller passes the real `MAX_TAG_OBJECTS`.
+fn walk_tag_chain(
+    repo_path: &Path,
+    git_bin: &str,
+    seeds: Vec<String>,
+    set: &mut HashSet<String>,
+    max_tag_objects: usize,
+    deadline: Instant,
+) -> Result<()> {
+    // Tag oids known but not yet inspected. Seeds may repeat / already be present;
+    // the `set.insert` gate below is what actually dedups and terminates cycles.
+    let mut pending: Vec<String> = seeds;
+    let mut inspected: usize = 0;
+
+    while !pending.is_empty() {
+        // Inspect only oids new to `set`; a re-seen oid was already walked.
+        let round: Vec<String> = pending
+            .drain(..)
+            .filter(|oid| set.insert(oid.clone()))
+            .collect();
+        if round.is_empty() {
+            break;
+        }
+        inspected += round.len();
+        if inspected > max_tag_objects {
+            anyhow::bail!(
+                "annotated-tag walk exceeded the object bound ({max_tag_objects}); refusing to serve"
+            );
+        }
+
+        // One bounded child for the whole round: feed all oids on stdin, read the
+        // framed records from the returned stdout.
+        let mut buf = String::with_capacity(round.len() * 65);
+        for oid in &round {
+            buf.push_str(oid);
+            buf.push('\n');
+        }
+        let stdout = run_bounded_git(
+            git_bin,
+            &["cat-file", "--batch"],
+            repo_path,
+            buf.as_bytes(),
+            deadline,
+        )?;
+
+        // Parse one record per requested oid: `<oid> <type> <size>\n<size bytes>\n`.
+        // A `<oid> missing\n` record has no size/body and is anomalous here (every
+        // oid came from a ref tip or a prior tag body), so fail closed.
+        let mut i = 0usize;
+        for _ in 0..round.len() {
+            let hdr_end = stdout[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|p| i + p)
+                .context("git cat-file --batch: truncated record header")?;
+            let header = std::str::from_utf8(&stdout[i..hdr_end])
+                .context("git cat-file --batch: non-utf8 record header")?;
+            i = hdr_end + 1;
+            let mut fields = header.split(' ');
+            let _oid = fields.next().unwrap_or("");
+            let ty = fields.next().unwrap_or("");
+            if ty == "missing" || fields.clone().next().is_none() {
+                anyhow::bail!("git cat-file --batch: object {header:?} missing or malformed");
+            }
+            let size: usize = fields
+                .next()
+                .unwrap_or("")
+                .parse()
+                .context("git cat-file --batch: bad record size")?;
+            let body_end = i
+                .checked_add(size)
+                .filter(|&e| e <= stdout.len())
+                .context("git cat-file --batch: truncated record body")?;
+            // Only a tag object can point at an inner tag; walk its header.
+            if ty == "tag" {
+                let body = std::str::from_utf8(&stdout[i..body_end])
+                    .context("git cat-file --batch: non-utf8 tag body")?;
+                let mut target = None;
+                let mut is_tag = false;
+                for line in body.lines() {
+                    if let Some(oid) = line.strip_prefix("object ") {
+                        target = Some(oid.trim().to_string());
+                    } else if line == "type tag" {
+                        is_tag = true;
+                    } else if line.is_empty() {
+                        break; // end of header
+                    }
+                }
+                if is_tag {
+                    if let Some(t) = target {
+                        pending.push(t);
+                    }
+                }
+            }
+            // Skip body plus its trailing newline to the next record.
+            i = body_end + 1;
+        }
+    }
+    Ok(())
+}
+
+/// The reachable-commit/tag gate set for the `/ipfs/{cid}` resolver (#173, F2):
+/// every reachable commit oid UNION every reachable annotated-tag OBJECT oid. A
+/// DANGLING commit/tag (referenced by no ref, directly or via a tag chain) is in
+/// neither part, so the resolver denies it under a path-scoped rule instead of
+/// leaking its message; a reachable one still serves.
+#[cfg(test)]
+pub fn reachable_commit_tag_oids(repo_path: &Path) -> Result<HashSet<String>> {
+    reachable_commit_tag_oids_bounded(repo_path, "git", WALK_TIMEOUT)
+}
+
+/// [`reachable_commit_tag_oids`] with an injectable `git_bin` and walk `timeout`,
+/// for the `GET /ipfs/{cid}` commit/tag gate. One deadline spans the whole walk.
+///
+/// Reachable commits come from bounded `git rev-list --all` (+ HEAD for the
+/// detached case). Unlike the blob allowed-set, this does NOT run
+/// `assert_all_refs_are_commits`: that guard fail-closes a repo's whole walk when
+/// any ref peels to a non-commit (an annotated tag of a tree is pushable through
+/// receive-pack), which would 404 every reachable commit/tag CID here for a
+/// legitimate reader. The guard exists to stop blob/tree UNDER-withholding; it is
+/// unnecessary for reachability, since a dangling object is absent from
+/// `rev-list --all` and the ref walk below regardless of odd refs — so dropping it
+/// recovers availability without admitting any dangling object (no leak).
+///
+/// Reachable tag OBJECTS: `rev-list --all` dereferences annotated tags to commits,
+/// so the tag objects are absent from it. Collect them by walking every ref tip and
+/// peeling each tag's chain, so a nested tag-of-a-tag's INNER tag object (reachable
+/// and pinnable, but not itself a ref tip) is included too. Fails closed on any git
+/// error.
+pub fn reachable_commit_tag_oids_bounded(
+    repo_path: &Path,
+    git_bin: &str,
+    timeout: Duration,
+) -> Result<HashSet<String>> {
+    let deadline = Instant::now() + timeout;
+    // Reachable commits — no ref-commit assertion (see docstring). The HEAD probe
+    // doubles as the seed source for the tag-valued detached HEAD below:
+    // `rev-parse --verify HEAD` returns the tag oid UNPEELED when HEAD names a tag
+    // object. Failing to resolve HEAD (unborn/absent) is not fatal — there is
+    // simply no HEAD to walk or seed.
+    let head_oid: Option<String> = run_bounded_git(
+        git_bin,
+        &["rev-parse", "--verify", "HEAD"],
+        repo_path,
+        b"",
+        deadline,
+    )
+    .ok()
+    .map(|out| String::from_utf8_lossy(&out).trim().to_string())
+    .filter(|s| !s.is_empty());
+    let mut rev_args = vec!["rev-list", "--all"];
+    if head_oid.is_some() {
+        rev_args.push("HEAD");
+    }
+    let rev = run_bounded_git(git_bin, &rev_args, repo_path, b"", deadline)?;
+    let mut set: HashSet<String> = String::from_utf8_lossy(&rev)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // Ref tips that are annotated tag objects seed the tag-chain walk.
+    let refs = run_bounded_git(
+        git_bin,
+        &["for-each-ref", "--format=%(objectname) %(objecttype)"],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let mut worklist: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&refs).lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(oid), Some("tag")) = (it.next(), it.next()) {
+            worklist.push(oid.to_string());
+        }
+    }
+    // A detached/direct HEAD may name an annotated tag object with no ref at that tag
+    // (#173 review, finding 3): `rev-list --all HEAD` above peels it to its commit and
+    // `for-each-ref` has no tag row, so the tag OBJECT would be omitted and its pinned
+    // CID would 404 for an authorized reader. Seed a tag-valued HEAD into the tag-chain
+    // walk; a `commit` HEAD adds nothing. A cat-file failure here only skips the seed
+    // (over-withholds that one tag — fail-closed), matching the original's tolerance.
+    if let Some(head_oid) = head_oid {
+        if let Ok(ty) = run_bounded_git(
+            git_bin,
+            &["cat-file", "-t", &head_oid],
+            repo_path,
+            b"",
+            deadline,
+        ) {
+            if String::from_utf8_lossy(&ty).trim() == "tag" {
+                worklist.push(head_oid);
+            }
+        }
+    }
+    // Peel every tag object's chain into `set`, adding each tag object it passes
+    // through. Bounded and batched (#173, jatmn tag fan-out): see `walk_tag_chain`.
+    walk_tag_chain(
+        repo_path,
+        git_bin,
+        worklist,
+        &mut set,
+        MAX_TAG_OBJECTS,
+        deadline,
+    )?;
+    Ok(set)
+}
+
 /// Objects safe to replicate, failing closed on blobs (#99). A candidate
 /// replicates iff it is NOT a blob (`all_blob_oids` — commits and trees are
 /// structural, never content-withheld) OR it is in `allowed_blobs` (reachable
@@ -1066,6 +1537,614 @@ esac\n";
             td.path(),
         );
         (td, bare, secret, public)
+    }
+
+    /// #173 (jatmn round 8, F4 — load-bearing): a repo with enough annotated tags that
+    /// one `cat-file --batch` round fills BOTH pipes (stdin > 64 KiB of oids while the
+    /// child blocks on a full stdout) must not deadlock. The old order wrote the whole
+    /// round to stdin before draining stdout and hung indefinitely, stranding a blocking-
+    /// pool thread; `run_bounded_git`'s concurrent writer/drain completes. Driven with a
+    /// completion timeout: GREEN finishes in well under a second, RED (old order) hangs
+    /// and the recv_timeout fires. ~3000 tags is well past the ~2030-oid deadlock
+    /// threshold (41 bytes/oid, 64 KiB pipes) and under MAX_TAG_OBJECTS (8192).
+    /// Bulk-created via one fast-import stream so the fixture cost is one git process,
+    /// not 3000 `git tag -a` spawns.
+    #[test]
+    fn walk_tag_chain_large_batch_does_not_deadlock() {
+        use std::io::Write;
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("f.txt"), b"x\n").unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "init"], &work);
+        let head = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Bulk-create ~3000 annotated tags via one fast-import stream.
+        const N: usize = 3000;
+        let mut stream = String::new();
+        for i in 0..N {
+            let msg = format!("annotated tag {i}\n");
+            stream.push_str(&format!("tag t{i}\n"));
+            stream.push_str(&format!("from {head}\n"));
+            stream.push_str("tagger t <t@t> 1700000000 +0000\n");
+            stream.push_str(&format!("data {}\n", msg.len()));
+            stream.push_str(&msg);
+        }
+        let mut fi = Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(&work)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        fi.stdin
+            .take()
+            .unwrap()
+            .write_all(stream.as_bytes())
+            .unwrap();
+        assert!(fi.wait().unwrap().success(), "fast-import failed");
+
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+
+        // Drive the walk on a worker thread with a completion timeout. The old
+        // write-all-before-drain order hangs here; the fix completes near-instantly.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(reachable_commit_tag_oids(&bare).map(|s| s.len()));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(20)) {
+            Ok(Ok(n)) => assert!(
+                n >= N,
+                "the walk must resolve every annotated tag object (got {n}, expected >= {N})"
+            ),
+            Ok(Err(e)) => panic!("walk errored: {e}"),
+            Err(_) => panic!("walk_tag_chain deadlocked on a large tag batch (F4 regression)"),
+        }
+    }
+
+    /// #173 review (finding 3): an annotated tag reachable ONLY through a tag-valued
+    /// detached HEAD (raw HEAD naming a tag object, with no ref at that tag) must still
+    /// enter `reachable_commit_tag_oids`. `rev-list --all HEAD` peels such a HEAD to its
+    /// commit and `for-each-ref` has no tag row, so without a HEAD tag-seed the tag
+    /// OBJECT is omitted and its pinned CID would 404 for an authorized reader. RED
+    /// before the HEAD tag-seed (the tag oid is absent); GREEN after.
+    #[test]
+    fn reachable_commit_tag_oids_includes_tag_valued_detached_head() {
+        use std::io::Write;
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        let run = |args: &[&str], dir: &Path| -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("a.txt"), b"hi\n").unwrap();
+        run(&["init", "-q"], &work);
+        run(&["config", "user.email", "t@t"], &work);
+        run(&["config", "user.name", "t"], &work);
+        run(&["add", "."], &work);
+        run(&["commit", "-qm", "seed"], &work);
+        run(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        let commit = run(&["rev-parse", "HEAD"], &bare);
+
+        // An annotated tag OBJECT in the bare ODB, with NO ref pointing at it.
+        let tag_body = format!(
+            "object {commit}\ntype commit\ntag htag\ntagger t <t@t> 0 +0000\n\nHEAD-only tag\n"
+        );
+        let tag_oid = {
+            let mut child = Command::new("git")
+                .args(["hash-object", "-t", "tag", "-w", "--stdin"])
+                .current_dir(&bare)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(tag_body.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(run(&["cat-file", "-t", &tag_oid], &bare), "tag");
+        // Raw-write HEAD directly to the tag object (the only way this state arises;
+        // update-ref / checkout both refuse a non-commit HEAD).
+        std::fs::write(bare.join("HEAD"), format!("{tag_oid}\n")).unwrap();
+
+        let set = reachable_commit_tag_oids(&bare).unwrap();
+        assert!(
+            set.contains(&tag_oid),
+            "a tag reachable only via a tag-valued detached HEAD must be in the reachable set"
+        );
+        assert!(
+            set.contains(&commit),
+            "the commit the HEAD tag peels to stays reachable (no regression)"
+        );
+    }
+
+    /// #173: `reachable_commit_tag_oids` on an empty repo (unborn HEAD) must return an
+    /// empty set, not error — exercising the `rev-parse HEAD` fail branch of the
+    /// detached-HEAD tag seed (there is simply no HEAD to seed).
+    #[test]
+    fn reachable_commit_tag_oids_handles_unborn_head() {
+        let td = TempDir::new().unwrap();
+        let bare = td.path().join("empty.git");
+        let ok = Command::new("git")
+            .args(["init", "-q", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init --bare failed");
+        let set = reachable_commit_tag_oids(&bare).unwrap();
+        assert!(
+            set.is_empty(),
+            "an empty repo (unborn HEAD) yields an empty reachable set with no error"
+        );
+    }
+
+    #[test]
+    fn object_paths_emits_trees_and_blob_paths_is_the_blob_slice() {
+        let (_td, bare, secret_oid, public_oid) = fixture();
+        let deadline = Instant::now() + WALK_TIMEOUT;
+        // The lenient enumeration; on this clean fixture it matches the strict one.
+        let commits = reachable_commit_oids(&bare, "git", deadline).unwrap();
+        let objs = object_paths(&bare, "git", &commits, deadline).unwrap();
+
+        // Blob records survive the `-rzt` change, at their paths (unchanged).
+        assert!(objs.contains(&(secret_oid.clone(), "/secret/b.txt".into(), "blob".into())));
+        assert!(objs.contains(&(public_oid.clone(), "/public/a.txt".into(), "blob".into())));
+
+        // The #135 addition: subtree tree objects at their directory paths.
+        assert!(
+            objs.iter().any(|(_, p, k)| k == "tree" && p == "/secret"),
+            "the /secret subtree tree must be emitted at its dir path"
+        );
+        assert!(
+            objs.iter().any(|(_, p, k)| k == "tree" && p == "/public"),
+            "the /public subtree tree must be emitted at its dir path"
+        );
+
+        // blob_paths must equal the blob slice of object_paths exactly — compared as
+        // SETS (both walks dedup via HashSet; the collected order is nondeterministic).
+        let bp: HashSet<(String, String)> = blob_paths(&bare, "git", WALK_TIMEOUT)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let bp_from_obj: HashSet<(String, String)> = objs
+            .iter()
+            .filter(|(_, _, k)| k == "blob")
+            .map(|(o, p, _)| (o.clone(), p.clone()))
+            .collect();
+        assert_eq!(
+            bp, bp_from_obj,
+            "blob_paths output must be byte-identical to object_paths' blob slice"
+        );
+    }
+
+    #[test]
+    fn allowed_tree_set_gates_withheld_subtree_tree() {
+        let (_td, bare, _s, _p) = fixture();
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let secret_tree = oid("HEAD:secret");
+        let public_tree = oid("HEAD:public");
+        let root_tree = oid("HEAD^{tree}");
+        let reader = "did:key:z6MkReader";
+        let rules = [rule("/secret/**", &[reader])];
+
+        // anon: the withheld /secret tree is excluded; root ("/") and /public are in.
+        let anon = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, None).unwrap();
+        assert!(
+            !anon.contains(&secret_tree),
+            "withheld /secret subtree tree excluded for anon"
+        );
+        assert!(anon.contains(&root_tree), "root tree included (path /)");
+        assert!(anon.contains(&public_tree), "/public subtree tree included");
+
+        // listed reader: sees the /secret tree (caller-aware, not a blanket deny).
+        let rd = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, Some(reader)).unwrap();
+        assert!(
+            rd.contains(&secret_tree),
+            "listed reader sees the /secret tree"
+        );
+
+        // owner: sees every reachable tree.
+        let ow = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, Some(OWNER)).unwrap();
+        assert!(
+            ow.contains(&secret_tree) && ow.contains(&public_tree) && ow.contains(&root_tree),
+            "owner sees all reachable trees"
+        );
+    }
+
+    #[test]
+    fn allowed_tree_set_excludes_dangling_tree() {
+        use std::io::Write;
+        let (_td, bare, secret_oid, _p) = fixture();
+        // A DANGLING tree: written to the ODB but referenced by no commit. Uses a
+        // UNIQUE entry name so its oid is content-distinct from every reachable tree
+        // (a content-identical tree would dedup to a reachable oid — that is T2, not
+        // danglingness). The reachable-only walk never enumerates it -> fail closed.
+        let mut child = Command::new("git")
+            .args(["mktree"])
+            .current_dir(&bare)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "100644 blob {secret_oid}\tdangling-only-unreferenced.txt"
+        )
+        .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "git mktree");
+        let dangling = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        let rules = [rule("/secret/**", &[])];
+        for caller in [None, Some(OWNER)] {
+            let set = allowed_tree_set_for_caller(&bare, &rules, true, OWNER, caller).unwrap();
+            assert!(
+                !set.contains(&dangling),
+                "dangling tree must never be in the reachable allowed-set (caller={caller:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_tree_set_includes_tree_shared_across_allowed_and_denied_paths() {
+        // T2 (content-dedup): the SAME tree oid reachable at both an allowed and a
+        // withheld path is INCLUDED for anon (allowed-wins) — its structure is
+        // visible to the caller at the allowed path. Mirrors the blob analog
+        // `same_blob_at_allowed_and_denied_path_is_not_withheld`.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(work.join("pub/sub")).unwrap();
+        std::fs::create_dir_all(work.join("sec/sub")).unwrap();
+        std::fs::write(work.join("pub/sub/f.txt"), b"same bytes\n").unwrap();
+        std::fs::write(work.join("sec/sub/f.txt"), b"same bytes\n").unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        run(&["add", "."]);
+        run(&["commit", "-qm", "seed"]);
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let pub_sub = oid("HEAD:pub/sub");
+        let sec_sub = oid("HEAD:sec/sub");
+        assert_eq!(pub_sub, sec_sub, "identical content dedups to one tree oid");
+
+        // Withhold /sec from anon; the shared oid is still reachable at /pub/sub.
+        let rules = [rule("/sec/**", &[])];
+        let anon = allowed_tree_set_for_caller(&work, &rules, true, OWNER, None).unwrap();
+        assert!(
+            anon.contains(&pub_sub),
+            "a tree reachable at an allowed path is included even when also at a withheld path"
+        );
+    }
+
+    #[test]
+    fn allowed_tree_set_includes_root_trees_of_all_reachable_commits() {
+        // The batched root-tree pass (root_tree_pairs) must return EVERY reachable
+        // commit's root tree, not just HEAD's — two commits with distinct root trees
+        // both land in the set. Guards the git-log-over-N-commits root derivation.
+        let td = TempDir::new().unwrap();
+        let work = td.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        let oid = |rev: &str| {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(&work)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::write(work.join("a.txt"), b"one\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c1"]);
+        let root1 = oid("HEAD^{tree}");
+        std::fs::write(work.join("b.txt"), b"two\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-qm", "c2"]);
+        let root2 = oid("HEAD^{tree}");
+        assert_ne!(root1, root2, "the two commits have distinct root trees");
+
+        // Public repo, no rules: every reachable tree is allowed for anon.
+        let set = allowed_tree_set_for_caller(&work, &[], true, OWNER, None).unwrap();
+        assert!(
+            set.contains(&root1) && set.contains(&root2),
+            "root trees of BOTH reachable commits are in the set (batched root pass)"
+        );
+    }
+
+    #[test]
+    fn root_tree_pairs_returns_every_root_tree_at_scale() {
+        // Parity + liveness at scale for root_tree_pairs (#173 P2): feed every
+        // reachable commit oid to `git log --format=%T --stdin` and collect each
+        // commit's root tree. With N commits that is ~N*41 bytes of oids in and
+        // ~N*41 bytes of %T out — past the ~64 KiB pipe buffer in both directions —
+        // so this exercises the large-bidirectional-IO path the 2-commit test above
+        // cannot, and asserts parity: every distinct root tree comes back.
+        //
+        // NOTE: this is NOT a deadlock guard. `git log --stdin` reads its whole
+        // revision list to EOF before emitting any %T, so the naive "write all of
+        // stdin, then drain stdout" form does not deadlock at any scale for this
+        // invocation. `run_bounded_git`'s concurrent writer/drain is cheap defensive
+        // isolation, not load-bearing, and this test does not claim otherwise. The
+        // 30s watchdog is a general liveness bound so a future regression that
+        // genuinely hangs fails fast here rather than stalling the suite.
+        const N: usize = 2500;
+        let td = TempDir::new().unwrap();
+        let bare = td.path().join("many.git");
+        assert!(Command::new("git")
+            .args(["init", "-q", "--bare", bare.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+
+        // fast-import a linear chain of N commits, each adding a distinct file so
+        // every root tree is distinct (dedup cannot shrink the output). One
+        // subprocess, ~1s — far cheaper than N `git commit` spawns.
+        let mut stream = String::new();
+        for i in 0..N {
+            let (b, cm) = (2 * i + 1, 2 * i + 2);
+            let content = format!("v{i}");
+            let msg = format!("c{i}");
+            stream.push_str(&format!(
+                "blob\nmark :{b}\ndata {}\n{content}\n",
+                content.len()
+            ));
+            stream.push_str(&format!(
+                "commit refs/heads/main\nmark :{cm}\ncommitter t <t@t> 0 +0000\ndata {}\n{msg}\n",
+                msg.len()
+            ));
+            if i > 0 {
+                stream.push_str(&format!("from :{}\n", 2 * (i - 1) + 2));
+            }
+            stream.push_str(&format!("M 100644 :{b} f{i}\n\n"));
+        }
+        let mut fi = Command::new("git")
+            .args(["fast-import", "--quiet"])
+            .current_dir(&bare)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            fi.stdin
+                .take()
+                .unwrap()
+                .write_all(stream.as_bytes())
+                .unwrap();
+        }
+        assert!(fi.wait().unwrap().success(), "fast-import failed");
+
+        let commits = reachable_commit_oids(&bare, "git", Instant::now() + WALK_TIMEOUT).unwrap();
+        assert_eq!(commits.len(), N, "all {N} commits reachable");
+
+        // Call root_tree_pairs directly (private, same module) under a liveness
+        // watchdog, then assert it returned every distinct root tree.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(
+                root_tree_pairs(&bare, "git", &commits, Instant::now() + WALK_TIMEOUT)
+                    .map(|s| s.len()),
+            );
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(len)) => assert_eq!(len, N, "every distinct root tree returned"),
+            Ok(Err(e)) => panic!("root_tree_pairs errored: {e}"),
+            Err(_) => panic!("root_tree_pairs did not return within 30s"),
+        }
+    }
+
+    /// #173 (jatmn tag fan-out): the batched `git cat-file --batch` tag walk must
+    /// return the SAME reachable set as the old per-tag `cat-file tag` loop — every
+    /// commit, the outer tag object, AND the inner tag object of a tag-of-a-tag chain
+    /// (the inner tag is reachable but is not itself a ref tip, so it is only found by
+    /// peeling the outer tag's target). Behavior-preservation proof for the rewrite.
+    #[test]
+    fn reachable_commit_tag_oids_includes_nested_tag_objects() {
+        let (_td, bare, _secret, _public) = fixture();
+        let run = |args: &[&str]| -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        // v1 -> commit, v2 -> v1 (tag-of-a-tag), plus a couple of sibling tags so the
+        // round batches more than one oid. Capture v1's oid, then DELETE the v1 ref so
+        // the inner tag object survives in the ODB but is NOT a ref tip: it is then
+        // reachable ONLY by peeling v2's target chain. That makes the peel load-bearing
+        // (breaking the inner-tag enqueue drops v1 from the set), unlike leaving v1 as
+        // its own ref where `for-each-ref` would seed it directly.
+        run(&["tag", "-a", "-m", "inner", "v1", "HEAD"]);
+        run(&["tag", "-a", "-m", "outer", "v2", "v1"]);
+        run(&["tag", "-a", "-m", "s1", "s1", "HEAD"]);
+        run(&["tag", "-a", "-m", "s2", "s2", "HEAD"]);
+        let commit = run(&["rev-parse", "HEAD"]);
+        let v1 = run(&["rev-parse", "v1"]);
+        let v2 = run(&["rev-parse", "v2"]);
+        let s1 = run(&["rev-parse", "s1"]);
+        let s2 = run(&["rev-parse", "s2"]);
+        run(&["tag", "-d", "v1"]);
+
+        let set = reachable_commit_tag_oids(&bare).unwrap();
+        assert!(set.contains(&commit), "the commit must be reachable");
+        assert!(
+            set.contains(&v2),
+            "the outer tag object (ref tip) must be present"
+        );
+        assert!(
+            set.contains(&v1),
+            "the INNER tag object of a tag-of-a-tag must be present (peeled from v2, no ref)"
+        );
+        assert!(set.contains(&s1), "sibling tag s1 must be present");
+        assert!(set.contains(&s2), "sibling tag s2 must be present");
+    }
+
+    /// #173 (jatmn tag fan-out): the object bound is load-bearing. A repo whose tag
+    /// count exceeds the bound must FAIL CLOSED (Err), not return a truncated set that
+    /// would under-withhold a still-reachable tag. Drives `walk_tag_chain` with a tiny
+    /// injected bound (the public fn uses the real `MAX_TAG_OBJECTS`); with the bound
+    /// check removed this would collect all tags and return Ok.
+    #[test]
+    fn walk_tag_chain_fails_closed_over_object_bound() {
+        let (_td, bare, _secret, _public) = fixture();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&bare)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        let mut seeds = Vec::new();
+        for n in 0..5 {
+            let name = format!("t{n}");
+            run(&["tag", "-a", "-m", &name, &name, "HEAD"]);
+            let oid = Command::new("git")
+                .args(["rev-parse", &name])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            seeds.push(String::from_utf8_lossy(&oid.stdout).trim().to_string());
+        }
+
+        // Within a generous bound: the walk succeeds and collects the tags.
+        let mut ok_set = HashSet::new();
+        walk_tag_chain(
+            &bare,
+            "git",
+            seeds.clone(),
+            &mut ok_set,
+            8192,
+            Instant::now() + WALK_TIMEOUT,
+        )
+        .unwrap();
+        assert!(
+            seeds.iter().all(|s| ok_set.contains(s)),
+            "all 5 tags collected under a generous bound"
+        );
+
+        // Under a bound of 2 with 5 tags: fail closed (Err), not a partial set.
+        let mut small_set = HashSet::new();
+        let result = walk_tag_chain(
+            &bare,
+            "git",
+            seeds,
+            &mut small_set,
+            2,
+            Instant::now() + WALK_TIMEOUT,
+        );
+        assert!(
+            result.is_err(),
+            "a tag count exceeding the object bound must fail closed (Err), not truncate"
+        );
     }
 
     #[test]

@@ -121,6 +121,28 @@ impl RateLimiter {
         true
     }
 
+    /// Non-consuming check: is this key ALREADY at its limit for the current window?
+    /// Unlike [`check`], it records nothing and never inserts a new key — used to shed
+    /// expensive preparatory work (e.g. the `/ipfs/{cid}` legacy scan's O(repos) DB
+    /// preload) BEFORE it runs, without perturbing the per-unit budget the consuming
+    /// `check` maintains (#173, F3). An unknown key or a disabled limiter is not
+    /// throttled. Prunes the key's expired timestamps as a side effect (keeps state
+    /// tidy) but adds none, so it cannot itself fill or grow the map.
+    pub(crate) async fn is_throttled(&self, key: &str) -> bool {
+        if self.max_requests == 0 {
+            return false;
+        }
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        if let Some(window) = state.get_mut(key) {
+            window
+                .timestamps
+                .retain(|t| now.duration_since(*t) < self.window);
+            return window.timestamps.len() >= self.max_requests;
+        }
+        false
+    }
+
     pub async fn cleanup(&self) {
         let now = Instant::now();
         let mut state = self.state.lock().await;
@@ -129,6 +151,13 @@ impl RateLimiter {
                 .retain(|t| now.duration_since(*t) < self.window);
             !w.timestamps.is_empty()
         });
+    }
+
+    /// Number of distinct keys currently tracked. Test-only introspection so a
+    /// cross-module test can assert that a sweep actually evicted expired entries.
+    #[cfg(test)]
+    pub(crate) async fn tracked_keys(&self) -> usize {
+        self.state.lock().await.len()
     }
 }
 

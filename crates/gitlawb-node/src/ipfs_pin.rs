@@ -91,7 +91,8 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
 /// `..._fail_closed` filter on the full-scan path before calling, so this
 /// function never sees a withheld blob. `repo_path` is still needed to read each
 /// object's bytes. The twin in `pinata.rs` mirrors this shape — change both in
-/// lockstep.
+/// lockstep. `repo_id` records the pin's provenance so `GET /ipfs/{cid}` resolves
+/// straight to this repo instead of scanning every repo (#173).
 ///
 /// Returns a list of `(sha256_hex, cid)` pairs for objects pinned this call.
 pub async fn pin_new_objects(
@@ -99,6 +100,7 @@ pub async fn pin_new_objects(
     repo_path: &std::path::Path,
     object_list: Vec<String>,
     db: &crate::db::Db,
+    repo_id: &str,
 ) -> Vec<(String, String)> {
     if ipfs_api.is_empty() {
         return vec![];
@@ -107,9 +109,36 @@ pub async fn pin_new_objects(
     let mut pinned = Vec::new();
 
     for sha in object_list {
-        // Skip if already pinned
+        // Skip if already pinned — but first backfill provenance if the existing
+        // pin has none. A legacy pin (recorded before repo_id existed, #173, jatmn)
+        // is skipped here before record_pinned_cid ever runs, so its NULL provenance
+        // would never resolve to one repo and known CIDs keep hitting the scan. The
+        // backfill only sets repo_id (AND repo_id IS NULL guard preserves
+        // first-pinner-owns) and never re-pins the bytes — the object is already on IPFS.
         match db.is_pinned(&sha).await {
-            Ok(true) => continue,
+            Ok(true) => {
+                match db.provenance_for_oid(&sha).await {
+                    Ok(None) => {
+                        if let Err(e) = db.backfill_pin_provenance(&sha, repo_id).await {
+                            tracing::warn!(sha = %sha, err = %e, "failed to backfill pin provenance");
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(sha = %sha, err = %e, "DB error reading pin provenance");
+                    }
+                }
+                // F1 (#173 round 8): record this repo as an ADDITIONAL source for the
+                // already-pinned object. This is the load-bearing skip-branch insert —
+                // a later repo pushing a shared object hits this path (already pinned),
+                // and without it `GET /ipfs/{cid}` only ever knows the first pinner, so a
+                // shared object first pinned from a private/quarantined repo 404s even
+                // when this repo would serve it. Bounded per object (MAX_PIN_SOURCES).
+                if let Err(e) = db.record_pin_source(&sha, repo_id).await {
+                    tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                }
+                continue;
+            }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(sha = %sha, err = %e, "DB error checking pinned status");
@@ -130,8 +159,13 @@ pub async fn pin_new_objects(
         // Pin to IPFS
         match pin_git_object(ipfs_api, &sha, &data).await {
             Ok(cid) if !cid.is_empty() => {
-                if let Err(e) = db.record_pinned_cid(&sha, &cid).await {
+                if let Err(e) = db.record_pinned_cid(&sha, &cid, Some(repo_id)).await {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinned CID in DB");
+                }
+                // F1 (#173 round 8): also record the first pinner in pin_repo_sources so
+                // every source (first and subsequent) is tried uniformly by the resolver.
+                if let Err(e) = db.record_pin_source(&sha, repo_id).await {
+                    tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
                 }
                 pinned.push((sha, cid));
             }

@@ -78,6 +78,10 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
@@ -98,7 +102,6 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
             16,
         ),
-        ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         git_bin: "git".to_string(),
     }
 }
@@ -2020,13 +2023,19 @@ mod tests {
 
     /// Seed a SHA-256 source repo (public/a.txt + secret/b.txt), bare-clone it
     /// into each `/tmp/<slug>/<name>.git` path, and return guards + oids.
-    /// SHA-256 object format is required: `get_by_cid` resolves a CID whose
-    /// multihash digest IS the git object id, which only matches in sha256 repos.
+    /// SHA-256 object format matches production (`--object-format=sha256`) so the
+    /// oids are 64-hex. A real CID digests the raw object CONTENT (not the git
+    /// oid), so tests build the request CID with `pin_cid_for` — mirroring the pin
+    /// path — and `get_by_cid` maps it back to the oid via `pinned_cids` (#173).
     struct CidFixture {
         _guards: Vec<std::path::PathBuf>,
         secret_oid: String,
         public_oid: String,
         secret_tree_oid: String,
+        public_tree_oid: String,
+        root_tree_oid: String,
+        commit_oid: String,
+        tag_oid: String,
     }
     impl Drop for CidFixture {
         fn drop(&mut self) {
@@ -2060,6 +2069,8 @@ mod tests {
         run(&["config", "user.name", "t"], &src);
         run(&["add", "."], &src);
         run(&["commit", "-qm", "seed"], &src);
+        // Annotated tag of the commit — exercises the "tags stay served" guard.
+        run(&["tag", "-a", "-m", "annotated", "v1", "HEAD"], &src);
         let oid = |rev: &str| {
             let out = Command::new("git")
                 .args(["rev-parse", rev])
@@ -2072,6 +2083,10 @@ mod tests {
         let secret_oid = oid("HEAD:secret/b.txt");
         let public_oid = oid("HEAD:public/a.txt");
         let secret_tree_oid = oid("HEAD:secret");
+        let public_tree_oid = oid("HEAD:public");
+        let root_tree_oid = oid("HEAD^{tree}");
+        let commit_oid = oid("HEAD");
+        let tag_oid = oid("refs/tags/v1");
         let mut guards = vec![src.clone()];
         for name in bare_names {
             let bare = std::path::PathBuf::from("/tmp")
@@ -2089,6 +2104,12 @@ mod tests {
                 ],
                 &src,
             );
+            // `git clone --bare` does NOT copy the source repo's local identity, so
+            // fixtures that create objects directly in the bare repo (`commit-tree`,
+            // `git tag -a`) abort with "identity unknown" on a CI runner that has no
+            // ambient/global git identity. Set it explicitly so the suite is portable.
+            run(&["config", "user.email", "t@t"], &bare);
+            run(&["config", "user.name", "t"], &bare);
         }
         // One guard for the whole /tmp/<slug> tree covers every bare clone.
         guards.push(std::path::PathBuf::from("/tmp").join(slug));
@@ -2097,16 +2118,1546 @@ mod tests {
             secret_oid,
             public_oid,
             secret_tree_oid,
+            public_tree_oid,
+            root_tree_oid,
+            commit_oid,
+            tag_oid,
         }
     }
 
-    /// CID whose sha2-256 multihash digest equals the given 64-hex git oid, so
-    /// `get_by_cid` decodes it back to that oid and `git cat-file`s it.
-    fn cid_for_oid(oid_hex: &str) -> String {
-        use gitlawb_core::cid::Cid;
-        let bytes = hex::decode(oid_hex).expect("hex oid");
-        let arr: [u8; 32] = bytes.as_slice().try_into().expect("32-byte sha256 oid");
-        Cid::from_sha256_bytes(&arr).to_string()
+    /// Record a pin exactly as the production pin path does — read the object's
+    /// raw bytes (`git cat-file <type>`, no framing), CID them with
+    /// `Cid::from_git_object_bytes`, and store the `(oid, cid)` row — then return
+    /// the CID string the node advertises (`gl ipfs list`) and a client sends to
+    /// `GET /ipfs/{cid}`. Building the CID from the oid instead (the old
+    /// `cid_for_oid`) produced an identifier that never occurs in production and
+    /// made the gate assertions vacuous: a real pin CID digests the raw content,
+    /// not the git oid, so `get_by_cid` resolves it through `pinned_cids` (#173).
+    async fn pin_cid_for(bare_repo: &std::path::Path, oid: &str, db: &crate::db::Db) -> String {
+        let (_ty, raw) = crate::git::store::read_object(bare_repo, oid)
+            .expect("read object bytes")
+            .expect("object exists in repo");
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
+        // Legacy-style pin (no provenance) so existing CID tests exercise the
+        // resolver's scan fallback; provenance-path tests pin via `pin_cid_for_repo`.
+        db.record_pinned_cid(oid, &cid, None)
+            .await
+            .expect("record pinned cid");
+        cid
+    }
+
+    /// Like [`pin_cid_for`] but records the pin's provenance (`repo_id`), so the
+    /// resolver resolves the CID straight to `repo_id` instead of scanning (#173).
+    #[allow(dead_code)] // used by the provenance-path resolver tests (P-U3)
+    async fn pin_cid_for_repo(
+        bare_repo: &std::path::Path,
+        oid: &str,
+        db: &crate::db::Db,
+        repo_id: &str,
+    ) -> String {
+        let (_ty, raw) = crate::git::store::read_object(bare_repo, oid)
+            .expect("read object bytes")
+            .expect("object exists in repo");
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
+        db.record_pinned_cid(oid, &cid, Some(repo_id))
+            .await
+            .expect("record pinned cid with provenance");
+        cid
+    }
+
+    /// INV-7 upgrade path for the pin-provenance column (#173, jatmn round 2): a node
+    /// already past v11 gets `pinned_cids.repo_id` from the NEW v12 migration, and a
+    /// legacy pin recorded before the column existed survives with NULL provenance (so
+    /// it falls back to the repo scan). Simulate the pre-v12 node by dropping the
+    /// column and un-applying v12, seed a legacy row, then re-migrate. RED before the
+    /// v12 migration exists (the column is never re-added → the SELECT errors); GREEN
+    /// after.
+    #[sqlx::test]
+    async fn pinned_cids_repo_provenance_upgrade_path(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+
+        // Pre-v12 shape: drop the provenance column and forget v12 was applied.
+        sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS repo_id")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 12")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A legacy pin recorded before provenance existed.
+        sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+            .bind("legacyoid")
+            .bind("legacycid")
+            .bind("2020-01-01T00:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Upgrade: re-run migrations → v12 re-adds the column.
+        state.db.run_migrations().await.expect("migrate to v12");
+
+        // The legacy pin survives with NULL provenance.
+        let legacy: Option<String> =
+            sqlx::query_scalar("SELECT repo_id FROM pinned_cids WHERE sha256_hex = 'legacyoid'")
+                .fetch_one(&pool)
+                .await
+                .expect("legacy pin row survives the upgrade");
+        assert!(
+            legacy.is_none(),
+            "a pin recorded before v12 must keep NULL provenance (it falls back to the scan)"
+        );
+
+        // A new pin can carry provenance.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind("newoid")
+        .bind("newcid")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("repo-abc")
+        .execute(&pool)
+        .await
+        .unwrap();
+        let prov: Option<String> =
+            sqlx::query_scalar("SELECT repo_id FROM pinned_cids WHERE sha256_hex = 'newoid'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            prov.as_deref(),
+            Some("repo-abc"),
+            "a pin recorded after v12 carries its source repo_id"
+        );
+    }
+
+    /// #173: a pin records the repository it came from; `provenance_for_oid` reads it
+    /// back; a legacy pin (no repo) reads back None; and first-pinner-owns holds — a
+    /// second push of the same oid does NOT rewrite provenance (ON CONFLICT DO
+    /// NOTHING). This is what lets the resolver gate a CID against its ONE source repo.
+    #[sqlx::test]
+    async fn record_pinned_cid_stores_and_reads_provenance(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        state
+            .db
+            .record_pinned_cid("oidA", "cidA", Some("repo-xyz"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .provenance_for_oid("oidA")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("repo-xyz"),
+            "a provenanced pin reads back its source repo_id"
+        );
+
+        state
+            .db
+            .record_pinned_cid("oidB", "cidB", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.provenance_for_oid("oidB").await.unwrap(),
+            None,
+            "a legacy pin (no repo) has NULL provenance"
+        );
+
+        // First-pinner-owns: a later push of the same oid must not rewrite provenance.
+        state
+            .db
+            .record_pinned_cid("oidA", "cidA", Some("repo-OTHER"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .provenance_for_oid("oidA")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("repo-xyz"),
+            "ON CONFLICT DO NOTHING keeps the first repo's provenance"
+        );
+
+        // An unpinned oid has no provenance.
+        assert_eq!(
+            state.db.provenance_for_oid("never-pinned").await.unwrap(),
+            None
+        );
+    }
+
+    /// #173 (provenance, happy path): a CID pinned with provenance resolves straight
+    /// to its ONE source repo and serves an authorized reader — no repo scan.
+    #[sqlx::test]
+    async fn ipfs_cid_provenance_serves_from_pinning_repo(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let _fx = seed_cid_repos(&slug, &short, &["provserve"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("provserve.git");
+        let fx = &_fx;
+
+        // Build the repo FIRST so the pin can carry its id as provenance.
+        let repo = seed_repo(&owner_did, "provserve"); // public
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &repo.id).await;
+
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a provenanced public CID serves its content"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the pinning repo's object is served"
+        );
+    }
+
+    /// #173 (provenance, THE load-bearing one — #124 flip + bounded fan-out): a CID
+    /// pinned from a PRIVATE repo must gate against that pinning repo (404), NOT serve
+    /// from a byte-identical PUBLIC copy in another repo. Provenance is strictly more
+    /// restrictive than the old scan (which served the public copy). RED before the
+    /// rework (the scan serves the public copy → 200 + leaks the secret bytes); GREEN
+    /// after (provenance → the private repo → 404, no leak).
+    #[sqlx::test]
+    async fn ipfs_cid_provenance_private_denies_despite_public_copy(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["privsrc", "pubcopy"]);
+        let priv_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("privsrc.git");
+
+        // Private source repo, built first so the pin carries its id as provenance.
+        let mut priv_repo = seed_repo(&owner_did, "privsrc");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+        let cid = pin_cid_for_repo(&priv_bare, &fx.secret_oid, &state.db, &priv_repo.id).await;
+
+        // A PUBLIC repo holds the SAME object (the old scan would serve it).
+        let pub_repo = seed_repo(&owner_did, "pubcopy"); // public, no rule
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public copy");
+
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "a provenanced private CID must 404, not serve from a public copy elsewhere (#124 flip)"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "the 404 body must not leak the withheld object"
+        );
+    }
+
+    /// #173 (jatmn round 8, F1 — load-bearing): a shared object first pinned from a
+    /// PRIVATE repo, then pushed again from a PUBLIC repo through the real pin path,
+    /// must serve by CID to an anonymous caller from the public source. First-pinner-
+    /// only provenance 404s it (only the private source is known); recording EVERY
+    /// pin-path source fixes it. The second push hits the already-pinned skip branch,
+    /// so this proves the skip-branch source insert fires (and does NOT re-pin: /add
+    /// expect(0)). RED before U1 (anon 404); GREEN after.
+    #[sqlx::test]
+    async fn ipfs_cid_multi_source_serves_from_later_public_pinner(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["privfirst", "pubsecond"]);
+        let priv_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("privfirst.git");
+        let pub_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pubsecond.git");
+
+        // Private repo pins the object FIRST — it owns the first-pinner provenance.
+        let mut priv_repo = seed_repo(&owner_did, "privfirst");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private first-pinner");
+        let cid = pin_cid_for_repo(&priv_bare, &fx.public_oid, &state.db, &priv_repo.id).await;
+
+        // A PUBLIC repo pushes the SAME object through the real pin path. The object is
+        // already pinned, so this hits the already-pinned skip branch, which must record
+        // the public repo as an additional source without re-pinning (/add expect 0).
+        let pub_repo = seed_repo(&owner_did, "pubsecond"); // public, no rule
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public second-pinner");
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        crate::ipfs_pin::pin_new_objects(
+            &server.url(),
+            &pub_bare,
+            vec![fx.public_oid.clone()],
+            &state.db,
+            &pub_repo.id,
+        )
+        .await;
+        m.assert_async().await; // asserts /add was NOT called (already pinned)
+
+        // Anonymous CID fetch: the private first source denies, the public second
+        // source serves → 200. Before F1 only the private source is known → 404.
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a shared object must serve by CID from a later public pin-path source (F1)"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the served body is the public object's bytes"
+        );
+    }
+
+    /// #173 (jatmn round 8, F1 — bound, R2): the per-object source set is capped at
+    /// `MAX_PIN_SOURCES` so an adversary pushing one object from many repos cannot make
+    /// resolution O(repos). Recording the same oid from `MAX_PIN_SOURCES + 3` distinct
+    /// repos leaves exactly `MAX_PIN_SOURCES` rows.
+    #[sqlx::test]
+    async fn ipfs_cid_pin_sources_capped_at_max(pool: PgPool) {
+        let state = test_state(pool).await;
+        let cap = crate::db::MAX_PIN_SOURCES;
+        for i in 0..(cap + 3) {
+            state
+                .db
+                .record_pin_source("capoid", &format!("repo-{i}"))
+                .await
+                .expect("record source");
+        }
+        let sources = state.db.pin_sources_for_oid("capoid").await.unwrap();
+        assert_eq!(
+            sources.len() as i64,
+            cap,
+            "the per-object source set is capped at MAX_PIN_SOURCES"
+        );
+    }
+
+    /// #173 (jatmn round 8, F1 — availability, grok-4.5 adversarial catch): the resolver's
+    /// per-object source cap must NEVER evict the first-pinner. A legacy public pin keeps
+    /// its source in `pinned_cids.repo_id` but not in `pin_repo_sources` (pre-v13 pins, or
+    /// a pin whose best-effort `record_pin_source` missed). If the cap `LIMIT` were applied
+    /// to the whole union with a lexicographic order, an attacker could push the same
+    /// object from `MAX_PIN_SOURCES` repos whose grindable ids sort before the public
+    /// source and evict it from the window — turning a public CID that served 200 into a
+    /// 404. This drives exactly that: a legacy public first-pinner plus `MAX_PIN_SOURCES`
+    /// lower-sorting attacker sources must STILL serve the public object. RED with a
+    /// whole-union LIMIT (the first-pinner is dropped → 404); GREEN once the first-pinner
+    /// is always included and the LIMIT caps only the additional sources.
+    #[sqlx::test]
+    async fn ipfs_cid_first_pinner_never_evicted_by_lower_sorting_sources(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["pubfirst"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pubfirst.git");
+        // Public repo whose id sorts AFTER every attacker id below. Legacy shape: the
+        // source lives in pinned_cids.repo_id only (pin_cid_for_repo records no
+        // pin_repo_sources row), exactly like a pin from before v13.
+        let mut pub_repo = seed_repo(&owner_did, "pubfirst"); // public, no rule
+        pub_repo.id = "zzzzzzzz-pubfirst".to_string();
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public first-pinner");
+        let cid = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &pub_repo.id).await;
+
+        // Attacker fills the whole MAX_PIN_SOURCES window with lower-sorting source ids
+        // (non-existent repos — their mere presence would evict the first-pinner under a
+        // whole-union LIMIT).
+        let cap = crate::db::MAX_PIN_SOURCES;
+        for i in 0..cap {
+            state
+                .db
+                .record_pin_source(&fx.public_oid, &format!("00-attacker-{i:02}"))
+                .await
+                .expect("attacker source");
+        }
+
+        // The public first-pinner must still serve — never evicted by the cap window.
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the first-pinner public source must never be evicted by lower-sorting attacker sources (F1 availability)"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the public object is served from the first-pinner"
+        );
+    }
+
+    /// INV-7 upgrade path for the F1 `pin_repo_sources` table (#173, jatmn round 8): a
+    /// node already past v12 gets the table from the NEW v13 migration. Simulate the
+    /// pre-v13 node by dropping the table and un-applying v13, then re-migrate and
+    /// assert a source row round-trips. RED before the v13 migration exists.
+    #[sqlx::test]
+    async fn pin_repo_sources_upgrade_path(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        sqlx::query("DROP TABLE IF EXISTS pin_repo_sources")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 13")
+            .execute(&pool)
+            .await
+            .unwrap();
+        state.db.run_migrations().await.expect("re-migrate");
+        state
+            .db
+            .record_pin_source("upgradeoid", "repo-upg")
+            .await
+            .expect("record after re-migrate");
+        assert_eq!(
+            state.db.pin_sources_for_oid("upgradeoid").await.unwrap(),
+            vec!["repo-upg".to_string()],
+            "the v13 pin_repo_sources table is present after upgrade"
+        );
+    }
+
+    /// #173 (jatmn round 8, F2 — load-bearing): a legacy `pinned_cids` row keyed on a
+    /// PROVIDER CID (Pinata/Kubo dag-pb — every release before this branch stored the
+    /// provider CID as the resolver key, not the raw-content CID) must NOT serve raw git
+    /// bytes that do not hash to the requested CID. `get_by_cid` recomputes the CID over
+    /// the served bytes and refuses to serve on mismatch. Seeded with a RAW SQL INSERT
+    /// because the current helpers store the raw CID, so a helper-seeded row is already
+    /// correct-shape and the RED assertion would be vacuous (INV-21). RED before U2
+    /// (serves the git bytes → 200); GREEN after (not served, no bytes egress).
+    #[sqlx::test]
+    async fn ipfs_cid_legacy_provider_cid_row_not_served(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["provsrc"]);
+        let repo = seed_repo(&owner_did, "provsrc"); // public, no rule
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // A valid sha2-256 CID whose digest is NOT the object's raw-content digest —
+        // stands in for a Pinata/Kubo dag-pb provider CID (the legacy resolver key).
+        let provider_cid = gitlawb_core::cid::Cid::from_git_object_bytes(
+            b"a decoy object whose CID is not the served object's CID",
+        )
+        .to_string();
+
+        // Legacy-shape row: cid = the PROVIDER CID (raw SQL — the helpers now store the
+        // raw CID and cannot reproduce this shape). The object itself is public+servable.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&fx.public_oid)
+        .bind(&provider_cid)
+        .bind("2020-01-01T00:00:00Z")
+        .bind(&repo.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Requesting the provider CID resolves the row and passes the repo gate, but the
+        // served bytes hash to a DIFFERENT CID, so the integrity check must withhold them.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&provider_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(
+            st,
+            StatusCode::OK,
+            "a provider-CID legacy row must not serve raw git bytes (F2)"
+        );
+        assert!(
+            !body.contains("public bytes"),
+            "the mismatched bytes must not egress"
+        );
+    }
+
+    /// #173 (jatmn round 8, F6 — INV-10 cost guard): the serve path buffers the object via
+    /// a blocking `cat-file`; an object larger than `ipfs_max_served_object_bytes` must be
+    /// WITHHELD (rejected by the size precheck, never buffered), with zero body bytes
+    /// egressed. Under the cap it serves unchanged. The oversize-reject counter guards it
+    /// both ways: a removed size precheck serves the object and leaves the counter at 0.
+    #[sqlx::test]
+    async fn ipfs_cid_f6_oversized_object_withheld(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["big"]);
+        let bare = std::path::PathBuf::from("/tmp").join(&slug).join("big.git");
+        let repo = seed_repo(&owner_did, "big"); // public, no rule
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &repo.id).await;
+
+        // Cap below the object size ("public bytes\n" = 13 bytes) → withheld.
+        state.ipfs_max_served_object_bytes = 5;
+        crate::api::ipfs::reset_oversize_rejects();
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_ne!(
+            st,
+            StatusCode::OK,
+            "an object over the size cap must not serve (F6)"
+        );
+        assert!(
+            !body.contains("public bytes"),
+            "no object bytes egress for an over-cap object"
+        );
+        assert_eq!(
+            crate::api::ipfs::oversize_rejects(),
+            1,
+            "the oversized object was rejected by the size precheck"
+        );
+
+        // Control: raise the cap above the object size → serves unchanged.
+        state.ipfs_max_served_object_bytes = crate::api::ipfs::MAX_SERVED_OBJECT_BYTES;
+        crate::api::ipfs::reset_oversize_rejects();
+        let (st2, body2) =
+            cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st2,
+            StatusCode::OK,
+            "under the cap the object serves normally"
+        );
+        assert!(
+            body2.contains("public bytes"),
+            "the served body is the object's bytes"
+        );
+        assert_eq!(
+            crate::api::ipfs::oversize_rejects(),
+            0,
+            "no oversize reject under the cap"
+        );
+    }
+
+    /// #173 (provenance, INV-11): a quarantined pinning repo must 404 by CID even for
+    /// its own owner — quarantine hard-drops before the visibility gate on the
+    /// provenance path too. The owner-signed 404 is the load-bearing negative (a
+    /// visibility-only gate would Allow the owner).
+    #[sqlx::test]
+    async fn ipfs_cid_provenance_quarantined_repo_404_even_owner(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["quarsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("quarsrc.git");
+        let repo = seed_repo(&owner_did, "quarsrc"); // public
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &repo.id).await;
+
+        // Baseline: before quarantine the provenanced CID serves (proves the path works).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed(&owner, &cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "provenanced CID serves before quarantine"
+        );
+
+        state
+            .db
+            .set_repo_quarantine(&repo.id, true)
+            .await
+            .expect("quarantine");
+
+        for req in [cid_anon(&cid), cid_signed(&owner, &cid)] {
+            let (st, body) = cid_parts(cid_router(&state).oneshot(req).await.unwrap()).await;
+            assert_eq!(
+                st,
+                StatusCode::NOT_FOUND,
+                "a quarantined pinning repo must 404 by CID (anon + owner)"
+            );
+            assert!(
+                !body.contains("public bytes"),
+                "the 404 body must not leak quarantined content"
+            );
+        }
+    }
+
+    /// #173 (provenance, bounded — must NOT fall back to the scan): a CID whose
+    /// provenance points at a repo that no longer exists must 404 rather than scan
+    /// every repo and serve a byte-identical public copy. Falling back to the scan
+    /// would reopen the O(repos) anonymous fan-out the provenance rework closes. RED
+    /// before the rework (the scan serves the public copy → 200); GREEN after.
+    #[sqlx::test]
+    async fn ipfs_cid_provenance_missing_repo_404_no_scan_fallback(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["gonesrc", "pubcopy2"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("gonesrc.git");
+
+        // Pin with provenance = a repo_id that is never created (deleted/absent).
+        let cid = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, "nonexistent-repo-id").await;
+
+        // A public repo holds the SAME object (the old scan would serve it).
+        let pub_repo = seed_repo(&owner_did, "pubcopy2");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public copy");
+
+        let (st, _) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "a provenance pointing at a missing repo must 404, not fall back to the scan"
+        );
+    }
+
+    /// #173 (provenance, path-scoped WALK gate): the #135/#173 per-object gates must
+    /// run on the NEW provenance path, not only the legacy scan. A provenanced pin from
+    /// a repo under a `/secret/**` rule runs `allowed_blob_set_for_caller` via the shared
+    /// gate: a withheld secret blob 404s to anon (no byte leak); the allowed reader gets
+    /// it. Exercises the walk gate on the provenance path in BOTH directions.
+    #[sqlx::test]
+    async fn ipfs_cid_provenance_path_scoped_walk_gates_withheld_blob(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let reader = Keypair::generate();
+        let reader_did = reader.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["provwalk"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("provwalk.git");
+        let repo = seed_repo(&owner_did, "provwalk"); // public at "/"
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // /secret/** Mode B with the reader allowed → the secret blob walk gates by caller.
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/secret/**",
+                VisibilityMode::B,
+                std::slice::from_ref(&reader_did),
+                &owner_did,
+            )
+            .await
+            .expect("path rule");
+        let cid = pin_cid_for_repo(&bare, &fx.secret_oid, &state.db, &repo.id).await;
+
+        // Anon: the walk denies the secret blob → 404, no leak.
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "a withheld secret blob 404s to anon on the provenance path (walk gate runs)"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "the 404 body must not leak the withheld blob"
+        );
+
+        // Allowed reader: the walk includes the secret blob → 200 with content.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed(&reader, &cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "an allowed reader gets the secret blob via the provenance walk gate"
+        );
+        assert!(
+            body.contains("TOP SECRET"),
+            "the allowed reader receives the content"
+        );
+    }
+
+    /// #173: the pinata pin path stores the locally-computed raw CID in the
+    /// resolver-key `cid` column and the provider CID in `pinata_cid`, and its ON
+    /// CONFLICT COALESCE fills a NULL provenance without overwriting an existing one
+    /// (first-pinner-owns). On conflict `cid` is left untouched so a prior local pin's
+    /// raw CID is never clobbered by a provider CID.
+    #[sqlx::test]
+    async fn record_pinata_cid_stores_and_coalesces_provenance(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        // A new row created via the pinata path carries provenance, and stores the
+        // raw CID in `cid` with the provider CID in `pinata_cid`.
+        state
+            .db
+            .record_pinata_cid("po1", "rawcid1", "pcid1", Some("repoA"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.provenance_for_oid("po1").await.unwrap().as_deref(),
+            Some("repoA")
+        );
+        let po1 = state
+            .db
+            .list_pinned_cids()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.sha256_hex == "po1")
+            .expect("po1 row exists");
+        assert_eq!(po1.cid, "rawcid1", "resolver-key cid is the raw CID");
+        assert_eq!(
+            po1.pinata_cid.as_deref(),
+            Some("pcid1"),
+            "the provider CID is kept in pinata_cid"
+        );
+
+        // An existing NULL-provenance row: the pinata COALESCE fills it, and the
+        // prior local pin's `cid` is left untouched (not overwritten by the raw arg).
+        state
+            .db
+            .record_pinned_cid("po2", "localcid2", None)
+            .await
+            .unwrap();
+        state
+            .db
+            .record_pinata_cid("po2", "rawcid2", "pcid2", Some("repoB"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.provenance_for_oid("po2").await.unwrap().as_deref(),
+            Some("repoB"),
+            "pinata fills a NULL provenance"
+        );
+        let po2 = state
+            .db
+            .list_pinned_cids()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.sha256_hex == "po2")
+            .expect("po2 row exists");
+        assert_eq!(
+            po2.cid, "localcid2",
+            "on conflict the prior local pin's cid is left untouched"
+        );
+
+        // An existing provenance: the pinata COALESCE must NOT overwrite it.
+        state
+            .db
+            .record_pinned_cid("po3", "cid3", Some("repoX"))
+            .await
+            .unwrap();
+        state
+            .db
+            .record_pinata_cid("po3", "rawcid3", "pcid3", Some("repoY"))
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.provenance_for_oid("po3").await.unwrap().as_deref(),
+            Some("repoX"),
+            "pinata COALESCE keeps the first-pinner's provenance"
+        );
+    }
+
+    /// #173 (jatmn, F4, load-bearing security): a Pinata-first pin (no prior local pin)
+    /// must make the resolver key (`pinned_cids.cid`) the locally-computed raw CID, NOT
+    /// the provider CID. Pinata wraps the bytes in dag-pb/UnixFS, so its returned CID
+    /// does not hash the raw content; if it became the resolver key, `/ipfs/{provider_cid}`
+    /// would serve raw git bytes that do not hash to it, breaking raw content-addressing.
+    /// Assert `oids_for_cid(raw_cid)` finds the sha AND `oids_for_cid(provider_cid)` does NOT.
+    #[sqlx::test]
+    async fn record_pinata_cid_resolver_key_is_raw_not_provider(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        let bytes = b"raw git object content for pinata-first pin";
+        let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(bytes).to_string();
+        // A distinct provider CID (a dag-pb wrapper CID Pinata would return).
+        let provider_cid = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+        assert_ne!(
+            raw_cid, provider_cid,
+            "the provider CID must differ from the raw CID for this test to be meaningful"
+        );
+
+        // Pinata-first: no prior local pin, so this INSERT creates the row.
+        state
+            .db
+            .record_pinata_cid("pfsha", &raw_cid, provider_cid, Some("repoP"))
+            .await
+            .unwrap();
+
+        // The raw CID resolves to the sha.
+        assert_eq!(
+            state.db.oids_for_cid(&raw_cid).await.unwrap(),
+            vec!["pfsha".to_string()],
+            "the locally-computed raw CID is the resolver key"
+        );
+        // The provider (dag-pb) CID must NOT resolve raw bytes.
+        assert!(
+            state
+                .db
+                .oids_for_cid(provider_cid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the provider dag-pb CID must never resolve raw git bytes"
+        );
+    }
+
+    /// #173 (end-to-end pin wiring): `pin_new_objects` records the repo_id it is given
+    /// as the pin's provenance. Drives the real pin path against a mocked IPFS `/add`
+    /// endpoint (so `pin_git_object` succeeds) and asserts `provenance_for_oid` returns
+    /// the repo — closing the gap between the push handler's threading and the DB write.
+    #[sqlx::test]
+    async fn pin_new_objects_records_provenance(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"bafyprovtest"}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let fx = seed_cid_repos("provpin_e2e", "ppe2e", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("provpin_e2e")
+            .join("pinsrc.git");
+
+        let pinned = crate::ipfs_pin::pin_new_objects(
+            &server.url(),
+            &bare,
+            vec![fx.public_oid.clone()],
+            &state.db,
+            "repoZ",
+        )
+        .await;
+        assert!(
+            !pinned.is_empty(),
+            "the object was pinned via the real pin path"
+        );
+        m.assert_async().await;
+        assert_eq!(
+            state
+                .db
+                .provenance_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("repoZ"),
+            "pin_new_objects records the repo_id it was given as the pin's provenance"
+        );
+    }
+
+    /// #173 (jatmn, F2): a legacy pin with NULL provenance backfills its source
+    /// via `backfill_pin_provenance`, and the `AND repo_id IS NULL` guard preserves
+    /// first-pinner-owns (a non-NULL provenance is left untouched).
+    #[sqlx::test]
+    async fn backfill_pin_provenance_fills_null_keeps_existing(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        // A legacy pin: no provenance recorded.
+        state
+            .db
+            .record_pinned_cid("legacy_oid", "legacy_cid", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.provenance_for_oid("legacy_oid").await.unwrap(),
+            None,
+            "a legacy pin starts with NULL provenance"
+        );
+
+        // Backfill sets the NULL provenance.
+        state
+            .db
+            .backfill_pin_provenance("legacy_oid", "repo-src")
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .provenance_for_oid("legacy_oid")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("repo-src"),
+            "backfill fills a NULL provenance from the known source"
+        );
+
+        // A pin that already has provenance: backfill must NOT overwrite it.
+        state
+            .db
+            .record_pinned_cid("owned_oid", "owned_cid", Some("repo-first"))
+            .await
+            .unwrap();
+        state
+            .db
+            .backfill_pin_provenance("owned_oid", "repo-second")
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db
+                .provenance_for_oid("owned_oid")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("repo-first"),
+            "the AND repo_id IS NULL guard keeps the first-pinner's provenance"
+        );
+    }
+
+    /// #173 (jatmn, F2, load-bearing): an object already pinned with NULL provenance
+    /// (a pre-provenance legacy pin) acquires its source when `pin_new_objects` sees
+    /// it again. The already-pinned skip path must backfill rather than leave the
+    /// object stuck on the O(repos) scan fallback — and it must NOT re-pin the bytes
+    /// (no IPFS `/add` call, the object is already on IPFS).
+    #[sqlx::test]
+    async fn pin_new_objects_backfills_legacy_null_provenance(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos("provpin_backfill", "ppbf", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("provpin_backfill")
+            .join("pinsrc.git");
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(
+            &crate::git::store::read_object(&bare, &fx.public_oid)
+                .expect("read object bytes")
+                .expect("object exists")
+                .1,
+        )
+        .to_string();
+
+        // Legacy pin: the object is already recorded with NULL provenance.
+        state
+            .db
+            .record_pinned_cid(&fx.public_oid, &cid, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.db.provenance_for_oid(&fx.public_oid).await.unwrap(),
+            None,
+            "the object starts as a legacy pin with NULL provenance"
+        );
+
+        // Mock IPFS `/add` and require it is NOT called: the already-pinned object
+        // must be backfilled, never re-pinned.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let pinned = crate::ipfs_pin::pin_new_objects(
+            &server.url(),
+            &bare,
+            vec![fx.public_oid.clone()],
+            &state.db,
+            "repoBF",
+        )
+        .await;
+
+        assert!(
+            pinned.is_empty(),
+            "an already-pinned object is not re-pinned (no bytes returned)"
+        );
+        m.assert_async().await; // asserts /add was called 0 times
+        assert_eq!(
+            state
+                .db
+                .provenance_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("repoBF"),
+            "pin_new_objects backfills the legacy pin's NULL provenance"
+        );
+    }
+
+    /// #173 (provenance-path throttle): a walk-requiring provenanced candidate whose
+    /// per-IP walk quota is spent returns 429 (the provenance arm's Throttled outcome,
+    /// then the fall-through). quota=1, keyed on XFF. The first reader request runs the
+    /// walk and spends the token; the second from the same IP is throttled → 429.
+    #[sqlx::test]
+    async fn ipfs_cid_provenance_walk_throttle_returns_429(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let reader = Keypair::generate();
+        let reader_did = reader.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        let fx = seed_cid_repos(&slug, &short, &["provthrottle"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("provthrottle.git");
+        let repo = seed_repo(&owner_did, "provthrottle");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/secret/**",
+                VisibilityMode::B,
+                std::slice::from_ref(&reader_did),
+                &owner_did,
+            )
+            .await
+            .expect("path rule");
+        let cid = pin_cid_for_repo(&bare, &fx.secret_oid, &state.db, &repo.id).await;
+
+        // 1st reader request runs the walk (reader is allowed) and spends the token.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed_xff(&reader, &cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "1st provenance walk from the IP serves");
+
+        // 2nd request from the same IP: the walk is throttled → 429 (provenance path).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed_xff(&reader, &cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a throttled provenance walk returns 429"
+        );
+    }
+
+    /// #173 (multi-oid dispatch, mixed provenance + legacy): one CID mapping to a
+    /// provenanced-then-denied oid AND a legacy (NULL-provenance) oid must still resolve
+    /// to the legacy-servable copy — the provenance arm's skip does not abort the loop.
+    #[sqlx::test]
+    async fn ipfs_cid_mixed_provenance_and_legacy_serves_legacy(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["mixpriv", "mixpub"]);
+
+        // Private repo holds secret_oid, pinned with provenance = itself (denies anon).
+        let mut priv_repo = seed_repo(&owner_did, "mixpriv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private");
+        // Public repo holds public_oid, legacy pin (NULL provenance -> scan serves it).
+        let pub_repo = seed_repo(&owner_did, "mixpub");
+        state.db.create_repo(&pub_repo).await.expect("seed public");
+
+        // One REAL CID (the non-unique cid index) maps to BOTH oids: the public oid as a
+        // legacy (NULL) pin, and the secret oid provenanced to the private repo.
+        let pub_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("mixpub.git");
+        let shared_cid = pin_cid_for(&pub_bare, &fx.public_oid, &state.db).await;
+        state
+            .db
+            .record_pinned_cid(&fx.secret_oid, &shared_cid, Some(&priv_repo.id))
+            .await
+            .unwrap();
+
+        // Anon: secret_oid (provenance -> private -> denied), public_oid (legacy -> scan
+        // -> public -> served). Resolves to the public copy regardless of oid order.
+        let resp = cid_router(&state)
+            .oneshot(cid_anon(&shared_cid))
+            .await
+            .unwrap();
+        let served = resp
+            .headers()
+            .get("x-git-hash")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let (st, body) = cid_parts(resp).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a CID mixing a provenanced-denied oid and a legacy-servable oid resolves"
+        );
+        assert_eq!(
+            served.as_deref(),
+            Some(fx.public_oid.as_str()),
+            "the served object is the legacy public oid"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the public content is served"
+        );
+    }
+
+    // ---- #173 round 3: legacy (NULL-provenance) scan bound + 503-on-truncation ----
+    // The provenance path targets one repo and is already bounded. These cover the
+    // legacy scan fallback, where an anonymous request could otherwise fan out to
+    // O(repos) `acquire` + `cat-file` probes (F1) and a walk-cap truncation could
+    // false-404 an object that may be readable (F2). The bound is a per-request probe
+    // BUDGET, not a per-IP brake: a walk-free public fetch stays un-rate-limited
+    // (ipfs_walk_rate_limited_per_source), while the expensive walk keeps its IP brake.
+
+    /// T1 (F1): the probe budget gates BEFORE `acquire`/`cat-file`, so it genuinely
+    /// bounds the fan-out — a repo past the budget is never probed, even one that
+    /// WOULD serve. With the budget at 0, a PUBLIC legacy copy that would otherwise
+    /// serve 200 is not probed at all → 503 truncated (absence unproven). RED before
+    /// the budget check (the repo is probed and serves 200).
+    #[sqlx::test]
+    async fn ipfs_cid_legacy_probe_budget_gates_before_serving(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_max_legacy_probes = 0; // probe nothing → any legacy candidate truncates
+
+        let fx = seed_cid_repos(&slug, &short, &["pubprobe"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("pubprobe.git");
+        let repo = seed_repo(&owner_did, "pubprobe"); // public, no path rule → would serve
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // Legacy pin (NULL provenance) → resolver takes the scan fallback.
+        let cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        let (st, _) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the probe budget gates before the probe: a servable copy past the budget is not reached → 503"
+        );
+    }
+
+    /// T7 (F1/F3 pre-limit): EVERY legacy probe is braked on the source IP from the
+    /// FIRST one, so a hostile caller cannot repeatedly force the whole-node `acquire`
+    /// fan-out across requests (each cold `acquire` is a Tigris round-trip, INV-10).
+    /// Since #173-F3 (jatmn) there is no free budget: a single-repo legacy scan is
+    /// itself charged. quota=1 keyed on XFF, one PUBLIC legacy copy that serves
+    /// walk-free (never touches the walk brake), so the second same-IP request can only
+    /// be shed by the probe brake: req1 serves and spends the token, req2 → 429. RED
+    /// before the probe brake (req2 serves 200). The cross-request bound this proves is
+    /// exactly the amplification F3 closes.
+    #[sqlx::test]
+    async fn ipfs_cid_legacy_fanout_braked_on_ip_past_free_budget(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        let fx = seed_cid_repos(&slug, &short, &["fanout"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("fanout.git");
+        let repo = seed_repo(&owner_did, "fanout"); // public, no path rule → walk-free serve
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await; // legacy pin
+
+        let (st1, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon_xff(&cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st1,
+            StatusCode::OK,
+            "1st legacy fan-out probe from the IP serves"
+        );
+
+        let (st2, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon_xff(&cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st2,
+            StatusCode::TOO_MANY_REQUESTS,
+            "with no free budget, a repeat fan-out from the same IP is braked at the first probe"
+        );
+    }
+
+    /// F3 (jatmn, across-request amplification): the pre-fix free-probe budget was
+    /// PER REQUEST, so a caller could repeat a known NULL-provenance CID and force a
+    /// fresh batch of `acquire` + `cat-file` probes every request with zero limiter
+    /// contact, unbounded anonymous amplification against Tigris. Charging every
+    /// legacy probe from the first one makes those probes accumulate against the
+    /// per-IP `ipfs_rate_limiter` ACROSS requests. Four repos, none holding the CID,
+    /// so a full scan probes all four; the per-IP budget is sized to exactly ONE such
+    /// scan (4 tokens). req1 (a genuine absence) fully scans and 404s, spending the
+    /// budget; req2 from the SAME IP is shed at the first probe → 429 (it never
+    /// re-runs the four `acquire` probes). RED with the old free carve-out restored:
+    /// req2 re-scans un-braked and 404s again (the amplification stays open). This is
+    /// the load-bearing across-request bound F3 asks for.
+    #[sqlx::test]
+    async fn ipfs_cid_legacy_fanout_bounded_across_requests(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        // Budget = one full scan of the four seeded repos. A repeat scan from the same
+        // IP then finds it spent. Keyed on XFF so `oneshot` can choose the source IP.
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(4, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        let names = ["a0", "a1", "a2", "a3"];
+        let _fx = seed_cid_repos(&slug, &short, &names);
+        for n in names {
+            let repo = seed_repo(&owner_did, n);
+            state.db.create_repo(&repo).await.expect("seed repo");
+        }
+        // A legacy pin whose oid is absent from every repo → each probed repo misses,
+        // so req1 scans all four (spending the four-token budget) and 404s cleanly.
+        let bogus_oid = "0".repeat(64);
+        let cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"absent-across-requests").to_string();
+        state
+            .db
+            .record_pinned_cid(&bogus_oid, &cid, None)
+            .await
+            .expect("record legacy pin");
+
+        let (st1, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon_xff(&cid, "9.9.9.9"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st1,
+            StatusCode::NOT_FOUND,
+            "1st scan completes under budget: a genuine absence is a definitive 404"
+        );
+
+        let (st2, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon_xff(&cid, "9.9.9.9"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st2,
+            StatusCode::TOO_MANY_REQUESTS,
+            "2nd same-IP scan is shed at the first probe (429), not re-run un-braked: the across-request amplification is closed"
+        );
+    }
+
+    /// #173 (jatmn round 8, F3 — INV-10 cost guard): an already-throttled source's
+    /// legacy NULL-provenance request must be shed by the non-consuming admission peek
+    /// BEFORE the O(repos) `scan_ctx` preload runs — not after, where the per-probe
+    /// brake sits. The preload-query counter proves it both ways: 0 for the throttled
+    /// replay, 1 for an unthrottled source. RED if the peek is removed (the preload runs
+    /// while throttled → count 1). The two existing `_fanout_` tests confirm the per-
+    /// probe consuming charge is untouched (no double-charge, no under-charge).
+    #[sqlx::test]
+    async fn ipfs_cid_f3_throttled_source_skips_preload(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        // Budget 1, keyed on XFF so `oneshot` can choose the source IP.
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        let _fx = seed_cid_repos(&slug, &short, &["r0"]);
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "r0"))
+            .await
+            .expect("seed repo");
+        // A legacy pin absent from every repo → the scan probes and 404s (spending the
+        // one token on the first probe).
+        let bogus_oid = "0".repeat(64);
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(b"f3-absent").to_string();
+        state
+            .db
+            .record_pinned_cid(&bogus_oid, &cid, None)
+            .await
+            .expect("legacy pin");
+
+        // Req1 from 9.9.9.9 spends the one token (and runs the preload once).
+        let _ = cid_router(&state)
+            .oneshot(cid_anon_xff(&cid, "9.9.9.9"))
+            .await
+            .unwrap();
+
+        // Measure the throttled replay: the peek must shed it before the preload runs.
+        crate::api::ipfs::reset_preload_queries();
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon_xff(&cid, "9.9.9.9"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::TOO_MANY_REQUESTS,
+            "an already-throttled legacy replay is 429"
+        );
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            0,
+            "a throttled source must NOT run the O(repos) preload (F3): shed before scan_ctx"
+        );
+
+        // Control: an unthrottled source (a different IP) still runs the preload once —
+        // the peek must not over-block.
+        crate::api::ipfs::reset_preload_queries();
+        let _ = cid_router(&state)
+            .oneshot(cid_anon_xff(&cid, "8.8.8.8"))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            1,
+            "an unthrottled source runs the preload once (the peek must not over-block)"
+        );
+    }
+
+    /// T2 (F1): the legacy scan is bounded per request. With the probe ceiling shrunk
+    /// to 2 and 3 candidate repos none of which hold the object, the 3rd repo is never
+    /// probed and the search is reported truncated → 503, not an unbounded fan-out.
+    /// RED before the probe cap (all 3 probe, none serve, definitive 404).
+    #[sqlx::test]
+    async fn ipfs_cid_legacy_scan_probe_cap_truncates_to_503(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_max_legacy_probes = 2;
+
+        let _fx = seed_cid_repos(&slug, &short, &["r0", "r1", "r2"]);
+        for n in ["r0", "r1", "r2"] {
+            let repo = seed_repo(&owner_did, n);
+            state.db.create_repo(&repo).await.expect("seed repo");
+        }
+        // A legacy pin whose oid is absent from every repo: each probed repo misses,
+        // so the cap (not a hit) decides the outcome.
+        let bogus_oid = "0".repeat(64);
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(b"absent-marker-t2").to_string();
+        state
+            .db
+            .record_pinned_cid(&bogus_oid, &cid, None)
+            .await
+            .expect("record legacy pin");
+
+        let (st, _) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a scan truncated by the probe cap is a retryable 503, not a definitive 404"
+        );
+    }
+
+    /// T3 (F2): a walk-cap truncation must not false-404. Walk ceiling shrunk to 1;
+    /// two public repos each carry a path-scoped rule over the object and deny anon.
+    /// The 1st spends the single walk (deny), the 2nd is skipped at the cap — the
+    /// resolver did NOT prove the object unreadable everywhere, so 503, not 404.
+    /// RED before the walk-cap `truncated` flag (returns the opaque 404).
+    #[sqlx::test]
+    async fn ipfs_cid_legacy_walk_cap_truncates_to_503(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let reader = Keypair::generate();
+        let reader_did = reader.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_max_history_walks = 1;
+
+        let fx = seed_cid_repos(&slug, &short, &["wa", "wb"]);
+        for n in ["wa", "wb"] {
+            let repo = seed_repo(&owner_did, n);
+            state.db.create_repo(&repo).await.expect("seed repo");
+            state
+                .db
+                .set_visibility_rule(
+                    &repo.id,
+                    "/secret/**",
+                    VisibilityMode::B,
+                    std::slice::from_ref(&reader_did),
+                    &owner_did,
+                )
+                .await
+                .expect("path rule");
+        }
+        // Legacy pin of the path-scoped secret blob (present in both repos, denies anon).
+        let bare_wa = std::path::PathBuf::from("/tmp").join(&slug).join("wa.git");
+        let cid = pin_cid_for(&bare_wa, &fx.secret_oid, &state.db).await;
+
+        let (st, _) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the walk cap truncated the scan, so absence is unproven → 503, not a false 404"
+        );
+    }
+
+    /// T4 (must-not over-fire): a legacy CID genuinely absent from every repo on a
+    /// node UNDER the probe cap still returns the definitive 404 — the 503 fires only
+    /// on real truncation, never as a blanket replacement for not-found.
+    #[sqlx::test]
+    async fn ipfs_cid_legacy_true_absence_stays_404(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_max_legacy_probes = 8; // well above the single repo → no truncation
+
+        let _fx = seed_cid_repos(&slug, &short, &["only"]);
+        let repo = seed_repo(&owner_did, "only");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let bogus_oid = "0".repeat(64);
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(b"absent-marker-t4").to_string();
+        state
+            .db
+            .record_pinned_cid(&bogus_oid, &cid, None)
+            .await
+            .expect("record legacy pin");
+
+        let (st, _) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "a fully-scanned genuine absence is a definitive 404, not a 503"
+        );
+    }
+
+    /// T5 (provenance path untouched): the probe cap governs ONLY the legacy scan.
+    /// With the cap set to 0 (which would truncate any legacy probe immediately) a
+    /// PROVENANCED pin still resolves to its one repo and serves 200 — proving the
+    /// `legacy_scan=false` guard exempts the provenance path. RED if the guard were
+    /// dropped (provenance would truncate to 503).
+    #[sqlx::test]
+    async fn ipfs_cid_provenance_serves_despite_zero_probe_cap(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_max_legacy_probes = 0; // would truncate every LEGACY probe
+
+        let fx = seed_cid_repos(&slug, &short, &["provonly"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("provonly.git");
+        let repo = seed_repo(&owner_did, "provonly"); // public, no path rule
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &repo.id).await;
+
+        let (st, _) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the provenance path ignores the legacy probe cap and serves"
+        );
     }
 
     fn cid_router(state: &AppState) -> Router {
@@ -2125,10 +3676,36 @@ mod tests {
             .unwrap();
         (st, String::from_utf8_lossy(&b).to_string())
     }
+    /// Raw body bytes (NOT lossy-decoded). A git tree body stores each child oid
+    /// as 32 RAW bytes that `from_utf8_lossy` mangles to U+FFFD, so a hex
+    /// `contains` check on `cid_parts`'s String is vacuous. #135 deny tests must
+    /// witness the leak on these raw bytes.
+    async fn cid_bytes(resp: axum::response::Response) -> (StatusCode, Vec<u8>) {
+        let st = resp.status();
+        let b = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (st, b.to_vec())
+    }
+    /// True if `needle` appears as a contiguous byte subsequence of `haystack`.
+    fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
     fn cid_anon(cid: &str) -> Request<Body> {
         Request::builder()
             .method(Method::GET)
             .uri(format!("/ipfs/{cid}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+    /// Anonymous CID request carrying `x-forwarded-for: <ip>` — an anon caller with a
+    /// resolvable source IP, so the per-IP walk brake keys on it (the walk still
+    /// denies anon at a path rule).
+    fn cid_anon_xff(cid: &str, xff_ip: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/ipfs/{cid}"))
+            .header("x-forwarded-for", xff_ip)
             .body(Body::empty())
             .unwrap()
     }
@@ -2141,6 +3718,27 @@ mod tests {
             .header("content-digest", s.content_digest)
             .header("signature-input", s.signature_input)
             .header("signature", s.signature)
+            .body(Body::empty())
+            .unwrap()
+    }
+    /// Signed CID request carrying `x-forwarded-for: <ip>`. Used by the walk
+    /// rate-limit test to key the per-IP limiter off a chosen source under
+    /// `TrustedProxy::XForwardedFor` (the request goes through `oneshot`, which
+    /// leaves no socket peer, so the header is the only key source).
+    fn cid_signed_xff(
+        kp: &gitlawb_core::identity::Keypair,
+        cid: &str,
+        xff_ip: &str,
+    ) -> Request<Body> {
+        let path = format!("/ipfs/{cid}");
+        let s = gitlawb_core::http_sig::sign_request(kp, "GET", &path, b"");
+        Request::builder()
+            .method(Method::GET)
+            .uri(&path)
+            .header("content-digest", s.content_digest)
+            .header("signature-input", s.signature_input)
+            .header("signature", s.signature)
+            .header("x-forwarded-for", xff_ip)
             .body(Body::empty())
             .unwrap()
     }
@@ -2162,9 +3760,18 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["withhold"]);
-        let secret_cid = cid_for_oid(&fx.secret_oid);
-        let tree_cid = cid_for_oid(&fx.secret_tree_oid);
-        let public_cid = cid_for_oid(&fx.public_oid);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("withhold.git");
+        // Request CIDs are the production pin CIDs (content-hash), recorded in
+        // pinned_cids so get_by_cid resolves each back to its oid (#173).
+        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
+        let tree_cid = pin_cid_for(&bare, &fx.secret_tree_oid, &state.db).await;
+        let public_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+        let root_tree_cid = pin_cid_for(&bare, &fx.root_tree_oid, &state.db).await;
+        let public_tree_cid = pin_cid_for(&bare, &fx.public_tree_oid, &state.db).await;
+        let commit_cid = pin_cid_for(&bare, &fx.commit_oid, &state.db).await;
+        let tag_cid = pin_cid_for(&bare, &fx.tag_oid, &state.db).await;
 
         state
             .db
@@ -2244,7 +3851,10 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "listed reader reads the blob");
         assert!(body.contains("TOP SECRET"));
 
-        // KTD3: anon tree CID under /secret → 200 (trees/commits are not withheld).
+        // #135: anon tree CID under withheld /secret → 404. The 404 body is an opaque
+        // error string (never the object), so status is the load-bearing deny check;
+        // the real leak witness is the CONTRAST with the reader below, who DOES get a
+        // 200 carrying the child structure that anon is denied.
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&tree_cid))
@@ -2252,7 +3862,73 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert_eq!(st, StatusCode::OK, "tree object is served to anon (KTD3)");
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "withheld subtree tree must not be served to anon (#135)"
+        );
+
+        // Over-denial guard + positive leak witness: the listed reader (signed) DOES
+        // read the withheld subtree's tree, and its body carries the exact child
+        // structure anon was denied — the child filename plus the child oid as the 32
+        // RAW bytes a git tree stores (witnessed on raw bytes, since cid_parts's lossy
+        // decode would mangle them). This proves b.txt / secret_raw are the real leak
+        // markers and that the anon 404 above actually withheld them.
+        let secret_raw = hex::decode(&fx.secret_oid).expect("hex oid");
+        let (st, body) = cid_bytes(
+            cid_router(&state)
+                .oneshot(cid_signed(&reader, &tree_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "listed reader reads the withheld subtree tree"
+        );
+        assert!(
+            bytes_contain(&body, b"b.txt") && bytes_contain(&body, &secret_raw),
+            "reader's tree body carries the child filename and raw child oid"
+        );
+
+        // Root tree (path "/") stays served to anon who passes the "/" gate.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&root_tree_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "root tree stays served (must-serve)");
+
+        // /public subtree tree stays served to anon (allowed path).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&public_tree_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "public subtree tree stays served");
+
+        // Commit and annotated tag objects stay served (unchanged by #135).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&commit_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "commit object stays served");
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&tag_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "tag object stays served");
 
         // R3: public blob anon → 200 (non-withheld content not affected).
         let (st, _) = cid_parts(
@@ -2264,8 +3940,11 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "public blob stays served");
 
-        // R5: a genuine unknown CID also 404, uniform with the withheld 404.
-        let absent_cid = cid_for_oid(&"ab".repeat(32));
+        // R5: a genuine unknown CID also 404, uniform with the withheld 404. A
+        // well-formed pin-style CID that was never recorded in pinned_cids, so the
+        // oid_for_cid resolve misses (the production not-found path).
+        let absent_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"never pinned to this node").to_string();
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&absent_cid))
@@ -2305,7 +3984,11 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["withhold", "pubcopy"]);
-        let secret_cid = cid_for_oid(&fx.secret_oid);
+        // Same content in both clones -> same oid/CID; read from either.
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("withhold.git");
+        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
 
         // Withholding repo, iterated FIRST (later updated_at; list_all_repos is DESC).
         let mut withhold = seed_repo(&owner_did, "withhold");
@@ -2366,7 +4049,10 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["priv"]);
-        let blob_cid = cid_for_oid(&fx.public_oid);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("priv.git");
+        let blob_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
 
         let mut rec = seed_repo(&owner_did, "priv");
         rec.is_public = false;
@@ -2422,15 +4108,17 @@ mod tests {
         let state = test_state(pool).await;
 
         let fx = seed_cid_repos(&slug, &short, &["withhold"]);
-        let secret_cid = cid_for_oid(&fx.secret_oid);
-        let public_cid = cid_for_oid(&fx.public_oid);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("withhold.git");
+        // Recorded pins so get_by_cid resolves each CID to its oid and reaches the
+        // walk; the 404s below are then the fail-closed skip, not a table miss.
+        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
+        let public_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
 
         // Force the withheld walk to fail closed: a ref pointing at a blob (not
         // tree-ish) makes `git ls-tree -r` error, which `withheld_blob_oids`
         // propagates as Err → the handler's `Ok(Err)` arm skips the repo.
-        let bare = std::path::PathBuf::from("/tmp")
-            .join(&slug)
-            .join("withhold.git");
         std::fs::write(
             bare.join("refs/heads/blobref"),
             format!("{}\n", fx.secret_oid),
@@ -2489,6 +4177,72 @@ mod tests {
         );
     }
 
+    /// #173 review (F2): the commit/tag reachability walk must FAIL CLOSED on a git
+    /// error, exactly like the blob/tree walk. A ref pointing at a nonexistent object
+    /// makes `rev-list --all` fail, so `reachable_commit_tag_oids` returns Err, which
+    /// the handler's shared `Ok(Err) => continue` arm turns into a repo skip. The
+    /// load-bearing discriminator is that the PUBLIC commit is ALSO 404: if the arm
+    /// fail-OPENed (served on error) it would 200. Drives the commit/tag branch of
+    /// the shared fail-closed arm specifically (the sibling test covers blob/tree).
+    #[sqlx::test]
+    async fn ipfs_cid_commit_tag_walk_error_fails_closed(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["cterr"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("cterr.git");
+        // A reachable commit CID — would serve 200 if the walk succeeded.
+        let commit_cid = pin_cid_for(&bare, &fx.commit_oid, &state.db).await;
+
+        // A ref to a NONEXISTENT object: `git rev-list --all` fails ("bad object"),
+        // so reachable_commit_tag_oids bails → the walk arm skips the repo.
+        std::fs::write(
+            bare.join("refs/heads/broken"),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+        )
+        .unwrap();
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "cterr"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "cterr")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("path rule");
+
+        // Fail-closed: a walk error skips the repo, so even the otherwise-reachable
+        // public commit is 404 (not served). A fail-OPEN arm would 200 here.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&commit_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "a commit/tag walk error must fail closed (repo skipped), never serve"
+        );
+    }
+
     /// #126: a dangling blob (written via `git hash-object -w`, never referenced
     /// by any commit/tree) must 404 through `GET /ipfs/{cid}` under path-scoped
     /// rules — for anon AND the owner. The pre-#126 deny-set was fail-open by
@@ -2544,7 +4298,9 @@ mod tests {
             64,
             "expected sha256 oid: {dangling_oid}"
         );
-        let dangling_cid = cid_for_oid(&dangling_oid);
+        // Record the pin so oid_for_cid resolves it — the 404 must then come from
+        // the allowed-set gate excluding the dangling oid, not from a table miss.
+        let dangling_cid = pin_cid_for(&bare, &dangling_oid, &state.db).await;
 
         state
             .db
@@ -2599,6 +4355,1328 @@ mod tests {
             "owner also 404s on dangling blobs under path-scoped rules (fail-closed default)"
         );
         assert!(!body.contains("DANGLING SECRET"));
+    }
+
+    /// #135: a DANGLING tree (in the ODB, referenced by no commit) 404s under
+    /// path-scoped rules for anon AND owner — the reachable-only allowed-tree-set
+    /// never enumerates it. Handler-level companion to the helper test
+    /// `allowed_tree_set_excludes_dangling_tree`, proving the `get_by_cid` tree arm
+    /// (memo insert + `!in_allowed` continue) fails closed on the dangling case.
+    #[sqlx::test]
+    async fn ipfs_cid_dangling_tree_fails_closed_under_path_rules(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["dangtree"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("dangtree.git");
+
+        // Dangling tree via `git mktree`: a UNIQUE entry name so its oid is
+        // content-distinct from every reachable tree (a content-identical tree would
+        // dedup to a reachable oid — that is T2, not danglingness).
+        let mut child = std::process::Command::new("git")
+            .args(["mktree"])
+            .current_dir(&bare)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git mktree");
+        {
+            use std::io::Write;
+            writeln!(
+                child.stdin.as_mut().unwrap(),
+                "100644 blob {}\tdangling-only-unreferenced.txt",
+                fx.secret_oid
+            )
+            .unwrap();
+        }
+        let out = child.wait_with_output().expect("mktree output");
+        assert!(
+            out.status.success(),
+            "git mktree: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let dangling_tree_oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(dangling_tree_oid.len(), 64, "expected sha256 oid");
+        // Record the pin so the 404 is the allowed-tree-set gate excluding the
+        // dangling tree, not a table miss.
+        let dangling_cid = pin_cid_for(&bare, &dangling_tree_oid, &state.db).await;
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "dangtree"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "dangtree")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("deny rule");
+
+        for req in [cid_anon(&dangling_cid), cid_signed(&owner, &dangling_cid)] {
+            let (st, _) = cid_parts(cid_router(&state).oneshot(req).await.unwrap()).await;
+            assert_eq!(
+                st,
+                StatusCode::NOT_FOUND,
+                "dangling tree must 404 under path-scoped rules (anon + owner)"
+            );
+        }
+    }
+
+    /// #173 (F1): a QUARANTINED repo must not serve a pinned object by CID, to anon
+    /// OR to the mirror's own owner — quarantine is "hidden from serve/clone/listings,
+    /// owner included" (authorize_repo_read / feed_quarantined_mirror_withheld_from_owner).
+    /// The repo is PUBLIC with no path-scoped rule, so the "/" visibility gate ALLOWS
+    /// it and quarantine is the sole possible denier: RED before the fix (the loop
+    /// never checks quarantine → serves 200 + bytes), GREEN after the quarantine skip.
+    /// The owner-signed 404 is the load-bearing negative — a visibility-only gate
+    /// would Allow the owner and miss this.
+    #[sqlx::test]
+    async fn ipfs_cid_quarantined_repo_withheld_from_anon_and_owner(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["quar"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("quar.git");
+        // Pin a ROOT-readable object (public/a.txt) — no path-scoped rule, so only
+        // quarantine can deny it.
+        let public_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "quar"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "quar")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Baseline: before quarantine the object serves 200 (proves the CID resolves
+        // and the object is otherwise servable, so the 404 below is quarantine's doing).
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&public_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "public root object serves before quarantine"
+        );
+        assert!(body.contains("public bytes"), "baseline serves the content");
+
+        // Quarantine it.
+        state
+            .db
+            .set_repo_quarantine(&rec.id, true)
+            .await
+            .expect("quarantine");
+
+        // anon AND owner-signed must both 404 with no content leak.
+        for req in [cid_anon(&public_cid), cid_signed(&owner, &public_cid)] {
+            let (st, body) = cid_parts(cid_router(&state).oneshot(req).await.unwrap()).await;
+            assert_eq!(
+                st,
+                StatusCode::NOT_FOUND,
+                "quarantined repo must not serve by CID (anon + owner)"
+            );
+            assert!(
+                !body.contains("public bytes"),
+                "404 body must not leak quarantined content"
+            );
+        }
+    }
+
+    /// #173 (F2): a DANGLING commit or annotated tag (in the ODB, referenced by no
+    /// ref) must 404 under path-scoped rules for anon AND owner. The resolver proved
+    /// reachability only for blobs/trees, so a dangling commit/tag fell through to
+    /// serve, leaking its message/metadata. RED before the fix (serves 200 +
+    /// sentinel), GREEN after (the reachable commit/tag set excludes them). The
+    /// reachable-commit/tag serve path is covered by
+    /// ipfs_cid_gate_withholds_blob_from_unauthorized (commit + annotated tag → 200).
+    #[sqlx::test]
+    async fn ipfs_cid_dangling_commit_and_tag_fail_closed_under_path_rules(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["dangct"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("dangct.git");
+
+        // Run a git plumbing command that reads from stdin and prints an oid.
+        let oid_from_stdin = |args: &[&str], input: &[u8]| -> String {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&bare)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn git");
+            child.stdin.as_mut().unwrap().write_all(input).unwrap();
+            let out = child.wait_with_output().expect("git output");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Dangling commit: commit-tree with a sentinel message, NO ref update.
+        let dangling_commit_oid = oid_from_stdin(
+            &["commit-tree", &fx.root_tree_oid],
+            b"DANGLING COMMIT SECRET\n",
+        );
+        assert_eq!(dangling_commit_oid.len(), 64, "expected sha256 commit oid");
+        // Dangling annotated tag: mktag of the dangling commit, NO ref.
+        let tag_body = format!(
+            "object {dangling_commit_oid}\ntype commit\ntag dang\ntagger t <t@t> 0 +0000\n\nDANGLING TAG SECRET\n"
+        );
+        let dangling_tag_oid = oid_from_stdin(&["mktag"], tag_body.as_bytes());
+        assert_eq!(dangling_tag_oid.len(), 64, "expected sha256 tag oid");
+
+        let commit_cid = pin_cid_for(&bare, &dangling_commit_oid, &state.db).await;
+        let tag_cid = pin_cid_for(&bare, &dangling_tag_oid, &state.db).await;
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "dangct"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "dangct")
+            .await
+            .unwrap()
+            .unwrap();
+        // Path-scoped rule triggers the per-object gate (KTD4).
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("deny rule");
+
+        for (cid, sentinel) in [
+            (&commit_cid, "DANGLING COMMIT SECRET"),
+            (&tag_cid, "DANGLING TAG SECRET"),
+        ] {
+            for req in [cid_anon(cid), cid_signed(&owner, cid)] {
+                let (st, body) = cid_parts(cid_router(&state).oneshot(req).await.unwrap()).await;
+                assert_eq!(
+                    st,
+                    StatusCode::NOT_FOUND,
+                    "dangling commit/tag must 404 under path-scoped rules (anon + owner)"
+                );
+                assert!(
+                    !body.contains(sentinel),
+                    "404 body must not leak the dangling message: {sentinel}"
+                );
+            }
+        }
+    }
+
+    /// #173 review (F2 hardening): a REACHABLE commit must still serve under a
+    /// path-scoped rule even when the repo carries a pushable non-commit ref (an
+    /// annotated tag of a tree, accepted by receive-pack). `reachable_commit_tag_oids`
+    /// must NOT route through `assert_all_refs_are_commits` (which bails on such a
+    /// ref and would fail-closed 404 every reachable commit/tag CID in the repo).
+    /// RED before the decoupling (the guard bails → 404), GREEN after.
+    #[sqlx::test]
+    async fn ipfs_cid_reachable_commit_served_despite_non_commit_ref(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["weirdref"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("weirdref.git");
+
+        // A pushable non-commit ref: an annotated tag pointing at a TREE. `git tag -a`
+        // in the bare repo creates refs/tags/treetag -> tag object -> tree, which
+        // peels to a non-commit and makes assert_all_refs_are_commits bail.
+        let out = std::process::Command::new("git")
+            .args([
+                "tag",
+                "-a",
+                "treetag",
+                &fx.root_tree_oid,
+                "-m",
+                "tag of a tree",
+            ])
+            .current_dir(&bare)
+            .output()
+            .expect("git tag -a");
+        assert!(
+            out.status.success(),
+            "git tag -a: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Pin the REACHABLE root commit.
+        let commit_cid = pin_cid_for(&bare, &fx.commit_oid, &state.db).await;
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "weirdref"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "weirdref")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("path rule");
+
+        // The reachable commit must still serve — the non-commit ref must not
+        // fail-closed the whole repo's commit/tag CID retrieval.
+        let resp = cid_router(&state)
+            .oneshot(cid_anon(&commit_cid))
+            .await
+            .unwrap();
+        let served_hash = resp
+            .headers()
+            .get("x-git-hash")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let (st, _body) = cid_parts(resp).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a reachable commit must serve despite a pushable non-commit ref in the repo"
+        );
+        assert_eq!(
+            served_hash.as_deref(),
+            Some(fx.commit_oid.as_str()),
+            "the served object is the reachable root commit"
+        );
+    }
+
+    /// #173 review (F-F): an annotated tag pointing at a TREE is pushable through
+    /// receive-pack, and the TREE allowed-set path
+    /// (`allowed_tree_set_for_caller` -> `tree_paths` -> `reachable_commits`) runs
+    /// `assert_all_refs_are_commits`, which bails on that ref and fail-closes the
+    /// whole repo — 404-ing EVERY tree CID (root + public subtrees) for its owner
+    /// and readers, not just the offending tag. The tree allowed-set feeds ONLY the
+    /// CID gate (absence = fail-closed 404), so `tree_paths` uses the lenient
+    /// reachable-commit enumeration: commit-reachable trees still serve, while a
+    /// tree reachable only via such a tag stays excluded. `blob_paths` keeps the
+    /// strict guard (it also feeds serve/replication, where a miss under-withholds).
+    /// RED before the decoupling (whole-repo bail -> 404 on the root/public tree),
+    /// GREEN after; the withheld-subtree 404 is the load-bearing must-not.
+    #[sqlx::test]
+    async fn ipfs_cid_tree_served_despite_non_commit_ref(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["treeweird"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("treeweird.git");
+
+        // Pushable non-commit ref: an annotated tag pointing at the ROOT TREE.
+        let out = std::process::Command::new("git")
+            .args([
+                "tag",
+                "-a",
+                "treetag",
+                &fx.root_tree_oid,
+                "-m",
+                "tag of a tree",
+            ])
+            .current_dir(&bare)
+            .output()
+            .expect("git tag -a");
+        assert!(
+            out.status.success(),
+            "git tag -a: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Pin the reachable root tree and public subtree (both at ALLOWED paths),
+        // plus the secret subtree (a DENIED path — the fail-closed negative).
+        let root_tree_cid = pin_cid_for(&bare, &fx.root_tree_oid, &state.db).await;
+        let public_tree_cid = pin_cid_for(&bare, &fx.public_tree_oid, &state.db).await;
+        let secret_tree_cid = pin_cid_for(&bare, &fx.secret_tree_oid, &state.db).await;
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "treeweird"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "treeweird")
+            .await
+            .unwrap()
+            .unwrap();
+        // Path-scoped rule triggers the per-object tree gate (KTD4).
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("path rule");
+
+        // Reachable trees at ALLOWED paths must still serve despite the tag-of-tree.
+        for (cid, want_oid, label) in [
+            (&root_tree_cid, &fx.root_tree_oid, "root tree"),
+            (&public_tree_cid, &fx.public_tree_oid, "public subtree"),
+        ] {
+            let resp = cid_router(&state).oneshot(cid_anon(cid)).await.unwrap();
+            let served = resp
+                .headers()
+                .get("x-git-hash")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let (st, _) = cid_parts(resp).await;
+            assert_eq!(
+                st,
+                StatusCode::OK,
+                "{label} CID must serve despite a pushable tag-of-tree in the repo"
+            );
+            assert_eq!(
+                served.as_deref(),
+                Some(want_oid.as_str()),
+                "{label}: the served object is the reachable tree"
+            );
+        }
+
+        // Fail-closed preserved: the DENIED subtree's CID is still withheld — the
+        // lenient walk must not under-withhold a path the caller cannot read.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&secret_tree_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "a withheld subtree's tree CID stays 404 (lenient walk must not under-withhold)"
+        );
+    }
+
+    /// #173 review (F2 hardening): the INNER tag object of a nested tag-of-a-tag is
+    /// reachable (via the outer ref tag) and pinnable, so its CID must serve under a
+    /// path rule. `reachable_commit_tag_oids` peels tag chains to include it. RED
+    /// before the peel loop (the inner tag is not a ref tip and rev-list dereferences
+    /// to the commit, so it is absent → 404), GREEN after.
+    #[sqlx::test]
+    async fn ipfs_cid_nested_tag_inner_object_served(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["nested"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("nested.git");
+
+        let git_stdin = |args: &[&str], input: &[u8]| -> String {
+            use std::io::Write;
+            let mut child = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&bare)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn git");
+            child.stdin.as_mut().unwrap().write_all(input).unwrap();
+            let out = child.wait_with_output().expect("git output");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Inner annotated tag of the reachable commit (no ref of its own).
+        let inner_body = format!(
+            "object {}\ntype commit\ntag inner\ntagger t <t@t> 0 +0000\n\ninner\n",
+            fx.commit_oid
+        );
+        let inner_tag_oid = git_stdin(&["mktag"], inner_body.as_bytes());
+        // Outer annotated tag of the inner tag, then a ref to the outer tag. The
+        // inner tag is reachable only THROUGH the outer, not as a ref tip.
+        let outer_body = format!(
+            "object {inner_tag_oid}\ntype tag\ntag outer\ntagger t <t@t> 0 +0000\n\nouter\n"
+        );
+        let outer_tag_oid = git_stdin(&["mktag"], outer_body.as_bytes());
+        let out = std::process::Command::new("git")
+            .args(["update-ref", "refs/tags/nested", &outer_tag_oid])
+            .current_dir(&bare)
+            .output()
+            .expect("update-ref");
+        assert!(
+            out.status.success(),
+            "update-ref: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let inner_cid = pin_cid_for(&bare, &inner_tag_oid, &state.db).await;
+
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "nested"))
+            .await
+            .expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "nested")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(&rec.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("path rule");
+
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&inner_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the inner tag of a nested tag-of-a-tag is reachable and must serve"
+        );
+    }
+
+    /// #135: with NO path-scoped rule the per-object gate is skipped, so a tree CID
+    /// is served (the `"/"` gate is the whole story). Guards against over-gating
+    /// trees — the tree analog of the blob skip-walk branch.
+    #[sqlx::test]
+    async fn ipfs_cid_tree_served_when_no_path_scoped_rule(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["nopathrule"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("nopathrule.git");
+        let tree_cid = pin_cid_for(&bare, &fx.secret_tree_oid, &state.db).await;
+
+        // Public repo, no visibility rules → has_path_scoped_rule is false.
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "nopathrule"))
+            .await
+            .expect("seed repo");
+
+        let (st, body) = cid_bytes(
+            cid_router(&state)
+                .oneshot(cid_anon(&tree_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "tree served to anon when no path-scoped rule exists"
+        );
+        assert!(
+            bytes_contain(&body, b"b.txt"),
+            "served tree carries its child structure"
+        );
+    }
+
+    /// #173 (Fix 1): the pinned_cids lookup must use the canonical base32 CID, not
+    /// the raw request spelling. A pin is stored under `cid.to_string()` (canonical
+    /// base32); a request carrying the SAME CID re-encoded to a different multibase
+    /// (base58btc) parses and passes the sha2-256 check but, on the pre-fix handler,
+    /// misses the lookup key → false 404. Public repo, no path-scoped rule, so no
+    /// walk — this isolates the lookup-key canonicalization.
+    #[sqlx::test]
+    async fn ipfs_alt_encoding_cid_resolves(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["altenc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("altenc.git");
+        // Canonical base32 CID as stored by the pin path.
+        let public_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        // Public repo, no visibility rules (no path-scoped walk).
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "altenc"))
+            .await
+            .expect("seed repo");
+
+        // Re-encode the SAME CID to base58btc — a different, equally-valid spelling
+        // that is NOT the stored key. The `cid` crate re-exports `multibase`.
+        let alt = public_cid
+            .parse::<cid::CidGeneric<64>>()
+            .unwrap()
+            .to_string_of_base(cid::multibase::Base::Base58Btc)
+            .unwrap();
+        assert_ne!(alt, public_cid, "alt encoding must differ from canonical");
+
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&alt)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "alt-multibase spelling of a pinned CID must resolve (canonicalized lookup)"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "resolved object serves its content"
+        );
+    }
+
+    /// #173 (Fix 2a, db-level): `oids_for_cid` returns EVERY oid recorded under a
+    /// CID, not an arbitrary one. `record_pinned_cid` is unique on the git oid and
+    /// non-unique on cid, so two distinct oids can share one content-CID. Old
+    /// `oid_for_cid` did `LIMIT 1`; the new plural method must surface both.
+    #[sqlx::test]
+    async fn oids_for_cid_returns_all_duplicates(pool: PgPool) {
+        let state = test_state(pool).await;
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(b"shared content cid").to_string();
+        let oid_a = "a".repeat(64);
+        let oid_b = "b".repeat(64);
+        state
+            .db
+            .record_pinned_cid(&oid_a, &cid, None)
+            .await
+            .unwrap();
+        state
+            .db
+            .record_pinned_cid(&oid_b, &cid, None)
+            .await
+            .unwrap();
+
+        let mut oids = state.db.oids_for_cid(&cid).await.unwrap();
+        oids.sort();
+        assert_eq!(
+            oids,
+            vec![oid_a, oid_b],
+            "oids_for_cid must return every oid recorded under the shared CID"
+        );
+    }
+
+    /// #173 (Fix 2b, handler-level): when two oids collide on one CID and the
+    /// first-recorded is absent from every repo while the second is a readable
+    /// public object, the handler must try both and serve the readable one. The
+    /// pre-fix handler resolved a single oid (LIMIT 1 → first-inserted for equal
+    /// keys) and 404'd. Ordering caveat: this relies on `oids_for_cid` returning
+    /// the absent oid before the readable one (heap/insert order for equal keys);
+    /// if that ordering ever changes, `oids_for_cid_returns_all_duplicates` remains
+    /// the load-bearing, deterministic driver for Fix 2.
+    #[sqlx::test]
+    async fn ipfs_cid_collision_serves_readable_duplicate(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["collision"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("collision.git");
+
+        // A GENUINE content collision: the shared CID is the readable object's REAL
+        // content CID, and a second (absent) oid is recorded under the SAME cid. The
+        // handler must try every oid and serve the one whose bytes hash to the CID.
+        // (F2, #173: the served bytes must match the requested content address, so the
+        // shared cid has to be the object's real cid — an arbitrary seed would now be
+        // withheld by the integrity check as an unverifiable provider-CID-style row.)
+        let (_ty, raw) = crate::git::store::read_object(&bare, &fx.public_oid)
+            .unwrap()
+            .unwrap();
+        let shared_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
+        let absent_oid = "c".repeat(64);
+        state
+            .db
+            .record_pinned_cid(&absent_oid, &shared_cid, None)
+            .await
+            .expect("record absent oid first");
+        state
+            .db
+            .record_pinned_cid(&fx.public_oid, &shared_cid, None)
+            .await
+            .expect("record readable oid second");
+
+        // Public repo, no rules → the readable public object is served if reached.
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "collision"))
+            .await
+            .expect("seed repo");
+
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&shared_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "handler must try every oid under the CID and serve the readable duplicate"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the readable duplicate's content is served"
+        );
+    }
+
+    /// #173 (Fix 3/F3, INV-10): the expensive legacy fan-out is rate-limited per
+    /// source IP. A valid tree CID makes the object-type pre-check pass, so each
+    /// repeat request pays a fresh walk (request-scoped memo only) — unbounded
+    /// amplification. Since #173-F3 (jatmn) the source charge sits on the LEGACY
+    /// PROBE (`acquire` + `cat-file`), which precedes the walk, so every legacy
+    /// candidate is charged to the non-farmable source IP from the first probe; a
+    /// second identical request from the same IP is shed with 429, but a targeted
+    /// PROVENANCE fetch (no scan) and a request from a different IP are unaffected.
+    /// The limiter is sized to admit one full scan of the two seeded repos (2 probes)
+    /// so the first request serves; the repeat then finds the bucket spent.
+    #[sqlx::test]
+    async fn ipfs_walk_rate_limited_per_source(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let reader = Keypair::generate();
+        let reader_did = reader.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        // The scan probes both seeded repos (walklimit + walkpublic) per request, so
+        // size the per-IP budget to admit exactly one full scan (2 probes). A repeat
+        // scan from the same IP then finds the bucket spent. Keyed on the rightmost
+        // X-Forwarded-For hop so the test can choose a source IP under `oneshot`.
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        let fx = seed_cid_repos(&slug, &short, &["walklimit"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("walklimit.git");
+        // The tree CID drives a path-scoped walk (the load-bearing amplification
+        // surface). The reader is allowed under /secret so the walk returns 200.
+        let secret_tree_cid = pin_cid_for(&bare, &fx.secret_tree_oid, &state.db).await;
+
+        // Oldest `updated_at` → `list_all_repos` (ORDER BY updated_at DESC) probes
+        // this serving repo LAST, so a scan deterministically charges the walk-free
+        // `walkpublic` miss first then this serve: exactly 2 probes per scan.
+        let mut walklimit = seed_repo(&owner_did, "walklimit");
+        walklimit.updated_at = chrono::Utc::now() - chrono::Duration::seconds(60);
+        state.db.create_repo(&walklimit).await.expect("seed repo");
+        let rec = state
+            .db
+            .get_repo(&owner_did, "walklimit")
+            .await
+            .unwrap()
+            .unwrap();
+        // Mode B path rule over /secret with the reader allowed → the reader's
+        // secret-tree fetch runs the allowed-tree walk and returns 200.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                VisibilityMode::B,
+                std::slice::from_ref(&reader_did),
+                &owner_did,
+            )
+            .await
+            .expect("path rule");
+
+        // The MUST-NOT object must be a genuinely CHEAP fetch: an object served
+        // from a repo with NO path-scoped rule takes the no-walk path, so the WALK
+        // brake never rate-limits it. It has to live in a repo that carries no path
+        // rule AND whose object graph does not overlap `walklimit` (a blob shared
+        // with the path-scoped repo would still walk there), so we seed a second bare
+        // repo with UNIQUE content. `acquire(owner, "walkpublic")` resolves to
+        // `/tmp/<slug>/walkpublic.git`. This copy is PROVENANCED (`pin_cid_for_repo`)
+        // so it resolves straight to its repo and skips the legacy probe brake: the
+        // point here is the WALK brake, and post-#173-F3 a walk-free LEGACY fetch is
+        // itself source-charged at the probe, so a legacy pin would (correctly) be
+        // shed from the exhausted IP and no longer isolate the walk brake.
+        let pub_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("walkpublic.git");
+        {
+            use std::process::Command;
+            let run = |args: &[&str], cwd: &std::path::Path| {
+                let out = Command::new("git")
+                    .args(args)
+                    .current_dir(cwd)
+                    .output()
+                    .expect("git runs");
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let src = std::env::temp_dir().join(format!("gl-cid-pub-{short}"));
+            let _ = std::fs::remove_dir_all(&src);
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("cheap.txt"), b"cheap public bytes\n").unwrap();
+            run(&["init", "-q", "--object-format=sha256"], &src);
+            run(&["config", "user.email", "t@t"], &src);
+            run(&["config", "user.name", "t"], &src);
+            run(&["add", "."], &src);
+            run(&["commit", "-qm", "cheap"], &src);
+            let _ = std::fs::remove_dir_all(&pub_bare);
+            run(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    src.to_str().unwrap(),
+                    pub_bare.to_str().unwrap(),
+                ],
+                &src,
+            );
+            let _ = std::fs::remove_dir_all(&src);
+        }
+        let cheap_oid = {
+            use std::process::Command;
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD:cheap.txt"])
+                .current_dir(&pub_bare)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse cheap.txt");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // Public repo, NO visibility rules → the cheap object takes the no-walk path.
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "walkpublic"))
+            .await
+            .expect("seed public repo");
+        let pub_rec = state
+            .db
+            .get_repo(&owner_did, "walkpublic")
+            .await
+            .unwrap()
+            .unwrap();
+        let public_cid = pin_cid_for_repo(&pub_bare, &cheap_oid, &state.db, &pub_rec.id).await;
+
+        // 1st legacy scan from 1.2.3.4 → 200 (its two probes fit the budget; the
+        // walk ran, reader allowed).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed_xff(&reader, &secret_tree_cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "1st legacy scan from a source IP is served"
+        );
+
+        // 2nd identical scan from the SAME IP → 429 (per-IP probe budget spent).
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed_xff(&reader, &secret_tree_cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::TOO_MANY_REQUESTS,
+            "2nd legacy scan from the same source IP is shed with 429"
+        );
+
+        // MUST-NOT: a targeted PROVENANCE fetch (no scan, no probe brake) from the
+        // SAME limited IP, even after the 429, is served: the brake is on the legacy
+        // scan, not the route.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed_xff(&reader, &public_cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a provenance (non-scan) fetch is never rate-limited, even from the exhausted IP"
+        );
+        assert!(
+            body.contains("cheap public bytes"),
+            "the cheap fetch serves content"
+        );
+
+        // PER-SOURCE isolation: the same tree-CID scan from a DIFFERENT IP → 200.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed_xff(&reader, &secret_tree_cid, "5.6.7.8"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "one source's exhaustion must not shed another source's walk"
+        );
+    }
+
+    /// #173 review (F-C): a SKIPPED legacy candidate (a walk-and-deny denier, OR a
+    /// probe-throttled repo since #173-F3) must not end the whole request: the scan
+    /// keeps going so a later walk-free copy still serves, and a spent probe budget is
+    /// a clean 429, never a false 404/503. Otherwise a public CID would 404/429 solely
+    /// because a newer path-scoped duplicate sorts ahead of an older no-rule copy under
+    /// `updated_at DESC`. Two same-oid legacy copies: a NEWER `/secret`-scoped denier
+    /// and an OLDER no-rule public copy.
+    ///
+    /// Two requests from the SAME IP, budget = 2 (one full scan of both copies):
+    /// req1 probes the denier (charged), its allowed-blob walk denies anon → skip and
+    /// keep scanning, then probes+serves the walk-free public copy → 200. That proves
+    /// the denier skip is non-fatal (`continue`, not `break`). req2 from the same IP
+    /// finds the probe budget spent, so the denier's probe throttles → skip-continue,
+    /// the public copy's probe throttles too → nothing servable → a clean 429 (not a
+    /// truncation 503 nor a false 404), proving the throttle is likewise non-fatal but
+    /// correctly shed. RED before `continue` (a `break` on the skipped denier 404s
+    /// req1 outright).
+    #[sqlx::test]
+    async fn ipfs_walk_quota_skips_denier_and_serves_public_copy(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use chrono::Utc;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        // Budget = one full two-repo scan (2 probes), keyed on the rightmost XFF hop
+        // so `oneshot` can choose a source IP (no socket peer). A repeat scan from the
+        // same IP then finds the budget spent.
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        // Identical secret-blob content in both bare clones → one CID resolves to
+        // `secret_oid` in each. A NEWER path-scoped denier (walk-and-deny anon) and an
+        // OLDER no-rule public copy (walk-free serve).
+        let fx = seed_cid_repos(&slug, &short, &["scopeddenier", "publiccopy"]);
+        let denier_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("scopeddenier.git");
+        let secret_cid = pin_cid_for(&denier_bare, &fx.secret_oid, &state.db).await;
+
+        // Newer denier: public at "/", `/secret/**` Mode B empty readers → an anon
+        // blob fetch clears "/", runs the allowed-blob walk, is denied → continue.
+        let mut denier = seed_repo(&owner_did, "scopeddenier");
+        denier.updated_at = Utc::now();
+        state.db.create_repo(&denier).await.expect("seed denier");
+        state
+            .db
+            .set_visibility_rule(&denier.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+            .await
+            .expect("path rule");
+
+        // Older public copy — NO rule → the secret blob serves via the no-walk path.
+        let mut public = seed_repo(&owner_did, "publiccopy");
+        public.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        state
+            .db
+            .create_repo(&public)
+            .await
+            .expect("seed public copy");
+
+        // req1 from 1.2.3.4: the denier is skipped (walk denies anon) and the scan
+        // keeps going to serve the older walk-free public copy. Both probes fit the
+        // budget, so this leaves the IP bucket spent.
+        let resp = cid_router(&state)
+            .oneshot(cid_anon_xff(&secret_cid, "1.2.3.4"))
+            .await
+            .unwrap();
+        let served_hash = resp
+            .headers()
+            .get("x-git-hash")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let (st, _body) = cid_parts(resp).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a skipped walk-requiring denier must not end the scan: the later walk-free public copy still serves"
+        );
+        assert_eq!(
+            served_hash.as_deref(),
+            Some(fx.secret_oid.as_str()),
+            "the served object is the secret blob from the no-rule public copy"
+        );
+
+        // req2 from the SAME exhausted IP: every legacy probe is now throttled. The
+        // throttle is non-fatal (skip and keep scanning), but nothing is servable, so
+        // it resolves to a clean 429, not a truncation 503, not a false 404.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon_xff(&secret_cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::TOO_MANY_REQUESTS,
+            "with the probe budget spent, the repeat legacy scan is shed with a clean 429"
+        );
+    }
+
+    /// INV-10 amplification bound: a single `GET /ipfs/{cid}` must not fan out an
+    /// unbounded number of full-history walks. The per-request `ipfs_rate_limiter`
+    /// check only brakes REPEAT requests (it fires once per request); within one
+    /// request the same object can exist under path-scoped rules in many repos,
+    /// each paying its own walk. `MAX_HISTORY_WALKS_PER_REQUEST` caps that fan-out.
+    ///
+    /// Load-bearing witness (#173, F4): a readable public copy (no path rule →
+    /// served via the no-walk path, exactly like
+    /// `ipfs_cid_served_from_public_copy_when_withheld_elsewhere`) is given the
+    /// OLDEST `updated_at` so `list_all_repos` (ORDER BY updated_at DESC) iterates it
+    /// LAST. Ahead of it sit `cap + 1` path-scoped deniers, each forcing an
+    /// allowed-blob walk that denies anon. The cap bounds SPAWNED walks to `cap`, but
+    /// hitting it must `continue` (skip only the walk-requiring denier), NOT `break`
+    /// the whole repo loop: the walk-free public copy needs no walk, so it is still
+    /// reached and served (200, `x-git-hash` = the blob oid). The old `break`
+    /// wrongly 404'd this publicly-readable content. Reverting `continue`→`break`
+    /// turns this 200 back into a 404: the RED proof that the loop keeps scanning for
+    /// a cheap readable copy after the cap. The `cap` walk ceiling still holds — only
+    /// `cap` walks are spawned across the deniers regardless (the amplification bound
+    /// is proven separately by `ipfs_walk_cap_still_serves_walk_free_candidate`).
+    #[sqlx::test]
+    async fn ipfs_walk_fanout_capped_per_request(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use chrono::Utc;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let cap = crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST as usize;
+
+        // `cap + 1` deniers guarantee the fan-out crosses the ceiling before the
+        // readable copy (iterated last) is reached. All bare clones share identical
+        // content, so the one secret-BLOB CID resolves to `secret_oid` in every repo.
+        let denier_names: Vec<String> = (0..=cap).map(|i| format!("denier{i}")).collect();
+        let mut names: Vec<&str> = vec!["readable"];
+        names.extend(denier_names.iter().map(|s| s.as_str()));
+        let fx = seed_cid_repos(&slug, &short, &names);
+
+        let readable_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("readable.git");
+        // The secret BLOB CID drives the path-scoped allowed-blob walk in every
+        // denier (the amplification surface) and is served cheaply from the
+        // no-rule public copy — the proven serve path.
+        let secret_cid = pin_cid_for(&readable_bare, &fx.secret_oid, &state.db).await;
+
+        // 1) Readable public copy — OLDEST updated_at → iterated LAST. Public with
+        //    NO visibility rule, so the blob serves via the no-walk path. This is
+        //    the copy an uncapped fan-out would eventually reach and serve.
+        let mut readable = seed_repo(&owner_did, "readable");
+        readable.updated_at = Utc::now() - chrono::Duration::seconds(60);
+        state
+            .db
+            .create_repo(&readable)
+            .await
+            .expect("seed readable copy");
+
+        // 2) cap+1 deniers with NEWER updated_at → iterated before the copy. Public
+        //    at "/", but a `/secret/**` Mode B rule with an EMPTY reader list, so an
+        //    anon blob fetch clears the "/" gate, runs the allowed-blob walk, and is
+        //    denied (the secret blob is in no one's set) → continue. Each distinct
+        //    repo.id is its own walk (the memo only dedups the same repo).
+        for name in &denier_names {
+            let mut denier = seed_repo(&owner_did, name);
+            denier.updated_at = Utc::now();
+            state.db.create_repo(&denier).await.expect("seed denier");
+            state
+                .db
+                .set_visibility_rule(&denier.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+                .await
+                .expect("path rule");
+        }
+
+        // Anon (no peer, no XFF → the IP brake is skipped, so the walk cap is the
+        // only thing in play). After the cap, `continue` skips only the
+        // walk-requiring deniers and keeps scanning, reaching the walk-free public
+        // copy (iterated last) → served 200. The served object is the secret blob
+        // from the no-rule public copy, which is legitimately public THERE.
+        let resp = cid_router(&state)
+            .oneshot(cid_anon(&secret_cid))
+            .await
+            .unwrap();
+        let served_hash = resp
+            .headers()
+            .get("x-git-hash")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let (st, _body) = cid_parts(resp).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "hitting the walk cap must skip only the walk-requiring candidate, not abandon the walk-free readable copy"
+        );
+        assert_eq!(
+            served_hash.as_deref(),
+            Some(fx.secret_oid.as_str()),
+            "the served object is the blob from the no-rule public copy reached after the cap"
+        );
+    }
+
+    /// Multi-oid companion to `ipfs_walk_fanout_capped_per_request`: exercises the
+    /// outer oid loop and proves the per-request walk budget PERSISTS across oid
+    /// candidates, so a commit/tag candidate cannot re-open the fan-out. Since #173
+    /// (F2) a `commit`/`tag` under a path-scoped rule is itself walk-gated (its
+    /// reachability is proven by a `rev-list` walk via `reachable_commit_tag_oids`),
+    /// so it is NOT walk-free — it draws from the same budget as the blob/tree walks.
+    ///
+    /// One CID → TWO oids (the non-unique cid index, #173): a withheld `/secret`
+    /// blob (walk-triggering, denied to anon in every denier) recorded FIRST so a
+    /// seq scan tries it first and burns the whole walk budget across the deniers;
+    /// the reachable root commit is second. Because the budget is already spent, the
+    /// commit candidate's reachability walk is also capped in every denier, so the
+    /// request 404s — proving commit/tag walks (F2) respect the fan-out ceiling and
+    /// cannot be used to bypass it (R6/F3). A reachable commit served with budget to
+    /// spare is covered by `ipfs_cid_gate_withholds_blob_from_unauthorized`. The
+    /// withheld blob must not leak. Since #173 F2 a scan the walk cap truncated
+    /// returns 503 (absence unproven), not the old opaque 404.
+    #[sqlx::test]
+    async fn ipfs_walk_commit_tag_candidate_respects_the_walk_cap(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use chrono::Utc;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let cap = crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST as usize;
+
+        // cap+1 path-scoped deniers, all carrying identical content (same oids).
+        let denier_names: Vec<String> = (0..=cap).map(|i| format!("m{i}")).collect();
+        let names: Vec<&str> = denier_names.iter().map(|s| s.as_str()).collect();
+        let fx = seed_cid_repos(&slug, &short, &names);
+        let bare = std::path::PathBuf::from("/tmp").join(&slug).join("m0.git");
+
+        // ONE cid → TWO oids. The withheld blob is recorded first (seq scan lists it
+        // first → tried first → burns the budget); the reachable commit is second.
+        let multi_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
+        state
+            .db
+            .record_pinned_cid(&fx.commit_oid, &multi_cid, None)
+            .await
+            .expect("co-locate the commit oid under the same cid");
+
+        for name in &denier_names {
+            let mut d = seed_repo(&owner_did, name);
+            d.updated_at = Utc::now();
+            state.db.create_repo(&d).await.expect("seed denier");
+            state
+                .db
+                .set_visibility_rule(&d.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+                .await
+                .expect("path rule");
+        }
+
+        // Anon: the blob candidate is denied in every denier (a walk each, spending
+        // the budget); the commit candidate's reachability walk is then also capped
+        // in every denier — so no candidate is served AND the walk cap truncated the
+        // scan, leaving absence unproven → 503 (not the old false 404, #173 F2).
+        // Either way commit/tag walks respect the ceiling and cannot re-open the
+        // fan-out (R6/F3). The withheld blob must not leak in the body.
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&multi_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a commit/tag reachability walk respects the per-request cap; a truncated scan is 503, not a false 404"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "the withheld blob must not leak in the truncation response"
+        );
+    }
+
+    /// #173 (F3, INV-15): the per-IP quota debits ONE token per expensive legacy
+    /// candidate, not once per request, so one IP cannot drive an unbounded fan-out.
+    /// With quota=1 and two path-scoped deniers holding one CID, a SINGLE request is
+    /// shed at 429: since #173-F3 (jatmn) each legacy PROBE (`acquire` + `cat-file`,
+    /// which precedes the walk) debits, so the first denier probes+walks+denies on
+    /// token 1 and the second denier's probe finds no token → 429. (Before F3 the
+    /// debit sat on the walk; the outcome is unchanged, the charge point moved earlier
+    /// to also bound walk-free probes.) Defeating the per-candidate debit let one IP
+    /// drive up to MAX_HISTORY_WALKS_PER_REQUEST × quota expensive ops/hour.
+    #[sqlx::test]
+    async fn ipfs_walk_quota_debited_per_walk(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        use gitlawb_core::identity::Keypair;
+
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        // Signed but NOT a reader → cleared at "/", denied at /secret → forces a walk.
+        let stranger = Keypair::generate();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+
+        let mut state = test_state(pool).await;
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        let fx = seed_cid_repos(&slug, &short, &["w0", "w1"]);
+        let bare = std::path::PathBuf::from("/tmp").join(&slug).join("w0.git");
+        // The secret BLOB CID forces a path-scoped allowed-blob walk in each denier.
+        let secret_cid = pin_cid_for(&bare, &fx.secret_oid, &state.db).await;
+
+        // Two path-scoped deniers (Mode B /secret, empty readers): each forces a
+        // walk that denies the signed stranger, so ONE request spawns two walks.
+        for name in ["w0", "w1"] {
+            let d = seed_repo(&owner_did, name);
+            state.db.create_repo(&d).await.expect("seed denier");
+            state
+                .db
+                .set_visibility_rule(&d.id, "/secret/**", VisibilityMode::B, &[], &owner_did)
+                .await
+                .expect("path rule");
+        }
+
+        // ONE request, quota 1: walk 1 debits the token, walk 2 has none → 429.
+        let (st, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_signed_xff(&stranger, &secret_cid, "1.2.3.4"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the second full-history walk in one request must be shed with 429 (per-walk debit)"
+        );
+    }
+
+    /// The periodic cleanup task must sweep the ipfs walk limiter, not only its
+    /// five siblings. Drives `AppState::sweep_rate_limiters` — the exact method the
+    /// 300s loop calls — and asserts the ipfs limiter's expired entry is evicted.
+    /// Dropping `ipfs_rate_limiter.cleanup()` from that method leaves the entry in
+    /// place (`tracked_keys` stays 1): the RED proof that the sweep covers it.
+    #[sqlx::test]
+    async fn sweep_rate_limiters_includes_ipfs_limiter(pool: PgPool) {
+        let mut state = test_state(pool).await;
+        // Short window so a single recorded hit is already expired at sweep time.
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(5, Duration::from_millis(50));
+
+        assert!(
+            state.ipfs_rate_limiter.check("1.2.3.4").await,
+            "record a hit on the ipfs limiter"
+        );
+        assert_eq!(
+            state.ipfs_rate_limiter.tracked_keys().await,
+            1,
+            "the source-IP key is tracked before the sweep"
+        );
+
+        // Expire the entry (still mapped — cleanup hasn't run), then sweep.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        state.sweep_rate_limiters().await;
+
+        assert_eq!(
+            state.ipfs_rate_limiter.tracked_keys().await,
+            0,
+            "the periodic sweep must evict the ipfs limiter's expired entries"
+        );
     }
 
     // ---------------------------------------------------------------------------

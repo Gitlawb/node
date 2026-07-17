@@ -200,9 +200,11 @@ mod authz_guard {
             (issues, "create_issue", "authorize_repo_read("),
             (bounties, "create_bounty", "authorize_repo_read("),
             (repos, "fork_repo", "authorize_repo_read("),
-            // get_by_cid gates each iterated repo row directly via visibility_check
-            // (KTD2a: it must NOT route through authorize_repo_read's fuzzy re-resolve).
-            (ipfs, "get_by_cid", "visibility_check("),
+            // get_by_cid resolves each candidate (provenance path + legacy scan) through
+            // the shared `gate_and_serve` (#173 round 2); the gate markers themselves are
+            // asserted below. This row proves the delegation is real — the gate is
+            // actually reached, not dead code.
+            (ipfs, "get_by_cid", "gate_and_serve("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),
@@ -234,6 +236,22 @@ mod authz_guard {
         assert!(
             fn_body(visibility, "require_owner").contains("did_matches("),
             "visibility::require_owner must use did_matches for DID-safe owner matching"
+        );
+
+        // The CID read surface (#173) enforces its gate inside the shared
+        // `gate_and_serve`, which BOTH the provenance path and the legacy scan call, so
+        // the markers must live there (the get_by_cid row above only proves delegation).
+        // The repo's own "/" visibility check (KTD2a — never authorize_repo_read's fuzzy
+        // re-resolve) and the quarantine hard-drop BEFORE visibility (INV-11) are both
+        // load-bearing: removing either re-opens a leak on the provenance path.
+        let gate_body = fn_body(ipfs, "gate_and_serve");
+        assert!(
+            gate_body.contains("visibility_check("),
+            "gate_and_serve must gate the CID read surface via visibility_check (KTD2a)"
+        );
+        assert!(
+            gate_body.contains("if quarantined"),
+            "gate_and_serve must hard-drop a quarantined repo before the visibility gate (INV-11)"
         );
 
         for (src, func, marker) in rows {
