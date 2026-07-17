@@ -24,7 +24,9 @@ use tokio::process::Command;
 ///
 /// The `be0cdd6` path-scoped upload-pack walk already applies this discipline by
 /// moving its permits into the `spawn_blocking`; this generalizes it to the plain
-/// (non-path-scoped) `info_refs` / `run_git_service` spawn paths.
+/// (non-path-scoped) `info_refs` / `run_git_service` spawn paths and, via the
+/// hand-back contract on `drive_git_child`, across both stages of the filtered
+/// (`upload_pack_excluding`) pack build (F1).
 pub struct AdmissionGuard {
     // Boxed so the concrete permit types stay private to the caller (repos.rs) — the
     // guard only needs to hold them and drop them, never inspect them. `Send +
@@ -71,8 +73,11 @@ pub async fn info_refs(
         .arg("--advertise-refs")
         .arg(repo_path);
     // No request body — advertise-refs does not read stdin.
-    let stdout =
+    let (stdout, admission) =
         drive_git_child(command, Bytes::new(), timeout, "advertise-refs", admission).await?;
+    // Single-stage op: the advertisement's group is reaped by now; release admission
+    // rather than holding it across the pure response framing below.
+    drop(admission);
 
     let content_type = format!("application/x-{service}-advertisement");
 
@@ -174,11 +179,12 @@ struct KillGroupOnDrop {
     // own SIGCHLD-driven orphan reaper.
     child: Option<tokio::process::Child>,
     pgid: Option<i32>,
-    // The global + per-source admission permits for this op, if any. On the plain
-    // (non-path-scoped) spawn paths repos.rs moves its permits in here so admission is
-    // released only when the group is confirmed reaped, on every exit — complete,
-    // timeout, or client-disconnect (#174 P1-a). The rev-list/pack-objects
-    // visibility-walk callers hold no admission and pass `None`.
+    // The global + per-source admission permits for this op, if any. repos.rs moves
+    // its permits in here (directly on the plain spawn paths, via the stage threading
+    // on the filtered rev-list/pack-objects ones) so admission is released only when
+    // the group is confirmed reaped, on every exit: complete, timeout, or
+    // client-disconnect (#174 P1-a, F1). `None` when the op carries no admission
+    // (e.g. the smart_http test harness).
     admission: Option<AdmissionGuard>,
 }
 
@@ -191,9 +197,10 @@ impl KillGroupOnDrop {
 
     /// Disarm on the success/timeout path: the body has already reaped the child (its
     /// `wait()` returned, or `reap_group_on_timeout` ran), so drop the handle and clear
-    /// the pgid, leaving the guard's Drop a no-op. Returns the admission guard so the
-    /// caller drops it at the earliest provably-free point (the group is already reaped
-    /// on both callers of this) rather than at end-of-bookkeeping.
+    /// the pgid, leaving the guard's Drop a no-op. Returns the admission guard: the
+    /// group is already reaped on both callers of this, so the success path hands it
+    /// back to drive_git_child's caller (a multi-stage build carries it to the next
+    /// stage) and the timeout path drops it there and then.
     fn disarm(&mut self) -> Option<AdmissionGuard> {
         self.pgid = None;
         self.child = None;
@@ -331,23 +338,36 @@ async fn run_git_service(
         .arg(service_to_command(service))
         .arg("--stateless-rpc")
         .arg(repo_path);
-    drive_git_child(command, input, timeout, service, admission).await
+    let (out, admission) = drive_git_child(command, input, timeout, service, admission).await?;
+    // Single-stage op: the child group is already reaped when drive_git_child
+    // returns, so releasing admission here keeps the permits held exactly for the
+    // process lifetime, no longer.
+    drop(admission);
+    Ok(out)
 }
 
 /// Drive a spawned git child under `timeout` with process-group teardown, returning
-/// its stdout. Shared core for [`run_git_service`] and [`info_refs`]: the caller
+/// its stdout together with the admission guard. Shared core for
+/// [`run_git_service`], [`info_refs`], and the filtered-pack stages: the caller
 /// passes a `Command` with its args set; this adds piped stdio and `process_group(0)`.
 /// On the deadline the whole group is torn down and reaped before returning
 /// [`GitServiceTimeout`]; on a dropped future (client disconnect) the
 /// [`KillGroupOnDrop`] guard fires. `input` is written to the child's stdin (empty
 /// for the advertise-refs path, which has no request body); `what` labels errors.
+///
+/// Admission contract: on success the guard is handed BACK so a multi-stage caller
+/// (the filtered-pack build) can carry one admission across consecutive children
+/// instead of releasing it between stages. On every Err return (timeout, spawn
+/// failure, interaction error, non-zero exit) the guard is dropped internally, and
+/// only after the child is reaped: an Err cannot carry the guard, and by then the
+/// group is confirmed gone, so releasing admission there is correct.
 async fn drive_git_child(
     mut command: Command,
     input: Bytes,
     timeout: Duration,
     what: &str,
     admission: Option<AdmissionGuard>,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, Option<AdmissionGuard>)> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -382,10 +402,10 @@ async fn drive_git_child(
         pgid,
         admission,
     };
-    // On non-unix there is no process-group teardown, so hold the admission guard here
-    // for the child's whole interaction; it drops when this function returns.
-    #[cfg(not(unix))]
-    let _admission = admission;
+    // On non-unix there is no process-group teardown; the `admission` parameter
+    // itself stays live for the child's whole interaction (nothing moves it until
+    // the match below), so the success path hands it back like the unix path and
+    // the timeout path drops it after the child is waited on.
 
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -419,16 +439,18 @@ async fn drive_git_child(
     };
 
     let timed = tokio::time::timeout(timeout, interact).await;
-    let (write_result, status) = match timed {
+    let (write_result, status, admission) = match timed {
         Ok(result) => {
             // The join runs all arms to completion, so the child is reaped: disarm
             // before surfacing any interaction error (a read/wait error), else the
             // guard's drop would reap an already-reaped child / signal a reused pgid.
-            // Dropping the returned admission guard here releases the permits at the
-            // earliest provably-free point on the success path (the op finished).
+            // Disarming hands the admission guard back; it rides to the Ok return
+            // below, and every error return between here and there drops it, always
+            // AFTER the reap, the earliest provably-free point.
             #[cfg(unix)]
-            drop(group_guard.disarm());
-            result?
+            let admission = group_guard.disarm();
+            let (write_result, status) = result?;
+            (write_result, status, admission)
         }
         Err(_elapsed) => {
             // Timeout: tear the whole group down and reap it before returning so a
@@ -444,6 +466,7 @@ async fn drive_git_child(
             {
                 let _ = child.start_kill();
                 let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                drop(admission);
             }
             return Err(GitServiceTimeout.into());
         }
@@ -452,7 +475,8 @@ async fn drive_git_child(
     // Surface git's own failure (its stderr, which the handler may classify as a
     // 400) before any stdin-write error: when git rejects a malformed body it
     // exits non-zero and closes stdin, so the write's EPIPE would otherwise mask
-    // the real cause.
+    // the real cause. `admission` drops on these error returns; the child is
+    // already reaped by the completed join above.
     if !status.success() {
         let stderr = String::from_utf8_lossy(&err);
         bail!("{what} failed: {stderr}");
@@ -460,7 +484,7 @@ async fn drive_git_child(
 
     write_result.context("failed to write to git stdin")?;
 
-    Ok(out)
+    Ok((out, admission))
 }
 
 fn service_to_command(service: &str) -> &str {
@@ -498,14 +522,17 @@ async fn rev_list_keep(
     repo_path: &Path,
     withheld: &HashSet<String>,
     timeout: Duration,
-) -> Result<Vec<String>> {
+    admission: Option<AdmissionGuard>,
+) -> Result<(Vec<String>, Option<AdmissionGuard>)> {
     let mut command = Command::new(git_bin);
     command
         .args(["rev-list", "--objects", "--all"])
         .current_dir(repo_path);
-    // The visibility-walk callers intentionally hold no admission permit (their
-    // admission is governed elsewhere), so pass `None` (#174 KTD2).
-    let stdout = drive_git_child(command, Bytes::new(), timeout, "rev-list", None).await?;
+    // The filtered-serve caller's admission rides through drive_git_child so a
+    // disconnect mid-enumeration keeps the permits held until the rev-list group is
+    // reaped; on success the guard comes back for the pack-objects stage (F1).
+    let (stdout, admission) =
+        drive_git_child(command, Bytes::new(), timeout, "rev-list", admission).await?;
     let mut keep = Vec::new();
     for line in String::from_utf8_lossy(&stdout).lines() {
         let oid = line.split_whitespace().next().unwrap_or("");
@@ -514,7 +541,7 @@ async fn rev_list_keep(
         }
         keep.push(oid.to_string());
     }
-    Ok(keep)
+    Ok((keep, admission))
 }
 
 /// Build a packfile containing every object reachable from all refs EXCEPT the
@@ -527,20 +554,30 @@ async fn rev_list_keep(
 /// disconnect. An outer `tokio::time::timeout` around a `spawn_blocking` cannot
 /// cancel the blocking thread, so neither stage may live off the async side
 /// (#174, KTD5).
+///
+/// `admission` carries the filtered-serve permits across BOTH stages: stage 1 hands
+/// it back on success, stage 2 takes it, and the caller receives it after stage 2 so
+/// release happens only once the last child group is reaped. On a disconnect the
+/// guard rides the active stage's detached reaper instead of dropping with the
+/// future (F1). A stage that fails or times out (including a stage 2 whose
+/// remaining budget has saturated to zero) drops the guard inside drive_git_child,
+/// after that stage's reap.
 pub async fn build_filtered_pack(
     git_bin: &str,
     repo_path: &Path,
     withheld: &HashSet<String>,
     timeout: Duration,
-) -> Result<Vec<u8>> {
+    admission: Option<AdmissionGuard>,
+) -> Result<(Vec<u8>, Option<AdmissionGuard>)> {
     // One deadline spans both git stages so a slow rev-list eats into the pack
     // budget rather than granting each stage a fresh `timeout` (2x the permit hold).
     let deadline = Instant::now() + timeout;
-    let keep = rev_list_keep(
+    let (keep, admission) = rev_list_keep(
         git_bin,
         repo_path,
         withheld,
         deadline.saturating_duration_since(Instant::now()),
+        admission,
     )
     .await?;
     let mut data = keep.join("\n").into_bytes();
@@ -554,8 +591,7 @@ pub async fn build_filtered_pack(
         Bytes::from(data),
         deadline.saturating_duration_since(Instant::now()),
         "pack-objects",
-        // Visibility-walk pack build: no admission permit here (#174 KTD2).
-        None,
+        admission,
     )
     .await
 }
@@ -584,16 +620,24 @@ pub async fn build_filtered_pack(
 /// instead of a thin delta. Honoring negotiation for smaller fetch packs is an
 /// optimization follow-up, not a correctness requirement.
 pub async fn upload_pack_excluding(
+    git_bin: &str,
     repo_path: &Path,
     request_body: Bytes,
     withheld: &HashSet<String>,
     timeout: Duration,
+    admission: Option<AdmissionGuard>,
 ) -> Result<Response> {
-    // The rev-list enumeration runs blocking off the runtime; the streaming
-    // pack-objects stage is duration-bounded and its process group is reaped on
-    // disconnect via drive_git_child (#174), so a hung build no longer pins its
-    // concurrency slot and a client disconnect no longer orphans the git child.
-    let pack = build_filtered_pack("git", repo_path, withheld, timeout).await?;
+    // Both filtered-pack stages run async under drive_git_child (duration-bounded,
+    // process group reaped on disconnect, #174), and `admission` threads through
+    // them so the caller's permits release only after the active stage's group is
+    // reaped, never the instant a disconnect drops this future (F1). `git_bin` is
+    // injectable for the same fake-git testing reason as `run_git_service`
+    // (production passes the configured git binary).
+    let (pack, admission) =
+        build_filtered_pack(git_bin, repo_path, withheld, timeout, admission).await?;
+    // Both git stages are done and their groups reaped; release admission before the
+    // pure in-memory response framing below.
+    drop(admission);
 
     // The client lists its capabilities on the first `want` line. Honor
     // side-band-64k when offered (every modern smart-HTTP client offers it);
@@ -712,9 +756,10 @@ mod tests {
         let mut withheld = std::collections::HashSet::new();
         withheld.insert(secret.clone());
 
-        let pack = build_filtered_pack("git", &bare, &withheld, Duration::from_secs(30))
-            .await
-            .unwrap();
+        let (pack, _admission) =
+            build_filtered_pack("git", &bare, &withheld, Duration::from_secs(30), None)
+                .await
+                .unwrap();
         let ids = pack_object_ids(&pack);
         assert!(ids.contains(&public), "public blob must be in the pack");
         assert!(
@@ -776,9 +821,10 @@ mod tests {
             b"0098want 0000000000000000000000000000000000000000 \
               side-band-64k ofs-delta agent=git/2\n00000009done\n",
         );
-        let resp = upload_pack_excluding(&bare, req, &withheld, Duration::from_secs(30))
-            .await
-            .unwrap();
+        let resp =
+            upload_pack_excluding("git", &bare, req, &withheld, Duration::from_secs(30), None)
+                .await
+                .unwrap();
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let ids = pack_object_ids(&extract_pack(&body));
         assert!(
@@ -837,9 +883,16 @@ mod tests {
         axum::extract::State(st): axum::extract::State<std::sync::Arc<FilterState>>,
         body: Bytes,
     ) -> Response {
-        upload_pack_excluding(&st.repo, body, &st.withheld, Duration::from_secs(30))
-            .await
-            .unwrap()
+        upload_pack_excluding(
+            "git",
+            &st.repo,
+            body,
+            &st.withheld,
+            Duration::from_secs(30),
+            None,
+        )
+        .await
+        .unwrap()
     }
 
     /// Spawn the server for `bare`, withholding `withheld`. Returns the clone URL
@@ -1359,14 +1412,19 @@ mod tests {
         for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
-                build_filtered_pack(git_bin, repo_path, withheld, stage_timeout),
+                build_filtered_pack(git_bin, repo_path, withheld, stage_timeout, None),
             )
             .await
             .expect(
                 "build_filtered_pack must return within the watchdog — the git stage \
                  must be timeout-bounded, not an uncancellable spawn_blocking",
             );
-            let err = result.expect_err("a hung git stage must return an error, not hang");
+            // `match` rather than `expect_err`: the Ok arm carries an
+            // AdmissionGuard, which has no Debug impl for expect_err to print.
+            let err = match result {
+                Ok(_) => panic!("a hung git stage must return an error, not hang"),
+                Err(e) => e,
+            };
             if is_transient_exec_race(&err) {
                 // Fresh-fake-git ETXTBSY: back off (growing) so a bursty fork-pressure
                 // spike subsides before retrying, per fake_git_run_with_pids.
@@ -1652,6 +1710,296 @@ mod tests {
         assert!(
             err.downcast_ref::<GitServiceTimeout>().is_some(),
             "a hung rev-list must abort with GitServiceTimeout, got: {err}"
+        );
+    }
+
+    // ── F1: filtered-serve admission threaded through both pack stages ──────
+    //
+    // The handler-level disconnect regression lives in api/repos.rs
+    // (upload_pack_filtered_permit_held_through_group_reap_after_disconnect); these
+    // exercise the guard contract at the smart_http seam: held through a
+    // mid-rev-list disconnect, handed back on success, and recovered (post-reap)
+    // on every error return.
+
+    /// F1: a client disconnect mid-REV-LIST (stage 1 of the filtered build) must
+    /// keep the threaded admission held until the rev-list group is reaped, and
+    /// stage 2 (pack-objects) must never spawn, since the dropped future cannot
+    /// advance to it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_filtered_pack_holds_admission_through_rev_list_reap_on_disconnect() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descfile = tmp.path().join("desc.pid");
+        let packfile = tmp.path().join("pack.ran");
+        // rev-list: SIGTERM-trapping descendant records its pid and loops (bounded
+        // so a broken fix leaks no permanent orphan); the leader waits, keeping the
+        // interaction pending. pack-objects: records that it ran (it must never run).
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               rev-list)\n\
+                 sh -c 'trap \"\" TERM; echo $$ > \"{desc}\"; i=0; while [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done' &\n\
+                 wait ;;\n\
+               pack-objects) : > \"{pack}\" ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            desc = descfile.display(),
+            pack = packfile.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+        let withheld = HashSet::new();
+
+        let mut fut = Box::pin(build_filtered_pack(
+            git_bin.to_str().unwrap(),
+            tmp.path(),
+            &withheld,
+            Duration::from_secs(60),
+            Some(guard),
+        ));
+        // Drive until the rev-list descendant records its pid.
+        let mut desc: Option<i32> = None;
+        for _ in 0..500 {
+            let _ = tokio::time::timeout(Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&descfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                desc = Some(p);
+                break;
+            }
+        }
+        let desc = desc.expect("the fake rev-list must have spawned its descendant");
+        let _cleanup = ReapOnPanic(vec![desc]);
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "admission held while rev-list runs"
+        );
+
+        // Client disconnect mid-enumeration.
+        drop(fut);
+
+        // Load-bearing: the permit must stay held while the SIGTERM-ignoring group
+        // member is still alive (check before the reaper's ~2s SIGKILL escalation).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            alive(desc),
+            "the SIGTERM-ignoring descendant must still be alive during the hold window"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "on disconnect mid-rev-list the admission must be held until the group is \
+             reaped, not released the instant the future drops (F1)"
+        );
+
+        let mut freed = false;
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "the reaper must release admission once the rev-list group is gone"
+        );
+        assert!(
+            !packfile.exists(),
+            "pack-objects must never spawn after a disconnect mid-rev-list"
+        );
+    }
+
+    /// F1 success path: a filtered serve that completes hands the guard back
+    /// through both stages and releases admission when the serve returns. No leak,
+    /// no double-release.
+    #[tokio::test]
+    async fn upload_pack_excluding_releases_admission_after_success() {
+        let td = TempDir::new().unwrap();
+        let (_work, bare, secret_oid, _public_oid) = fixture_with_secret(&td);
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+        let withheld = HashSet::from([secret_oid]);
+        let resp = upload_pack_excluding(
+            "git",
+            &bare,
+            Bytes::from_static(b"0000"),
+            &withheld,
+            Duration::from_secs(30),
+            Some(guard),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "admission must be released once the filtered serve returns"
+        );
+    }
+
+    /// F1 error path: a rev-list that exits non-zero fails the build AND recovers
+    /// the threaded admission: drive_git_child drops the guard only after the
+    /// completed join has reaped the child, and the error return must not leak it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_filtered_pack_releases_admission_after_rev_list_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body =
+            "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo boom >&2; exit 2 ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let withheld = HashSet::new();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
+            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+            let result = build_filtered_pack(
+                git_bin.to_str().unwrap(),
+                tmp.path(),
+                &withheld,
+                Duration::from_secs(30),
+                Some(guard),
+            )
+            .await;
+            let err = match result {
+                Ok(_) => panic!("a non-zero rev-list exit must fail the build"),
+                Err(e) => e,
+            };
+            // Load-bearing on EVERY attempt: even a transient spawn-failure return
+            // must recover the permit (the guard drops before the Err surfaces).
+            assert_eq!(
+                sem.available_permits(),
+                1,
+                "the admission permit must be recovered on the error return, not leaked"
+            );
+            if is_transient_exec_race(&err) {
+                tokio::time::sleep(Duration::from_millis(FAKE_GIT_BACKOFF_STEP_MS * (i + 1))).await;
+                continue;
+            }
+            assert!(
+                err.to_string().contains("rev-list failed"),
+                "the failure must surface rev-list's own error, got: {err}"
+            );
+            return;
+        }
+        panic!(
+            "fake git kept hitting ETXTBSY after {FAKE_GIT_RETRY_ATTEMPTS} attempts \
+             (persistent exec failure, not a transient parallel-runner miss)"
+        );
+    }
+
+    /// F1: a pack-objects stage that times out (stage 2 of the filtered build,
+    /// guard threaded through) recovers the admission after the reap: the timeout
+    /// Err cannot carry the guard, so drive_git_child must drop it post-reap.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_filtered_pack_recovers_admission_after_pack_objects_timeout() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // rev-list returns one oid fast (guard handed back); pack-objects hangs.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef ;;\n  pack-objects) sleep 300 ;;\n  *) exit 1 ;;\nesac\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let withheld = HashSet::new();
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
+            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                build_filtered_pack(
+                    git_bin.to_str().unwrap(),
+                    tmp.path(),
+                    &withheld,
+                    Duration::from_millis(200),
+                    Some(guard),
+                ),
+            )
+            .await
+            .expect(
+                "build_filtered_pack must return within the watchdog; the git stage \
+                 must be timeout-bounded",
+            );
+            let err = match result {
+                Ok(_) => panic!("a hung pack-objects must fail the build"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                sem.available_permits(),
+                1,
+                "admission must be recovered after the stage-2 timeout reap, not leaked"
+            );
+            if is_transient_exec_race(&err) {
+                tokio::time::sleep(Duration::from_millis(FAKE_GIT_BACKOFF_STEP_MS * (i + 1))).await;
+                continue;
+            }
+            assert!(
+                err.downcast_ref::<GitServiceTimeout>().is_some(),
+                "a hung pack-objects must abort with GitServiceTimeout, got: {err}"
+            );
+            return;
+        }
+        panic!(
+            "fake git kept hitting ETXTBSY after {FAKE_GIT_RETRY_ATTEMPTS} attempts \
+             (persistent exec failure, not a transient parallel-runner miss)"
+        );
+    }
+
+    /// F1 zero-budget contract: build_filtered_pack hands pack-objects
+    /// `deadline.saturating_duration_since(now)`, which saturates to ZERO once
+    /// rev-list has consumed the whole budget. A zero-budget stage must still route
+    /// the guard through the timeout's reap-then-drop rather than leak it: the
+    /// child spawns, the deadline fires immediately, the group is reaped, and only
+    /// then does the guard drop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drive_git_child_zero_budget_drops_admission_after_reap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_bin = write_fake_git(tmp.path(), "#!/bin/sh\nsleep 300\n");
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        for i in 0..FAKE_GIT_RETRY_ATTEMPTS {
+            let guard = AdmissionGuard::new(sem.clone().try_acquire_owned().unwrap(), None::<()>);
+            let mut command = tokio::process::Command::new(git_bin.to_str().unwrap());
+            command
+                .args(["pack-objects", "--stdout"])
+                .current_dir(tmp.path());
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                drive_git_child(
+                    command,
+                    Bytes::new(),
+                    Duration::ZERO,
+                    "pack-objects",
+                    Some(guard),
+                ),
+            )
+            .await
+            .expect("a zero-budget stage must abort via its own deadline, not hang");
+            let err = match result {
+                Ok(_) => panic!("a zero-budget stage must return an error"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                sem.available_permits(),
+                1,
+                "the guard must drop after the zero-budget timeout reap, not leak"
+            );
+            if is_transient_exec_race(&err) {
+                tokio::time::sleep(Duration::from_millis(FAKE_GIT_BACKOFF_STEP_MS * (i + 1))).await;
+                continue;
+            }
+            assert!(
+                err.downcast_ref::<GitServiceTimeout>().is_some(),
+                "a zero-budget stage must abort with GitServiceTimeout, got: {err}"
+            );
+            return;
+        }
+        panic!(
+            "fake git kept hitting ETXTBSY after {FAKE_GIT_RETRY_ATTEMPTS} attempts \
+             (persistent exec failure, not a transient parallel-runner miss)"
         );
     }
 

@@ -932,19 +932,30 @@ pub async fn git_upload_pack(
         // the smart_http paths, not a generic 500 (#174 U3).
         let withheld = withheld.map_err(|e| git_service_app_error(&e))?;
 
+        // Move the permits returned by the walk into the guard, ONE construction
+        // site for both serve arms below, so admission tracks the served git group's
+        // reap (complete/timeout/disconnect) whether the pack is plain or filtered.
+        // The handler keeps no copy (F1: handler-local permits would drop the
+        // instant a disconnect drops this future, mid-reap).
+        let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
         if withheld.is_empty() {
-            // No blobs to withhold: serve the plain pack, moving the permits returned by
-            // the walk into the guard so admission tracks the served git group's reap
-            // (the walk already held them per be0cdd6; this hands them to the serve).
-            let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+            // No blobs to withhold: serve the plain pack (the walk already held the
+            // permits per be0cdd6; the guard hands them to the serve).
             smart_http::upload_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await
         } else {
             tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
-            // upload_pack_excluding runs its own rev-list/pack-objects (both pass `None`
-            // admission internally); the walk's permits stay handler-locals held across
-            // this serve, as be0cdd6 established, and drop when the handler returns.
-            let _hold = (_permit, _caller_permit);
-            smart_http::upload_pack_excluding(&disk_path, body, &withheld, git_timeout).await
+            // The guard threads through both filtered-pack stages (rev-list, then
+            // pack-objects), so a disconnect mid-stage keeps the permits held until
+            // that stage's process group is reaped (F1).
+            smart_http::upload_pack_excluding(
+                &state.git_bin,
+                &disk_path,
+                body,
+                &withheld,
+                git_timeout,
+                Some(admission),
+            )
+            .await
         }
     }
     .map_err(|e| {
@@ -4005,6 +4016,226 @@ mod tests {
         // A replacement is now no longer shed by the global cap (it proceeds past
         // admission; it then fails downstream on the fake git, which is not a 503).
         let peer3: SocketAddr = "203.0.113.73:5000".parse().unwrap();
+        let resp = router.oneshot(make_req(peer3)).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "after the group is reaped the freed slot must admit a replacement"
+        );
+    }
+
+    /// F1 (filtered-serve residual of #174 P1-a, RED-before/GREEN-after): on the
+    /// FILTERED (path-scoped, non-empty withheld) upload-pack branch a client
+    /// disconnect mid-pack-objects must NOT release the read admission while the
+    /// detached reaper is still tearing down the git group. Pre-fix the handler held
+    /// the permits as locals (`_hold`) across `upload_pack_excluding`, so dropping
+    /// the future released them instantly and disconnect-spam could exceed the read
+    /// caps during each reap window (RED). The fix threads the AdmissionGuard through
+    /// both filtered-pack stages so it rides `KillGroupOnDrop` into the reaper.
+    ///
+    /// Same isolation as the plain-path test above: read pool = 1, per-source cap
+    /// permissive, so only the global permit can shed a replacement. The fake git
+    /// serves the withheld walk (for-each-ref/rev-parse/rev-list/ls-tree) with a blob
+    /// under the denied `/src/**` subtree so the filtered branch is taken, answers
+    /// the pack build's rev-list fast, and hangs pack-objects in a SIGTERM-trapping
+    /// descendant. The descendant hang is first-invocation-only (keyed on the
+    /// pidfile's existence) so the post-reap replacement request completes fast.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn upload_pack_filtered_permit_held_through_group_reap_after_disconnect(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descfile = tmp.path().join("desc.pid");
+        let commit = "1111111111111111111111111111111111111111";
+        let blob = "2222222222222222222222222222222222222222";
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               rev-parse) echo {commit} ;;\n\
+               rev-list) echo {commit} ;;\n\
+               ls-tree) printf '100644 blob {blob}\\tsrc/x.txt' ;;\n\
+               pack-objects)\n\
+                 if [ ! -e \"{desc}\" ]; then\n\
+                   sh -c 'trap \"\" TERM; echo $$ > \"{desc}\"; i=0; while [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done' &\n\
+                   wait\n\
+                 fi ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            desc = descfile.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        // Isolate the global read pool: size 1; per-source cap + rate limiter permissive
+        // so only the leaked global permit can shed the replacement.
+        state.git_read_semaphore = Arc::new(Semaphore::new(1));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let owner = "z6upf1";
+        let name = "upf";
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // Real bare repo at the path acquire() computes, so the handler reaches the
+        // walk and the filtered serve.
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        // Path-scoped rule denying the anonymous caller under /src, matching the
+        // fake ls-tree's blob path, so the withheld set is NON-EMPTY and the
+        // filtered (upload_pack_excluding) branch is taken.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/src/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkUF1ReaderAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+
+        let sem = state.git_read_semaphore.clone();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one read slot before the request"
+        );
+
+        let router = crate::server::build_router(state);
+        let make_req = |peer: SocketAddr| {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{owner}/{name}/git-upload-pack"))
+                .body(Body::from(&b"0000"[..]))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let peer: SocketAddr = "203.0.113.81:5000".parse().unwrap();
+        let mut fut = Box::pin(router.clone().oneshot(make_req(peer)));
+        // Drive until the pack-objects descendant records its pid: the request is
+        // past the walk, inside the filtered serve's stage 2, holding the read permit.
+        // Stop polling the instant the future completes (re-polling a completed
+        // oneshot panics); read the descfile first so a spawn that recorded its pid
+        // then returned is still caught.
+        let mut spawned: Option<i32> = None;
+        let mut early = None;
+        for _ in 0..500 {
+            let done = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&descfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                spawned = Some(p);
+                break;
+            }
+            if let Ok(resp) = done {
+                early = Some(resp.map(|r| r.status()));
+                break;
+            }
+        }
+        let desc = spawned.unwrap_or_else(|| {
+            panic!("the fake pack-objects must have spawned; early finish: {early:?}")
+        });
+        // Kill the descendant regardless of outcome so a RED run leaks no orphan.
+        struct ReapOnDrop(i32);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapOnDrop(desc);
+        assert!(
+            unsafe { libc::kill(desc, 0) == 0 },
+            "descendant should be running before the disconnect"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the read slot is held while the filtered serve runs"
+        );
+
+        // Client disconnect: drop the request future mid-pack-objects. The detached
+        // reaper must now own the AdmissionGuard and hold it until ESRCH.
+        drop(fut);
+
+        // Load-bearing: the slot must STAY held while the SIGTERM-ignoring group is
+        // still alive. On the pre-fix code the handler-local `_hold` drops here and
+        // the slot frees at once (RED). Check quickly (before the reaper's ~2s
+        // SIGKILL escalation).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            unsafe { libc::kill(desc, 0) == 0 },
+            "the SIGTERM-ignoring descendant must still be alive during the hold window"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "on disconnect the read admission must be HELD until the filtered serve's \
+             process group is reaped, not released the instant the future drops (F1)"
+        );
+        // A replacement request from a DIFFERENT source must shed 503: the only pool
+        // that can shed it is the held global permit (per-source cap is permissive).
+        let peer2: SocketAddr = "203.0.113.82:5000".parse().unwrap();
+        let resp = router.clone().oneshot(make_req(peer2)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "while the prior group is still alive the held global permit must shed a \
+             replacement with 503"
+        );
+
+        // After the reaper SIGKILLs + reaps the group the AdmissionGuard drops and
+        // the slot frees. Poll for recovery.
+        let mut freed = false;
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "once the reaper confirms the group gone the admission guard must drop and \
+             free the global slot"
+        );
+        // A replacement is now admitted and completes: the fake pack-objects takes
+        // its fast path (the descfile exists), so the filtered serve returns instead
+        // of hanging.
+        let peer3: SocketAddr = "203.0.113.83:5000".parse().unwrap();
         let resp = router.oneshot(make_req(peer3)).await.unwrap();
         assert_ne!(
             resp.status(),
