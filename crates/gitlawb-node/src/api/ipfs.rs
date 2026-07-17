@@ -51,6 +51,15 @@ use crate::visibility::{visibility_check, Decision};
 /// fail-closed 404'd under path-scoped rules (#126). Denial and genuine
 /// not-found both fall through to an opaque 404.
 ///
+/// Scan completeness (F2): the 404 above is returned ONLY when every candidate
+/// repo reached a VERDICT — visibility deny, probe-says-absent, walk-gate deny,
+/// or served. A candidate skipped WITHOUT a verdict (acquire failure/timeout,
+/// probe error, walk failure/panic, content-read error, or truncation by
+/// `ipfs_max_repos_walked` / `ipfs_max_repo_visits`) taints the scan, and a
+/// tainted scan that found nothing sheds a retryable 503 + Retry-After naming
+/// the truncation sources — existing content is never misreported absent
+/// because of unrelated repos or transient faults.
+///
 /// Scope: this closes the direct unauthenticated scan, including the dangling
 /// case. A stale-public mirror row still serves withheld content (tracked
 /// separately, #124).
@@ -139,13 +148,35 @@ pub async fn get_by_cid(
     // deny entry (#126).
     let mut allowed_memo: HashMap<String, HashSet<String>> = HashMap::new();
 
-    // Cap the number of candidate repos one request walks (it already short-circuits on
-    // serve): a CID present in — or path-gated out of — many repos must not serialize an
-    // unbounded number of full-history walks inside the single held admission slot.
+    // Verdict-or-taint bookkeeping (F2): a candidate repo the loop cannot bring to a
+    // VERDICT (visibility deny / probe-says-absent / walk-gate deny / served) marks
+    // the scan truncated with its source. A truncated scan that finds nothing must
+    // NOT report 404 — the object may sit in a repo we skipped — so the terminal arm
+    // sheds a retryable 503 naming the sources, keyed so the operator can tell which
+    // knob (or backend) to look at.
+    let mut truncated_by: Vec<&'static str> = Vec::new();
+    fn taint(truncated_by: &mut Vec<&'static str>, source: &'static str) {
+        if !truncated_by.contains(&source) {
+            truncated_by.push(source);
+        }
+    }
+
+    // Cap on EXPENSIVE walks only (F2): counts the repos that actually require the
+    // full-history `allowed_blob_set_for_caller_bounded` walk (a path-scoped blob),
+    // checked immediately before the spawn_blocking below. Cheap probe-only visits
+    // are bounded by `repos_visited` — counting them here starved later-ordered
+    // repos out of a plain 200 on nodes with more readable repos than the cap.
     let mut repos_walked: usize = 0;
+    // Ceiling on VISITS (F2): every repo past the visibility gate costs an acquire
+    // (worst case a full Tigris archive download on a cache miss) plus a cat-file
+    // probe, so one request can trigger at most `ipfs_max_repo_visits` object-store
+    // fetches. On exhaustion the scan STOPS — there is no cheaper way to continue.
+    let mut repos_visited: usize = 0;
 
     for repo in &repos {
-        // Repo-level read gate against THIS row's own rules (KTD2a).
+        // Repo-level read gate against THIS row's own rules (KTD2a). Deny is a
+        // VERDICT: this repo would never serve the caller, so skipping it cannot
+        // hide content from them.
         let rules: &[crate::db::VisibilityRule] = rules_by_repo
             .get(&repo.id)
             .map(Vec::as_slice)
@@ -154,23 +185,24 @@ pub async fn get_by_cid(
             continue;
         }
 
-        // Loop bound (#174 P1-3): once this request has walked its cap of candidate
-        // repos (each a git subprocess, up to a full-history walk), stop and fall
-        // through to the opaque 404 rather than serialize an unbounded number under the
-        // single held admission slot.
-        if repos_walked >= state.config.ipfs_max_repos_walked {
+        // Visit ceiling (F2): bound the acquire+probe cost class. Stopping here
+        // leaves the remaining candidates unproven, so the scan is truncated.
+        if repos_visited >= state.config.ipfs_max_repo_visits {
             tracing::warn!(
-                cap = state.config.ipfs_max_repos_walked,
-                "/ipfs request hit the per-request repo-walk cap; stopping the scan"
+                ceiling = state.config.ipfs_max_repo_visits,
+                "/ipfs request hit the per-request repo-visit ceiling \
+                 (GITLAWB_IPFS_MAX_REPO_VISITS); stopping the scan without a verdict"
             );
+            taint(&mut truncated_by, "visit-ceiling");
             break;
         }
-        repos_walked += 1;
+        repos_visited += 1;
 
         // Bound the per-repo acquire under `git_acquire_timeout_secs`: this loop shares
         // the P1-2 stall vector (a hung Tigris HEAD/GET on one repo would otherwise
-        // block the whole /ipfs request). On expiry keep the existing fail-closed skip —
-        // never serve an un-acquired repo; a public copy (if any) still gets its turn.
+        // block the whole /ipfs request). On expiry keep the fail-closed skip — never
+        // serve an un-acquired repo; a public copy (if any) still gets its turn — but
+        // the repo got no verdict, so the skip taints the scan.
         let acquire_deadline =
             std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
         let repo_path = match tokio::time::timeout(
@@ -180,21 +212,28 @@ pub async fn get_by_cid(
         .await
         {
             Ok(Ok(p)) => p,
-            Ok(Err(_)) => continue,
+            Ok(Err(e)) => {
+                tracing::warn!(repo = %repo.name, err = %e, "repo acquire failed during /ipfs scan; skipping repo without a verdict");
+                taint(&mut truncated_by, "acquire");
+                continue;
+            }
             Err(_elapsed) => {
-                tracing::warn!(repo = %repo.name, "repo acquire timed out during /ipfs walk; skipping repo");
+                tracing::warn!(repo = %repo.name, "repo acquire timed out during /ipfs scan; skipping repo without a verdict");
+                taint(&mut truncated_by, "acquire");
                 continue;
             }
         };
 
         // Check whether the object exists in this repo before any expensive
         // reachability walk. This prevents random-CID spray from triggering
-        // full-history git walks on repos that don't carry the object.
+        // full-history git walks on repos that don't carry the object. Absent
+        // (`Ok(None)`) is a VERDICT; a probe that could not run is not.
         let obj_type = match store::object_type(&repo_path, &sha256_hex) {
             Ok(Some(t)) => t,
             Ok(None) => continue,
             Err(e) => {
-                tracing::warn!(repo = %repo.name, err = %e, "error checking git object type");
+                tracing::warn!(repo = %repo.name, err = %e, "object-type probe failed during /ipfs scan; skipping repo without a verdict");
+                taint(&mut truncated_by, "probe");
                 continue;
             }
         };
@@ -205,6 +244,21 @@ pub async fn get_by_cid(
         let path_scoped = has_path_scoped_rule(rules);
         if path_scoped && obj_type == "blob" {
             if !allowed_memo.contains_key(&repo.id) {
+                // Walk cap (F2), checked at the one site that actually spends a walk:
+                // on exhaustion skip THIS repo without a verdict and KEEP scanning —
+                // later candidates may still reach a cheap probe-only verdict (a plain
+                // public copy serves its 200 with no walk at all).
+                if repos_walked >= state.config.ipfs_max_repos_walked {
+                    tracing::warn!(
+                        cap = state.config.ipfs_max_repos_walked,
+                        repo = %repo.name,
+                        "/ipfs request hit the per-request walk cap \
+                         (GITLAWB_IPFS_MAX_REPOS_WALKED); skipping repo without a verdict"
+                    );
+                    taint(&mut truncated_by, "walk-cap");
+                    continue;
+                }
+                repos_walked += 1;
                 let rp = repo_path.clone();
                 let r = rules.to_vec();
                 let is_public = repo.is_public;
@@ -229,20 +283,25 @@ pub async fn get_by_cid(
                 .await;
                 // Fail closed on EITHER a task panic (JoinError) or a walk error:
                 // we cannot prove the caller may read here, so skip this repo and
-                // let a public copy (if any) serve. Never serve on an unproven gate.
+                // let a public copy (if any) serve. Never serve on an unproven gate
+                // — and never report absent on one either (no verdict, taint).
                 let set = match walk {
                     Ok(Ok(set)) => set,
                     Ok(Err(e)) => {
-                        tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk failed; skipping repo");
+                        tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk failed during /ipfs scan; skipping repo without a verdict");
+                        taint(&mut truncated_by, "walk-failure");
                         continue;
                     }
                     Err(e) => {
-                        tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk task panicked; skipping repo");
+                        tracing::warn!(repo = %repo.name, err = %e, "allowed-blob walk task panicked during /ipfs scan; skipping repo without a verdict");
+                        taint(&mut truncated_by, "walk-failure");
                         continue;
                     }
                 };
                 allowed_memo.insert(repo.id.clone(), set);
             }
+            // Not in the caller's reachable allowed-set: a VERDICT (deny), the walk
+            // proved this repo would never serve the blob to this caller.
             let in_allowed = allowed_memo
                 .get(&repo.id)
                 .is_some_and(|set| set.contains(&sha256_hex));
@@ -251,11 +310,14 @@ pub async fn get_by_cid(
             }
         }
 
-        // Now that we've passed the gate, read the content.
+        // Now that we've passed the gate, read the content. A failed read after a
+        // passed gate is not an absence verdict — the probe just said the object
+        // exists here — so the skip taints the scan.
         let content = match store::read_object_content(&repo_path, &sha256_hex, &obj_type) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(repo = %repo.name, err = %e, "error reading git object content");
+                tracing::warn!(repo = %repo.name, err = %e, "object content read failed during /ipfs scan; skipping repo without a verdict");
+                taint(&mut truncated_by, "read");
                 continue;
             }
         };
@@ -279,7 +341,20 @@ pub async fn get_by_cid(
         return Ok((StatusCode::OK, headers, content).into_response());
     }
 
-    // Not found in any repo
+    // Truncated scan (F2): at least one candidate repo yielded no verdict, so the
+    // object is not proven absent. A 404 here would misreport existing content, so
+    // shed retryable instead — Overloaded is the single 503 + Retry-After site in
+    // error.rs, and the message names the truncation sources so the operator can
+    // map the shed to the right knob or backend.
+    if !truncated_by.is_empty() {
+        return Err(AppError::Overloaded(format!(
+            "ipfs scan incomplete ({}) for CID {cid_str}; retry shortly",
+            truncated_by.join("+")
+        )));
+    }
+
+    // Complete scan: every candidate reached a verdict and none served, so the
+    // object is definitively absent (or denied) for this caller.
     Err(AppError::RepoNotFound(format!(
         "no git object found for CID {cid_str}"
     )))
@@ -351,6 +426,554 @@ mod tests {
             req.extensions_mut().insert(ConnectInfo(p));
         }
         req
+    }
+
+    /// Run real git, asserting success. Shared by the F2 scan-verdict tests.
+    fn run_git(args: &[&str], cwd: &std::path::Path) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Seed a repo row plus a REAL sha256 bare repo at its acquired path holding one
+    /// committed blob (`src/secret.txt` = `content`). Returns `(repo_id, blob_oid)`.
+    /// Same recipe as `get_by_cid_walk_permit_held_through_blocking_walk`: the CID
+    /// digest IS the sha256 object id under `--object-format=sha256`, so the real
+    /// `cat-file` probe finds the blob.
+    async fn seed_repo_with_blob(
+        state: &crate::state::AppState,
+        tmp: &std::path::Path,
+        owner: &str,
+        name: &str,
+        content: &[u8],
+    ) -> (String, String) {
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &format!("/unused-{name}"), None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        let bare = state
+            .repo_store
+            .acquire(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(&bare).unwrap();
+        let work = tmp.join(format!("work-{owner}-{name}"));
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/secret.txt"), content).unwrap();
+        run_git(
+            &["init", "-q", "--object-format=sha256", "-b", "main"],
+            &work,
+        );
+        run_git(&["config", "user.email", "t@t"], &work);
+        run_git(&["config", "user.name", "t"], &work);
+        run_git(&["add", "src/secret.txt"], &work);
+        run_git(&["commit", "-q", "-m", "seed"], &work);
+        run_git(
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            tmp,
+        );
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD:src/secret.txt"])
+            .current_dir(&work)
+            .output()
+            .expect("git rev-parse runs");
+        assert!(out.status.success(), "rev-parse failed");
+        let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (rec.id, oid)
+    }
+
+    /// CIDv1(raw, sha2-256) for a sha256 object id, as the handler resolves it.
+    fn cid_for_oid(oid: &str) -> String {
+        let oid_bytes = gitlawb_core::cid::sha256_hex_to_bytes(oid).unwrap();
+        gitlawb_core::cid::Cid::from_sha256_bytes(&oid_bytes)
+            .as_str()
+            .to_string()
+    }
+
+    /// Fake git for the WALK only (`state.git_bin`): empty refs, `rev-parse`
+    /// resolves, and each `rev-list` appends one line to `log` and prints nothing —
+    /// every walked repo yields an EMPTY allowed-set (path-gate deny verdict) and
+    /// the log's line count == the number of expensive walks run. The probe and the
+    /// content read shell to the real `git`, so seeded objects must genuinely exist.
+    #[cfg(unix)]
+    fn walk_logging_fake_git(dir: &std::path::Path, log: &std::path::Path) -> String {
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               for-each-ref) : ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               rev-list) echo walk >> \"{}\" ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            log.display()
+        );
+        let git_path = dir.join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+        git_path.to_str().unwrap().to_string()
+    }
+
+    /// F2 buried-row repro: with more readable repos than `ipfs_max_repos_walked`,
+    /// existing PUBLIC content past the cap must still serve. The cap counts
+    /// EXPENSIVE walks only — this request has no path-scoped rules anywhere, so it
+    /// runs ZERO walks (the fake-git walk log stays empty) and the cap can never cut
+    /// the scan: the blob buried in the OLDER-updated repo (iterated last under
+    /// `list_all_repos`' updated_at DESC) serves its 200. Before F2 the cap counted
+    /// visibility-passing VISITS and broke the loop into the opaque 404 — existing
+    /// content misreported absent because of unrelated repos. MUTATION (RED): count
+    /// visits against the cap again (re-add the check+increment at the visibility
+    /// gate) and the buried row 503s instead of serving.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_buried_public_row_past_walk_cap_still_serves(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let walk_log = tmp.path().join("walks.log");
+        state.git_bin = walk_logging_fake_git(tmp.path(), &walk_log);
+        // Tighter than the repo count: the old visit-counting cap cut the scan here.
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_max_repos_walked = 1;
+        state.config = Arc::new(cfg);
+
+        // Seed the blob-carrying repo FIRST so its updated_at is OLDER: the empty
+        // repo is iterated first and the blob row sits past the old visit budget.
+        let (_, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6f2buried",
+            "buried",
+            b"buried row proof\n",
+        )
+        .await;
+        seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6f2buried",
+            "fresh",
+            b"unrelated content\n",
+        )
+        .await;
+
+        let peer: SocketAddr = "203.0.113.60:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid_for_oid(&oid), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a public blob in a repo past the walk cap must still serve — the cap \
+             counts expensive walks and this scan needs none"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"buried row proof\n");
+        let walks = std::fs::read_to_string(&walk_log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            walks, 0,
+            "a request with no path-scoped rules anywhere must run zero expensive walks"
+        );
+    }
+
+    /// F2 walk-cap skip-and-continue: exhausting `ipfs_max_repos_walked` skips the
+    /// walk-NEEDING repo without a verdict but keeps the scan alive. Three public
+    /// repos carry the same blob, newest first: the first (path-scoped) consumes the
+    /// cap-of-1 walk and denies (empty allowed-set — a verdict); the second
+    /// (path-scoped) needs a walk the cap forbids and is skipped WITHOUT one (taint);
+    /// the third is plain public and serves the 200 from a cheap probe — found beats
+    /// taint, and exactly one expensive walk ran. Before F2 the cap broke the loop at
+    /// the second repo and the request 404'd despite the public copy. MUTATION (RED):
+    /// turn the walk-cap skip back into a `break` and the public copy never serves.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_walk_cap_skip_continues_to_later_public_copy(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let walk_log = tmp.path().join("walks.log");
+        state.git_bin = walk_logging_fake_git(tmp.path(), &walk_log);
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_max_repos_walked = 1;
+        state.config = Arc::new(cfg);
+
+        // Insert order = oldest first, so iteration (updated_at DESC) is reversed:
+        // gatedwalk, then gatedskip, then pubcopy. Identical content -> one CID.
+        let content = b"skip and continue proof\n";
+        let (_, oid) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f2skip", "pubcopy", content).await;
+        let (skip_id, _) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f2skip", "gatedskip", content).await;
+        let (walk_id, _) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f2skip", "gatedwalk", content).await;
+        for id in [&walk_id, &skip_id] {
+            state
+                .db
+                .set_visibility_rule(
+                    id,
+                    "src/**",
+                    crate::db::VisibilityMode::B,
+                    &["did:key:z6MkU3IpfsReaderCCCCCCCCCCCCCCCCCCCCCCCC".to_string()],
+                    "z6f2skip",
+                )
+                .await
+                .unwrap();
+        }
+
+        let peer: SocketAddr = "203.0.113.61:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid_for_oid(&oid), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the walk-cap skip must continue the scan so the plain public copy serves"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], content.as_slice());
+        let walks = std::fs::read_to_string(&walk_log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            walks, 1,
+            "cap honored exactly: the first path-scoped repo walks, the second is cut"
+        );
+    }
+
+    /// F2 visit ceiling: `ipfs_max_repo_visits` bounds the acquire+probe cost class
+    /// (each visit can be a full Tigris archive fetch on a cache miss). Unlike the
+    /// walk cap there is no cheap way to keep scanning, so exhaustion STOPS the scan
+    /// — and the stop is a truncation, not an absence: with ceiling 1 the newer
+    /// empty repo consumes the only visit and the blob-carrying older repo is never
+    /// probed, so the request sheds a retryable 503 + Retry-After, never a false
+    /// 404. MUTATION (RED): drop the ceiling check and the blob serves (200); drop
+    /// only the taint on the break and the 503 decays to a 404.
+    #[sqlx::test]
+    async fn get_by_cid_visit_ceiling_stops_scan_with_503(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_max_repo_visits = 1;
+        state.config = Arc::new(cfg);
+
+        // Blob repo first (older, iterated second); empty repo second (newer,
+        // consumes the single visit).
+        let (_, oid) = seed_repo_with_blob(
+            &state,
+            tmp.path(),
+            "z6f2visit",
+            "buried",
+            b"visit ceiling proof\n",
+        )
+        .await;
+        seed_repo_with_blob(&state, tmp.path(), "z6f2visit", "fresh", b"unrelated\n").await;
+
+        let peer: SocketAddr = "203.0.113.62:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid_for_oid(&oid), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a visit-ceiling truncation must shed a retryable 503, not report absent"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
+    }
+
+    /// F2 negative arm: a COMPLETE scan that finds nothing keeps its definitive 404
+    /// — the truncation 503 must never fire when every candidate reached a verdict.
+    /// Two public repos both probe clean (the requested CID is nowhere), no rules,
+    /// no cap or ceiling hit: 404 with no Retry-After. MUTATION (RED): taint the
+    /// scan unconditionally and this decays into a 503.
+    #[sqlx::test]
+    async fn get_by_cid_complete_scan_keeps_definitive_404(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        seed_repo_with_blob(&state, tmp.path(), "z6f2clean", "one", b"content one\n").await;
+        seed_repo_with_blob(&state, tmp.path(), "z6f2clean", "two", b"content two\n").await;
+
+        // valid_cid() is the "hello" blob — present in neither repo.
+        let peer: SocketAddr = "203.0.113.63:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a complete clean scan is a definitive absence — 404, never the 503 shed"
+        );
+        assert!(
+            resp.headers().get("retry-after").is_none(),
+            "a definitive 404 must not advertise a retry"
+        );
+    }
+
+    /// F2 acquire taint: a repo row with NO local copy over a Tigris backend that
+    /// stalls (non-routable endpoint — the connect just hangs) hits the 1s acquire
+    /// timeout at the read-acquire site. The skip carries no verdict, so the scan is
+    /// truncated: retryable 503 + Retry-After, never the old silent-skip 404.
+    /// MUTATION (RED): drop the taint on the acquire-timeout arm and this decays to
+    /// a 404.
+    #[sqlx::test]
+    async fn get_by_cid_acquire_timeout_taints_scan_to_503(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        // Endpoint-pinned test client (no AWS_* env reads — env is racy under a
+        // parallel test run); 10.255.255.1 is non-routable so the HEAD hangs.
+        let tigris = crate::git::tigris::TigrisClient::for_testing_with_endpoint(
+            "test-bucket",
+            "http://10.255.255.1:9000",
+        )
+        .await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = 1;
+        state.config = Arc::new(cfg);
+
+        // Row exists in the DB but has no local copy, so the read acquire must
+        // consult Tigris (local-miss path) and stall until the timeout.
+        state
+            .db
+            .upsert_mirror_repo("z6f2acq", "ghost", "/unused-ghost", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.64:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an acquire timeout leaves the repo unproven — the scan must shed 503, not 404"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
+    }
+
+    /// F2 probe taint: a repo row whose local dir does not exist (no Tigris) —
+    /// `RepoStore::acquire` returns the path anyway (local passthrough), and the
+    /// `cat-file -t` probe cannot even spawn (missing working dir), so
+    /// `object_type` is Err. That is not an absence verdict, so the scan is
+    /// truncated: 503, never 404. A second, real repo probes clean (absent verdict)
+    /// — the one bad row is what taints. NOTE: the probe shells to the real `git`
+    /// (not `state.git_bin`) and maps a NONZERO cat-file exit to `Ok(None)` (an
+    /// absent verdict), so a fake git exiting nonzero cannot reach this arm; only a
+    /// spawn failure is Err, hence the missing-dir recipe. MUTATION (RED): drop the
+    /// taint on the probe-error arm and this decays to a 404.
+    #[sqlx::test]
+    async fn get_by_cid_probe_error_taints_scan_to_503(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        // Older row: a real repo that probes clean. Newer row: no dir on disk.
+        seed_repo_with_blob(&state, tmp.path(), "z6f2probe", "real", b"probe clean\n").await;
+        state
+            .db
+            .upsert_mirror_repo("z6f2probe", "ghost", "/unused-ghost", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.65:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a failed probe leaves the repo unproven — the scan must shed 503, not 404"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
+    }
+
+    /// F2 read taint: the gate passes (the probe reads the truncated loose object's
+    /// intact "blob 64" header) but the content read fails (`cat-file blob` dies on
+    /// the deflate stream cut mid-content) — the probe just said the object EXISTS
+    /// here, so the failed read is no absence verdict: 503, never 404. The loose
+    /// object is hand-rolled: zlib header + one stored deflate block declaring 72
+    /// bytes ("blob 64\0" + 64), truncated after the header NUL + 4 content bytes,
+    /// no adler trailer. MUTATION (RED): drop the taint on the read-error arm and
+    /// this decays to a 404.
+    #[sqlx::test]
+    async fn get_by_cid_read_error_taints_scan_to_503(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        state
+            .db
+            .upsert_mirror_repo("z6f2read", "corrupt", "/unused-corrupt", None, false)
+            .await
+            .unwrap();
+        let rec = state
+            .db
+            .get_repo("z6f2read", "corrupt")
+            .await
+            .unwrap()
+            .unwrap();
+        let bare = state
+            .repo_store
+            .acquire(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&["init", "-q", "--bare", "--object-format=sha256"], &bare);
+        // Hand-rolled truncated loose object (dangling is fine: no path-scoped rules,
+        // so the "/" gate is the whole story and the read follows the probe).
+        let oid = "6bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459c";
+        let mut corrupt: Vec<u8> = vec![0x78, 0x01, 0x01, 0x48, 0x00, 0xb7, 0xff];
+        corrupt.extend_from_slice(b"blob 64\0AAAA");
+        let obj_dir = bare.join("objects").join(&oid[..2]);
+        std::fs::create_dir_all(&obj_dir).unwrap();
+        std::fs::write(obj_dir.join(&oid[2..]), &corrupt).unwrap();
+        // Preconditions: the probe classifies it as a blob, the full read fails —
+        // otherwise the test would pass vacuously via some other arm.
+        assert_eq!(
+            crate::git::store::object_type(&bare, oid)
+                .unwrap()
+                .as_deref(),
+            Some("blob"),
+            "the truncated loose object's header must still probe as a blob"
+        );
+        assert!(
+            crate::git::store::read_object_content(&bare, oid, "blob").is_err(),
+            "the truncated loose object's content read must fail"
+        );
+
+        let peer: SocketAddr = "203.0.113.66:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid_for_oid(oid), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a failed read after a passed gate leaves the repo unproven — 503, not 404"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
+    }
+
+    /// F2 denied-is-a-verdict: repos that DENY the caller at the visibility gate
+    /// are settled, not skipped — an all-denied scan is COMPLETE: 404, zero visits.
+    /// The private rows deliberately have no local dirs: if the deny didn't
+    /// short-circuit before the visit, the missing-dir probe would taint the scan
+    /// into a 503, which the 404 assertion rules out — so the 404 also proves zero
+    /// acquires, probes, or walks ran for denied rows.
+    #[sqlx::test]
+    async fn get_by_cid_all_denied_is_complete_scan_404(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        for name in ["priv-a", "priv-b"] {
+            let now = chrono::Utc::now();
+            state
+                .db
+                .create_repo(&crate::db::RepoRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: name.to_string(),
+                    owner_did: "did:key:z6MkF2DenyOwnerAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                    description: None,
+                    is_public: false,
+                    default_branch: "main".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                    disk_path: format!("/nonexistent/{name}"),
+                    forked_from: None,
+                    machine_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        let peer: SocketAddr = "203.0.113.67:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "an anonymous caller denied by every repo gets a complete-scan 404 — a deny \
+             is a verdict and must not visit, taint, or 503"
+        );
     }
 
     /// Shed at capacity: an exhausted `git_ipfs_walk_semaphore` sheds a `/ipfs/{cid}`
@@ -736,13 +1359,16 @@ mod tests {
         );
     }
 
-    /// Loop bound (cap N): one `/ipfs/{cid}` request against a CID present in many repos
-    /// must not serialize an unbounded number of full-history walks. With
-    /// `ipfs_max_repos_walked = 1` and TWO public, path-scoped repos both carrying the
-    /// blob at the requested CID, the handler walks only the FIRST candidate then stops
-    /// (the second is cut by the cap), so the fake git's `rev-list` (one per walk) runs
-    /// exactly once. MUTATION (RED): remove the `repos_walked >= cap` break and both
-    /// repos are walked (count 2).
+    /// Loop bound (cap N) + F2 truncation verdict: one `/ipfs/{cid}` request against a
+    /// CID present in many path-scoped repos must not serialize an unbounded number of
+    /// full-history walks — and cutting a candidate WITHOUT a verdict must not report
+    /// the object absent. With `ipfs_max_repos_walked = 1` and TWO public, path-scoped
+    /// repos both carrying the blob, the first candidate is walked (empty allowed-set →
+    /// a deny VERDICT) and the second is cut by the cap (no verdict), so the fake git's
+    /// `rev-list` runs exactly once and the request sheds a retryable 503 + Retry-After
+    /// — never the old false 404 (the blob genuinely sits in the second repo).
+    /// MUTATION (RED): remove the `repos_walked >= cap` skip and both repos are walked
+    /// (count 2); drop the truncation taint on the skip and the 503 decays to a 404.
     #[cfg(unix)]
     #[sqlx::test]
     async fn get_by_cid_caps_repos_walked_per_request(pool: sqlx::PgPool) {
@@ -871,9 +1497,21 @@ mod tests {
             .unwrap();
         req.extensions_mut().insert(ConnectInfo(peer));
         let resp = ipfs_router(state).oneshot(req).await.unwrap();
-        // The empty allowed-set path-gates both repos to a `continue`, so a 404; the
-        // point is HOW MANY walks ran to get there.
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // The first repo's walk yields the empty allowed-set (deny verdict); the second
+        // repo NEEDS a walk the cap forbids, so the scan is truncated without a verdict
+        // on it: retryable 503, never a false 404 for the blob it genuinely carries.
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a walk-cap truncation must shed a retryable 503, not report the object absent"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
 
         let walks = std::fs::read_to_string(&walk_log)
             .map(|s| s.lines().count())

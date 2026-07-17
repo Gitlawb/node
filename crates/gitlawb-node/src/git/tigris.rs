@@ -31,6 +31,25 @@ impl TigrisClient {
         })
     }
 
+    /// Test-only constructor with an explicit S3 endpoint, region, and static
+    /// credentials — no env-var reads, so parallel tests cannot race each other's
+    /// `AWS_*` environment the way the env-based `new` would. Lets a test point
+    /// the client at a non-routable endpoint to exercise acquire-stall paths.
+    #[cfg(test)]
+    pub(crate) async fn for_testing_with_endpoint(bucket: &str, endpoint_url: &str) -> Self {
+        let creds = aws_sdk_s3::config::Credentials::new("test", "test", None, None, "test");
+        let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .endpoint_url(endpoint_url)
+            .region(aws_config::Region::new("auto"))
+            .credentials_provider(creds)
+            .load()
+            .await;
+        Self {
+            s3: S3Client::new(&config),
+            bucket: bucket.to_string(),
+        }
+    }
+
     /// S3 key for a given repo: `repos/v1/{owner_slug}/{repo_name}.tar.zst`
     fn repo_key(owner_slug: &str, repo_name: &str) -> String {
         format!("repos/v1/{owner_slug}/{repo_name}.tar.zst")

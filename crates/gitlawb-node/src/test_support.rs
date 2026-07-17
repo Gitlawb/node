@@ -2409,7 +2409,10 @@ mod tests {
     /// the handler skips the whole repo rather than serving. Asserts no leak of the
     /// withheld blob AND that even the *public* blob in that repo is withheld — the
     /// latter distinguishes fail-closed-skip from normal per-blob withholding and
-    /// would serve 200 if the error arm wrongly proceeded.
+    /// would serve 200 if the error arm wrongly proceeded. The skip carries no
+    /// VERDICT (F2), so the response is the retryable truncation 503, not a 404
+    /// claiming the object is absent — never-serve-unproven and never-404-unproven
+    /// hold together.
     #[sqlx::test]
     async fn ipfs_cid_walk_error_fails_closed(pool: PgPool) {
         use crate::db::VisibilityMode;
@@ -2454,7 +2457,8 @@ mod tests {
             .await
             .expect("deny rule");
 
-        // Withheld secret CID under a walk error → 404, no leak.
+        // Withheld secret CID under a walk error → the repo is skipped without a
+        // verdict, so the scan is truncated (503), and nothing leaks.
         let (st, body) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&secret_cid))
@@ -2464,17 +2468,17 @@ mod tests {
         .await;
         assert_eq!(
             st,
-            StatusCode::NOT_FOUND,
-            "walk error must not serve the withheld blob"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "walk error must not serve the withheld blob — the unproven skip sheds 503"
         );
         assert!(
             !body.contains("TOP SECRET"),
-            "walk-error 404 must not leak the secret"
+            "walk-error 503 must not leak the secret"
         );
 
-        // The PUBLIC blob in the same repo is also 404: the walk error fails closed
-        // by skipping the whole repo, not by serving. Without the fail-closed arm
-        // this would serve 200, so this assertion is the load-bearing discriminator.
+        // The PUBLIC blob in the same repo is also not served: the walk error fails
+        // closed by skipping the whole repo. Without the fail-closed arm this would
+        // serve 200, so this assertion is the load-bearing discriminator.
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&public_cid))
@@ -2484,8 +2488,9 @@ mod tests {
         .await;
         assert_eq!(
             st,
-            StatusCode::NOT_FOUND,
-            "walk error fails closed: repo skipped, even the public blob is not served"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "walk error fails closed: repo skipped without a verdict, even the public \
+             blob is not served and the scan sheds 503"
         );
     }
 
