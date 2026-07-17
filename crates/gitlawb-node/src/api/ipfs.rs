@@ -502,9 +502,26 @@ async fn gate_and_serve(
         }
         walk.probes += 1;
     }
-    let repo_path = match state.repo_store.acquire(&repo.owner_did, &repo.name).await {
-        Ok(p) => p,
-        Err(_) => return GateOutcome::Skip,
+    // Bound the per-repo acquire under `git_acquire_timeout_secs`: this gate runs while
+    // the /ipfs walk permit is held (F5), so a hung or cold-Tigris acquire would otherwise
+    // pin the global walk slot for the whole request. On expiry skip the repo (a public
+    // copy may still serve) and mark the search truncated so a wholly-unserved request
+    // tails to a retryable 503, never a false 404 (reopened the #174 P1-2 stall vector on
+    // this path otherwise).
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let repo_path = match tokio::time::timeout(
+        acquire_deadline,
+        state.repo_store.acquire(&repo.owner_did, &repo.name),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(_)) => return GateOutcome::Skip,
+        Err(_elapsed) => {
+            tracing::warn!(repo = %repo.name, "repo acquire timed out during /ipfs gate; skipping repo");
+            walk.truncated = true;
+            return GateOutcome::Skip;
+        }
     };
 
     // Existence probe before any walk (random-CID spray must not trigger a walk on a
