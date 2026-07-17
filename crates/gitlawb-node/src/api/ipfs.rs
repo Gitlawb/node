@@ -530,15 +530,32 @@ async fn gate_and_serve(
     let obj_type = {
         let rp = repo_path.clone();
         let sha = sha256_hex.to_string();
-        match tokio::task::spawn_blocking(move || store::object_type(&rp, &sha)).await {
-            Ok(Ok(Some(t))) => t,
-            Ok(Ok(None)) => return GateOutcome::Skip,
-            Ok(Err(e)) => {
+        // Bound the blocking `git cat-file -t` under `git_service_timeout_secs`: this probe
+        // runs while the /ipfs walk permit is held, so a wedged cat-file (corrupt pack, NFS
+        // stall) would otherwise pin the global walk slot for the request's life. On timeout
+        // free the slot (mark truncated -> retryable 503) and skip the repo. spawn_blocking
+        // cannot be cancelled, so the child may linger on a blocking-pool thread, but it no
+        // longer holds the walk permit.
+        let probe_deadline = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        match tokio::time::timeout(
+            probe_deadline,
+            tokio::task::spawn_blocking(move || store::object_type(&rp, &sha)),
+        )
+        .await
+        {
+            Ok(Ok(Ok(Some(t)))) => t,
+            Ok(Ok(Ok(None))) => return GateOutcome::Skip,
+            Ok(Ok(Err(e))) => {
                 tracing::warn!(repo = %repo.name, err = %e, "error checking git object type");
                 return GateOutcome::Skip;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(repo = %repo.name, err = %e, "object-type probe task panicked; skipping repo");
+                return GateOutcome::Skip;
+            }
+            Err(_elapsed) => {
+                tracing::warn!(repo = %repo.name, "object-type probe timed out under the /ipfs walk permit; skipping repo");
+                walk.truncated = true;
                 return GateOutcome::Skip;
             }
         }
@@ -670,30 +687,49 @@ async fn gate_and_serve(
     let read_sha = sha256_hex.to_string();
     let read_type = obj_type.clone();
     let want_cid = ctx.canonical_cid.to_string();
-    let read = tokio::task::spawn_blocking(move || -> ServedRead {
-        match store::object_size(&read_repo, &read_sha) {
-            Ok(Some(size)) if size > max_bytes => return ServedRead::TooLarge(size),
-            Ok(Some(_)) => {}
-            // git ran and reported no such object (or an unparseable size): genuine
-            // not-found for this candidate.
-            Ok(None) => return ServedRead::Gone,
-            // git itself failed to run: an infra failure, not a not-found.
-            Err(e) => return ServedRead::ReadErr(e.to_string()),
-        }
-        let content = match store::read_object_content(&read_repo, &read_sha, &read_type) {
-            Ok(c) => c,
-            Err(e) => return ServedRead::ReadErr(e.to_string()),
-        };
-        let served = gitlawb_core::cid::Cid::from_git_object_bytes(&content).to_string();
-        if served != want_cid {
-            return ServedRead::Mismatch(served);
-        }
-        ServedRead::Ok(content)
-    })
+    // Bound the blocking size+read+verify under `git_service_timeout_secs` (same rationale
+    // as the object-type probe): a hung cat-file must not pin the held /ipfs walk permit.
+    let read_deadline = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let read = tokio::time::timeout(
+        read_deadline,
+        tokio::task::spawn_blocking(move || -> ServedRead {
+            match store::object_size(&read_repo, &read_sha) {
+                Ok(Some(size)) if size > max_bytes => return ServedRead::TooLarge(size),
+                Ok(Some(_)) => {}
+                // git ran and reported no such object (or an unparseable size): genuine
+                // not-found for this candidate.
+                Ok(None) => return ServedRead::Gone,
+                // git itself failed to run: an infra failure, not a not-found.
+                Err(e) => return ServedRead::ReadErr(e.to_string()),
+            }
+            let content = match store::read_object_content(&read_repo, &read_sha, &read_type) {
+                Ok(c) => c,
+                Err(e) => return ServedRead::ReadErr(e.to_string()),
+            };
+            let served = gitlawb_core::cid::Cid::from_git_object_bytes(&content).to_string();
+            if served != want_cid {
+                return ServedRead::Mismatch(served);
+            }
+            ServedRead::Ok(content)
+        }),
+    )
     .await;
-    let content = match read {
-        Ok(ServedRead::Ok(c)) => c,
-        Ok(ServedRead::TooLarge(size)) => {
+    let served_read = match read {
+        Ok(Ok(sr)) => sr,
+        Ok(Err(e)) => {
+            tracing::warn!(repo = %repo.name, err = %e, "object read task panicked");
+            walk.truncated = true;
+            return GateOutcome::Skip;
+        }
+        Err(_elapsed) => {
+            tracing::warn!(repo = %repo.name, "object read timed out under the /ipfs walk permit; skipping repo");
+            walk.truncated = true;
+            return GateOutcome::Skip;
+        }
+    };
+    let content = match served_read {
+        ServedRead::Ok(c) => c,
+        ServedRead::TooLarge(size) => {
             tracing::warn!(
                 repo = %repo.name, size, max = max_bytes,
                 "withholding object: exceeds the served-object size cap (F6)"
@@ -702,24 +738,19 @@ async fn gate_and_serve(
             note_oversize_reject();
             return GateOutcome::Skip;
         }
-        Ok(ServedRead::Mismatch(served)) => {
+        ServedRead::Mismatch(served) => {
             tracing::warn!(
                 repo = %repo.name, requested = %ctx.canonical_cid, served = %served,
                 "withholding object: served bytes do not hash to the requested CID (legacy provider-CID row?)"
             );
             return GateOutcome::Skip;
         }
-        Ok(ServedRead::Gone) => return GateOutcome::Skip,
-        Ok(ServedRead::ReadErr(e)) => {
+        ServedRead::Gone => return GateOutcome::Skip,
+        ServedRead::ReadErr(e) => {
             // Infra failure (git spawn/IO), NOT a not-found: mark the search truncated so
             // a wholly-unserved request tails to a retryable 503, never a definitive 404
             // for an authorized caller (INV-25 spirit — logging alone is not surfacing).
             tracing::warn!(repo = %repo.name, err = %e, "error reading git object content");
-            walk.truncated = true;
-            return GateOutcome::Skip;
-        }
-        Err(e) => {
-            tracing::warn!(repo = %repo.name, err = %e, "object read task panicked");
             walk.truncated = true;
             return GateOutcome::Skip;
         }

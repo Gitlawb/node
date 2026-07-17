@@ -96,6 +96,22 @@ pub async fn pin_new_objects(
     for sha in object_list {
         match db.has_pinata_cid(&sha).await {
             Ok(true) => {
+                // Backfill NULL first-pinner provenance from a known source, in lockstep
+                // with the ipfs_pin skip branch: a pinata-only node otherwise leaves
+                // pre-provenance rows' `pinned_cids.repo_id` NULL forever (grok P2-D). The
+                // resolver still finds the object via the pin_repo_sources union below, so
+                // this is a consistency backfill, not a correctness fix.
+                match db.provenance_for_oid(&sha).await {
+                    Ok(None) => {
+                        if let Err(e) = db.backfill_pin_provenance(&sha, repo_id).await {
+                            tracing::warn!(sha = %sha, err = %e, "failed to backfill pin provenance");
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Err(e) => {
+                        tracing::warn!(sha = %sha, err = %e, "DB error reading pin provenance");
+                    }
+                }
                 // F1 (#173 round 8): record this repo as an additional source for the
                 // already-pinned object (mirrors the ipfs_pin skip-branch insert) so the
                 // resolver can serve a shared object from any pin-path source.
