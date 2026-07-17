@@ -65,6 +65,29 @@ pub struct AppState {
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
     /// push path throttles on the resolved client IP instead.
     pub push_rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for the `GET /ipfs/{cid}` full-history walk.
+    /// The route is anonymous and a valid tree CID (exposed by the public pins
+    /// index) makes each repeat request pay a fresh allowed-set walk (rev-list +
+    /// ls-tree per commit), memoized only per request — unbounded amplification
+    /// (INV-10). Braking the walk on the non-farmable source IP caps that cost
+    /// without touching cheap non-walk fetches. Keyed by `push_limiter_trust`.
+    pub ipfs_rate_limiter: RateLimiter,
+    /// Per-request ceiling on full-history reachability walks the CID resolver
+    /// may spawn (default `api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST`). A field,
+    /// not a bare const, so tests can shrink it to exercise the cap cheaply;
+    /// production keeps the const default.
+    pub ipfs_max_history_walks: u32,
+    /// Per-request ceiling on legacy (NULL-provenance) repo probes in the CID
+    /// resolver's scan fallback (default `api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST`).
+    /// Bounds the anonymous `acquire` + `cat-file` fan-out across the node (#173,
+    /// INV-10); a field for the same test-seam reason as `ipfs_max_history_walks`.
+    pub ipfs_max_legacy_probes: u32,
+    /// Hard ceiling on the byte size of an object `GET /ipfs/{cid}` will buffer and
+    /// serve (default `api::ipfs::MAX_SERVED_OBJECT_BYTES`). The serve reads via a
+    /// blocking `git cat-file` and buffers the whole object; without a bound a large
+    /// public blob could exhaust memory or block a runtime worker (#173, F6, INV-10).
+    /// A field for the same test-seam reason as the sibling caps.
+    pub ipfs_max_served_object_bytes: u64,
     /// Which forwarded header (if any) the edge is trusted to set, for
     /// resolving the push limiter's client-IP key. See `GITLAWB_TRUSTED_PROXY`.
     /// Node-wide; also keys the two peer-sync limiters below.
@@ -171,13 +194,6 @@ pub struct AppState {
     /// (`with_default_max_keys`, reject-before-insert) so a source-key farm cannot grow
     /// it (INV-15).
     pub git_ipfs_walk_per_caller: crate::rate_limit::PerCallerConcurrency,
-    /// Per-client-IP rate limiter for `GET /ipfs/{cid}`. The route is publicly
-    /// reachable and each request can drive a full-history git walk, so it carries a
-    /// per-IP flood brake in addition to the concurrency cap above — a rate limit
-    /// bounds request *rate*, the semaphore bounds concurrent slow holds (different
-    /// axes). Keyed on the resolved client IP via `push_limiter_trust`. Layered on the
-    /// `/ipfs` route via `rate_limit_by_ip`.
-    pub ipfs_rate_limiter: RateLimiter,
     /// The `git` executable the served-git withheld-blob walk spawns. Production is
     /// `"git"` (resolved via PATH); injectable so a fake `git` can drive the walk's
     /// process-group teardown in handler tests without mutating the process-global
@@ -190,6 +206,20 @@ impl AppState {
     /// initial value matches the current state.
     pub fn subscribe_shutdown(&self) -> tokio::sync::watch::Receiver<bool> {
         self.shutdown_tx.subscribe()
+    }
+
+    /// Sweep expired entries from every per-IP/DID rate limiter. Driven by the
+    /// periodic cleanup task so a bounded limiter's key map sheds stale entries
+    /// instead of sitting near its cap until an inline capacity sweep reclaims
+    /// them. Every limiter on the state is swept here; adding a new limiter means
+    /// adding it to this list.
+    pub(crate) async fn sweep_rate_limiters(&self) {
+        self.rate_limiter.cleanup().await;
+        self.create_ip_rate_limiter.cleanup().await;
+        self.push_rate_limiter.cleanup().await;
+        self.ipfs_rate_limiter.cleanup().await;
+        self.sync_trigger_rate_limiter.cleanup().await;
+        self.peer_write_rate_limiter.cleanup().await;
     }
 
     /// Trigger graceful shutdown. Idempotent — calling more than once

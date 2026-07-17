@@ -74,8 +74,10 @@ pub async fn pin_object(
 /// `..._fail_closed` filter on the full-scan path before calling. `repo_path` is
 /// still needed to read each object's bytes. The twin in `ipfs_pin.rs` mirrors
 /// this shape — change both in lockstep. Objects already recorded with a
-/// `pinata_cid` are skipped. Returns `(sha_hex, cid)` pairs for each newly
-/// pinned object.
+/// `pinata_cid` are skipped. `repo_id` records the pin's provenance (#173).
+/// Returns `(sha_hex, provider_cid)` pairs for each newly pinned object: the
+/// provider CID is the Pinata gateway CID (used for branch→CID recording and
+/// ref-update gossip), NOT the raw resolver-key CID stored in `pinned_cids.cid`.
 pub async fn pin_new_objects(
     client: &reqwest::Client,
     upload_url: &str,
@@ -83,6 +85,7 @@ pub async fn pin_new_objects(
     repo_path: &std::path::Path,
     object_list: Vec<String>,
     db: &crate::db::Db,
+    repo_id: &str,
 ) -> Vec<(String, String)> {
     if jwt.is_empty() {
         return vec![];
@@ -92,7 +95,15 @@ pub async fn pin_new_objects(
 
     for sha in object_list {
         match db.has_pinata_cid(&sha).await {
-            Ok(true) => continue,
+            Ok(true) => {
+                // F1 (#173 round 8): record this repo as an additional source for the
+                // already-pinned object (mirrors the ipfs_pin skip-branch insert) so the
+                // resolver can serve a shared object from any pin-path source.
+                if let Err(e) = db.record_pin_source(&sha, repo_id).await {
+                    tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                }
+                continue;
+            }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(sha = %sha, err = %e, "DB error checking pinata_cid");
@@ -111,8 +122,20 @@ pub async fn pin_new_objects(
 
         match pin_object(client, upload_url, jwt, &sha, &data).await {
             Ok(cid) if !cid.is_empty() => {
-                if let Err(e) = db.record_pinata_cid(&sha, &cid).await {
+                // The resolver key (`pinned_cids.cid`) must be the locally-computed
+                // raw-content CID, never the provider CID: Pinata wraps the bytes in
+                // dag-pb/UnixFS, so its returned CID does not hash the raw content and
+                // must not become an alias `/ipfs/{cid}` serves raw git bytes for (#173).
+                let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&data).to_string();
+                if let Err(e) = db
+                    .record_pinata_cid(&sha, &raw_cid, &cid, Some(repo_id))
+                    .await
+                {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinata_cid in DB");
+                }
+                // F1 (#173 round 8): also record the first pinner in pin_repo_sources.
+                if let Err(e) = db.record_pin_source(&sha, repo_id).await {
+                    tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
                 }
                 pinned.push((sha, cid));
             }

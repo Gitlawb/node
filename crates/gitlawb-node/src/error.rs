@@ -41,6 +41,9 @@ pub enum AppError {
     #[error("incomplete: {0}")]
     Incomplete(String),
 
+    #[error("search incomplete: {0}")]
+    SearchIncomplete(String),
+
     #[error("git error: {0}")]
     Git(String),
 
@@ -141,6 +144,15 @@ impl IntoResponse for AppError {
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }
+            // A bounded search that could not complete (the CID resolver hit its
+            // legacy-probe or walk ceiling), distinct from the 404 that asserts a
+            // definitive not-found: absence was NOT proven, so the caller should
+            // retry rather than treat it as gone (#173, F2). 503, retryable.
+            AppError::SearchIncomplete(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "search_incomplete",
+                msg.clone(),
+            ),
             AppError::Git(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "git_error", msg.clone()),
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.

@@ -516,6 +516,10 @@ mod tests {
             rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
             create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
             push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+            ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
+            ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
             peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
@@ -532,7 +536,6 @@ mod tests {
             git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_ipfs_walk_per_caller:
                 crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
-            ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             git_bin: "git".to_string(),
         }
     }

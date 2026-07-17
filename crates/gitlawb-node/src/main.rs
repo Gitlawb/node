@@ -374,6 +374,9 @@ async fn main() -> Result<()> {
         rate_limiter,
         create_ip_rate_limiter,
         push_rate_limiter,
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
@@ -465,22 +468,16 @@ async fn main() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let rl = state.rate_limiter.clone();
-        let create_ip_rl = state.create_ip_rate_limiter.clone();
-        let push_rl = state.push_rate_limiter.clone();
-        let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
-        let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let cleanup_state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        rl.cleanup().await;
-                        create_ip_rl.cleanup().await;
-                        push_rl.cleanup().await;
-                        sync_trigger_rl.cleanup().await;
-                        peer_write_rl.cleanup().await;
+                        // Sweep every per-IP/DID limiter (incl. the ipfs walk brake)
+                        // so bounded maps shed stale keys instead of sitting at cap.
+                        cleanup_state.sweep_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)

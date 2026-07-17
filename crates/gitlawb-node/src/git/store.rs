@@ -290,6 +290,26 @@ pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>>
     ))
 }
 
+/// Object size in bytes (`git cat-file -s`) WITHOUT reading the content, so an
+/// oversized object can be rejected before it is buffered into memory (#173, F6).
+/// `None` if the object does not exist or the size is unparseable.
+pub fn object_size(repo_path: &Path, sha256_hex: &str) -> Result<Option<u64>> {
+    // allow-unbounded-git: cheap cat-file -s header read (no content), holds no served-git
+    // permit and cannot hang; exact twin of object_type above. Not an INV-22 lifecycle op.
+    let out = Command::new("git")
+        .args(["cat-file", "-s", sha256_hex])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git cat-file -s")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok())
+}
+
 /// Read an object's content if its type is already known.
 pub fn read_object_content(repo_path: &Path, sha256_hex: &str, obj_type: &str) -> Result<Vec<u8>> {
     let content_output = Command::new("git")
