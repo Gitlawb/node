@@ -67,13 +67,13 @@ fn child_terminated_without_reaping(pid: i32) -> bool {
 }
 
 #[cfg(unix)]
-pub(crate) fn run_bounded_git(
+pub(crate) fn run_bounded_git_raw(
     git_bin: &str,
     args: &[&str],
     repo_path: &Path,
     stdin_bytes: &[u8],
     deadline: Instant,
-) -> Result<Vec<u8>> {
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
     use std::sync::mpsc::RecvTimeoutError;
@@ -191,6 +191,23 @@ pub(crate) fn run_bounded_git(
     if killed && !status.success() {
         return Err(crate::git::smart_http::GitServiceTimeout.into());
     }
+    Ok((status, out, err))
+}
+
+/// Bounded git returning only stdout, `bail!`ing on any nonzero exit. The thin
+/// wrapper the walk callers use. Probes that must distinguish exit classes —
+/// `git cat-file` absence vs an object-store access failure — call
+/// [`run_bounded_git_raw`] and classify the status/stderr themselves.
+#[cfg(unix)]
+pub(crate) fn run_bounded_git(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    let label = args.first().copied().unwrap_or("git");
+    let (status, out, err) = run_bounded_git_raw(git_bin, args, repo_path, stdin_bytes, deadline)?;
     if !status.success() {
         anyhow::bail!("git {label} failed: {}", String::from_utf8_lossy(&err));
     }
@@ -210,13 +227,13 @@ pub(crate) fn run_bounded_git(
 /// the Unix version's signature and result semantics so every caller compiles on all
 /// targets (#174).
 #[cfg(not(unix))]
-pub(crate) fn run_bounded_git(
+pub(crate) fn run_bounded_git_raw(
     git_bin: &str,
     args: &[&str],
     repo_path: &Path,
     stdin_bytes: &[u8],
     deadline: Instant,
-) -> Result<Vec<u8>> {
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
     use std::io::{Read, Write};
     use std::sync::mpsc::RecvTimeoutError;
 
@@ -283,6 +300,20 @@ pub(crate) fn run_bounded_git(
     if killed && !status.success() {
         return Err(crate::git::smart_http::GitServiceTimeout.into());
     }
+    Ok((status, out, err))
+}
+
+/// Non-Unix thin wrapper matching the Unix [`run_bounded_git`] semantics.
+#[cfg(not(unix))]
+pub(crate) fn run_bounded_git(
+    git_bin: &str,
+    args: &[&str],
+    repo_path: &Path,
+    stdin_bytes: &[u8],
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    let label = args.first().copied().unwrap_or("git");
+    let (status, out, err) = run_bounded_git_raw(git_bin, args, repo_path, stdin_bytes, deadline)?;
     if !status.success() {
         anyhow::bail!("git {label} failed: {}", String::from_utf8_lossy(&err));
     }
