@@ -206,11 +206,15 @@ pub struct Config {
 
     /// Maximum connections in the PostgreSQL pool. This is a cap, not a floor
     /// (connections open lazily). Size against the database server's
-    /// max_connections, remembering admin tooling opens its own pool.
+    /// max_connections, remembering admin tooling opens its own pool. Each
+    /// concurrent write pins one pooled connection for its whole duration (the
+    /// advisory lock in `repo_store::acquire_write` is connection-affine), so this
+    /// must exceed `max_concurrent_git_pushes` by `DB_POOL_APP_HEADROOM` or slow
+    /// pushes starve every other DB path — enforced by `Config::validate`.
     #[arg(
         long,
         env = "GITLAWB_DB_MAX_CONNECTIONS",
-        default_value_t = 20,
+        default_value_t = 48,
         value_parser = clap::value_parser!(u32).range(1..)
     )]
     pub db_max_connections: u32,
@@ -461,6 +465,36 @@ impl Config {
         }
         PathBuf::from(&self.key_path)
     }
+
+    /// DB connections reserved for everything other than held write-locks: auth
+    /// lookups, visibility-rule reads, the post-receive tail's own DB writes, and
+    /// admin tooling. A write pins one pooled connection for its whole duration, so
+    /// the pool must clear the concurrent-write cap by at least this margin.
+    pub const DB_POOL_APP_HEADROOM: u32 = 8;
+
+    /// Cross-field boot validation. Single-field ranges are enforced by clap; this
+    /// catches combinations that ship a denial-of-service under otherwise-valid
+    /// values. Call once at startup and fail fast on `Err`.
+    pub fn validate(&self) -> Result<(), String> {
+        // A write pins one pooled connection for its whole duration (the
+        // connection-affine advisory lock in repo_store::acquire_write), and
+        // concurrent writes are capped at max_concurrent_git_pushes. If the pool
+        // does not exceed that cap by DB_POOL_APP_HEADROOM, a burst of slow pushes
+        // drains every connection and every other DB path 503s. (#174 F1)
+        let floor = (self.max_concurrent_git_pushes as u64) + (Self::DB_POOL_APP_HEADROOM as u64);
+        if (self.db_max_connections as u64) < floor {
+            return Err(format!(
+                "GITLAWB_DB_MAX_CONNECTIONS ({}) must be at least max_concurrent_git_pushes ({}) \
+                 + {} headroom = {}: each concurrent write pins one pooled connection for its whole \
+                 duration, so a smaller pool lets a burst of slow pushes starve every other DB path.",
+                self.db_max_connections,
+                self.max_concurrent_git_pushes,
+                Self::DB_POOL_APP_HEADROOM,
+                floor
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -664,6 +698,44 @@ mod tests {
             ])
             .max_concurrent_reads_per_caller,
             1_048_576
+        );
+    }
+
+    /// #174 F1: a connection-affine write lock pins a pooled connection per
+    /// concurrent write, so the pool must clear `max_concurrent_git_pushes` by
+    /// `DB_POOL_APP_HEADROOM` or a push burst starves every other DB path.
+    /// `validate()` must reject an under-sized pool at boot.
+    #[test]
+    fn db_pool_must_clear_the_git_push_cap() {
+        // Shipped defaults validate (48 >= 32 + 8).
+        Config::parse_from(["gitlawb-node"])
+            .validate()
+            .expect("default config must validate");
+
+        // An under-sized pool relative to the push cap is rejected (20 < 32 + 8).
+        let under = Config::parse_from([
+            "gitlawb-node",
+            "--db-max-connections",
+            "20",
+            "--max-concurrent-git-pushes",
+            "32",
+        ]);
+        assert!(
+            under.validate().is_err(),
+            "db_max_connections 20 below max_concurrent_git_pushes 32 + headroom must be rejected"
+        );
+
+        // Exactly at the floor validates (40 == 32 + 8).
+        let at_floor = Config::parse_from([
+            "gitlawb-node",
+            "--db-max-connections",
+            "40",
+            "--max-concurrent-git-pushes",
+            "32",
+        ]);
+        assert!(
+            at_floor.validate().is_ok(),
+            "db_max_connections at the floor (pushes + headroom) must validate"
         );
     }
 }
