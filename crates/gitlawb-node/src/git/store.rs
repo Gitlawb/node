@@ -339,19 +339,86 @@ pub fn object_type_bounded(
         &[],
         deadline,
     )?;
-    if !status.success() {
-        // Same classification as `object_type` (a nonzero exit is an ABSENCE verdict
-        // only when git could examine the object store); U5 refines the absence arm
-        // with an out-of-band readability check.
-        let stderr = String::from_utf8_lossy(&stderr);
-        if stderr.contains("not a git repository")
-            || stderr.lines().any(|l| l.starts_with("error:"))
-        {
-            bail!("git cat-file -t failed: {}", stderr.trim());
-        }
-        return Ok(None);
+    if status.success() {
+        return Ok(Some(String::from_utf8_lossy(&stdout).trim().to_string()));
     }
-    Ok(Some(String::from_utf8_lossy(&stdout).trim().to_string()))
+    // A nonzero exit whose stderr proves git could not EXAMINE the object store —
+    // "not a git repository", or any `error:` line (corrupt loose object, bad idx) —
+    // is not an absence verdict, so surface it as Err (#173/#174: never a false 404).
+    let stderr = String::from_utf8_lossy(&stderr);
+    if stderr.contains("not a git repository") || stderr.lines().any(|l| l.starts_with("error:")) {
+        bail!("git cat-file -t failed: {}", stderr.trim());
+    }
+    // Any other bare `fatal:` ("could not get object info") is the absence-vs-
+    // unreadable-pack COLLISION (#174 F5): a genuinely missing object and a packed
+    // object whose pack/idx is unreadable (permissions, or a mid-repack race) emit the
+    // identical string. Disambiguate OUT OF BAND: if the object store is not readable,
+    // this is not an absence verdict -> Err (taint -> retryable 503).
+    if !object_store_readable(repo_path) {
+        bail!(
+            "git cat-file -t inconclusive: object store not readable at {} (not an absence verdict)",
+            repo_path.display()
+        );
+    }
+    // Store readable: re-probe once. An object still absent on a confirmed-readable
+    // store is very likely truly absent (Ok(None)); if a mid-repack race resolved and
+    // the re-probe now finds it, return the type. This narrows, but cannot fully close,
+    // the concurrent-repack window (the readability check samples a different instant).
+    let (status2, stdout2, stderr2) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &["cat-file", "-t", sha256_hex],
+        repo_path,
+        &[],
+        deadline,
+    )?;
+    if status2.success() {
+        return Ok(Some(String::from_utf8_lossy(&stdout2).trim().to_string()));
+    }
+    let stderr2 = String::from_utf8_lossy(&stderr2);
+    if stderr2.contains("not a git repository") || stderr2.lines().any(|l| l.starts_with("error:"))
+    {
+        bail!("git cat-file -t failed: {}", stderr2.trim());
+    }
+    Ok(None)
+}
+
+/// Best-effort check that a repo's object store is readable, used to disambiguate a
+/// genuine missing-object `git cat-file` fatal from an unreadable or racing pack
+/// (both emit "could not get object info"). Returns false on any unreadable
+/// `objects/` dir or any pack/idx that cannot be opened (EACCES / EIO), so the
+/// caller surfaces an error rather than a false absence. Cheap — a couple of readdir
+/// plus open probes. It narrows, but does not close, the concurrent-repack TOCTOU: it
+/// samples a different instant than the failing cat-file.
+fn object_store_readable(repo_path: &Path) -> bool {
+    let objects = repo_path.join("objects");
+    // The objects dir itself must be listable; drain the iterator so a mid-listing
+    // EACCES/EIO surfaces, not just the initial open.
+    let Ok(entries) = std::fs::read_dir(&objects) else {
+        return false;
+    };
+    for entry in entries {
+        if entry.is_err() {
+            return false;
+        }
+    }
+    // Every pack file and its index must be openable for read. A loose-only store
+    // (no pack dir) is fine — the objects readdir above already proved reachability.
+    if let Ok(pack_entries) = std::fs::read_dir(objects.join("pack")) {
+        for entry in pack_entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let path = entry.path();
+            if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("pack") | Some("idx")
+            ) && std::fs::File::open(&path).is_err()
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Bounded, reaped variant of [`read_object_content`] for the async `/ipfs` serve
@@ -570,5 +637,115 @@ mod tests {
             !names.iter().any(|p| p == "base.txt"),
             "unchanged file must not appear: {names:?}"
         );
+    }
+
+    /// #174 F5 (RED-before/GREEN-after): a packed object whose pack/idx is unreadable
+    /// makes `git cat-file -t` emit "could not get object info" — byte-identical to a
+    /// genuine miss. `object_type_bounded` must report absence ONLY when the object
+    /// store is confirmed readable; an unreadable store is Err (-> retryable 503),
+    /// never Ok(None) (-> a wrong 404 for a present object).
+    #[cfg(unix)]
+    #[test]
+    fn object_type_bounded_unreadable_pack_is_error_not_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        g(&["init", "-q", "--object-format=sha256", "."], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("file.txt"), b"packed f5 content\n").unwrap();
+        g(&["add", "file.txt"], &work);
+        g(&["commit", "-qm", "c1"], &work);
+        let blob = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD:file.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        g(&["gc", "-q"], &bare);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        // Readable store: the packed blob probes present; a genuine miss is Ok(None).
+        assert_eq!(
+            super::object_type_bounded("git", &bare, &blob, deadline)
+                .unwrap()
+                .as_deref(),
+            Some("blob"),
+            "a packed blob on a readable store must probe present"
+        );
+        assert!(
+            super::object_type_bounded("git", &bare, &"0".repeat(64), deadline)
+                .unwrap()
+                .is_none(),
+            "a genuinely-absent object on a readable store must be Ok(None)"
+        );
+
+        // Make the pack unreadable: cat-file -t now emits the collided fatal for the
+        // PRESENT blob. It must surface as Err, not a false Ok(None).
+        let pack_dir = bare.join("objects").join("pack");
+        let set_pack_mode = |mode: u32| {
+            for e in std::fs::read_dir(&pack_dir).unwrap() {
+                let p = e.unwrap().path();
+                if matches!(
+                    p.extension().and_then(|s| s.to_str()),
+                    Some("pack") | Some("idx")
+                ) {
+                    let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                    perms.set_mode(mode);
+                    std::fs::set_permissions(&p, perms).unwrap();
+                }
+            }
+        };
+        set_pack_mode(0o000);
+        // Root bypasses file permissions, so the chmod won't block reads there; only
+        // assert the error path when the pack is genuinely unreadable to this process.
+        let a_pack = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("pack"));
+        let genuinely_unreadable = a_pack
+            .as_ref()
+            .map(|p| std::fs::File::open(p).is_err())
+            .unwrap_or(false);
+        let res = super::object_type_bounded("git", &bare, &blob, deadline);
+        set_pack_mode(0o644); // restore so TempDir cleanup succeeds
+
+        if genuinely_unreadable {
+            assert!(
+                res.is_err(),
+                "an unreadable pack must surface as Err (-> retryable 503), not Ok(None) \
+                 (-> a wrong 404 for a present object); got {res:?}"
+            );
+        }
     }
 }
