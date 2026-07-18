@@ -127,16 +127,25 @@ pub struct AppState {
     /// walk must not hold a foreground write slot, and a handler already holding a
     /// write permit that needed a second would self-deadlock at pool size 1.
     pub git_encrypt_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Bounds the OUTSTANDING post-push encryption-task set by per-repo coalescing
-    /// (#174 P2-2). `git_encrypt_semaphore` caps *active* walks; this caps how many
-    /// detached tasks *spawn and park* on that semaphore's `acquire_owned().await`.
-    /// Before spawning a per-push encryption task, the receive-pack handler consults
-    /// this set: if the repo already has a task in flight it coalesces (skips the
-    /// duplicate spawn) rather than parking a new unbounded waiter, and its tip pairs
-    /// are recorded for that task's drain loop (#174 F5). Coalescing only delays the
-    /// coalesced push's walk — it never drops the withheld-blob recovery copy, which
-    /// `2a54c15` deliberately kept fail-closed (there is no reconciliation sweep to
-    /// re-derive a dropped copy). See [`EncryptInflight`].
+    /// Bounds concurrent post-push pin loops (`ipfs_pin` / `pinata` `pin_new_objects`)
+    /// across all repos (#174 F6). `encrypt_inflight` caps the pin-task COUNT to one
+    /// per repo, but each pin loop holds a full per-push object-id list while walking
+    /// it, so N distinct repos could hold N such MB-scale lists at once. This caps how
+    /// many run concurrently; a loop DEFERS (waits) when the pool is full, never drops.
+    pub pin_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Bounds the outstanding post-push encryption-task set to at most one PER REPO by
+    /// coalescing (#174 P2-2). This is NOT a global cap: N distinct repos still admit N
+    /// tasks; the cross-repo residual (an authenticated actor pushing to many repos
+    /// leaves many parked tasks) is throttled by auth plus the per-IP/per-DID rate
+    /// limits, and its real cost — the MB-scale per-push object-id list each pin loop
+    /// holds — is bounded by `pin_semaphore`, not this. `git_encrypt_semaphore` caps
+    /// *active* walks; this caps duplicate SPAWNS per repo. Before spawning a per-push
+    /// encryption task, the receive-pack handler consults this set: if the repo already
+    /// has a task in flight it coalesces (skips the duplicate spawn) rather than parking
+    /// a new waiter, and its tip pairs are recorded for that task's drain loop (#174 F5).
+    /// Coalescing only delays the coalesced push's walk — it never drops the withheld-blob
+    /// recovery copy, which `2a54c15` deliberately kept fail-closed (there is no
+    /// reconciliation sweep to re-derive a dropped copy). See [`EncryptInflight`].
     pub encrypt_inflight: EncryptInflight,
     /// Per-caller concurrency sub-cap on the read pool: each caller (keyed on the
     /// resolved source IP, #174 U1) may hold at most `max_concurrent_reads_per_caller`
