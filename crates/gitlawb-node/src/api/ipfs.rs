@@ -292,29 +292,49 @@ pub async fn get_by_cid(
             }
         };
 
-        // Budget gate for the probe stage (F3). The probe subprocess has no
-        // internal duration clamp, so this pre-start check is its entire bound.
-        if budget_gate(
+        // Budget gate for the probe stage (F3): a probe is never STARTED with zero
+        // remaining, and a started probe now runs its git child under a deadline
+        // clamped to the remainder (below), so it can never complete past the budget.
+        let Some(probe_budget) = budget_gate(
             &mut truncated_by,
             request_deadline,
             state.config.ipfs_request_budget_secs,
             &repo.name,
             "object-type probe",
-        )
-        .is_none()
-        {
+        ) else {
             break;
-        }
+        };
 
         // Check whether the object exists in this repo before any expensive
         // reachability walk. This prevents random-CID spray from triggering
         // full-history git walks on repos that don't carry the object. Absent
-        // (`Ok(None)`) is a VERDICT; a probe that could not run is not.
-        let obj_type = match store::object_type(&repo_path, &sha256_hex) {
-            Ok(Some(t)) => t,
-            Ok(None) => continue,
-            Err(e) => {
+        // (`Ok(None)`) is a VERDICT; a probe that could not run is not. The
+        // `git cat-file -t` shells out, so run it OFF the async worker under the
+        // reaped bounded runner (#174 F3) — a hung/corrupt object store cannot pin a
+        // runtime worker or the held IPFS permits past the deadline.
+        let probe_deadline = std::time::Instant::now()
+            + std::cmp::min(
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                probe_budget,
+            );
+        // The probe shells to the real `git` (as `object_type` historically did),
+        // independent of `state.git_bin` (which tests point at a fake walk git).
+        let probe_path = repo_path.clone();
+        let probe_sha = sha256_hex.clone();
+        let obj_type = match tokio::task::spawn_blocking(move || {
+            store::object_type_bounded("git", &probe_path, &probe_sha, probe_deadline)
+        })
+        .await
+        {
+            Ok(Ok(Some(t))) => t,
+            Ok(Ok(None)) => continue,
+            Ok(Err(e)) => {
                 tracing::warn!(repo = %repo.name, err = %e, "object-type probe failed during /ipfs scan; skipping repo without a verdict");
+                taint(&mut truncated_by, "probe");
+                continue;
+            }
+            Err(join_err) => {
+                tracing::warn!(repo = %repo.name, err = %join_err, "object-type probe task panicked during /ipfs scan; skipping repo without a verdict");
                 taint(&mut truncated_by, "probe");
                 continue;
             }
@@ -413,25 +433,49 @@ pub async fn get_by_cid(
         // serving keeps the terminal arm honest and the stop unconditional; the
         // retryable 503 tells the caller to come back rather than letting an
         // over-budget request keep spending.
-        if budget_gate(
+        let Some(read_budget) = budget_gate(
             &mut truncated_by,
             request_deadline,
             state.config.ipfs_request_budget_secs,
             &repo.name,
             "content read",
-        )
-        .is_none()
-        {
+        ) else {
             break;
-        }
+        };
 
         // Now that we've passed the gate, read the content. A failed read after a
         // passed gate is not an absence verdict — the probe just said the object
-        // exists here — so the skip taints the scan.
-        let content = match store::read_object_content(&repo_path, &sha256_hex, &obj_type) {
-            Ok(c) => c,
-            Err(e) => {
+        // exists here — so the skip taints the scan. Like the probe, the read shells
+        // out to `git cat-file <type>`, so run it OFF the async worker under the reaped
+        // bounded runner clamped to the remaining budget (#174 F3).
+        let read_deadline = std::time::Instant::now()
+            + std::cmp::min(
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                read_budget,
+            );
+        // Real `git`, as the read historically used, independent of `state.git_bin`.
+        let read_path = repo_path.clone();
+        let read_sha = sha256_hex.clone();
+        let read_type = obj_type.clone();
+        let content = match tokio::task::spawn_blocking(move || {
+            store::read_object_content_bounded(
+                "git",
+                &read_path,
+                &read_sha,
+                &read_type,
+                read_deadline,
+            )
+        })
+        .await
+        {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 tracing::warn!(repo = %repo.name, err = %e, "object content read failed during /ipfs scan; skipping repo without a verdict");
+                taint(&mut truncated_by, "read");
+                continue;
+            }
+            Err(join_err) => {
+                tracing::warn!(repo = %repo.name, err = %join_err, "object content read task panicked during /ipfs scan; skipping repo without a verdict");
                 taint(&mut truncated_by, "read");
                 continue;
             }
@@ -1539,22 +1583,22 @@ mod tests {
         );
     }
 
-    /// F3 expiry between probe and walk: an object PROBED PRESENT in a
-    /// path-scoped repo is still not served once the budget is gone; the
-    /// walk-stage gate taints and stops before any walk starts. The probe is
-    /// stalled past the 1s budget while still SUCCEEDING via a FIFO at
-    /// `objects/info/alternates`: real `git cat-file -t` blocks opening it at
-    /// odb setup until a plain OS thread feeds it an empty alternates list at
-    /// ~2s, after which the probe finds the genuine loose object and reports
-    /// "blob". The walk-needing repo thus reaches the walk gate with zero
-    /// remaining: 503 naming the budget, never a 404 (the walk-gate deny of the
-    /// fake git's empty allowed-set would have been a verdict) and never a
-    /// serve, and the fake-git walk log stays EMPTY (no walk ever started).
-    /// MUTATION (RED): drop the walk-stage budget gate and this decays to the
-    /// walked 404 with one logged walk.
+    /// #174 F3 hung-probe reap (RED-before/GREEN-after): the `git cat-file -t`
+    /// probe runs OFF the async worker under the reaped bounded runner, so a hung or
+    /// corrupt object store cannot pin a runtime worker or the held IPFS permits.
+    /// `objects/info/alternates` is a FIFO with no writer, so real `git cat-file -t`
+    /// blocks at odb setup forever. With the probe bounded to
+    /// `min(git_service_timeout, remaining budget)` (~1s here), the watchdog tears the
+    /// git process group down at the deadline and the probe returns Err — a taint, not
+    /// a verdict — so the scan sheds a retryable 503 naming the probe, no walk ever
+    /// starts, and the whole request returns in bounded time.
+    ///
+    /// Load-bearing: with the probe on the bare async worker (pre-fix) this FIFO blocks
+    /// the handler forever (no feeder frees it) and the request hangs — the wrapping
+    /// timeout fires (RED). With the reaped bounded probe it returns 503 promptly.
     #[cfg(unix)]
     #[sqlx::test]
-    async fn get_by_cid_budget_expiry_between_probe_and_walk_sheds_503(pool: sqlx::PgPool) {
+    async fn get_by_cid_hung_probe_is_reaped_and_sheds_503(pool: sqlx::PgPool) {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut state = crate::test_support::test_state(pool.clone()).await;
         let repos_dir = tmp.path().join("repos");
@@ -1587,12 +1631,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Stall the REAL-git probe past the budget while still letting it
-        // succeed: `objects/info/alternates` as a FIFO blocks cat-file's odb
-        // setup until a writer appears. The feeder thread supplies an EMPTY
-        // alternates list (open + close, no bytes) after 2s, so the probe then
-        // resolves the genuine loose object. Non-blocking open with retries so
-        // a handler that never probes cannot wedge the feeder forever.
+        // Hang the REAL-git probe indefinitely: `objects/info/alternates` as a FIFO
+        // with no writer blocks `git cat-file -t` at odb setup forever. There is no
+        // feeder — the reaped bounded runner must tear the git process group down at
+        // the deadline; a bare unbounded probe would block the handler here.
         let rec = state
             .db
             .get_repo("z6f3probe", "gated")
@@ -1611,28 +1653,16 @@ mod tests {
             0,
             "mkfifo(objects/info/alternates) must succeed"
         );
-        let feeder = std::thread::spawn(move || {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            for _ in 0..300 {
-                if std::fs::OpenOptions::new()
-                    .write(true)
-                    .custom_flags(libc::O_NONBLOCK)
-                    .open(&fifo)
-                    .is_ok()
-                {
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
-
         let peer: SocketAddr = "203.0.113.72:5000".parse().unwrap();
-        let resp = ipfs_router(state)
-            .oneshot(get_cid(&cid_for_oid(&oid), Some(peer)))
-            .await
-            .unwrap();
-        feeder.join().unwrap();
+        // The request must return in bounded time: the reaped probe sheds a 503; a
+        // bare unbounded probe would block on the FIFO forever (no feeder frees it).
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            ipfs_router(state).oneshot(get_cid(&cid_for_oid(&oid), Some(peer))),
+        )
+        .await
+        .expect("the hung probe must be reaped, not block the handler")
+        .unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1651,8 +1681,8 @@ mod tests {
             .unwrap();
         let body = String::from_utf8_lossy(&body);
         assert!(
-            body.contains("budget"),
-            "the shed must name the budget taint; got: {body}"
+            body.contains("probe"),
+            "the shed must name the reaped-probe taint; got: {body}"
         );
         let walks = std::fs::read_to_string(&walk_log)
             .map(|s| s.lines().count())

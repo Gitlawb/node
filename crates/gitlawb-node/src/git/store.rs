@@ -320,6 +320,62 @@ pub fn read_object_content(repo_path: &Path, sha256_hex: &str, obj_type: &str) -
     Ok(content_output.stdout)
 }
 
+/// Bounded, reaped variant of [`object_type`] for the async `/ipfs` serve path
+/// (#174 F3): runs `git cat-file -t` off the caller's runtime through the
+/// process-group + watchdog reaper, so a hung or corrupt object store cannot pin a
+/// runtime worker or an IPFS admission permit past `deadline`. Exit classification
+/// is identical to [`object_type`] — a missing object is `Ok(None)`, a store-access
+/// failure is `Err` — so the serve path's 404-vs-503 semantics are unchanged.
+pub fn object_type_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    deadline: std::time::Instant,
+) -> Result<Option<String>> {
+    let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &["cat-file", "-t", sha256_hex],
+        repo_path,
+        &[],
+        deadline,
+    )?;
+    if !status.success() {
+        // Same classification as `object_type` (a nonzero exit is an ABSENCE verdict
+        // only when git could examine the object store); U5 refines the absence arm
+        // with an out-of-band readability check.
+        let stderr = String::from_utf8_lossy(&stderr);
+        if stderr.contains("not a git repository")
+            || stderr.lines().any(|l| l.starts_with("error:"))
+        {
+            bail!("git cat-file -t failed: {}", stderr.trim());
+        }
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&stdout).trim().to_string()))
+}
+
+/// Bounded, reaped variant of [`read_object_content`] for the async `/ipfs` serve
+/// path (#174 F3). Same teardown guarantees as [`object_type_bounded`].
+pub fn read_object_content_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    obj_type: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>> {
+    let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &["cat-file", obj_type, sha256_hex],
+        repo_path,
+        &[],
+        deadline,
+    )?;
+    if !status.success() {
+        bail!("git cat-file failed: {}", String::from_utf8_lossy(&stderr));
+    }
+    Ok(stdout)
+}
+
 /// Read a git object by its SHA-256 hex object ID.
 ///
 /// Returns `(object_type, content_bytes)` where `content_bytes` is the raw
