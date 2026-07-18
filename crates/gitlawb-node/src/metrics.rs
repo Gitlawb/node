@@ -218,6 +218,17 @@ pub fn record_fetch(repo: &str) {
     }
 }
 
+/// Test-only: current `gitlawb_fetches_total` value for `repo` (0 if the registry
+/// is not initialized). Lets api-layer tests assert the completed-fetch count with
+/// a unique label instead of scraping the encoded text.
+#[cfg(test)]
+pub fn fetch_count_for_test(repo: &str) -> u64 {
+    FETCHES
+        .get()
+        .map(|c| c.with_label_values(&[repo]).get())
+        .unwrap_or(0)
+}
+
 /// Record one HTTP signature check that passed.
 #[allow(dead_code)] // wired in a follow-up; helpers are part of the public metrics surface
 pub fn record_auth_success(route: &str) {
