@@ -245,6 +245,262 @@ mod authz_guard {
         }
     }
 
+    /// Completeness fence over the GraphQL mutation surface: the mirror of
+    /// `every_in_scope_mutation_has_its_gate` for `graphql/mutation.rs`. Kept a
+    /// SEPARATE guard with its own table (never folded into the REST rows above):
+    /// a guard over a heterogeneous set must classify per member, and these
+    /// same-named task rows belong to the GraphQL surface, not `api/tasks.rs`.
+    ///
+    /// COMPLETENESS comes from async-graphql's own introspection (structured field
+    /// names from the engine), NOT any text parse of source or SDL, so no source-text
+    /// shape and no serialized-SDL quirk can hide a live mutation from the fence. The
+    /// schema field set must equal the registered set: a new field with no row fails
+    /// (a repo-write cannot slip in unlisted); a registered name absent from the
+    /// schema fails (renamed or removed).
+    ///
+    /// The MARKER check is the only source-scraped part, and it is not the
+    /// completeness guarantee. Three honest limits, so a green check is not misread
+    /// as full authorization coverage:
+    ///   1. A present marker is not load-bearingness (the gate may not redden on a
+    ///      hostile probe: the #203 present-but-vacuous case). The adversarial tests
+    ///      in `graphql/mutation.rs` are the load-bearing layer.
+    ///   2. A present marker is not gate-correctness (it may be the wrong bucket for
+    ///      the operation's resource: a repo-write registered as signer-self would
+    ///      pass, so INV-1 review remains the defense).
+    ///   3. The marker check scrapes the comment-masked, brace-bounded resolver body;
+    ///      a `{`/`}` or a `did_matches(` inside a STRING literal is not masked, so it
+    ///      could mis-slice that body or satisfy the marker vacuously (the same
+    ///      vacuous-marker class as limit 1). Completeness is unaffected: it comes
+    ///      from introspection, not from this scrape.
+    #[test]
+    fn every_graphql_mutation_has_its_gate() {
+        // (Rust snake name, schema field in camelCase, expected gate marker). The
+        // four are Bucket C signer-self (`did_matches(`); a repo-write would be
+        // Bucket A (`require_repo_owner(`). Same-named REST rows live in the guard
+        // above against `api/tasks.rs`.
+        let registered: &[(&str, &str, &str)] = &[
+            ("create_task", "createTask", "did_matches("),
+            ("claim_task", "claimTask", "did_matches("),
+            ("complete_task", "completeTask", "did_matches("),
+            ("fail_task", "failTask", "did_matches("),
+        ];
+
+        // Completeness both directions against the authoritative schema field set.
+        let fields = graphql_mutation_fields_from_schema();
+        for f in &fields {
+            assert!(
+                registered.iter().any(|(_, camel, _)| camel == f),
+                "unclassified GraphQL mutation `{f}`: add it to \
+                 every_graphql_mutation_has_its_gate with a deliberate gate \
+                 (`require_repo_owner(` for a repo-write, `did_matches(` for a task op)"
+            );
+        }
+        for (_, camel, _) in registered {
+            assert!(
+                fields.iter().any(|f| f == camel),
+                "registered GraphQL mutation `{camel}` is not in the schema \
+                 (renamed or removed); update the table"
+            );
+        }
+
+        // Marker present (source scrape; the vacuity limit, backstopped by the
+        // adversarial tests): each resolver body carries its bucket marker.
+        let masked = mask_comments(include_str!("../graphql/mutation.rs"));
+        for (snake, _, marker) in registered {
+            let body = resolver_body(&masked, snake);
+            assert!(
+                body.contains(marker),
+                "GraphQL mutation `{snake}` is missing its gate marker `{marker}`: gate removed"
+            );
+        }
+    }
+
+    /// The mutation field names (camelCase, as async-graphql exposes them) via the
+    /// engine's own introspection. STRUCTURED: the names arrive as data, so nothing in
+    /// the resolver source or the serialized SDL (a brace in a doc description, a
+    /// comment, a string) can hide a field. The schema builds with no data and
+    /// introspection runs no resolver, so this stays a plain DB-free unit test. A
+    /// navigation miss yields an empty list, which fails loud via the set-equality
+    /// above (a registered name reads as "not in the schema"), never vacuously.
+    fn graphql_mutation_fields_from_schema() -> Vec<String> {
+        use crate::graphql::mutation::MutationRoot;
+        use crate::graphql::query::QueryRoot;
+        use crate::graphql::subscription::SubscriptionRoot;
+        use async_graphql::Value;
+        let schema =
+            async_graphql::Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+        let resp = tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(schema.execute("{ __schema { mutationType { fields { name } } } }"));
+        assert!(
+            resp.errors.is_empty(),
+            "schema introspection failed: {:?}",
+            resp.errors
+        );
+        let mut names = Vec::new();
+        if let Value::Object(root) = &resp.data {
+            if let Some(Value::Object(sc)) = root.get("__schema") {
+                if let Some(Value::Object(mt)) = sc.get("mutationType") {
+                    if let Some(Value::List(field_list)) = mt.get("fields") {
+                        for field in field_list {
+                            if let Value::Object(fo) = field {
+                                if let Some(Value::String(n)) = fo.get("name") {
+                                    names.push(n.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        names
+    }
+
+    /// The comment-masked body of `async fn <snake>` in `graphql/mutation.rs`, bounded
+    /// to the resolver's OWN braces (its `{ .. }`), for the marker check. Brace-matching
+    /// on the comment-masked source means a `}` in a trailing helper cannot extend the
+    /// body and a comment marker does not count. A `{`/`}` inside a STRING literal is
+    /// not masked, a documented marker-check-only residual (limit 3); completeness does
+    /// not use this.
+    fn resolver_body(masked_src: &str, snake: &str) -> String {
+        let needle = format!("async fn {snake}(");
+        let start = masked_src.find(&needle).unwrap_or_else(|| {
+            panic!("resolver `async fn {snake}(` not found in graphql/mutation.rs")
+        });
+        let open = start
+            + masked_src[start..]
+                .find('{')
+                .expect("resolver body opening brace");
+        let mut depth = 0i32;
+        let mut end = masked_src.len();
+        for (i, c) in masked_src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        masked_src[open..end].to_string()
+    }
+
+    /// `src` with `//` line comments and `/* */` block comments (nested) blanked to
+    /// spaces, WITHOUT opening a comment inside a `"..."` string (so a `"https://"` does
+    /// not erase the rest of its line). String CONTENTS are left intact, so a brace or
+    /// a gate marker inside a string is not masked; for the marker check that is a
+    /// documented vacuity residual (limit 3), and completeness does not use this at
+    /// all. Char literals and raw/byte strings are not tracked (absent in resolver
+    /// bodies); a `'"'` char or a raw string is the remaining narrow residual.
+    fn mask_comments(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0;
+        let mut block_depth = 0usize;
+        let mut in_string = false;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if block_depth > 0 {
+                if c == '/' && next == Some('*') {
+                    block_depth += 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else if c == '*' && next == Some('/') {
+                    block_depth -= 1;
+                    out.push_str("  ");
+                    i += 2;
+                } else {
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                    i += 1;
+                }
+            } else if in_string {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(n) = next {
+                        out.push(n);
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    if c == '"' {
+                        in_string = false;
+                    }
+                    i += 1;
+                }
+            } else if c == '"' {
+                in_string = true;
+                out.push('"');
+                i += 1;
+            } else if c == '/' && next == Some('/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(' ');
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                block_depth = 1;
+                out.push_str("  ");
+                i += 2;
+            } else {
+                out.push(c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The introspection field set (the completeness source of truth) is exactly the
+    /// registered mutations. If async-graphql adds or renames a field, this reddens
+    /// and forces the `every_graphql_mutation_has_its_gate` table to be updated.
+    #[test]
+    fn schema_lists_exactly_the_registered_mutations() {
+        let mut fields = graphql_mutation_fields_from_schema();
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec!["claimTask", "completeTask", "createTask", "failTask"],
+            "the introspected mutation field set is the authoritative discovered set"
+        );
+    }
+
+    /// The marker check is bounded to a resolver's OWN body and is comment- and
+    /// string-aware: a `//` inside a `"https://"` string does not erase a real gate on
+    /// that line (no false-red), and a trailing module helper's `did_matches(` does not
+    /// rescue a resolver whose own gate was removed (no false-green).
+    #[test]
+    fn resolver_body_is_bounded_and_comment_and_string_aware() {
+        let src = "\
+impl MutationRoot {
+    async fn ok(&self) -> Result<u32> {
+        let _ = (\"see https://x/y\", did_matches(a, b)); // URL string then gate, one line
+        Ok(0)
+    }
+    async fn last(&self) -> Result<u32> {
+        // did_matches( only in a comment
+        Ok(0)
+    }
+}
+fn helper() { let _ = did_matches(z, z); }
+#[cfg(test)]
+mod tests { async fn t() { let _ = did_matches(x, y); } }
+";
+        let masked = mask_comments(src);
+        assert!(
+            resolver_body(&masked, "ok").contains("did_matches("),
+            "a `//` inside a string must not erase the real gate on that line"
+        );
+        assert!(
+            !resolver_body(&masked, "last").contains("did_matches("),
+            "the marker check must be bounded to the resolver's own body (a trailing \
+             helper's marker must not rescue a resolver whose gate was removed)"
+        );
+    }
+
     /// Proves the comment-stripping that GUARD-1 added: a marker that appears only
     /// in a full-line comment (the real `replicas.rs` false-pass shape) must NOT
     /// satisfy a row.
