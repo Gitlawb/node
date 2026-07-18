@@ -420,11 +420,13 @@ pub struct Config {
     /// acquire wait and walk deadline are clamped to `min(their own timeout,
     /// remaining budget)`; a stage is never started with zero remaining. On
     /// exhaustion the scan stops without a verdict and the request sheds a
-    /// retryable 503 + Retry-After rather than a false 404. Residual overshoot
-    /// past the budget is bounded by the kill/reap slack of the one in-flight
-    /// clamped stage (the walk watchdog's SIGTERM grace + SIGKILL settle) plus
-    /// the `object_type` / `read_object_content` probe subprocesses, which are
-    /// budget-checked before they start but carry no internal duration clamp.
+    /// retryable 503 + Retry-After rather than a false 404. The clamps bound
+    /// only the acquire and walk stages (overshoot there is the walk watchdog's
+    /// SIGTERM grace + SIGKILL settle); the `object_type` /
+    /// `read_object_content` probe subprocesses are budget-checked before they
+    /// start but have NO duration bound of their own, so a hung git probe
+    /// (corrupt pack, stuck filesystem) holds the request's walk slot for the
+    /// full duration of the hang.
     /// Must be positive. Default: 600s (10 min), matching
     /// `git_service_timeout_secs` so a single full-length walk still fits.
     #[arg(

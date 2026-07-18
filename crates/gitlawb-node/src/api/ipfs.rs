@@ -64,9 +64,9 @@ use crate::visibility::{visibility_check, Decision};
 /// Request budget (F3): one absolute clock (`ipfs_request_budget_secs`) spans
 /// the whole admitted request. No stage (acquire, probe, walk, content read)
 /// starts once it is exhausted, and the acquire wait and walk deadline are
-/// clamped to the remainder, so an admitted request cannot hold its scarce walk
-/// slot past the budget plus the in-flight stage's kill/reap slack and one
-/// unclamped probe subprocess.
+/// clamped to the remainder. The probe and content-read subprocesses have no
+/// duration bound of their own past their pre-start budget check, so a hung
+/// git probe holds the request's walk slot for the full duration of the hang.
 ///
 /// Scope: this closes the direct unauthenticated scan, including the dangling
 /// case. A stale-public mirror row still serves withheld content (tracked
@@ -188,9 +188,9 @@ pub async fn get_by_cid(
     // leaving this and every later candidate unproven, never a false 404). A
     // stage is never started with zero remaining; the probe and read
     // subprocesses carry no internal duration clamp, so this pre-start check is
-    // their entire bound (documented overshoot: at most one unclamped cat-file
-    // plus the in-flight clamped stage's kill/reap slack). The acquire and walk
-    // stages clamp their deadlines to the returned remainder.
+    // their entire bound (a hung one holds the request's walk slot for the
+    // duration of the hang). The acquire and walk stages clamp their deadlines
+    // to the returned remainder.
     fn budget_gate(
         truncated_by: &mut Vec<&'static str>,
         deadline: std::time::Instant,
@@ -941,6 +941,96 @@ mod tests {
                 .and_then(|h| h.to_str().ok()),
             Some("1"),
             "the truncation 503 must carry Retry-After"
+        );
+    }
+
+    /// F2 found-beats-taint on the acquire arm: an acquire timeout taints the
+    /// scan but must NOT stop it — the loop `continue`s, and a later repo that
+    /// genuinely carries the object still serves. The NEWER row (visited first
+    /// under `list_all_repos`' updated_at DESC) is a Tigris-backed ghost whose
+    /// acquire stalls against the silent endpoint and times out at 1s; the
+    /// OLDER row is a plain public repo carrying the blob, reached next and
+    /// served from a cheap probe — found beats taint: 200 with the blob bytes,
+    /// never the truncation 503. MUTATION (RED): turn the acquire-timeout arm's
+    /// `continue` into a `break` and the public copy never serves (503).
+    #[sqlx::test]
+    async fn get_by_cid_acquire_taint_does_not_block_later_public_copy(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Seed the blob repo through a LOCAL-ONLY store first, so seeding never
+        // consults the (deliberately unreachable) Tigris endpoint.
+        state.repo_store =
+            crate::git::repo_store::RepoStore::for_testing(repos_dir.clone(), pool.clone());
+        let content = b"acquire taint continue proof\n";
+        let (_, oid) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f2acqcont", "pubcopy", content).await;
+        // Swap in a Tigris-backed store over the SAME repos_dir (the seeded bare
+        // repo stays a fast local hit) and add a NEWER ghost row with no local
+        // copy: its acquire consults the silent local endpoint and stalls to the
+        // 1s timeout (endpoint-pinned test client, no AWS_* env reads).
+        let endpoint = silent_tigris_endpoint().await;
+        let tigris =
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
+        state
+            .db
+            .upsert_mirror_repo("z6f2acqcont", "ghost", "/unused-ghost", None, false)
+            .await
+            .unwrap();
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = 1;
+        state.config = Arc::new(cfg);
+
+        // Ordering precondition: the ghost must be iterated FIRST (updated_at
+        // DESC — it was upserted after the blob repo), otherwise the pubcopy
+        // would serve before the taint ever fires and the continue-vs-break
+        // distinction would go untested.
+        let order: Vec<String> = state
+            .db
+            .list_all_repos()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        let ghost_pos = order.iter().position(|n| n == "ghost").unwrap();
+        let pub_pos = order.iter().position(|n| n == "pubcopy").unwrap();
+        assert!(
+            ghost_pos < pub_pos,
+            "precondition: the stalling ghost must be iterated before the blob repo; got {order:?}"
+        );
+
+        let peer: SocketAddr = "203.0.113.73:5000".parse().unwrap();
+        let started = std::time::Instant::now();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&cid_for_oid(&oid), Some(peer)))
+            .await
+            .unwrap();
+        // The taint arm demonstrably FIRED on this run: the response can only
+        // arrive after the ghost's stalled acquire burned its full 1s timeout
+        // (a cheap skip or a deny verdict would answer near-instantly).
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "the ghost's acquire must stall to its timeout before the scan continues; \
+             got {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an acquire taint must not stop the scan — the later public copy serves"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(
+            &body[..],
+            content.as_slice(),
+            "the served body must be the blob content from the later public copy"
         );
     }
 
