@@ -315,21 +315,12 @@ pub async fn resolve_candidates_for_push(
             full_scan: false,
         };
     }
-    // Scan admission (#174 F4): DEFER (await), never shed — a dropped scan would
-    // silently under-pin this push. The permit moves into the blocking closure so
-    // a started scan always completes holding it. Residuals as documented at
-    // `replication_withheld_set`'s acquire: park wait is queue-depth multiplied,
-    // and a client disconnect while parked loses this push's replication work.
-    let parked = Instant::now();
-    let permit = scan_sem
-        .acquire_owned()
-        .await
-        .expect("git_encrypt_semaphore is never closed");
-    tracing::debug!(
-        repo = %repo_path.display(),
-        queue_wait_ms = parked.elapsed().as_millis() as u64,
-        "pin-candidate scan admitted to the scan pool"
-    );
+    // Scan admission (#174 F4): DEFER, never shed — a dropped scan would
+    // silently under-pin this push. The permit moves into the blocking closure
+    // so a started scan always completes holding it. Residuals at
+    // `acquire_scan_permit`.
+    let permit =
+        crate::state::acquire_scan_permit(scan_sem, &repo_path, "pin-candidate scan").await;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         // ONE shared deadline for the whole scan, per jatmn ("the same deadline").

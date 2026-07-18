@@ -271,7 +271,8 @@ pub struct TreeEntry {
 /// `/ipfs/<cid>` is computed from these same content bytes via
 /// `gitlawb_core::cid::Cid::from_git_object_bytes`.
 ///
-/// Get just the object type. Returns `None` if the object doesn't exist.
+/// Get just the object type. Returns `None` if the object doesn't exist; a
+/// probe that could not examine the object store is `Err`, never `None`.
 pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>> {
     let type_output = Command::new("git")
         .args(["cat-file", "-t", sha256_hex])
@@ -280,6 +281,19 @@ pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>>
         .context("failed to run git cat-file -t")?;
 
     if !type_output.status.success() {
+        // A nonzero exit is an ABSENCE verdict only when git could examine the
+        // object store: missing-object and invalid-oid probes die with a single
+        // clean `fatal:` line. A broken repo dir (`fatal: not a git repository`)
+        // or a corrupt object (`error: inflate` / `error: unable to unpack`
+        // lines before the fatal) proves nothing about absence, so it must
+        // surface as Err — the /ipfs scan taints on Err rather than treating
+        // the repo as probed-clean.
+        let stderr = String::from_utf8_lossy(&type_output.stderr);
+        if stderr.contains("not a git repository")
+            || stderr.lines().any(|l| l.starts_with("error:"))
+        {
+            bail!("git cat-file -t failed: {}", stderr.trim());
+        }
         return Ok(None);
     }
 

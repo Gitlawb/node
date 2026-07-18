@@ -443,3 +443,34 @@ impl Drop for EncryptInflightGuard {
         }
     }
 }
+
+/// Admit a post-receive git scan to the shared `git_encrypt_semaphore` pool
+/// (#174 F4): DEFER (await), never shed — a dropped scan would lose the push's
+/// recovery copy or silently under-pin it. The returned permit must move into
+/// the blocking closure so a started scan always completes holding it (a
+/// disconnect cannot cancel `spawn_blocking` or leak the permit mid-walk).
+/// Accepted residuals, stated once for every caller: (1) the park wait is
+/// queue-depth multiplied — post-receive tails are no longer admission-bounded
+/// once the write permit is released, so N landed pushes can queue N scans and
+/// the last waits N scan-durations; (2) a client-timeout disconnect while
+/// parked HERE drops the handler future and silently loses this push's
+/// replication work — the `encrypt_inflight` coalescing requeue does NOT cover
+/// it, because this park precedes the `try_begin` spawn gate.
+pub async fn acquire_scan_permit(
+    scan_sem: Arc<tokio::sync::Semaphore>,
+    repo: &std::path::Path,
+    stage: &'static str,
+) -> tokio::sync::OwnedSemaphorePermit {
+    let parked = std::time::Instant::now();
+    let permit = scan_sem
+        .acquire_owned()
+        .await
+        .expect("git_encrypt_semaphore is never closed");
+    tracing::debug!(
+        repo = %repo.display(),
+        stage,
+        queue_wait_ms = parked.elapsed().as_millis() as u64,
+        "post-receive scan admitted to the scan pool"
+    );
+    permit
+}

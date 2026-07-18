@@ -182,14 +182,35 @@ pub async fn get_by_cid(
         }
     }
 
-    // Remaining request budget (F3), or None once exhausted. A stage is never
-    // started with zero remaining; the probe and read subprocesses carry no
-    // internal duration clamp, so the check before them is their entire bound
-    // (documented overshoot: at most one unclamped cat-file plus the in-flight
-    // clamped stage's kill/reap slack).
-    fn budget_remaining(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    // Budget gate shared by the four per-stage checks (F3): the remaining
+    // request budget, or — once exhausted — None, after logging the stage and
+    // knob and tainting "budget"; the call site only breaks (the scan STOPS,
+    // leaving this and every later candidate unproven, never a false 404). A
+    // stage is never started with zero remaining; the probe and read
+    // subprocesses carry no internal duration clamp, so this pre-start check is
+    // their entire bound (documented overshoot: at most one unclamped cat-file
+    // plus the in-flight clamped stage's kill/reap slack). The acquire and walk
+    // stages clamp their deadlines to the returned remainder.
+    fn budget_gate(
+        truncated_by: &mut Vec<&'static str>,
+        deadline: std::time::Instant,
+        budget_secs: u64,
+        repo_name: &str,
+        stage: &'static str,
+    ) -> Option<std::time::Duration> {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
-        (!left.is_zero()).then_some(left)
+        if left.is_zero() {
+            tracing::warn!(
+                repo = %repo_name,
+                stage,
+                budget_secs,
+                "/ipfs request budget exhausted before the stage \
+                 (GITLAWB_IPFS_REQUEST_BUDGET_SECS); stopping the scan without a verdict"
+            );
+            taint(truncated_by, "budget");
+            return None;
+        }
+        Some(left)
     }
 
     // Cap on EXPENSIVE walks only (F2): counts the repos that actually require the
@@ -216,18 +237,15 @@ pub async fn get_by_cid(
             continue;
         }
 
-        // Budget gate for the acquire stage (F3): once the request budget is
-        // exhausted the scan STOPS, leaving this and every later candidate
-        // unproven (taint, never a false 404). Checked ahead of the visit
+        // Budget gate for the acquire stage (F3), checked ahead of the visit
         // bookkeeping so an unstarted acquire is not counted as a visit.
-        let Some(budget_left) = budget_remaining(request_deadline) else {
-            tracing::warn!(
-                repo = %repo.name,
-                budget_secs = state.config.ipfs_request_budget_secs,
-                "/ipfs request budget exhausted before the repo acquire \
-                 (GITLAWB_IPFS_REQUEST_BUDGET_SECS); stopping the scan without a verdict"
-            );
-            taint(&mut truncated_by, "budget");
+        let Some(budget_left) = budget_gate(
+            &mut truncated_by,
+            request_deadline,
+            state.config.ipfs_request_budget_secs,
+            &repo.name,
+            "repo acquire",
+        ) else {
             break;
         };
 
@@ -276,13 +294,15 @@ pub async fn get_by_cid(
 
         // Budget gate for the probe stage (F3). The probe subprocess has no
         // internal duration clamp, so this pre-start check is its entire bound.
-        if budget_remaining(request_deadline).is_none() {
-            tracing::warn!(
-                repo = %repo.name,
-                "/ipfs request budget exhausted before the object-type probe; \
-                 stopping the scan without a verdict"
-            );
-            taint(&mut truncated_by, "budget");
+        if budget_gate(
+            &mut truncated_by,
+            request_deadline,
+            state.config.ipfs_request_budget_secs,
+            &repo.name,
+            "object-type probe",
+        )
+        .is_none()
+        {
             break;
         }
 
@@ -311,14 +331,13 @@ pub async fn get_by_cid(
                 // started walk runs its git children under a deadline clamped
                 // to the remainder (the min below), so a walk can never
                 // complete past the budget.
-                let Some(budget_left) = budget_remaining(request_deadline) else {
-                    tracing::warn!(
-                        repo = %repo.name,
-                        budget_secs = state.config.ipfs_request_budget_secs,
-                        "/ipfs request budget exhausted before the visibility walk \
-                         (GITLAWB_IPFS_REQUEST_BUDGET_SECS); stopping the scan without a verdict"
-                    );
-                    taint(&mut truncated_by, "budget");
+                let Some(budget_left) = budget_gate(
+                    &mut truncated_by,
+                    request_deadline,
+                    state.config.ipfs_request_budget_secs,
+                    &repo.name,
+                    "visibility walk",
+                ) else {
                     break;
                 };
                 // Walk cap (F2), checked at the one site that actually spends a walk:
@@ -394,13 +413,15 @@ pub async fn get_by_cid(
         // serving keeps the terminal arm honest and the stop unconditional; the
         // retryable 503 tells the caller to come back rather than letting an
         // over-budget request keep spending.
-        if budget_remaining(request_deadline).is_none() {
-            tracing::warn!(
-                repo = %repo.name,
-                "/ipfs request budget exhausted before the content read; \
-                 stopping the scan without a verdict"
-            );
-            taint(&mut truncated_by, "budget");
+        if budget_gate(
+            &mut truncated_by,
+            request_deadline,
+            state.config.ipfs_request_budget_secs,
+            &repo.name,
+            "content read",
+        )
+        .is_none()
+        {
             break;
         }
 
@@ -598,6 +619,24 @@ mod tests {
         gitlawb_core::cid::Cid::from_sha256_bytes(&oid_bytes)
             .as_str()
             .to_string()
+    }
+
+    /// A local endpoint whose TCP accept succeeds instantly but that never writes
+    /// an HTTP response, so a Tigris HEAD against it stalls deterministically
+    /// until the caller's timeout. (A non-routable address hangs only if the
+    /// network blackholes the SYN — a fast RST would end the stall early.) The
+    /// accepted sockets are parked in the spawned task, which dies with the
+    /// test's runtime, so the peer never sees a close mid-test.
+    async fn silent_tigris_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        endpoint
     }
 
     /// Fake git for the WALK only (`state.git_bin`): empty refs, `rev-parse`
@@ -854,9 +893,9 @@ mod tests {
     }
 
     /// F2 acquire taint: a repo row with NO local copy over a Tigris backend that
-    /// stalls (non-routable endpoint — the connect just hangs) hits the 1s acquire
-    /// timeout at the read-acquire site. The skip carries no verdict, so the scan is
-    /// truncated: retryable 503 + Retry-After, never the old silent-skip 404.
+    /// stalls (a silent local endpoint — accepted, never answered) hits the 1s
+    /// acquire timeout at the read-acquire site. The skip carries no verdict, so the
+    /// scan is truncated: retryable 503 + Retry-After, never the old silent-skip 404.
     /// MUTATION (RED): drop the taint on the acquire-timeout arm and this decays to
     /// a 404.
     #[sqlx::test]
@@ -866,12 +905,12 @@ mod tests {
         std::fs::create_dir_all(&repos_dir).unwrap();
         let mut state = crate::test_support::test_state(pool.clone()).await;
         // Endpoint-pinned test client (no AWS_* env reads — env is racy under a
-        // parallel test run); 10.255.255.1 is non-routable so the HEAD hangs.
-        let tigris = crate::git::tigris::TigrisClient::for_testing_with_endpoint(
-            "test-bucket",
-            "http://10.255.255.1:9000",
-        )
-        .await;
+        // parallel test run); the silent local endpoint stalls the HEAD
+        // deterministically.
+        let endpoint = silent_tigris_endpoint().await;
+        let tigris =
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await;
         state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         let mut cfg = (*state.config).clone();
@@ -911,9 +950,10 @@ mod tests {
     /// `object_type` is Err. That is not an absence verdict, so the scan is
     /// truncated: 503, never 404. A second, real repo probes clean (absent verdict)
     /// — the one bad row is what taints. NOTE: the probe shells to the real `git`
-    /// (not `state.git_bin`) and maps a NONZERO cat-file exit to `Ok(None)` (an
-    /// absent verdict), so a fake git exiting nonzero cannot reach this arm; only a
-    /// spawn failure is Err, hence the missing-dir recipe. MUTATION (RED): drop the
+    /// (not `state.git_bin`), and a clean missing/invalid-object nonzero exit is
+    /// still `Ok(None)` (an absent verdict) — this arm needs a probe that could
+    /// not RUN, hence the missing-dir spawn failure here; the corrupt-repo test
+    /// below drives the stderr-discriminated Err. MUTATION (RED): drop the
     /// taint on the probe-error arm and this decays to a 404.
     #[sqlx::test]
     async fn get_by_cid_probe_error_taints_scan_to_503(pool: sqlx::PgPool) {
@@ -948,6 +988,76 @@ mod tests {
                 .and_then(|h| h.to_str().ok()),
             Some("1"),
             "the truncation 503 must carry Retry-After"
+        );
+    }
+
+    /// F2 probe taint, corrupt-repo arm: a repo whose git dir EXISTS but is broken
+    /// (objects/ removed, HEAD garbage) makes the real `cat-file -t` die with the
+    /// repo-level `fatal: not a git repository` — a probe that could not examine
+    /// the object store, not an absence verdict, so `object_type` must map it to
+    /// Err and the scan must shed the probe-tainted 503, never the silent-absence
+    /// 404. A second, real repo probes clean (absent verdict) — the corrupt row is
+    /// what taints. MUTATION (RED): map every nonzero cat-file exit back to
+    /// `Ok(None)` in `object_type` (drop the stderr discrimination) and this
+    /// decays to a 404.
+    #[sqlx::test]
+    async fn get_by_cid_corrupt_repo_dir_probe_error_taints_scan_to_503(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        // Older row: a real repo that probes clean. Newer row: a bare repo whose
+        // git dir exists on disk but is corrupt at the repo level.
+        seed_repo_with_blob(&state, tmp.path(), "z6f2corrupt", "real", b"probe clean\n").await;
+        state
+            .db
+            .upsert_mirror_repo("z6f2corrupt", "broken", "/unused-broken", None, false)
+            .await
+            .unwrap();
+        let rec = state
+            .db
+            .get_repo("z6f2corrupt", "broken")
+            .await
+            .unwrap()
+            .unwrap();
+        let bare = state
+            .repo_store
+            .acquire(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&["init", "-q", "--bare", "--object-format=sha256"], &bare);
+        std::fs::remove_dir_all(bare.join("objects")).unwrap();
+        std::fs::write(bare.join("HEAD"), b"junk\n").unwrap();
+
+        let peer: SocketAddr = "203.0.113.68:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a repo-level cat-file fatal leaves the repo unproven — the scan must \
+             shed 503, not report the object absent"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("probe"),
+            "the shed must name the probe taint; got: {body}"
         );
     }
 
@@ -1074,7 +1184,7 @@ mod tests {
     /// (`ipfs_request_budget_secs`) bounds the whole admitted scan; per-repo
     /// stages may not each draw a fresh timeout past it. Budget 1s, per-iteration
     /// acquire timeout 2s; the NEWER row is a Tigris-backed ghost (no local copy,
-    /// non-routable endpoint) whose acquire stalls, the OLDER row is a plain
+    /// silent local endpoint) whose acquire stalls, the OLDER row is a plain
     /// public repo carrying the blob. The ghost's acquire runs clamped to the ~1s
     /// remainder and times out; at the next repo the budget gate sees zero
     /// remaining, taints "budget", and STOPS the scan, so the blob repo is never
@@ -1105,13 +1215,12 @@ mod tests {
         .await;
         // Swap in a Tigris-backed store over the SAME repos_dir (the seeded bare
         // repo stays a fast local hit) and add a NEWER ghost row with no local
-        // copy: its acquire consults the non-routable endpoint and stalls
-        // (endpoint-pinned test client, no AWS_* env reads; 10.255.255.1 hangs).
-        let tigris = crate::git::tigris::TigrisClient::for_testing_with_endpoint(
-            "test-bucket",
-            "http://10.255.255.1:9000",
-        )
-        .await;
+        // copy: its acquire consults the silent local endpoint and stalls past
+        // the budget (endpoint-pinned test client, no AWS_* env reads).
+        let endpoint = silent_tigris_endpoint().await;
+        let tigris =
+            crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
+                .await;
         state.repo_store = crate::git::repo_store::RepoStore::new(repos_dir, Some(tigris), pool);
         state
             .db
