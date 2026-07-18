@@ -288,6 +288,13 @@ pub struct PinCandidateSet {
 /// rev-list, and the full-scan fallback — run under ONE permit held for the
 /// whole blocking scan. The deletion-only fast path (no new tips) spawns no git
 /// and never parks.
+///
+/// `force_full_scan` forces the full-scan fallback regardless of the tips — the
+/// coalesced-drain `PendingWork::FullScan` marker (#174 F5). It composes with
+/// the env kill-switch (either forces), and it disqualifies the empty-tips fast
+/// path: a forced-scan call with no tips must still enumerate the repo, never
+/// silently resolve to an empty delta (which would pin nothing and lose the
+/// drained pushes' work — the F5 bug shape).
 pub async fn resolve_candidates_for_push(
     scan_sem: std::sync::Arc<tokio::sync::Semaphore>,
     repo_path: PathBuf,
@@ -295,11 +302,13 @@ pub async fn resolve_candidates_for_push(
     old_tips: Vec<String>,
     git_bin: String,
     timeout: Duration,
+    force_full_scan: bool,
 ) -> PinCandidateSet {
+    let force = force_full_scan || self::force_full_scan();
     // No-git fast path: a deletion-only push resolves to an empty delta without
-    // spawning any git child, so it must not park on the scan pool. The
-    // kill-switch disqualifies it — forcing the full scan spawns git.
-    if new_tips.is_empty() && !force_full_scan() {
+    // spawning any git child, so it must not park on the scan pool. A forced
+    // full scan (caller flag or kill-switch) disqualifies it — the scan spawns git.
+    if new_tips.is_empty() && !force {
         tracing::info!(delta = 0usize, repo = %repo_path.display(), "pin candidate set from push delta");
         return PinCandidateSet {
             candidates: Vec::new(),
@@ -327,7 +336,16 @@ pub async fn resolve_candidates_for_push(
         let deadline = Instant::now() + timeout;
         let new_refs: Vec<&str> = new_tips.iter().map(String::as_str).collect();
         let old_refs: Vec<&str> = old_tips.iter().map(String::as_str).collect();
-        match resolve_push_delta(&repo_path, &new_refs, &old_refs, &git_bin, deadline) {
+        // `force` already folds in the env kill-switch, so the forced arm skips the
+        // delta machinery outright; the unforced arm goes through the normal
+        // resolver (whose own env read is false here by construction).
+        let resolved = if force {
+            tracing::debug!("full scan forced (coalesced-drain marker or kill-switch)");
+            PinCandidates::FullScanRequired
+        } else {
+            resolve_push_delta(&repo_path, &new_refs, &old_refs, &git_bin, deadline)
+        };
+        match resolved {
             PinCandidates::Delta(objs) => {
                 tracing::info!(delta = objs.len(), repo = %repo_path.display(), "pin candidate set from push delta");
                 PinCandidateSet { candidates: objs, full_scan: false }
@@ -586,6 +604,7 @@ mod tests {
             vec![c1.clone()],
             "git".to_string(),
             std::time::Duration::from_secs(600),
+            false,
         )
         .await;
         assert!(!set.full_scan, "happy-path delta is not a full scan");
@@ -616,6 +635,7 @@ mod tests {
             vec![],
             "git".to_string(),
             std::time::Duration::from_secs(600),
+            false,
         )
         .await;
         assert!(set.full_scan, "non-commit tip is signalled as a full scan");
@@ -665,6 +685,7 @@ mod tests {
                 vec![],
                 git_bin.clone(),
                 Duration::from_secs(5),
+                false,
             ),
         )
         .await;
@@ -686,6 +707,7 @@ mod tests {
             vec![],
             git_bin,
             Duration::from_secs(5),
+            false,
         )
         .await;
         assert!(
@@ -730,6 +752,7 @@ mod tests {
                 vec!["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()],
                 fake.to_str().unwrap().to_string(),
                 Duration::from_secs(5),
+                false,
             ),
         )
         .await
@@ -742,6 +765,56 @@ mod tests {
             }
         );
         assert!(!marker.exists(), "the fast path must spawn no git at all");
+    }
+
+    /// #174 F5: the coalesced-drain FullScan marker is signalled via the explicit
+    /// `force_full_scan` flag, and a flagged call with NO tips must still enumerate
+    /// the whole repo (full_scan=true, non-empty candidates). The RED arm of the
+    /// encoding question: if the marker were encoded as a plain empty-tips call
+    /// (flag off — the fast path), the drain would resolve to an empty delta and
+    /// pin nothing, silently losing the coalesced pushes' work.
+    #[tokio::test]
+    async fn forced_full_scan_with_no_tips_enumerates_the_repo() {
+        let repo = Repo::new();
+        repo.commit_file("a.txt", "one\n");
+        let all: HashSet<String> = list_all_objects(&repo.path, "git", td())
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(!all.is_empty(), "fixture repo has objects");
+
+        let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            repo.path.clone(),
+            vec![],
+            vec![],
+            "git".to_string(),
+            std::time::Duration::from_secs(600),
+            true,
+        )
+        .await;
+        assert!(set.full_scan, "the forced call is signalled as a full scan");
+        let got: HashSet<String> = set.candidates.into_iter().collect();
+        assert_eq!(
+            got, all,
+            "a forced full scan with no tips enumerates the repo — never an empty delta"
+        );
+
+        // The discriminator: the SAME empty-tips call without the flag is the
+        // deletion-only fast path (empty delta, pin nothing). The two must differ,
+        // or the marker encoding has collapsed into the silent-loss shape.
+        let unforced = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            repo.path.clone(),
+            vec![],
+            vec![],
+            "git".to_string(),
+            std::time::Duration::from_secs(600),
+            false,
+        )
+        .await;
+        assert!(!unforced.full_scan);
+        assert!(unforced.candidates.is_empty());
     }
 
     #[test]
