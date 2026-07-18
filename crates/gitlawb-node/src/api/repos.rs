@@ -139,10 +139,25 @@ async fn fail_closed_full_scan_objects(
         crate::state::acquire_scan_permit(encrypt_sem, &disk_path, "fail-closed full scan").await;
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
         let _permit = permit;
+        // One whole-scan deadline shared across both phases (#174 F4). A fresh
+        // `Instant::now() + timeout` for phase 2 let a large-but-successful phase 1 plus
+        // a full phase 2 hold the scan permit ~2x the configured budget. Sharing the
+        // deadline caps total occupancy at ~1x: phase 1 runs against the remaining
+        // budget, and if it consumes the budget phase 2 gets what is left and fails
+        // closed (pins nothing) rather than over-holding — the safe direction. The cost
+        // is honest: a genuinely large repo whose phase 1 nears the budget under-pins
+        // this push rather than the previous silent ~2x hold; size the budget so both
+        // phases normally fit.
+        let deadline = std::time::Instant::now() + timeout;
         let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
-            &disk_path, &git_bin, timeout, &rules, is_public, &owner_did,
+            &disk_path,
+            &git_bin,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            &rules,
+            is_public,
+            &owner_did,
         )?;
-        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path, &git_bin, std::time::Instant::now() + timeout)?;
+        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path, &git_bin, deadline)?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
             candidates, &allowed, &all_blobs,
         ))
@@ -5033,6 +5048,51 @@ mod tests {
         assert!(
             marker.exists(),
             "once admission is available the deferred full scan runs its git"
+        );
+    }
+
+    /// #174 F4 (RED-before/GREEN-after): the two full-scan phases share ONE whole-scan
+    /// deadline. Phase 1 (`replicable_blob_set_bounded`) succeeds but consumes almost
+    /// the whole budget; phase 2 (`all_blob_oids`) then gets only the remainder. With a
+    /// shared deadline phase 2 is reaped and the scan fails closed (pins nothing) — the
+    /// safe direction. With a FRESH `Instant::now() + timeout` for phase 2 (pre-fix) it
+    /// gets a full second budget, completes with an empty blob set, and the non-blob
+    /// candidate is kept — so the result is NON-empty (RED) and the permit is held ~2x.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_scan_shares_one_deadline_across_both_phases() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Phase 1 (ls-tree) sleeps 1.5s and succeeds (empty tree); phase 2
+        // (cat-file --batch-all-objects) sleeps 1.5s. With a 2s whole-scan budget the
+        // shared deadline leaves phase 2 only ~0.5s, so it is reaped; a fresh 2s budget
+        // would let it finish.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  rev-list) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  ls-tree) sleep 1.5 ;;\n  cat-file) case \"$*\" in *--batch-all-objects*) sleep 1.5 ;; *) : ;; esac ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        // A candidate that is NOT a blob (never appears in all_blob_oids): kept by
+        // replicable_objects_fail_closed only if phase 2 actually ran to completion.
+        let candidates = vec!["cccccccccccccccccccccccccccccccccccccccc".to_string()];
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+        let objs = fail_closed_full_scan_objects(
+            sem,
+            tmp.path().to_path_buf(),
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            OWNER_DID.to_string(),
+            candidates,
+            git_bin,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            objs.is_empty(),
+            "a large-but-successful phase 1 must leave phase 2 only the SHARED whole-scan \
+             remainder, so it reaps and the scan fails closed; got {objs:?} (a fresh phase-2 \
+             budget completed the scan and kept the candidate — the ~2x-budget bug)"
         );
     }
 
