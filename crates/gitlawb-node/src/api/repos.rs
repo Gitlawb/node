@@ -74,30 +74,14 @@ async fn replication_withheld_set(
         // that off the async worker thread.
         Some(rules) => {
             let owner_did = owner_did.to_string();
-            // Scan admission (#174 F4): DEFER (await), never shed — dropping the
-            // walk would skip the vetting and fail the push's replication closed
-            // for no reason. Accepted residuals, stated honestly: (1) the park
-            // wait is queue-depth multiplied — post-receive tails are no longer
-            // admission-bounded once the write permit is released, so N landed
-            // pushes can queue N walks and the last waits N walk-durations;
-            // (2) a client-timeout disconnect while parked HERE drops the
-            // handler future and silently loses this push's replication work —
-            // the encrypt_inflight coalescing requeue does NOT cover it, because
-            // this park precedes the `try_begin` spawn gate.
-            let parked = std::time::Instant::now();
-            let permit = encrypt_sem
-                .acquire_owned()
-                .await
-                .expect("git_encrypt_semaphore is never closed");
-            tracing::debug!(
-                repo = %disk_path.display(),
-                queue_wait_ms = parked.elapsed().as_millis() as u64,
-                "post-push withheld walk admitted to the scan pool"
-            );
+            // Scan admission (#174 F4): DEFER, never shed — dropping the walk
+            // would skip the vetting and fail the push's replication closed for
+            // no reason. Residuals at `acquire_scan_permit`.
+            let permit =
+                crate::state::acquire_scan_permit(encrypt_sem, &disk_path, "withheld walk").await;
             tokio::task::spawn_blocking(move || {
                 // The permit lives inside the blocking closure: a started walk
-                // always completes holding it (a disconnect cannot cancel
-                // spawn_blocking or leak the permit mid-walk).
+                // always completes holding it.
                 let _permit = permit;
                 crate::git::visibility_pack::withheld_blob_oids_bounded(
                     &disk_path, &git_bin, timeout, &rules, is_public, &owner_did, None,
@@ -137,9 +121,7 @@ async fn replication_withheld_set(
 ///
 /// Always walks (there is no no-git arm), so the whole blocking scan runs under
 /// one `git_encrypt_semaphore` admission permit (#174 F4) — see
-/// `replication_withheld_set`'s acquire for the defer rationale and the honest
-/// residuals (queue-depth-multiplied park wait; a disconnect while parked loses
-/// this push's replication work, uncovered by the coalescing requeue).
+/// `acquire_scan_permit` for the defer rationale and the honest residuals.
 #[allow(clippy::too_many_arguments)]
 async fn fail_closed_full_scan_objects(
     encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
@@ -153,16 +135,8 @@ async fn fail_closed_full_scan_objects(
 ) -> Vec<String> {
     // Scan admission (#174 F4): DEFER, never shed; the permit moves into the
     // closure so a started scan always completes holding it.
-    let parked = std::time::Instant::now();
-    let permit = encrypt_sem
-        .acquire_owned()
-        .await
-        .expect("git_encrypt_semaphore is never closed");
-    tracing::debug!(
-        repo = %disk_path.display(),
-        queue_wait_ms = parked.elapsed().as_millis() as u64,
-        "post-push fail-closed full scan admitted to the scan pool"
-    );
+    let permit =
+        crate::state::acquire_scan_permit(encrypt_sem, &disk_path, "fail-closed full scan").await;
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
         let _permit = permit;
         let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
@@ -925,7 +899,11 @@ async fn resolve_drain_object_list(
             return None;
         }
     };
-    let rules_opt = ctx.db.list_visibility_rules(&ctx.repo_id).await.ok();
+    // record.id, never the spawn-time ctx.repo_id: the record above is re-fetched
+    // fresh by owner/name, and a delete+re-create between spawn and drain gives
+    // the row a NEW id — rules read against the stale id come back empty and
+    // would fail open for the new row.
+    let rules_opt = ctx.db.list_visibility_rules(&record.id).await.ok();
     let (_announce, withheld) = replication_withheld_set(
         ctx.encrypt_sem.clone(),
         rules_opt.clone(),

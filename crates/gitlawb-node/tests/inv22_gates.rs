@@ -105,12 +105,25 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
          pushes via finish_or_take_pending before releasing its repo key"
     );
 
-    // F4: every post-receive scan helper acquires a `git_encrypt_semaphore` permit
-    // BEFORE its spawn_blocking git walk, so a push burst cannot accumulate unbounded
-    // concurrent scans once the write permit is released. Structural check: within each
-    // helper the first `acquire_owned` precedes the first `spawn_blocking`. Removing a
-    // gate pushes the next `acquire_owned` occurrence past the helper's own
-    // `spawn_blocking` (or off the end of the file), turning the assertion red.
+    // F4: every post-receive scan helper admits itself to the shared scan pool via
+    // `crate::state::acquire_scan_permit` BEFORE its spawn_blocking git walk, so a
+    // push burst cannot accumulate unbounded concurrent scans once the write permit
+    // is released. Two halves, both load-bearing: the helper body must actually
+    // acquire the pool (state.rs sits the helper at the end of the file, so the
+    // definition tail contains no other `acquire_owned` to match vacuously), and
+    // within each scan helper the first qualified call precedes the first
+    // `spawn_blocking`. Severing a call site pushes the next occurrence past the
+    // helper's own `spawn_blocking` (or off the end of the file), turning the
+    // assertion red; comments name the helper without the `crate::state::` prefix,
+    // so this targets the real call sites.
+    let state_rs = src("state.rs");
+    let helper_def = state_rs
+        .find("fn acquire_scan_permit")
+        .expect("F4 gate missing: state.rs no longer defines acquire_scan_permit");
+    assert!(
+        state_rs[helper_def..].contains("acquire_owned"),
+        "F4 gate gutted: acquire_scan_permit must acquire the scan pool via acquire_owned"
+    );
     let push_delta = src("git/push_delta.rs");
     for (file_src, file, helper) in [
         (&repos, "api/repos.rs", "fn replication_withheld_set"),
@@ -125,9 +138,11 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
             .find(helper)
             .unwrap_or_else(|| panic!("{file}: `{helper}` not found"));
         let tail = &file_src[start..];
-        let acquire = tail.find("acquire_owned").unwrap_or_else(|| {
-            panic!("F4 gate missing: {file} `{helper}` no longer acquires a scan permit")
-        });
+        let acquire = tail
+            .find("crate::state::acquire_scan_permit(")
+            .unwrap_or_else(|| {
+                panic!("F4 gate missing: {file} `{helper}` no longer acquires a scan permit")
+            });
         let spawn = tail.find("spawn_blocking").unwrap_or_else(|| {
             panic!("{file}: `{helper}` lost its spawn_blocking walk — update this guard")
         });
