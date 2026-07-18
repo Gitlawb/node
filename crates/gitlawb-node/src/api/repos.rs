@@ -1645,314 +1645,336 @@ pub async fn git_receive_pack(
         }
     }
 
-    // Replication enforcement (Phase 2): decide once per push whether the public
-    // may read this repo at all and, if so, which blob OIDs must not leave the
-    // node. `withheld == None` means replicate nothing (private / mode A /
-    // undetermined): skip every pin so even commit and tree objects (which
-    // withheld_blob_oids never lists) stay local. `announce` gates the
-    // network-facing announcements. Fail closed: a private or undetermined repo
-    // never leaks.
-    let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
-    let (announce, withheld) = replication_withheld_set(
-        state.git_encrypt_semaphore.clone(),
-        rules_opt.clone(),
-        &record.owner_did,
-        record.is_public,
-        disk_path.clone(),
-        state.git_bin.clone(),
-        std::time::Duration::from_secs(state.config.git_service_timeout_secs),
-    )
-    .await;
-
-    // Resolve the per-push pin candidate set once, off the async worker, then
-    // filter to what may actually replicate. Delta path: the reachable-only
-    // `withheld` set suffices (delta objects are reachable). Full-scan path: the
-    // candidate set can include dangling blobs the withheld set never classified,
-    // so fail closed — replicate a blob only if it is reachable AND
-    // visibility-allowed (#99). Only computed when something will actually
-    // replicate; every degraded path logs rather than failing silently.
-    let object_list: Vec<String> = if let Some(withheld_set) = withheld.clone() {
-        let new_tips: Vec<String> = ref_updates
-            .iter()
-            .map(|u| u.new_sha.clone())
-            .filter(|s| s != ZERO_SHA)
-            .collect();
-        let old_tips: Vec<String> = ref_updates
-            .iter()
-            .map(|u| u.old_sha.clone())
-            .filter(|s| s != ZERO_SHA)
-            .collect();
-        let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+    // #174 F2: move the whole post-receive replication tail into an independently owned
+    // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
+    // resolution), so leaving it in the request future means a client/proxy disconnect
+    // while parked silently drops this push's pins, recovery copy, and announcements —
+    // the residual `state.rs` documented, because the durable `try_begin` gate sat after
+    // the park. The request future now returns the git response immediately and the tail
+    // runs detached; a disconnect can no longer drop it. Each push owns its own tail,
+    // including its own always-spawned announce, so per-push announcements are never
+    // coalesced away (the announce spawn stays out of the per-repo encrypt coalescing).
+    let did = did.to_string();
+    tokio::spawn(async move {
+        // Replication enforcement (Phase 2): decide once per push whether the public
+        // may read this repo at all and, if so, which blob OIDs must not leave the
+        // node. `withheld == None` means replicate nothing (private / mode A /
+        // undetermined): skip every pin so even commit and tree objects (which
+        // withheld_blob_oids never lists) stay local. `announce` gates the
+        // network-facing announcements. Fail closed: a private or undetermined repo
+        // never leaks.
+        let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
+        let (announce, withheld) = replication_withheld_set(
             state.git_encrypt_semaphore.clone(),
+            rules_opt.clone(),
+            &record.owner_did,
+            record.is_public,
             disk_path.clone(),
-            new_tips,
-            old_tips,
             state.git_bin.clone(),
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
-            false,
         )
         .await;
-        if pin_set.full_scan {
-            fail_closed_full_scan_objects(
+
+        // Resolve the per-push pin candidate set once, off the async worker, then
+        // filter to what may actually replicate. Delta path: the reachable-only
+        // `withheld` set suffices (delta objects are reachable). Full-scan path: the
+        // candidate set can include dangling blobs the withheld set never classified,
+        // so fail closed — replicate a blob only if it is reachable AND
+        // visibility-allowed (#99). Only computed when something will actually
+        // replicate; every degraded path logs rather than failing silently.
+        let object_list: Vec<String> = if let Some(withheld_set) = withheld.clone() {
+            let new_tips: Vec<String> = ref_updates
+                .iter()
+                .map(|u| u.new_sha.clone())
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            let old_tips: Vec<String> = ref_updates
+                .iter()
+                .map(|u| u.old_sha.clone())
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            let pin_set = crate::git::push_delta::resolve_candidates_for_push(
                 state.git_encrypt_semaphore.clone(),
                 disk_path.clone(),
-                rules_opt.clone().unwrap_or_default(),
-                record.is_public,
-                record.owner_did.clone(),
-                pin_set.candidates,
+                new_tips,
+                old_tips,
                 state.git_bin.clone(),
                 std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                false,
             )
-            .await
-        } else {
-            crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
-        }
-    } else {
-        Vec::new()
-    };
-
-    // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
-    // Skipped entirely when the public cannot read the repo (withheld == None).
-    //
-    // Coalesce-and-requeue per repo (#174 P2-2 + F5): the spawned task's walks park
-    // on `git_encrypt_semaphore` (which DEFERS when the pool is full rather than
-    // dropping the recovery copy). To bound the OUTSTANDING task set, at most one
-    // task per repo is in flight; a push arriving while one is in flight does NOT
-    // spawn a duplicate — and is NOT dropped either. The in-flight task pins only
-    // its own pre-spawn object-list snapshot, so this push's (old, new) tip pairs
-    // are merged into the in-flight key's pending slot in the same critical section
-    // as the presence check, and the task loop-drains them (fresh rules, fail
-    // closed) before releasing the key. Without the requeue a coalesced push's pins
-    // and recovery copies would be silently absent until an unrelated later push
-    // (the F5 loss). The guard still releases the key on panic (Drop on unwind), so
-    // a crashed walk never permanently locks the repo out.
-    if withheld.is_some() {
-        let tip_pairs: Vec<(String, String)> = ref_updates
-            .iter()
-            .map(|u| (u.old_sha.clone(), u.new_sha.clone()))
-            .collect();
-        match state.encrypt_inflight.try_begin(&record.id, tip_pairs) {
-            crate::state::BeginOutcome::Coalesced => {
-                tracing::debug!(
-                    repo = %record.id,
-                    "post-push encryption task already in flight for this repo; coalesced \
-                     — this push's tip pairs are queued for that task's drain"
-                );
-            }
-            crate::state::BeginOutcome::Admitted(inflight_guard) => {
-                let ctx = EncryptTaskCtx {
-                    ipfs_api: state.config.ipfs_api.clone(),
-                    repo_path: disk_path.clone(),
-                    db: state.db.clone(),
-                    repo_id: record.id.clone(),
-                    owner_did: record.owner_did.clone(),
-                    repo_name: record.name.clone(),
-                    irys_url: state.config.irys_url.clone(),
-                    http_client: std::sync::Arc::clone(&state.http_client),
-                    node_did: state.node_did.to_string(),
-                    node_keypair: std::sync::Arc::clone(&state.node_keypair),
-                    git_bin: state.git_bin.clone(),
-                    git_timeout: std::time::Duration::from_secs(
-                        state.config.git_service_timeout_secs,
-                    ),
-                    encrypt_sem: state.git_encrypt_semaphore.clone(),
-                };
-                tokio::spawn(run_encrypt_pin_task(
-                    ctx,
-                    inflight_guard,
-                    object_list.clone(),
-                    rules_opt.clone(),
+            .await;
+            if pin_set.full_scan {
+                fail_closed_full_scan_objects(
+                    state.git_encrypt_semaphore.clone(),
+                    disk_path.clone(),
+                    rules_opt.clone().unwrap_or_default(),
                     record.is_public,
-                ));
-            }
-        }
-    }
-
-    // Pin new git objects to Pinata, then record branch→CID and gossip.
-    //
-    // #174 P2-2 scope note: this SECOND detached spawn is deliberately NOT brought
-    // under the per-repo encryption coalescing above. Two reasons: (1) it does not
-    // park on `git_encrypt_semaphore` (or any semaphore) — the Pinata `pin_new_objects`
-    // is a bounded reqwest round-trip, so it does not form the unbounded PARKED-waiter
-    // set that is the P2-2 residual; it runs to completion under the HTTP client's
-    // network timeouts. (2) Unlike the idempotent recovery-copy walk, this task does
-    // PER-PUSH, PER-REF work — branch→CID upserts, gossip publish, GraphQL subscription
-    // broadcast, Arweave anchoring, and peer notify, each keyed to THIS push's
-    // ref_updates. Coalescing it against an in-flight task for the same repo would DROP
-    // a later push's ref-update announcements (a correctness regression), not merely
-    // delay a duplicate. So it is scoped out with rationale, not brought under the bound.
-    {
-        let pinata_jwt = state.config.pinata_jwt.clone();
-        let pinata_upload_url = state.config.pinata_upload_url.clone();
-        let repo_path_clone = disk_path.clone();
-        let db_clone = state.db.clone();
-        let http_client = Arc::clone(&state.http_client);
-        let node_did_str = state.node_did.to_string();
-        let repo_slug = format!(
-            "{}/{}",
-            crate::db::normalize_owner_key(&record.owner_did),
-            record.name
-        );
-        let ref_updates_clone = ref_updates
-            .iter()
-            .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
-            .collect::<Vec<_>>();
-        let p2p_handle = state.p2p.clone();
-        let pusher_did_clone = did.to_string();
-        let db_for_peers = state.db.clone();
-        let ref_update_tx = state.ref_update_tx.clone();
-        let irys_url = state.config.irys_url.clone();
-        let owner_did_for_arweave = record.owner_did.clone();
-        let self_public_url = state.config.public_url.clone();
-        let node_keypair = Arc::clone(&state.node_keypair);
-        let object_list_pinata = object_list;
-        let do_pinata_replication = withheld.is_some();
-        tokio::spawn(async move {
-            let pinned = if do_pinata_replication {
-                crate::pinata::pin_new_objects(
-                    &http_client,
-                    &pinata_upload_url,
-                    &pinata_jwt,
-                    &repo_path_clone,
-                    object_list_pinata,
-                    &db_clone,
+                    record.owner_did.clone(),
+                    pin_set.candidates,
+                    state.git_bin.clone(),
+                    std::time::Duration::from_secs(state.config.git_service_timeout_secs),
                 )
                 .await
             } else {
-                Vec::new()
-            };
-
-            if !pinned.is_empty() {
-                tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
+                crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
             }
+        } else {
+            Vec::new()
+        };
 
-            // Build sha→cid map from pinned objects
-            let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
+        // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
+        // Skipped entirely when the public cannot read the repo (withheld == None).
+        //
+        // Coalesce-and-requeue per repo (#174 P2-2 + F5): the spawned task's walks park
+        // on `git_encrypt_semaphore` (which DEFERS when the pool is full rather than
+        // dropping the recovery copy). To bound the OUTSTANDING task set, at most one
+        // task per repo is in flight; a push arriving while one is in flight does NOT
+        // spawn a duplicate — and is NOT dropped either. The in-flight task pins only
+        // its own pre-spawn object-list snapshot, so this push's (old, new) tip pairs
+        // are merged into the in-flight key's pending slot in the same critical section
+        // as the presence check, and the task loop-drains them (fresh rules, fail
+        // closed) before releasing the key. Without the requeue a coalesced push's pins
+        // and recovery copies would be silently absent until an unrelated later push
+        // (the F5 loss). The guard still releases the key on panic (Drop on unwind), so
+        // a crashed walk never permanently locks the repo out.
+        if withheld.is_some() {
+            let tip_pairs: Vec<(String, String)> = ref_updates
+                .iter()
+                .map(|u| (u.old_sha.clone(), u.new_sha.clone()))
+                .collect();
+            match state.encrypt_inflight.try_begin(&record.id, tip_pairs) {
+                crate::state::BeginOutcome::Coalesced => {
+                    tracing::debug!(
+                        repo = %record.id,
+                        "post-push encryption task already in flight for this repo; coalesced \
+                         — this push's tip pairs are queued for that task's drain"
+                    );
+                }
+                crate::state::BeginOutcome::Admitted(inflight_guard) => {
+                    let ctx = EncryptTaskCtx {
+                        ipfs_api: state.config.ipfs_api.clone(),
+                        repo_path: disk_path.clone(),
+                        db: state.db.clone(),
+                        repo_id: record.id.clone(),
+                        owner_did: record.owner_did.clone(),
+                        repo_name: record.name.clone(),
+                        irys_url: state.config.irys_url.clone(),
+                        http_client: std::sync::Arc::clone(&state.http_client),
+                        node_did: state.node_did.to_string(),
+                        node_keypair: std::sync::Arc::clone(&state.node_keypair),
+                        git_bin: state.git_bin.clone(),
+                        git_timeout: std::time::Duration::from_secs(
+                            state.config.git_service_timeout_secs,
+                        ),
+                        encrypt_sem: state.git_encrypt_semaphore.clone(),
+                    };
+                    tokio::spawn(run_encrypt_pin_task(
+                        ctx,
+                        inflight_guard,
+                        object_list.clone(),
+                        rules_opt.clone(),
+                        record.is_public,
+                    ));
+                }
+            }
+        }
 
-            // Record branch→CID for each ref update and publish gossip
-            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                let cid = cid_map.get(new_sha).map(|s| s.as_str());
+        // Pin new git objects to Pinata, then record branch→CID and gossip.
+        //
+        // #174 P2-2 scope note: this SECOND detached spawn is deliberately NOT brought
+        // under the per-repo encryption coalescing above. Two reasons: (1) it does not
+        // park on `git_encrypt_semaphore` (or any semaphore) — the Pinata `pin_new_objects`
+        // is a bounded reqwest round-trip, so it does not form the unbounded PARKED-waiter
+        // set that is the P2-2 residual; it runs to completion under the HTTP client's
+        // network timeouts. (2) Unlike the idempotent recovery-copy walk, this task does
+        // PER-PUSH, PER-REF work — branch→CID upserts, gossip publish, GraphQL subscription
+        // broadcast, Arweave anchoring, and peer notify, each keyed to THIS push's
+        // ref_updates. Coalescing it against an in-flight task for the same repo would DROP
+        // a later push's ref-update announcements (a correctness regression), not merely
+        // delay a duplicate. So it is scoped out with rationale, not brought under the bound.
+        {
+            let pinata_jwt = state.config.pinata_jwt.clone();
+            let pinata_upload_url = state.config.pinata_upload_url.clone();
+            let repo_path_clone = disk_path.clone();
+            let db_clone = state.db.clone();
+            let http_client = Arc::clone(&state.http_client);
+            let node_did_str = state.node_did.to_string();
+            let repo_slug = format!(
+                "{}/{}",
+                crate::db::normalize_owner_key(&record.owner_did),
+                record.name
+            );
+            let ref_updates_clone = ref_updates
+                .iter()
+                .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
+                .collect::<Vec<_>>();
+            let p2p_handle = state.p2p.clone();
+            let pusher_did_clone = did.to_string();
+            let db_for_peers = state.db.clone();
+            let ref_update_tx = state.ref_update_tx.clone();
+            let irys_url = state.config.irys_url.clone();
+            let owner_did_for_arweave = record.owner_did.clone();
+            let self_public_url = state.config.public_url.clone();
+            let node_keypair = Arc::clone(&state.node_keypair);
+            let object_list_pinata = object_list;
+            let do_pinata_replication = withheld.is_some();
+            tokio::spawn(async move {
+                let pinned = if do_pinata_replication {
+                    crate::pinata::pin_new_objects(
+                        &http_client,
+                        &pinata_upload_url,
+                        &pinata_jwt,
+                        &repo_path_clone,
+                        object_list_pinata,
+                        &db_clone,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                };
 
-                if let Some(cid_str) = cid {
-                    let _ = db_clone
-                        .upsert_branch_cid(&repo_slug, ref_name, new_sha, cid_str, &node_did_str)
-                        .await;
+                if !pinned.is_empty() {
+                    tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
                 }
 
+                // Build sha→cid map from pinned objects
+                let cid_map: std::collections::HashMap<String, String> =
+                    pinned.into_iter().collect();
+
+                // Record branch→CID for each ref update and publish gossip
+                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                    let cid = cid_map.get(new_sha).map(|s| s.as_str());
+
+                    if let Some(cid_str) = cid {
+                        let _ = db_clone
+                            .upsert_branch_cid(
+                                &repo_slug,
+                                ref_name,
+                                new_sha,
+                                cid_str,
+                                &node_did_str,
+                            )
+                            .await;
+                    }
+
+                    if announce {
+                        if let Some(p2p) = &p2p_handle {
+                            p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
+                                node_did: node_did_str.clone(),
+                                pusher_did: pusher_did_clone.clone(),
+                                repo: repo_slug.clone(),
+                                ref_name: ref_name.clone(),
+                                old_sha: old_sha.clone(),
+                                new_sha: new_sha.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                cert_id: None,
+                                cid: cid.map(|s| s.to_string()),
+                            })
+                            .await;
+                        }
+                    }
+                }
+
+                // Broadcast ref update to GraphQL subscription listeners — one per ref.
+                // Gated on `announce`: /graphql/ws is unauthenticated (mounted after
+                // the optional_signature layer), and the subscription resolver has no
+                // caller to gate against, so only publicly-readable ref updates may
+                // reach anonymous subscribers. Mirrors the gossip (above) and Arweave
+                // (below) sends, which are already `announce`-gated. Without this a
+                // private-repo push would leak live ref metadata over the socket —
+                // the subscription analog of #112/#114.
+                let now_ts = chrono::Utc::now().to_rfc3339();
                 if announce {
-                    if let Some(p2p) = &p2p_handle {
-                        p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
-                            node_did: node_did_str.clone(),
-                            pusher_did: pusher_did_clone.clone(),
+                    for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                        let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
                             repo: repo_slug.clone(),
                             ref_name: ref_name.clone(),
                             old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            cert_id: None,
-                            cid: cid.map(|s| s.to_string()),
-                        })
-                        .await;
+                            pusher_did: pusher_did_clone.clone(),
+                            node_did: node_did_str.clone(),
+                            timestamp: now_ts.clone(),
+                        });
                     }
                 }
-            }
 
-            // Broadcast ref update to GraphQL subscription listeners — one per ref.
-            // Gated on `announce`: /graphql/ws is unauthenticated (mounted after
-            // the optional_signature layer), and the subscription resolver has no
-            // caller to gate against, so only publicly-readable ref updates may
-            // reach anonymous subscribers. Mirrors the gossip (above) and Arweave
-            // (below) sends, which are already `announce`-gated. Without this a
-            // private-repo push would leak live ref metadata over the socket —
-            // the subscription analog of #112/#114.
-            let now_ts = chrono::Utc::now().to_rfc3339();
-            if announce {
-                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                    let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
-                        repo: repo_slug.clone(),
-                        ref_name: ref_name.clone(),
-                        old_sha: old_sha.clone(),
-                        new_sha: new_sha.clone(),
-                        pusher_did: pusher_did_clone.clone(),
-                        node_did: node_did_str.clone(),
-                        timestamp: now_ts.clone(),
-                    });
-                }
-            }
-
-            // Arweave permanent anchoring — fire for each ref update.
-            // Suppressed for repos the public cannot read (public permanent ledger).
-            if announce && !irys_url.is_empty() {
-                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                    let cid = cid_map.get(new_sha).cloned();
-                    let anchor = crate::arweave::RefAnchor {
-                        repo: repo_slug.clone(),
-                        owner_did: owner_did_for_arweave.clone(),
-                        ref_name: ref_name.clone(),
-                        old_sha: old_sha.clone(),
-                        new_sha: new_sha.clone(),
-                        cid: cid.clone(),
-                        timestamp: now_ts.clone(),
-                        node_did: node_did_str.clone(),
-                    };
-                    match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor).await
-                    {
-                        Ok(tx_id) if !tx_id.is_empty() => {
-                            let arweave_url = crate::arweave::arweave_url(&tx_id);
-                            let _ = db_clone
-                                .record_arweave_anchor(&crate::db::RecordAnchorInput {
-                                    repo: &repo_slug,
-                                    owner_did: &owner_did_for_arweave,
-                                    ref_name,
-                                    old_sha,
-                                    new_sha,
-                                    cid: cid.as_deref(),
-                                    irys_tx_id: &tx_id,
-                                    arweave_url: &arweave_url,
-                                    node_did: &node_did_str,
-                                })
-                                .await;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed"),
-                    }
-                }
-            }
-
-            // HTTP peer notification — notify all known peers to pull from us.
-            // This is the reliable fallback when Gossipsub p2p is not yet connected.
-            // Suppressed for repos the public cannot read. Runs last so a slow or
-            // unreachable peer cannot delay the local GraphQL broadcast or Arweave
-            // anchoring above; this is the lowest-priority best-effort step.
-            if announce {
-                if let Ok(peers) = db_for_peers.list_peers().await {
-                    for peer in peers {
-                        if peer.http_url.is_empty() {
-                            continue;
-                        }
-                        let peer_url = peer.http_url.trim_end_matches('/');
-                        if let Some(self_url) = self_public_url.as_deref() {
-                            if peer_url == self_url.trim_end_matches('/') {
-                                continue;
+                // Arweave permanent anchoring — fire for each ref update.
+                // Suppressed for repos the public cannot read (public permanent ledger).
+                if announce && !irys_url.is_empty() {
+                    for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                        let cid = cid_map.get(new_sha).cloned();
+                        let anchor = crate::arweave::RefAnchor {
+                            repo: repo_slug.clone(),
+                            owner_did: owner_did_for_arweave.clone(),
+                            ref_name: ref_name.clone(),
+                            old_sha: old_sha.clone(),
+                            new_sha: new_sha.clone(),
+                            cid: cid.clone(),
+                            timestamp: now_ts.clone(),
+                            node_did: node_did_str.clone(),
+                        };
+                        match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor)
+                            .await
+                        {
+                            Ok(tx_id) if !tx_id.is_empty() => {
+                                let arweave_url = crate::arweave::arweave_url(&tx_id);
+                                let _ = db_clone
+                                    .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                                        repo: &repo_slug,
+                                        owner_did: &owner_did_for_arweave,
+                                        ref_name,
+                                        old_sha,
+                                        new_sha,
+                                        cid: cid.as_deref(),
+                                        irys_tx_id: &tx_id,
+                                        arweave_url: &arweave_url,
+                                        node_did: &node_did_str,
+                                    })
+                                    .await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed")
                             }
                         }
-                        let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
-                        notify_peer_of_refs(
-                            &http_client,
-                            node_keypair.as_ref(),
-                            &peer.did,
-                            &notify_url,
-                            &repo_slug,
-                            &ref_updates_clone,
-                            &node_did_str,
-                            &pusher_did_clone,
-                        )
-                        .await;
                     }
                 }
-            }
-        });
-    }
+
+                // HTTP peer notification — notify all known peers to pull from us.
+                // This is the reliable fallback when Gossipsub p2p is not yet connected.
+                // Suppressed for repos the public cannot read. Runs last so a slow or
+                // unreachable peer cannot delay the local GraphQL broadcast or Arweave
+                // anchoring above; this is the lowest-priority best-effort step.
+                if announce {
+                    if let Ok(peers) = db_for_peers.list_peers().await {
+                        for peer in peers {
+                            if peer.http_url.is_empty() {
+                                continue;
+                            }
+                            let peer_url = peer.http_url.trim_end_matches('/');
+                            if let Some(self_url) = self_public_url.as_deref() {
+                                if peer_url == self_url.trim_end_matches('/') {
+                                    continue;
+                                }
+                            }
+                            let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
+                            notify_peer_of_refs(
+                                &http_client,
+                                node_keypair.as_ref(),
+                                &peer.did,
+                                &notify_url,
+                                &repo_slug,
+                                &ref_updates_clone,
+                                &node_did_str,
+                                &pusher_did_clone,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            });
+        }
+    });
 
     Ok(result)
 }
@@ -5179,9 +5201,23 @@ mod tests {
         assert_eq!(a.status(), 200, "push A lands 200 despite scan contention");
         assert_eq!(b.status(), 200, "push B lands 200 despite scan contention");
 
-        // Let the detached recipients walks drain through the same pool before
-        // reading the detector files.
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // Wait for both pushes' detached scan tails to drain through the pool of 1
+        // before reading the detector files. The WHOLE tail (withheld walk included) now
+        // runs detached (#174 F2), so poll until every expected scan has run rather than a
+        // fixed sleep, which is load-sensitive under a parallel test run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let ran = std::fs::read_to_string(&ranfile)
+                .unwrap_or_default()
+                .lines()
+                .count();
+            if ran >= 6 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Small settle so the last scan's rmdir has landed before the overlap check.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             !overlap.exists(),
             "with a scan pool of 1, no two scans' git may ever be alive at once \
@@ -5252,9 +5288,20 @@ mod tests {
     /// F4 scenario 4 — landed-push-never-fails: a push whose post-receive walk must
     /// park (pool held elsewhere) DEFERS and then returns the receive-pack success
     /// once admission frees; contention never converts the landed push into a 5xx.
+    /// #174 F2 (RED-before/GREEN-after): the post-receive replication tail parks on
+    /// `git_encrypt_semaphore` (withheld/candidate/full-scan resolution). Leaving it in the
+    /// request future means a client/proxy disconnect while parked silently loses this
+    /// push's pins, recovery copy, and announcements (state.rs documented this residual).
+    /// The fix moves the whole tail into an independently owned task, so the handler
+    /// returns its receive-pack 200 WITHOUT waiting on the scan pool and a disconnect can
+    /// no longer drop the work.
+    ///
+    /// Load-bearing: with the tail inline (pre-fix) the handler parks while the pool is
+    /// held and does NOT return within the bound (RED — the timeout fires). With the
+    /// detached tail it returns 200 promptly (GREEN).
     #[cfg(unix)]
     #[sqlx::test]
-    async fn receive_pack_landed_push_defers_on_scan_contention_never_errors(pool: sqlx::PgPool) {
+    async fn receive_pack_landed_push_returns_without_parking_on_scan_pool(pool: sqlx::PgPool) {
         use axum::extract::{Path, State};
         use axum::Extension;
         use std::net::SocketAddr;
@@ -5268,40 +5315,38 @@ mod tests {
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f4park", "p1", true).await;
         let sem = Arc::new(Semaphore::new(1));
         state.git_encrypt_semaphore = sem.clone();
-        // The test holds the pool's only permit: the push's withheld walk must park.
+        // Hold the pool's only permit: the post-receive scan would park if it ran in the
+        // request future.
         let held = sem.clone().acquire_owned().await.unwrap();
 
         let peer: SocketAddr = "203.0.113.74:5000".parse().unwrap();
-        let mut handle = tokio::spawn(git_receive_pack(
-            State(state),
-            Path(("z6f4park".to_string(), "p1".to_string())),
-            Extension(crate::auth::AuthenticatedDid(
-                "did:key:z6MkF4ParkPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-            )),
-            crate::rate_limit::PeerAddr(Some(peer)),
-            axum::http::HeaderMap::new(),
-            ref_update_body("2222222222222222222222222222222222222222"),
-        ));
-
-        // Parked, not errored: the handler must NOT complete while the pool is held.
-        let parked = tokio::time::timeout(std::time::Duration::from_millis(700), &mut handle).await;
-        assert!(
-            parked.is_err(),
-            "the post-receive walk must defer while the scan pool is held; got {parked:?}"
-        );
-
-        // Release admission: the SAME push now finishes with the receive-pack 200.
-        drop(held);
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
-            .await
-            .expect("the deferred push must complete once admission frees")
-            .expect("the push task must not panic")
-            .expect("contention must never convert a landed push into an error");
+        // The handler must return its receive-pack 200 WITHOUT waiting on the held scan
+        // pool — the tail is owned by a detached task. Pre-fix this times out.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            git_receive_pack(
+                State(state),
+                Path(("z6f4park".to_string(), "p1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(
+                    "did:key:z6MkF4ParkPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                )),
+                crate::rate_limit::PeerAddr(Some(peer)),
+                axum::http::HeaderMap::new(),
+                ref_update_body("2222222222222222222222222222222222222222"),
+            ),
+        )
+        .await
+        .expect("the handler must return without parking on the held scan pool")
+        .expect("contention must never convert a landed push into an error");
         assert_eq!(
             resp.status(),
             200,
-            "the response is the receive-pack success, not a contention 5xx"
+            "the response is the receive-pack success, returned before the detached tail runs"
         );
+
+        // The detached tail is still owned: release admission and let it drain cleanly.
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     // ---- #174 U4 (P2-2): post-push encryption task set bounded by per-repo coalescing ----

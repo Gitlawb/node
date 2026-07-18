@@ -449,13 +449,13 @@ impl Drop for EncryptInflightGuard {
 /// recovery copy or silently under-pin it. The returned permit must move into
 /// the blocking closure so a started scan always completes holding it (a
 /// disconnect cannot cancel `spawn_blocking` or leak the permit mid-walk).
-/// Accepted residuals, stated once for every caller: (1) the park wait is
-/// queue-depth multiplied — post-receive tails are no longer admission-bounded
-/// once the write permit is released, so N landed pushes can queue N scans and
-/// the last waits N scan-durations; (2) a client-timeout disconnect while
-/// parked HERE drops the handler future and silently loses this push's
-/// replication work — the `encrypt_inflight` coalescing requeue does NOT cover
-/// it, because this park precedes the `try_begin` spawn gate.
+/// Accepted residual, stated once for every caller: the park wait is queue-depth
+/// multiplied — post-receive tails are no longer admission-bounded once the write
+/// permit is released, so N landed pushes can queue N scans and the last waits N
+/// scan-durations. A client-timeout disconnect no longer loses the work (#174 F2):
+/// the whole post-receive replication tail runs in an independently owned task, so
+/// dropping the request future cannot drop this parked scan — the park no longer
+/// precedes any durable-record gate in a cancellable future.
 pub async fn acquire_scan_permit(
     scan_sem: Arc<tokio::sync::Semaphore>,
     repo: &std::path::Path,
