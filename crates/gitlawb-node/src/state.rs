@@ -132,8 +132,9 @@ pub struct AppState {
     /// detached tasks *spawn and park* on that semaphore's `acquire_owned().await`.
     /// Before spawning a per-push encryption task, the receive-pack handler consults
     /// this set: if the repo already has a task in flight it coalesces (skips the
-    /// duplicate spawn) rather than parking a new unbounded waiter. Coalescing only
-    /// delays a duplicate walk — it never drops the withheld-blob recovery copy, which
+    /// duplicate spawn) rather than parking a new unbounded waiter, and its tip pairs
+    /// are recorded for that task's drain loop (#174 F5). Coalescing only delays the
+    /// coalesced push's walk — it never drops the withheld-blob recovery copy, which
     /// `2a54c15` deliberately kept fail-closed (there is no reconciliation sweep to
     /// re-derive a dropped copy). See [`EncryptInflight`].
     pub encrypt_inflight: EncryptInflight,
@@ -230,23 +231,80 @@ impl AppState {
 /// unbounded outstanding set.
 ///
 /// This tracks the repo keys with an in-flight encryption task. Before spawning, the
-/// handler calls [`try_begin`](Self::try_begin): if a task for the repo is already
-/// in-flight it returns `None` and the handler SKIPS spawning a duplicate (coalesce —
-/// the newer push's objects are covered by the pending/next walk over the same repo's
-/// history). This bounds the outstanding set to <=1 pending task per repo WITHOUT
-/// dropping work: coalescing only delays a duplicate walk, it never sheds the recovery
-/// copy (there is no reconciliation sweep, so a *dropped* job would be lost forever).
+/// handler calls [`try_begin`](Self::try_begin) with the push's (old, new) tip pairs:
+/// if no task is in-flight the push is [`Admitted`](BeginOutcome::Admitted) and spawns
+/// one; if a task IS in-flight the push [`Coalesces`](BeginOutcome::Coalesced) — no
+/// duplicate spawn — and its tip pairs are merged into the in-flight key's pending
+/// slot in the SAME critical section as the presence check. The in-flight task pins
+/// only its own pre-spawn object-list snapshot, so the merge is what keeps coalescing
+/// lossless (#174 F5): the task loop-drains the pending slot via
+/// [`EncryptInflightGuard::finish_or_take_pending`] before releasing the key, so a
+/// coalesced push's pins and recovery copies are delayed, never dropped (there is no
+/// reconciliation sweep, so a *dropped* job would be lost forever). Check-then-record
+/// as two lock acquisitions would race the task's final pending check — hence one
+/// critical section for both.
 ///
-/// The returned [`EncryptInflightGuard`] is moved into the detached task and removes
-/// the repo key on drop — on normal completion, error, OR panic (Drop runs on unwind)
-/// — so one crashed walk can never permanently lock a repo out of future recovery
-/// copies.
+/// The returned [`EncryptInflightGuard`] is moved into the detached task. On normal
+/// exit the key is removed (and the guard disarmed) inside `finish_or_take_pending`'s
+/// empty-pending critical section; the guard's Drop is the PANIC backstop (Drop runs
+/// on unwind), so one crashed walk can never permanently lock a repo out of future
+/// recovery copies.
 #[derive(Clone, Default)]
 pub struct EncryptInflight {
-    // std::sync::Mutex: only ever held for O(1) HashSet insert/remove in a sync
-    // context (right before `tokio::spawn`, and in the guard's Drop) — never across
-    // an await, so a std Mutex is correct and cheaper than a tokio one.
-    repos: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    // std::sync::Mutex: only ever held for O(1)-ish map ops (insert/remove/merge —
+    // the merge is an O(pairs) Vec extend bounded by MAX_PENDING_TIP_PAIRS) in a
+    // sync context, never across an await, so a std Mutex is correct and cheaper
+    // than a tokio one. Key present == task in flight; the value is the work
+    // recorded by pushes that coalesced against it.
+    repos: Arc<std::sync::Mutex<std::collections::HashMap<String, PendingWork>>>,
+}
+
+/// Cap on the accumulated coalesced tip pairs per repo. Past it the pending slot
+/// degrades to [`PendingWork::FullScan`], so a hostile pusher cannot grow the slot
+/// without bound while a walk is in flight; the drain then costs one full-repo
+/// enumeration instead (the same already-tested fallback the push path uses).
+const MAX_PENDING_TIP_PAIRS: usize = 1024;
+
+/// Work recorded by pushes that coalesced against an in-flight encryption task,
+/// drained by that task one batch per loop iteration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingWork {
+    /// The coalesced pushes' raw (old_sha, new_sha) ref-update pairs, zeros
+    /// included — the drain strips the create/delete sentinels exactly like the
+    /// handler tail does. An EMPTY vec is "nothing pending", never a work item.
+    Tips(Vec<(String, String)>),
+    /// The pair bound overflowed: drain with a FORCED full-repo scan. This must be
+    /// signalled explicitly (the `force_full_scan` flag on
+    /// `resolve_candidates_for_push`), never encoded as an empty tip list — empty
+    /// tips resolve to an empty delta and would pin nothing (the F5 loss again).
+    FullScan,
+}
+
+/// Outcome of [`EncryptInflight::try_begin`].
+pub enum BeginOutcome {
+    /// No task was in flight: the caller spawns one, moving the guard into it. The
+    /// push's own tip pairs are NOT recorded — the caller's pre-spawn snapshot
+    /// covers them; the pending slot starts empty.
+    Admitted(EncryptInflightGuard),
+    /// A task is in flight; this push's tip pairs were merged into its pending
+    /// slot (same critical section as the presence check). The in-flight task's
+    /// drain loop will process them.
+    Coalesced,
+}
+
+/// Outcome of [`EncryptInflightGuard::finish_or_take_pending`].
+pub enum FinishOutcome {
+    /// Coalesced work was pending: it is handed back with the still-armed guard
+    /// (the repo key is retained) and the task must run another drain iteration.
+    Pending(EncryptInflightGuard, PendingWork),
+    /// Nothing was pending: the repo key was removed AND the guard disarmed in one
+    /// critical section, so dropping the returned guard is inert. The task exits.
+    /// Remove-then-drop as two steps would double-remove: a successor task admitted
+    /// between them would have ITS key deleted by the late Drop. The disarmed guard
+    /// is handed back rather than dropped internally so that remove→drop window is
+    /// real and the disarm is testable; production just lets it fall out of scope
+    /// (hence the allow).
+    Finished(#[allow(dead_code)] EncryptInflightGuard),
 }
 
 impl EncryptInflight {
@@ -254,19 +312,25 @@ impl EncryptInflight {
         Self::default()
     }
 
-    /// Try to begin an encryption task for `repo_id`. Returns `Some(guard)` if no task
-    /// for the repo was in-flight (the caller should spawn), or `None` if one already
-    /// is (the caller should COALESCE — skip spawning a duplicate). The guard releases
-    /// the repo key on drop.
-    pub fn try_begin(&self, repo_id: &str) -> Option<EncryptInflightGuard> {
-        let mut set = self.repos.lock().expect("encrypt_inflight mutex poisoned");
-        if set.insert(repo_id.to_string()) {
-            Some(EncryptInflightGuard {
-                repos: Arc::clone(&self.repos),
-                repo_id: repo_id.to_string(),
-            })
-        } else {
-            None
+    /// Begin-or-coalesce an encryption task for `repo_id`, in one critical section.
+    /// `tip_pairs` is this push's raw (old_sha, new_sha) ref-update list; it is
+    /// merged into the pending slot only on the [`Coalesced`](BeginOutcome::Coalesced)
+    /// arm (an admitted caller's own snapshot already covers its pairs).
+    pub fn try_begin(&self, repo_id: &str, tip_pairs: Vec<(String, String)>) -> BeginOutcome {
+        let mut map = self.repos.lock().expect("encrypt_inflight mutex poisoned");
+        match map.entry(repo_id.to_string()) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(PendingWork::Tips(Vec::new()));
+                BeginOutcome::Admitted(EncryptInflightGuard {
+                    repos: Arc::clone(&self.repos),
+                    repo_id: repo_id.to_string(),
+                    armed: true,
+                })
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                merge_pending(slot.get_mut(), tip_pairs);
+                BeginOutcome::Coalesced
+            }
         }
     }
 
@@ -287,21 +351,95 @@ impl EncryptInflight {
     }
 }
 
-/// RAII guard removing a repo key from [`EncryptInflight`] when the detached
-/// encryption task finishes (drop on completion, error, or panic-unwind). Move-only —
-/// there is no reason to clone a guard, and cloning would double-remove.
+/// Merge a coalesced push's tip pairs into a repo's pending slot. FullScan absorbs
+/// everything; a Tips slot that would exceed [`MAX_PENDING_TIP_PAIRS`] degrades to
+/// FullScan rather than growing without bound.
+fn merge_pending(slot: &mut PendingWork, pairs: Vec<(String, String)>) {
+    match slot {
+        PendingWork::FullScan => {}
+        PendingWork::Tips(acc) => {
+            if acc.len().saturating_add(pairs.len()) > MAX_PENDING_TIP_PAIRS {
+                *slot = PendingWork::FullScan;
+            } else {
+                acc.extend(pairs);
+            }
+        }
+    }
+}
+
+/// Guard owned by the detached encryption task for its repo key. Move-only — there
+/// is no reason to clone a guard, and cloning would double-remove. Normal exit goes
+/// through [`finish_or_take_pending`](Self::finish_or_take_pending); Drop is the
+/// panic-path backstop only.
 pub struct EncryptInflightGuard {
-    repos: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    repos: Arc<std::sync::Mutex<std::collections::HashMap<String, PendingWork>>>,
     repo_id: String,
+    /// True until the normal-exit path removes the key. A disarmed guard's Drop is
+    /// a no-op: the key slot may already belong to a successor task admitted after
+    /// our removal, and removing THAT key would break at-most-one-task-per-repo.
+    armed: bool,
+}
+
+impl EncryptInflightGuard {
+    /// The task's end-of-iteration step, one critical section: if coalesced work is
+    /// pending, take it and hand the still-armed guard back (key retained — iterate);
+    /// if nothing is pending, remove the key and disarm the guard (task exits; the
+    /// returned guard's Drop is inert). The atomicity is load-bearing both ways: a
+    /// push landing before this call is merged and therefore drained here; a push
+    /// landing after it finds the key gone and is admitted as a fresh task. No
+    /// interleaving can lose the work or admit two tasks for one repo.
+    pub fn finish_or_take_pending(mut self) -> FinishOutcome {
+        let mut map = self.repos.lock().expect("encrypt_inflight mutex poisoned");
+        match map.get_mut(&self.repo_id) {
+            Some(PendingWork::Tips(acc)) if acc.is_empty() => {
+                map.remove(&self.repo_id);
+                self.armed = false;
+                drop(map);
+                FinishOutcome::Finished(self)
+            }
+            Some(slot) => {
+                let work = std::mem::replace(slot, PendingWork::Tips(Vec::new()));
+                drop(map);
+                FinishOutcome::Pending(self, work)
+            }
+            None => {
+                // Unreachable while armed (only this method removes a live key),
+                // but never panic in the release path: treat as finished.
+                self.armed = false;
+                drop(map);
+                FinishOutcome::Finished(self)
+            }
+        }
+    }
 }
 
 impl Drop for EncryptInflightGuard {
     fn drop(&mut self) {
-        // A poisoned lock (a prior panic while holding it) still lets us take the inner
-        // set via into_inner-on-guard; but poisoning here is not expected because the
-        // only critical sections are the O(1) ops above. Remove best-effort.
-        if let Ok(mut set) = self.repos.lock() {
-            set.remove(&self.repo_id);
+        // Normal exit disarmed us inside finish_or_take_pending's critical section;
+        // an armed drop means the task ended abnormally (panic-unwind, or a future
+        // code path that returns without finishing). Release the key so the repo is
+        // not permanently locked out, and log any pending work this loses — there
+        // is no sweep, so it stays lost until a later push re-walks the repo.
+        if !self.armed {
+            return;
+        }
+        // A poisoned lock is not expected (the critical sections above are small
+        // and panic-free); remove best-effort.
+        if let Ok(mut map) = self.repos.lock() {
+            match map.remove(&self.repo_id) {
+                Some(PendingWork::Tips(acc)) if !acc.is_empty() => tracing::warn!(
+                    repo = %self.repo_id,
+                    lost_tip_pairs = acc.len(),
+                    "encryption task ended abnormally with coalesced pushes pending; \
+                     their pins/recovery copies are lost until a later push"
+                ),
+                Some(PendingWork::FullScan) => tracing::warn!(
+                    repo = %self.repo_id,
+                    "encryption task ended abnormally with a pending full-scan drain; \
+                     it is lost until a later push"
+                ),
+                _ => {}
+            }
         }
     }
 }

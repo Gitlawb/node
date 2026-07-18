@@ -88,6 +88,23 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
          encrypt_inflight.try_begin to coalesce per repo (bound the outstanding-task set)"
     );
 
+    // F5: coalescing must REQUEUE, not shed. The in-flight task pins only its own
+    // pre-spawn snapshot, so a coalesced push's tip pairs are recorded on its key and
+    // the task must loop-drain them (`finish_or_take_pending`) before releasing it.
+    // Removing the drain reverts to the silent loss: a coalesced push's pins and
+    // recovery copies are absent until an unrelated later push. Scan only the
+    // production half of the file — the u5 tests in its `mod tests` also name the
+    // drain call, and matching them would make this check vacuous.
+    let repos_production = repos
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields a first chunk");
+    assert!(
+        repos_production.contains("finish_or_take_pending"),
+        "F5 gate missing: the post-push encryption task must loop-drain coalesced \
+         pushes via finish_or_take_pending before releasing its repo key"
+    );
+
     // F4: every post-receive scan helper acquires a `git_encrypt_semaphore` permit
     // BEFORE its spawn_blocking git walk, so a push burst cannot accumulate unbounded
     // concurrent scans once the write permit is released. Structural check: within each

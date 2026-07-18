@@ -843,6 +843,244 @@ async fn withheld_recipients_gated(
     .await
 }
 
+/// Everything the detached post-push pin/encrypt task needs, cloned once at spawn
+/// and shared by the snapshot iteration and every coalesced-drain iteration
+/// (#174 F5).
+struct EncryptTaskCtx {
+    ipfs_api: String,
+    repo_path: std::path::PathBuf,
+    db: Arc<crate::db::Db>,
+    repo_id: String,
+    owner_did: String,
+    repo_name: String,
+    irys_url: String,
+    http_client: Arc<reqwest::Client>,
+    node_did: String,
+    node_keypair: Arc<gitlawb_core::identity::Keypair>,
+    git_bin: String,
+    git_timeout: std::time::Duration,
+    encrypt_sem: Arc<tokio::sync::Semaphore>,
+}
+
+/// The detached post-push pin/encrypt task (#174 P2-2 + F5): run this push's own
+/// pre-resolved snapshot through the pipeline, then loop-drain every push that
+/// coalesced against the in-flight key until a finish attempt finds nothing
+/// pending (which releases the key in the same critical section).
+///
+/// The loop holds NO encrypt-pool permit at the task level: each helper it calls
+/// (`replication_withheld_set`, `resolve_candidates_for_push`,
+/// `fail_closed_full_scan_objects`, `withheld_recipients_gated`) acquires and
+/// releases its own walk permit, so the drain makes progress at pool size 1 — a
+/// task-level permit would nest over those same-semaphore acquires and deadlock.
+async fn run_encrypt_pin_task(
+    ctx: EncryptTaskCtx,
+    guard: crate::state::EncryptInflightGuard,
+    snapshot_objects: Vec<String>,
+    snapshot_rules: Option<Vec<crate::db::VisibilityRule>>,
+    snapshot_is_public: bool,
+) {
+    pin_and_encrypt_objects(&ctx, snapshot_objects, snapshot_rules, snapshot_is_public).await;
+    let mut guard = guard;
+    loop {
+        match guard.finish_or_take_pending() {
+            crate::state::FinishOutcome::Finished(_) => break,
+            crate::state::FinishOutcome::Pending(g, pending) => {
+                guard = g;
+                if let Some((object_list, rules, is_public)) =
+                    resolve_drain_object_list(&ctx, pending).await
+                {
+                    pin_and_encrypt_objects(&ctx, object_list, rules, is_public).await;
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a coalesced-drain iteration's replicable object list. Re-fetches the
+/// repo record and visibility rules FRESH — rules tightened between the coalesced
+/// push and its drain must be honored, fail closed: a newly-withheld blob is not
+/// pinned, and a repo that is no longer announceable (or whose record cannot be
+/// re-read) pins nothing at all (`None`). Returns the filtered object list plus
+/// the fresh rules/is_public snapshot for the encrypt stage — the same
+/// resolution → withheld-filter pipeline the receive-pack tail runs.
+async fn resolve_drain_object_list(
+    ctx: &EncryptTaskCtx,
+    pending: crate::state::PendingWork,
+) -> Option<(Vec<String>, Option<Vec<crate::db::VisibilityRule>>, bool)> {
+    let record = match ctx.db.get_repo(&ctx.owner_did, &ctx.repo_name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(
+                repo = %ctx.repo_id,
+                "coalesced drain: repo record is gone; dropping the pending work"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                repo = %ctx.repo_id,
+                err = %e,
+                "coalesced drain: repo re-fetch failed; pinning nothing (fail closed)"
+            );
+            return None;
+        }
+    };
+    let rules_opt = ctx.db.list_visibility_rules(&ctx.repo_id).await.ok();
+    let (_announce, withheld) = replication_withheld_set(
+        ctx.encrypt_sem.clone(),
+        rules_opt.clone(),
+        &record.owner_did,
+        record.is_public,
+        ctx.repo_path.clone(),
+        ctx.git_bin.clone(),
+        ctx.git_timeout,
+    )
+    .await;
+    let withheld_set = match withheld {
+        Some(w) => w,
+        None => {
+            tracing::info!(
+                repo = %ctx.repo_id,
+                "coalesced drain: repo is not announceable under current rules; \
+                 pinning nothing (fail closed)"
+            );
+            return None;
+        }
+    };
+    let (new_tips, old_tips, force_full_scan) = match pending {
+        crate::state::PendingWork::Tips(pairs) => {
+            let new_tips: Vec<String> = pairs
+                .iter()
+                .map(|(_, n)| n.clone())
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            let old_tips: Vec<String> = pairs
+                .into_iter()
+                .map(|(o, _)| o)
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            (new_tips, old_tips, false)
+        }
+        // The overflow marker forces the full scan via the explicit flag. It must
+        // never be encoded as a plain empty-tips call: empty tips resolve to an
+        // empty delta and would pin nothing (the F5 silent loss again).
+        crate::state::PendingWork::FullScan => (Vec::new(), Vec::new(), true),
+    };
+    let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+        ctx.encrypt_sem.clone(),
+        ctx.repo_path.clone(),
+        new_tips,
+        old_tips,
+        ctx.git_bin.clone(),
+        ctx.git_timeout,
+        force_full_scan,
+    )
+    .await;
+    let object_list = if pin_set.full_scan {
+        fail_closed_full_scan_objects(
+            ctx.encrypt_sem.clone(),
+            ctx.repo_path.clone(),
+            rules_opt.clone().unwrap_or_default(),
+            record.is_public,
+            record.owner_did.clone(),
+            pin_set.candidates,
+            ctx.git_bin.clone(),
+            ctx.git_timeout,
+        )
+        .await
+    } else {
+        crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
+    };
+    Some((object_list, rules_opt, record.is_public))
+}
+
+/// The pin/encrypt pipeline shared by the snapshot iteration and the
+/// coalesced-drain iterations: local IPFS pin, then (path-scoped rules only) the
+/// admission-gated recipients walk → encrypt-then-pin → Arweave manifest anchor.
+async fn pin_and_encrypt_objects(
+    ctx: &EncryptTaskCtx,
+    object_list: Vec<String>,
+    rules: Option<Vec<crate::db::VisibilityRule>>,
+    is_public: bool,
+) {
+    let pinned =
+        crate::ipfs_pin::pin_new_objects(&ctx.ipfs_api, &ctx.repo_path, object_list, &ctx.db).await;
+    if !pinned.is_empty() {
+        tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
+        for (sha, cid) in &pinned {
+            tracing::info!(sha = %sha, %cid, "pinned");
+        }
+    }
+
+    // Option B1: encrypt-then-pin the withheld blobs so authorized readers can
+    // recover them when the origin cannot serve them. No path-scoped rule can
+    // withhold a blob, so withheld_blob_recipients would return an empty map
+    // after a full per-ref walk; skip it. Mirrors the has_path_scoped_rule gate
+    // on the other two withheld-walk sites.
+    if let Some(rules) = rules.filter(|r| visibility_pack::has_path_scoped_rule(r)) {
+        // Bound the number of concurrent post-push encryption walks (#174 P1-e):
+        // acquire an admission permit before the full-history walk, deferring
+        // when the pool is full rather than shedding the recovery pin.
+        let recip = withheld_recipients_gated(
+            ctx.encrypt_sem.clone(),
+            ctx.repo_path.clone(),
+            ctx.git_bin.clone(),
+            ctx.git_timeout,
+            rules,
+            is_public,
+            ctx.owner_did.clone(),
+        )
+        .await;
+        if let Ok(Ok(recipients)) = recip {
+            let node_seed = ctx.node_keypair.to_seed();
+            let delta = crate::encrypted_pin::encrypt_and_pin(
+                &ctx.ipfs_api,
+                &ctx.repo_path,
+                &ctx.db,
+                &ctx.repo_id,
+                &node_seed,
+                &recipients,
+            )
+            .await;
+
+            // Option B3: anchor a per-push manifest of the blobs sealed this
+            // push to Arweave, so the oid->cid index survives total node loss.
+            // Best-effort; never fails the push.
+            if !delta.is_empty() && !ctx.irys_url.is_empty() {
+                let owner_short = crate::db::normalize_owner_key(&ctx.owner_did);
+                let repo_slug = format!("{owner_short}/{}", ctx.repo_name);
+                let ts = chrono::Utc::now().to_rfc3339();
+                let manifest = crate::arweave::EncryptedManifest {
+                    repo: &repo_slug,
+                    owner_did: &ctx.owner_did,
+                    node_did: &ctx.node_did,
+                    timestamp: &ts,
+                    blobs: &delta,
+                };
+                match crate::arweave::anchor_encrypted_manifest(
+                    &ctx.http_client,
+                    &ctx.irys_url,
+                    &manifest,
+                )
+                .await
+                {
+                    Ok(tx) if !tx.is_empty() => tracing::info!(
+                        repo = %repo_slug,
+                        tx_id = %tx,
+                        "anchored encrypted manifest to Arweave"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        repo = %repo_slug,
+                        err = %e,
+                        "encrypted manifest anchor failed"
+                    ),
+                }
+            }
+        }
+    }
+}
+
 /// Map an error from a `smart_http` git service call to the right `AppError`:
 /// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
 /// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
@@ -1473,6 +1711,7 @@ pub async fn git_receive_pack(
             old_tips,
             state.git_bin.clone(),
             std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            false,
         )
         .await;
         if pin_set.full_scan {
@@ -1497,127 +1736,56 @@ pub async fn git_receive_pack(
     // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
     // Skipped entirely when the public cannot read the repo (withheld == None).
     //
-    // Coalesce per repo (#174 P2-2): this task parks on `git_encrypt_semaphore`
-    // (which DEFERS when the pool is full rather than dropping the recovery copy). To
-    // bound the OUTSTANDING parked-task set, only spawn if no encryption task for this
-    // repo is already in flight; otherwise skip — the pending/next walk over this
-    // repo's history already covers the newer push's objects, so the recovery copy is
-    // delayed, never lost. The guard removes the repo key when the task ends (success,
-    // error, or panic), so a later push is re-admitted (no permanent skip).
+    // Coalesce-and-requeue per repo (#174 P2-2 + F5): the spawned task's walks park
+    // on `git_encrypt_semaphore` (which DEFERS when the pool is full rather than
+    // dropping the recovery copy). To bound the OUTSTANDING task set, at most one
+    // task per repo is in flight; a push arriving while one is in flight does NOT
+    // spawn a duplicate — and is NOT dropped either. The in-flight task pins only
+    // its own pre-spawn object-list snapshot, so this push's (old, new) tip pairs
+    // are merged into the in-flight key's pending slot in the same critical section
+    // as the presence check, and the task loop-drains them (fresh rules, fail
+    // closed) before releasing the key. Without the requeue a coalesced push's pins
+    // and recovery copies would be silently absent until an unrelated later push
+    // (the F5 loss). The guard still releases the key on panic (Drop on unwind), so
+    // a crashed walk never permanently locks the repo out.
     if withheld.is_some() {
-        match state.encrypt_inflight.try_begin(&record.id) {
-            None => {
+        let tip_pairs: Vec<(String, String)> = ref_updates
+            .iter()
+            .map(|u| (u.old_sha.clone(), u.new_sha.clone()))
+            .collect();
+        match state.encrypt_inflight.try_begin(&record.id, tip_pairs) {
+            crate::state::BeginOutcome::Coalesced => {
                 tracing::debug!(
                     repo = %record.id,
-                    "post-push encryption task already in flight for this repo; coalescing \
-                     (the pending recovery-copy walk covers this push's objects)"
+                    "post-push encryption task already in flight for this repo; coalesced \
+                     — this push's tip pairs are queued for that task's drain"
                 );
             }
-            Some(inflight_guard) => {
-                let object_list_ipfs = object_list.clone();
-                let ipfs_api = state.config.ipfs_api.clone();
-                let repo_path_clone = disk_path.clone();
-                let db_clone = state.db.clone();
-                let rules_for_enc = rules_opt.clone();
-                let repo_id = record.id.clone();
-                let owner_did = record.owner_did.clone();
-                let is_public = record.is_public;
-                let irys_url = state.config.irys_url.clone();
-                let http_client = std::sync::Arc::clone(&state.http_client);
-                let node_did_str = state.node_did.to_string();
-                let node_seed = state.node_keypair.to_seed();
-                let repo_name = record.name.clone();
-                let enc_git_bin = state.git_bin.clone();
-                let enc_timeout =
-                    std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-                let encrypt_sem = state.git_encrypt_semaphore.clone();
-                tokio::spawn(async move {
-                    // Held for the whole task; drop (on completion/error/panic) releases the
-                    // repo's coalescing key so the next push for this repo can spawn again.
-                    let _inflight_guard = inflight_guard;
-                    let pinned = crate::ipfs_pin::pin_new_objects(
-                        &ipfs_api,
-                        &repo_path_clone,
-                        object_list_ipfs,
-                        &db_clone,
-                    )
-                    .await;
-                    if !pinned.is_empty() {
-                        tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
-                        for (sha, cid) in &pinned {
-                            tracing::info!(sha = %sha, %cid, "pinned");
-                        }
-                    }
-
-                    // Option B1: encrypt-then-pin the withheld blobs so authorized
-                    // readers can recover them when the origin cannot serve them.
-                    // No path-scoped rule can withhold a blob, so withheld_blob_recipients
-                    // would return an empty map after a full per-ref walk; skip it. Mirrors
-                    // the has_path_scoped_rule gate on the other two withheld-walk sites.
-                    if let Some(rules) =
-                        rules_for_enc.filter(|r| visibility_pack::has_path_scoped_rule(r))
-                    {
-                        // Bound the number of concurrent post-push encryption walks (#174 P1-e):
-                        // acquire an admission permit before the full-history walk, deferring
-                        // when the pool is full rather than shedding the recovery pin.
-                        let recip = withheld_recipients_gated(
-                            encrypt_sem.clone(),
-                            repo_path_clone.clone(),
-                            enc_git_bin.clone(),
-                            enc_timeout,
-                            rules,
-                            is_public,
-                            owner_did.clone(),
-                        )
-                        .await;
-                        if let Ok(Ok(recipients)) = recip {
-                            let delta = crate::encrypted_pin::encrypt_and_pin(
-                                &ipfs_api,
-                                &repo_path_clone,
-                                &db_clone,
-                                &repo_id,
-                                &node_seed,
-                                &recipients,
-                            )
-                            .await;
-
-                            // Option B3: anchor a per-push manifest of the blobs sealed
-                            // this push to Arweave, so the oid->cid index survives total
-                            // node loss. Best-effort; never fails the push.
-                            if !delta.is_empty() && !irys_url.is_empty() {
-                                let owner_short = crate::db::normalize_owner_key(&owner_did);
-                                let repo_slug = format!("{owner_short}/{repo_name}");
-                                let ts = chrono::Utc::now().to_rfc3339();
-                                let manifest = crate::arweave::EncryptedManifest {
-                                    repo: &repo_slug,
-                                    owner_did: &owner_did,
-                                    node_did: &node_did_str,
-                                    timestamp: &ts,
-                                    blobs: &delta,
-                                };
-                                match crate::arweave::anchor_encrypted_manifest(
-                                    &http_client,
-                                    &irys_url,
-                                    &manifest,
-                                )
-                                .await
-                                {
-                                    Ok(tx) if !tx.is_empty() => tracing::info!(
-                                        repo = %repo_slug,
-                                        tx_id = %tx,
-                                        "anchored encrypted manifest to Arweave"
-                                    ),
-                                    Ok(_) => {}
-                                    Err(e) => tracing::warn!(
-                                        repo = %repo_slug,
-                                        err = %e,
-                                        "encrypted manifest anchor failed"
-                                    ),
-                                }
-                            }
-                        }
-                    }
-                });
+            crate::state::BeginOutcome::Admitted(inflight_guard) => {
+                let ctx = EncryptTaskCtx {
+                    ipfs_api: state.config.ipfs_api.clone(),
+                    repo_path: disk_path.clone(),
+                    db: state.db.clone(),
+                    repo_id: record.id.clone(),
+                    owner_did: record.owner_did.clone(),
+                    repo_name: record.name.clone(),
+                    irys_url: state.config.irys_url.clone(),
+                    http_client: std::sync::Arc::clone(&state.http_client),
+                    node_did: state.node_did.to_string(),
+                    node_keypair: std::sync::Arc::clone(&state.node_keypair),
+                    git_bin: state.git_bin.clone(),
+                    git_timeout: std::time::Duration::from_secs(
+                        state.config.git_service_timeout_secs,
+                    ),
+                    encrypt_sem: state.git_encrypt_semaphore.clone(),
+                };
+                tokio::spawn(run_encrypt_pin_task(
+                    ctx,
+                    inflight_guard,
+                    object_list.clone(),
+                    rules_opt.clone(),
+                    record.is_public,
+                ));
             }
         }
     }
@@ -5197,9 +5365,9 @@ mod tests {
         let mut admitted = Vec::new();
         let mut coalesced = 0usize;
         for _ in 0..K {
-            match inflight.try_begin(repo) {
-                Some(g) => admitted.push(g),
-                None => coalesced += 1,
+            match inflight.try_begin(repo, vec![]) {
+                crate::state::BeginOutcome::Admitted(g) => admitted.push(g),
+                crate::state::BeginOutcome::Coalesced => coalesced += 1,
             }
         }
 
@@ -5238,12 +5406,15 @@ mod tests {
     /// one repo in flight cannot starve a second repo's recovery copy.
     #[test]
     fn u4_distinct_repos_each_admit_one_encrypt_task() {
+        use crate::state::BeginOutcome;
         let inflight = crate::state::EncryptInflight::new();
-        let a = inflight.try_begin("owner/repo-a");
-        let b = inflight.try_begin("owner/repo-b");
-        let c = inflight.try_begin("owner/repo-c");
+        let a = inflight.try_begin("owner/repo-a", vec![]);
+        let b = inflight.try_begin("owner/repo-b", vec![]);
+        let c = inflight.try_begin("owner/repo-c", vec![]);
         assert!(
-            a.is_some() && b.is_some() && c.is_some(),
+            matches!(&a, BeginOutcome::Admitted(_))
+                && matches!(&b, BeginOutcome::Admitted(_))
+                && matches!(&c, BeginOutcome::Admitted(_)),
             "three distinct repos each admit their own encryption task"
         );
         assert_eq!(inflight.len(), 3, "one in-flight entry per distinct repo");
@@ -5258,19 +5429,24 @@ mod tests {
     /// survives normal completion AND a panic, so no permanent skip / no leaked key.
     #[test]
     fn u4_coalesced_repo_is_reprocessed_after_task_ends_not_permanently_skipped() {
+        use crate::state::{BeginOutcome, FinishOutcome};
         let inflight = crate::state::EncryptInflight::new();
         let repo = "did:key:z6MkDurableRepoBBBBBBBBBBBBBBBBBBBBBBBBB/repo";
 
         // Push #1 admits and "spawns". A concurrent push #2 (task #1 still in flight)
-        // coalesces — no duplicate spawn.
-        let guard1 = inflight.try_begin(repo).expect("first push admits");
+        // coalesces — no duplicate spawn; its (empty) tip set is recorded, not lost.
+        let guard1 = admit(&inflight, repo);
         assert!(
-            inflight.try_begin(repo).is_none(),
+            matches!(inflight.try_begin(repo, vec![]), BeginOutcome::Coalesced),
             "while task #1 is in flight, push #2 to the same repo coalesces"
         );
 
-        // Task #1 finishes (encrypt_and_pin ran or errored): guard drops, key released.
-        drop(guard1);
+        // Task #1 finishes normally: nothing pending (push #2 carried no tips), so
+        // the empty-pending check removes the key in its critical section.
+        assert!(
+            matches!(guard1.finish_or_take_pending(), FinishOutcome::Finished(_)),
+            "no pending tips — the task exits and releases the key"
+        );
         assert_eq!(
             inflight.len(),
             0,
@@ -5280,18 +5456,21 @@ mod tests {
         // A LATER push for the SAME repo is admitted again (processed, not skipped
         // forever). This is what coalesce->shed breaks: shed drops the job and no sweep
         // re-derives the missing copy, so the recovery copy is permanently lost.
-        let guard2 = inflight.try_begin(repo).expect(
-            "a later push for a coalesced repo MUST be re-admitted — durability: the \
-             deferred recovery copy is produced eventually, never dropped",
-        );
+        let guard2 = admit(&inflight, repo);
+        // An errored task (guard dropped without finishing) still releases the key.
         drop(guard2);
         assert_eq!(inflight.len(), 0);
 
-        // Durability across PANIC: a task that panics mid-walk must still release its key
-        // (Drop runs on unwind), so one crashed walk never permanently locks a repo out
-        // of future recovery copies.
+        // Durability across PANIC: a task that panics mid-walk must still release its
+        // key (the still-armed guard's Drop runs on unwind), so one crashed walk never
+        // permanently locks a repo out of future recovery copies. Coalesce real tips
+        // first: the panic loses them (logged), and the loss must not corrupt the set.
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _g = inflight.try_begin(repo).expect("admit before the panic");
+            let _g = admit(&inflight, repo);
+            assert!(matches!(
+                inflight.try_begin(repo, vec![("old1".to_string(), "new1".to_string())]),
+                BeginOutcome::Coalesced
+            ));
             assert_eq!(inflight.len(), 1);
             panic!("simulate the detached encryption task panicking mid-walk");
         }));
@@ -5302,9 +5481,12 @@ mod tests {
             "a panicked encryption task still releases its repo key (Drop on unwind) — no \
              permanent leak that would block every future recovery copy for the repo"
         );
+        // The next push is re-admitted, and the panicked task's pending tips did NOT
+        // survive into it (they are lost-and-logged, recovered only by a later push).
+        let guard3 = admit(&inflight, repo);
         assert!(
-            inflight.try_begin(repo).is_some(),
-            "after a panicked task the repo can still be admitted — durability preserved"
+            matches!(guard3.finish_or_take_pending(), FinishOutcome::Finished(_)),
+            "the pre-panic pending tips must not leak into the re-admitted task"
         );
     }
 
@@ -5315,9 +5497,23 @@ mod tests {
         let inflight = crate::state::EncryptInflight::new();
         assert!(inflight.is_empty(), "cold set is empty");
         assert!(
-            inflight.try_begin("owner/first").is_some(),
+            matches!(
+                inflight.try_begin("owner/first", vec![]),
+                crate::state::BeginOutcome::Admitted(_)
+            ),
             "the first push on a cold in-flight set must admit (never falsely coalesce)"
         );
+    }
+
+    /// Unwrap an Admitted outcome (panic on Coalesced) — the u4/u5 suites' shorthand.
+    fn admit(
+        inflight: &crate::state::EncryptInflight,
+        repo: &str,
+    ) -> crate::state::EncryptInflightGuard {
+        match inflight.try_begin(repo, vec![]) {
+            crate::state::BeginOutcome::Admitted(g) => g,
+            crate::state::BeginOutcome::Coalesced => panic!("expected {repo} to admit"),
+        }
     }
 
     /// Model of the pre-fix / mutated code: no coalescing check, so every push spawns.
@@ -5325,6 +5521,567 @@ mod tests {
     /// the fix prevents), used as the RED comparison in the bound test above.
     fn simulate_without_coalescing(pushes: usize) -> usize {
         (0..pushes).count()
+    }
+
+    // ---- #174 U5 (F5): a push that loses try_begin is REQUEUED, never dropped ----
+    //
+    // F5: the in-flight task pins only its own pre-spawn object-list snapshot, so a
+    // push B arriving while task A is in flight used to be SKIPPED outright (the old
+    // None arm) — B's pins and recovery copies were silently absent until an
+    // unrelated later push re-walked the repo. U5 records B's (old, new) tip pairs
+    // into the in-flight key's pending slot in the SAME critical section as the
+    // presence check, and A's task loop-drains them before releasing the key.
+
+    /// The F5 lost-update repro. Task A is in flight past its snapshot; push B
+    /// coalesces carrying its tip pair; when A finishes its snapshot iteration the
+    /// tracker must hand A exactly B's recorded work with the key retained — and only
+    /// an empty pending check may remove the key. On pre-U5 code this is RED: the
+    /// coalesce arm records B's work nowhere and there is no drain surface at all.
+    #[test]
+    fn u5_coalesced_push_work_is_drained_by_the_inflight_task() {
+        use crate::state::{BeginOutcome, FinishOutcome, PendingWork};
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkF5LostUpdateCCCCCCCCCCCCCCCCCCCCCCCC/repo";
+
+        // Push A admits; its spawned task is "in flight past its snapshot".
+        let guard_a = match inflight.try_begin(repo, vec![]) {
+            BeginOutcome::Admitted(g) => g,
+            BeginOutcome::Coalesced => panic!("first push must admit"),
+        };
+
+        // Push B lands while A is in flight: coalesced, tip pair recorded.
+        let b_pair = (
+            "b0ldb0ldb0ldb0ldb0ldb0ldb0ldb0ldb0ldb0ld".to_string(),
+            "bnewbnewbnewbnewbnewbnewbnewbnewbnewbnew".to_string(),
+        );
+        match inflight.try_begin(repo, vec![b_pair.clone()]) {
+            BeginOutcome::Coalesced => {}
+            BeginOutcome::Admitted(_) => panic!("push B must coalesce while A is in flight"),
+        }
+
+        // A finishes its snapshot iteration: it must be handed B's work (drained),
+        // not exit — an exit here is exactly the F5 silent loss.
+        match guard_a.finish_or_take_pending() {
+            FinishOutcome::Pending(guard_a, work) => {
+                assert_eq!(
+                    work,
+                    PendingWork::Tips(vec![b_pair]),
+                    "A drains exactly B's recorded tip pair"
+                );
+                assert_eq!(inflight.len(), 1, "the key is retained while A iterates");
+                // Nothing further pending: A now exits and releases the key.
+                match guard_a.finish_or_take_pending() {
+                    FinishOutcome::Finished(_) => {}
+                    FinishOutcome::Pending(..) => panic!("no second batch was recorded"),
+                }
+                assert_eq!(
+                    inflight.len(),
+                    0,
+                    "an empty pending check at task end releases the key"
+                );
+            }
+            FinishOutcome::Finished(_) => panic!(
+                "F5: B's coalesced work vanished — the in-flight task exited without draining it"
+            ),
+        }
+    }
+
+    /// Drain-vs-admit race, both orderings driven deterministically through the lock
+    /// API (the check+merge and check+remove are each ONE critical section, so a push
+    /// can only land on one side of A's final pending check — never inside it):
+    /// before it, the push is merged and A drains it; after it, the key is gone and
+    /// the push is admitted as a fresh task. Neither ordering loses the work. A
+    /// check-then-record split (merge moved outside try_begin's critical section)
+    /// turns ordering 1 RED: the work recorded after A's check is never drained.
+    #[test]
+    fn u5_drain_vs_admit_race_loses_no_work_in_either_ordering() {
+        use crate::state::{BeginOutcome, FinishOutcome, PendingWork};
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkF5RaceOrderDDDDDDDDDDDDDDDDDDDDDDDDD/repo";
+        let pair = ("cold".to_string(), "cnew".to_string());
+
+        // Ordering 1: push C lands BEFORE A's final pending check → merged in
+        // try_begin's critical section → A must drain it (key retained).
+        let guard_a = admit(&inflight, repo);
+        assert!(matches!(
+            inflight.try_begin(repo, vec![pair.clone()]),
+            BeginOutcome::Coalesced
+        ));
+        match guard_a.finish_or_take_pending() {
+            FinishOutcome::Pending(g, work) => {
+                assert_eq!(work, PendingWork::Tips(vec![pair.clone()]));
+                assert!(matches!(
+                    g.finish_or_take_pending(),
+                    FinishOutcome::Finished(_)
+                ));
+            }
+            FinishOutcome::Finished(_) => {
+                panic!("a push merged before the final check must be drained, not lost")
+            }
+        }
+        assert!(inflight.is_empty());
+
+        // Ordering 2: push C lands AFTER A's final pending check removed the key →
+        // it must be ADMITTED as a fresh task (its own snapshot covers its work).
+        let guard_a = admit(&inflight, repo);
+        assert!(matches!(
+            guard_a.finish_or_take_pending(),
+            FinishOutcome::Finished(_)
+        ));
+        match inflight.try_begin(repo, vec![pair]) {
+            BeginOutcome::Admitted(g) => drop(g),
+            BeginOutcome::Coalesced => panic!(
+                "a push landing after the key was removed must admit a new task — a \
+                 coalesce here records work no task will ever drain"
+            ),
+        }
+    }
+
+    /// Exit-vs-successor (the double-remove hazard). A's normal exit removes the key
+    /// and disarms the guard in ONE critical section, and the disarmed guard is
+    /// handed back — so its eventual Drop lands in the real remove→drop window. A
+    /// successor task B admitted inside that window must keep ITS key when A's guard
+    /// finally drops. With the disarm reverted (Drop removing unconditionally) this
+    /// is RED: dropping A's guard deletes B's key and the third push falsely admits
+    /// a second task for the repo.
+    #[test]
+    fn u5_disarmed_guard_drop_never_removes_a_successor_key() {
+        use crate::state::{BeginOutcome, FinishOutcome};
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkF5DisarmEEEEEEEEEEEEEEEEEEEEEEEEEEEE/repo";
+
+        // A admits and exits normally; HOLD the disarmed guard to keep the window open.
+        let guard_a = admit(&inflight, repo);
+        let disarmed = match guard_a.finish_or_take_pending() {
+            FinishOutcome::Finished(g) => g,
+            FinishOutcome::Pending(..) => panic!("nothing was pending"),
+        };
+        assert!(inflight.is_empty(), "A's exit released the key");
+
+        // Successor B is admitted inside the remove→drop window.
+        let guard_b = admit(&inflight, repo);
+        assert_eq!(inflight.len(), 1);
+
+        // A's disarmed guard now drops. B's key must SURVIVE: a third push still
+        // coalesces against B's in-flight task.
+        drop(disarmed);
+        assert_eq!(
+            inflight.len(),
+            1,
+            "dropping A's disarmed guard must not remove successor B's key"
+        );
+        assert!(
+            matches!(inflight.try_begin(repo, vec![]), BeginOutcome::Coalesced),
+            "B's task is still the (only) in-flight task — at-most-one-per-repo holds"
+        );
+        drop(guard_b);
+        assert!(inflight.is_empty());
+    }
+
+    /// Pending overflow: past the 1024-pair bound the slot degrades to the FullScan
+    /// marker (bounded memory under a hostile push burst); at exactly the bound it
+    /// stays a Tips batch. The marker is an explicit variant, never an empty tip
+    /// list — an empty-tips encoding would drain to an empty delta and pin nothing.
+    #[test]
+    fn u5_pending_overflow_degrades_to_full_scan_marker() {
+        use crate::state::{BeginOutcome, FinishOutcome, PendingWork};
+        let inflight = crate::state::EncryptInflight::new();
+        let pair = |i: usize| (format!("old{i}"), format!("new{i}"));
+
+        // At the bound: exactly 1024 pairs stay a Tips batch.
+        let repo_at = "owner/at-bound";
+        let g = admit(&inflight, repo_at);
+        assert!(matches!(
+            inflight.try_begin(repo_at, (0..1024).map(pair).collect()),
+            BeginOutcome::Coalesced
+        ));
+        match g.finish_or_take_pending() {
+            FinishOutcome::Pending(g, PendingWork::Tips(v)) => {
+                assert_eq!(v.len(), 1024, "at the bound the pairs are kept verbatim");
+                assert!(matches!(
+                    g.finish_or_take_pending(),
+                    FinishOutcome::Finished(_)
+                ));
+            }
+            other => panic!(
+                "expected a Tips batch at the bound, got {:?}",
+                match other {
+                    FinishOutcome::Pending(_, w) => Some(w),
+                    FinishOutcome::Finished(_) => None,
+                }
+            ),
+        }
+
+        // Past the bound: the accumulated slot degrades to FullScan and later
+        // merges are absorbed (still one bounded marker, not a growing list).
+        let repo_over = "owner/over-bound";
+        let g = admit(&inflight, repo_over);
+        assert!(matches!(
+            inflight.try_begin(repo_over, (0..1024).map(pair).collect()),
+            BeginOutcome::Coalesced
+        ));
+        assert!(matches!(
+            inflight.try_begin(repo_over, vec![pair(9999)]),
+            BeginOutcome::Coalesced
+        ));
+        assert!(matches!(
+            inflight.try_begin(repo_over, vec![pair(10000)]),
+            BeginOutcome::Coalesced
+        ));
+        match g.finish_or_take_pending() {
+            FinishOutcome::Pending(g, work) => {
+                assert_eq!(
+                    work,
+                    PendingWork::FullScan,
+                    "overflow degrades to the explicit FullScan marker"
+                );
+                assert!(matches!(
+                    g.finish_or_take_pending(),
+                    FinishOutcome::Finished(_)
+                ));
+            }
+            FinishOutcome::Finished(_) => panic!("the overflowed pending work vanished"),
+        }
+    }
+
+    // ---- u5 drain-pipeline fixtures: a real git repo + a DB repo row ----
+
+    fn u5_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn u5_init_repo(dir: &std::path::Path) {
+        u5_git(dir, &["init", "-q", "-b", "main"]);
+        u5_git(dir, &["config", "user.email", "t@t"]);
+        u5_git(dir, &["config", "user.name", "t"]);
+    }
+
+    /// Commit `name` (parent dirs created) with `body`; returns the commit sha.
+    fn u5_commit_file(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, body).unwrap();
+        u5_git(dir, &["add", name]);
+        u5_git(dir, &["commit", "-qm", &format!("add {name}")]);
+        u5_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// A drain-task context over the test state and an on-disk repo. Empty
+    /// `ipfs_api`/`irys_url` keep the pin/anchor stages inert (no network).
+    fn u5_ctx(
+        state: &AppState,
+        rec: &crate::db::RepoRecord,
+        repo_path: std::path::PathBuf,
+        git_bin: &str,
+        sem: std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> EncryptTaskCtx {
+        EncryptTaskCtx {
+            ipfs_api: String::new(),
+            repo_path,
+            db: state.db.clone(),
+            repo_id: rec.id.clone(),
+            owner_did: rec.owner_did.clone(),
+            repo_name: rec.name.clone(),
+            irys_url: String::new(),
+            http_client: std::sync::Arc::clone(&state.http_client),
+            node_did: state.node_did.to_string(),
+            node_keypair: std::sync::Arc::clone(&state.node_keypair),
+            git_bin: git_bin.to_string(),
+            git_timeout: std::time::Duration::from_secs(600),
+            encrypt_sem: sem,
+        }
+    }
+
+    /// The drain resolves a coalesced push's tip pair to exactly that push's
+    /// introduced objects (delta semantics — the F5 observable: push B's pins are
+    /// recorded by the drain, and pre-existing objects are not re-listed).
+    #[sqlx::test]
+    async fn u5_drain_resolves_coalesced_tips_to_their_objects(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
+        let c2 = u5_commit_file(tmp.path(), "b.txt", "two\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5delta", "d", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5delta", "d").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            "git",
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+
+        // Push B advanced main c1 -> c2 and lost try_begin; its pair was coalesced.
+        let (list, _rules, is_public) = resolve_drain_object_list(
+            &ctx,
+            crate::state::PendingWork::Tips(vec![(c1.clone(), c2.clone())]),
+        )
+        .await
+        .expect("a public repo drains to a pin list");
+        assert!(is_public, "mirror rows are public");
+        let got: std::collections::HashSet<String> = list.into_iter().collect();
+        let new_blob = u5_git(tmp.path(), &["rev-parse", "HEAD:b.txt"]);
+        let old_blob = u5_git(tmp.path(), &["rev-parse", &format!("{c1}:a.txt")]);
+        assert!(
+            got.contains(&c2) && got.contains(&new_blob),
+            "B's commit and blob are in the drained pin list (the F5 fix)"
+        );
+        assert!(
+            !got.contains(&c1) && !got.contains(&old_blob),
+            "pre-existing objects are not re-listed (delta, not full scan)"
+        );
+    }
+
+    /// The FullScan marker drains through the FLAGGED full-scan path to a NON-EMPTY
+    /// candidate set. RED arm of the encoding: were the marker a plain empty-tips
+    /// call, the deletion-only fast path would return an empty delta and the drain
+    /// would pin nothing (the F5 silent loss resurfacing).
+    #[sqlx::test]
+    async fn u5_drain_full_scan_marker_yields_nonempty_candidates(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5full", "f", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5full", "f").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            "git",
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+
+        let (list, _rules, _pub) =
+            resolve_drain_object_list(&ctx, crate::state::PendingWork::FullScan)
+                .await
+                .expect("a public repo drains to a pin list");
+        let got: std::collections::HashSet<String> = list.into_iter().collect();
+        assert!(
+            !got.is_empty(),
+            "the FullScan drain must enumerate the repo — an empty list means the \
+             marker collapsed into the empty-tips fast path"
+        );
+        let blob = u5_git(tmp.path(), &["rev-parse", "HEAD:a.txt"]);
+        assert!(
+            got.contains(&c1) && got.contains(&blob),
+            "the full-scan drain covers the repo's commit and blob"
+        );
+    }
+
+    /// Rules tightened between the coalesced push and its drain are honored, fail
+    /// closed: the drain re-fetches rules/is_public fresh, so (1) a newly-withheld
+    /// blob is NOT pinned, and (2) a repo whose root became unreadable to the
+    /// anonymous public drains to nothing at all.
+    #[sqlx::test]
+    async fn u5_drain_honors_rules_tightened_after_the_push(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        u5_commit_file(tmp.path(), "pub.txt", "public\n");
+        let c2 = u5_commit_file(tmp.path(), "secret/hidden.txt", "sealed\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5tight", "t", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5tight", "t").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            "git",
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        let pending = || crate::state::PendingWork::Tips(vec![(ZERO_SHA.to_string(), c2.clone())]);
+
+        // At push time the repo had no rules. TIGHTEN before the drain: /secret/**
+        // becomes reader-gated. The drain must re-fetch and withhold the new blob.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[READER_DID.to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        let (list, _rules, _pub) = resolve_drain_object_list(&ctx, pending())
+            .await
+            .expect("still announceable at root");
+        let got: std::collections::HashSet<String> = list.into_iter().collect();
+        let pub_blob = u5_git(tmp.path(), &["rev-parse", "HEAD:pub.txt"]);
+        let secret_blob = u5_git(tmp.path(), &["rev-parse", "HEAD:secret/hidden.txt"]);
+        assert!(
+            got.contains(&pub_blob),
+            "the still-public blob is pinned by the drain"
+        );
+        assert!(
+            !got.contains(&secret_blob),
+            "a blob withheld by a rule added AFTER the push must NOT be pinned by \
+             the drain (fresh rules, fail closed)"
+        );
+
+        // Tighten further: root becomes reader-gated → not announceable to the
+        // anonymous public → the drain pins nothing at all.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/",
+                crate::db::VisibilityMode::A,
+                &[READER_DID.to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        assert!(
+            resolve_drain_object_list(&ctx, pending()).await.is_none(),
+            "a repo no longer announceable under current rules drains to nothing \
+             (fail closed)"
+        );
+    }
+
+    /// Hot-repo drain at encrypt-pool size 1: the task loop holds NO task-level
+    /// permit, so per-iteration helper acquires (withheld walk, candidate scan,
+    /// recipients walk) each get the pool's single permit in turn and BOTH the
+    /// snapshot iteration and the coalesced-drain iteration complete. RED if the
+    /// loop takes a task-level permit: the first helper acquire nests over the
+    /// same exhausted semaphore and the task parks forever.
+    #[sqlx::test]
+    async fn u5_hot_repo_drain_completes_at_pool_size_one(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        u5_commit_file(tmp.path(), "pub.txt", "public\n");
+        let c2 = u5_commit_file(tmp.path(), "secret/hidden.txt", "sealed\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5hot", "h", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5hot", "h").await.unwrap().unwrap();
+        // A path-scoped rule so every gated walk actually runs (withheld walk on
+        // the drain, recipients walk on both iterations). READER_DID carries no
+        // resolvable key, so the encrypt stage plans no seal and stays offline.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[READER_DID.to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        let rules = state.db.list_visibility_rules(&rec.id).await.unwrap();
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let ctx = u5_ctx(&state, &rec, tmp.path().to_path_buf(), "git", sem);
+
+        let inflight = crate::state::EncryptInflight::new();
+        let guard = admit(&inflight, &rec.id);
+        assert!(matches!(
+            inflight.try_begin(&rec.id, vec![(ZERO_SHA.to_string(), c2)]),
+            crate::state::BeginOutcome::Coalesced
+        ));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_encrypt_pin_task(ctx, guard, Vec::new(), Some(rules), true),
+        )
+        .await
+        .expect(
+            "the drain must complete at pool size 1 — a task-level permit would \
+             deadlock the helper-internal acquires",
+        );
+        assert!(
+            inflight.is_empty(),
+            "the drained task released its repo key on exit"
+        );
+    }
+
+    /// The task LOOP is load-bearing: work coalesced during the snapshot iteration
+    /// is drained (its candidate scan runs git) before the task exits. RED under
+    /// the drain-loop revert (task drops its guard after the snapshot without
+    /// checking pending): the fake git never runs and the marker is absent.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn u5_task_drains_coalesced_work_before_exiting(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("git.ran");
+        // The drain's candidate scan probes the tip type then walks: report a
+        // commit tip and an empty rev-list, recording every invocation.
+        let body = format!(
+            "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  cat-file) echo commit ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        state
+            .db
+            .upsert_mirror_repo("z6u5loop", "l", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5loop", "l").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            &git_bin,
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+
+        let inflight = crate::state::EncryptInflight::new();
+        let guard = admit(&inflight, &rec.id);
+        // Push B coalesces mid-flight with a real (created-ref) tip pair.
+        assert!(matches!(
+            inflight.try_begin(
+                &rec.id,
+                vec![(
+                    ZERO_SHA.to_string(),
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                )]
+            ),
+            crate::state::BeginOutcome::Coalesced
+        ));
+
+        // Snapshot: empty object list, no rules — the snapshot iteration itself
+        // spawns no git, so any git invocation below belongs to the DRAIN.
+        run_encrypt_pin_task(ctx, guard, Vec::new(), None, true).await;
+        assert!(
+            marker.exists(),
+            "the task must drain B's coalesced tips (candidate scan runs git) \
+             before exiting — an absent marker is the F5 skip"
+        );
+        assert!(
+            inflight.is_empty(),
+            "the empty pending check at task end released the key"
+        );
     }
 
     /// #174 SC2 (per-source key, U1): the per-caller read sub-cap keys on the
