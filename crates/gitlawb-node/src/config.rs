@@ -319,6 +319,24 @@ pub struct Config {
     )]
     pub max_concurrent_git_pushes: usize,
 
+    /// Max concurrent post-push pin loops (`ipfs_pin` and `pinata`
+    /// `pin_new_objects`) across all repos. `EncryptInflight` bounds the outstanding
+    /// pin-task COUNT to one per repo, but each pin loop holds a full per-push
+    /// object-id list (up to `git_max_pack_bytes` worth of OIDs) while it walks it,
+    /// so N distinct repos could hold N such lists at once. This caps how many run
+    /// concurrently, bounding that MB-scale memory regardless of how many repos an
+    /// authenticated actor pushes to (#174 F6). Beyond it a pin loop DEFERS (waits),
+    /// never drops — a dropped pin would lose the object's replication copy.
+    ///
+    /// Default: 8. Must be between 1 and 1_048_576.
+    #[arg(
+        long,
+        env = "GITLAWB_MAX_CONCURRENT_PIN_TASKS",
+        default_value_t = 8,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub max_concurrent_pin_tasks: usize,
+
     /// Maximum concurrent read operations (`upload-pack` and the upload-pack
     /// `info/refs` advertisement) a single caller may hold at once, so one caller
     /// cannot monopolize the `max_concurrent_git_ops` read pool (#174). Callers are
@@ -515,6 +533,26 @@ mod tests {
         // 0 is a footgun (immediate-504 on every request); clap must reject it.
         assert!(
             Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn max_concurrent_pin_tasks_defaults_and_rejects_out_of_range() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).max_concurrent_pin_tasks,
+            8
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--max-concurrent-pin-tasks", "2"])
+                .max_concurrent_pin_tasks,
+            2
+        );
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--max-concurrent-pin-tasks", "0"]).is_err()
+        );
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--max-concurrent-pin-tasks", "1048577"])
+                .is_err()
         );
     }
 

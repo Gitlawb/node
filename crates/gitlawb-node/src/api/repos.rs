@@ -849,6 +849,7 @@ struct EncryptTaskCtx {
     git_bin: String,
     git_timeout: std::time::Duration,
     encrypt_sem: Arc<tokio::sync::Semaphore>,
+    pin_sem: Arc<tokio::sync::Semaphore>,
 }
 
 /// The detached post-push pin/encrypt task (#174 P2-2 + F5): run this push's own
@@ -990,14 +991,40 @@ async fn resolve_drain_object_list(
 /// The pin/encrypt pipeline shared by the snapshot iteration and the
 /// coalesced-drain iterations: local IPFS pin, then (path-scoped rules only) the
 /// admission-gated recipients walk → encrypt-then-pin → Arweave manifest anchor.
+/// Pin `object_list` to the local IPFS node under the global pin-admission permit
+/// (#174 F6). `EncryptInflight` bounds the pin-task COUNT to one per repo, but each
+/// pin loop holds a full per-push object-id list while walking it; this permit bounds
+/// how many such MB-scale lists are held at once across all repos. DEFERS (waits) when
+/// the pool is full — never drops, since a dropped pin loses the replication copy.
+async fn pin_new_objects_gated(
+    pin_sem: &Arc<tokio::sync::Semaphore>,
+    ipfs_api: &str,
+    repo_path: &std::path::Path,
+    object_list: Vec<String>,
+    db: &Arc<crate::db::Db>,
+) -> Vec<(String, String)> {
+    let _permit = pin_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("pin_semaphore is never closed");
+    crate::ipfs_pin::pin_new_objects(ipfs_api, repo_path, object_list, db).await
+}
+
 async fn pin_and_encrypt_objects(
     ctx: &EncryptTaskCtx,
     object_list: Vec<String>,
     rules: Option<Vec<crate::db::VisibilityRule>>,
     is_public: bool,
 ) {
-    let pinned =
-        crate::ipfs_pin::pin_new_objects(&ctx.ipfs_api, &ctx.repo_path, object_list, &ctx.db).await;
+    let pinned = pin_new_objects_gated(
+        &ctx.pin_sem,
+        &ctx.ipfs_api,
+        &ctx.repo_path,
+        object_list,
+        &ctx.db,
+    )
+    .await;
     if !pinned.is_empty() {
         tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
         for (sha, cid) in &pinned {
@@ -1782,6 +1809,7 @@ pub async fn git_receive_pack(
                             state.config.git_service_timeout_secs,
                         ),
                         encrypt_sem: state.git_encrypt_semaphore.clone(),
+                        pin_sem: state.pin_semaphore.clone(),
                     };
                     tokio::spawn(run_encrypt_pin_task(
                         ctx,
@@ -1833,8 +1861,16 @@ pub async fn git_receive_pack(
             let node_keypair = Arc::clone(&state.node_keypair);
             let object_list_pinata = object_list;
             let do_pinata_replication = withheld.is_some();
+            // Same global pin-admission bound as the IPFS loop (#174 F6): the Pinata pin
+            // loop also holds this push's full object-id list while pinning it, so it must
+            // share the cap. It DEFERS on a full pool rather than dropping the pin.
+            let pin_sem_pinata = state.pin_semaphore.clone();
             tokio::spawn(async move {
                 let pinned = if do_pinata_replication {
+                    let _pin_permit = pin_sem_pinata
+                        .acquire_owned()
+                        .await
+                        .expect("pin_semaphore is never closed");
                     crate::pinata::pin_new_objects(
                         &http_client,
                         &pinata_upload_url,
@@ -5096,6 +5132,48 @@ mod tests {
         );
     }
 
+    /// #174 F6 (RED-before/GREEN-after): a post-push pin loop holds this push's full
+    /// object-id list while walking it, so concurrent pin loops across many repos must
+    /// be bounded by a global permit, not just the per-repo task count. `pin_new_objects_gated`
+    /// DEFERS (waits) when the pin pool is exhausted rather than running unbounded.
+    ///
+    /// Load-bearing: without the permit acquire the pin loop runs immediately even with
+    /// the pool held (RED — the deferral assertion fails). With it, it parks.
+    #[sqlx::test]
+    async fn pin_new_objects_gated_defers_when_pin_pool_exhausted(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let state = crate::test_support::test_state(pool).await;
+        let db = state.db.clone();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pin_sem = Arc::new(Semaphore::new(1));
+        // Hold the only pin permit.
+        let held = pin_sem.clone().acquire_owned().await.unwrap();
+
+        // Empty ipfs_api makes the pin itself a no-op, but the loop must still DEFER on
+        // the exhausted pin pool rather than run.
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            pin_new_objects_gated(&pin_sem, "", tmp.path(), vec![], &db),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a pin loop must defer while the pin pool is exhausted (#174 F6)"
+        );
+
+        // Release admission: the SAME call now completes.
+        drop(held);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pin_new_objects_gated(&pin_sem, "", tmp.path(), vec![], &db),
+        )
+        .await
+        .expect("the pin loop completes once admission frees");
+        assert!(out.is_empty(), "an empty ipfs_api pins nothing");
+    }
+
     /// Shared fixture for the F4 handler-layer tests: a state whose repo_store and
     /// git_bin point at the given tempdir/fake-git, plus a seeded on-disk repo,
     /// optionally with a path-scoped rule (so the post-receive walks actually run).
@@ -5884,6 +5962,7 @@ mod tests {
             git_bin: git_bin.to_string(),
             git_timeout: std::time::Duration::from_secs(600),
             encrypt_sem: sem,
+            pin_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
         }
     }
 
