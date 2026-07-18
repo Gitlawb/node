@@ -410,14 +410,33 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    // The child has exited (or been killed), so the pipes are closed and the reader
-    // threads run to completion. Reap the child and collect the drained output. On
-    // the unix timeout path `reap_group` already reaped the leader, so `wait` here
-    // returns ECHILD; tolerate that and report the killed status the loop observed.
+    // Collect the leader's status. On the timeout path `reap_group` already reaped
+    // it, so `wait` returns ECHILD; tolerate that and report the killed status the
+    // loop observed. On the clean path `try_wait` above already reaped it, so this
+    // returns the cached real status.
     let status = child.wait().unwrap_or_else(|_| {
         debug_assert!(!completed, "clean-exit path must still be reapable here");
         exited_status()
     });
+
+    // A leader that exits on its own does NOT guarantee the pipes are closed: a
+    // descendant (the git-remote-gitlawb helper mid-HTTP request) can outlive the
+    // leader while still holding the inherited stdout/stderr write-ends, so the
+    // reader joins below would block on its ~300s HTTP timeout, past the deadline
+    // this function promises (#192 F2, INV-22). The timeout path already tore the
+    // group down; on the clean path, close it here too. A process-group ID stays
+    // reserved while any member is alive, so signalling the group is safe as long as
+    // `kill(-pgid, 0)` still reports a live member; once the group is empty the pipes
+    // are closed anyway and the leader's reaped pid may have been recycled, so skip.
+    #[cfg(unix)]
+    if completed {
+        let pgid = child.id() as i32;
+        // SAFETY: kill(-pgid, 0) only probes group liveness; it borrows no memory.
+        if unsafe { libc::kill(-pgid, 0) } == 0 {
+            reap_group(&mut child);
+        }
+    }
+
     let stdout = out_reader.join().expect("stdout reader");
     let stderr = err_reader.join().expect("stderr reader");
     (
@@ -759,5 +778,62 @@ fn run_bounded_reaps_descendants_holding_the_pipe() {
         "reader joins blocked on a surviving descendant instead of the deadline: \
          elapsed={elapsed:?} (expected <4s; a leader-only kill leaves the \
          grandchild fixture holding the pipes for its full lifetime)"
+    );
+}
+
+/// Fixture: spawn a detached grandchild (`fixture_sleep`) that inherits the stdio
+/// pipes, then the LEADER returns immediately. This is the leader-exits-first
+/// shape (#192 F2): the leader is gone almost at once, well before any deadline,
+/// but the descendant keeps the caller's pipe write-ends open for its full
+/// lifetime. Dropping the `Child` handle neither kills nor waits it, so the
+/// grandchild stays alive holding the pipes.
+// Leaving the grandchild unreaped is the point: the leader exits without waiting
+// it, so a descendant outlives the leader still holding the inherited pipes.
+#[allow(clippy::zombie_processes)]
+#[test]
+#[ignore = "self-exec fixture: only runs under GL_TEST_FIXTURE=exit_holder"]
+fn fixture_exit_leaving_pipe_holder() {
+    if std::env::var("GL_TEST_FIXTURE").ok().as_deref() != Some("exit_holder") {
+        return;
+    }
+    // Stdio is inherited by default, so the grandchild holds the same pipe
+    // write-ends the caller handed this leader. Do not wait on it: the leader
+    // returns now, leaving the grandchild alive and holding the pipes.
+    let _detached = fixture_command("fixture_sleep", "sleep")
+        .spawn()
+        .expect("spawn grandchild fixture");
+}
+
+/// Leader-exits-first companion to `run_bounded_reaps_descendants_holding_the_pipe`
+/// (#192 F2). The leader spawns a pipe-holding descendant and returns immediately,
+/// so `try_wait` sees it gone and the loop breaks `completed` well before the
+/// deadline. The descendant still holds the reader pipes, so without closing the
+/// group on the clean-exit path the reader joins block on the descendant's full
+/// lifetime (~10s here; the real helper's ~300s HTTP timeout). Reverting the
+/// clean-path group reap in `run_bounded` turns this RED (elapsed ~10s). Unix-only:
+/// the fix relies on the process group staying reserved while a member is alive,
+/// and the Windows `taskkill /T` tree walk cannot reach a descendant once its
+/// leader has exited.
+#[cfg(unix)]
+#[test]
+fn run_bounded_bounds_join_when_leader_exits_leaving_a_pipe_holder() {
+    let cmd = fixture_command("fixture_exit_leaving_pipe_holder", "exit_holder");
+
+    let start = Instant::now();
+    // A 30s deadline the leader never approaches: it exits almost immediately, so
+    // this exercises the clean-exit path, not the timeout path.
+    let (completed, _out) = run_bounded(cmd, Duration::from_secs(30));
+    let elapsed = start.elapsed();
+
+    assert!(
+        completed,
+        "the leader exited well within the 30s deadline, so run_bounded must report \
+         completion rather than a timeout"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "reader joins blocked on a descendant that outlived the leader: \
+         elapsed={elapsed:?} (expected <5s; the clean-exit path must close the \
+         process group so the grandchild's held pipes do not stall the joins)"
     );
 }
