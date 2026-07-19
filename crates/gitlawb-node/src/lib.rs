@@ -2387,4 +2387,99 @@ mod shutdown_grace_tests {
         );
         assert!(result.is_ok());
     }
+
+    // Real-socket contract: at grace expiry the server abandons a request still
+    // in flight; the client never receives a 503 (or any late error response),
+    // it just observes the connection going away or no response at all. Wires a
+    // real `axum::serve` future through `drive_serve_with_grace` exactly as the
+    // production path does. RED: asserting the client reads back an
+    // "HTTP/1.1 503" status line fails (no response bytes ever arrive).
+    #[tokio::test]
+    async fn real_socket_in_flight_request_abandoned_without_503() {
+        use axum::routing::get;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The slow handler signals once the request is in flight, then outlasts
+        // the grace by a wide margin.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_tx = entered.clone();
+        let app = axum::Router::new().route(
+            "/slow",
+            get(move || {
+                let entered_tx = entered_tx.clone();
+                async move {
+                    entered_tx.notify_one();
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    "done"
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Mirror the production wiring: axum drains on a watch flip, and the
+        // graceful-shutdown closure arms the grace clock at the signal.
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
+            while !*shutdown_rx.borrow_and_update() {
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            let _ = armed_tx.send(());
+        });
+
+        let driver = tokio::spawn(drive_serve_with_grace(
+            serve,
+            armed_rx,
+            Duration::from_millis(250),
+        ));
+
+        // Put a request in flight on the slow route and wait until the handler
+        // is actually running, so the drain has something to abandon.
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /slow HTTP/1.1\r\nhost: test\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("slow handler must start before the shutdown signal fires");
+
+        // Fire the shutdown signal; the in-flight request now outlasts grace.
+        let signal_at = Instant::now();
+        shutdown_tx.send(true).unwrap();
+
+        let (result, grace_expired) = tokio::time::timeout(Duration::from_secs(5), driver)
+            .await
+            .expect("driver must return soon after grace expiry, not hang on the drain")
+            .expect("driver task must not panic");
+        assert!(
+            grace_expired,
+            "an in-flight request outlasting grace must be abandoned"
+        );
+        assert!(
+            result.is_ok(),
+            "abandon path returns Ok so teardown proceeds"
+        );
+        assert!(
+            signal_at.elapsed() < Duration::from_secs(5),
+            "must return within a bounded window past the grace"
+        );
+
+        // The client must never see a 503 status line: the request is abandoned
+        // at the transport, not answered. Read whatever arrives before a bounded
+        // window; a clean close (EOF) and no bytes at all both satisfy the
+        // contract.
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut buf)).await;
+        assert!(
+            !buf.starts_with(b"HTTP/1.1 503"),
+            "abandoned in-flight request must not be answered with a 503; got: {:?}",
+            String::from_utf8_lossy(&buf)
+        );
+    }
 }
