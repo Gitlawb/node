@@ -247,7 +247,11 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
+    /// Access the underlying Postgres connection pool. Test-only: production DB
+    /// access goes through `Db`'s methods, and the advisory-lock subsystem now
+    /// uses its own pool (`connect_lock_pool`), so nothing outside tests reaches
+    /// for the raw app pool.
+    #[cfg(test)]
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -290,6 +294,30 @@ impl Db {
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Build a standalone Postgres pool for the advisory-lock subsystem,
+    /// separate from the app pool. No migrations run here (the app pool owns
+    /// the schema); this pool only serves the session-scoped advisory-lock
+    /// connections that `RepoStore`'s write guards pin for a write's whole
+    /// lifetime, so a concurrent-push burst pins connections from here rather
+    /// than starving the app pool. Sized by GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS.
+    pub async fn connect_lock_pool(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<PgPool> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "connecting advisory-lock pool"
+        );
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect(database_url)
+            .await
+            .context("connecting advisory-lock pool")
     }
 
     /// Cheap liveness probe against the pool, for readiness checks: one

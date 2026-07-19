@@ -288,8 +288,20 @@ async fn main() -> Result<()> {
 
     let object_store =
         tigris.map(|t| std::sync::Arc::new(t) as std::sync::Arc<dyn git::tigris::ObjectStore>);
+    // Advisory-lock guards get their own pool, separate from the app pool
+    // (db.pool()) that serves normal handlers, so a concurrent-push burst pins
+    // lock connections here instead of starving request handlers. Sized to peak
+    // writers via GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS.
+    let lock_pool_acquire_timeout = std::time::Duration::from_secs(config.db_acquire_timeout_secs);
+    let lock_pool = Db::connect_lock_pool(
+        &config.database_url,
+        config.db_lock_pool_max_connections,
+        lock_pool_acquire_timeout,
+    )
+    .await
+    .context("connecting advisory-lock pool")?;
     let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), object_store, db.pool().clone());
+        git::repo_store::RepoStore::new(config.repos_dir.clone(), object_store, lock_pool);
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.
@@ -641,11 +653,19 @@ async fn run_admin_command(command: config::Command, config: &Config) -> Result<
                     }
                 }
             };
-            let repo_store = git::repo_store::RepoStore::new(
-                config.repos_dir.clone(),
-                object_store,
-                db.pool().clone(),
-            );
+            // Give the purge-spam store a dedicated advisory-lock pool, separate
+            // from `db`'s app pool. The guard then holds a lock-pool connection
+            // while `delete_repo_by_id` runs on the app pool, so a purge at
+            // GITLAWB_DB_MAX_CONNECTIONS=1 does not self-deadlock (KTD3).
+            let lock_pool = Db::connect_lock_pool(
+                &config.database_url,
+                config.db_lock_pool_max_connections,
+                acquire_timeout,
+            )
+            .await
+            .context("connecting advisory-lock pool for purge-spam")?;
+            let repo_store =
+                git::repo_store::RepoStore::new(config.repos_dir.clone(), object_store, lock_pool);
             admin::run_purge_spam(&db, &repo_store, &config.repos_dir, execute)
                 .await
                 .map(|_| ())

@@ -20,13 +20,26 @@ use tracing::{debug, info, warn};
 use super::store;
 use super::tigris::ObjectStore;
 
+/// Default bound on `release()`'s post-write archive upload (INV-22). Generous
+/// for a large-repo PUT while still guaranteeing the guard's pinned advisory-
+/// lock connection returns to the pool within a fixed window even if the upload
+/// stalls indefinitely.
+const DEFAULT_RELEASE_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Centralized repo storage: local disk cache + optional object-store backend.
 #[derive(Clone)]
 pub struct RepoStore {
     repos_dir: PathBuf,
     object_store: Option<Arc<dyn ObjectStore>>,
-    /// Shared Postgres pool for advisory locks.
-    pool: PgPool,
+    /// Dedicated Postgres pool for advisory-lock guard connections, separate
+    /// from the app pool that serves normal request handlers. Each write guard
+    /// pins one connection from here for its whole lifetime, so a concurrent-
+    /// push burst pins connections from this pool rather than starving the app
+    /// pool. Sized by GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS to peak writers.
+    lock_pool: PgPool,
+    /// Upper bound on the post-write archive upload in `release()`, so a stalled
+    /// upload cannot pin the guard's lock connection indefinitely.
+    release_upload_timeout: std::time::Duration,
     /// Tracks repos already confirmed to exist in the object store — avoids
     /// redundant HEAD checks and background uploads for repos we've migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
@@ -34,11 +47,12 @@ pub struct RepoStore {
 
 impl RepoStore {
     #[cfg(test)]
-    pub fn for_testing(repos_dir: PathBuf, pool: PgPool) -> Self {
+    pub fn for_testing(repos_dir: PathBuf, lock_pool: PgPool) -> Self {
         Self {
             repos_dir,
             object_store: None,
-            pool,
+            lock_pool,
+            release_upload_timeout: DEFAULT_RELEASE_UPLOAD_TIMEOUT,
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
@@ -46,14 +60,23 @@ impl RepoStore {
     pub fn new(
         repos_dir: PathBuf,
         object_store: Option<Arc<dyn ObjectStore>>,
-        pool: PgPool,
+        lock_pool: PgPool,
     ) -> Self {
         Self {
             repos_dir,
             object_store,
-            pool,
+            lock_pool,
+            release_upload_timeout: DEFAULT_RELEASE_UPLOAD_TIMEOUT,
             migrated: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Shrink the `release()` upload timeout — test-only, so a stall test can
+    /// assert the lock connection is freed within a short bound.
+    #[cfg(test)]
+    pub fn with_release_upload_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.release_upload_timeout = timeout;
+        self
     }
 
     /// Ensure a repo is available on local disk, downloading from Tigris if needed.
@@ -174,14 +197,14 @@ impl RepoStore {
         //
         // Between FAILED attempts the connection is returned to the pool (the
         // `drop` below) so a writer spinning on a contended repo does NOT hold a
-        // pool connection through the retry backoff — holding one per spinner
-        // would starve the shared pool under a same-repo write burst. Only the
-        // WINNING attempt keeps its connection (the lock lives on it).
+        // lock-pool connection through the retry backoff — holding one per
+        // spinner would starve the lock pool under a same-repo write burst. Only
+        // the WINNING attempt keeps its connection (the lock lives on it).
         let conn = {
             let mut acquired = None;
             for attempt in 0..60 {
                 let mut c = self
-                    .pool
+                    .lock_pool
                     .acquire()
                     .await
                     .context("acquiring write-lock connection")?;
@@ -220,6 +243,7 @@ impl RepoStore {
             lock_key,
             conn: Some(conn),
             object_store: self.object_store.clone(),
+            release_upload_timeout: self.release_upload_timeout,
         };
 
         // Always download the latest from the object store before writing.
@@ -272,7 +296,7 @@ impl RepoStore {
         let (owner_slug, _local) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
         let mut conn = self
-            .pool
+            .lock_pool
             .acquire()
             .await
             .context("acquiring lock connection")?;
@@ -560,6 +584,9 @@ pub struct RepoWriteGuard {
     /// it to the pool) while `Drop` closes it when release was never reached.
     conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
     object_store: Option<Arc<dyn ObjectStore>>,
+    /// Upper bound on the `release()` archive upload — copied from the store so
+    /// a stalled upload cannot pin this connection past the bound.
+    release_upload_timeout: std::time::Duration,
 }
 
 impl RepoWriteGuard {
@@ -574,14 +601,26 @@ impl RepoWriteGuard {
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
     pub async fn release(mut self, success: bool) {
-        // Upload to Tigris only on success.
+        // Upload to Tigris only on success. Bound the upload so a stalled PUT
+        // cannot pin the guard's advisory-lock connection indefinitely — on
+        // timeout we log and fall through to the unlock, returning the
+        // connection to the pool within the bound. (INV-22.)
         if success {
             if let Some(ref tigris) = self.object_store {
-                if let Err(e) = tigris
-                    .upload(&self.owner_slug, &self.repo_name, &self.local_path)
-                    .await
+                match tokio::time::timeout(
+                    self.release_upload_timeout,
+                    tigris.upload(&self.owner_slug, &self.repo_name, &self.local_path),
+                )
+                .await
                 {
-                    warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+                    }
+                    Err(_) => {
+                        warn!(repo = %self.repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
+                            "tigris upload timed out after write — releasing the advisory lock without a completed upload");
+                    }
                 }
             }
         } else {
@@ -924,6 +963,9 @@ mod tests {
         // it true — lets U3's resurrect test assert a deleted archive stays gone.
         exists: std::sync::Arc<std::sync::atomic::AtomicBool>,
         download_gate: Option<std::sync::Arc<tokio::sync::Notify>>,
+        // When set, `upload()` parks on this gate before doing anything — models a
+        // stalled PUT so the release-upload timeout can be observed (U2).
+        upload_gate: Option<std::sync::Arc<tokio::sync::Notify>>,
         uploads: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
         deletes: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     }
@@ -933,6 +975,7 @@ mod tests {
             Self {
                 exists: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(exists)),
                 download_gate: None,
+                upload_gate: None,
                 uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 deletes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
@@ -945,6 +988,10 @@ mod tests {
             Ok(self.exists.load(std::sync::atomic::Ordering::SeqCst))
         }
         async fn upload(&self, o: &str, r: &str, _p: &std::path::Path) -> anyhow::Result<()> {
+            if let Some(gate) = &self.upload_gate {
+                // Park indefinitely — the caller's timeout must be what unblocks.
+                gate.notified().await;
+            }
             self.uploads
                 .lock()
                 .unwrap()
@@ -1347,6 +1394,180 @@ mod tests {
             uploads.lock().unwrap().len(),
             1,
             "an uncontended fork upload must PUT exactly once"
+        );
+    }
+
+    // ── U2: dedicated lock pool + bounded release upload (R2, KTD2) ──────────
+
+    // A no-reap pool sized to `max_connections` with a short acquire timeout, so
+    // a held guard's connection is not reclaimed mid-assertion (see
+    // raw-advisory-lock-guard-must-free-on-drop-and-ambient-pool-reap-masks-the-leak.md)
+    // and an exhausted pool fails fast instead of stalling the whole test.
+    async fn sized_no_reap_pool(
+        connect_opts: &sqlx::postgres::PgConnectOptions,
+        max_connections: u32,
+    ) -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .min_connections(0)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .test_before_acquire(false)
+            .connect_with(connect_opts.clone())
+            .await
+            .unwrap()
+    }
+
+    // R2/KTD2: advisory-lock guards pin connections from the DEDICATED lock pool,
+    // so N concurrent distinct-repo write guards do NOT consume the app pool — an
+    // unrelated app-pool handler query still gets a connection. On the pre-split
+    // base (the store shared the app pool, RepoStore::new(_, _, db.pool())) those
+    // N guards pinned every app-pool connection and the unrelated query 503'd on
+    // acquire; the `shared_pool_starves_*` control below pins that RED behavior.
+    #[sqlx::test]
+    async fn write_guards_on_lock_pool_do_not_starve_the_app_pool(
+        _pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        const N: u32 = 3;
+        let lock_pool = sized_no_reap_pool(&connect_opts, N).await;
+        let app_pool = sized_no_reap_pool(&connect_opts, N).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::new(tmp.path().to_path_buf(), None, lock_pool.clone());
+
+        // Hold N distinct-repo write guards -> N lock-pool connections pinned.
+        let mut guards = Vec::new();
+        for i in 0..N {
+            let owner = format!("did:key:z6MkStarveApp{i}AAAAAAAAAAAAAAAAAAAAAAAA");
+            guards.push(store.acquire_write(&owner, "starve").await.unwrap());
+        }
+
+        // The lock pool is now exhausted: a further acquire on it times out —
+        // proving the guards really pinned all N of its connections (so the app-
+        // pool assertion below is load-bearing, not vacuously green on idle).
+        assert!(
+            lock_pool.acquire().await.is_err(),
+            "the lock pool must be exhausted by N held write guards"
+        );
+
+        // ...but the app pool is a SEPARATE pool, so an unrelated handler query
+        // still acquires a connection. This is the query that starved pre-split.
+        assert!(
+            app_pool.acquire().await.is_ok(),
+            "the app pool must stay available while N write guards are held on the lock pool"
+        );
+
+        for g in guards {
+            g.release(true).await;
+        }
+    }
+
+    // The pre-split hazard, pinned as a characterization test: when the store
+    // SHARES its guard pool with the app pool (the pre-U2 wiring), N held write
+    // guards pin every connection and an unrelated query on that SAME pool
+    // starves (acquire times out). This is the RED the dedicated lock pool
+    // closes; keeping it green documents WHY the pools must be split.
+    #[sqlx::test]
+    async fn shared_pool_starves_the_app_pool_under_held_write_guards(
+        _pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        const N: u32 = 3;
+        let shared = sized_no_reap_pool(&connect_opts, N).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Pre-split topology: the store's guard pool IS the app pool.
+        let store = RepoStore::new(tmp.path().to_path_buf(), None, shared.clone());
+
+        let mut guards = Vec::new();
+        for i in 0..N {
+            let owner = format!("did:key:z6MkSharedStarve{i}AAAAAAAAAAAAAAAAAAAAAA");
+            guards.push(store.acquire_write(&owner, "starve").await.unwrap());
+        }
+
+        // An unrelated query on the SAME pool now starves.
+        assert!(
+            shared.acquire().await.is_err(),
+            "a shared pool must starve under N held write guards — the hazard the split closes"
+        );
+
+        for g in guards {
+            g.release(true).await;
+        }
+    }
+
+    // R2: the lock pool is sized to peak writers, so N = pool-size concurrent
+    // distinct-repo writers all acquire and proceed (the starvation is not
+    // merely relocated from the app pool onto pushers).
+    #[sqlx::test]
+    async fn lock_pool_admits_peak_writers_concurrently(
+        _pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        const N: u32 = 4;
+        let lock_pool = sized_no_reap_pool(&connect_opts, N).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::new(tmp.path().to_path_buf(), None, lock_pool);
+
+        let mut guards = Vec::new();
+        for i in 0..N {
+            let owner = format!("did:key:z6MkPeakWriter{i}AAAAAAAAAAAAAAAAAAAAAAAA");
+            guards.push(
+                store
+                    .acquire_write(&owner, "peak")
+                    .await
+                    .expect("every writer up to the lock-pool size must acquire and proceed"),
+            );
+        }
+        assert_eq!(guards.len(), N as usize);
+        for g in guards {
+            g.release(true).await;
+        }
+    }
+
+    // R2/INV-22: a stalled release() upload must not pin the guard's advisory-
+    // lock connection indefinitely. With a short upload bound and an upload that
+    // never completes, release() still returns and frees the lock within the
+    // bound. Pre-fix (untimed upload) release() would hang on the stalled PUT
+    // and never reach the unlock.
+    #[sqlx::test]
+    async fn release_upload_stall_is_bounded(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use sqlx::ConnectOptions;
+        let pool = no_reap_pool(pool_opts, &connect_opts).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        // The upload parks forever; the release timeout is what must unblock it.
+        ts.upload_gate = Some(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        )
+        .with_release_upload_timeout(std::time::Duration::from_millis(300));
+        let owner = "did:key:z6MkReleaseStallBoundAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "stall";
+        let key = lock_key_for(owner, name);
+        let mut observer = connect_opts.connect().await.unwrap();
+
+        let guard = store.acquire_write(owner, name).await.unwrap();
+        assert!(
+            !advisory_lock_is_free(&mut observer, key).await,
+            "the lock must be held while the guard is alive"
+        );
+
+        // release(success) -> the upload stalls, but the bound caps the hold.
+        let start = std::time::Instant::now();
+        guard.release(true).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "release() must return within the upload bound, not hang on the stalled PUT"
+        );
+        assert!(
+            poll_until_free(&mut observer, key).await,
+            "the advisory lock must be freed after the bounded (timed-out) upload"
         );
     }
 }

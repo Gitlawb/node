@@ -221,6 +221,22 @@ pub struct Config {
     )]
     pub db_max_connections: u32,
 
+    /// Maximum connections in the dedicated advisory-lock pool, separate from
+    /// the main pool above. Every in-flight repo write (git-receive-pack, fork,
+    /// merge) pins one connection here for its whole lifetime — the write, its
+    /// metadata/fan-out tail, and the bounded post-write archive upload — so
+    /// size it to the expected peak number of concurrent distinct-repo writers,
+    /// NOT small. Keeping it separate from GITLAWB_DB_MAX_CONNECTIONS is what
+    /// stops a push burst from starving normal request handlers. Keep
+    /// (main pool + lock pool) within the database server's max_connections.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS",
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub db_lock_pool_max_connections: u32,
+
     /// Maximum time a request waits for a pool connection before failing with
     /// 503, in seconds. Bounds queueing when the database is slow or down.
     #[arg(
