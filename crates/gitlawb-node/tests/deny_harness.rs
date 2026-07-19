@@ -638,3 +638,75 @@ async fn drop_without_shutdown_unblocks_database(
     }
     probe.close().await.expect("probe connection closes");
 }
+
+/// Isolates the `handle.abort()` half of `TestNode`'s `Drop` teardown. The
+/// existing `drop_without_shutdown_unblocks_database` fences both redundant
+/// mechanisms together and stays GREEN if only the abort is removed (the
+/// graceful watch signal alone drains the serve task). This test suppresses the
+/// graceful signal (`force_abort_only_teardown`) so ONLY the abort runs, making
+/// the abort line load-bearing: with the abort removed from `Drop` neither
+/// mechanism runs, the serve task keeps its pool clones open, and the probe sees
+/// the leaked sessions for the full bound (RED); with the abort present the
+/// aborted task's future is dropped on a scheduler tick and the sessions drain
+/// (GREEN). Same vacuous-pass guards as the sibling test: node pool built with
+/// reaping disabled, and a standalone observer connection.
+#[sqlx::test]
+async fn drop_with_broken_graceful_chain_still_unblocks_via_abort(
+    pool_opts: sqlx::postgres::PgPoolOptions,
+    connect_opts: sqlx::postgres::PgConnectOptions,
+) {
+    use sqlx::{ConnectOptions as _, Connection as _};
+
+    let pool = pool_opts
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(connect_opts.clone())
+        .await
+        .expect("node pool connects");
+
+    // Inner scope so the node drops as a test body's would, with no shutdown().
+    {
+        let mut node = spawn_node(pool).await;
+        // Break the graceful chain: Drop will not send the watch signal, so
+        // only handle.abort() can tear the serve task down.
+        node.force_abort_only_teardown();
+        let client = bounded_client();
+        let resp = client
+            .get(format!("{}/health", node.base_url))
+            .send()
+            .await
+            .expect("probe request sends");
+        assert!(
+            resp.status().is_success(),
+            "the server must be live before the drop"
+        );
+    }
+
+    // Standalone observer: with only the abort running, the serve task's future
+    // (and its pool clones) must still be dropped, leaving zero other sessions.
+    let mut probe = connect_opts
+        .connect()
+        .await
+        .expect("standalone probe connects");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let others: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&mut probe)
+        .await
+        .expect("session count query runs");
+        if others == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "abort-only teardown still holds {others} session(s) against the \
+             per-test database after 5s; handle.abort() is not releasing the \
+             serve task's pool clones and sqlx's DROP DATABASE cleanup would fail"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    probe.close().await.expect("probe connection closes");
+}

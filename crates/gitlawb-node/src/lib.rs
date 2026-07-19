@@ -1111,6 +1111,23 @@ fn tighten_and_verify_created(
         })
 }
 
+/// Fsync the parent directory of `final_path` so the namespace change (a link
+/// or a create into it) is durable before success is reported (#194). Unix-only:
+/// opening a directory as a file is not portable. An empty or missing parent
+/// resolves to `"."`.
+#[cfg(unix)]
+fn fsync_parent_dir(final_path: &std::path::Path) -> anyhow::Result<()> {
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::File::open(dir)
+        .with_context(|| format!("open key directory {} to fsync", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("fsync key directory {}", dir.display()))?;
+    Ok(())
+}
+
 /// Outcome of an atomic key publish.
 enum KeyPublish {
     /// We created the key file; it now holds the complete PEM.
@@ -1120,11 +1137,15 @@ enum KeyPublish {
 }
 
 /// Wall-clock budget for reading a key another start may still be publishing.
-/// The atomic publish (`publish_key_atomically`) means a *present* key file is
-/// always complete, so this normally succeeds on the first read; the deadline
-/// only covers cross-host cache lag. It is a wall-clock budget, NOT a fixed
-/// retry count, so a slow/stalled filesystem cannot starve a losing start after
-/// an arbitrarily short (~100ms) window (#194).
+/// On the atomic hard-link path (`publish_key_atomically`) a *present* key file
+/// is always complete, so a read there succeeds on the first try. On the
+/// hard-link fallback (`publish_key_fallback`) the final NAME becomes visible
+/// while the PEM is still being written, so a losing/concurrent reader can
+/// observe an empty/partial final; this deadline is the window it rides out
+/// until the winner's write completes. Cross-host cache lag is a secondary
+/// reason a present key may not read on the first attempt. It is a wall-clock
+/// budget, NOT a fixed retry count, so a slow/stalled filesystem cannot starve a
+/// losing start after an arbitrarily short (~100ms) window (#194).
 const KEY_RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bounded number of temp-file names a publish will try before giving up.
@@ -1191,6 +1212,10 @@ struct PublishFaults {
     /// Runs before the `hard_link`; an `Err` is taken as the link result and
     /// the real link is never attempted.
     link: fn() -> std::io::Result<()>,
+    /// Runs before the fallback's `create_new` open of the FINAL path; an `Err`
+    /// is taken as the open result (a non-`AlreadyExists` open error), so the
+    /// publish surfaces it chained with `link_err`.
+    fallback_create: fn() -> std::io::Result<()>,
     /// Runs before the fallback's `write_all`; an `Err` is taken as the write
     /// result.
     fallback_write: fn() -> std::io::Result<()>,
@@ -1212,6 +1237,7 @@ impl PublishFaults {
     /// The production value: no fault injected at any step.
     const NONE: Self = Self {
         link: || Ok(()),
+        fallback_create: || Ok(()),
         fallback_write: || Ok(()),
         fallback_fsync: || Ok(()),
         #[cfg(unix)]
@@ -1240,11 +1266,15 @@ impl PublishFaults {
 /// without hard-link support, or a transient link error), the publish falls
 /// back to `create_new(0o600)` directly on the final path
 /// (`publish_key_fallback`). The fallback keeps (b): `create_new` still admits
-/// exactly one winner and a lost race loads the existing key. It weakens (a)
-/// and (c): the final name is visible while the PEM is being written, a window
-/// concurrent readers ride out via `load_racing_key`'s wall-clock deadline,
-/// and a crash mid-write leaves a partial final that fails loudly
-/// (`invalid PEM key`) at the next start rather than being cleaned up.
+/// exactly one winner and a lost race loads the existing key. It weakens (a),
+/// (c), and (d): the final name is visible while the PEM is being written, a
+/// window concurrent readers ride out via `load_racing_key`'s wall-clock
+/// deadline; a crash mid-write leaves a partial final that fails loudly
+/// (`invalid PEM key`) at the next start rather than being cleaned up; and the
+/// final name can become durable before the PEM bytes are fsynced, so a power
+/// loss can additionally leave a durable empty/truncated final. In every case
+/// the failure mode is the same LOUD invalid-PEM (or mode) error at the next
+/// start, never a silently used key.
 ///
 /// `before_link` is a no-op in production; tests use it to widen the
 /// post-write / pre-link window deterministically. `faults` is the
@@ -1329,12 +1359,7 @@ fn publish_key_atomically(
             // loser may already have loaded it, and a later start loads it via
             // the exists() path.
             #[cfg(unix)]
-            {
-                std::fs::File::open(dir)
-                    .with_context(|| format!("open key directory {} to fsync", dir.display()))?
-                    .sync_all()
-                    .with_context(|| format!("fsync key directory {}", dir.display()))?;
-            }
+            fsync_parent_dir(final_path)?;
             Ok(KeyPublish::Won)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(KeyPublish::Lost),
@@ -1372,7 +1397,7 @@ fn publish_key_fallback(
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = match opts.open(final_path) {
+    let mut f = match (faults.fallback_create)().and_then(|()| opts.open(final_path)) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(KeyPublish::Lost),
         Err(e) => {
@@ -1416,16 +1441,7 @@ fn publish_key_fallback(
     // reported, as on the hard-link path. Same policy on failure: the final is
     // complete and data-synced, so it is NOT removed.
     #[cfg(unix)]
-    {
-        let dir = final_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::File::open(dir)
-            .with_context(|| format!("open key directory {} to fsync", dir.display()))?
-            .sync_all()
-            .with_context(|| format!("fsync key directory {}", dir.display()))?;
-    }
+    fsync_parent_dir(final_path)?;
     Ok(KeyPublish::Won)
 }
 
@@ -2073,6 +2089,42 @@ mod identity_key_tests {
         );
     }
 
+    // A non-AlreadyExists error from the fallback's create_new open of the
+    // final path must surface, chained with the original link error, so a
+    // two-step failure (link failed, then the direct create also failed) is
+    // diagnosable. RED without the gate wired: the injected open error never
+    // reaches the real open, so the publish succeeds instead of erroring.
+    #[test]
+    fn failed_fallback_create_surfaces_the_open_error_and_chains_link_err() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            fallback_create: || Err(std::io::Error::other("injected fallback create failure")),
+            ..PublishFaults::NONE
+        };
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("a failed fallback create must error the start"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("injected fallback create failure"),
+            "the error must surface the fallback create failure: {msg}"
+        );
+        let link_display = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
+        assert!(
+            msg.contains(&link_display),
+            "the error must chain the original link failure ({link_display}): {msg}"
+        );
+        assert!(
+            !key_path.exists(),
+            "a failed fallback create must not leave the final key"
+        );
+    }
+
     // A failed fallback FSYNC after a complete write errors the start but
     // leaves the final in place: the content is complete, and a concurrent
     // loser may already have loaded it (mirrors the Won arm's fsync policy).
@@ -2106,6 +2158,64 @@ mod identity_key_tests {
         assert!(
             Keypair::from_pem(&body).is_ok(),
             "the surviving final must be loadable at the next start"
+        );
+    }
+
+    // #194: the fallback path can leave a durable empty/truncated final if a
+    // crash lands between the name becoming durable and the PEM fsync (the
+    // reconditioned KEY_RACE_DEADLINE / publish_key_atomically doc). This
+    // observes the promised behavior at the next start: such a residue must
+    // fail LOUDLY (an invalid-PEM parse error, or a mode rejection), never
+    // parse as Ok and never be replaced by a freshly generated key. This is a
+    // characterization/observation test of behavior that already exists, not a
+    // RED-first guard: it passes on current code.
+    #[test]
+    fn fallback_crash_residue_fails_loudly_not_silently() {
+        use super::{ensure_key_mode_0600, load_existing_key};
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // (1) an empty final at 0600 (durable name, no PEM bytes yet).
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, b"").expect("seed empty final");
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 empty");
+        let err = match load_existing_key(&empty) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an empty final must fail loudly, not parse as Ok"),
+        };
+        assert!(
+            err.contains("invalid PEM"),
+            "an empty final must surface a parse error, got: {err}"
+        );
+
+        // (2) a truncated/garbage non-PEM final at 0600.
+        let garbage = dir.path().join("garbage.pem");
+        std::fs::write(&garbage, b"-----BEGIN nonsense truncated").expect("seed garbage final");
+        std::fs::set_permissions(&garbage, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 garbage");
+        let err = match load_existing_key(&garbage) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a truncated final must fail loudly, not parse as Ok"),
+        };
+        assert!(
+            err.contains("invalid PEM"),
+            "a truncated final must surface a parse error, got: {err}"
+        );
+
+        // (3) mode-rejection path: an empty final at 0400. The loader tightens a
+        // loose mode where the mount allows it, so the reachable rejection is
+        // `ensure_key_mode_0600` failing closed on a mode it cannot narrow (a
+        // mode-ignoring mount); assert that branch directly on a 0400 file.
+        let loose = dir.path().join("loose.pem");
+        std::fs::write(&loose, b"").expect("seed loose final");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o400))
+            .expect("0400 loose");
+        let err = ensure_key_mode_0600(&loose)
+            .expect_err("a non-0600 final must be rejected, not used exposed")
+            .to_string();
+        assert!(
+            err.contains("400"),
+            "the mode rejection must name the exposed mode, got: {err}"
         );
     }
 
@@ -2210,13 +2320,21 @@ mod identity_key_tests {
         run_umask_case("277", "fallback");
     }
 
-    /// #194 (U2): permissive umasks stay healthy: 0600 is already 0600
-    /// under 0077 and 0000, the tighten is a no-op, and the verify must not
-    /// disturb a clean publish. (`created_key_is_mode_0600` pins the suite's
-    /// ambient umask; these pin the boundary values explicitly.)
+    /// #194 (U2): a permissive umask stays healthy: 0600 is already 0600 under
+    /// 0077, the tighten is a no-op, and the verify must not disturb a clean
+    /// publish. (`created_key_is_mode_0600` pins the suite's ambient umask;
+    /// these pin the boundary values explicitly.) Split per-umask so a
+    /// 0000-specific regression is not masked by a 0077 failure.
     #[test]
-    fn permissive_umasks_0077_and_0000_still_publish_0600() {
+    fn permissive_umask_0077_still_publishes_0600() {
         run_umask_case("077", "hardlink");
+    }
+
+    /// #194 (U2): the fully permissive umask 0000 stays healthy too — 0600 is
+    /// already 0600, the tighten is a no-op, and the verify must not disturb a
+    /// clean publish.
+    #[test]
+    fn permissive_umask_0000_still_publishes_0600() {
         run_umask_case("000", "hardlink");
     }
 
