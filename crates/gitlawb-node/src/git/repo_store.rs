@@ -228,41 +228,55 @@ impl RepoStore {
             anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
         }
 
+        // Construct the guard immediately so its Drop implementation protects
+        // subsequent cancellation points (tigris download below).
+        let mut guard = RepoWriteGuard {
+            owner_slug,
+            repo_name: repo_name.to_string(),
+            local_path,
+            lock_key,
+            conn: Some(conn),
+            tigris: self.tigris.clone(),
+        };
+
         // Always download the latest from Tigris before writing.
         // Local disk may be stale if another machine pushed since our last access.
         if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
+            if tigris
+                .exists(&guard.owner_slug, repo_name)
+                .await
+                .unwrap_or(false)
+            {
                 debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
+                if let Err(e) = tigris
+                    .download(&guard.owner_slug, repo_name, &guard.local_path)
+                    .await
+                {
                     // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
                     // Tigris archive must not block a write when a valid local copy
                     // exists — release(success) will re-upload a good archive.
-                    if local_path.exists() {
+                    if guard.local_path.exists() {
                         warn!(repo = %repo_name, err = %e,
                             "write acquire: tigris download failed — falling back to local copy");
                     } else {
-                        // Drop the lock on the error path before returning; the
-                        // connection is released to the pool by Drop on
-                        // PoolConnection, but the lock must be released explicitly
-                        // so a subsequent writer isn't blocked until idle timeout.
-                        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                            .bind(lock_key)
-                            .execute(&mut *conn)
-                            .await;
+                        // Drop the lock on the error path before returning.
+                        // Unlock through the guard's connection, then clear conn
+                        // so Drop returns it to the pool (lock-free) instead of
+                        // closing it.
+                        if let Some(ref mut gconn) = guard.conn {
+                            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                                .bind(guard.lock_key)
+                                .execute(&mut **gconn)
+                                .await;
+                        }
+                        guard.conn = None;
                         return Err(e).context("downloading repo from tigris for write");
                     }
                 }
             }
         }
 
-        Ok(RepoWriteGuard {
-            owner_slug,
-            repo_name: repo_name.to_string(),
-            local_path,
-            lock_key,
-            conn,
-            tigris: self.tigris.clone(),
-        })
+        Ok(guard)
     }
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
@@ -411,12 +425,16 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 /// Holds the owning `PoolConnection<Postgres>` so the lock is released on
 /// the same session that acquired it — see `acquire_write` for the session
 /// affinity rationale.
+///
+/// On cancellation (drop without `release()`), the connection is closed instead
+/// of returned to the pool, so the advisory lock is released by Postgres when
+/// the backend session ends.
 pub struct RepoWriteGuard {
     owner_slug: String,
     repo_name: String,
     pub local_path: PathBuf,
     lock_key: i64,
-    conn: PoolConnection<sqlx::Postgres>,
+    conn: Option<PoolConnection<sqlx::Postgres>>,
     tigris: Option<TigrisClient>,
 }
 
@@ -446,13 +464,26 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
-        // Release advisory lock on the owning session. The connection is then
-        // returned to the pool by `PoolConnection::Drop` when `self` drops at
-        // the end of this function.
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(self.lock_key)
-            .execute(&mut *self.conn)
-            .await;
+        // Release advisory lock on the owning session, then return connection
+        // to the pool. Take the connection so Drop sees None and does nothing.
+        if let Some(mut conn) = self.conn.take() {
+            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(self.lock_key)
+                .execute(&mut *conn)
+                .await;
+            // conn drops here, returned to the pool
+        }
+    }
+}
+
+impl Drop for RepoWriteGuard {
+    fn drop(&mut self) {
+        // If conn is still Some, release() was never called (e.g. cancellation).
+        // Close the connection instead of returning it to the pool, so the
+        // Postgres backend session ends and the advisory lock is released.
+        if let Some(ref mut conn) = self.conn {
+            conn.close_on_drop();
+        }
     }
 }
 
