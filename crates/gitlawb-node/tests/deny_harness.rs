@@ -135,7 +135,9 @@ fn receive_pack_update_body(branch: &str) -> Vec<u8> {
 #[sqlx::test]
 async fn signed_stranger_protected_branch_push_is_forbidden(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    // #195 (F1): a bounded timeout so a wedged git-receive-pack fails the suite
+    // rather than hanging it until CI kills the job.
+    let client = support::bounded_client();
     let owner = Keypair::generate();
     let owner_did = owner.did().to_string();
     let stranger = Keypair::generate();
@@ -379,8 +381,14 @@ async fn withheld_path_blob_read_is_denied(pool: sqlx::PgPool) {
 /// Build a git v0 receive-pack body creating `refs/heads/<branch>` at a fresh
 /// commit that adds `files` on top of the existing `main`, force-updating main to
 /// a deterministic base so `<branch>` shares history with main. Returns the body
-/// bytes plus the new feature tip. Shells out to the local `git`.
-fn build_branch_push_body(server_main_tip: &str, branch: &str, files: &[(&str, &str)]) -> Vec<u8> {
+/// bytes plus a map of each pushed file's blob OID (full sha1), so the caller can
+/// withhold the OID of a pushed secret path (#195, F2). Shells out to the local
+/// `git`.
+fn build_branch_push_body(
+    server_main_tip: &str,
+    branch: &str,
+    files: &[(&str, &str)],
+) -> (Vec<u8>, std::collections::HashMap<String, String>) {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -424,7 +432,15 @@ fn build_branch_push_body(server_main_tip: &str, branch: &str, files: &[(&str, &
     run(&["commit", "-q", "-m", "feature"]);
     let feature_tip = run(&["rev-parse", "HEAD"]);
 
-    let mut child = Command::new("git")
+    // #195 (F2): capture each pushed file's blob OID (full sha1). seed_bare_repo
+    // never seeds these pushed paths, so this is the only place their OID is known;
+    // the PR-diff denial withholds the secret path's OID (full + [..12] short form).
+    let mut pushed_oids = std::collections::HashMap::new();
+    for (p, _) in files {
+        pushed_oids.insert((*p).to_string(), run(&["rev-parse", &format!("HEAD:{p}")]));
+    }
+
+    let child = Command::new("git")
         .args(["pack-objects", "--stdout", "--revs"])
         .current_dir(&work)
         .stdin(Stdio::piped())
@@ -448,7 +464,7 @@ fn build_branch_push_body(server_main_tip: &str, branch: &str, files: &[(&str, &
     body.extend_from_slice(b"0000");
     body.extend_from_slice(&pack);
     let _ = std::fs::remove_dir_all(&work);
-    body
+    (body, pushed_oids)
 }
 
 /// get_pr_diff has a SECOND, path-scoped gate after the repo-root read: it
@@ -462,7 +478,9 @@ fn build_branch_push_body(server_main_tip: &str, branch: &str, files: &[(&str, &
 #[sqlx::test]
 async fn get_pr_diff_withheld_path_is_denied(pool: sqlx::PgPool) {
     let node = spawn_node(pool).await;
-    let client = reqwest::Client::new();
+    // #195 (F1): a bounded timeout so a wedged git subprocess push fails the suite
+    // rather than hanging it until CI kills the job.
+    let client = support::bounded_client();
     let owner = Keypair::generate();
     let owner_did = owner.did().to_string();
 
@@ -477,7 +495,7 @@ async fn get_pr_diff_withheld_path_is_denied(pool: sqlx::PgPool) {
         .await;
 
     // Push a `feature` branch whose diff vs main touches the withheld secret path.
-    let body = build_branch_push_body(
+    let (body, pushed_oids) = build_branch_push_body(
         &oids["HEAD"],
         "feature",
         &[("secret/x.txt", "TOPSECRET-PRDIFF-PATH")],
@@ -515,7 +533,11 @@ async fn get_pr_diff_withheld_path_is_denied(pool: sqlx::PgPool) {
 
     // Anon PASSES the public repo-root gate, then the per-path gate DENIES the diff
     // (it touches the withheld secret path): 404, leaking no content or OID.
-    let secret_oid = oids.get("secret/x.txt").cloned().unwrap_or_default(); // seed_bare_repo didn't seed it; the pushed one is unknown here.
+    // #195 (F2): withhold the pushed secret blob's OID in both forms (the full
+    // sha1 and `oid[..12]`), matching the private_blob_oid_short convention
+    // (probe.rs:200), NOT `git rev-parse --short` (variable-length).
+    let secret_oid_full = pushed_oids["secret/x.txt"].clone();
+    let secret_oid_short = secret_oid_full[..12].to_string();
     let resp = client
         .get(format!(
             "{}/api/v1/repos/{owner_did}/prdiff-repo/pulls/{number}/diff",
@@ -524,10 +546,11 @@ async fn get_pr_diff_withheld_path_is_denied(pool: sqlx::PgPool) {
         .send()
         .await
         .expect("anon diff read sends");
-    let mut withheld = vec!["TOPSECRET-PRDIFF-PATH"];
-    if !secret_oid.is_empty() {
-        withheld.push(secret_oid.as_str());
-    }
+    let withheld = vec![
+        "TOPSECRET-PRDIFF-PATH",
+        secret_oid_full.as_str(),
+        secret_oid_short.as_str(),
+    ];
     assert_denied(resp, 404, &withheld).await;
 
     // Owner sees the full diff (the per-path gate admits the reader).
@@ -717,6 +740,17 @@ async fn send_probe(
             &probe.path,
             probe.body.clone(),
             &fixture.claimant,
+        ),
+        // #195 (F3): the assignee actor arm of complete_task / fail_task signs with
+        // the fixture's assignee identity (the one that claimed the seeded task), so
+        // reverting the assignee gate turns that arm's Not403 twin RED.
+        Signer::Assignee => signed_request(
+            client,
+            probe.method.clone(),
+            base_url,
+            &probe.path,
+            probe.body.clone(),
+            &fixture.assignee,
         ),
     };
     let rb = if probe.json {
@@ -1239,6 +1273,58 @@ mod completeness {
         false
     }
 
+    /// The CLOSED set of caller-self REST gates deliberately NOT driven as a
+    /// registry row. INTENTIONALLY EMPTY (#195, F3/R4): every caller-self
+    /// `did_matches(caller, X)` gate in `src/api` is driven by a real-node
+    /// hostile+control probe (a `SignerSelfGate` field-binding row or a
+    /// `MultiPrincipalGate` assignee-arm row), so no caller-self REST gate is
+    /// un-drivable. A new classifier-marked handler that is not a driven row must
+    /// fail `signer_self_gates_are_all_driven`; it is not parked here.
+    const SIGNER_SELF_NOT_DRIVEN: &[&str] = &[];
+
+    /// True when `body` contains a CALLER-SELF `did_matches` call: one whose FIRST
+    /// arg is the caller (`caller` / `&caller` / `&auth.0`) AND whose SECOND arg is
+    /// NOT `&record.owner_did`. Sibling to [`has_owner_did_matches`] (the owner form
+    /// is guarded there); this is the field-binding / actor idiom the task and
+    /// register handlers use: create_task (`&body.delegator_did`), claim_task
+    /// (`&body.assignee_did`), complete_task / fail_task (the stored `assignee_did`,
+    /// spelled across lines), register (`agent_did.as_str()`). The arg1 set matches
+    /// its owner sibling's (NOT just `&auth.0`), so a `let caller = &auth.0;
+    /// did_matches(caller, X)` gate cannot escape. The paren-walk is multi-line-robust
+    /// because complete_task / fail_task spell the call across lines.
+    fn has_signer_self_did_matches(body: &str) -> bool {
+        let bytes = body.as_bytes();
+        let mut i = 0;
+        while let Some(rel) = body[i..].find("did_matches(") {
+            let open = i + rel + "did_matches(".len();
+            let mut depth = 1i32;
+            let mut comma: Option<usize> = None;
+            let mut j = open;
+            while j < body.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    b',' if depth == 1 && comma.is_none() => comma = Some(j),
+                    _ => {}
+                }
+                j += 1;
+            }
+            i = j;
+            let close = j.saturating_sub(1);
+            let Some(comma) = comma else { continue };
+            let arg1 = body[open..comma].split_whitespace().collect::<String>();
+            let arg2 = body[comma + 1..close]
+                .split_whitespace()
+                .collect::<String>();
+            let caller_first = arg1 == "caller" || arg1 == "&caller" || arg1 == "&auth.0";
+            let owner_second = arg2 == "&record.owner_did";
+            if caller_first && !owner_second {
+                return true;
+            }
+        }
+        false
+    }
+
     #[test]
     fn deny_registry_is_not_stale_and_owner_gates_are_all_driven() {
         let server = include_str!("../src/server.rs");
@@ -1334,6 +1420,78 @@ mod completeness {
                 registry_owner_handlers.contains(h.as_str()),
                 "handler `{h}` carries an owner-gate marker but is not an owner-gate \
                  row in deny_bearing_routes() — add it so the runtime sweep drives its 403"
+            );
+        }
+    }
+
+    /// CALLER-SELF ORPHAN GUARD (#195, F3/R4, INV-21b). Sibling to the owner-gate
+    /// and read-gate orphan guards above: every handler carrying a caller-self
+    /// `did_matches(caller, X)` gate (X != `&record.owner_did`) must be a DRIVEN
+    /// registry row (ANY gate class: a `SignerSelfGate` field-binding row or a
+    /// `MultiPrincipalGate` assignee-arm row) OR listed in the (empty)
+    /// `SIGNER_SELF_NOT_DRIVEN`. Derived from a SOURCE scan of the `src/api` `.rs`
+    /// files at test time (KTD-2): a caller-self gate spelled with the inline
+    /// `did_matches(caller|&caller|&auth.0, X)` idiom in an existing OR new api file
+    /// is caught and forced to be a driven row. It does NOT catch two shapes (the
+    /// same limits the owner/read sibling guards have): a check hidden behind a
+    /// helper (the owner side tracks `require_owner` / `require_repo_owner` as markers
+    /// for exactly this reason -- add a marker if a caller-self helper is introduced),
+    /// and a gate in a new SUBDIRECTORY module (the scan is flat, not recursive). The
+    /// parallel GraphQL mutation gates (`src/graphql/mutation.rs`) are out of this
+    /// scan's scope, fenced separately (#219).
+    #[test]
+    fn signer_self_gates_are_all_driven() {
+        // A caller-self gate may be driven as a SignerSelfGate row (body-field bind)
+        // OR a MultiPrincipalGate row (the complete/fail assignee actor gate), so the
+        // required set is EVERY registry handler regardless of class.
+        let registry_handlers: HashSet<&str> = deny_bearing_routes()
+            .iter()
+            .map(|r| short_handler(r.handler))
+            .collect();
+
+        let api_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/api");
+        let mut signer_self_marked: HashSet<String> = HashSet::new();
+        for entry in std::fs::read_dir(api_dir).expect("read api dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                let src = std::fs::read_to_string(&path).expect("read api file");
+                signer_self_marked.extend(handlers_matching(&src, has_signer_self_did_matches));
+            }
+        }
+        // Drop the gate helpers' own definitions (mirror of the owner scan dropping
+        // require_owner / require_repo_owner): none of these is a mounted handler.
+        signer_self_marked.remove("did_matches");
+        signer_self_marked.remove("require_owner");
+        signer_self_marked.remove("require_repo_owner");
+
+        // Non-vacuous floor PINNED to the exact caller-self handler count (close_pr,
+        // close_issue, dispute/submit/approve/cancel_bounty, create/claim/complete/
+        // fail_task, register = 11). Pinned, not loose, so a PARTIAL classifier
+        // regression (dropping even one) trips here rather than being absorbed by the
+        // runtime sweep; bump it when the caller-self surface legitimately changes.
+        assert!(
+            signer_self_marked.len() >= 11,
+            "caller-self marker scan found only {} handlers (expected 11); the scan broke or the caller-self surface changed without bumping this floor",
+            signer_self_marked.len()
+        );
+
+        for h in &signer_self_marked {
+            assert!(
+                registry_handlers.contains(h.as_str())
+                    || SIGNER_SELF_NOT_DRIVEN.contains(&h.as_str()),
+                "handler `{h}` carries a caller-self did_matches gate but is neither a \
+                 driven registry row nor in SIGNER_SELF_NOT_DRIVEN; drive its 403"
+            );
+        }
+
+        // Staleness: every SIGNER_SELF_NOT_DRIVEN entry must still be a real
+        // caller-self handler. Vacuous while the list is empty, but it keeps a future
+        // exemption honest (the mirror of the owner/read staleness checks).
+        for name in SIGNER_SELF_NOT_DRIVEN {
+            assert!(
+                signer_self_marked.contains(*name),
+                "SIGNER_SELF_NOT_DRIVEN lists `{name}`, which no longer carries a \
+                 caller-self did_matches gate; update the list"
             );
         }
     }
@@ -1709,5 +1867,35 @@ mod completeness {
                 "self/author did_matches form must NOT be treated as an owner gate: {body}"
             );
         }
+    }
+
+    // ── F3 unit tests: the caller-self did_matches discriminator ─────────────────
+
+    #[test]
+    fn has_signer_self_did_matches_fires_on_caller_self_and_ignores_owner_form() {
+        // Fires: caller-spelled first arg (bound via `let caller = &auth.0;`), a
+        // non-owner second arg, the field-binding form the task handlers use. Proves
+        // the arg1 set is honored (a `&auth.0`-only classifier would miss this).
+        let self_form = "let caller = &auth.0;\n\
+                         if !crate::api::did_matches(caller, &x.foo_did) {\n\
+                             return Err(forbidden(\"...\"));\n\
+                         }";
+        assert!(
+            has_signer_self_did_matches(self_form),
+            "the caller-self field-binding did_matches must be recognized"
+        );
+        // The `&auth.0` spelling with a non-owner second arg fires too.
+        let auth0_form = "if !crate::api::did_matches(&auth.0, &body.assignee_did) {";
+        assert!(
+            has_signer_self_did_matches(auth0_form),
+            "the &auth.0 caller-self form must be recognized"
+        );
+        // Does NOT fire on the owner form (that is has_owner_did_matches' job), so a
+        // caller-self classifier that matched it would double-count.
+        let owner_form = "if !crate::api::did_matches(caller, &record.owner_did) {";
+        assert!(
+            !has_signer_self_did_matches(owner_form),
+            "the owner form must NOT be treated as a caller-self gate (no double-count)"
+        );
     }
 }

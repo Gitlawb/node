@@ -1,10 +1,17 @@
 //! U1: the deny-bearing route set for the invariant deny-prober.
 //!
-//! ONLY the routes that carry a runtime deny to assert live here: owner-gate
-//! (403), read-gate (404), and signature-required (401). Everything else on the
-//! surface (positive-only / public / signer-self) is NOT listed here; U4's
-//! completeness cross-check discharges those against the existing `authz_guard`
-//! classification in `crates/gitlawb-node/src/api/mod.rs`.
+//! Every route that carries a runtime deny to assert lives here: owner-gate
+//! (403), multi-principal (403), read-gate (404), signature-required (401), and
+//! caller-self / actor (403): `SignerSelfGate` for the request-body field
+//! bindings (create_task delegator, claim_task assignee, register did) and
+//! `MultiPrincipalGate` with the assignee arm for the complete/fail actor gates.
+//! The completeness cross-check in `deny_harness.rs` derives the caller-self set
+//! from `src/api` and requires each `did_matches(caller, X)` handler to be a
+//! driven row, so a new one cannot silently escape the sweep.
+//!
+//! Scope: this doc claims the REST/api surface only. The parallel GraphQL
+//! mutation caller-self gates (`src/graphql/mutation.rs`) are out of this
+//! harness and fenced separately (#219).
 //!
 //! Each row is classified by READING its handler, never inferred from the route
 //! name, and records the handler fn name so a reviewer can spot-check. Guessing
@@ -38,12 +45,22 @@ pub enum GateClass {
     ReadGate,
     /// `require_signature` layer -> 401 on the git write routes. Probed unsigned.
     SignatureRequired,
+    /// A caller-self 403 gate that binds a DID field in the request BODY to the
+    /// authenticated signer (`did_matches(caller, &body.<field>_did)`): create_task
+    /// (delegator_did), claim_task (assignee_did), register (did). Probed with a
+    /// validly-signed stranger whose body names the OWNER (mismatch -> 403) plus an
+    /// owner control whose body names the owner (match -> Not403). Distinct from
+    /// `OwnerGate`: the bound identity is a body field, not the stored repo owner,
+    /// and the completeness classifier keys on exactly that (#195, F3, KTD-1). The
+    /// actor-vs-stored caller-self gates (complete_task/fail_task) are the
+    /// `MultiPrincipalGate` assignee-arm shape instead, not this class.
+    SignerSelfGate,
 }
 
 impl GateClass {
     pub fn expected_status(self) -> u16 {
         match self {
-            GateClass::OwnerGate | GateClass::MultiPrincipalGate => 403,
+            GateClass::OwnerGate | GateClass::MultiPrincipalGate | GateClass::SignerSelfGate => 403,
             GateClass::ReadGate => 404,
             GateClass::SignatureRequired => 401,
         }
@@ -63,6 +80,11 @@ pub enum Principal {
     Creator,
     /// The bounty claimant (`did_matches(caller, claimant_did)`).
     Claimant,
+    /// The task assignee (`did_matches(caller, stored assignee_did)`): the actor
+    /// arm of complete_task / fail_task (#195, F3). Unlike the field-binding
+    /// `SignerSelfGate`, the identity is the task's STORED assignee, so the arm is
+    /// driven against a seeded claimed task, not a body field.
+    Assignee,
 }
 
 /// How a read-gate row's positive twin proves the 404 is the gate and not a
@@ -127,6 +149,17 @@ pub enum IdSource {
     /// (bounties.rs:381), so only an "open" bounty reaches the 403; the creator
     /// twin consumes it (open -> cancelled).
     OpenBountyId,
+    /// `{id}` -> the fixture's task seeded "pending" (#195, F3). The claim_task
+    /// caller-self gate fires before the DB claim, so the stranger 403 does not
+    /// consume it; the owner control then claims it (pending -> claimed).
+    ClaimableTaskId,
+    /// `{id}` -> the fixture's task seeded "claimed" by the assignee (#195, F3).
+    /// complete_task's assignee actor gate reaches it; the assignee twin then
+    /// finishes it (claimed -> completed).
+    CompletableTaskId,
+    /// `{id}` -> a second assignee-claimed task (#195, F3), so fail_task's twin
+    /// (claimed -> failed) does not race complete_task for one entity.
+    FailableTaskId,
 }
 
 /// One deny-bearing route. `path` is a template with `{owner}`/`{repo}`/`{id}`
@@ -709,6 +742,84 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
         },
+        // ── Caller-self / actor (403), #195 (F3). The task/register handlers carry
+        //    genuine caller-self 403 gates a bypass would expose (impersonate a
+        //    delegator/assignee, or forge a trust row for a DID you don't control).
+        //    Before this change they were marker-only (INV-21 vacuous); now each is
+        //    driven hostile-then-authorized. The field-binding shape (a body DID
+        //    field must equal the caller) is `SignerSelfGate`; the actor-vs-stored
+        //    shape (caller must equal the task's stored assignee) is
+        //    `MultiPrincipalGate` with the Assignee arm. Register is DRIVEN, not
+        //    excused: the harness runs icaptcha inert (spawn_node never inits the
+        //    verifier), so a stranger-signed POST /api/register reaches the 403.
+        Row {
+            method: "POST",
+            path: "/api/v1/tasks",
+            gate: GateClass::SignerSelfGate,
+            handler: "tasks::create_task",
+            // delegator_did must equal the signer (tasks.rs:101). Stranger names the
+            // owner -> mismatch -> 403; owner names the owner -> match -> 201.
+            body: Some(r#"{"kind":"review","capability":"read","delegator_did":"{owner}"}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/tasks/{id}/claim",
+            gate: GateClass::SignerSelfGate,
+            handler: "tasks::claim_task",
+            // assignee_did must equal the signer (tasks.rs:174); the gate fires
+            // before the DB claim, so the stranger 403 leaves the pending task for
+            // the owner control to claim.
+            body: Some(r#"{"assignee_did":"{owner}"}"#),
+            needs: &["claimable_task_id"],
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::ClaimableTaskId,
+        },
+        Row {
+            method: "POST",
+            path: "/api/register",
+            gate: GateClass::SignerSelfGate,
+            handler: "register::register",
+            // did must equal the signer (register.rs:55). The did must parse
+            // (register.rs:50) so the 403 is reached, so `{owner}` is a real DID.
+            // `message` is an unknown field serde ignores.
+            body: Some(r#"{"did":"{owner}","capabilities":[],"message":"probe"}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/tasks/{id}/complete",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "tasks::complete_task",
+            // Caller must equal the task's STORED assignee (tasks.rs:220). Driven
+            // against a claimed task: stranger -> 403, the assignee arm -> 200.
+            body: Some(r#"{"result":"ok"}"#),
+            needs: &["completable_task_id"],
+            reach: Reach::None,
+            principals: &[Principal::Assignee],
+            id_source: IdSource::CompletableTaskId,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/tasks/{id}/fail",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "tasks::fail_task",
+            // Caller must equal the task's STORED assignee (tasks.rs:273). Its own
+            // claimed task so the assignee twin (claimed -> failed) does not race
+            // complete_task's.
+            body: Some(r#"{"reason":"x"}"#),
+            needs: &["failable_task_id"],
+            reach: Reach::None,
+            principals: &[Principal::Assignee],
+            id_source: IdSource::FailableTaskId,
+        },
         // The read-gate handlers NOT driven here (deferred GET reads, read-gating
         // mutations, git smart-HTTP reads, the content-addressed read, and the
         // global list-filters) are no longer tracked by free-text prose: they are
@@ -868,9 +979,81 @@ mod tests {
             );
         }
         assert!(
-            checked >= 6,
-            "expected at least the six known multi-principal rows (close_pr, \
-             close_issue, dispute/submit/approve/cancel bounty), checked {checked}"
+            checked >= 8,
+            "expected at least the eight known multi-principal rows (close_pr, \
+             close_issue, dispute/submit/approve/cancel bounty, complete_task, \
+             fail_task), checked {checked}"
+        );
+    }
+
+    /// STRUCTURAL enforcement for `SignerSelfGate` rows (#195, F3): each caller-self
+    /// field-binding row's generator output must be exactly one Stranger/Deny(403)
+    /// hostile plus one Owner/Not403 control, and both bodies must bind the self
+    /// field to the owner DID (so the hostile is a real signer-vs-body mismatch and
+    /// the control a real match). Mirrors `multi_principal_rows_emit_one_twin_per_arm`
+    /// so a SignerSelfGate row that stopped emitting its twin (the vacuous-guard
+    /// failure) fails HERE, not only in a DB sweep nobody re-runs. Invokes
+    /// `probes_for` directly, the same generator the real sweep drives.
+    #[test]
+    fn signer_self_rows_emit_one_hostile_and_one_control() {
+        use crate::support::probe::{probes_for, tests_support::fx, Expect, Signer};
+
+        let fixture = fx();
+        let mut checked = 0usize;
+        for r in deny_bearing_routes() {
+            if r.gate != GateClass::SignerSelfGate {
+                continue;
+            }
+            checked += 1;
+            let ps = probes_for(r, &fixture);
+            assert_eq!(
+                ps.len(),
+                2,
+                "signer-self row {} {} must emit exactly two probes, emitted {}",
+                r.method,
+                r.path,
+                ps.len()
+            );
+
+            let hostile = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Stranger && matches!(p.expect, Expect::Deny(403)))
+                .count();
+            assert_eq!(
+                hostile, 1,
+                "signer-self row {} {} must drive exactly one stranger-403 hostile, drove {hostile}",
+                r.method, r.path
+            );
+
+            let control = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Owner && matches!(p.expect, Expect::Not403))
+                .count();
+            assert_eq!(
+                control, 1,
+                "signer-self row {} {} must drive exactly one owner Not403 control, drove {control}",
+                r.method, r.path
+            );
+
+            // The bound self field (delegator_did / assignee_did / did) must resolve
+            // to the owner DID in BOTH bodies: the hostile is a stranger signing a
+            // body that names the owner (mismatch), the control an owner signing the
+            // same (match). A row whose body did not run through `fill()` would carry
+            // a literal `{owner}` and fail here.
+            for p in &ps {
+                let body = String::from_utf8(p.body.clone()).expect("probe body is UTF-8 JSON");
+                assert!(
+                    body.contains(&fixture.owner_did),
+                    "signer-self row {} {} body must bind the self field to the owner DID, got {body}",
+                    r.method,
+                    r.path
+                );
+            }
+        }
+        assert!(
+            checked >= 3,
+            "expected at least the three SignerSelfGate rows (create_task, claim_task, \
+             register), checked {checked}"
         );
     }
 }

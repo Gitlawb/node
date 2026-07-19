@@ -10,3 +10,15 @@ pub mod probe;
 #[allow(dead_code)]
 pub mod routes;
 pub mod signing;
+
+/// A reqwest client with a bounded request timeout, so a wedged git subprocess or
+/// route fails the suite rather than hanging it until CI kills the job (#195, F1).
+/// The two real-node probes that drive git subprocesses use this; the inline
+/// twins at the upload-pack and registry-sweep sites use the same pattern.
+#[allow(dead_code)]
+pub fn bounded_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap()
+}

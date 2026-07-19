@@ -28,10 +28,16 @@ pub struct Fixture {
     pub creator: Keypair,
     /// The bounty claimant, distinct from every other identity.
     pub claimant: Keypair,
+    /// The task assignee, distinct from every other identity (#195, F3). The
+    /// complete/fail actor gates drive their Assignee arm as this identity, so it
+    /// must differ from owner and stranger or the arm cannot false-pass on an
+    /// owner fallback.
+    pub assignee: Keypair,
     pub owner_did: String,
     pub author_did: String,
     pub creator_did: String,
     pub claimant_did: String,
+    pub assignee_did: String,
     /// The id (UUID) of the seeded disputable bounty, filled into the
     /// `dispute_bounty` row's `{id}` placeholder (IdSource::BountyId).
     pub bounty_id: String,
@@ -47,6 +53,15 @@ pub struct Fixture {
     pub submitted_bounty_id: String,
     /// Left "open" (create only) for the cancel_bounty row (IdSource::OpenBountyId).
     pub open_bounty_id: String,
+    /// #195 (F3): a task seeded "pending" (delegated by the owner) for the
+    /// claim_task caller-self row (IdSource::ClaimableTaskId).
+    pub claimable_task_id: String,
+    /// A task seeded "claimed" by the assignee for the complete_task actor row
+    /// (IdSource::CompletableTaskId).
+    pub completable_task_id: String,
+    /// A second assignee-claimed task for the fail_task actor row
+    /// (IdSource::FailableTaskId).
+    pub failable_task_id: String,
     /// The id (UUID) of the seeded issue (authored by `author`), filled into the
     /// `close_issue` row's `{id}` placeholder (IdSource::IssueId).
     pub issue_id: String,
@@ -108,6 +123,11 @@ impl Fixture {
         let creator_did = creator.did().to_string();
         let claimant = Keypair::generate();
         let claimant_did = claimant.did().to_string();
+        // #195 (F3): a distinct assignee identity (!= owner, != stranger) for the
+        // complete/fail actor gates, so their Assignee arm cannot false-pass on an
+        // owner fallback.
+        let assignee = Keypair::generate();
+        let assignee_did = assignee.did().to_string();
         let content_path = "public/a.txt".to_string();
 
         let pub_repo = "prober-pub";
@@ -238,20 +258,35 @@ impl Fixture {
 
         let priv_markers = vec![issue_marker, pr_marker, pr_diff_marker, bounty_marker];
 
+        // #195 (F3): seed the caller-self task entities through the real task write
+        // routes (behind add_auth_layers only, no icaptcha). The claimable task
+        // stays "pending" so its claim control (the owner) can claim it; the
+        // completable and failable tasks are claimed by the assignee, so
+        // complete_task / fail_task reach their assignee actor gate against a
+        // "claimed" task.
+        let claimable_task_id = seed_pending_task(node, &owner).await;
+        let completable_task_id = seed_claimed_task(node, &owner, &assignee).await;
+        let failable_task_id = seed_claimed_task(node, &owner, &assignee).await;
+
         Fixture {
             owner,
             stranger,
             author,
             creator,
             claimant,
+            assignee,
             owner_did,
             author_did,
             creator_did,
             claimant_did,
+            assignee_did,
             bounty_id,
             claimed_bounty_id,
             submitted_bounty_id,
             open_bounty_id,
+            claimable_task_id,
+            completable_task_id,
+            failable_task_id,
             issue_id,
             priv_issue_id,
             priv_bounty_id,
@@ -306,6 +341,74 @@ async fn seed_authored_issue(
         .as_str()
         .expect("created issue carries an id")
         .to_string()
+}
+
+/// Create a "pending" task delegated by `delegator` through the real `create_task`
+/// handler and return its minted id. `create_task` binds `delegator_did` to the
+/// signer, so the body names the signer's DID. Task write routes sit behind
+/// `add_auth_layers` only (no icaptcha), so a signed create reaches the handler.
+async fn seed_pending_task(node: &TestNode, delegator: &Keypair) -> String {
+    use super::signing::signed_request;
+
+    let client = reqwest::Client::new();
+    let delegator_did = delegator.did().to_string();
+    let body =
+        format!(r#"{{"kind":"review","capability":"read","delegator_did":"{delegator_did}"}}"#)
+            .into_bytes();
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        "/api/v1/tasks",
+        body,
+        delegator,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("create task sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "seeding: task create must return 201 (delegator_did binds to the signer)"
+    );
+    let created: serde_json::Value = resp.json().await.expect("task create returns JSON");
+    created["id"]
+        .as_str()
+        .expect("created task carries an id")
+        .to_string()
+}
+
+/// Create a "pending" task (delegated by `owner`), then claim it as `assignee`
+/// (`claim_task` binds `assignee_did` to the signer), leaving it "claimed" so
+/// `complete_task` / `fail_task` reach their assignee actor gate. Returns the id.
+async fn seed_claimed_task(node: &TestNode, owner: &Keypair, assignee: &Keypair) -> String {
+    use super::signing::signed_request;
+
+    let id = seed_pending_task(node, owner).await;
+
+    let client = reqwest::Client::new();
+    let assignee_did = assignee.did().to_string();
+    let claim_path = format!("/api/v1/tasks/{id}/claim");
+    let body = format!(r#"{{"assignee_did":"{assignee_did}"}}"#).into_bytes();
+    let resp = signed_request(
+        &client,
+        reqwest::Method::POST,
+        &node.base_url,
+        &claim_path,
+        body,
+        assignee,
+    )
+    .header("content-type", "application/json")
+    .send()
+    .await
+    .expect("claim task sends");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "seeding: task claim must return 200 (assignee_did binds to the signer)"
+    );
+    id
 }
 
 /// How far along its lifecycle a seeded bounty is driven, expressed as the real
@@ -717,6 +820,8 @@ pub enum Signer {
     Creator,
     /// The bounty claimant arm of dispute_bounty.
     Claimant,
+    /// The task assignee arm of complete_task / fail_task (#195, F3).
+    Assignee,
 }
 
 /// The signer identity that grants a given multi-principal arm. The runtime sweep
@@ -728,6 +833,7 @@ pub fn signer_for_principal(p: Principal) -> Signer {
         Principal::Author => Signer::Author,
         Principal::Creator => Signer::Creator,
         Principal::Claimant => Signer::Claimant,
+        Principal::Assignee => Signer::Assignee,
     }
 }
 
@@ -783,6 +889,11 @@ fn fill(path: &str, fixture: &Fixture, repo: &str, id_source: IdSource) -> Strin
         IdSource::ClaimedBountyId => fixture.claimed_bounty_id.as_str(),
         IdSource::SubmittedBountyId => fixture.submitted_bounty_id.as_str(),
         IdSource::OpenBountyId => fixture.open_bounty_id.as_str(),
+        // #195 (F3): the caller-self task rows, each keyed to a seeded task in the
+        // state its gate needs (pending for claim, claimed for complete/fail).
+        IdSource::ClaimableTaskId => fixture.claimable_task_id.as_str(),
+        IdSource::CompletableTaskId => fixture.completable_task_id.as_str(),
+        IdSource::FailableTaskId => fixture.failable_task_id.as_str(),
     };
     path.replace("{owner}", &fixture.owner_did)
         .replace("{repo}", repo)
@@ -954,6 +1065,45 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
                 withheld: Vec::new(),
             }]
         }
+        GateClass::SignerSelfGate => {
+            // #195 (F3, KTD-1): a body-field caller-self gate. The shared body runs
+            // through `fill()` so `{owner}` resolves to the real owner DID; hostile
+            // and control differ ONLY in signer. Hostile: a Stranger signs but the
+            // body names the owner -> `did_matches(stranger, owner) == false` -> 403.
+            // Control: the Owner signs and the body names the owner -> match ->
+            // Not403. (The repo arg to `fill` is inert here: task/register paths
+            // carry no `{repo}` placeholder, but the signature requires it.)
+            let path = fill(row.path, fixture, &fixture.public_repo, row.id_source);
+            let filled_body = row
+                .body
+                .map(|b| fill(b, fixture, &fixture.public_repo, row.id_source).into_bytes())
+                .unwrap_or_default();
+            vec![
+                Probe {
+                    label: format!("{} signer-self hostile (stranger)", row.handler),
+                    method: method.clone(),
+                    path: path.clone(),
+                    body: filled_body.clone(),
+                    signer: Signer::Stranger,
+                    json,
+                    expect: Expect::Deny(403),
+                    // Each gate returns a fixed forbidden() message before serializing
+                    // any entity, and nothing private is seeded on this substrate, so
+                    // an empty withheld list is the honest assertion (KTD-4).
+                    withheld: Vec::new(),
+                },
+                Probe {
+                    label: format!("{} signer-self control (owner)", row.handler),
+                    method,
+                    path,
+                    body: filled_body,
+                    signer: Signer::Owner,
+                    json,
+                    expect: Expect::Not403,
+                    withheld: Vec::new(),
+                },
+            ]
+        }
     }
 }
 
@@ -970,17 +1120,23 @@ pub mod tests_support {
         let author = Keypair::generate();
         let creator = Keypair::generate();
         let claimant = Keypair::generate();
+        let assignee = Keypair::generate();
         Fixture {
             author_did: author.did().to_string(),
             creator_did: creator.did().to_string(),
             claimant_did: claimant.did().to_string(),
+            assignee_did: assignee.did().to_string(),
             author,
             creator,
             claimant,
+            assignee,
             bounty_id: "bounty-uuid-1234".to_string(),
             claimed_bounty_id: "claimed-bounty-uuid-1234".to_string(),
             submitted_bounty_id: "submitted-bounty-uuid-1234".to_string(),
             open_bounty_id: "open-bounty-uuid-1234".to_string(),
+            claimable_task_id: "claimable-task-uuid-1234".to_string(),
+            completable_task_id: "completable-task-uuid-1234".to_string(),
+            failable_task_id: "failable-task-uuid-1234".to_string(),
             issue_id: "issue-uuid-1234".to_string(),
             priv_issue_id: "priv-issue-uuid-1234".to_string(),
             priv_bounty_id: "priv-bounty-uuid-1234".to_string(),
