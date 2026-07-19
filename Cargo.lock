@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-gitlawb"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "gitlawb-core",
@@ -3312,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-attest"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-node"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3412,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "gl"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3824,6 +3824,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "tracing",
 ]
