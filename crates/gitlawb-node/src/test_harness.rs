@@ -57,6 +57,12 @@ pub struct TestNode {
     /// (sqlx pool clones share one inner, so closing this closes the clones
     /// inside `AppState`/`Db` too).
     pool: PgPool,
+    /// Test-only: when set, `Drop` skips the graceful watch signal so ONLY
+    /// `handle.abort()` tears the serve task down. Defaults false, so every
+    /// other test keeps both redundant teardown mechanisms. Set via
+    /// [`Self::force_abort_only_teardown`] to fence that the abort alone
+    /// releases the database when the graceful chain is broken.
+    suppress_graceful_shutdown_on_drop: bool,
 }
 
 impl Drop for TestNode {
@@ -77,7 +83,13 @@ impl Drop for TestNode {
         // router/state) is dropped on a subsequent scheduler tick, which sqlx
         // cleanup's own awaits provide before the drop statement runs. The
         // race is closed by those scheduling points, not by the abort alone.
-        let _ = self.shutdown_tx.send(true);
+        //
+        // `suppress_graceful_shutdown_on_drop` (test-only) forces the abort to
+        // carry teardown by itself, so a test can fence that the abort line is
+        // load-bearing; it is false everywhere else.
+        if !self.suppress_graceful_shutdown_on_drop {
+            let _ = self.shutdown_tx.send(true);
+        }
         if let Some(handle) = self.server.take() {
             handle.abort();
         }
@@ -174,10 +186,19 @@ pub async fn spawn_node(pool: PgPool) -> TestNode {
         db,
         server: Some(server),
         pool,
+        suppress_graceful_shutdown_on_drop: false,
     }
 }
 
 impl TestNode {
+    /// Test-only: make `Drop` tear the serve task down through `handle.abort()`
+    /// alone by suppressing the graceful watch signal. Used to prove the abort
+    /// is load-bearing (that the database is released even when the graceful
+    /// chain is broken); no production or normal-teardown path calls this.
+    pub fn force_abort_only_teardown(&mut self) {
+        self.suppress_graceful_shutdown_on_drop = true;
+    }
+
     /// Graceful async teardown: signal shutdown, join the serve task, close
     /// the pool, remove the temp repos dir. Call this at the end of every
     /// test. `#[sqlx::test]` issues `DROP DATABASE` as soon as the test
