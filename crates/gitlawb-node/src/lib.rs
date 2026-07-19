@@ -1151,9 +1151,37 @@ fn load_racing_key(path: &std::path::Path) -> Result<Keypair> {
     }
 }
 
+/// Compile-time fault-injection seam for `publish_key_atomically`, extending
+/// the `before_link` closure precedent: every hook is a no-op `Ok` in
+/// production (`PublishFaults::NONE`); tests swap in a hook returning `Err` to
+/// force that step to fail deterministically. Plain `fn` pointers, not a
+/// runtime/env knob: production code only ever passes `NONE`.
+#[derive(Clone, Copy)]
+struct PublishFaults {
+    /// Runs before the `hard_link`; an `Err` is taken as the link result and
+    /// the real link is never attempted.
+    link: fn() -> std::io::Result<()>,
+    /// Runs before the fallback's `write_all`; an `Err` is taken as the write
+    /// result.
+    fallback_write: fn() -> std::io::Result<()>,
+    /// Runs before the fallback's file `sync_all`; an `Err` is taken as the
+    /// fsync result.
+    fallback_fsync: fn() -> std::io::Result<()>,
+}
+
+impl PublishFaults {
+    /// The production value: no fault injected at any step.
+    const NONE: Self = Self {
+        link: || Ok(()),
+        fallback_write: || Ok(()),
+        fallback_fsync: || Ok(()),
+    };
+}
+
 /// Publish `pem` to `final_path` atomically: write the full bytes to a sibling
 /// temp file, then `hard_link` the temp into place. `hard_link` is atomic and
-/// fails if `final_path` already exists, which gives three guarantees at once:
+/// fails if `final_path` already exists, which on the hard-link path gives
+/// these guarantees at once:
 ///   (a) the final path only ever appears with COMPLETE content — a concurrent
 ///       reader never observes an empty/half-written key, unlike a
 ///       `create_new`+`write_all` that exposes an empty inode before the PEM is
@@ -1164,12 +1192,25 @@ fn load_racing_key(path: &std::path::Path) -> Result<Keypair> {
 ///   (d) durability: the PEM bytes are fsynced before the name appears and the
 ///       namespace change is fsynced (on Unix) before success is reported, so a
 ///       power crash cannot leave a durable-but-truncated final key (#194).
+///
+/// If the link fails for any reason other than `AlreadyExists` (a filesystem
+/// without hard-link support, or a transient link error), the publish falls
+/// back to `create_new(0o600)` directly on the final path
+/// (`publish_key_fallback`). The fallback keeps (b): `create_new` still admits
+/// exactly one winner and a lost race loads the existing key. It weakens (a)
+/// and (c): the final name is visible while the PEM is being written, a window
+/// concurrent readers ride out via `load_racing_key`'s wall-clock deadline,
+/// and a crash mid-write leaves a partial final that fails loudly
+/// (`invalid PEM key`) at the next start rather than being cleaned up.
+///
 /// `before_link` is a no-op in production; tests use it to widen the
-/// post-write / pre-link window deterministically.
+/// post-write / pre-link window deterministically. `faults` is the
+/// compile-time fault-injection seam (`PublishFaults::NONE` in production).
 fn publish_key_atomically(
     final_path: &std::path::Path,
     pem: &[u8],
     before_link: &dyn Fn(),
+    faults: PublishFaults,
 ) -> Result<KeyPublish> {
     use std::io::Write;
     let dir = final_path
@@ -1228,7 +1269,7 @@ fn publish_key_atomically(
 
     before_link();
 
-    let linked = std::fs::hard_link(&tmp, final_path);
+    let linked = (faults.link)().and_then(|()| std::fs::hard_link(&tmp, final_path));
     let _ = std::fs::remove_file(&tmp);
     match linked {
         Ok(()) => {
@@ -1248,9 +1289,86 @@ fn publish_key_atomically(
             Ok(KeyPublish::Won)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(KeyPublish::Lost),
-        Err(e) => Err(e)
-            .with_context(|| format!("link identity key into place at {}", final_path.display())),
+        Err(e) => publish_key_fallback(final_path, pem, e, faults),
     }
+}
+
+/// Fallback publish for a key directory whose filesystem cannot hard-link
+/// (Unsupported/EPERM on some network and overlay mounts, or a transient link
+/// error): create the FINAL path directly with `create_new(true).mode(0o600)`
+/// (the INV-23 creation pattern) and write the PEM into it. `AlreadyExists`
+/// still routes to the lost-race path, so no-clobber holds. Split-phase error
+/// handling, mirroring the Won arm's fsync policy in `publish_key_atomically`:
+/// a failed `write_all` removes the final (partial content cannot parse and
+/// would wedge every later start), but a failed file- or dir-fsync does NOT
+/// (the content is complete, and a concurrent loser may already have loaded
+/// it). Every error context chains `link_err` so a two-step failure is
+/// diagnosable.
+fn publish_key_fallback(
+    final_path: &std::path::Path,
+    pem: &[u8],
+    link_err: std::io::Error,
+    faults: PublishFaults,
+) -> Result<KeyPublish> {
+    use std::io::Write;
+    warn!(
+        path = %final_path.display(),
+        err = %link_err,
+        "hard_link failed; publishing identity key via direct create_new fallback"
+    );
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = match opts.open(final_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(KeyPublish::Lost),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "create identity key {} in hard_link fallback (link failed: {link_err})",
+                    final_path.display()
+                )
+            })
+        }
+    };
+    write_key_or_cleanup(
+        final_path,
+        (faults.fallback_write)().and_then(|()| f.write_all(pem)),
+    )
+    .with_context(|| {
+        format!(
+            "hard_link fallback publish to {} (link failed: {link_err})",
+            final_path.display()
+        )
+    })?;
+    (faults.fallback_fsync)()
+        .and_then(|()| f.sync_all())
+        .with_context(|| {
+            format!(
+                "fsync identity key {} in hard_link fallback (link failed: {link_err})",
+                final_path.display()
+            )
+        })?;
+    drop(f);
+    // Fsync the parent directory so the new name is durable before success is
+    // reported, as on the hard-link path. Same policy on failure: the final is
+    // complete and data-synced, so it is NOT removed.
+    #[cfg(unix)]
+    {
+        let dir = final_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::File::open(dir)
+            .with_context(|| format!("open key directory {} to fsync", dir.display()))?
+            .sync_all()
+            .with_context(|| format!("fsync key directory {}", dir.display()))?;
+    }
+    Ok(KeyPublish::Won)
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
@@ -1273,7 +1391,7 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
     // Publish atomically: the final path only ever appears complete, and a lost
     // race loads the winner's key rather than overwriting it.
-    match publish_key_atomically(&key_path, pem.as_bytes(), &|| {})? {
+    match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, PublishFaults::NONE)? {
         KeyPublish::Won => {
             info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
             Ok(kp)
@@ -1347,7 +1465,7 @@ mod gossip_ssrf_tests {
 mod identity_key_tests {
     use super::{
         load_or_create_keypair, load_racing_key, publish_key_atomically, Config, KeyPublish,
-        Keypair, KEY_TEMP_ATTEMPTS,
+        Keypair, PublishFaults, KEY_TEMP_ATTEMPTS,
     };
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
@@ -1366,7 +1484,8 @@ mod identity_key_tests {
         let writer_path = key_path.clone();
         let writer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            publish_key_atomically(&writer_path, pem.as_bytes(), &|| {}).expect("publish");
+            publish_key_atomically(&writer_path, pem.as_bytes(), &|| {}, PublishFaults::NONE)
+                .expect("publish");
         });
 
         let started = std::time::Instant::now();
@@ -1396,7 +1515,8 @@ mod identity_key_tests {
         let pem_b = Keypair::generate().to_pem().expect("pem b");
         assert_ne!(pem_a.as_str(), pem_b.as_str(), "fixtures must differ");
 
-        let out = publish_key_atomically(&key_path, pem_a.as_bytes(), &|| {}).expect("publish a");
+        let out = publish_key_atomically(&key_path, pem_a.as_bytes(), &|| {}, PublishFaults::NONE)
+            .expect("publish a");
         assert!(matches!(out, KeyPublish::Won), "first publish wins");
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap().as_str(),
@@ -1404,7 +1524,8 @@ mod identity_key_tests {
             "final holds the full PEM"
         );
 
-        let out = publish_key_atomically(&key_path, pem_b.as_bytes(), &|| {}).expect("publish b");
+        let out = publish_key_atomically(&key_path, pem_b.as_bytes(), &|| {}, PublishFaults::NONE)
+            .expect("publish b");
         assert!(matches!(out, KeyPublish::Lost), "second publish loses");
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap().as_str(),
@@ -1437,9 +1558,14 @@ mod identity_key_tests {
         let wp = key_path.clone();
         let writer = std::thread::spawn(move || {
             // Hold the post-write / pre-link window open for 200ms.
-            publish_key_atomically(&wp, pem.as_bytes(), &|| {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            })
+            publish_key_atomically(
+                &wp,
+                pem.as_bytes(),
+                &|| {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                },
+                PublishFaults::NONE,
+            )
             .expect("publish");
         });
 
@@ -1493,7 +1619,7 @@ mod identity_key_tests {
         std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600))
             .expect("stale temp perms");
 
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {})
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, PublishFaults::NONE)
             .expect("publish must recover from a stale temp, not wedge the start");
         assert!(matches!(out, KeyPublish::Won), "publish wins");
         assert_eq!(
@@ -1521,10 +1647,11 @@ mod identity_key_tests {
             std::fs::write(&tmp, b"taken").expect("seed taken temp");
         }
 
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}) {
-            Err(e) => e,
-            Ok(_) => panic!("publish must fail when every temp name is taken"),
-        };
+        let err =
+            match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, PublishFaults::NONE) {
+                Err(e) => e,
+                Ok(_) => panic!("publish must fail when every temp name is taken"),
+            };
         let msg = format!("{err:#}");
         assert!(
             msg.contains(&format!(".identity.pem.tmp.{}", std::process::id()))
@@ -1703,6 +1830,224 @@ mod identity_key_tests {
         assert!(
             ensure_key_mode_0600(&key_path).is_ok(),
             "a 0600 key must be accepted"
+        );
+    }
+
+    /// Shared body for the link-failure fallback tests: with the link step
+    /// forced to fail with `kind`, the publish must fall back to a direct
+    /// `create_new(0o600)` on the final path and win; the key must be 0600 and
+    /// round-trip through the normal loader. RED without the fallback: the
+    /// link error propagates and the start fails.
+    fn assert_link_failure_falls_back(faults: PublishFaults) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+            .expect("a failed hard_link must fall back to a direct publish, not fail the start");
+        assert!(matches!(out, KeyPublish::Won), "fallback publish wins");
+
+        let mode = std::fs::metadata(&key_path)
+            .expect("key file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "fallback-published key must be 0600, got {:o}",
+            mode & 0o777
+        );
+        let loaded = super::load_existing_key(&key_path)
+            .expect("fallback-published key loads via the normal loader");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "fallback publish must round-trip the same identity"
+        );
+    }
+
+    // A key directory whose filesystem rejects hard links with EPERM (some
+    // network/overlay mounts) must not brick a new node.
+    #[test]
+    fn permission_denied_link_falls_back_to_direct_create() {
+        assert_link_failure_falls_back(PublishFaults {
+            link: || Err(std::io::ErrorKind::PermissionDenied.into()),
+            ..PublishFaults::NONE
+        });
+    }
+
+    // A filesystem without hard-link support at all (Unsupported).
+    #[test]
+    fn unsupported_link_falls_back_to_direct_create() {
+        assert_link_failure_falls_back(PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        });
+    }
+
+    // Link failure with the final ALREADY present must route to the lost-race
+    // path: the fallback's create_new hits AlreadyExists, the existing key is
+    // loaded, and it is never clobbered.
+    #[test]
+    fn link_failure_with_existing_final_loses_without_clobbering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let winner = Keypair::generate();
+        let pem_winner = winner.to_pem().expect("pem winner");
+        let out = publish_key_atomically(
+            &key_path,
+            pem_winner.as_bytes(),
+            &|| {},
+            PublishFaults::NONE,
+        )
+        .expect("winner publishes");
+        assert!(matches!(out, KeyPublish::Won), "winner publish wins");
+
+        let pem_loser = Keypair::generate().to_pem().expect("pem loser");
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::PermissionDenied.into()),
+            ..PublishFaults::NONE
+        };
+        let out = publish_key_atomically(&key_path, pem_loser.as_bytes(), &|| {}, faults)
+            .expect("an existing final must read as a lost race, not an error");
+        assert!(
+            matches!(out, KeyPublish::Lost),
+            "fallback loses to the existing key"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap().as_str(),
+            pem_winner.as_str(),
+            "the existing key must NOT be clobbered by the fallback"
+        );
+        let loaded = load_racing_key(&key_path).expect("lost race loads the winner");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", winner.did()),
+            "the lost race must return the winner's identity"
+        );
+    }
+
+    // Two concurrent publishers, both with the link step failing: the
+    // fallback's create_new must admit exactly one winner and the loser must
+    // converge on the winner's key (no-clobber survives the fallback path).
+    #[test]
+    fn concurrent_fallback_publishers_converge_on_one_winner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = std::sync::Arc::new(dir.path().join("identity.pem"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let kp = key_path.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    let me = Keypair::generate();
+                    let pem = me.to_pem().expect("pem");
+                    let faults = PublishFaults {
+                        link: || Err(std::io::ErrorKind::Unsupported.into()),
+                        ..PublishFaults::NONE
+                    };
+                    // Release both threads at once to maximize the race.
+                    b.wait();
+                    match publish_key_atomically(&kp, pem.as_bytes(), &|| {}, faults)
+                        .expect("fallback publish")
+                    {
+                        KeyPublish::Won => (true, format!("{}", me.did())),
+                        KeyPublish::Lost => (
+                            false,
+                            format!(
+                                "{}",
+                                load_racing_key(&kp).expect("loser loads winner").did()
+                            ),
+                        ),
+                    }
+                })
+            })
+            .collect();
+        let results: Vec<(bool, String)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread joins"))
+            .collect();
+
+        let winners = results.iter().filter(|(won, _)| *won).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one fallback create_new must win, got {results:?}"
+        );
+        assert_eq!(
+            results[0].1, results[1].1,
+            "the loser must converge on the winner's identity: {results:?}"
+        );
+    }
+
+    // A failed fallback WRITE removes the final: partial content cannot parse
+    // and would wedge every later start on `invalid PEM key`. The error must
+    // surface the write failure AND the original link error, so a two-step
+    // failure is diagnosable.
+    #[test]
+    fn failed_fallback_write_removes_the_partial_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            fallback_write: || Err(std::io::Error::other("injected write failure")),
+            ..PublishFaults::NONE
+        };
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("a failed fallback write must error the start"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("injected write failure"),
+            "the error must surface the write failure: {msg}"
+        );
+        let link_display = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
+        assert!(
+            msg.contains(&link_display),
+            "the error must chain the original link failure ({link_display}): {msg}"
+        );
+        assert!(
+            !key_path.exists(),
+            "a failed fallback write must remove the partial final"
+        );
+    }
+
+    // A failed fallback FSYNC after a complete write errors the start but
+    // leaves the final in place: the content is complete, and a concurrent
+    // loser may already have loaded it (mirrors the Won arm's fsync policy).
+    #[test]
+    fn failed_fallback_fsync_keeps_the_complete_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            fallback_fsync: || Err(std::io::Error::other("injected fsync failure")),
+            ..PublishFaults::NONE
+        };
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("a failed fallback fsync must error the start"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("injected fsync failure"),
+            "the error must surface the fsync failure: {msg}"
+        );
+        let body = std::fs::read_to_string(&key_path)
+            .expect("an fsync failure after a complete write must NOT remove the final");
+        assert_eq!(
+            body.as_str(),
+            pem.as_str(),
+            "the surviving final must hold the complete PEM"
+        );
+        assert!(
+            Keypair::from_pem(&body).is_ok(),
+            "the surviving final must be loadable at the next start"
         );
     }
 }
