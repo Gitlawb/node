@@ -1363,16 +1363,36 @@ impl Db {
         }
 
         // Children keyed on the derived `owner_short/name` slug rather than the id.
-        for table in [
-            "branch_cids",
-            "sync_queue",
-            "received_ref_updates",
-            "arweave_anchors",
-        ] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE repo = $1"))
-                .bind(&slug)
-                .execute(&mut *tx)
-                .await?;
+        // INV-9 same-method slug collision: a canonical `did:key:zX` row and a bare
+        // `zX` mirror both normalize (via OWNER_KEY_CASE_SQL) to slug `zX/name`, so
+        // these tables cannot tell whose rows they are. Purging one row must not wipe
+        // a surviving sibling's records. Gate the slug-scoped deletes on the absence
+        // of any OTHER repos row resolving to the same slug, using the same
+        // OWNER_KEY_CASE_SQL the slug was built from so the check is byte-identical to
+        // the cascade key. (Residual: this is a point-in-time check inside one READ
+        // COMMITTED tx, not full serialization against a concurrent colliding create;
+        // see the plan's KTD4. Purge is the sole caller, so the window is
+        // operator-scoped.)
+        let sibling_exists: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM repos WHERE id <> $1 AND {key} || '/' || name = $2)",
+            key = OWNER_KEY_CASE_SQL
+        ))
+        .bind(id)
+        .bind(&slug)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !sibling_exists {
+            for table in [
+                "branch_cids",
+                "sync_queue",
+                "received_ref_updates",
+                "arweave_anchors",
+            ] {
+                sqlx::query(&format!("DELETE FROM {table} WHERE repo = $1"))
+                    .bind(&slug)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         // NOTE: `bounties` (financial: amount/wallet/tx_hash) and `issue_comments`
         // (no issues table to map issue_id → repo) are deliberately NOT cascaded
@@ -3748,6 +3768,98 @@ mod dedup_db_tests {
             count(&db, "SELECT COUNT(*) FROM pr_reviews WHERE pr_id=$1", "pr1").await,
             0,
             "PR grandchild (pr_reviews) must be deleted with its parent PR"
+        );
+    }
+
+    /// U4 gate-raise (INV-9 same-method slug collision): a canonical `did:key:zX`
+    /// row and a bare `zX` mirror of the same name both normalize to slug `zX/name`,
+    /// which is the key the slug-scoped child tables use. Purging the EMPTY canonical
+    /// row must NOT run the slug-scoped cascade, because that would wipe the surviving
+    /// non-empty mirror's branch_cids/arweave_anchors (keyed on the shared slug). The
+    /// physical `did:key:` row still goes; the sibling's slug-scoped records stay.
+    /// RED on base: the cascade fires and both survivor rows are deleted.
+    #[sqlx::test]
+    async fn delete_repo_keeps_sibling_slug_records_on_collision(pool: PgPool) {
+        let db = db(pool).await;
+        // Two rows collapsing to slug `z6MkSiblingCollisionFixture/victim`: an empty
+        // canonical `did:key:` row (deletion target) and a non-empty bare mirror.
+        let canonical = rec(
+            "rid-canonical-empty",
+            "did:key:z6MkSiblingCollisionFixture",
+            "victim",
+            "empty canonical",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let mirror = rec(
+            "z6MkSiblingCollisionFixture/victim",
+            "z6MkSiblingCollisionFixture",
+            "victim",
+            "non-empty mirror",
+            "2026-02-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.create_repo(&mirror).await.unwrap();
+
+        // Both rows resolve to this slug; the child rows belong to the mirror.
+        let slug = format!(
+            "{}/victim",
+            crate::db::normalize_owner_key("did:key:z6MkSiblingCollisionFixture")
+        );
+        sqlx::query(
+            "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
+             VALUES ($1, 'refs/heads/main', '1', 'cid', 'n', '2026-02-01T00:00:00Z')",
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at)
+             VALUES ('anch1', $1, 'z6MkSiblingCollisionFixture', 'refs/heads/main', '0', '1', 'cid', 'irys', 'https://ar/1', 'n', '2026-02-01T00:00:00Z')",
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // Purge the empty canonical row.
+        let removed = db.delete_repo_by_id("rid-canonical-empty").await.unwrap();
+        assert_eq!(removed, 1, "the empty canonical row is deleted");
+
+        async fn count(db: &Db, sql: &str, arg: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(arg)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        }
+        // The surviving mirror keeps its slug-scoped records (the collision guard
+        // skips the slug-scoped cascade because a sibling row shares the slug).
+        assert!(
+            count(&db, "SELECT COUNT(*) FROM branch_cids WHERE repo=$1", &slug).await > 0,
+            "sibling's branch_cids must survive the collision purge"
+        );
+        assert!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM arweave_anchors WHERE repo=$1",
+                &slug
+            )
+            .await
+                > 0,
+            "sibling's arweave_anchors must survive the collision purge"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM repos WHERE id=$1",
+                "z6MkSiblingCollisionFixture/victim"
+            )
+            .await,
+            1,
+            "the surviving mirror repos row is untouched"
         );
     }
 
