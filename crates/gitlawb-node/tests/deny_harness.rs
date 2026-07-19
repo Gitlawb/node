@@ -6,7 +6,8 @@
 //! Each `#[sqlx::test]` gets an ephemeral per-test database; `spawn_node` runs
 //! the schema migrations and serves the real router on `127.0.0.1:0`. Every
 //! test ends with `node.shutdown().await` so the serve task is joined and the
-//! pool closed before sqlx's `DROP DATABASE` cleanup runs.
+//! pool closed before sqlx's `DROP DATABASE` cleanup runs (except the Drop
+//! regression test at the bottom, which deliberately skips it).
 
 mod support;
 
@@ -551,4 +552,89 @@ async fn shutdown_joins_server_and_closes_pool(pool: sqlx::PgPool) {
         "the server must be gone after shutdown(); got {:?} instead",
         after.map(|r| r.status())
     );
+}
+
+// ── Teardown: Drop without shutdown() must still release the database ─────────
+
+/// A test that returns WITHOUT calling `shutdown()` (early return, forgotten
+/// teardown) must not leave the detached serve task holding pool clones open
+/// against sqlx's cleanup: `#[sqlx::test]` issues a plain `DROP DATABASE` (no
+/// FORCE) the moment the test future returns, a still-connected session makes
+/// the drop fail, and sqlx only prints the error, silently leaking the
+/// per-test database. `TestNode`'s `Drop` tears the server down two redundant
+/// ways: the graceful watch signal, and an abort of the remaining serve
+/// handle (which drops the task's future, and the pool clones inside its
+/// router/state, on a subsequent scheduler tick without depending on the
+/// graceful chain of watcher/connection tasks completing). This test fails if
+/// BOTH are broken (verified by neutering them in turn: with signal and abort
+/// both removed the probe sees the leaked sessions for the full bound; either
+/// mechanism alone drains them by the first probe), so it fences the Drop
+/// teardown contract as a whole rather than either mechanism individually.
+///
+/// Two guards against a vacuous pass: the node pool is built with ambient
+/// reaping disabled (`idle_timeout`/`max_lifetime` `None`; sqlx's default test
+/// pool options reap idle connections after ~1s, which would release the
+/// database by itself and mask a broken teardown), and the probe runs over a
+/// standalone connection rather than a clone of the node pool, so observing
+/// does not itself keep the pool alive.
+#[sqlx::test]
+async fn drop_without_shutdown_unblocks_database(
+    pool_opts: sqlx::postgres::PgPoolOptions,
+    connect_opts: sqlx::postgres::PgConnectOptions,
+) {
+    use sqlx::{ConnectOptions as _, Connection as _};
+
+    let pool = pool_opts
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(connect_opts.clone())
+        .await
+        .expect("node pool connects");
+
+    // Inner scope so the node (and the client's keep-alive connection) drop
+    // exactly as they would when a test body returns, with no shutdown() call.
+    {
+        let node = spawn_node(pool).await;
+        let client = bounded_client();
+        let resp = client
+            .get(format!("{}/health", node.base_url))
+            .send()
+            .await
+            .expect("probe request sends");
+        assert!(
+            resp.status().is_success(),
+            "the server must be live before the drop"
+        );
+    }
+
+    // Standalone observer: count OTHER sessions connected to the per-test
+    // database. Zero means the only session left is the probe itself, i.e. the
+    // database is droppable the instant the probe disconnects, which is
+    // exactly the state sqlx's cleanup needs. Bounded poll: the abort takes
+    // effect on a scheduler tick, not synchronously in Drop.
+    let mut probe = connect_opts
+        .connect()
+        .await
+        .expect("standalone probe connects");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let others: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid()",
+        )
+        .fetch_one(&mut probe)
+        .await
+        .expect("session count query runs");
+        if others == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dropped-without-shutdown node still holds {others} session(s) \
+             against the per-test database after 5s; sqlx's DROP DATABASE \
+             cleanup would fail and leak the database"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    probe.close().await.expect("probe connection closes");
 }
