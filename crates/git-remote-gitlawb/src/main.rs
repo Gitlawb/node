@@ -447,8 +447,15 @@ fn read_upload_pack_round<R: Read>(stdin: &mut R) -> Result<(Vec<u8>, RoundEnd)>
             Err(e) => return Err(e.into()),
         }
 
-        let len_hex = std::str::from_utf8(&len_bytes).unwrap_or("0000");
-        let pkt_len = usize::from_str_radix(len_hex, 16).unwrap_or(0);
+        // A malformed 4-byte length header must NOT be silently collapsed to a
+        // 0000 flush (#192 F5): that masks corrupted/desynchronized protocol input
+        // and can emit accumulated have lines as a synthesized flush round.
+        let Ok(len_hex) = std::str::from_utf8(&len_bytes) else {
+            bail!("malformed pkt-line length prefix: non-UTF-8 bytes {len_bytes:02x?}");
+        };
+        let Ok(pkt_len) = usize::from_str_radix(len_hex, 16) else {
+            bail!("malformed pkt-line length prefix: non-hex {len_hex:?}");
+        };
 
         if pkt_len == 0 {
             // Flush pkt "0000": this round is complete.
@@ -1975,6 +1982,29 @@ mod tests {
         let err = read_upload_pack_round(&mut r).unwrap_err();
         assert!(
             err.to_string().contains("invalid pkt-line length"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// #192 F5: a non-hex length header (e.g. "zzzz") is a malformed frame and must
+    /// be rejected, not silently collapsed to a 0000 flush.
+    #[test]
+    fn read_upload_pack_round_rejects_non_hex_length() {
+        let mut r = io::Cursor::new(b"zzzzdone\n".to_vec());
+        let err = read_upload_pack_round(&mut r).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("pkt-line"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// #192 F5: a non-UTF-8 length header must be rejected, not treated as a flush.
+    #[test]
+    fn read_upload_pack_round_rejects_non_utf8_length() {
+        let mut r = io::Cursor::new(vec![0xffu8, 0xff, 0xff, 0xff]);
+        let err = read_upload_pack_round(&mut r).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("pkt-line"),
             "unexpected error: {err}"
         );
     }
