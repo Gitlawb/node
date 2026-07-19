@@ -264,6 +264,10 @@ fn fetch_with_helper(clone: &Path, node_url: &str) -> (bool, std::process::Outpu
         .arg(clone)
         .args(["fetch", "origin", "main"])
         .env("PATH", path_env)
+        // Pin the C locale so git's diagnostics (asserted on by the withheld-path
+        // test, e.g. `expected ACK/NAK`) are the untranslated English strings on a
+        // machine/CI with git-l10n installed and LANG set to a translated locale.
+        .env("LC_ALL", "C")
         .env("GITLAWB_NODE", node_url)
         .env("GITLAWB_KEY", "/nonexistent-key-for-anon-fetch");
     run_bounded(cmd, Duration::from_secs(30))
@@ -738,6 +742,17 @@ fn real_git_withheld_shaped_first_post() {
             "fetch failed with 0 POSTs to the shim: a pre-POST failure (broken \
              advertisement / helper lookup / connection) is NOT the withheld \
              rejection this test records. git stderr:\n{stderr}"
+        );
+        // Bind to the SPECIFIC #191 break, not any nonzero exit. Real git rejects
+        // the NAK+pack mid-negotiation with `fatal: git fetch-pack: expected
+        // ACK/NAK, got '...'`. A truncated/corrupt response or a later HTTP failure
+        // after the first POST would also exit nonzero with posts>=1; asserting the
+        // signature keeps those from masquerading as the recorded rejection.
+        assert!(
+            stderr.contains("expected ACK/NAK"),
+            "nonzero exit with posts>=1 but not the recorded #191 rejection \
+             (`expected ACK/NAK`): a different failure must not pass as the \
+             withheld-path break. git stderr:\n{stderr}"
         );
         eprintln!(
             "WITHHELD-PATH NOTE (#117): real git did NOT accept a NAK+pack mid-negotiation \
