@@ -655,7 +655,7 @@ pub async fn git_upload_pack(
     // reaches it even when that POST carries no `done`. Track it so the completed-
     // fetch metric counts that path too (#192 F1, filtered case).
     let mut served_filtered_pack = false;
-    let resp = if !visibility_pack::has_path_scoped_rule(&rules) {
+    let (resp, served_pack) = if !visibility_pack::has_path_scoped_rule(&rules) {
         smart_http::upload_pack(&disk_path, body, git_timeout).await
     } else {
         // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
@@ -700,13 +700,16 @@ pub async fn git_upload_pack(
         app
     })?;
     // Count a completed fetch (and observe the pack) only on the POST that actually
-    // completes one. On the plain path that is the finalizing `done` round; counting
-    // per POST would record an N-round stateless-RPC fetch as N completions (#192
-    // F1). The filtered path serves its whole pack on one no-`done` POST, counted via
-    // served_filtered_pack. Either way a completed fetch is exactly one such POST.
+    // completes one, keyed off the RESPONSE outcome rather than the request (#192
+    // F1/F2). On the plain path that is the POST whose response delivered a pack:
+    // this catches a `no-done` completion (server replies `ACK <oid> ready` + pack)
+    // and skips a negotiation-only round (ACK/NAK, no pack), so an N-round
+    // stateless-RPC fetch counts exactly once. The filtered path always builds a
+    // self-contained pack and can't tell an accepted fresh clone from a rejected
+    // mid-negotiation response, so it is gated on the finalizing `done` round.
     // NOTE: observe_pack_size still measures the request body, not the served pack;
     // that mislabel predates this change and is tracked as a follow-up.
-    if should_count_fetch(finalizes_fetch, served_filtered_pack) {
+    if should_count_fetch(finalizes_fetch, served_filtered_pack, served_pack) {
         crate::metrics::record_fetch(&format!("{owner}/{name}"));
         crate::metrics::observe_pack_size(body_len as f64);
     }
@@ -715,13 +718,35 @@ pub async fn git_upload_pack(
 
 /// Whether an upload-pack POST completed a fetch and should be counted once.
 ///
-/// The plain serve path streams a pack only on the finalizing `done` round
-/// (`finalizes_fetch`); the filtered path (`upload_pack_excluding`) serves a
-/// self-contained pack on the one POST that reaches it regardless of negotiation
-/// (`served_filtered_pack`). A completed fetch is exactly one such POST, so this
-/// never double-counts a multi-round negotiation.
-fn should_count_fetch(finalizes_fetch: bool, served_filtered_pack: bool) -> bool {
-    finalizes_fetch || served_filtered_pack
+/// Completion is signalled by the response outcome, split by serve path (#192
+/// F1/F2):
+///
+/// - Plain path (`served_filtered_pack == false`): count exactly when the
+///   response delivered a pack (`response_served_pack`). This counts a `no-done`
+///   completion (server streams `ACK <oid> ready` + pack even though the request
+///   carried no `done`) and does NOT count a negotiation-only round (ACK/NAK, no
+///   pack), so a multi-round fetch is one completion, not N.
+/// - Filtered path (`served_filtered_pack == true`): `upload_pack_excluding`
+///   always builds a self-contained pack, so `response_served_pack` can't
+///   distinguish an accepted fresh clone from a rejected mid-negotiation response.
+///   Gate on the finalizing `done` round: a fresh filtered clone carries
+///   `want`+`done`; the pre-#191 rejected two-POST scenario carries no `done`, so
+///   it is not counted (and not double-counted). Interim until #191 makes filtered
+///   negotiation valid.
+///
+/// The rule is one isolated expression: the filtered branch is
+/// `served_filtered_pack && finalizes_fetch` (reduces to `finalizes_fetch` here),
+/// the plain branch is `response_served_pack`.
+fn should_count_fetch(
+    finalizes_fetch: bool,
+    served_filtered_pack: bool,
+    response_served_pack: bool,
+) -> bool {
+    if served_filtered_pack {
+        finalizes_fetch
+    } else {
+        response_served_pack
+    }
 }
 
 /// True when an upload-pack request body carries a `done` pkt-line, i.e. the
@@ -744,8 +769,13 @@ fn request_finalizes_fetch(body: &[u8]) -> bool {
             return false;
         };
         // 0000/0001/0002 are flush/delim/response-end markers: a 4-byte header
-        // with no payload. Advance past the header and keep scanning.
+        // with no payload. 0003 is not a valid pkt-line length (a pkt-line is
+        // either one of those markers or has length >= 4), so reject it as
+        // malformed framing rather than treating it as a marker.
         if len < 4 {
+            if len == 3 {
+                return false;
+            }
             i += 4;
             continue;
         }
@@ -754,7 +784,10 @@ fn request_finalizes_fetch(body: &[u8]) -> bool {
         }
         let payload = &body[i + 4..i + len];
         if payload.strip_suffix(b"\n").unwrap_or(payload) == b"done" {
-            return true;
+            // A `done` pkt-line finalizes the request; it must be the last thing
+            // in the body. Trailing bytes after it are malformed framing, so fail
+            // closed rather than count.
+            return i + len == body.len();
         }
         i += len;
     }
@@ -1922,50 +1955,128 @@ mod tests {
         assert!(!request_finalizes_fetch(b"000cwantdone"));
         // A malformed length prefix does not panic and does not count.
         assert!(!request_finalizes_fetch(b"zzzzdone\n"));
+        // 0003 is a len<4 value that is NOT a valid marker (only 0000/0001/0002
+        // are); treating it as a marker would skip 4 bytes and read the trailing
+        // `0009done\n` as a finalizer. Reject the malformed framing.
+        assert!(!request_finalizes_fetch(b"00030009done\n"));
+        // A trailing byte after the `done` pkt-line is malformed; fail closed.
+        assert!(!request_finalizes_fetch(b"0009done\nx"));
     }
 
     #[test]
-    fn should_count_fetch_counts_done_or_filtered_but_not_bare_negotiation() {
-        assert!(should_count_fetch(true, false)); // plain: finalizing `done` round
-        assert!(should_count_fetch(false, true)); // filtered: full pack, no `done`
-        assert!(should_count_fetch(true, true)); // filtered fresh clone (want+done)
-        assert!(!should_count_fetch(false, false)); // plain negotiation-only round
+    fn should_count_fetch_uses_response_outcome_split_by_path() {
+        // Plain path (served_filtered_pack = false): count == response_served_pack.
+        assert!(should_count_fetch(false, false, true)); // no-done, pack in response
+        assert!(should_count_fetch(true, false, true)); // done, pack in response
+        assert!(!should_count_fetch(false, false, false)); // negotiation-only, no pack
+        assert!(!should_count_fetch(true, false, false)); // no pack served -> not counted
+
+        // Filtered path (served_filtered_pack = true): count == finalizes_fetch.
+        assert!(should_count_fetch(true, true, true)); // fresh clone: want+done
+        assert!(!should_count_fetch(false, true, true)); // rejected mid-negotiation: no done
+        assert!(!should_count_fetch(false, true, false));
     }
 
+    // (a) #192 F1 — a `no-done` fetch: the client finishes a flush-terminated
+    // round and the server answers `ACK <oid> ready` + pack, with no `done` in the
+    // request. It must count exactly one completion. RED under the old
+    // `finalizes || served_filtered_pack` rule (both false across every round -> 0);
+    // GREEN once the plain path counts off the response pack.
     #[test]
-    fn fetch_completion_counts_once_per_fetch_plain_and_filtered() {
+    fn no_done_plain_fetch_counts_once() {
         crate::metrics::init("0.0.0-test", "did:key:test");
+        let (pack_bearing, negotiation_only) = smart_http::upload_pack_result_fixtures();
 
         let want = "0032want 1111111111111111111111111111111111111111\n";
-        let nego = format!("{want}0000").into_bytes(); // negotiation-only, no done
-        let done = format!("{want}00000009done\n").into_bytes(); // finalizing
+        let no_done = format!("{want}0000").into_bytes(); // no `done` pkt-line
 
-        // Plain path: one POST per round, only the finalizing `done` round streams a
-        // pack. Drive the same decision the handler uses; an N-round fetch counts once.
-        let plain = "fetchgate/plain-counts-once";
-        let before = crate::metrics::fetch_count_for_test(plain);
-        for body in [nego.as_slice(), nego.as_slice(), done.as_slice()] {
-            if should_count_fetch(request_finalizes_fetch(body), false) {
-                crate::metrics::record_fetch(plain);
+        // Two rounds, neither request carrying `done`: a negotiation round (no pack
+        // in the response) then the completing round (pack in the response).
+        let rounds: [(&[u8], &[u8]); 2] = [
+            (no_done.as_slice(), &negotiation_only),
+            (no_done.as_slice(), &pack_bearing),
+        ];
+        let label = "fetchgate/no-done-plain";
+        let before = crate::metrics::fetch_count_for_test(label);
+        for (req, output) in rounds {
+            let finalizes = request_finalizes_fetch(req);
+            let served_pack = smart_http::response_served_pack(output);
+            if should_count_fetch(finalizes, false, served_pack) {
+                crate::metrics::record_fetch(label);
             }
         }
         assert_eq!(
-            crate::metrics::fetch_count_for_test(plain) - before,
+            crate::metrics::fetch_count_for_test(label) - before,
             1,
-            "a plain multi-round fetch must record exactly one completed fetch"
+            "a no-done fetch (server sends pack, request has no `done`) must count once"
         );
+    }
 
-        // Filtered path: upload_pack_excluding serves a self-contained pack on the one
-        // POST that reaches it, which carries no `done`. It must still count once.
-        let filtered = "fetchgate/filtered-counts-once";
-        let before = crate::metrics::fetch_count_for_test(filtered);
-        if should_count_fetch(request_finalizes_fetch(&nego), true) {
-            crate::metrics::record_fetch(filtered);
+    // (b) A plain negotiation-only round (server replies ACK/NAK with no pack)
+    // must count zero, so the intermediate rounds of a multi-round fetch never
+    // over-count.
+    #[test]
+    fn plain_negotiation_only_round_counts_zero() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let (_pack_bearing, negotiation_only) = smart_http::upload_pack_result_fixtures();
+
+        let want = "0032want 1111111111111111111111111111111111111111\n";
+        let no_done = format!("{want}0000").into_bytes();
+        let label = "fetchgate/plain-negotiation-only";
+        let before = crate::metrics::fetch_count_for_test(label);
+        let served_pack = smart_http::response_served_pack(&negotiation_only);
+        if should_count_fetch(request_finalizes_fetch(&no_done), false, served_pack) {
+            crate::metrics::record_fetch(label);
         }
         assert_eq!(
-            crate::metrics::fetch_count_for_test(filtered) - before,
+            crate::metrics::fetch_count_for_test(label) - before,
+            0,
+            "a plain negotiation-only round (no pack in the response) must not count"
+        );
+    }
+
+    // (c) #192 F2 — the pre-#191 rejected filtered scenario: the node answers a
+    // mid-negotiation POST with NAK + a full pack, real git rejects it and (before
+    // #191) the exchange spans two filtered POSTs, neither carrying `done`. It must
+    // count zero, not two. RED under the old rule (each filtered POST set the flag
+    // -> counted twice); GREEN once the filtered path is gated on `done`.
+    #[test]
+    fn rejected_filtered_fetch_counts_zero_not_two() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let want = "0032want 1111111111111111111111111111111111111111\n";
+        let no_done = format!("{want}0000").into_bytes(); // no `done`
+        let label = "fetchgate/rejected-filtered";
+        let before = crate::metrics::fetch_count_for_test(label);
+        // Two filtered POSTs (served_filtered_pack = true, each response carries a
+        // self-contained pack), neither carrying `done`.
+        for _ in 0..2 {
+            if should_count_fetch(request_finalizes_fetch(&no_done), true, true) {
+                crate::metrics::record_fetch(label);
+            }
+        }
+        assert_eq!(
+            crate::metrics::fetch_count_for_test(label) - before,
+            0,
+            "a rejected filtered fetch (no `done`) must not count, and must not double-count"
+        );
+    }
+
+    // (d) A fresh filtered clone carries `want`+`done` and the node serves a full
+    // pack; it must count exactly one.
+    #[test]
+    fn fresh_filtered_clone_counts_once() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let want = "0032want 1111111111111111111111111111111111111111\n";
+        let done = format!("{want}00000009done\n").into_bytes(); // want + done
+        let label = "fetchgate/fresh-filtered-clone";
+        let before = crate::metrics::fetch_count_for_test(label);
+        if should_count_fetch(request_finalizes_fetch(&done), true, true) {
+            crate::metrics::record_fetch(label);
+        }
+        assert_eq!(
+            crate::metrics::fetch_count_for_test(label) - before,
             1,
-            "a filtered fetch served without `done` must still record one completed fetch"
+            "a fresh filtered clone (want+done) must count exactly one"
         );
     }
 
