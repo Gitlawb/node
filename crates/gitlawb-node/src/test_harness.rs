@@ -50,7 +50,9 @@ pub struct TestNode {
     db: Arc<Db>,
     /// The detached `axum::serve` task, joined by [`Self::shutdown`]. `None`
     /// once taken, so the `Drop` fallback never overlaps a completed teardown.
-    server: Option<tokio::task::JoinHandle<()>>,
+    /// Carries `serve`'s own `io::Result<()>` so `shutdown()` can observe it
+    /// rather than discard it (see the coverage note there).
+    server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     /// A clone of the served pool, kept so [`Self::shutdown`] can close it
     /// (sqlx pool clones share one inner, so closing this closes the clones
     /// inside `AppState`/`Db` too).
@@ -154,14 +156,14 @@ pub async fn spawn_node(pool: PgPool) -> TestNode {
     let addr = listener.local_addr().expect("read bound addr");
 
     let server = tokio::spawn(async move {
-        let _ = axum::serve(
+        axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.changed().await;
         })
-        .await;
+        .await
     });
 
     TestNode {
@@ -191,10 +193,20 @@ impl TestNode {
     pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
         if let Some(handle) = self.server.take() {
-            tokio::time::timeout(Duration::from_secs(10), handle)
+            let result = tokio::time::timeout(Duration::from_secs(10), handle)
                 .await
                 .expect("serve task must exit within 10s of the shutdown signal (wedged graceful shutdown)")
                 .expect("serve task must not panic");
+            // Honest coverage contract: on axum 0.8.8,
+            // `WithGracefulShutdown::into_future` always resolves `Ok(())`
+            // (the shutdown signal is treated as success and `accept()`
+            // errors are retried forever rather than returned), so this
+            // `Err` arm is unreachable today - every existing harness test
+            // exercises only the `Ok` path through this line. It is
+            // forward-compat insurance, added at reviewer request, for a
+            // future axum where `serve` can actually fail: that should
+            // surface here as a clear panic, not be silently discarded.
+            result.expect("axum::serve exited with an error");
         }
         self.pool.close().await;
         let _ = std::fs::remove_dir_all(&self.repos_dir);
