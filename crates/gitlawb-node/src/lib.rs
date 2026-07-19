@@ -1081,6 +1081,36 @@ fn ensure_key_mode_0600(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Secure a just-created, still-EMPTY key file before any PEM byte is written
+/// (#194, U2): tighten to 0600, then verify with `ensure_key_mode_0600`. The
+/// pair matters: `create_new`'s requested 0600 is narrowed by the process
+/// umask (0277 lands 0400), so the tighten repairs that first; the verify
+/// alone would falsely fail closed. On a mode-ignoring mount (vfat: chmod
+/// silently no-ops returning Ok) the tighten changes nothing and the verify
+/// fails CLOSED, so the private key never hits a group/other-readable file.
+/// On failure the empty file is removed so a retry is not wedged on
+/// `AlreadyExists`; removal is safe precisely because nothing has been
+/// written yet (the split-phase rule protects only files holding PEM bytes).
+/// `verify_fault` is the fault-injection hook (`Ok` in production).
+#[cfg(unix)]
+fn tighten_and_verify_created(
+    path: &std::path::Path,
+    verify_fault: fn() -> std::io::Result<()>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(anyhow::Error::new)
+        .and_then(|()| verify_fault().map_err(anyhow::Error::new))
+        .and_then(|()| ensure_key_mode_0600(path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(path);
+            e.context(format!(
+                "could not secure just-created identity key {} to 0600",
+                path.display()
+            ))
+        })
+}
+
 /// Outcome of an atomic key publish.
 enum KeyPublish {
     /// We created the key file; it now holds the complete PEM.
@@ -1167,6 +1197,15 @@ struct PublishFaults {
     /// Runs before the fallback's file `sync_all`; an `Err` is taken as the
     /// fsync result.
     fallback_fsync: fn() -> std::io::Result<()>,
+    /// Runs between the tighten and the 0600 verification of the just-created
+    /// TEMP file; an `Err` is taken as the verification result. Simulates a
+    /// mode-ignoring mount (vfat: chmod no-ops returning Ok), which cannot be
+    /// reproduced on ext4.
+    #[cfg(unix)]
+    temp_mode_verify: fn() -> std::io::Result<()>,
+    /// Same, for the FINAL file created on the hard-link fallback path.
+    #[cfg(unix)]
+    fallback_mode_verify: fn() -> std::io::Result<()>,
 }
 
 impl PublishFaults {
@@ -1175,6 +1214,10 @@ impl PublishFaults {
         link: || Ok(()),
         fallback_write: || Ok(()),
         fallback_fsync: || Ok(()),
+        #[cfg(unix)]
+        temp_mode_verify: || Ok(()),
+        #[cfg(unix)]
+        fallback_mode_verify: || Ok(()),
     };
 }
 
@@ -1260,6 +1303,12 @@ fn publish_key_atomically(
             dir.display()
         );
     };
+    // Secure the empty temp BEFORE the PEM bytes hit it: on a mode-ignoring
+    // mount this fails closed with nothing sensitive on disk, and the
+    // hard_link later carries the verified 0600 inode to the final name
+    // (#194, U2).
+    #[cfg(unix)]
+    tighten_and_verify_created(&tmp, faults.temp_mode_verify)?;
     // On a failed write OR fsync, remove the temp so nothing partial is ever
     // linked (#194). The fsync makes the PEM bytes durable BEFORE the name can
     // appear: without it a power crash after the link could leave a durable
@@ -1335,6 +1384,15 @@ fn publish_key_fallback(
             })
         }
     };
+    // Secure the empty final BEFORE the PEM bytes hit it (#194, U2). The
+    // helper's fail-closed removal is what keeps a retry from wedging on
+    // AlreadyExists, and is safe here for the same reason as everywhere: the
+    // file is still empty, so the split-phase keep-the-final rule below does
+    // not apply yet.
+    #[cfg(unix)]
+    tighten_and_verify_created(final_path, faults.fallback_mode_verify).with_context(|| {
+        format!("secure identity key in hard_link fallback (link failed: {link_err})")
+    })?;
     write_key_or_cleanup(
         final_path,
         (faults.fallback_write)().and_then(|()| f.write_all(pem)),
@@ -2048,6 +2106,214 @@ mod identity_key_tests {
         assert!(
             Keypair::from_pem(&body).is_ok(),
             "the surviving final must be loadable at the next start"
+        );
+    }
+
+    /// Env var carrying `mask:site` for `umask_worker_publish_lands_0600`.
+    const UMASK_WORKER_ENV: &str = "GITLAWB_TEST_UMASK_CASE";
+
+    /// Spawns this test binary again, running only the ignored umask worker
+    /// with `mask:site` in the environment. The umask is process-global, so
+    /// setting it in the shared test process narrows every concurrent test's
+    /// file and tempdir creation modes (observed: a parallel test's fresh
+    /// tempdir landing dr-x------ and its file create failing EACCES). A
+    /// child process that runs nothing but the one case confines the mask.
+    fn run_umask_case(mask: &str, site: &str) {
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "identity_key_tests::umask_worker_publish_lands_0600",
+                "--exact",
+                "--ignored",
+            ])
+            .env(UMASK_WORKER_ENV, format!("{mask}:{site}"))
+            .output()
+            .expect("spawn umask worker");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // status alone is not enough: a drifted worker name would match zero
+        // tests and still exit 0, a vacuous green.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "umask {mask} {site} worker did not pass:\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// In-child body of the umask tests: never runs in the shared suite
+    /// process (ignored without the spawning tests' env var). Publishes under
+    /// the given umask and asserts the key lands 0600 and round-trips. The
+    /// mode assertion runs BEFORE the loader call, which would otherwise
+    /// tighten a loose key itself and mask a publish-site regression.
+    #[test]
+    #[ignore = "umask worker: spawned in a child process by the umask_* tests"]
+    fn umask_worker_publish_lands_0600() {
+        let Ok(spec) = std::env::var(UMASK_WORKER_ENV) else {
+            // A manual `--ignored` sweep without the env var: nothing to do.
+            return;
+        };
+        let (mask_str, site) = spec.split_once(':').expect("spec is mask:site");
+        let mask = libc::mode_t::from_str_radix(mask_str, 8).expect("octal mask");
+        let faults = match site {
+            "hardlink" => PublishFaults::NONE,
+            "fallback" => PublishFaults {
+                link: || Err(std::io::ErrorKind::Unsupported.into()),
+                ..PublishFaults::NONE
+            },
+            other => panic!("unknown umask worker site {other:?}"),
+        };
+
+        // The tempdir is created BEFORE the mask narrows, as a deploy's key
+        // directory predates the process umask; 0277 would land the dir
+        // itself 0400. No restore: this process exists only for this case.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+        unsafe { libc::umask(mask) };
+
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+            .expect("publish must succeed: the tighten repairs the umask-narrowed create mode");
+        assert!(matches!(out, KeyPublish::Won), "publish wins");
+
+        let mode = std::fs::metadata(&key_path)
+            .expect("key file exists")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "under umask {mask:o} the published key must land 0600, got {:o}",
+            mode & 0o777
+        );
+        let loaded = super::load_existing_key(&key_path).expect("loader accepts the key");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "publish under umask {mask:o} must round-trip the same identity"
+        );
+    }
+
+    /// #194 (U2): `create_new`'s requested 0600 is narrowed by the process
+    /// umask, so 0277 lands the file 0400; the tighten half of the
+    /// tighten-then-verify pair must repair it to 0600 (the verify alone
+    /// would falsely fail closed). Hard-link site. Pre-state note: before
+    /// U2 this publish already SUCCEEDED but left the key 0400 on disk, so
+    /// the mode assertion is what was RED.
+    #[test]
+    fn umask_0277_hardlink_publish_is_repaired_to_0600() {
+        run_umask_case("277", "hardlink");
+    }
+
+    /// Same repair, at the fallback creation site (link forced to fail).
+    #[test]
+    fn umask_0277_fallback_publish_is_repaired_to_0600() {
+        run_umask_case("277", "fallback");
+    }
+
+    /// #194 (U2): permissive umasks stay healthy: 0600 is already 0600
+    /// under 0077 and 0000, the tighten is a no-op, and the verify must not
+    /// disturb a clean publish. (`created_key_is_mode_0600` pins the suite's
+    /// ambient umask; these pin the boundary values explicitly.)
+    #[test]
+    fn permissive_umasks_0077_and_0000_still_publish_0600() {
+        run_umask_case("077", "hardlink");
+        run_umask_case("000", "hardlink");
+    }
+
+    /// #194 (U2): on a mode-ignoring mount (vfat: chmod silently no-ops) the
+    /// 0600 verification of the just-created TEMP file must fail the publish
+    /// CLOSED, BEFORE any PEM byte is written. Afterwards the key directory
+    /// must be empty: the final never appeared, and the empty temp was
+    /// removed so a retry is not wedged. The error must name the temp file
+    /// and surface the verify failure.
+    #[test]
+    fn forced_temp_mode_verify_failure_fails_closed_before_any_pem_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        let faults = PublishFaults {
+            temp_mode_verify: || Err(std::io::Error::other("injected mode-ignoring mount")),
+            ..PublishFaults::NONE
+        };
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("an unverifiable temp mode must fail the publish closed"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("injected mode-ignoring mount") && msg.contains(".identity.pem.tmp."),
+            "the error must surface the verify failure and name the temp file: {msg}"
+        );
+        assert!(!key_path.exists(), "the final key must never appear");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no PEM byte may hit disk and the empty temp must be removed: {leftovers:?}"
+        );
+    }
+
+    /// #194 (U2): the same fail-closed check at the FALLBACK creation site
+    /// (link fault + verify fault). The just-created EMPTY final must be
+    /// removed, no PEM byte may have hit it, the error must chain the
+    /// original link failure, and a subsequent retry on a healthy mount must
+    /// publish cleanly rather than wedge on AlreadyExists.
+    #[test]
+    fn forced_fallback_mode_verify_failure_removes_the_empty_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            fallback_mode_verify: || Err(std::io::Error::other("injected mode-ignoring mount")),
+            ..PublishFaults::NONE
+        };
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("an unverifiable final mode must fail the publish closed"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("injected mode-ignoring mount") && msg.contains("identity.pem"),
+            "the error must surface the verify failure and name the final: {msg}"
+        );
+        let link_display = std::io::Error::from(std::io::ErrorKind::Unsupported).to_string();
+        assert!(
+            msg.contains(&link_display),
+            "the error must chain the original link failure ({link_display}): {msg}"
+        );
+        assert!(
+            !key_path.exists(),
+            "the empty final must be removed so a retry is not wedged"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "nothing may remain on disk after the fail-closed publish: {leftovers:?}"
+        );
+
+        // The removal is what un-wedges the retry: after a remount (or on a
+        // start whose chmod works) the same path must publish cleanly.
+        let retry_faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, retry_faults)
+            .expect("a retry after the fail-closed publish must not be wedged");
+        assert!(matches!(out, KeyPublish::Won), "retry wins cleanly");
+        let loaded = super::load_existing_key(&key_path).expect("retried key loads");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "the retry must publish the intended identity"
         );
     }
 }
