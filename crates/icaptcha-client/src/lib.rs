@@ -535,6 +535,15 @@ mod tests {
             None,
         );
 
+        // Arm 4: Operator configured, no URL advertised (the node sent only
+        // x-icaptcha-level, not x-icaptcha-url). resolve_solver_url falls back
+        // to the operator origin and marks the key trusted. This is the common
+        // API-key deployment path — a regression that additionally required
+        // url.is_some() for key attachment would leave all current tests green
+        // but make these fallback challenge/answer requests omit Authorization
+        // and fail against the protected operator service.
+        let operator_fallback = IcaptchaCfg::new("did:key:zTEST", None, Some(3));
+
         // Restore env and release the lock BEFORE asserting, so a failing
         // assertion can't poison the shared lock or cascade into a sibling.
         match prev_key {
@@ -564,5 +573,15 @@ mod tests {
             "key must not ride to default origin when operator is configured"
         );
         assert_eq!(default_advert.url, "https://icaptcha.gitlawb.com/v2");
+
+        assert_eq!(
+            operator_fallback.api_key.as_deref(),
+            Some("secret-bearer"),
+            "fallback to operator origin with no advert must still attach key"
+        );
+        assert_eq!(
+            operator_fallback.url, "https://icap.mynode.example",
+            "no-advert path must resolve to operator URL"
+        );
     }
 }
