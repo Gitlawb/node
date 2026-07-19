@@ -34,8 +34,9 @@ use crate::state::AppState;
 /// [`TestNode::shutdown`]: it joins the serve task and closes the pool, so
 /// `#[sqlx::test]`'s `DROP DATABASE` cleanup (which runs the moment the test
 /// future returns) never races the server's still-open connections. Dropping
-/// without it only signals shutdown and removes the temp repository directory,
-/// a best-effort fallback for tests that panic before reaching teardown.
+/// without it signals shutdown, aborts any remaining serve task, and removes
+/// the temp repository directory, a fallback for tests that return or panic
+/// before reaching teardown.
 pub struct TestNode {
     /// Base URL of the running node, e.g. `http://127.0.0.1:54321`.
     pub base_url: String,
@@ -58,13 +59,26 @@ pub struct TestNode {
 
 impl Drop for TestNode {
     fn drop(&mut self) {
-        // Best-effort fallback for tests that panic before reaching
+        // Fallback for tests that return or panic before reaching
         // [`TestNode::shutdown`]: flip the shared shutdown signal so the serve
-        // task exits, then remove the temp repos dir. Drop cannot await, so it
-        // cannot join the server or close the pool; a test that already failed
-        // should not panic again in teardown. Both actions are idempotent, so
-        // running after `shutdown()` is harmless.
+        // task exits gracefully, abort whatever is left of it, and remove the
+        // temp repos dir. Drop cannot await, so it cannot join the server or
+        // close the pool; a test that already failed should not panic again in
+        // teardown. All three actions are idempotent or no-ops after
+        // `shutdown()` (which takes the handle), so running afterwards is
+        // harmless.
+        //
+        // The abort matters when the graceful chain does not run to completion
+        // before sqlx's `DROP DATABASE` cleanup: `JoinHandle::abort()` is a
+        // synchronous cancellation request callable from non-async Drop, and
+        // the aborted task's future (with the `PgPool` clones inside its
+        // router/state) is dropped on a subsequent scheduler tick, which sqlx
+        // cleanup's own awaits provide before the drop statement runs. The
+        // race is closed by those scheduling points, not by the abort alone.
         let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.server.take() {
+            handle.abort();
+        }
         let _ = std::fs::remove_dir_all(&self.repos_dir);
     }
 }
