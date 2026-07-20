@@ -220,7 +220,9 @@ pub fn build_router(state: AppState) -> Router {
         .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
-    let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
+    let arweave_routes = Router::new()
+        .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
+        .route("/api/v1/arweave/verify/{tx_id}", get(arweave::verify_anchor_endpoint));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
@@ -585,8 +587,9 @@ async fn contracts_info(State(state): State<AppState>) -> Json<serde_json::Value
             "name_registry": if name_registry.is_empty() { serde_json::Value::Null } else { serde_json::json!(name_registry) },
         },
         "arweave": {
-            "enabled": !state.config.irys_url.is_empty(),
-            "irys_url": if state.config.irys_url.is_empty() { serde_json::Value::Null } else { serde_json::json!(&state.config.irys_url) },
+            "enabled": !state.config.bundler_url.is_empty(),
+            "bundler_url": if state.config.bundler_url.is_empty() { serde_json::Value::Null } else { serde_json::json!(&state.config.bundler_url) },
+            "gateway": &state.config.arweave_gateway,
         }
     }))
 }

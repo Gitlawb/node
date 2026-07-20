@@ -86,10 +86,15 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_AUTO_SYNC", default_value_t = false)]
     pub auto_sync: bool,
 
-    /// Irys URL for Arweave permanent anchoring.
-    /// Leave empty to disable. Use https://devnet.irys.xyz for free devnet.
-    #[arg(long, env = "GITLAWB_IRYS_URL", default_value = "")]
-    pub irys_url: String,
+    /// Bundler URL for Arweave permanent anchoring (Turbo/upload.ardrive.io).
+    /// Leave empty to disable anchoring.
+    #[arg(long, env = "GITLAWB_BUNDLER_URL", default_value = "")]
+    pub bundler_url: String,
+
+    /// Arweave gateway URL for resolving arweave_tx_id to data items.
+    /// Used by the verify endpoint. Default: https://arweave.net
+    #[arg(long, env = "GITLAWB_ARWEAVE_GATEWAY", default_value = "https://arweave.net")]
+    pub arweave_gateway: String,
 
     /// Base L2 DID registry contract address (0x...)
     #[arg(long, env = "GITLAWB_CONTRACT_DID_REGISTRY", default_value = "")]
