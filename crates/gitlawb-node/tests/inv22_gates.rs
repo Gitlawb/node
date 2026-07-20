@@ -153,3 +153,50 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
         );
     }
 }
+
+/// F4 (repo_store advisory-unlock cancellation safety): `RepoWriteGuard::release`
+/// must await `pg_advisory_unlock` while `self` still owns the pooled connection,
+/// and must not mark itself `released` until that await resolves. Either shape,
+/// reintroduced, re-opens the mid-unlock cancellation leak: taking the connection
+/// early leaves `Drop` with `conn == None`, and setting `released = true` early
+/// leaves the `Drop` backstop inert — both strand the session lock on cancellation.
+///
+/// Scoped to the `release` fn body: the `Drop` impl legitimately takes the
+/// connection and unlocks, so a whole-file scan would match it and read as a false
+/// pass. Reverting either ordering turns this red (proven load-bearing).
+#[test]
+fn f4_release_keeps_conn_owned_until_unlock_resolves() {
+    let repo_store = src("git/repo_store.rs");
+
+    let rel_start = repo_store
+        .find("pub async fn release(mut self")
+        .expect("F4 gate: repo_store.rs no longer defines RepoWriteGuard::release");
+    let rel_end = repo_store[rel_start..]
+        .find("impl Drop for RepoWriteGuard")
+        .map(|off| rel_start + off)
+        .expect("F4 gate: release fn / Drop impl markers moved — update this guard");
+    let release_body = &repo_store[rel_start..rel_end];
+
+    let unlock = release_body
+        .find("pg_advisory_unlock")
+        .expect("F4 gate: release must still issue pg_advisory_unlock");
+    let before_unlock = &release_body[..unlock];
+
+    // (a) the connection must still be owned by `self` at the unlock await.
+    assert!(
+        !before_unlock.contains("self.conn.take()"),
+        "F4 regression: RepoWriteGuard::release takes self.conn BEFORE awaiting \
+         pg_advisory_unlock. A cancellation during the unlock await then strands the \
+         session advisory lock (Drop sees conn == None and skips its backstop). \
+         Unlock through the still-owned connection instead."
+    );
+    // (b) `released` must not be set before the unlock await — the other
+    // reintroduction shape a single-reorder check on (a) alone is blind to.
+    assert!(
+        !before_unlock.contains("released = true"),
+        "F4 regression: RepoWriteGuard::release sets `released = true` BEFORE awaiting \
+         pg_advisory_unlock. A cancellation during the await then leaves the Drop \
+         backstop inert (it early-returns on released). Set released only AFTER the \
+         unlock await resolves."
+    );
+}
