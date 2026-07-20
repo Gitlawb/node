@@ -239,6 +239,7 @@ fn sanitize_tag(s: &str) -> String {
 }
 
 /// Arweave URL for a given transaction ID, resolved through a configurable gateway.
+#[allow(dead_code)]
 pub fn arweave_url(gateway: &str, tx_id: &str) -> String {
     format!("{}/{}", gateway.trim_end_matches('/'), tx_id)
 }
