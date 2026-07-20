@@ -1398,6 +1398,27 @@ impl Db {
         // (no issues table to map issue_id → repo) are deliberately NOT cascaded
         // here — dropping money records or unmappable rows on a repo delete would
         // be wrong. They are left intact by design.
+        //
+        // But bounties key on (repo_owner, repo_name), not an immutable repo id, so
+        // an untouched OPEN bounty would silently re-attach to a same-name repo the
+        // owner recreates and become claimable again (finding F). Tombstone the
+        // repo's non-terminal bounties to a dead `purged` status instead of deleting
+        // them: this preserves the financial record while making them unclaimable
+        // (claim/submit/approve/cancel/dispute all gate on specific non-`purged`
+        // source statuses, so `purged` is inert and no transition reopens it).
+        // Scope by (repo_owner, repo_name) as the surviving purge does; the already
+        // terminal `completed`/`cancelled` bounties are left as-is. (Residual: a
+        // tombstoned bounty stays readable/listable under the same owner/name after
+        // recreation — a view, not a claim/payout re-attach; see the plan's KTD8.)
+        sqlx::query(
+            "UPDATE bounties SET status = 'purged'
+             WHERE repo_owner = $1 AND repo_name = $2
+               AND status IN ('open', 'claimed', 'submitted')",
+        )
+        .bind(&owner_did)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await?;
 
         let result = sqlx::query("DELETE FROM repos WHERE id = $1")
             .bind(id)
@@ -3646,7 +3667,7 @@ mod agent_discovery_tests {
 
 #[cfg(test)]
 mod dedup_db_tests {
-    use super::{Db, RepoRecord};
+    use super::{BountyRecord, Db, RepoRecord};
     use chrono::{DateTime, Utc};
     use sqlx::PgPool;
 
@@ -3860,6 +3881,146 @@ mod dedup_db_tests {
             .await,
             1,
             "the surviving mirror repos row is untouched"
+        );
+    }
+
+    /// U8 (F): bounties key on (repo_owner, repo_name), not an immutable repo id,
+    /// and `delete_repo_by_id` deliberately does not delete them (financial record).
+    /// Without tombstoning, a purged repo's OPEN bounty stays claimable and silently
+    /// re-attaches to a same-name repo recreated by the (spam) owner. The purge must
+    /// transition the affected non-terminal bounties to the terminal `purged` status
+    /// (preserving amount/wallet/tx_hash) so no claim/dispute path can re-expose them.
+    /// A bounty on an unrelated surviving repo must be left untouched.
+    /// RED on base: the bounty stays `open` and `claim_bounty` succeeds after recreate.
+    #[sqlx::test]
+    async fn delete_repo_by_id_tombstones_bounties_against_recreation(pool: PgPool) {
+        let db = db(pool).await;
+        let owner = "did:key:z6MkBountyPurgeFixtureForTombstone";
+        let victim = rec(
+            "rid-bounty-victim",
+            owner,
+            "victim",
+            "spam repo",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&victim).await.unwrap();
+
+        // An unrelated surviving repo with its own open bounty.
+        let survivor_owner = "did:key:z6MkBountySurvivorFixtureUntouched";
+        let survivor = rec(
+            "rid-bounty-survivor",
+            survivor_owner,
+            "keeper",
+            "legit repo",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&survivor).await.unwrap();
+
+        let bounty = |id: &str, r_owner: &str, r_name: &str, status: &str| BountyRecord {
+            id: id.to_string(),
+            repo_owner: r_owner.to_string(),
+            repo_name: r_name.to_string(),
+            issue_id: None,
+            title: "fix the bug".to_string(),
+            amount: 5_000,
+            creator_did: "did:key:z6MkCreator".to_string(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: status.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 604_800,
+            tx_hash: None,
+        };
+        db.create_bounty(&bounty("bnt-victim", owner, "victim", "open"))
+            .await
+            .unwrap();
+        // A mid-flight `claimed` bounty must also be tombstoned: otherwise a later
+        // dispute (which resets `claimed`/`submitted` back to `open`) would re-expose
+        // it on the recreated repo.
+        db.create_bounty(&bounty("bnt-victim-claimed", owner, "victim", "claimed"))
+            .await
+            .unwrap();
+        // An already-terminal `completed` bounty is outside the tombstone set.
+        db.create_bounty(&bounty(
+            "bnt-victim-completed",
+            owner,
+            "victim",
+            "completed",
+        ))
+        .await
+        .unwrap();
+        db.create_bounty(&bounty("bnt-survivor", survivor_owner, "keeper", "open"))
+            .await
+            .unwrap();
+
+        // Purge the spam repo, then let the owner recreate the same owner/name.
+        let removed = db.delete_repo_by_id("rid-bounty-victim").await.unwrap();
+        assert_eq!(removed, 1, "the purged repo row is deleted");
+        let recreated = rec(
+            "rid-bounty-recreated",
+            owner,
+            "victim",
+            "recreated repo",
+            "2026-03-01T00:00:00Z",
+            "2026-03-01T00:00:00Z",
+        );
+        db.create_repo(&recreated).await.unwrap();
+
+        // The purged repo's bounty is tombstoned, so a claim is a no-op: the
+        // `UPDATE ... WHERE status='open'` matches nothing and it stays `purged`.
+        db.claim_bounty(
+            "bnt-victim",
+            "did:key:z6MkAttacker",
+            Some("0xattacker"),
+            "2026-03-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let victim_bounty = db.get_bounty("bnt-victim").await.unwrap().unwrap();
+        assert_eq!(
+            victim_bounty.status, "purged",
+            "the purged repo's bounty must be tombstoned, not re-claimable"
+        );
+        assert!(
+            victim_bounty.claimant_did.is_none(),
+            "the tombstoned bounty must not accept a new claimant"
+        );
+        // The financial record is preserved (tombstoned, not deleted).
+        assert_eq!(victim_bounty.amount, 5_000, "amount preserved on tombstone");
+        assert_eq!(
+            victim_bounty.creator_did, "did:key:z6MkCreator",
+            "creator_did preserved on tombstone"
+        );
+
+        // A mid-flight claimed bounty on the same repo is tombstoned too (so a
+        // dispute cannot reopen it against the recreated repo).
+        let claimed_bounty = db.get_bounty("bnt-victim-claimed").await.unwrap().unwrap();
+        assert_eq!(
+            claimed_bounty.status, "purged",
+            "a claimed bounty on the purged repo must also be tombstoned"
+        );
+        // An already-terminal completed bounty is left as-is (not in the tombstone set).
+        let completed_bounty = db
+            .get_bounty("bnt-victim-completed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed_bounty.status, "completed",
+            "a terminal completed bounty must be left untouched"
+        );
+
+        // The unrelated survivor's bounty is untouched and still claimable.
+        let survivor_bounty = db.get_bounty("bnt-survivor").await.unwrap().unwrap();
+        assert_eq!(
+            survivor_bounty.status, "open",
+            "an unrelated repo's bounty must stay open"
         );
     }
 
