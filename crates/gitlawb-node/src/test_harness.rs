@@ -97,6 +97,47 @@ impl Drop for TestNode {
     }
 }
 
+/// Outcome of joining the serve task during teardown, split so the wedged-task
+/// path is observable to a test (which injects a short timeout) without waiting
+/// the production teardown window.
+enum ServeTeardown {
+    /// The task returned (carrying `serve`'s `io::Result<()>`) — either within
+    /// the timeout, or in the race between the timeout firing and the abort
+    /// landing. A task that actually finished is never a wedge.
+    Graceful(std::io::Result<()>),
+    /// The task did not finish within the timeout and was aborted (cancelled)
+    /// and reaped.
+    TimedOutAborted,
+}
+
+/// Join `handle` within `timeout`; on expiry `abort()` it and await the aborted
+/// handle so the serve task (and the `PgPool` clones inside its router/state) is
+/// reaped BEFORE the caller returns and `#[sqlx::test]` runs `DROP DATABASE`.
+/// Takes `&mut` (a `JoinHandle` is `Unpin`) so ownership is retained across the
+/// timeout and the handle can be aborted on expiry — the previous code moved the
+/// handle into `timeout` and, on elapse, dropped it, which DETACHES the still
+/// running task rather than aborting it, leaking the test database (#194 F2).
+async fn join_or_abort(
+    handle: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    timeout: Duration,
+) -> ServeTeardown {
+    match tokio::time::timeout(timeout, &mut *handle).await {
+        Ok(join_result) => ServeTeardown::Graceful(join_result.expect("serve task must not panic")),
+        Err(_elapsed) => {
+            handle.abort();
+            match handle.await {
+                // The task finished in the race between the timeout firing and
+                // the abort landing — honor its result, not a false wedge.
+                Ok(result) => ServeTeardown::Graceful(result),
+                Err(e) if e.is_cancelled() => ServeTeardown::TimedOutAborted,
+                // A genuine panic in the serve task surfaces here, mirroring the
+                // in-time arm's `.expect("serve task must not panic")`.
+                Err(e) => std::panic::resume_unwind(e.into_panic()),
+            }
+        }
+    }
+}
+
 /// Allocate a process-unique temp directory for a spawned node's repositories
 /// without pulling in the `tempfile` dev-dependency (which is unavailable to
 /// the library crate under `--features test-harness`).
@@ -211,26 +252,49 @@ impl TestNode {
     /// When `self` drops on return, `Drop` re-sends the signal and re-removes
     /// the dir; both are idempotent, and the serve handle was already taken,
     /// so the overlap is harmless.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(self) {
+        self.shutdown_with_timeout(Duration::from_secs(10)).await;
+    }
+
+    /// Body of [`Self::shutdown`] with an injectable teardown timeout so a test
+    /// can drive the wedged-shutdown path without waiting the production 10s.
+    /// Production always calls this with 10s.
+    async fn shutdown_with_timeout(mut self, timeout: Duration) {
         let _ = self.shutdown_tx.send(true);
-        if let Some(handle) = self.server.take() {
-            let result = tokio::time::timeout(Duration::from_secs(10), handle)
-                .await
-                .expect("serve task must exit within 10s of the shutdown signal (wedged graceful shutdown)")
-                .expect("serve task must not panic");
-            // Honest coverage contract: on axum 0.8.8,
-            // `WithGracefulShutdown::into_future` always resolves `Ok(())`
-            // (the shutdown signal is treated as success and `accept()`
-            // errors are retried forever rather than returned), so this
-            // `Err` arm is unreachable today - every existing harness test
-            // exercises only the `Ok` path through this line. It is
-            // forward-compat insurance, added at reviewer request, for a
-            // future axum where `serve` can actually fail: that should
-            // surface here as a clear panic, not be silently discarded.
-            result.expect("axum::serve exited with an error");
-        }
+        let outcome = match self.server.take() {
+            Some(mut handle) => Some(join_or_abort(&mut handle, timeout).await),
+            None => None,
+        };
+        // Release the pool and temp dir on EVERY path before returning OR
+        // panicking. A wedged graceful shutdown is exactly when in-flight
+        // per-connection tasks still hold `PgPool` clones; aborting the serve
+        // future alone does not reliably drop them, so the explicit
+        // `pool.close()` (which closes the shared inner) is what frees them
+        // before `#[sqlx::test]` runs `DROP DATABASE`. Panicking before this
+        // (the previous behavior) skipped the close on the one path that needs
+        // it most (#194 F2).
         self.pool.close().await;
         let _ = std::fs::remove_dir_all(&self.repos_dir);
+        match outcome {
+            // Honest coverage contract: on axum 0.8.8,
+            // `WithGracefulShutdown::into_future` always resolves `Ok(())` (the
+            // shutdown signal is treated as success and `accept()` errors are
+            // retried forever rather than returned), so this `Err` arm is
+            // unreachable today - every existing harness test exercises only the
+            // `Ok` path here. Forward-compat insurance for a future axum where
+            // `serve` can fail: that should surface as a clear panic, not be
+            // silently discarded.
+            Some(ServeTeardown::Graceful(result)) => {
+                result.expect("axum::serve exited with an error");
+            }
+            Some(ServeTeardown::TimedOutAborted) => {
+                panic!(
+                    "serve task did not exit within {timeout:?} of the shutdown \
+                     signal (wedged graceful shutdown)"
+                );
+            }
+            None => {}
+        }
     }
 
     /// Insert a repo owned by `owner_did` and return its repo id. Mirrors
@@ -352,5 +416,53 @@ impl TestNode {
         );
 
         oids
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{join_or_abort, ServeTeardown};
+    use std::time::Duration;
+
+    /// A wedged serve task (never returns within the window) must be ABORTED and
+    /// reaped on timeout, not detached. The previous teardown moved the
+    /// `JoinHandle` into `timeout` and dropped it on elapse, which detaches the
+    /// still-running task and leaks the test DB across `DROP DATABASE` (#194 F2).
+    /// Load-bearing: neutralize the abort in `join_or_abort` (return without
+    /// abort+await) and this flips RED — `handle.is_finished()` stays false
+    /// because the task was left running.
+    #[tokio::test]
+    async fn join_or_abort_aborts_a_wedged_task_on_timeout() {
+        let mut handle: tokio::task::JoinHandle<std::io::Result<()>> = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        assert!(
+            matches!(
+                join_or_abort(&mut handle, Duration::from_millis(50)).await,
+                ServeTeardown::TimedOutAborted
+            ),
+            "a task that never returns must be reported timed-out, not graceful"
+        );
+        assert!(
+            handle.is_finished(),
+            "the wedged serve task must be aborted and reaped, not detached"
+        );
+    }
+
+    /// A task that returns within the window is reported graceful, carrying its
+    /// `io::Result` — the normal teardown path.
+    #[tokio::test]
+    async fn join_or_abort_reports_graceful_when_task_exits_in_time() {
+        let mut handle: tokio::task::JoinHandle<std::io::Result<()>> =
+            tokio::spawn(async { Ok(()) });
+        assert!(
+            matches!(
+                join_or_abort(&mut handle, Duration::from_secs(5)).await,
+                ServeTeardown::Graceful(Ok(()))
+            ),
+            "a prompt clean exit must be reported graceful"
+        );
     }
 }
