@@ -300,8 +300,7 @@ impl RepoStore {
     /// [`try_lock_repo`](Self::try_lock_repo) against a caller-chosen pool. The
     /// Postgres advisory lock is DATABASE-global, so the lock still mutually
     /// excludes holders of the same key from any other pool — only the connection
-    /// the guard pins comes from `pool`. `create_repo` uses this with the app pool
-    /// so its transient lock never draws from the write `lock_pool`.
+    /// the guard pins comes from `pool`. Backs the `lock_pool`-based delegators.
     async fn try_lock_repo_on(
         &self,
         pool: &PgPool,
@@ -448,12 +447,9 @@ impl RepoStore {
     }
 
     /// [`lock_repo_blocking`](Self::lock_repo_blocking) against a caller-chosen
-    /// pool. `create_repo` passes the app pool so its transient serialization lock
-    /// (check-exists -> init -> insert) does not draw a connection from the write
-    /// `lock_pool` — a receive-pack burst that pins every lock-pool connection
-    /// must not starve repo creation. The advisory lock is DB-global, so this
-    /// still serializes create against a same-key purge that holds the lock from
-    /// the lock pool.
+    /// pool. The advisory lock is DB-global, so the guard mutually excludes the same
+    /// key across pools; only the pinned connection comes from `pool`. Backs the
+    /// `lock_pool`-based [`lock_repo_blocking`](Self::lock_repo_blocking) delegator.
     pub async fn lock_repo_blocking_on(
         &self,
         pool: &PgPool,

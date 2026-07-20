@@ -247,13 +247,12 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool. Most DB access goes through
-    /// `Db`'s methods; the write advisory-lock subsystem uses its own pool
-    /// (`connect_lock_pool`). `create_repo` is the one production caller: its
-    /// transient serialization lock is taken on THIS app pool rather than the
-    /// write lock pool, so a write burst that pins the lock pool cannot starve
-    /// repo creation.
-    pub(crate) fn pool(&self) -> &PgPool {
+    /// Access the underlying Postgres connection pool. Test-only: all production DB
+    /// access goes through `Db`'s methods, and the write advisory-lock subsystem uses
+    /// its own pool (`connect_lock_pool`). Tests reach for the raw pool to seed and
+    /// assert directly.
+    #[cfg(test)]
+    pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
@@ -917,6 +916,18 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
 /// drift apart. If you change `normalize_owner_key`, update this const too.
 const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
 
+/// `OWNER_KEY_CASE_SQL` over an arbitrary owner column. The const above hardcodes
+/// `owner_did` (the `repos` column the `idx_repos_owner_key_name` index is built
+/// on); the bounty tombstone needs the same normalizer over `bounties.repo_owner`,
+/// which is not index-backed. Byte-identical to `normalize_owner_key`; update this
+/// alongside the const and the fn if the rule changes.
+fn owner_key_case_sql(col: &str) -> String {
+    format!(
+        "CASE WHEN {col} LIKE 'did:key:%' AND position(':' in substr({col}, 9)) = 0 \
+         THEN substr({col}, 9) ELSE {col} END"
+    )
+}
+
 #[cfg(test)]
 mod normalize_owner_key_tests {
     use super::normalize_owner_key;
@@ -1412,22 +1423,34 @@ impl Db {
         // tombstoned bounty stays readable/listable under the same owner/name after
         // recreation — a view, not a claim/payout re-attach; see the plan's KTD8.)
         //
-        // Match BOTH owner representations. `create_bounty` stores `repo_owner`
-        // verbatim from the URL Path param, which is commonly the bare SHORT form
-        // (`z6Mk...`), while `repos.owner_did` here is the full `did:key:z6Mk...`.
-        // Binding only the full form leaves the common short-form bounty `open`, so it
-        // re-attaches to the recreated repo — the exact hole the tombstone closes.
-        // `normalize_owner_key` gives the bare short form the URL uses.
-        sqlx::query(
-            "UPDATE bounties SET status = 'purged'
-             WHERE repo_owner IN ($1, $2) AND repo_name = $3
-               AND status IN ('open', 'claimed', 'submitted')",
-        )
-        .bind(&owner_did)
-        .bind(normalize_owner_key(&owner_did))
-        .bind(&name)
-        .execute(&mut *tx)
-        .await?;
+        // Gate the tombstone on the SAME sibling check as the cascade: only when no
+        // other repos row resolves to this slug. If a mirror row survives, the logical
+        // repo still exists (and still serves via the mirror), so its bounty is still
+        // valid — tombstoning it would kill a live repo's bounty. Only when the last
+        // row for the slug is gone can a recreate re-attach an open bounty.
+        //
+        // When it does fire, match EVERY owner representation by normalizing BOTH sides.
+        // `create_bounty` stores `repo_owner` verbatim from the URL Path param, commonly
+        // the bare SHORT form (`z6Mk...`), but a full-DID URL that resolves to a bare
+        // mirror row yields the FULL `did:key:z6Mk...` form. The repo row here is likewise
+        // either form (`delete_repo_by_id` is reachable on bare mirror rows). Comparing the
+        // SQL-normalized stored `repo_owner` against the normalized target covers all four
+        // combinations (did:key-row + short-bounty AND bare-row + full-bounty); binding
+        // only one side left the mirror form `open`, so it re-attached to the recreated
+        // repo. It's a rare purge, so a seq scan on `bounties` (the normalizer is not
+        // index-backed) is fine.
+        if !sibling_exists {
+            sqlx::query(&format!(
+                "UPDATE bounties SET status = 'purged'
+                 WHERE {key} = $1 AND repo_name = $2
+                   AND status IN ('open', 'claimed', 'submitted')",
+                key = owner_key_case_sql("repo_owner")
+            ))
+            .bind(normalize_owner_key(&owner_did))
+            .bind(&name)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         let result = sqlx::query("DELETE FROM repos WHERE id = $1")
             .bind(id)
@@ -3854,6 +3877,30 @@ mod dedup_db_tests {
         .await
         .unwrap();
 
+        // An OPEN bounty on the shared owner/name — it belongs to the logical repo the
+        // surviving mirror still serves, so purging the empty sibling must NOT tombstone it.
+        db.create_bounty(&BountyRecord {
+            id: "bnt-collision".to_string(),
+            repo_owner: "z6MkSiblingCollisionFixture".to_string(),
+            repo_name: "victim".to_string(),
+            issue_id: None,
+            title: "sibling bounty".to_string(),
+            amount: 5_000,
+            creator_did: "did:key:z6MkCreator".to_string(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".to_string(),
+            created_at: "2026-02-01T00:00:00Z".to_string(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 604_800,
+            tx_hash: None,
+        })
+        .await
+        .unwrap();
+
         // Purge the empty canonical row.
         let removed = db.delete_repo_by_id("rid-canonical-empty").await.unwrap();
         assert_eq!(removed, 1, "the empty canonical row is deleted");
@@ -3890,6 +3937,17 @@ mod dedup_db_tests {
             .await,
             1,
             "the surviving mirror repos row is untouched"
+        );
+        // The bounty is NOT tombstoned: the mirror still serves the logical repo, so
+        // the tombstone is gated on no sibling surviving.
+        assert_eq!(
+            db.get_bounty("bnt-collision")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "open",
+            "a bounty on a repo whose mirror survives the purge must stay open, not be tombstoned"
         );
     }
 
@@ -4087,6 +4145,47 @@ mod dedup_db_tests {
         assert_eq!(
             survivor_bounty.status, "open",
             "an unrelated repo's bounty must stay open"
+        );
+
+        // Symmetric owner-form case (the mirror of `bnt-victim-short`). Here the repo
+        // row is the BARE short-owner mirror (`owner_did = z6X`), while the bounty was
+        // stored in the FULL `did:key:z6X` form, the shape a full-DID URL that
+        // resolves to the bare mirror produces. The tombstone must normalize BOTH the
+        // stored `repo_owner` and the target, or this full-form bounty stays `open`
+        // when the bare row is purged and re-attaches to a recreated repo, the same
+        // re-attach hole in the opposite direction. `delete_repo_by_id` is reachable on
+        // bare mirror rows (`list_repos_by_owner_did` matches under normalization).
+        // RED before the symmetric fix (only the target side was normalized): stays
+        // `open`. GREEN after: `purged`.
+        let bare_owner = "z6MkBareOwnerFixtureForSymmetricTombstone";
+        let bare = rec(
+            "rid-bounty-bare-victim",
+            bare_owner,
+            "victim",
+            "bare spam repo",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&bare).await.unwrap();
+        db.create_bounty(&bounty(
+            "bnt-bare-full",
+            &format!("did:key:{bare_owner}"),
+            "victim",
+            "open",
+        ))
+        .await
+        .unwrap();
+        let removed_bare = db
+            .delete_repo_by_id("rid-bounty-bare-victim")
+            .await
+            .unwrap();
+        assert_eq!(removed_bare, 1, "the bare-owner repo row is deleted");
+        let bare_full_bounty = db.get_bounty("bnt-bare-full").await.unwrap().unwrap();
+        assert_eq!(
+            bare_full_bounty.status, "purged",
+            "a FULL-form bounty on a BARE-owner repo row must be tombstoned too \
+             (symmetric normalization); RED before: only the target side was \
+             normalized, so the full-form bounty stayed open"
         );
     }
 
