@@ -208,9 +208,16 @@ pub async fn create_repo(
     // explicitly on the success path, and its guard's Drop frees the lock on every
     // error path below. Bounded-wait (no object-store I/O), so the uncontended hot
     // path returns on the first attempt. (KTD6, R6.)
+    //
+    // Take this transient lock on the APP pool, not the write lock_pool. lock_pool
+    // is sized for long-held receive-pack write guards; a push burst that pins it
+    // would otherwise starve create's acquire (-> 500). The advisory lock is
+    // DB-global, so locking from the app pool still serializes against a same-key
+    // purge holding the lock from lock_pool. (INV-15 sibling: don't couple a cheap
+    // path to the expensive path's capacity.)
     let repo_lock = state
         .repo_store
-        .lock_repo_blocking(&owner_did, &req.name)
+        .lock_repo_blocking_on(state.db.pool(), &owner_did, &req.name)
         .await
         .map_err(|e| AppError::Git(e.to_string()))?
         .ok_or_else(|| {
@@ -579,11 +586,12 @@ pub async fn git_info_refs(
     // trusted-proxy policy as the POST middleware (shared buckets).
     if service == "git-receive-pack" {
         if let Some(key) = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust) {
-            if !state.push_rate_limiter.check(&key).await {
+            // Use check_retry (like U5's other 429 sites) so the rejection carries a
+            // window-derived Retry-After, built via the shared 429 response helper
+            // that the per-IP middleware also uses.
+            if let Some(retry_after) = state.push_rate_limiter.check_retry(&key).await {
                 tracing::warn!(repo = %name, key = %key, "receive-pack advertisement rate limited");
-                return Err(AppError::TooManyRequests(
-                    "push rate limit exceeded — try again later".into(),
-                ));
+                return Ok(crate::rate_limit::too_many_requests(retry_after));
             }
         }
     }
@@ -2678,6 +2686,60 @@ mod tests {
         );
     }
 
+    /// The receive-pack advertisement 429 must carry a window-derived Retry-After,
+    /// consistent with the other push 429 sites (U5). Before the fix this site
+    /// returned a bare 429 with no Retry-After header at all — a client had nothing
+    /// to back off on. A freshly-filled bucket's oldest
+    /// entry is ~now, so the advertised delay must be close to the whole window
+    /// (100s), never missing and never the old constant 60.
+    #[sqlx::test]
+    async fn receive_pack_advertisement_429_carries_window_derived_retry_after(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Budget 1, 100s window, keyed on the socket peer (no trusted proxy).
+        state.push_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(100));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6advretry", "adv", "/tmp/advretry", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.56:6000".parse().unwrap();
+        // Fill the single-request budget so the handler's own check rejects.
+        assert!(state.push_rate_limiter.check(&peer.ip().to_string()).await);
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advretry/adv/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry: u64 = resp
+            .headers()
+            .get("retry-after")
+            .expect("advertisement 429 must carry a retry-after header")
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("retry-after must be an integer number of seconds");
+        assert!(
+            (95..=100).contains(&retry),
+            "freshly-filled bucket must advertise ~window (95..=100s), got {retry} \
+             (missing header or constant-60 bug otherwise)"
+        );
+    }
+
     // U2/R3/AE1: a fully-received push must complete server-side even when the
     // client disconnects during the apply. The pack is buffered before the
     // handler runs, so the acquire→receive→release core is detached from the
@@ -3836,5 +3898,98 @@ mod tests {
             dir.exists(),
             "on-disk dir present after an uncontended create"
         );
+    }
+
+    // create_repo's transient serialization lock must NOT draw from the write
+    // lock_pool. lock_pool is sized for LONG-HELD receive-pack write guards; a
+    // concurrent-push burst that pins every lock_pool connection would otherwise
+    // starve legitimate repo creation (create's acquire times out -> 500). The fix
+    // takes create's transient lock on the APP pool instead, which the write burst
+    // never touches. RED on base (create locks on lock_pool): with the lock_pool
+    // saturated by held write guards, create errors. GREEN after (create locks on
+    // the app pool): create still succeeds.
+    #[sqlx::test]
+    async fn create_repo_survives_a_saturated_lock_pool(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use axum::extract::State;
+        use axum::Extension;
+        use std::time::Duration;
+
+        // App pool: serves state.db AND (after the fix) create's transient lock.
+        let app_pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts.clone())
+            .await
+            .unwrap();
+        let mut state = crate::test_support::test_state(app_pool.clone()).await;
+
+        // A SEPARATE, small write lock pool that fails fast on exhaustion, so a
+        // create wired to it errors quickly rather than blocking the whole test.
+        const N: u32 = 2;
+        let lock_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(N)
+            .acquire_timeout(Duration::from_secs(2))
+            .min_connections(0)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .test_before_acquire(false)
+            .connect_with(connect_opts.clone())
+            .await
+            .unwrap();
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            lock_pool.clone(),
+        );
+
+        // Saturate the lock pool with N held write guards on distinct repos — the
+        // 32-writer burst, scaled down. Each guard pins one lock_pool connection.
+        let mut guards = Vec::new();
+        for i in 0..N {
+            let owner = format!("did:key:z6MkSaturateLock{i}AAAAAAAAAAAAAAAAAAAAAA");
+            guards.push(
+                state
+                    .repo_store
+                    .acquire_write(&owner, "held")
+                    .await
+                    .unwrap(),
+            );
+        }
+        // The lock pool is exhausted, so the create assertion below is load-bearing
+        // (not vacuously green because the pool happened to be idle).
+        assert!(
+            lock_pool.acquire().await.is_err(),
+            "the lock pool must be exhausted by N held write guards"
+        );
+
+        // create for an UNCONTENDED key. Its advisory lock is free (the write
+        // guards hold different keys), so the only thing that can stop it is the
+        // saturated lock_pool — which it must not touch.
+        let owner = "did:key:z6MkCreateAppPoolCCCCCCCCCCCCCCCCCCCCCCCC";
+        let name = "created";
+        let created = super::create_repo(
+            State(state.clone()),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            axum::http::HeaderMap::new(),
+            Json(CreateRepoRequest {
+                name: name.to_string(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+            }),
+        )
+        .await
+        .expect("create must survive a saturated lock pool by locking on the app pool");
+        assert_eq!(created.0, StatusCode::CREATED);
+        assert!(
+            state.db.get_repo(owner, name).await.unwrap().is_some(),
+            "row present after a create under a saturated lock pool"
+        );
+
+        for g in guards {
+            g.release(true).await;
+        }
     }
 }

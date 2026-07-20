@@ -72,7 +72,9 @@ impl RateLimiter {
 
     /// Returns `true` if the request is allowed. Thin wrapper over
     /// [`check_retry`](Self::check_retry) for callers that only need the
-    /// allow/deny decision, not the rejection's Retry-After delay.
+    /// allow/deny decision, not the rejection's Retry-After delay. Test-only now:
+    /// production 429 sites use `check_retry` so they can advertise Retry-After.
+    #[cfg(test)]
     pub(crate) async fn check(&self, key: &str) -> bool {
         self.check_retry(key).await.is_none()
     }
