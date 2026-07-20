@@ -626,6 +626,7 @@ impl RepoWriteGuard {
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
+    #[must_use = "a false return means the durable upload failed; the write must be reported as failed, not 2xx"]
     pub async fn release(mut self, success: bool) -> bool {
         // Whether the durable copy is safe. Stays `true` when there is nothing to
         // upload (no object store, or `success == false` where no upload is
@@ -951,8 +952,9 @@ mod tests {
         );
 
         // After the writer releases (on its pinned connection), the lock is free
-        // and the single connection is back in the pool.
-        guard.release(true).await;
+        // and the single connection is back in the pool. No object store here, so
+        // release always returns true, so the value is irrelevant to this test.
+        let _ = guard.release(true).await;
         let after = store.try_lock_repo(owner, name).await.unwrap();
         assert!(
             after.is_some(),
@@ -986,7 +988,8 @@ mod tests {
              connection (Ok(None)); Ok(Some) would mean the lock is not held"
         );
 
-        guard.release(true).await;
+        // No object store, so release always returns true, so value irrelevant here.
+        let _ = guard.release(true).await;
         let after = store.try_lock_repo(owner, name).await.unwrap();
         assert!(after.is_some(), "lock is free after release");
         after.unwrap().release().await;
@@ -1229,7 +1232,8 @@ mod tests {
 
         for _ in 0..3 {
             let guard = store.acquire_write(owner, name).await.unwrap();
-            guard.release(true).await;
+            // No object store, so release always returns true, so value irrelevant.
+            let _ = guard.release(true).await;
         }
     }
 
@@ -1499,7 +1503,8 @@ mod tests {
         );
 
         for g in guards {
-            g.release(true).await;
+            // No object store, so release always returns true, so value irrelevant.
+            let _ = g.release(true).await;
         }
     }
 
@@ -1532,7 +1537,8 @@ mod tests {
         );
 
         for g in guards {
-            g.release(true).await;
+            // No object store, so release always returns true, so value irrelevant.
+            let _ = g.release(true).await;
         }
     }
 
@@ -1561,7 +1567,8 @@ mod tests {
         }
         assert_eq!(guards.len(), N as usize);
         for g in guards {
-            g.release(true).await;
+            // No object store, so release always returns true, so value irrelevant.
+            let _ = g.release(true).await;
         }
     }
 
@@ -1598,9 +1605,11 @@ mod tests {
             "the lock must be held while the guard is alive"
         );
 
-        // release(success) -> the upload stalls, but the bound caps the hold.
+        // release(success) -> the upload stalls, but the bound caps the hold. The
+        // return here is false (the upload timed out), but this test asserts only
+        // the timing bound, so the value is intentionally ignored.
         let start = std::time::Instant::now();
-        guard.release(true).await;
+        let _ = guard.release(true).await;
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "release() must return within the upload bound, not hang on the stalled PUT"

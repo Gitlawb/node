@@ -224,10 +224,25 @@ pub async fn merge_pr(
         &pr.title,
     );
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(merge_result.is_ok()).await;
+    // Always release the advisory lock, even on error; upload to Tigris only on
+    // success. A false return means the durable upload failed/timed out: the merge
+    // commit applied to local disk but never reached object storage, so the next
+    // acquire_write reverts it from the stale archive. Report 5xx so the client
+    // retries rather than marking the PR merged in the DB while the merged tree
+    // was silently lost. Fail BEFORE merge_pr / touch_repo / webhooks. (P1
+    // data-loss guard, same as receive-pack.)
+    let upload_ok = guard.release(merge_result.is_ok()).await;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
+
+    if !upload_ok {
+        tracing::error!(repo = %record.name,
+            "durable upload failed after merge; reporting failure so the client retries");
+        return Err(AppError::Git(format!(
+            "durable storage upload failed for {}",
+            record.name
+        )));
+    }
 
     state.db.merge_pr(&pr.id, &merger_did).await?;
     let _ = state.db.touch_repo(&record.id).await;

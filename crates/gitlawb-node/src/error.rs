@@ -44,6 +44,9 @@ pub enum AppError {
     #[error("git service timed out: {0}")]
     Timeout(String),
 
+    #[error("service unavailable: {0}")]
+    Unavailable(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -136,6 +139,14 @@ impl IntoResponse for AppError {
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
             AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "git_timeout", msg.clone()),
+            // 503, retryable: a transient resource contention (e.g. the repo lock
+            // pool is pinned by a write burst or a purge holds the key), distinct
+            // from the 500 git_error so the client knows to back off and retry.
+            AppError::Unavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
+                msg.clone(),
+            ),
             AppError::Db(e) if db_unavailable(e) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 DB_UNAVAILABLE_CODE,
@@ -171,6 +182,22 @@ mod tests {
             StatusCode::GATEWAY_TIMEOUT
         );
         // Guard against a swap with the generic git failure (500).
+        assert_eq!(
+            AppError::Git("x".into()).into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn unavailable_maps_to_503_distinct_from_git_500() {
+        // The create-repo lock-acquire failure returns Unavailable so a client sees
+        // a retryable 503, not a terminal 500 git_error.
+        assert_eq!(
+            AppError::Unavailable("lock pool pinned".into())
+                .into_response()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
         assert_eq!(
             AppError::Git("x".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
