@@ -424,8 +424,10 @@ impl RepoStore {
     /// to `acquire_write`'s spin, without any object-store I/O. Retries
     /// `try_lock_repo` with short backoff. In practice the fork target's lock is
     /// uncontended (its DB row is created after the upload), so this returns on
-    /// the first attempt.
-    async fn lock_repo_blocking(
+    /// the first attempt. Also used by `create_repo` to serialize its
+    /// existence-check -> init -> insert against a concurrent same-key purge
+    /// (which holds this same lock across delete-row + remove-dir).
+    pub async fn lock_repo_blocking(
         &self,
         owner_did: &str,
         repo_name: &str,
