@@ -290,26 +290,6 @@ pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>>
     ))
 }
 
-/// Object size in bytes (`git cat-file -s`) WITHOUT reading the content, so an
-/// oversized object can be rejected before it is buffered into memory (#173, F6).
-/// `None` if the object does not exist or the size is unparseable.
-pub fn object_size(repo_path: &Path, sha256_hex: &str) -> Result<Option<u64>> {
-    // allow-unbounded-git: cheap cat-file -s header read (no content), holds no served-git
-    // permit and cannot hang; exact twin of object_type above. Not an INV-22 lifecycle op.
-    let out = Command::new("git")
-        .args(["cat-file", "-s", sha256_hex])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git cat-file -s")?;
-    if !out.status.success() {
-        return Ok(None);
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok())
-}
-
 /// Read an object's content if its type is already known.
 pub fn read_object_content(repo_path: &Path, sha256_hex: &str, obj_type: &str) -> Result<Vec<u8>> {
     let content_output = Command::new("git")
@@ -324,6 +304,90 @@ pub fn read_object_content(repo_path: &Path, sha256_hex: &str, obj_type: &str) -
     }
 
     Ok(content_output.stdout)
+}
+
+/// Bounded twin of [`object_type`] for the `GET /ipfs/{cid}` serve path (#173
+/// round-10, R1/KTD2). Runs `git cat-file -t` under
+/// [`run_bounded_git`](crate::git::visibility_pack::run_bounded_git) so the child runs
+/// in its own process group and a watchdog reaps it (SIGTERM -> grace -> SIGKILL) at
+/// `timeout`. The bare [`object_type`] is a `spawn_blocking` `Command::output` that an
+/// async timeout cannot cancel, so a wedged `cat-file` there pins the caller's held
+/// /ipfs walk admission for the whole hang; this twin cannot. Semantics mirror
+/// [`object_type`]: `Ok(Some(t))` for an existing object, `Ok(None)` when git exits
+/// non-zero without timing out (the object is absent), and
+/// `Err(`[`GitServiceTimeout`](crate::git::smart_http::GitServiceTimeout)`)` on the
+/// deadline so the handler can mark the search truncated (retryable 503) rather than a
+/// false not-found. Callers off the /ipfs path keep the bare helper.
+pub fn object_type_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<String>> {
+    let deadline = std::time::Instant::now() + timeout;
+    match crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["cat-file", "-t", sha256_hex],
+        repo_path,
+        b"",
+        deadline,
+    ) {
+        Ok(out) => Ok(Some(String::from_utf8_lossy(&out).trim().to_string())),
+        Err(e) if e.is::<crate::git::smart_http::GitServiceTimeout>() => Err(e),
+        // A non-timeout failure is git reporting no such object (a non-zero exit),
+        // matching `object_type`'s `Ok(None)`.
+        Err(_) => Ok(None),
+    }
+}
+
+/// Bounded `git cat-file -s` size read for the `GET /ipfs/{cid}` serve path (#173
+/// round-10, R1/KTD2): reads the object size WITHOUT its content (so an oversized object
+/// is rejected before it is buffered, #173 F6), under
+/// [`run_bounded_git`](crate::git::visibility_pack::run_bounded_git) so a wedged size
+/// read is reaped at `timeout` instead of pinning the held /ipfs walk admission.
+/// `Ok(Some(n))` on success, `Ok(None)` when the object is absent (a non-timeout
+/// non-zero exit), `Err(GitServiceTimeout)` on the deadline.
+pub fn object_size_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<u64>> {
+    let deadline = std::time::Instant::now() + timeout;
+    match crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["cat-file", "-s", sha256_hex],
+        repo_path,
+        b"",
+        deadline,
+    ) {
+        Ok(out) => Ok(String::from_utf8_lossy(&out).trim().parse::<u64>().ok()),
+        Err(e) if e.is::<crate::git::smart_http::GitServiceTimeout>() => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Bounded twin of [`read_object_content`] for the `GET /ipfs/{cid}` serve path (#173
+/// round-10, R1/KTD2): `git cat-file <type>` under
+/// [`run_bounded_git`](crate::git::visibility_pack::run_bounded_git) so a wedged content
+/// read is reaped at `timeout` instead of pinning the held /ipfs walk admission. Returns
+/// the raw object bytes on success and an error (including `GitServiceTimeout` on the
+/// deadline) otherwise, mirroring [`read_object_content`].
+pub fn read_object_content_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    obj_type: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    let deadline = std::time::Instant::now() + timeout;
+    crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["cat-file", obj_type, sha256_hex],
+        repo_path,
+        b"",
+        deadline,
+    )
 }
 
 /// Read a git object by its SHA-256 hex object ID.
@@ -519,6 +583,86 @@ mod tests {
         assert!(
             !names.iter().any(|p| p == "base.txt"),
             "unchanged file must not appear: {names:?}"
+        );
+    }
+
+    /// #173 round-10 (KTD2): `object_type_bounded` reaps a wedged `cat-file` child at its
+    /// deadline instead of blocking on it to natural exit, so a hung probe cannot pin the
+    /// /ipfs walk admission the owning task holds. A fake `git` records its pid and sleeps
+    /// far past the 1s deadline; the `run_bounded_git` watchdog (SIGTERM -> grace ->
+    /// SIGKILL of the process group) must kill it well before that natural exit, and the
+    /// call must surface `GitServiceTimeout`. REVERT PROOF (RED): swap the twin's
+    /// `run_bounded_git` for the bare `Command::output()` and the wedged child stays alive
+    /// past the deadline — the mid-flight liveness poll below reads it still running.
+    #[cfg(unix)]
+    #[test]
+    fn object_type_bounded_reaps_wedged_child_at_deadline() {
+        use std::time::Duration;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("catfile.pid");
+        // `cat-file` records its own pid then sleeps 8s (>> the 1s deadline) so the probe
+        // is genuinely wedged; the watchdog is what must end it.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               cat-file) echo $$ > \"{}\"; sleep 8 ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            pidfile.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+        let repo = tmp.path().to_path_buf();
+        let git = git_path.to_str().unwrap().to_string();
+
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) == 0 };
+
+        // The bounded probe blocks until the watchdog tears the child down, so run it on
+        // a worker thread and poll for the reap from here.
+        let handle = std::thread::spawn(move || {
+            super::object_type_bounded(&git, &repo, "deadbeef", Duration::from_secs(1))
+        });
+
+        let mut pid = None;
+        for _ in 0..500 {
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                pid = Some(p);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = pid.expect("the fake cat-file must have spawned and recorded its pid");
+
+        // Past the 1s deadline + SIGTERM grace but well before the 8s natural exit: the
+        // watchdog must already have reaped the wedged group. A bare, unbounded read would
+        // leave it running here — the load-bearing RED.
+        std::thread::sleep(Duration::from_secs(3));
+        let reaped = !alive(pid);
+        // Defensive reap so a RED run leaks no orphan.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        assert!(
+            reaped,
+            "object_type_bounded must reap the wedged cat-file child at the deadline, \
+             not leave it running to its natural exit"
+        );
+
+        let res = handle.join().expect("probe thread joins");
+        let err = res.expect_err("a deadline overrun must be an error, not a value");
+        assert!(
+            err.is::<crate::git::smart_http::GitServiceTimeout>(),
+            "a deadline overrun must surface GitServiceTimeout, got: {err:?}"
         );
     }
 }
