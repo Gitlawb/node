@@ -209,15 +209,18 @@ pub async fn create_repo(
     // error path below. Bounded-wait (no object-store I/O), so the uncontended hot
     // path returns on the first attempt. (KTD6, R6.)
     //
-    // Take this transient lock on the APP pool, not the write lock_pool. lock_pool
-    // is sized for long-held receive-pack write guards; a push burst that pins it
-    // would otherwise starve create's acquire (-> 500). The advisory lock is
-    // DB-global, so locking from the app pool still serializes against a same-key
-    // purge holding the lock from lock_pool. (INV-15 sibling: don't couple a cheap
-    // path to the expensive path's capacity.)
+    // Lock on the write lock_pool (via `lock_repo_blocking`), NOT the app pool. The
+    // create's own work (get_repo, proof.consume, db.create_repo) runs on the app
+    // pool via state.db, so drawing the lock guard from a SEPARATE pool keeps it from
+    // pinning an app connection that work then needs. At GITLAWB_DB_MAX_CONNECTIONS=1
+    // an app-pool lock self-deadlocks (get_repo waits for the one connection the
+    // guard holds -> PoolTimedOut -> 500). The advisory lock is DB-global, so it
+    // still serializes against a same-key purge holding it from lock_pool. Accepted
+    // residual: a sustained 32-writer burst that pins lock_pool can make this acquire
+    // wait -> a retryable 503, far less bad than breaking create at MAX_CONNECTIONS=1.
     let repo_lock = state
         .repo_store
-        .lock_repo_blocking_on(state.db.pool(), &owner_did, &req.name)
+        .lock_repo_blocking(&owner_did, &req.name)
         .await
         .map_err(|e| AppError::Git(e.to_string()))?
         .ok_or_else(|| {
@@ -3900,16 +3903,17 @@ mod tests {
         );
     }
 
-    // create_repo's transient serialization lock must NOT draw from the write
-    // lock_pool. lock_pool is sized for LONG-HELD receive-pack write guards; a
-    // concurrent-push burst that pins every lock_pool connection would otherwise
-    // starve legitimate repo creation (create's acquire times out -> 500). The fix
-    // takes create's transient lock on the APP pool instead, which the write burst
-    // never touches. RED on base (create locks on lock_pool): with the lock_pool
-    // saturated by held write guards, create errors. GREEN after (create locks on
-    // the app pool): create still succeeds.
+    // create_repo must NOT take its serialization lock from the APP pool. Doing so
+    // pins an app-pool connection in the lock guard while the create's own work
+    // (get_repo / proof.consume / db.create_repo, all on state.db = the app pool)
+    // still needs an app connection. At GITLAWB_DB_MAX_CONNECTIONS=1 (a supported
+    // config) the guard holds the only app connection and get_repo self-deadlocks
+    // (PoolTimedOut -> 500). Locking on the separate write lock_pool instead keeps
+    // the lock and the work on different pools, so a size-1 app pool never wedges.
+    // RED on the app-pool-lock code: create times out -> Err. GREEN after reverting
+    // create to lock on lock_pool.
     #[sqlx::test]
-    async fn create_repo_survives_a_saturated_lock_pool(
+    async fn create_repo_does_not_self_deadlock_at_one_app_connection(
         pool_opts: sqlx::postgres::PgPoolOptions,
         connect_opts: sqlx::postgres::PgConnectOptions,
     ) {
@@ -3917,24 +3921,30 @@ mod tests {
         use axum::Extension;
         use std::time::Duration;
 
-        // App pool: serves state.db AND (after the fix) create's transient lock.
-        let app_pool = pool_opts
-            .max_connections(5)
+        // Migrate the per-test DB on a normal pool: `migrate()` pins one connection for
+        // its cross-process advisory lock while applying statements on a second, so it
+        // needs >1 connection and cannot itself run on the size-1 pool under test.
+        let migrate_pool = pool_opts.connect_with(connect_opts.clone()).await.unwrap();
+        let mut state = crate::test_support::test_state(migrate_pool).await;
+
+        // Now point state.db at an APP pool of MAX size 1 on the SAME database, the
+        // minimal supported config (GITLAWB_DB_MAX_CONNECTIONS=1). The schema is
+        // already applied, so this pool only serves create's work (get_repo -> insert).
+        // A short acquire timeout makes the RED case (the lock guard pinning this one
+        // connection while get_repo waits for another) fail fast instead of hanging.
+        let app_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(2))
             .connect_with(connect_opts.clone())
             .await
             .unwrap();
-        let mut state = crate::test_support::test_state(app_pool.clone()).await;
+        state.db = std::sync::Arc::new(crate::db::Db::for_testing(app_pool.clone()));
 
-        // A SEPARATE, small write lock pool that fails fast on exhaustion, so a
-        // create wired to it errors quickly rather than blocking the whole test.
-        const N: u32 = 2;
+        // A SEPARATE write lock pool (where create's serialization lock belongs). Its
+        // being separate is the whole point: the lock guard must not draw from the app
+        // pool the create work runs on.
         let lock_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(N)
-            .acquire_timeout(Duration::from_secs(2))
-            .min_connections(0)
-            .idle_timeout(None)
-            .max_lifetime(None)
-            .test_before_acquire(false)
+            .max_connections(5)
             .connect_with(connect_opts.clone())
             .await
             .unwrap();
@@ -3944,31 +3954,8 @@ mod tests {
             lock_pool.clone(),
         );
 
-        // Saturate the lock pool with N held write guards on distinct repos — the
-        // 32-writer burst, scaled down. Each guard pins one lock_pool connection.
-        let mut guards = Vec::new();
-        for i in 0..N {
-            let owner = format!("did:key:z6MkSaturateLock{i}AAAAAAAAAAAAAAAAAAAAAA");
-            guards.push(
-                state
-                    .repo_store
-                    .acquire_write(&owner, "held")
-                    .await
-                    .unwrap(),
-            );
-        }
-        // The lock pool is exhausted, so the create assertion below is load-bearing
-        // (not vacuously green because the pool happened to be idle).
-        assert!(
-            lock_pool.acquire().await.is_err(),
-            "the lock pool must be exhausted by N held write guards"
-        );
-
-        // create for an UNCONTENDED key. Its advisory lock is free (the write
-        // guards hold different keys), so the only thing that can stop it is the
-        // saturated lock_pool — which it must not touch.
-        let owner = "did:key:z6MkCreateAppPoolCCCCCCCCCCCCCCCCCCCCCCCC";
-        let name = "created";
+        let owner = "did:key:z6MkOneAppConnNoDeadlockDDDDDDDDDDDDDDDDDDDD";
+        let name = "solo";
         let created = super::create_repo(
             State(state.clone()),
             Extension(crate::auth::AuthenticatedDid(owner.to_string())),
@@ -3981,15 +3968,11 @@ mod tests {
             }),
         )
         .await
-        .expect("create must survive a saturated lock pool by locking on the app pool");
+        .expect("create must not self-deadlock at app-pool size 1 (lock on lock_pool)");
         assert_eq!(created.0, StatusCode::CREATED);
         assert!(
             state.db.get_repo(owner, name).await.unwrap().is_some(),
-            "row present after a create under a saturated lock pool"
+            "row present after a create with a size-1 app pool"
         );
-
-        for g in guards {
-            g.release(true).await;
-        }
     }
 }
