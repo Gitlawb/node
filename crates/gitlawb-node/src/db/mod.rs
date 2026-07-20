@@ -2114,6 +2114,18 @@ impl Db {
     }
 
     /// Retrieve the most recent certificate for a repo (highest seq).
+    pub async fn get_cert_by_seq(&self, repo_id: &str, seq: i64) -> Result<Option<RefCertificate>> {
+        let row = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+             FROM ref_certificates WHERE repo_id = $1 AND seq = $2",
+        )
+        .bind(repo_id)
+        .bind(seq)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_cert))
+    }
+
     pub async fn get_most_recent_cert(&self, repo_id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
             "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
