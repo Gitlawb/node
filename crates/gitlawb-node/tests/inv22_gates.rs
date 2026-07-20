@@ -68,6 +68,22 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
          withheld_recipients_gated, which acquires git_encrypt_semaphore"
     );
 
+    // U1 / R2 (#173 round-10): the path-scoped filtered-pack serve must thread the
+    // caller's AdmissionGuard through BOTH git stages so read + per-caller admission is
+    // held until the pack-objects group is reaped on disconnect, closing the cap bypass
+    // the plain upload_pack path already fixed. Two load-bearing markers: rev-list hands
+    // the disarmed guard back (its tuple return type), and build_filtered_pack forwards
+    // that guard into the pack-objects stage (the `admission` arg after the
+    // "pack-objects" label). Reverting either — dropping the guard between stages, or
+    // passing `None` to pack-objects — trips this.
+    assert!(
+        smart_http.contains("Result<(Vec<String>, Option<AdmissionGuard>)>")
+            && smart_http.contains("\"pack-objects\",\n        admission,"),
+        "U1/R2 gate missing: build_filtered_pack must thread the AdmissionGuard through \
+         rev-list -> pack-objects so the permits are held until the pack-objects group \
+         is reaped on disconnect (the path-scoped half of #174 P1-a)"
+    );
+
     // P1-e non-bypass tripwire: the bounded recipients walk is spawn_blocking'd nowhere
     // but inside withheld_recipients_gated. A second call site (count > 1) is a new
     // detached git walk that skips the admission gate — exactly the class U5 closed.

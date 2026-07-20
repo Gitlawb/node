@@ -940,11 +940,15 @@ pub async fn git_upload_pack(
             smart_http::upload_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await
         } else {
             tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
-            // upload_pack_excluding runs its own rev-list/pack-objects (both pass `None`
-            // admission internally); the walk's permits stay handler-locals held across
-            // this serve, as be0cdd6 established, and drop when the handler returns.
-            let _hold = (_permit, _caller_permit);
-            smart_http::upload_pack_excluding(&disk_path, body, &withheld, git_timeout).await
+            // Move both admission permits into the guard so they release only after the
+            // filtered serve's git group (rev-list then pack-objects) is reaped, on
+            // complete/timeout/disconnect — not the instant a disconnect drops this
+            // future. Without this, disconnect-spam on a path-scoped repo could hold PIDs
+            // past the concurrency cap while the permits were already freed (#174 P1-a,
+            // R2). The guard rides both stages inside upload_pack_excluding.
+            let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+            smart_http::upload_pack_excluding(&disk_path, body, &withheld, git_timeout, Some(admission))
+                .await
         }
     }
     .map_err(|e| {
