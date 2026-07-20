@@ -460,7 +460,10 @@ impl Drop for RepoWriteGuard {
     /// handler future was dropped before `release`), unlock on the pinned
     /// connection. `Drop` cannot await, so spawn a detached unlock — it runs on the
     /// same session (connection-affine). An off-runtime drop falls back to a log;
-    /// the ~60s stale-lock retry loop in `acquire_write` reclaims it.
+    /// the ~60s stale-lock retry loop in `acquire_write` reclaims it. On runtime
+    /// SHUTDOWN the spawned unlock task may be dropped before it polls, so the unlock
+    /// may not run — but shutdown tears down the pool, and closing the connection
+    /// releases the session-level advisory lock server-side, so this too is bounded.
     fn drop(&mut self) {
         if self.released || !self.locked {
             return;
