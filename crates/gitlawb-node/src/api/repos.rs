@@ -927,470 +927,504 @@ pub async fn git_receive_pack(
     let body_len = body.len();
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
 
-    // Detach the acquire → receive-pack → release core from THIS handler future.
-    // The pack `body` is already fully buffered, so the spawned task is
-    // self-contained: a client disconnect drops the handler future but does NOT
-    // cancel the task, so a fully-received push still completes server-side —
-    // applies the pack, uploads, and releases the lock in order. What a
-    // disconnect forgoes is the cancellable post-push bookkeeping below, not the
-    // push itself. (KTD-3, R3.)
-    let repo_store = state.repo_store.clone();
-    let owner_did = record.owner_did.clone();
-    let repo_name = record.name.clone();
-    let receive_result = tokio::spawn(async move {
-        let guard = repo_store
-            .acquire_write(&owner_did, &repo_name)
+    // Detach the WHOLE push — acquire → receive-pack → release AND the success
+    // tail (metadata + fan-out) — from THIS handler future. The pack `body` is
+    // already fully buffered, so the spawned task is self-contained: a client
+    // disconnect drops the handler future but does NOT cancel the task, so a
+    // fully-received push still applies the pack, releases the lock, AND runs its
+    // full metadata/fan-out tail server-side. Folding the tail INTO the task (vs
+    // leaving it in the cancellable request future) is what prevents a split-brain
+    // on disconnect: committed git with no push record / certs / broadcast. (KTD1,
+    // R1.)
+    //
+    // report-status is handed to the (possibly still-connected) client over a
+    // oneshot the request future awaits — NOT by awaiting the JoinHandle, which
+    // would re-couple the client response to the full tail completing (a latency
+    // regression). The task sends the receive-pack result, then continues the tail
+    // independently; if the client has disconnected the receiver is dropped and the
+    // send fails, which the task ignores and runs the tail regardless.
+    let (report_tx, report_rx) = tokio::sync::oneshot::channel::<Result<Response>>();
+    tokio::spawn(async move {
+        let guard = match state
+            .repo_store
+            .acquire_write(&record.owner_did, &record.name)
             .await
-            .map_err(|e| {
-                tracing::error!(repo = %repo_name, err = %e, "acquire_write failed");
-                AppError::Git(e.to_string())
-            })?;
+        {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(repo = %record.name, err = %e, "acquire_write failed");
+                let _ = report_tx.send(Err(AppError::Git(e.to_string())));
+                return;
+            }
+        };
         let disk_path = guard.path().to_path_buf();
-        tracing::debug!(repo = %repo_name, path = %disk_path.display(), "running git receive-pack");
+        tracing::debug!(repo = %record.name, path = %disk_path.display(), "running git receive-pack");
         let result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
-        // Always release the advisory lock — even on error — to prevent stale
-        // locks from blocking subsequent pushes. Only upload to Tigris when the
-        // push succeeded; uploading a half-applied repo would propagate corruption.
+        // Always release the advisory lock — even on error, and BEFORE the tail —
+        // to prevent stale locks and to avoid holding the write lock across the
+        // fan-out. Only upload to Tigris when the push succeeded; uploading a
+        // half-applied repo would propagate corruption.
         guard.release(result.is_ok()).await;
-        Ok::<_, AppError>(result)
-    })
-    .await
-    .map_err(|e| {
-        tracing::error!(repo = %name, err = %e, "receive-pack task panicked");
-        AppError::Internal(anyhow::anyhow!("receive-pack task failed: {e}"))
-    })??;
 
-    // Recompute the on-disk path for the post-push tail below — the guard that
-    // exposed it now lives inside the detached task. Identical to the path
-    // acquire_write resolved (repos_dir/owner_slug/name.git).
-    let disk_path = store::repo_disk_path(&state.config.repos_dir, &record.owner_did, &record.name);
-
-    let result = receive_result.map_err(|e| {
-        let app = git_service_app_error(&e);
-        match &app {
-            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
-            AppError::BadRequest(msg) => {
-                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
+        // On receive-pack error, deliver the classified error to the client and run
+        // NO tail. On success, hand report-status to the client now, then continue
+        // the tail regardless of whether the client is still listening.
+        let response = match result {
+            Ok(resp) => resp,
+            Err(e) => {
+                let app = git_service_app_error(&e);
+                match &app {
+                    AppError::Timeout(_) => {
+                        tracing::warn!(repo = %record.name, "git receive-pack timed out")
+                    }
+                    AppError::BadRequest(msg) => {
+                        tracing::warn!(repo = %record.name, err = %msg, "git receive-pack: bad client request")
+                    }
+                    _ => tracing::error!(repo = %record.name, err = %e, "git receive-pack failed"),
+                }
+                let _ = report_tx.send(Err(app));
+                return;
             }
-            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
-        }
-        app
-    })?;
+        };
+        let _ = report_tx.send(Ok(response));
 
-    // Update the repo's updated_at timestamp after a successful push
-    let _ = state.db.touch_repo(&record.id).await;
+        // Update the repo's updated_at timestamp after a successful push
+        let _ = state.db.touch_repo(&record.id).await;
 
-    // Record the successful push for metrics. The body has already been
-    // consumed by smart_http::receive_pack so we observe size up front.
-    crate::metrics::record_push(&record.id);
-    crate::metrics::observe_pack_size(body_len as f64);
+        // Record the successful push for metrics. The body has already been
+        // consumed by smart_http::receive_pack so we observe size up front.
+        crate::metrics::record_push(&record.id);
+        crate::metrics::observe_pack_size(body_len as f64);
 
-    // Record push event for trust score and issue a signed ref certificate.
-    // The route is behind `require_signature`, so the verified pusher identity is
-    // always present; use it directly rather than re-parsing the headers.
-    let did = auth.0.as_str();
-    {
-        // Use the first new commit hash we parsed, fall back to timestamp
-        let commit_hash = ref_updates
-            .first()
-            .map(|u| u.new_sha.clone())
-            .unwrap_or_else(|| Utc::now().timestamp().to_string());
+        // Record push event for trust score and issue a signed ref certificate.
+        // The route is behind `require_signature`, so the verified pusher identity is
+        // always present; use it directly rather than re-parsing the headers.
+        let did = auth.0.as_str();
+        {
+            // Use the first new commit hash we parsed, fall back to timestamp
+            let commit_hash = ref_updates
+                .first()
+                .map(|u| u.new_sha.clone())
+                .unwrap_or_else(|| Utc::now().timestamp().to_string());
 
-        let _ = state.db.record_push(did, &record.id, &commit_hash, 0).await;
-        if let Ok(push_count) = state.db.get_push_count(did).await {
-            // 0.05 base (from registration) + 0.05 per push, capped at 1.0
-            // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
-            let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
-            let _ = state.db.update_trust_score(did, new_score).await;
-        }
-
-        // Issue a signed certificate for every ref this push advanced, each
-        // carrying that ref's real old→new transition. A multi-ref push must
-        // not collapse to a single cert covering only the first ref.
-        for update in &ref_updates {
-            match cert::issue_ref_certificate(
-                &state,
-                &record.id,
-                &update.ref_name,
-                &update.old_sha,
-                &update.new_sha,
-                did,
-            )
-            .await
-            {
-                Ok(c) => {
-                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
-                }
-                Err(e) => {
-                    tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
-                }
-            }
-        }
-    }
-
-    // Fire push webhooks — one per ref update
-    if !ref_updates.is_empty() {
-        let base_url = state
-            .config
-            .public_url
-            .as_deref()
-            .unwrap_or("http://127.0.0.1:7545")
-            .trim_end_matches('/');
-        let owner_short = crate::db::normalize_owner_key(&record.owner_did);
-        let clone_url = format!("{}/{}/{}.git", base_url, owner_short, record.name);
-
-        for update in &ref_updates {
-            let payload = serde_json::json!({
-                "ref": update.ref_name,
-                "before": update.old_sha,
-                "after": update.new_sha,
-                "created": update.old_sha == ZERO_SHA,
-                "forced": false,
-                "pusher": {
-                    "did": did,
-                },
-                "repository": {
-                    "id": record.id,
-                    "name": record.name,
-                    "owner_did": record.owner_did,
-                    "clone_url": clone_url,
-                },
-            });
-            webhooks::fire_event(
-                state.db.clone(),
-                state.http_client.clone(),
-                &record.id,
-                "push",
-                payload,
-            );
-        }
-    }
-
-    // Replication enforcement (Phase 2): decide once per push whether the public
-    // may read this repo at all and, if so, which blob OIDs must not leave the
-    // node. `withheld == None` means replicate nothing (private / mode A /
-    // undetermined): skip every pin so even commit and tree objects (which
-    // withheld_blob_oids never lists) stay local. `announce` gates the
-    // network-facing announcements. Fail closed: a private or undetermined repo
-    // never leaks.
-    let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
-    let (announce, withheld) = replication_withheld_set(
-        rules_opt.clone(),
-        &record.owner_did,
-        record.is_public,
-        disk_path.clone(),
-    )
-    .await;
-
-    // Resolve the per-push pin candidate set once, off the async worker, then
-    // filter to what may actually replicate. Delta path: the reachable-only
-    // `withheld` set suffices (delta objects are reachable). Full-scan path: the
-    // candidate set can include dangling blobs the withheld set never classified,
-    // so fail closed — replicate a blob only if it is reachable AND
-    // visibility-allowed (#99). Only computed when something will actually
-    // replicate; every degraded path logs rather than failing silently.
-    let object_list: Vec<String> = if let Some(withheld_set) = withheld.clone() {
-        let new_tips: Vec<String> = ref_updates
-            .iter()
-            .map(|u| u.new_sha.clone())
-            .filter(|s| s != ZERO_SHA)
-            .collect();
-        let old_tips: Vec<String> = ref_updates
-            .iter()
-            .map(|u| u.old_sha.clone())
-            .filter(|s| s != ZERO_SHA)
-            .collect();
-        let pin_set = crate::git::push_delta::resolve_candidates_for_push(
-            disk_path.clone(),
-            new_tips,
-            old_tips,
-        )
-        .await;
-        if pin_set.full_scan {
-            fail_closed_full_scan_objects(
-                disk_path.clone(),
-                rules_opt.clone().unwrap_or_default(),
-                record.is_public,
-                record.owner_did.clone(),
-                pin_set.candidates,
-            )
-            .await
-        } else {
-            crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
-        }
-    } else {
-        Vec::new()
-    };
-
-    // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
-    // Skipped entirely when the public cannot read the repo (withheld == None).
-    if withheld.is_some() {
-        let object_list_ipfs = object_list.clone();
-        let ipfs_api = state.config.ipfs_api.clone();
-        let repo_path_clone = disk_path.clone();
-        let db_clone = state.db.clone();
-        let rules_for_enc = rules_opt.clone();
-        let repo_id = record.id.clone();
-        let owner_did = record.owner_did.clone();
-        let is_public = record.is_public;
-        let irys_url = state.config.irys_url.clone();
-        let http_client = std::sync::Arc::clone(&state.http_client);
-        let node_did_str = state.node_did.to_string();
-        let node_seed = state.node_keypair.to_seed();
-        let repo_name = record.name.clone();
-        tokio::spawn(async move {
-            let pinned = crate::ipfs_pin::pin_new_objects(
-                &ipfs_api,
-                &repo_path_clone,
-                object_list_ipfs,
-                &db_clone,
-            )
-            .await;
-            if !pinned.is_empty() {
-                tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
-                for (sha, cid) in &pinned {
-                    tracing::info!(sha = %sha, %cid, "pinned");
-                }
+            let _ = state.db.record_push(did, &record.id, &commit_hash, 0).await;
+            if let Ok(push_count) = state.db.get_push_count(did).await {
+                // 0.05 base (from registration) + 0.05 per push, capped at 1.0
+                // 1 push → 0.10, 5 pushes → 0.30, 19 pushes → 1.0
+                let new_score = (push_count as f64 * 0.05 + 0.05).min(1.0);
+                let _ = state.db.update_trust_score(did, new_score).await;
             }
 
-            // Option B1: encrypt-then-pin the withheld blobs so authorized
-            // readers can recover them when the origin cannot serve them.
-            // No path-scoped rule can withhold a blob, so withheld_blob_recipients
-            // would return an empty map after a full per-ref walk; skip it. Mirrors
-            // the has_path_scoped_rule gate on the other two withheld-walk sites.
-            if let Some(rules) = rules_for_enc.filter(|r| visibility_pack::has_path_scoped_rule(r))
-            {
-                let p = repo_path_clone.clone();
-                let owner = owner_did.clone();
-                let recip = tokio::task::spawn_blocking(move || {
-                    crate::git::visibility_pack::withheld_blob_recipients(
-                        &p, &rules, is_public, &owner,
-                    )
-                })
-                .await;
-                if let Ok(Ok(recipients)) = recip {
-                    let delta = crate::encrypted_pin::encrypt_and_pin(
-                        &ipfs_api,
-                        &repo_path_clone,
-                        &db_clone,
-                        &repo_id,
-                        &node_seed,
-                        &recipients,
-                    )
-                    .await;
-
-                    // Option B3: anchor a per-push manifest of the blobs sealed
-                    // this push to Arweave, so the oid->cid index survives total
-                    // node loss. Best-effort; never fails the push.
-                    if !delta.is_empty() && !irys_url.is_empty() {
-                        let owner_short = crate::db::normalize_owner_key(&owner_did);
-                        let repo_slug = format!("{owner_short}/{repo_name}");
-                        let ts = chrono::Utc::now().to_rfc3339();
-                        let manifest = crate::arweave::EncryptedManifest {
-                            repo: &repo_slug,
-                            owner_did: &owner_did,
-                            node_did: &node_did_str,
-                            timestamp: &ts,
-                            blobs: &delta,
-                        };
-                        match crate::arweave::anchor_encrypted_manifest(
-                            &http_client,
-                            &irys_url,
-                            &manifest,
-                        )
-                        .await
-                        {
-                            Ok(tx) if !tx.is_empty() => tracing::info!(
-                                repo = %repo_slug,
-                                tx_id = %tx,
-                                "anchored encrypted manifest to Arweave"
-                            ),
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(
-                                repo = %repo_slug,
-                                err = %e,
-                                "encrypted manifest anchor failed"
-                            ),
-                        }
+            // Issue a signed certificate for every ref this push advanced, each
+            // carrying that ref's real old→new transition. A multi-ref push must
+            // not collapse to a single cert covering only the first ref.
+            for update in &ref_updates {
+                match cert::issue_ref_certificate(
+                    &state,
+                    &record.id,
+                    &update.ref_name,
+                    &update.old_sha,
+                    &update.new_sha,
+                    did,
+                )
+                .await
+                {
+                    Ok(c) => {
+                        tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
+                    }
+                    Err(e) => {
+                        tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
                     }
                 }
             }
-        });
-    }
+        }
 
-    // Pin new git objects to Pinata, then record branch→CID and gossip
-    {
-        let pinata_jwt = state.config.pinata_jwt.clone();
-        let pinata_upload_url = state.config.pinata_upload_url.clone();
-        let repo_path_clone = disk_path.clone();
-        let db_clone = state.db.clone();
-        let http_client = Arc::clone(&state.http_client);
-        let node_did_str = state.node_did.to_string();
-        let repo_slug = format!(
-            "{}/{}",
-            crate::db::normalize_owner_key(&record.owner_did),
-            record.name
-        );
-        let ref_updates_clone = ref_updates
-            .iter()
-            .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
-            .collect::<Vec<_>>();
-        let p2p_handle = state.p2p.clone();
-        let pusher_did_clone = did.to_string();
-        let db_for_peers = state.db.clone();
-        let ref_update_tx = state.ref_update_tx.clone();
-        let irys_url = state.config.irys_url.clone();
-        let owner_did_for_arweave = record.owner_did.clone();
-        let self_public_url = state.config.public_url.clone();
-        let node_keypair = Arc::clone(&state.node_keypair);
-        let object_list_pinata = object_list;
-        let do_pinata_replication = withheld.is_some();
-        tokio::spawn(async move {
-            let pinned = if do_pinata_replication {
-                crate::pinata::pin_new_objects(
-                    &http_client,
-                    &pinata_upload_url,
-                    &pinata_jwt,
-                    &repo_path_clone,
-                    object_list_pinata,
-                    &db_clone,
+        // Fire push webhooks — one per ref update
+        if !ref_updates.is_empty() {
+            let base_url = state
+                .config
+                .public_url
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:7545")
+                .trim_end_matches('/');
+            let owner_short = crate::db::normalize_owner_key(&record.owner_did);
+            let clone_url = format!("{}/{}/{}.git", base_url, owner_short, record.name);
+
+            for update in &ref_updates {
+                let payload = serde_json::json!({
+                    "ref": update.ref_name,
+                    "before": update.old_sha,
+                    "after": update.new_sha,
+                    "created": update.old_sha == ZERO_SHA,
+                    "forced": false,
+                    "pusher": {
+                        "did": did,
+                    },
+                    "repository": {
+                        "id": record.id,
+                        "name": record.name,
+                        "owner_did": record.owner_did,
+                        "clone_url": clone_url,
+                    },
+                });
+                webhooks::fire_event(
+                    state.db.clone(),
+                    state.http_client.clone(),
+                    &record.id,
+                    "push",
+                    payload,
+                );
+            }
+        }
+
+        // Replication enforcement (Phase 2): decide once per push whether the public
+        // may read this repo at all and, if so, which blob OIDs must not leave the
+        // node. `withheld == None` means replicate nothing (private / mode A /
+        // undetermined): skip every pin so even commit and tree objects (which
+        // withheld_blob_oids never lists) stay local. `announce` gates the
+        // network-facing announcements. Fail closed: a private or undetermined repo
+        // never leaks.
+        let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
+        let (announce, withheld) = replication_withheld_set(
+            rules_opt.clone(),
+            &record.owner_did,
+            record.is_public,
+            disk_path.clone(),
+        )
+        .await;
+
+        // Resolve the per-push pin candidate set once, off the async worker, then
+        // filter to what may actually replicate. Delta path: the reachable-only
+        // `withheld` set suffices (delta objects are reachable). Full-scan path: the
+        // candidate set can include dangling blobs the withheld set never classified,
+        // so fail closed — replicate a blob only if it is reachable AND
+        // visibility-allowed (#99). Only computed when something will actually
+        // replicate; every degraded path logs rather than failing silently.
+        let object_list: Vec<String> = if let Some(withheld_set) = withheld.clone() {
+            let new_tips: Vec<String> = ref_updates
+                .iter()
+                .map(|u| u.new_sha.clone())
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            let old_tips: Vec<String> = ref_updates
+                .iter()
+                .map(|u| u.old_sha.clone())
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+                disk_path.clone(),
+                new_tips,
+                old_tips,
+            )
+            .await;
+            if pin_set.full_scan {
+                fail_closed_full_scan_objects(
+                    disk_path.clone(),
+                    rules_opt.clone().unwrap_or_default(),
+                    record.is_public,
+                    record.owner_did.clone(),
+                    pin_set.candidates,
                 )
                 .await
             } else {
-                Vec::new()
-            };
-
-            if !pinned.is_empty() {
-                tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
+                crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
             }
+        } else {
+            Vec::new()
+        };
 
-            // Build sha→cid map from pinned objects
-            let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
-
-            // Record branch→CID for each ref update and publish gossip
-            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                let cid = cid_map.get(new_sha).map(|s| s.as_str());
-
-                if let Some(cid_str) = cid {
-                    let _ = db_clone
-                        .upsert_branch_cid(&repo_slug, ref_name, new_sha, cid_str, &node_did_str)
-                        .await;
+        // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
+        // Skipped entirely when the public cannot read the repo (withheld == None).
+        if withheld.is_some() {
+            let object_list_ipfs = object_list.clone();
+            let ipfs_api = state.config.ipfs_api.clone();
+            let repo_path_clone = disk_path.clone();
+            let db_clone = state.db.clone();
+            let rules_for_enc = rules_opt.clone();
+            let repo_id = record.id.clone();
+            let owner_did = record.owner_did.clone();
+            let is_public = record.is_public;
+            let irys_url = state.config.irys_url.clone();
+            let http_client = std::sync::Arc::clone(&state.http_client);
+            let node_did_str = state.node_did.to_string();
+            let node_seed = state.node_keypair.to_seed();
+            let repo_name = record.name.clone();
+            tokio::spawn(async move {
+                let pinned = crate::ipfs_pin::pin_new_objects(
+                    &ipfs_api,
+                    &repo_path_clone,
+                    object_list_ipfs,
+                    &db_clone,
+                )
+                .await;
+                if !pinned.is_empty() {
+                    tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
+                    for (sha, cid) in &pinned {
+                        tracing::info!(sha = %sha, %cid, "pinned");
+                    }
                 }
 
+                // Option B1: encrypt-then-pin the withheld blobs so authorized
+                // readers can recover them when the origin cannot serve them.
+                // No path-scoped rule can withhold a blob, so withheld_blob_recipients
+                // would return an empty map after a full per-ref walk; skip it. Mirrors
+                // the has_path_scoped_rule gate on the other two withheld-walk sites.
+                if let Some(rules) =
+                    rules_for_enc.filter(|r| visibility_pack::has_path_scoped_rule(r))
+                {
+                    let p = repo_path_clone.clone();
+                    let owner = owner_did.clone();
+                    let recip = tokio::task::spawn_blocking(move || {
+                        crate::git::visibility_pack::withheld_blob_recipients(
+                            &p, &rules, is_public, &owner,
+                        )
+                    })
+                    .await;
+                    if let Ok(Ok(recipients)) = recip {
+                        let delta = crate::encrypted_pin::encrypt_and_pin(
+                            &ipfs_api,
+                            &repo_path_clone,
+                            &db_clone,
+                            &repo_id,
+                            &node_seed,
+                            &recipients,
+                        )
+                        .await;
+
+                        // Option B3: anchor a per-push manifest of the blobs sealed
+                        // this push to Arweave, so the oid->cid index survives total
+                        // node loss. Best-effort; never fails the push.
+                        if !delta.is_empty() && !irys_url.is_empty() {
+                            let owner_short = crate::db::normalize_owner_key(&owner_did);
+                            let repo_slug = format!("{owner_short}/{repo_name}");
+                            let ts = chrono::Utc::now().to_rfc3339();
+                            let manifest = crate::arweave::EncryptedManifest {
+                                repo: &repo_slug,
+                                owner_did: &owner_did,
+                                node_did: &node_did_str,
+                                timestamp: &ts,
+                                blobs: &delta,
+                            };
+                            match crate::arweave::anchor_encrypted_manifest(
+                                &http_client,
+                                &irys_url,
+                                &manifest,
+                            )
+                            .await
+                            {
+                                Ok(tx) if !tx.is_empty() => tracing::info!(
+                                    repo = %repo_slug,
+                                    tx_id = %tx,
+                                    "anchored encrypted manifest to Arweave"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!(
+                                    repo = %repo_slug,
+                                    err = %e,
+                                    "encrypted manifest anchor failed"
+                                ),
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Pin new git objects to Pinata, then record branch→CID and gossip
+        {
+            let pinata_jwt = state.config.pinata_jwt.clone();
+            let pinata_upload_url = state.config.pinata_upload_url.clone();
+            let repo_path_clone = disk_path.clone();
+            let db_clone = state.db.clone();
+            let http_client = Arc::clone(&state.http_client);
+            let node_did_str = state.node_did.to_string();
+            let repo_slug = format!(
+                "{}/{}",
+                crate::db::normalize_owner_key(&record.owner_did),
+                record.name
+            );
+            let ref_updates_clone = ref_updates
+                .iter()
+                .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
+                .collect::<Vec<_>>();
+            let p2p_handle = state.p2p.clone();
+            let pusher_did_clone = did.to_string();
+            let db_for_peers = state.db.clone();
+            let ref_update_tx = state.ref_update_tx.clone();
+            let irys_url = state.config.irys_url.clone();
+            let owner_did_for_arweave = record.owner_did.clone();
+            let self_public_url = state.config.public_url.clone();
+            let node_keypair = Arc::clone(&state.node_keypair);
+            let object_list_pinata = object_list;
+            let do_pinata_replication = withheld.is_some();
+            tokio::spawn(async move {
+                let pinned = if do_pinata_replication {
+                    crate::pinata::pin_new_objects(
+                        &http_client,
+                        &pinata_upload_url,
+                        &pinata_jwt,
+                        &repo_path_clone,
+                        object_list_pinata,
+                        &db_clone,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                };
+
+                if !pinned.is_empty() {
+                    tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
+                }
+
+                // Build sha→cid map from pinned objects
+                let cid_map: std::collections::HashMap<String, String> =
+                    pinned.into_iter().collect();
+
+                // Record branch→CID for each ref update and publish gossip
+                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                    let cid = cid_map.get(new_sha).map(|s| s.as_str());
+
+                    if let Some(cid_str) = cid {
+                        let _ = db_clone
+                            .upsert_branch_cid(
+                                &repo_slug,
+                                ref_name,
+                                new_sha,
+                                cid_str,
+                                &node_did_str,
+                            )
+                            .await;
+                    }
+
+                    if announce {
+                        if let Some(p2p) = &p2p_handle {
+                            p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
+                                node_did: node_did_str.clone(),
+                                pusher_did: pusher_did_clone.clone(),
+                                repo: repo_slug.clone(),
+                                ref_name: ref_name.clone(),
+                                old_sha: old_sha.clone(),
+                                new_sha: new_sha.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                cert_id: None,
+                                cid: cid.map(|s| s.to_string()),
+                            })
+                            .await;
+                        }
+                    }
+                }
+
+                // Broadcast ref update to GraphQL subscription listeners — one per ref.
+                // Gated on `announce`: /graphql/ws is unauthenticated (mounted after
+                // the optional_signature layer), and the subscription resolver has no
+                // caller to gate against, so only publicly-readable ref updates may
+                // reach anonymous subscribers. Mirrors the gossip (above) and Arweave
+                // (below) sends, which are already `announce`-gated. Without this a
+                // private-repo push would leak live ref metadata over the socket —
+                // the subscription analog of #112/#114.
+                let now_ts = chrono::Utc::now().to_rfc3339();
                 if announce {
-                    if let Some(p2p) = &p2p_handle {
-                        p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
-                            node_did: node_did_str.clone(),
-                            pusher_did: pusher_did_clone.clone(),
+                    for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                        let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
                             repo: repo_slug.clone(),
                             ref_name: ref_name.clone(),
                             old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            cert_id: None,
-                            cid: cid.map(|s| s.to_string()),
-                        })
-                        .await;
+                            pusher_did: pusher_did_clone.clone(),
+                            node_did: node_did_str.clone(),
+                            timestamp: now_ts.clone(),
+                        });
                     }
                 }
-            }
 
-            // Broadcast ref update to GraphQL subscription listeners — one per ref.
-            // Gated on `announce`: /graphql/ws is unauthenticated (mounted after
-            // the optional_signature layer), and the subscription resolver has no
-            // caller to gate against, so only publicly-readable ref updates may
-            // reach anonymous subscribers. Mirrors the gossip (above) and Arweave
-            // (below) sends, which are already `announce`-gated. Without this a
-            // private-repo push would leak live ref metadata over the socket —
-            // the subscription analog of #112/#114.
-            let now_ts = chrono::Utc::now().to_rfc3339();
-            if announce {
-                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                    let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
-                        repo: repo_slug.clone(),
-                        ref_name: ref_name.clone(),
-                        old_sha: old_sha.clone(),
-                        new_sha: new_sha.clone(),
-                        pusher_did: pusher_did_clone.clone(),
-                        node_did: node_did_str.clone(),
-                        timestamp: now_ts.clone(),
-                    });
-                }
-            }
-
-            // Arweave permanent anchoring — fire for each ref update.
-            // Suppressed for repos the public cannot read (public permanent ledger).
-            if announce && !irys_url.is_empty() {
-                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                    let cid = cid_map.get(new_sha).cloned();
-                    let anchor = crate::arweave::RefAnchor {
-                        repo: repo_slug.clone(),
-                        owner_did: owner_did_for_arweave.clone(),
-                        ref_name: ref_name.clone(),
-                        old_sha: old_sha.clone(),
-                        new_sha: new_sha.clone(),
-                        cid: cid.clone(),
-                        timestamp: now_ts.clone(),
-                        node_did: node_did_str.clone(),
-                    };
-                    match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor).await
-                    {
-                        Ok(tx_id) if !tx_id.is_empty() => {
-                            let arweave_url = crate::arweave::arweave_url(&tx_id);
-                            let _ = db_clone
-                                .record_arweave_anchor(&crate::db::RecordAnchorInput {
-                                    repo: &repo_slug,
-                                    owner_did: &owner_did_for_arweave,
-                                    ref_name,
-                                    old_sha,
-                                    new_sha,
-                                    cid: cid.as_deref(),
-                                    irys_tx_id: &tx_id,
-                                    arweave_url: &arweave_url,
-                                    node_did: &node_did_str,
-                                })
-                                .await;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed"),
-                    }
-                }
-            }
-
-            // HTTP peer notification — notify all known peers to pull from us.
-            // This is the reliable fallback when Gossipsub p2p is not yet connected.
-            // Suppressed for repos the public cannot read. Runs last so a slow or
-            // unreachable peer cannot delay the local GraphQL broadcast or Arweave
-            // anchoring above; this is the lowest-priority best-effort step.
-            if announce {
-                if let Ok(peers) = db_for_peers.list_peers().await {
-                    for peer in peers {
-                        if peer.http_url.is_empty() {
-                            continue;
-                        }
-                        let peer_url = peer.http_url.trim_end_matches('/');
-                        if let Some(self_url) = self_public_url.as_deref() {
-                            if peer_url == self_url.trim_end_matches('/') {
-                                continue;
+                // Arweave permanent anchoring — fire for each ref update.
+                // Suppressed for repos the public cannot read (public permanent ledger).
+                if announce && !irys_url.is_empty() {
+                    for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                        let cid = cid_map.get(new_sha).cloned();
+                        let anchor = crate::arweave::RefAnchor {
+                            repo: repo_slug.clone(),
+                            owner_did: owner_did_for_arweave.clone(),
+                            ref_name: ref_name.clone(),
+                            old_sha: old_sha.clone(),
+                            new_sha: new_sha.clone(),
+                            cid: cid.clone(),
+                            timestamp: now_ts.clone(),
+                            node_did: node_did_str.clone(),
+                        };
+                        match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor)
+                            .await
+                        {
+                            Ok(tx_id) if !tx_id.is_empty() => {
+                                let arweave_url = crate::arweave::arweave_url(&tx_id);
+                                let _ = db_clone
+                                    .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                                        repo: &repo_slug,
+                                        owner_did: &owner_did_for_arweave,
+                                        ref_name,
+                                        old_sha,
+                                        new_sha,
+                                        cid: cid.as_deref(),
+                                        irys_tx_id: &tx_id,
+                                        arweave_url: &arweave_url,
+                                        node_did: &node_did_str,
+                                    })
+                                    .await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed")
                             }
                         }
-                        let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
-                        notify_peer_of_refs(
-                            &http_client,
-                            node_keypair.as_ref(),
-                            &peer.did,
-                            &notify_url,
-                            &repo_slug,
-                            &ref_updates_clone,
-                            &node_did_str,
-                            &pusher_did_clone,
-                        )
-                        .await;
                     }
                 }
-            }
-        });
-    }
+
+                // HTTP peer notification — notify all known peers to pull from us.
+                // This is the reliable fallback when Gossipsub p2p is not yet connected.
+                // Suppressed for repos the public cannot read. Runs last so a slow or
+                // unreachable peer cannot delay the local GraphQL broadcast or Arweave
+                // anchoring above; this is the lowest-priority best-effort step.
+                if announce {
+                    if let Ok(peers) = db_for_peers.list_peers().await {
+                        for peer in peers {
+                            if peer.http_url.is_empty() {
+                                continue;
+                            }
+                            let peer_url = peer.http_url.trim_end_matches('/');
+                            if let Some(self_url) = self_public_url.as_deref() {
+                                if peer_url == self_url.trim_end_matches('/') {
+                                    continue;
+                                }
+                            }
+                            let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
+                            notify_peer_of_refs(
+                                &http_client,
+                                node_keypair.as_ref(),
+                                &peer.did,
+                                &notify_url,
+                                &repo_slug,
+                                &ref_updates_clone,
+                                &node_did_str,
+                                &pusher_did_clone,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    // Await report-status from the detached task WITHOUT blocking on the tail. If
+    // the client disconnected, this future is already dropped and `report_rx` with
+    // it — the task then runs the tail regardless. A send-before-report task panic
+    // drops the sender, surfaced here as an internal error (matching the prior
+    // JoinError → 500 mapping).
+    let result = report_rx.await.map_err(|_| {
+        AppError::Internal(anyhow::anyhow!(
+            "receive-pack task failed before reporting report-status"
+        ))
+    })??;
 
     Ok(result)
 }
@@ -2758,6 +2792,282 @@ mod tests {
             ref_present,
             "refs/heads/main must be created after a fully-received push despite client disconnect"
         );
+    }
+
+    // U1/R1: a fully-received push must produce its metadata + fan-out TAIL even
+    // when the client disconnects mid-apply. The pre-fix handler detaches only
+    // acquire→receive→release; the whole success tail (touch_repo, record_push,
+    // certs, webhooks, replication, ref broadcast) runs inline in the cancellable
+    // request future, so a disconnect after receive-pack succeeds commits the git
+    // refs (in the surviving task) but drops the tail — a split-brain: committed
+    // git, no push record. Here we drop the handler mid-apply (sleeping hook), let
+    // the surviving task finish, and assert the push record landed. RED pre-fix
+    // (push_events row absent), GREEN after (tail folded into the detached task).
+    #[sqlx::test]
+    async fn push_metadata_tail_completes_after_client_disconnect(pool: sqlx::PgPool) {
+        use axum::extract::{Path as AxPath, State};
+        use axum::Extension;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+
+        let owner = "z6u1tailowner";
+        let name = "u1tail";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let bare = repos_dir
+            .path()
+            .join(&owner_slug)
+            .join(format!("{name}.git"));
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
+            .await
+            .unwrap();
+
+        fn git(args: &[&str], dir: &std::path::Path) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        // Build a commit in a scratch working repo.
+        let work = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q", "-b", "main", "."], work.path());
+        git(&["config", "user.email", "t@t"], work.path());
+        git(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "hi").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c"], work.path());
+        let oid = git(&["rev-parse", "HEAD"], work.path());
+
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &work.path().to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "clone --bare failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        git(
+            &[
+                "-C",
+                &bare.to_string_lossy(),
+                "update-ref",
+                "-d",
+                "refs/heads/main",
+            ],
+            work.path(),
+        );
+
+        // Sleeping pre-receive hook: the deterministic mid-apply window we drop in.
+        let hook = bare.join("hooks").join("pre-receive");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\ncat >/dev/null\nsleep 2\nexit 0\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Receive-pack POST body: create refs/heads/main -> oid, plus a real pack.
+        let zero = "0".repeat(40);
+        let cmd = format!("{zero} {oid} refs/heads/main\0report-status\n");
+        let mut body = Vec::new();
+        let len = cmd.len() + 4;
+        body.extend_from_slice(format!("{len:04x}").as_bytes());
+        body.extend_from_slice(cmd.as_bytes());
+        body.extend_from_slice(b"0000");
+        let pack = Command::new("git")
+            .args([
+                "-C",
+                &bare.to_string_lossy(),
+                "pack-objects",
+                "--stdout",
+                "-q",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            pack.status.success(),
+            "pack-objects failed: {}",
+            String::from_utf8_lossy(&pack.stderr)
+        );
+        body.extend_from_slice(&pack.stdout);
+        let body = Bytes::from(body);
+
+        // Drive the handler, then DROP it mid-hook (the "client disconnect").
+        let handler = super::git_receive_pack(
+            State(state.clone()),
+            AxPath((owner.to_string(), format!("{name}.git"))),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            body,
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(800), handler).await;
+
+        // Poll for the tail's push record past the hook's sleep. The pusher DID is
+        // the repo owner, so the push_events count for `owner` becomes 1 once the
+        // surviving task runs the tail.
+        let mut pushes = 0i64;
+        for _ in 0..40 {
+            pushes = state.db.get_push_count(owner).await.unwrap();
+            if pushes >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert_eq!(
+            pushes, 1,
+            "the push-metadata tail (record_push) must land after a fully-received \
+             push despite the client disconnect — it must run in the detached task, \
+             not the cancelled request future"
+        );
+    }
+
+    // U1/R1 no-regression: a CONNECTED push (handler awaited to completion) must
+    // still get report-status back over the oneshot AND run the full tail. Guards
+    // the two ways the refactor could regress a connected client: the response
+    // coupling to tail completion (a latency regression), and the oneshot never
+    // delivering (client would see a spurious 500).
+    #[sqlx::test]
+    async fn connected_push_returns_report_status_and_runs_tail(pool: sqlx::PgPool) {
+        use axum::extract::{Path as AxPath, State};
+        use axum::Extension;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+
+        let owner = "z6u1connowner";
+        let name = "u1conn";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let bare = repos_dir
+            .path()
+            .join(&owner_slug)
+            .join(format!("{name}.git"));
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
+            .await
+            .unwrap();
+
+        fn git(args: &[&str], dir: &std::path::Path) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let work = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q", "-b", "main", "."], work.path());
+        git(&["config", "user.email", "t@t"], work.path());
+        git(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "hi").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c"], work.path());
+        let oid = git(&["rev-parse", "HEAD"], work.path());
+
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &work.path().to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone --bare failed");
+        git(
+            &[
+                "-C",
+                &bare.to_string_lossy(),
+                "update-ref",
+                "-d",
+                "refs/heads/main",
+            ],
+            work.path(),
+        );
+
+        // No hook: the push applies immediately, so the handler returns promptly.
+        let zero = "0".repeat(40);
+        let cmd = format!("{zero} {oid} refs/heads/main\0report-status\n");
+        let mut body = Vec::new();
+        let len = cmd.len() + 4;
+        body.extend_from_slice(format!("{len:04x}").as_bytes());
+        body.extend_from_slice(cmd.as_bytes());
+        body.extend_from_slice(b"0000");
+        let pack = Command::new("git")
+            .args([
+                "-C",
+                &bare.to_string_lossy(),
+                "pack-objects",
+                "--stdout",
+                "-q",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(pack.status.success(), "pack-objects failed");
+        body.extend_from_slice(&pack.stdout);
+        let body = Bytes::from(body);
+
+        // Await the handler to completion (connected client) and assert it returned
+        // report-status (200) over the oneshot — not a 500 from a dropped sender.
+        let resp = super::git_receive_pack(
+            State(state.clone()),
+            AxPath((owner.to_string(), format!("{name}.git"))),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            body,
+        )
+        .await
+        .expect("connected push must return report-status");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // And the tail runs (detached task): the push record lands.
+        let mut pushes = 0i64;
+        for _ in 0..40 {
+            pushes = state.db.get_push_count(owner).await.unwrap();
+            if pushes >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert_eq!(pushes, 1, "the tail must run on a connected push too");
     }
 
     /// Repo creation must be throttled by the per-IP creation limiter BEFORE
