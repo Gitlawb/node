@@ -165,7 +165,7 @@ pub async fn get_by_cid(
     // admits any `did:key` unthrottled, so a DID key would be free to mint around); a
     // `None` key (no trusted header, no peer) is bounded by the global pool only,
     // never the per-source sub-cap.
-    let _ipfs_walk_permit = state
+    let ipfs_walk_permit = state
         .git_ipfs_walk_semaphore
         .clone()
         .try_acquire_owned()
@@ -174,7 +174,7 @@ pub async fn get_by_cid(
             AppError::Overloaded("ipfs service at capacity, retry shortly".into())
         })?;
     let source_key = crate::rate_limit::client_key(&headers, peer, state.push_limiter_trust);
-    let _ipfs_caller_permit = match &source_key {
+    let ipfs_caller_permit = match &source_key {
         Some(ip) => Some(state.git_ipfs_walk_per_caller.try_acquire(ip).ok_or_else(|| {
             tracing::warn!(key = %ip, "/ipfs per-source walk cap reached; shedding request with 503");
             AppError::Overloaded("ipfs service at capacity for this source, retry shortly".into())
@@ -182,219 +182,253 @@ pub async fn get_by_cid(
         None => None,
     };
 
-    // Resolve the content-addressed CID to the object's git oid(s). A real pin
-    // CID digests the raw object content (`Cid::from_git_object_bytes`), NOT the
-    // git oid (git frames content with a `"<type> <len>\0"` header first), so we
-    // map it back through `pinned_cids` rather than treating the digest as an oid
-    // (#173). The cid index is non-unique, so one CID can map to several oids (a
-    // tree and a blob whose raw bytes collide, or content pinned under two oids);
-    // we try each candidate below rather than pick one arbitrarily and false-404
-    // when the chosen one is withheld or absent while another is readable (#173).
-    // An empty result is an opaque 404, uniform with a genuine not-found and a
-    // visibility denial.
-    let oids = state
-        .db
-        .oids_for_cid(&canonical_cid)
-        .await
-        .map_err(AppError::Internal)?;
-    if oids.is_empty() {
-        return Err(AppError::RepoNotFound(format!(
-            "no git object found for CID {cid_str}"
-        )));
-    }
-    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
-    let caller_owned = caller.map(|c| c.to_string());
+    // Caller DID (owned) resolved before the spawn: the detached task below cannot
+    // borrow the handler's `auth` extension.
+    let caller_owned = auth.as_ref().map(|e| e.0 .0.as_str().to_string());
 
-    // Per-request walk budget + memos + throttle flag, shared by the provenance path
-    // and the legacy scan so both honor the same fan-out ceiling, per-repo memo, and
-    // IP brake. The caller is constant for one request, so `repo.id` alone keys the memo.
-    let mut walk = WalkState {
-        walks: 0,
-        probes: 0,
-        truncated: false,
-        allowed_blob_memo: HashMap::new(),
-        allowed_tree_memo: HashMap::new(),
-        reachable_ct_memo: HashMap::new(),
-    };
-    // Set when a walk-requiring candidate is skipped because the source IP's walk quota
-    // is spent (#173 review, F-C): the scan keeps going so a later walk-free copy still
-    // serves; only if nothing is servable is it turned into the 429.
-    let mut throttled = false;
-    let rctx = ResolveCtx {
-        caller,
-        caller_owned: &caller_owned,
-        headers: &headers,
-        peer,
-        cid_str: &cid_str,
-        canonical_cid: &canonical_cid,
-    };
+    // #173 round-10 (R1, KTD1): move BOTH admission permits into an AdmissionGuard OWNED
+    // by a detached tokio task that runs the whole gated serve pipeline, and have the
+    // handler await its JoinHandle. Dropping the request future on a client disconnect
+    // drops the JoinHandle, which DETACHES the task (tokio does not abort a task when its
+    // handle drops) rather than cancelling it — so the pipeline runs to its bounded
+    // completion and releases admission only then, instead of the permits dropping the
+    // instant the handler future is torn down while a spawn_blocking git probe/walk/read
+    // is still alive (the disconnect-spam cap bypass this closes, the /ipfs half of #174
+    // P1-a). Every git child on this pipeline is duration-bounded (the run_bounded_git
+    // probe/read twins + the bounded walk), so the detached task cannot hold admission
+    // past ~git_service_timeout_secs. The client key is already captured (`source_key`)
+    // before the spawn; the detached task has no request extractors.
+    let admission =
+        crate::git::smart_http::AdmissionGuard::new(ipfs_walk_permit, ipfs_caller_permit);
+    let serve: tokio::task::JoinHandle<Result<Response>> = tokio::spawn(async move {
+        // The guard is held for the whole task and drops LAST — after the response is
+        // built — releasing admission exactly once when the pipeline is truly done.
+        let _admission = admission;
 
-    // Legacy scan context (repos + rules + quarantined ids), loaded LAZILY only when a
-    // legacy NULL-provenance pin is hit — the provenance path must never trigger the
-    // O(repos) load (that fan-out is exactly what provenance removes, #173 round 2).
-    let mut scan_ctx: Option<LegacyScanCtx> = None;
-
-    for sha256_hex in &oids {
-        // A pinned object records EVERY repo it was pinned from (#173 round 8, F1).
-        // Resolve a PROVENANCED pin by trying each source repo (bounded to
-        // MAX_PIN_SOURCES) through the SAME gate; the first that authorizes serves — no
-        // scan fan-out. A shared object first pinned from a private/quarantined repo
-        // still serves from a later PUBLIC source. Deterministic (ORDER BY on the
-        // union), so no ordering can turn an authorized copy into a 404.
-        let sources = state
+        // Resolve the content-addressed CID to the object's git oid(s). A real pin
+        // CID digests the raw object content (`Cid::from_git_object_bytes`), NOT the
+        // git oid (git frames content with a `"<type> <len>\0"` header first), so we
+        // map it back through `pinned_cids` rather than treating the digest as an oid
+        // (#173). The cid index is non-unique, so one CID can map to several oids (a
+        // tree and a blob whose raw bytes collide, or content pinned under two oids);
+        // we try each candidate below rather than pick one arbitrarily and false-404
+        // when the chosen one is withheld or absent while another is readable (#173).
+        // An empty result is an opaque 404, uniform with a genuine not-found and a
+        // visibility denial.
+        let oids = state
             .db
-            .pin_sources_for_oid(sha256_hex)
+            .oids_for_cid(&canonical_cid)
             .await
             .map_err(AppError::Internal)?;
-        // Provenance fast-path: try each recorded source repo through the SAME gate
-        // (bounded to first-pinner + MAX_PIN_SOURCES). Empty for a legacy NULL-provenance
-        // pin. The first source that authorizes serves — no scan fan-out on the common
-        // path.
-        for repo_id in &sources {
-            let repo = match state
-                .db
-                .get_repo_by_id(repo_id)
-                .await
-                .map_err(AppError::Internal)?
-            {
-                Some(r) => r,
-                // A source repo is gone: skip it; a later source or the scan fallback
-                // below may still resolve.
-                None => continue,
-            };
-            let quarantined = state
-                .db
-                .is_repo_quarantined(repo_id)
-                .await
-                .map_err(AppError::Internal)?;
-            let rules_map = state
-                .db
-                .list_visibility_rules_for_repos(std::slice::from_ref(repo_id))
-                .await
-                .map_err(AppError::Internal)?;
-            let rules = rules_map.get(repo_id).map(Vec::as_slice).unwrap_or(&[]);
-            match gate_and_serve(
-                &state,
-                &repo,
-                rules,
-                quarantined,
-                sha256_hex,
-                &rctx,
-                &mut walk,
-                false,
-            )
-            .await
-            {
-                GateOutcome::Served(resp) => return Ok(resp),
-                GateOutcome::Throttled => {
-                    throttled = true;
-                    continue;
-                }
-                GateOutcome::Skip => continue,
-            }
+        if oids.is_empty() {
+            return Err(AppError::RepoNotFound(format!(
+                "no git object found for CID {cid_str}"
+            )));
         }
+        let caller = caller_owned.as_deref();
 
-        // Bounded legacy-scan fallback. Run it when the provenance set could not have
-        // served the caller AND may be INCOMPLETE:
-        //   - empty  -> a legacy NULL-provenance pin (recorded before provenance existed), or
-        //   - at_cap -> `record_pin_source` stops inserting at MAX_PIN_SOURCES and drops
-        //               later sources SILENTLY, so a full table may hide a servable source
-        //               (e.g. a later PUBLIC pinner buried by 16 attacker sources — the
-        //               pin-source griefing hole). The scan gates every repo through the
-        //               real per-caller gate, so it finds that copy.
-        // A non-empty, non-full set is COMPLETE (every recorded source was just tried), so
-        // skip the scan and let the tail 404 — ordinary denials never fan out to O(repos)
-        // (INV-10 / F3). The at_cap query runs only on a provenance MISS (we return above
-        // on Served), so it never costs the serve path.
-        let needs_scan = sources.is_empty()
-            || state
+        // Per-request walk budget + memos + throttle flag, shared by the provenance path
+        // and the legacy scan so both honor the same fan-out ceiling, per-repo memo, and
+        // IP brake. The caller is constant for one request, so `repo.id` alone keys the memo.
+        let mut walk = WalkState {
+            walks: 0,
+            probes: 0,
+            truncated: false,
+            allowed_blob_memo: HashMap::new(),
+            allowed_tree_memo: HashMap::new(),
+            reachable_ct_memo: HashMap::new(),
+        };
+        // Set when a walk-requiring candidate is skipped because the source IP's walk quota
+        // is spent (#173 review, F-C): the scan keeps going so a later walk-free copy still
+        // serves; only if nothing is servable is it turned into the 429.
+        let mut throttled = false;
+        let rctx = ResolveCtx {
+            caller,
+            caller_owned: &caller_owned,
+            headers: &headers,
+            peer,
+            cid_str: &cid_str,
+            canonical_cid: &canonical_cid,
+        };
+
+        // Legacy scan context (repos + rules + quarantined ids), loaded LAZILY only when a
+        // legacy NULL-provenance pin is hit — the provenance path must never trigger the
+        // O(repos) load (that fan-out is exactly what provenance removes, #173 round 2).
+        let mut scan_ctx: Option<LegacyScanCtx> = None;
+
+        for sha256_hex in &oids {
+            // A pinned object records EVERY repo it was pinned from (#173 round 8, F1).
+            // Resolve a PROVENANCED pin by trying each source repo (bounded to
+            // MAX_PIN_SOURCES) through the SAME gate; the first that authorizes serves — no
+            // scan fan-out. A shared object first pinned from a private/quarantined repo
+            // still serves from a later PUBLIC source. Deterministic (ORDER BY on the
+            // union), so no ordering can turn an authorized copy into a 404.
+            let sources = state
                 .db
-                .pin_sources_at_cap(sha256_hex)
+                .pin_sources_for_oid(sha256_hex)
                 .await
                 .map_err(AppError::Internal)?;
-        if needs_scan {
-            // F3 (#173, INV-10/INV-15): peek the per-IP limiter WITHOUT consuming a token
-            // so an already-throttled source is shed BEFORE the O(repos) preload; the
-            // consuming per-probe charge inside gate_and_serve is left UNCHANGED (it is
-            // load-bearing for the across-request bound), so this adds no double-charge.
-            if let Some(key) =
-                crate::rate_limit::client_key(rctx.headers, rctx.peer, state.push_limiter_trust)
-            {
-                if state.ipfs_rate_limiter.is_throttled(&key).await {
-                    throttled = true;
-                    continue;
-                }
-            }
-            // Load the scan context once, lazily (shared across oid candidates).
-            if scan_ctx.is_none() {
-                #[cfg(test)]
-                bump_preload_queries();
-                let repos = state
+            // Provenance fast-path: try each recorded source repo through the SAME gate
+            // (bounded to first-pinner + MAX_PIN_SOURCES). Empty for a legacy NULL-provenance
+            // pin. The first source that authorizes serves — no scan fan-out on the common
+            // path.
+            for repo_id in &sources {
+                let repo = match state
                     .db
-                    .list_all_repos()
-                    .await
-                    .map_err(AppError::Internal)?;
-                let repo_ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
-                let rules_by_repo = state
-                    .db
-                    .list_visibility_rules_for_repos(&repo_ids)
-                    .await
-                    .map_err(AppError::Internal)?;
-                let quarantined: HashSet<String> = state
-                    .db
-                    .list_quarantined_repos()
+                    .get_repo_by_id(repo_id)
                     .await
                     .map_err(AppError::Internal)?
-                    .into_iter()
-                    .map(|r| r.id)
-                    .collect();
-                scan_ctx = Some((repos, rules_by_repo, quarantined));
-            }
-            let (repos, rules_by_repo, quarantined) = scan_ctx.as_ref().unwrap();
-            for repo in repos {
-                let rules = rules_by_repo
-                    .get(&repo.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let is_quar = quarantined.contains(&repo.id);
+                {
+                    Some(r) => r,
+                    // A source repo is gone: skip it; a later source or the scan fallback
+                    // below may still resolve.
+                    None => continue,
+                };
+                let quarantined = state
+                    .db
+                    .is_repo_quarantined(repo_id)
+                    .await
+                    .map_err(AppError::Internal)?;
+                let rules_map = state
+                    .db
+                    .list_visibility_rules_for_repos(std::slice::from_ref(repo_id))
+                    .await
+                    .map_err(AppError::Internal)?;
+                let rules = rules_map.get(repo_id).map(Vec::as_slice).unwrap_or(&[]);
                 match gate_and_serve(
-                    &state, repo, rules, is_quar, sha256_hex, &rctx, &mut walk, true,
+                    &state,
+                    &repo,
+                    rules,
+                    quarantined,
+                    sha256_hex,
+                    &rctx,
+                    &mut walk,
+                    false,
                 )
                 .await
                 {
                     GateOutcome::Served(resp) => return Ok(resp),
-                    // A throttled walk-requiring candidate is skipped, not fatal:
-                    // keep scanning for a later walk-free copy (#173 review, F-C).
-                    GateOutcome::Throttled => throttled = true,
-                    GateOutcome::Skip => {}
+                    GateOutcome::Throttled => {
+                        throttled = true;
+                        continue;
+                    }
+                    GateOutcome::Skip => continue,
+                }
+            }
+
+            // Bounded legacy-scan fallback. Run it when the provenance set could not have
+            // served the caller AND may be INCOMPLETE:
+            //   - empty  -> a legacy NULL-provenance pin (recorded before provenance existed), or
+            //   - at_cap -> `record_pin_source` stops inserting at MAX_PIN_SOURCES and drops
+            //               later sources SILENTLY, so a full table may hide a servable source
+            //               (e.g. a later PUBLIC pinner buried by 16 attacker sources — the
+            //               pin-source griefing hole). The scan gates every repo through the
+            //               real per-caller gate, so it finds that copy.
+            // A non-empty, non-full set is COMPLETE (every recorded source was just tried), so
+            // skip the scan and let the tail 404 — ordinary denials never fan out to O(repos)
+            // (INV-10 / F3). The at_cap query runs only on a provenance MISS (we return above
+            // on Served), so it never costs the serve path.
+            let needs_scan = sources.is_empty()
+                || state
+                    .db
+                    .pin_sources_at_cap(sha256_hex)
+                    .await
+                    .map_err(AppError::Internal)?;
+            if needs_scan {
+                // F3 (#173, INV-10/INV-15): peek the per-IP limiter WITHOUT consuming a token
+                // so an already-throttled source is shed BEFORE the O(repos) preload; the
+                // consuming per-probe charge inside gate_and_serve is left UNCHANGED (it is
+                // load-bearing for the across-request bound), so this adds no double-charge.
+                if let Some(key) =
+                    crate::rate_limit::client_key(rctx.headers, rctx.peer, state.push_limiter_trust)
+                {
+                    if state.ipfs_rate_limiter.is_throttled(&key).await {
+                        throttled = true;
+                        continue;
+                    }
+                }
+                // Load the scan context once, lazily (shared across oid candidates).
+                if scan_ctx.is_none() {
+                    #[cfg(test)]
+                    bump_preload_queries();
+                    let repos = state
+                        .db
+                        .list_all_repos()
+                        .await
+                        .map_err(AppError::Internal)?;
+                    let repo_ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
+                    let rules_by_repo = state
+                        .db
+                        .list_visibility_rules_for_repos(&repo_ids)
+                        .await
+                        .map_err(AppError::Internal)?;
+                    let quarantined: HashSet<String> = state
+                        .db
+                        .list_quarantined_repos()
+                        .await
+                        .map_err(AppError::Internal)?
+                        .into_iter()
+                        .map(|r| r.id)
+                        .collect();
+                    scan_ctx = Some((repos, rules_by_repo, quarantined));
+                }
+                let (repos, rules_by_repo, quarantined) = scan_ctx.as_ref().unwrap();
+                for repo in repos {
+                    let rules = rules_by_repo
+                        .get(&repo.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let is_quar = quarantined.contains(&repo.id);
+                    match gate_and_serve(
+                        &state, repo, rules, is_quar, sha256_hex, &rctx, &mut walk, true,
+                    )
+                    .await
+                    {
+                        GateOutcome::Served(resp) => return Ok(resp),
+                        // A throttled walk-requiring candidate is skipped, not fatal:
+                        // keep scanning for a later walk-free copy (#173 review, F-C).
+                        GateOutcome::Throttled => throttled = true,
+                        GateOutcome::Skip => {}
+                    }
                 }
             }
         }
-    }
 
-    // Nothing served — three distinct tails, in precedence order:
-    //  1. The scan was cut short by a cap (legacy probe ceiling or walk ceiling), so
-    //     the object was NOT proven absent/unreadable everywhere → 503, retryable, and
-    //     explicitly NOT a definitive not-found (#173, F2). This outranks the throttle:
-    //     an incomplete search must not masquerade as a clean rate-limit outcome, and
-    //     it carries only the caller-supplied CID (no object/OID/metadata leak).
-    //  2. A walk-requiring candidate was skipped for a spent IP quota while the scan
-    //     otherwise completed → 429 (the brake bit; a cheaper copy was sought first).
-    //  3. A full scan under the caps found nothing readable → opaque 404, uniform with
-    //     a genuine not-found and a visibility denial.
-    if walk.truncated {
-        return Err(AppError::SearchIncomplete(format!(
-            "CID {cid_str} search incomplete — retry"
-        )));
+        // Nothing served — three distinct tails, in precedence order:
+        //  1. The scan was cut short by a cap (legacy probe ceiling or walk ceiling), so
+        //     the object was NOT proven absent/unreadable everywhere → 503, retryable, and
+        //     explicitly NOT a definitive not-found (#173, F2). This outranks the throttle:
+        //     an incomplete search must not masquerade as a clean rate-limit outcome, and
+        //     it carries only the caller-supplied CID (no object/OID/metadata leak).
+        //  2. A walk-requiring candidate was skipped for a spent IP quota while the scan
+        //     otherwise completed → 429 (the brake bit; a cheaper copy was sought first).
+        //  3. A full scan under the caps found nothing readable → opaque 404, uniform with
+        //     a genuine not-found and a visibility denial.
+        if walk.truncated {
+            return Err(AppError::SearchIncomplete(format!(
+                "CID {cid_str} search incomplete — retry"
+            )));
+        }
+        if throttled {
+            return Err(AppError::TooManyRequests(
+                "ipfs retrieval rate limit exceeded — try again later".into(),
+            ));
+        }
+        Err(AppError::RepoNotFound(format!(
+            "no git object found for CID {cid_str}"
+        )))
+    });
+
+    // Await the detached serve task. Dropping THIS future (client disconnect) drops the
+    // JoinHandle and detaches the task, which keeps running and releases admission only
+    // when it completes (KTD1). A JoinError here is a panic in the pipeline (the task is
+    // never aborted), surfaced as a 500 rather than a silent hang.
+    match serve.await {
+        Ok(result) => result,
+        Err(join_err) => Err(AppError::Internal(anyhow::anyhow!(
+            "ipfs serve task failed: {join_err}"
+        ))),
     }
-    if throttled {
-        return Err(AppError::TooManyRequests(
-            "ipfs retrieval rate limit exceeded — try again later".into(),
-        ));
-    }
-    Err(AppError::RepoNotFound(format!(
-        "no git object found for CID {cid_str}"
-    )))
 }
 
 /// Outcome of gating one repo for one candidate oid.
@@ -553,32 +587,34 @@ async fn gate_and_serve(
     let obj_type = {
         let rp = repo_path.clone();
         let sha = sha256_hex.to_string();
-        // Bound the blocking `git cat-file -t` under `git_service_timeout_secs`: this probe
-        // runs while the /ipfs walk permit is held, so a wedged cat-file (corrupt pack, NFS
-        // stall) would otherwise pin the global walk slot for the request's life. On timeout
-        // free the slot (mark truncated -> retryable 503) and skip the repo. spawn_blocking
-        // cannot be cancelled, so the child may linger on a blocking-pool thread, but it no
-        // longer holds the walk permit.
-        let probe_deadline = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-        match tokio::time::timeout(
-            probe_deadline,
-            tokio::task::spawn_blocking(move || store::object_type(&rp, &sha)),
-        )
+        let git_bin = state.git_bin.clone();
+        // Bound the probe CHILD itself (process-group teardown at `git_service_timeout_secs`
+        // via `object_type_bounded` -> `run_bounded_git`), not just an outer tokio timeout
+        // racing an uncancellable `spawn_blocking`: this probe runs while the /ipfs walk
+        // permit is held by the owning task, so a wedged cat-file (corrupt pack, NFS stall)
+        // must be REAPED at the deadline rather than left to linger and delay the task's
+        // completion — and thus admission release (#173 round-10, KTD2). No outer timeout,
+        // mirroring the bounded walk below; a `GitServiceTimeout` marks the search truncated
+        // (retryable 503).
+        let probe_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        match tokio::task::spawn_blocking(move || {
+            store::object_type_bounded(&git_bin, &rp, &sha, probe_timeout)
+        })
         .await
         {
-            Ok(Ok(Ok(Some(t)))) => t,
-            Ok(Ok(Ok(None))) => return GateOutcome::Skip,
-            Ok(Ok(Err(e))) => {
-                tracing::warn!(repo = %repo.name, err = %e, "error checking git object type");
-                return GateOutcome::Skip;
-            }
+            Ok(Ok(Some(t))) => t,
+            Ok(Ok(None)) => return GateOutcome::Skip,
             Ok(Err(e)) => {
-                tracing::warn!(repo = %repo.name, err = %e, "object-type probe task panicked; skipping repo");
+                if e.is::<crate::git::smart_http::GitServiceTimeout>() {
+                    tracing::warn!(repo = %repo.name, "object-type probe timed out under the /ipfs walk permit; skipping repo");
+                    walk.truncated = true;
+                } else {
+                    tracing::warn!(repo = %repo.name, err = %e, "error checking git object type");
+                }
                 return GateOutcome::Skip;
             }
-            Err(_elapsed) => {
-                tracing::warn!(repo = %repo.name, "object-type probe timed out under the /ipfs walk permit; skipping repo");
-                walk.truncated = true;
+            Err(e) => {
+                tracing::warn!(repo = %repo.name, err = %e, "object-type probe task panicked; skipping repo");
                 return GateOutcome::Skip;
             }
         }
@@ -710,42 +746,46 @@ async fn gate_and_serve(
     let read_sha = sha256_hex.to_string();
     let read_type = obj_type.clone();
     let want_cid = ctx.canonical_cid.to_string();
-    // Bound the blocking size+read+verify under `git_service_timeout_secs` (same rationale
-    // as the object-type probe): a hung cat-file must not pin the held /ipfs walk permit.
-    let read_deadline = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-    let read = tokio::time::timeout(
-        read_deadline,
-        tokio::task::spawn_blocking(move || -> ServedRead {
-            match store::object_size(&read_repo, &read_sha) {
-                Ok(Some(size)) if size > max_bytes => return ServedRead::TooLarge(size),
-                Ok(Some(_)) => {}
-                // git ran and reported no such object (or an unparseable size): genuine
-                // not-found for this candidate.
-                Ok(None) => return ServedRead::Gone,
-                // git itself failed to run: an infra failure, not a not-found.
-                Err(e) => return ServedRead::ReadErr(e.to_string()),
-            }
-            let content = match store::read_object_content(&read_repo, &read_sha, &read_type) {
-                Ok(c) => c,
-                Err(e) => return ServedRead::ReadErr(e.to_string()),
-            };
-            let served = gitlawb_core::cid::Cid::from_git_object_bytes(&content).to_string();
-            if served != want_cid {
-                return ServedRead::Mismatch(served);
-            }
-            ServedRead::Ok(content)
-        }),
-    )
+    let git_bin = state.git_bin.clone();
+    // Bound the size+read CHILDREN themselves (process-group teardown at
+    // `git_service_timeout_secs` via the `*_bounded` twins), not an outer tokio timeout
+    // over an uncancellable `spawn_blocking`: a hung cat-file must be REAPED at the
+    // deadline rather than left to pin the held /ipfs walk permit (#173 round-10, KTD2).
+    // No outer timeout, mirroring the bounded walk; a `GitServiceTimeout` from either
+    // twin surfaces as `ServedRead::ReadErr` -> truncated (retryable 503).
+    let read_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let read = tokio::task::spawn_blocking(move || -> ServedRead {
+        match store::object_size_bounded(&git_bin, &read_repo, &read_sha, read_timeout) {
+            Ok(Some(size)) if size > max_bytes => return ServedRead::TooLarge(size),
+            Ok(Some(_)) => {}
+            // git ran and reported no such object (or an unparseable size): genuine
+            // not-found for this candidate.
+            Ok(None) => return ServedRead::Gone,
+            // git failed to run OR the bounded read timed out (GitServiceTimeout): an
+            // infra/timeout failure, not a not-found.
+            Err(e) => return ServedRead::ReadErr(e.to_string()),
+        }
+        let content = match store::read_object_content_bounded(
+            &git_bin,
+            &read_repo,
+            &read_sha,
+            &read_type,
+            read_timeout,
+        ) {
+            Ok(c) => c,
+            Err(e) => return ServedRead::ReadErr(e.to_string()),
+        };
+        let served = gitlawb_core::cid::Cid::from_git_object_bytes(&content).to_string();
+        if served != want_cid {
+            return ServedRead::Mismatch(served);
+        }
+        ServedRead::Ok(content)
+    })
     .await;
     let served_read = match read {
-        Ok(Ok(sr)) => sr,
-        Ok(Err(e)) => {
+        Ok(sr) => sr,
+        Err(e) => {
             tracing::warn!(repo = %repo.name, err = %e, "object read task panicked");
-            walk.truncated = true;
-            return GateOutcome::Skip;
-        }
-        Err(_elapsed) => {
-            tracing::warn!(repo = %repo.name, "object read timed out under the /ipfs walk permit; skipping repo");
             walk.truncated = true;
             return GateOutcome::Skip;
         }
@@ -1063,38 +1103,33 @@ mod tests {
         drop(held);
     }
 
-    /// Retain-through-blocking (#174 F5, the load-bearing async property, on the
-    /// NEWLY-BOUNDED TREE path): the walk admission is held until the `spawn_blocking`
-    /// walk actually RETURNS, not when a tokio timeout fires. The requested CID
-    /// resolves to a TREE object under a path-scoped rule, so the gate runs
-    /// `allowed_tree_set_for_caller_bounded` — the walk this integration converts to
-    /// `run_bounded_git` — rather than the blob walk #174 already proved. With the
-    /// global pool at size 1, drive a request until its walk (a fake git that hangs on
-    /// `rev-list`) is in flight; the slot must stay held (`available_permits() == 0`)
-    /// and a replacement from a DIFFERENT source must shed 503 for as long as the
-    /// blocking walk runs — even though the request future is only `.await`ing the
-    /// blocking join. When the blocking walk ends the permit frees and a replacement
-    /// is admitted. The permit lives INSIDE the handler across the blocking `.await`;
-    /// move it out (drop before the walk) and the replacement would be admitted while
-    /// the walk still burns a blocking thread (the bug this guards).
+    /// Build the shared `/ipfs` TREE-walk fixture. A fake `git` whose `rev-list` records
+    /// its pid then sleeps ~6s (so the tree walk blocks deterministically inside
+    /// `run_bounded_git`) and whose `cat-file -t` answers "tree" (so the bounded
+    /// object-type probe, `object_type_bounded` on `state.git_bin`, routes into the
+    /// tree-gate arm); a real SHA-256 bare repo with a committed `src/` tree pinned WITH
+    /// provenance; and a path-scoped rule so the gate takes the tree-walk branch. Returns
+    /// the tempdir (keep it alive for the whole test), the state (the caller sets the walk
+    /// semaphores), the requested CID, and the rev-list pidfile path.
     #[cfg(unix)]
-    #[sqlx::test]
-    async fn get_by_cid_walk_permit_held_through_bounded_tree_walk(pool: sqlx::PgPool) {
+    async fn seed_tree_walk_fixture(
+        pool: sqlx::PgPool,
+    ) -> (
+        tempfile::TempDir,
+        crate::state::AppState,
+        String,
+        std::path::PathBuf,
+    ) {
         use std::process::Command;
 
         let tmp = tempfile::TempDir::new().unwrap();
         let revlist_pid = tmp.path().join("revlist.pid");
-        // Fake git for the /ipfs TREE walk only (object_type/read_object_content use
-        // the real `git`, so the tree must genuinely exist below). `rev-parse`
-        // resolves (so the lenient enumeration appends HEAD) and `rev-list` records
-        // its pid then sleeps ~6s so the walk BLOCKS deterministically inside
-        // `run_bounded_git`. The sleep bounds the walk so a broken fix cannot wedge
-        // the suite.
         let body = format!(
             "#!/bin/sh\n\
              case \"$1\" in\n\
                for-each-ref) : ;;\n\
                rev-parse) echo deadbeef ;;\n\
+               cat-file) if [ \"$2\" = \"-t\" ]; then echo tree; fi ;;\n\
                rev-list) echo $$ > \"{}\"; sleep 6 ;;\n\
                *) : ;;\n\
              esac\n\
@@ -1114,10 +1149,6 @@ mod tests {
         let repos_dir = tmp.path().join("repos");
         std::fs::create_dir_all(&repos_dir).unwrap();
         state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
-        // Isolate the global walk pool at size 1; per-source cap permissive so only the
-        // held global permit can shed the replacement.
-        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
-        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
         state.git_bin = git_path.to_str().unwrap().to_string();
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
 
@@ -1129,10 +1160,6 @@ mod tests {
             .await
             .unwrap();
         let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
-        // The exact bare path the handler's `acquire` resolves. Build a REAL SHA-256
-        // bare repo there with a committed `src/` directory, so real
-        // `git cat-file -t <oid>` classifies the requested object as a TREE and the
-        // handler routes into the tree-walk arm of the gate.
         let bare = state
             .repo_store
             .acquire(&rec.owner_did, &rec.name)
@@ -1177,7 +1204,6 @@ mod tests {
             ],
             tmp.path(),
         );
-        // The `src` directory's TREE oid — the object the request asks for.
         let tree_oid = {
             let out = Command::new("git")
                 .args(["rev-parse", "HEAD:src"])
@@ -1187,8 +1213,6 @@ mod tests {
             assert!(out.status.success(), "rev-parse failed");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        // Precondition: real git classifies the object as a TREE (so the handler
-        // reaches the tree-walk arm, not the blob arm or an early `continue`).
         assert_eq!(
             crate::git::store::object_type(&bare, &tree_oid)
                 .unwrap()
@@ -1196,9 +1220,6 @@ mod tests {
             Some("tree"),
             "the seeded sha256 tree must exist so the handler reaches the tree walk"
         );
-        // Pin the tree's content CID WITH provenance so the resolver targets this one
-        // repo (no legacy scan). A real pin CID digests the raw object content, not
-        // the git oid, so build it exactly as the pin path does (#173).
         let (_ty, raw) = crate::git::store::read_object(&bare, &tree_oid)
             .unwrap()
             .expect("tree object readable");
@@ -1208,8 +1229,6 @@ mod tests {
             .record_pinned_cid(&tree_oid, &cid, Some(&rec.id))
             .await
             .unwrap();
-        // A path-scoped rule so has_path_scoped_rule() is true (the tree-gate branch)
-        // without denying the "/" gate on the public repo.
         state
             .db
             .set_visibility_rule(
@@ -1221,6 +1240,34 @@ mod tests {
             )
             .await
             .unwrap();
+
+        (tmp, state, cid, revlist_pid)
+    }
+
+    /// Retain-through-blocking (#174 F5, the load-bearing async property, on the
+    /// NEWLY-BOUNDED TREE path): the walk admission is held until the `spawn_blocking`
+    /// walk actually RETURNS, not when a tokio timeout fires. The requested CID
+    /// resolves to a TREE object under a path-scoped rule, so the gate runs
+    /// `allowed_tree_set_for_caller_bounded` — the walk this integration converts to
+    /// `run_bounded_git` — rather than the blob walk #174 already proved. With the
+    /// global pool at size 1, drive a request until its walk (a fake git that hangs on
+    /// `rev-list`) is in flight; the slot must stay held (`available_permits() == 0`)
+    /// and a replacement from a DIFFERENT source must shed 503 for as long as the
+    /// blocking walk runs — even though the request future is only `.await`ing the
+    /// blocking join. When the blocking walk ends the permit frees and a replacement
+    /// is admitted. The permit lives INSIDE the handler across the blocking `.await`;
+    /// move it out (drop before the walk) and the replacement would be admitted while
+    /// the walk still burns a blocking thread (the bug this guards).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_walk_permit_held_through_bounded_tree_walk(pool: sqlx::PgPool) {
+        let (tmp, mut state, cid, revlist_pid) = seed_tree_walk_fixture(pool).await;
+        // Isolate the global walk pool at size 1; per-source cap permissive so only the
+        // held global permit can shed the replacement.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        // Keep the fixture tempdir alive for the whole test (its Drop removes the repos).
+        let _tmp = tmp;
 
         let sem = state.git_ipfs_walk_semaphore.clone();
         assert_eq!(
@@ -1291,13 +1338,34 @@ mod tests {
             "a replacement must shed 503 while the prior request's blocking tree walk still runs"
         );
 
-        // Drop the in-flight request; the detached blocking walk keeps running (a
-        // spawn_blocking cannot be cancelled), but the permit is a handler local, so
-        // dropping the future releases it once the blocking join is abandoned. Either
-        // way, kill the sleeping child so the slot frees promptly and poll for
-        // recovery — the point already proven above is that the slot stayed held for
-        // the duration of the blocking work.
+        // #173 round-10 (R1, KTD1): the NEW invariant. Drop the in-flight request. The
+        // gated serve pipeline runs in a DETACHED tokio task that OWNS the admission
+        // guard, so dropping the request future must NOT release admission — the task
+        // runs to its bounded completion first. Under the OLD handler-local permit the
+        // slot would free the instant the future dropped even though the blocking walk
+        // is still burning a thread (the cap bypass this closes).
         drop(fut);
+        // While the detached task is still inside the ~6s blocking tree walk, admission
+        // stays held. Poll a short window: a handler-local permit would already read 1.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "dropping the request must NOT release admission while the detached walk \
+             still runs (the spawned task owns the guard until its bounded work ends)"
+        );
+        // A replacement from a different source STILL sheds 503 after the drop — the
+        // detached task holds the global slot, exactly as it did while the future lived.
+        let peer3: SocketAddr = "203.0.113.83:5000".parse().unwrap();
+        let resp = router.clone().oneshot(make_req(peer3)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a replacement must still shed 503 after the original request was dropped, \
+             while its detached walk holds admission"
+        );
+        // Tear the walk down; the detached task finishes and drops the guard exactly
+        // once, freeing the single slot back to 1 (never double-freed to 2).
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }
@@ -1311,7 +1379,112 @@ mod tests {
         }
         assert!(
             freed,
-            "once the blocking walk ends the walk permit must free the global slot"
+            "once the detached walk tears down, the task drops the guard and frees the slot"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "admission released exactly once — the single slot is back, not double-freed"
+        );
+    }
+
+    /// Amplification negative (#173 round-10, R1): sequential cancel-spam from ONE source
+    /// cannot hold more than the per-source cap of concurrent detached walk tasks. A
+    /// detached serve task holds its per-source permit until its bounded work finishes (up
+    /// to `git_service_timeout_secs`), so with a per-source cap of 1 a second request from
+    /// the SAME source sheds 503 even though the GLOBAL pool has room — the source cannot
+    /// amplify its concurrent walk children past the cap by dropping-and-retrying. (The
+    /// worst case: a detached task can occupy its global/per-source permit for one
+    /// bound-interval, so distributed cancel-spam can hold the global pool that long — the
+    /// accepted bounded-admission tradeoff, not a leak.)
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_cancel_spam_bounded_by_per_source_cap(pool: sqlx::PgPool) {
+        let (tmp, mut state, cid, revlist_pid) = seed_tree_walk_fixture(pool).await;
+        // Global pool has ample room (4); the per-source cap is 1. So any shed of a
+        // same-source replacement is the PER-SOURCE cap, never global exhaustion.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(4));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let _tmp = tmp;
+
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        let per_caller = state.git_ipfs_walk_per_caller.clone();
+        let router = ipfs_router(state);
+        let make_req = |peer: SocketAddr| {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/ipfs/{cid}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        // Source S fires request 1; drive until its tree walk is in flight (the task now
+        // holds source S's single per-source permit).
+        let source_s: SocketAddr = "203.0.113.71:5000".parse().unwrap();
+        let mut fut = Box::pin(router.clone().oneshot(make_req(source_s)));
+        let mut walk_pid: Option<i32> = None;
+        for _ in 0..500 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&revlist_pid)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                walk_pid = Some(p);
+                break;
+            }
+        }
+        let pid = walk_pid.expect("the fake git rev-list must have spawned");
+        struct ReapOnDrop(i32);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapOnDrop(pid);
+
+        // Cancel-spam: drop request 1's future. Its detached task keeps running the walk
+        // and KEEPS holding source S's single per-source permit.
+        drop(fut);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // A SECOND request from source S sheds 503. The global pool still has room (only 1
+        // of 4 taken), so this is the per-source cap, not global exhaustion.
+        let resp = router.clone().oneshot(make_req(source_s)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a same-source cancel-spam replacement must shed 503 on the per-source cap \
+             while the detached task still holds the source's permit"
+        );
+        assert!(
+            sem.available_permits() >= 3,
+            "the shed was the per-source cap, not global exhaustion (global pool still has room)"
+        );
+        assert_eq!(
+            per_caller.tracked_keys(),
+            1,
+            "exactly one per-source permit is outstanding for the one source — no amplification"
+        );
+
+        // Tear the detached walk down; the task completes and releases source S's permit
+        // (tracked_keys returns to 0), so the source is no longer over the cap.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let mut released = false;
+        for _ in 0..400 {
+            if per_caller.tracked_keys() == 0 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            released,
+            "once the detached task tears down it releases source S's per-source permit"
         );
     }
 

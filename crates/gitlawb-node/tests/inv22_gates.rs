@@ -29,6 +29,7 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
     let repos = src("api/repos.rs");
     let smart_http = src("git/smart_http.rs");
     let vis = src("git/visibility_pack.rs");
+    let ipfs = src("api/ipfs.rs");
 
     // U1 / P1-a: run_bounded_git stands the watchdog down only after confirming the
     // child actually terminated (WNOWAIT), not on the raw stdout-drain EOF — otherwise
@@ -82,6 +83,38 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
         "U1/R2 gate missing: build_filtered_pack must thread the AdmissionGuard through \
          rev-list -> pack-objects so the permits are held until the pack-objects group \
          is reaped on disconnect (the path-scoped half of #174 P1-a)"
+    );
+
+    // U2 / R1 (#173 round-10): the `GET /ipfs/{cid}` serve pipeline must run in a
+    // DETACHED tokio task that OWNS the AdmissionGuard built from BOTH walk permits, so a
+    // cancelled or timed-out request releases admission only after the spawned (bounded)
+    // work completes — not the instant the handler future drops (the /ipfs half of #174
+    // P1-a). Two load-bearing markers: the guard is constructed from the two named
+    // permits, and the whole pipeline is moved into a `tokio::spawn`. Reverting to
+    // handler-local permits (dropping the guard/spawn) trips this.
+    assert!(
+        ipfs.contains("AdmissionGuard::new(ipfs_walk_permit, ipfs_caller_permit)")
+            && ipfs.contains(
+                "let serve: tokio::task::JoinHandle<Result<Response>> = tokio::spawn(async move {"
+            ),
+        "U2/R1 gate missing: get_by_cid must move both /ipfs admission permits into an \
+         AdmissionGuard owned by a detached tokio::spawn task so admission is released \
+         only after the spawned serve work completes (the /ipfs half of #174 P1-a)"
+    );
+
+    // U2 / KTD2 (#173 round-10): the probe/read children on the /ipfs path must be the
+    // duration-bounded twins (process-group teardown via run_bounded_git), not the bare
+    // `store::object_type` / `read_object_content` (or an unbounded `cat-file -s`) a tokio
+    // timeout cannot cancel — otherwise a wedged cat-file lingers and pins the held
+    // admission past the deadline. Reverting any twin call site back to a bare read trips
+    // this.
+    assert!(
+        ipfs.contains("object_type_bounded(")
+            && ipfs.contains("object_size_bounded(")
+            && ipfs.contains("read_object_content_bounded("),
+        "U2/KTD2 gate missing: the /ipfs probe+read must call the run_bounded_git-backed \
+         *_bounded twins so a wedged cat-file is reaped at the deadline, not left to pin \
+         the held /ipfs walk admission"
     );
 
     // P1-e non-bypass tripwire: the bounded recipients walk is spawn_blocking'd nowhere

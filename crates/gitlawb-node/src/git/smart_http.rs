@@ -1752,8 +1752,9 @@ mod tests {
                 // then, since re-polling a completed future panics.
                 let mut pids = None;
                 for _ in 0..500 {
-                    let finished =
-                        tokio::time::timeout(Duration::from_millis(10), &mut fut).await.is_ok();
+                    let finished = tokio::time::timeout(Duration::from_millis(10), &mut fut)
+                        .await
+                        .is_ok();
                     if let Some(p) = read_two_pids(&pidfile) {
                         pids = Some(p);
                         break;
