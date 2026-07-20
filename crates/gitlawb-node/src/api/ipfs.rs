@@ -61,6 +61,13 @@ use crate::visibility::{visibility_check, Decision};
 /// the truncation sources — existing content is never misreported absent
 /// because of unrelated repos or transient faults.
 ///
+/// Deterministic fault (F5/U4): a candidate repo that is persistently broken (a
+/// corrupt repo, a bad `.git/config`) also yields no absence verdict, but a retry
+/// cannot fix it, so a scan that found nothing sheds a TERMINAL, non-retryable 500
+/// (opaque body) rather than the retryable 503 — checked first so a deterministic
+/// fault is never downgraded, and gated on nothing-served so a healthy repo that
+/// carries the object still serves.
+///
 /// Request budget (F3): one absolute clock (`ipfs_request_budget_secs`) spans
 /// the whole admitted request. No stage (acquire, probe, walk, content read)
 /// starts once it is exhausted, and the acquire wait and walk deadline are
@@ -181,6 +188,13 @@ pub async fn get_by_cid(
             truncated_by.push(source);
         }
     }
+    // A DETERMINISTIC probe fault (a corrupt repo / bad `.git/config`; #174 F5/U4) is
+    // separate from a transient taint: a retry cannot fix it, so a scan that found
+    // nothing must NOT shed the retryable 503 (which would invite a conformant client
+    // to retry-storm a fresh `git cat-file` per attempt against the broken repo). It
+    // sheds a terminal, non-retryable 500 instead — but only if nothing served, so one
+    // corrupt repo never masks a healthy repo that carries the object.
+    let mut deterministic_fault = false;
 
     // Budget gate shared by the four per-stage checks (F3): the remaining
     // request budget, or — once exhausted — None, after logging the stage and
@@ -328,9 +342,20 @@ pub async fn get_by_cid(
         {
             Ok(Ok(Some(t))) => t,
             Ok(Ok(None)) => continue,
-            Ok(Err(e)) => {
-                tracing::warn!(repo = %repo.name, err = %e, "object-type probe failed during /ipfs scan; skipping repo without a verdict");
+            // Transient probe fault (unreadable/mid-repack store): unproven, retryable.
+            Ok(Err(store::ProbeError::Transient(e))) => {
+                tracing::warn!(repo = %repo.name, err = %e, "object-type probe hit a transient store fault during /ipfs scan; skipping repo without a verdict");
                 taint(&mut truncated_by, "probe");
+                continue;
+            }
+            // Deterministic probe fault (corrupt repo / bad config): a retry cannot fix
+            // it, so it does NOT taint (which would shed a retryable 503). It records a
+            // terminal condition that the terminal arm renders as a non-retryable 500
+            // only if nothing served. The raw git detail stays in the log; the client
+            // body is opaque.
+            Ok(Err(store::ProbeError::Deterministic(e))) => {
+                tracing::warn!(repo = %repo.name, err = %e, "object-type probe hit a deterministic fault (corrupt repo/config) during /ipfs scan; skipping repo without a verdict");
+                deterministic_fault = true;
                 continue;
             }
             Err(join_err) => {
@@ -498,6 +523,21 @@ pub async fn get_by_cid(
         );
 
         return Ok((StatusCode::OK, headers, content).into_response());
+    }
+
+    // Deterministic fault (F5/U4): a candidate repo is persistently broken (corrupt
+    // repo / bad `.git/config`), so the object is not proven absent AND a retry cannot
+    // change that. Shed a TERMINAL, non-retryable 500 rather than the retryable 503
+    // below — a 503 would let a conformant client retry-storm a fresh `git cat-file`
+    // per attempt against the broken repo. This is checked before the transient 503 so
+    // a deterministic fault is never downgraded to a retryable status. The body is
+    // opaque (a generic message via `AppError::Git` -> 500, no Retry-After): the raw
+    // git stderr — which leaks filesystem paths / config — was logged at the probe, and
+    // never reaches the client.
+    if deterministic_fault {
+        return Err(AppError::Git(
+            "ipfs object probe could not complete: a candidate repository is corrupt".into(),
+        ));
     }
 
     // Truncated scan (F2): at least one candidate repo yielded no verdict, so the
@@ -1192,6 +1232,88 @@ mod tests {
         assert!(
             body.contains("probe"),
             "the shed must name the probe taint; got: {body}"
+        );
+    }
+
+    /// #174 F5/U4 (RED-before/GREEN-after): a candidate repo with a corrupt
+    /// `.git/config` makes `git cat-file` die with `fatal: bad config line N` while
+    /// `objects/` stays readable. That is a DETERMINISTIC fault, not an absence, and a
+    /// retry cannot fix it — so the scan must shed a TERMINAL, non-retryable 500, never
+    /// the old false 404 (`Ok(None)` fell through) and never the retryable 503 (which
+    /// would invite a conformant client to retry-storm a fresh `cat-file` per attempt).
+    /// A second, healthy repo probes clean (absent verdict); the corrupt row is what
+    /// forces the 500. The body must be OPAQUE — no raw git stderr, no filesystem path.
+    /// MUTATION (RED): route the deterministic fault back to `Ok(None)` in
+    /// `object_type_bounded` and this decays to a 404; classify it Transient and it
+    /// decays to a retryable 503.
+    #[sqlx::test]
+    async fn get_by_cid_bad_config_repo_is_terminal_500_not_404_or_503(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        // A healthy repo that probes clean (would give a definitive 404 on its own) plus
+        // a repo whose bare git dir has a corrupt config (objects/ intact).
+        seed_repo_with_blob(&state, tmp.path(), "z6f5clean", "real", b"probe clean\n").await;
+        state
+            .db
+            .upsert_mirror_repo("z6f5badcfg", "broken", "/unused-badcfg", None, false)
+            .await
+            .unwrap();
+        let rec = state
+            .db
+            .get_repo("z6f5badcfg", "broken")
+            .await
+            .unwrap()
+            .unwrap();
+        let bare = state
+            .repo_store
+            .acquire(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&["init", "-q", "--bare", "--object-format=sha256"], &bare);
+        // Corrupt the config; leave objects/ readable (the readable-store + git-fails
+        // combination is exactly what makes this deterministic, not transient).
+        {
+            use std::io::Write;
+            let mut cfg = std::fs::OpenOptions::new()
+                .append(true)
+                .open(bare.join("config"))
+                .unwrap();
+            cfg.write_all(b"\n[broken section\nnot a valid = = = line\n")
+                .unwrap();
+        }
+
+        let peer: SocketAddr = "203.0.113.69:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a bad-config (deterministic) repo fault must shed a terminal 500, never a \
+             404 (false absence) or a retryable 503"
+        );
+        assert!(
+            resp.headers().get("retry-after").is_none(),
+            "a terminal 500 must NOT advertise a retry (that is the whole point vs 503)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            !body.contains("bad config")
+                && !body.contains(tmp.path().to_str().unwrap())
+                && !body.contains(".git")
+                && !body.contains("fatal"),
+            "the 500 body must be opaque — no raw git stderr / config text / filesystem \
+             path; got: {body}"
         );
     }
 
