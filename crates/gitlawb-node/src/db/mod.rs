@@ -2850,6 +2850,7 @@ pub struct RecordAnchorInputV2<'a> {
     pub cid: Option<&'a str>,
     pub arweave_tx_id: &'a str,
     pub node_did: &'a str,
+    #[allow(dead_code)]
     pub gateway_url: &'a str,
 }
 
@@ -2922,6 +2923,7 @@ impl Db {
             .collect())
     }
 
+    #[allow(dead_code)]
     /// Update the anchor status to confirmed with receipt details.
     pub async fn confirm_arweave_anchor(
         &self,
@@ -2940,6 +2942,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// Mark an anchor as failed (retries exhausted).
     pub async fn fail_arweave_anchor(&self, id: &str) -> Result<()> {
         sqlx::query("UPDATE arweave_anchors SET status='failed' WHERE id=$1")
@@ -2949,6 +2952,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// List pending anchors that need confirmation check.
     pub async fn list_pending_anchors(&self) -> Result<Vec<ArweaveAnchor>> {
         let rows = sqlx::query(
@@ -6148,8 +6152,7 @@ mod ref_certificate_tests {
 
 #[cfg(test)]
 mod arweave_anchor_tests {
-    use super::{ArweaveAnchor, Db, RecordAnchorInputV2};
-    use chrono::Utc;
+    use super::{Db, RecordAnchorInputV2};
     use sqlx::PgPool;
 
     async fn db(pool: PgPool) -> Db {
