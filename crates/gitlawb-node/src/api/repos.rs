@@ -222,9 +222,14 @@ pub async fn create_repo(
         .repo_store
         .lock_repo_blocking(&owner_did, &req.name)
         .await
-        .map_err(|e| AppError::Git(e.to_string()))?
+        // Both arms are a transient resource condition, not a create failure: the
+        // lock pool is pinned (Err from acquiring the lock connection) or the key
+        // stayed held through the bounded retry (None: a live writer or a purge).
+        // Return a retryable 503 so the client backs off and retries, as the
+        // call-site comment promises, rather than a misleading 500 git_error.
+        .map_err(|e| AppError::Unavailable(e.to_string()))?
         .ok_or_else(|| {
-            AppError::Git(format!(
+            AppError::Unavailable(format!(
                 "could not acquire repo lock for {owner_did}/{} — held by a live writer or purge",
                 req.name
             ))
