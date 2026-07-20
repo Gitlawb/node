@@ -136,6 +136,12 @@ pub struct RefCertificate {
     pub node_did: String,
     pub signature: String,
     pub issued_at: String,
+    /// Monotonic sequence number for chain continuity
+    pub seq: i64,
+    /// Hash of the previous certificate in the chain (first cert uses zeros)
+    pub prev: String,
+    /// RFC 9421 HTTP Signature from the pusher, proving they authorized this push
+    pub pusher_sig: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,7 +523,10 @@ const MIGRATIONS: &[Migration] = &[
                 pusher_did  TEXT NOT NULL,
                 node_did    TEXT NOT NULL,
                 signature   TEXT NOT NULL,
-                issued_at   TEXT NOT NULL
+                issued_at   TEXT NOT NULL,
+                seq         BIGINT NOT NULL DEFAULT 1,
+                prev        TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000',
+                pusher_sig  TEXT
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_ref_certs_repo ON ref_certificates(repo_id)",
             r#"CREATE TABLE IF NOT EXISTS peers (
@@ -629,17 +638,20 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_repo      ON agent_tasks(repo_id)",
             // ── Arweave permanent anchors ────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS arweave_anchors (
-                id          TEXT NOT NULL PRIMARY KEY,
-                repo        TEXT NOT NULL,
-                owner_did   TEXT NOT NULL,
-                ref_name    TEXT NOT NULL,
-                old_sha     TEXT NOT NULL,
-                new_sha     TEXT NOT NULL,
-                cid         TEXT,
-                irys_tx_id  TEXT NOT NULL,
-                arweave_url TEXT NOT NULL,
-                node_did    TEXT NOT NULL,
-                anchored_at TEXT NOT NULL
+                id              TEXT NOT NULL PRIMARY KEY,
+                repo            TEXT NOT NULL,
+                owner_did       TEXT NOT NULL,
+                ref_name        TEXT NOT NULL,
+                old_sha         TEXT NOT NULL,
+                new_sha         TEXT NOT NULL,
+                cid             TEXT,
+                arweave_tx_id   TEXT NOT NULL,
+                node_did        TEXT NOT NULL,
+                anchored_at     TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                deadline_height BIGINT,
+                receipt_sig     TEXT,
+                cert_id         TEXT
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo    ON arweave_anchors(repo)",
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_new_sha ON arweave_anchors(new_sha)",
@@ -881,6 +893,23 @@ const MIGRATIONS: &[Migration] = &[
         stmts: &[
             // Index deferred — the feed gate (#144) does not read owner_did yet.
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
+        ],
+    },
+    Migration {
+        version: 12,
+        name: "arweave_anchor_v2_and_cert_chain",
+        stmts: &[
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 1",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS prev TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS pusher_sig TEXT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS deadline_height BIGINT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS receipt_sig TEXT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS cert_id TEXT",
+            // Rename irys_tx_id → arweave_tx_id only if the old column still exists
+            // (fresh databases created by v1 already use arweave_tx_id).
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='arweave_anchors' AND column_name='irys_tx_id') THEN ALTER TABLE arweave_anchors RENAME COLUMN irys_tx_id TO arweave_tx_id; END IF; END $$",
+            "ALTER TABLE arweave_anchors DROP COLUMN IF EXISTS arweave_url",
         ],
     },
 ];
@@ -1990,8 +2019,8 @@ impl Db {
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates
-             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (repo_id, ref_name) DO UPDATE SET
                 old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
@@ -2003,9 +2032,15 @@ impl Db {
                                  THEN EXCLUDED.node_did  ELSE ref_certificates.node_did  END,
                 signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.signature ELSE ref_certificates.signature END,
+                seq       = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.seq       ELSE ref_certificates.seq       END,
+                prev      = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.prev      ELSE ref_certificates.prev      END,
+                pusher_sig = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                  THEN EXCLUDED.pusher_sig ELSE ref_certificates.pusher_sig END,
                 issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
                                  THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
-             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at",
+             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -2016,6 +2051,9 @@ impl Db {
         .bind(&cert.node_did)
         .bind(&cert.signature)
         .bind(&cert.issued_at)
+        .bind(cert.seq)
+        .bind(&cert.prev)
+        .bind(&cert.pusher_sig)
         .fetch_one(&self.pool)
         .await?;
         Ok(row_to_cert(row))
@@ -2030,8 +2068,8 @@ impl Db {
         // bounded even if a raw/negative value slips through the handler layer.
         let limit = limit.max(1);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC LIMIT $2",
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+              FROM ref_certificates WHERE repo_id = $1 ORDER BY seq DESC, issued_at DESC LIMIT $2",
         )
         .bind(repo_id)
         .bind(limit)
@@ -2053,8 +2091,8 @@ impl Db {
         let limit = limit.max(1);
         let pattern = format!("{}%", prefix);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY issued_at DESC LIMIT $3",
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+              FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY seq DESC, issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
         .bind(&pattern)
@@ -2066,10 +2104,22 @@ impl Db {
 
     pub async fn get_ref_certificate(&self, id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
              FROM ref_certificates WHERE id = $1",
         )
         .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_cert))
+    }
+
+    /// Retrieve the most recent certificate for a repo (highest seq).
+    pub async fn get_most_recent_cert(&self, repo_id: &str) -> Result<Option<RefCertificate>> {
+        let row = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig
+             FROM ref_certificates WHERE repo_id = $1 ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(repo_id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(row_to_cert))
@@ -2653,31 +2703,34 @@ pub struct ArweaveAnchor {
     pub old_sha: String,
     pub new_sha: String,
     pub cid: Option<String>,
-    pub irys_tx_id: String,
-    pub arweave_url: String,
+    pub arweave_tx_id: String,
     pub node_did: String,
     pub anchored_at: String,
+    pub status: String,
+    pub deadline_height: Option<i64>,
+    pub receipt_sig: Option<String>,
+    pub cert_id: Option<String>,
 }
 
 /// Input parameters for recording an Arweave anchor.
-pub struct RecordAnchorInput<'a> {
+pub struct RecordAnchorInputV2<'a> {
     pub repo: &'a str,
     pub owner_did: &'a str,
     pub ref_name: &'a str,
     pub old_sha: &'a str,
     pub new_sha: &'a str,
     pub cid: Option<&'a str>,
-    pub irys_tx_id: &'a str,
-    pub arweave_url: &'a str,
+    pub arweave_tx_id: &'a str,
     pub node_did: &'a str,
+    pub gateway_url: &'a str,
 }
 
 impl Db {
-    pub async fn record_arweave_anchor(&self, input: &RecordAnchorInput<'_>) -> Result<()> {
+    pub async fn record_arweave_anchor(&self, input: &RecordAnchorInputV2<'_>) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at)
+            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
         )
         .bind(&id)
@@ -2687,10 +2740,10 @@ impl Db {
         .bind(input.old_sha)
         .bind(input.new_sha)
         .bind(input.cid)
-        .bind(input.irys_tx_id)
-        .bind(input.arweave_url)
+        .bind(input.arweave_tx_id)
         .bind(input.node_did)
         .bind(&now)
+        .bind("pending")
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2703,7 +2756,7 @@ impl Db {
     ) -> Result<Vec<ArweaveAnchor>> {
         let rows = if let Some(repo) = repo {
             sqlx::query(
-                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
+                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, deadline_height, receipt_sig, cert_id
                  FROM arweave_anchors WHERE repo=$1 ORDER BY anchored_at DESC LIMIT $2",
             )
             .bind(repo)
@@ -2712,7 +2765,7 @@ impl Db {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
+                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, deadline_height, receipt_sig, cert_id
                  FROM arweave_anchors ORDER BY anchored_at DESC LIMIT $1",
             )
             .bind(limit)
@@ -2730,10 +2783,69 @@ impl Db {
                 old_sha: r.get("old_sha"),
                 new_sha: r.get("new_sha"),
                 cid: r.get("cid"),
-                irys_tx_id: r.get("irys_tx_id"),
-                arweave_url: r.get("arweave_url"),
+                arweave_tx_id: r.get("arweave_tx_id"),
                 node_did: r.get("node_did"),
                 anchored_at: r.get("anchored_at"),
+                status: r.get("status"),
+                deadline_height: r.try_get("deadline_height").unwrap_or(None),
+                receipt_sig: r.try_get("receipt_sig").unwrap_or(None),
+                cert_id: r.try_get("cert_id").unwrap_or(None),
+            })
+            .collect())
+    }
+
+    /// Update the anchor status to confirmed with receipt details.
+    pub async fn confirm_arweave_anchor(
+        &self,
+        id: &str,
+        deadline_height: i64,
+        receipt_sig: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE arweave_anchors SET status='confirmed', deadline_height=$1, receipt_sig=$2 WHERE id=$3",
+        )
+        .bind(deadline_height)
+        .bind(receipt_sig)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Mark an anchor as failed (retries exhausted).
+    pub async fn fail_arweave_anchor(&self, id: &str) -> Result<()> {
+        sqlx::query("UPDATE arweave_anchors SET status='failed' WHERE id=$1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// List pending anchors that need confirmation check.
+    pub async fn list_pending_anchors(&self) -> Result<Vec<ArweaveAnchor>> {
+        let rows = sqlx::query(
+            "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, deadline_height, receipt_sig, cert_id
+             FROM arweave_anchors WHERE status='pending' ORDER BY anchored_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ArweaveAnchor {
+                id: r.get("id"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
+                ref_name: r.get("ref_name"),
+                old_sha: r.get("old_sha"),
+                new_sha: r.get("new_sha"),
+                cid: r.get("cid"),
+                arweave_tx_id: r.get("arweave_tx_id"),
+                node_did: r.get("node_did"),
+                anchored_at: r.get("anchored_at"),
+                status: r.get("status"),
+                deadline_height: r.try_get("deadline_height").unwrap_or(None),
+                receipt_sig: r.try_get("receipt_sig").unwrap_or(None),
+                cert_id: r.try_get("cert_id").unwrap_or(None),
             })
             .collect())
     }
@@ -2808,6 +2920,9 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
         node_did: r.get("node_did"),
         signature: r.get("signature"),
         issued_at: r.get("issued_at"),
+        seq: r.try_get("seq").unwrap_or(0),
+        prev: r.try_get("prev").unwrap_or_default(),
+        pusher_sig: r.try_get("pusher_sig").unwrap_or(None),
     }
 }
 
@@ -3613,7 +3728,7 @@ mod migration_tests {
             "pre-migration row must exist"
         );
 
-        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did) ──
+        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did, v12 arweave) ──
         db.migrate().await.unwrap();
 
         // ── Assertions ────────────────────────────────────────────────────
@@ -4993,6 +5108,9 @@ mod ref_certificate_tests {
             node_did: "did:key:zNODE".to_string(),
             signature: "sig".to_string(),
             issued_at: issued_at.to_string(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
         }
     }
 
@@ -5512,6 +5630,191 @@ mod ref_certificate_tests {
             err.is_err(),
             "raw duplicate INSERT must be rejected by the unique index"
         );
+    }
+
+    #[sqlx::test]
+    async fn get_most_recent_cert_returns_highest_seq(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "most-recent-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/most-recent-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Insert certs with increasing seq
+        for i in 1..=3 {
+            let mut cert = make_cert(
+                &format!("cert-seq-{i}"),
+                &repo_id,
+                "refs/heads/main",
+                "0000",
+                "1111",
+                &format!("2026-07-03T20:0{i}:00Z"),
+            );
+            cert.seq = i;
+            db.insert_ref_certificate(&cert).await.unwrap();
+        }
+
+        let most_recent = db.get_most_recent_cert(&repo_id).await.unwrap();
+        assert!(most_recent.is_some(), "should find a cert");
+        assert_eq!(most_recent.unwrap().seq, 3, "highest seq returned");
+    }
+
+    #[sqlx::test]
+    async fn get_most_recent_cert_returns_none_for_empty_repo(pool: PgPool) {
+        let db = db(pool).await;
+        let result = db
+            .get_most_recent_cert("nonexistent-repo-id")
+            .await
+            .unwrap();
+        assert!(result.is_none(), "empty repo returns None");
+    }
+}
+
+#[cfg(test)]
+mod arweave_anchor_tests {
+    use super::{ArweaveAnchor, Db, RecordAnchorInputV2};
+    use chrono::Utc;
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    #[sqlx::test]
+    async fn record_and_list_arweave_anchors(pool: PgPool) {
+        let db = db(pool).await;
+
+        let input = RecordAnchorInputV2 {
+            repo: "alice/myrepo",
+            owner_did: "did:key:zOWNER",
+            ref_name: "refs/heads/main",
+            old_sha: "0000000000000000000000000000000000000000",
+            new_sha: "1111111111111111111111111111111111111111",
+            cid: Some("bafyreib5..."),
+            arweave_tx_id: "test-tx-id-123",
+            node_did: "did:key:zNODE",
+            gateway_url: "https://arweave.net",
+        };
+
+        db.record_arweave_anchor(&input).await.unwrap();
+
+        let anchors = db.list_arweave_anchors(Some("alice/myrepo"), 10).await.unwrap();
+        assert_eq!(anchors.len(), 1, "one anchor recorded");
+        assert_eq!(anchors[0].status, "pending", "default status is pending");
+        assert_eq!(anchors[0].arweave_tx_id, "test-tx-id-123");
+    }
+
+    #[sqlx::test]
+    async fn confirm_anchor_updates_status(pool: PgPool) {
+        let db = db(pool).await;
+        let input = RecordAnchorInputV2 {
+            repo: "bob/myrepo",
+            owner_did: "did:key:zOWNER",
+            ref_name: "refs/heads/main",
+            old_sha: "0000000000000000000000000000000000000000",
+            new_sha: "1111111111111111111111111111111111111111",
+            cid: None,
+            arweave_tx_id: "tx-confirm",
+            node_did: "did:key:zNODE",
+            gateway_url: "https://arweave.net",
+        };
+        db.record_arweave_anchor(&input).await.unwrap();
+
+        let anchors = db.list_arweave_anchors(Some("bob/myrepo"), 10).await.unwrap();
+        let id = &anchors[0].id;
+
+        db.confirm_arweave_anchor(id, 1234567, "receipt-sig-value")
+            .await
+            .unwrap();
+
+        let updated = db.list_arweave_anchors(Some("bob/myrepo"), 10).await.unwrap();
+        assert_eq!(updated[0].status, "confirmed");
+        assert_eq!(updated[0].deadline_height, Some(1234567));
+        assert_eq!(updated[0].receipt_sig, Some("receipt-sig-value".into()));
+    }
+
+    #[sqlx::test]
+    async fn fail_anchor_updates_status(pool: PgPool) {
+        let db = db(pool).await;
+        let input = RecordAnchorInputV2 {
+            repo: "carol/myrepo",
+            owner_did: "did:key:zOWNER",
+            ref_name: "refs/heads/main",
+            old_sha: "0000000000000000000000000000000000000000",
+            new_sha: "1111111111111111111111111111111111111111",
+            cid: None,
+            arweave_tx_id: "tx-fail",
+            node_did: "did:key:zNODE",
+            gateway_url: "https://arweave.net",
+        };
+        db.record_arweave_anchor(&input).await.unwrap();
+
+        let anchors = db.list_arweave_anchors(Some("carol/myrepo"), 10).await.unwrap();
+        let id = &anchors[0].id;
+
+        db.fail_arweave_anchor(id).await.unwrap();
+
+        let updated = db.list_arweave_anchors(Some("carol/myrepo"), 10).await.unwrap();
+        assert_eq!(updated[0].status, "failed");
+    }
+
+    #[sqlx::test]
+    async fn list_pending_anchors_returns_only_pending(pool: PgPool) {
+        let db = db(pool).await;
+
+        // Record two anchors for different repos
+        db.record_arweave_anchor(&RecordAnchorInputV2 {
+            repo: "dave/repo-a",
+            owner_did: "did:key:zOWNER",
+            ref_name: "refs/heads/main",
+            old_sha: "0000000000000000000000000000000000000000",
+            new_sha: "1111111111111111111111111111111111111111",
+            cid: None,
+            arweave_tx_id: "tx-pending-1",
+            node_did: "did:key:zNODE",
+            gateway_url: "https://arweave.net",
+        })
+        .await
+        .unwrap();
+
+        // Record a second anchor for the same repo
+        db.record_arweave_anchor(&RecordAnchorInputV2 {
+            repo: "dave/repo-b",
+            owner_did: "did:key:zOWNER",
+            ref_name: "refs/heads/feature",
+            old_sha: "aaaa",
+            new_sha: "bbbb",
+            cid: None,
+            arweave_tx_id: "tx-pending-2",
+            node_did: "did:key:zNODE",
+            gateway_url: "https://arweave.net",
+        })
+        .await
+        .unwrap();
+
+        let pending = db.list_pending_anchors().await.unwrap();
+        assert_eq!(pending.len(), 2, "both anchors are pending");
+
+        // Confirm one anchor
+        let first_id = pending[0].id.clone();
+        db.confirm_arweave_anchor(&first_id, 100, "sig").await.unwrap();
+
+        let pending_after = db.list_pending_anchors().await.unwrap();
+        assert_eq!(pending_after.len(), 1, "only one pending remains");
     }
 }
 #[cfg(test)]
