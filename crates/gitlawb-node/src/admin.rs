@@ -204,6 +204,16 @@ fn local_refs_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> Option<u
                 "purge-spam: could not stat path — treating as non-empty (skipped)");
             return Some(1);
         }
+        // A symlink at the target is never a legitimate bare repo we may treat as
+        // empty-and-purgeable. The marker checks below FOLLOW the link, so a
+        // symlink to a real empty bare repo outside `repos_dir` would otherwise
+        // read 0 refs and be admitted — deleting the DB row while `path_within`
+        // spares the outside dir. Fail closed as present so it is never a candidate.
+        Ok(m) if m.file_type().is_symlink() => {
+            warn!(path = %path.display(),
+                "purge-spam: path is a symlink — treating as non-empty (skipped)");
+            return Some(1);
+        }
         Ok(_) => {}
     }
     if !path.join("HEAD").is_file() || !path.join("objects").is_dir() {
@@ -1145,6 +1155,61 @@ mod db_tests {
         assert_eq!(
             local_refs_on_disk(tmp.path(), &repo.owner_did, &repo.name),
             Some(0)
+        );
+    }
+
+    /// A symlink at a burst repo's expected on-disk path is never a legitimate
+    /// bare repo we may treat as empty-and-purgeable, even when its target is a
+    /// real EMPTY bare repo living OUTSIDE repos_dir. `symlink_metadata` only
+    /// distinguishes NotFound; the marker checks (`HEAD` file, `objects` dir)
+    /// FOLLOW the link, so the outside repo's 0 refs would be admitted — the DB
+    /// row is deleted (the `path_within` gate spares the outside dir, but only
+    /// AFTER delete_repo_by_id). A symlink at the target must fail CLOSED.
+    #[test]
+    fn symlink_to_outside_empty_bare_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        // A real empty bare repo OUTSIDE repos_dir (HEAD + objects/ => looks bare).
+        let outside = tmp.path().join("outside.git");
+        store::init_bare(&outside).unwrap();
+        assert!(outside.join("HEAD").is_file() && outside.join("objects").is_dir());
+
+        let repo = rec("t-sym", SPAM_BURST_TARGET_DID, "spam1");
+        let target = store::repo_disk_path(&repos_dir, &repo.owner_did, &repo.name);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+
+        // Following the link the empty bare repo reads 0 refs (admitted as empty).
+        // A symlink at the target must fail closed to Some(1), never Some(0)/None.
+        assert_eq!(
+            local_refs_on_disk(&repos_dir, &repo.owner_did, &repo.name),
+            Some(1),
+            "a symlink at the target (even to a real empty bare repo outside repos_dir) must fail closed to Some(1)"
+        );
+    }
+
+    /// The DANGLING-symlink case (target does not exist) is why the stat uses
+    /// `symlink_metadata`, not `metadata`: `metadata` would surface NotFound and
+    /// wrongly return None (promoting the repo to remote-unverified, whose
+    /// refresh does a remove_dir_all). `symlink_metadata` succeeds, so the path
+    /// is present, and the symlink classification fails it closed to Some(1).
+    #[test]
+    fn dangling_symlink_fails_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        let repo = rec("t-dangle", SPAM_BURST_TARGET_DID, "spam1");
+        let target = store::repo_disk_path(&repos_dir, &repo.owner_did, &repo.name);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/target", &target).unwrap();
+
+        assert_eq!(
+            local_refs_on_disk(&repos_dir, &repo.owner_did, &repo.name),
+            Some(1),
+            "a dangling symlink is present (not NotFound) and must fail closed to Some(1)"
         );
     }
 
