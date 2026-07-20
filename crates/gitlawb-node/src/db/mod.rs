@@ -1410,12 +1410,20 @@ impl Db {
         // terminal `completed`/`cancelled` bounties are left as-is. (Residual: a
         // tombstoned bounty stays readable/listable under the same owner/name after
         // recreation — a view, not a claim/payout re-attach; see the plan's KTD8.)
+        //
+        // Match BOTH owner representations. `create_bounty` stores `repo_owner`
+        // verbatim from the URL Path param, which is commonly the bare SHORT form
+        // (`z6Mk...`), while `repos.owner_did` here is the full `did:key:z6Mk...`.
+        // Binding only the full form leaves the common short-form bounty `open`, so it
+        // re-attaches to the recreated repo — the exact hole the tombstone closes.
+        // `normalize_owner_key` gives the bare short form the URL uses.
         sqlx::query(
             "UPDATE bounties SET status = 'purged'
-             WHERE repo_owner = $1 AND repo_name = $2
+             WHERE repo_owner IN ($1, $2) AND repo_name = $3
                AND status IN ('open', 'claimed', 'submitted')",
         )
         .bind(&owner_did)
+        .bind(normalize_owner_key(&owner_did))
         .bind(&name)
         .execute(&mut *tx)
         .await?;
@@ -3667,7 +3675,7 @@ mod agent_discovery_tests {
 
 #[cfg(test)]
 mod dedup_db_tests {
-    use super::{BountyRecord, Db, RepoRecord};
+    use super::{normalize_owner_key, BountyRecord, Db, RepoRecord};
     use chrono::{DateTime, Utc};
     use sqlx::PgPool;
 
@@ -3940,12 +3948,29 @@ mod dedup_db_tests {
         db.create_bounty(&bounty("bnt-victim", owner, "victim", "open"))
             .await
             .unwrap();
+        // The common `create_bounty` path stores `repo_owner` verbatim from the URL
+        // Path param, which is the bare SHORT owner form (`z6Mk...`), not the full
+        // `did:key:z6Mk...`. The tombstone must match this form too or a short-form
+        // bounty stays `open` and re-attaches to the recreated repo.
+        let short_owner = normalize_owner_key(owner);
+        db.create_bounty(&bounty("bnt-victim-short", short_owner, "victim", "open"))
+            .await
+            .unwrap();
         // A mid-flight `claimed` bounty must also be tombstoned: otherwise a later
         // dispute (which resets `claimed`/`submitted` back to `open`) would re-expose
         // it on the recreated repo.
         db.create_bounty(&bounty("bnt-victim-claimed", owner, "victim", "claimed"))
             .await
             .unwrap();
+        // A mid-flight `submitted` bounty is in the tombstone set too.
+        db.create_bounty(&bounty(
+            "bnt-victim-submitted",
+            owner,
+            "victim",
+            "submitted",
+        ))
+        .await
+        .unwrap();
         // An already-terminal `completed` bounty is outside the tombstone set.
         db.create_bounty(&bounty(
             "bnt-victim-completed",
@@ -3998,6 +4023,26 @@ mod dedup_db_tests {
             "creator_did preserved on tombstone"
         );
 
+        // The short-owner-form bounty (the common create_bounty path) is tombstoned
+        // too, so it cannot re-attach to the recreated repo and become claimable.
+        db.claim_bounty(
+            "bnt-victim-short",
+            "did:key:z6MkAttacker",
+            Some("0xattacker"),
+            "2026-03-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let short_bounty = db.get_bounty("bnt-victim-short").await.unwrap().unwrap();
+        assert_eq!(
+            short_bounty.status, "purged",
+            "a short-owner-form bounty on the purged repo must also be tombstoned"
+        );
+        assert!(
+            short_bounty.claimant_did.is_none(),
+            "the tombstoned short-form bounty must not accept a new claimant"
+        );
+
         // A mid-flight claimed bounty on the same repo is tombstoned too (so a
         // dispute cannot reopen it against the recreated repo).
         let claimed_bounty = db.get_bounty("bnt-victim-claimed").await.unwrap().unwrap();
@@ -4005,6 +4050,26 @@ mod dedup_db_tests {
             claimed_bounty.status, "purged",
             "a claimed bounty on the purged repo must also be tombstoned"
         );
+        // Dispute gates on status IN ('claimed','submitted'); a tombstoned bounty is
+        // `purged`, so dispute is inert and cannot reopen it back to `open`.
+        db.dispute_bounty("bnt-victim-claimed").await.unwrap();
+        let disputed_bounty = db.get_bounty("bnt-victim-claimed").await.unwrap().unwrap();
+        assert_eq!(
+            disputed_bounty.status, "purged",
+            "dispute must not reopen a tombstoned bounty"
+        );
+
+        // A mid-flight submitted bounty on the same repo is tombstoned too.
+        let submitted_bounty = db
+            .get_bounty("bnt-victim-submitted")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            submitted_bounty.status, "purged",
+            "a submitted bounty on the purged repo must also be tombstoned"
+        );
+
         // An already-terminal completed bounty is left as-is (not in the tombstone set).
         let completed_bounty = db
             .get_bounty("bnt-victim-completed")
