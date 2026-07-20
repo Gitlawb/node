@@ -572,12 +572,19 @@ pub async fn get_by_cid(
     // repo / bad `.git/config`), so the object is not proven absent AND a retry cannot
     // change that. Shed a TERMINAL, non-retryable 500 rather than the retryable 503
     // below — a 503 would let a conformant client retry-storm a fresh `git cat-file`
-    // per attempt against the broken repo. This is checked before the transient 503 so
-    // a deterministic fault is never downgraded to a retryable status. The body is
-    // opaque (a generic message via `AppError::Git` -> 500, no Retry-After): the raw
-    // git stderr — which leaks filesystem paths / config — was logged at the probe, and
-    // never reaches the client.
-    if deterministic_fault {
+    // per attempt against the broken repo. The body is opaque (a generic message via
+    // `AppError::Git` -> 500, no Retry-After): the raw git stderr — which leaks
+    // filesystem paths / config — was logged at the probe, and never reaches the client.
+    //
+    // Gate on `truncated_by.is_empty()`: the terminal 500 fires only when a
+    // deterministic fault is the SOLE reason nothing served. When a TRANSIENT taint
+    // co-occurs (a DIFFERENT repo was skipped by budget / acquire / walk-cap / probe /
+    // visit-ceiling), the requested object may live in that transiently-skipped repo,
+    // so fall through to the retryable 503 below — a retry can re-probe it and serve
+    // the content. Reporting a terminal 500 there would wrongly tell a conformant
+    // client not to retry, leaving reachable content unreachable until the unrelated
+    // broken repo is repaired.
+    if deterministic_fault && truncated_by.is_empty() {
         return Err(AppError::Git(
             "ipfs object probe could not complete: a candidate repository is corrupt".into(),
         ));
@@ -1357,6 +1364,113 @@ mod tests {
                 && !body.contains("fatal"),
             "the 500 body must be opaque — no raw git stderr / config text / filesystem \
              path; got: {body}"
+        );
+    }
+
+    /// #174 F5 co-occurrence (RED-before/GREEN-after): a deterministic fault on ONE
+    /// repo and a TRANSIENT taint on a DIFFERENT repo occur in the same scan, and the
+    /// requested CID is served by neither. The transiently-skipped repo could hold the
+    /// object, so a retry can surface it — the correct shed is the RETRYABLE 503, not
+    /// the terminal 500. Two broken repos drive it, both local so the outcome is
+    /// deterministic: a bad-`config` repo whose `objects/` stays readable is a
+    /// DETERMINISTIC probe fault (`deterministic_fault = true`), while a repo whose
+    /// `objects/` dir is removed is a TRANSIENT probe fault (taints "probe"). A third
+    /// healthy repo probes clean (absent verdict) so nothing serves. Before the fix the
+    /// terminal `if deterministic_fault` arm fired first and shed 500 unconditionally,
+    /// hiding the transiently-skipped repo behind a non-retryable status. MUTATION
+    /// (RED): drop the `&& truncated_by.is_empty()` gate and this shes 500 again.
+    #[sqlx::test]
+    async fn get_by_cid_deterministic_fault_with_cooccurring_transient_taint_is_503_not_500(
+        pool: sqlx::PgPool,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        // Healthy repo that probes clean (definitive absence on its own).
+        seed_repo_with_blob(&state, tmp.path(), "z6f5coclean", "real", b"probe clean\n").await;
+
+        // Bad-config repo: objects/ readable, config corrupt -> DETERMINISTIC fault.
+        state
+            .db
+            .upsert_mirror_repo("z6f5cobadcfg", "broken", "/unused-badcfg", None, false)
+            .await
+            .unwrap();
+        let rec = state
+            .db
+            .get_repo("z6f5cobadcfg", "broken")
+            .await
+            .unwrap()
+            .unwrap();
+        let bare = state
+            .repo_store
+            .acquire(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&["init", "-q", "--bare", "--object-format=sha256"], &bare);
+        {
+            use std::io::Write;
+            let mut cfg = std::fs::OpenOptions::new()
+                .append(true)
+                .open(bare.join("config"))
+                .unwrap();
+            cfg.write_all(b"\n[broken section\nnot a valid = = = line\n")
+                .unwrap();
+        }
+
+        // Corrupt-dir repo: objects/ removed -> TRANSIENT probe fault (taints "probe"),
+        // a DIFFERENT repo than the deterministic one above.
+        state
+            .db
+            .upsert_mirror_repo("z6f5cocorrupt", "broken", "/unused-corrupt", None, false)
+            .await
+            .unwrap();
+        let rec2 = state
+            .db
+            .get_repo("z6f5cocorrupt", "broken")
+            .await
+            .unwrap()
+            .unwrap();
+        let bare2 = state
+            .repo_store
+            .acquire(&rec2.owner_did, &rec2.name)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(&bare2).unwrap();
+        run_git(&["init", "-q", "--bare", "--object-format=sha256"], &bare2);
+        std::fs::remove_dir_all(bare2.join("objects")).unwrap();
+        std::fs::write(bare2.join("HEAD"), b"junk\n").unwrap();
+
+        let peer: SocketAddr = "203.0.113.71:5000".parse().unwrap();
+        let resp = ipfs_router(state)
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a deterministic fault co-occurring with a transient taint on a DIFFERENT \
+             repo must shed the retryable 503 (a retry can surface the object in the \
+             transiently-skipped repo), never the terminal 500"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the co-occurrence 503 must carry Retry-After"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("probe"),
+            "the shed must name the transient probe taint; got: {body}"
         );
     }
 
