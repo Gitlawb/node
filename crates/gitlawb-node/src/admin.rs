@@ -672,6 +672,27 @@ mod db_tests {
         crate::git::repo_store::RepoStore::for_testing(repos_dir.to_path_buf(), pool.clone())
     }
 
+    /// A Postgres pool of a fixed size with a short acquire timeout and no ambient
+    /// reaping, so a purge exercised at GITLAWB_DB_MAX_CONNECTIONS=1 fails fast
+    /// (rather than stalling the whole test) if the single connection is pinned.
+    /// min/idle/lifetime pinned so a held connection is never reclaimed
+    /// mid-assertion.
+    async fn sized_no_reap_pool(
+        connect_opts: &sqlx::postgres::PgConnectOptions,
+        max_connections: u32,
+    ) -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .min_connections(0)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .test_before_acquire(false)
+            .connect_with(connect_opts.clone())
+            .await
+            .unwrap()
+    }
+
     fn rec(id: &str, owner: &str, name: &str) -> RepoRecord {
         RepoRecord {
             id: id.to_string(),
@@ -827,6 +848,61 @@ mod db_tests {
             "DB row deleted"
         );
         assert!(!path.exists(), "on-disk bare repo dir must be removed too");
+    }
+
+    // U3 (R3/KTD3): a purge at GITLAWB_DB_MAX_CONNECTIONS=1 (app pool size 1) must
+    // still delete. U2 split the pools: the advisory-lock guard pins a connection
+    // from the dedicated lock_pool while delete_repo_by_id runs on the app pool, so
+    // the single app connection is free for the delete's begin() even while the guard
+    // holds the repo lock. Load-bearing for the admin wiring: if the purge store were
+    // (mis)wired to share ONE pool for the guard and the delete, the held guard
+    // connection would leave begin() nothing to acquire, delete would time out
+    // (PoolTimedOut), and the row would survive — deleted stays 0. The split store
+    // built here is what keeps the purge correct at one connection.
+    #[sqlx::test]
+    async fn purge_at_one_app_connection_deletes_with_split_pools(
+        _pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        // Migrate + seed on a normal multi-connection pool: migrate() pins one
+        // connection for its advisory lock while running migration queries on
+        // others, so it cannot run on a size-1 pool.
+        let setup_db = Db::for_testing(sized_no_reap_pool(&connect_opts, 5).await);
+        setup_db.run_migrations().await.unwrap();
+        let empty = rec("t-empty", SPAM_BURST_TARGET_DID, "spam1");
+        setup_db.create_repo(&empty).await.unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = store::repo_disk_path(tmp.path(), &empty.owner_did, &empty.name);
+        store::init_bare(&path).unwrap();
+        assert_eq!(
+            store::list_refs(&path).unwrap().len(),
+            0,
+            "precondition: the candidate is a real empty bare repo"
+        );
+
+        // The purge runs at ONE app connection (finding E's MAX_CONNECTIONS=1) with a
+        // SEPARATE lock pool. Split store: the guard draws from lock_pool, the delete
+        // runs on the app pool via `db` — the production wiring from main.rs's
+        // purge-spam path.
+        let app_pool = sized_no_reap_pool(&connect_opts, 1).await;
+        let lock_pool = sized_no_reap_pool(&connect_opts, 1).await;
+        let db = Db::for_testing(app_pool);
+        let store =
+            crate::git::repo_store::RepoStore::new(tmp.path().to_path_buf(), None, lock_pool);
+        let summary = run_purge_spam(&db, &store, tmp.path(), true).await.unwrap();
+
+        assert_eq!(
+            summary.deleted, 1,
+            "a split-pool purge at one app connection must delete the candidate row"
+        );
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the target row must be gone after a size-1 purge"
+        );
     }
 
     // U4 (M4): a repo whose per-repo advisory lock is held by a live writer must be
