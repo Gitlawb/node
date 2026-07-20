@@ -988,6 +988,96 @@ async fn resolve_drain_object_list(
     Some((object_list, rules_opt, record.is_public))
 }
 
+/// Re-derive the Pinata replication object set for a push from its ref-update
+/// tuples (#174 F2 / KTD-3).
+///
+/// The detached Pinata task used to MOVE the push's full pre-resolved object list
+/// into its closure and hold it across the `pin_semaphore` await. Under a slow
+/// Pinata backend every later push then parked a fresh task each still retaining
+/// an MB-scale OID list, so outstanding memory grew O(pushes x object-list) —
+/// unbounded. The task now captures only the small `(ref, old, new)` tuples and
+/// calls this once a pin slot frees, re-deriving the SAME OID set via
+/// `git rev-list` (the delta scan) filtered by the current withheld set. Retained
+/// memory is O(ref tuples); the object list is materialized only inside the
+/// pin-bounded section, so at most `pin_semaphore` permits' worth exist at once.
+///
+/// Coalescing / shedding were rejected because the task's per-ref work is
+/// non-idempotent (branch->CID upsert, gossip, GraphQL broadcast, Arweave anchor,
+/// peer-notify); dropping a later push's task drops its announcements. Only the
+/// retained object list is dropped here, not the task, so every push's effects
+/// still fire exactly once.
+///
+/// Fresh by design, exactly like `resolve_drain_object_list`: the withheld set
+/// and candidate set are recomputed from the current rules, so a rule tightened
+/// since the push is honored and fails closed (a newly-withheld blob is not
+/// pinned; a no-longer-announceable repo pins nothing). Every git child runs
+/// through the same INV-22 bounded, process-group-reaped helpers the sibling
+/// post-receive scans use (`replication_withheld_set`,
+/// `resolve_candidates_for_push`, `fail_closed_full_scan_objects`).
+#[allow(clippy::too_many_arguments)]
+async fn pinata_object_list_for_refs(
+    encrypt_sem: Arc<tokio::sync::Semaphore>,
+    disk_path: std::path::PathBuf,
+    ref_updates: &[(String, String, String)],
+    rules_opt: Option<Vec<crate::db::VisibilityRule>>,
+    is_public: bool,
+    owner_did: String,
+    git_bin: String,
+    timeout: std::time::Duration,
+) -> Vec<String> {
+    let (_announce, withheld) = replication_withheld_set(
+        encrypt_sem.clone(),
+        rules_opt.clone(),
+        &owner_did,
+        is_public,
+        disk_path.clone(),
+        git_bin.clone(),
+        timeout,
+    )
+    .await;
+    // Not announceable, or the withheld walk failed: replicate nothing (fail
+    // closed) — mirrors the receive-pack tail's `withheld == None` handling.
+    let withheld_set = match withheld {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+    let new_tips: Vec<String> = ref_updates
+        .iter()
+        .map(|(_, _, new)| new.clone())
+        .filter(|s| s != ZERO_SHA)
+        .collect();
+    let old_tips: Vec<String> = ref_updates
+        .iter()
+        .map(|(_, old, _)| old.clone())
+        .filter(|s| s != ZERO_SHA)
+        .collect();
+    let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+        encrypt_sem.clone(),
+        disk_path.clone(),
+        new_tips,
+        old_tips,
+        git_bin.clone(),
+        timeout,
+        false,
+    )
+    .await;
+    if pin_set.full_scan {
+        fail_closed_full_scan_objects(
+            encrypt_sem,
+            disk_path,
+            rules_opt.unwrap_or_default(),
+            is_public,
+            owner_did,
+            pin_set.candidates,
+            git_bin,
+            timeout,
+        )
+        .await
+    } else {
+        crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
+    }
+}
+
 /// The pin/encrypt pipeline shared by the snapshot iteration and the
 /// coalesced-drain iterations: local IPFS pin, then (path-scoped rules only) the
 /// admission-gated recipients walk → encrypt-then-pin → Arweave manifest anchor.
@@ -1825,16 +1915,20 @@ pub async fn git_receive_pack(
         // Pin new git objects to Pinata, then record branch→CID and gossip.
         //
         // #174 P2-2 scope note: this SECOND detached spawn is deliberately NOT brought
-        // under the per-repo encryption coalescing above. Two reasons: (1) it does not
-        // park on `git_encrypt_semaphore` (or any semaphore) — the Pinata `pin_new_objects`
-        // is a bounded reqwest round-trip, so it does not form the unbounded PARKED-waiter
-        // set that is the P2-2 residual; it runs to completion under the HTTP client's
-        // network timeouts. (2) Unlike the idempotent recovery-copy walk, this task does
-        // PER-PUSH, PER-REF work — branch→CID upserts, gossip publish, GraphQL subscription
-        // broadcast, Arweave anchoring, and peer notify, each keyed to THIS push's
-        // ref_updates. Coalescing it against an in-flight task for the same repo would DROP
-        // a later push's ref-update announcements (a correctness regression), not merely
-        // delay a duplicate. So it is scoped out with rationale, not brought under the bound.
+        // under the per-repo encryption coalescing above, because unlike the idempotent
+        // recovery-copy walk it does PER-PUSH, PER-REF work — branch→CID upserts, gossip
+        // publish, GraphQL subscription broadcast, Arweave anchoring, and peer notify, each
+        // keyed to THIS push's ref_updates. Coalescing (or shedding) it against an in-flight
+        // task for the same repo would DROP a later push's ref-update announcements (a
+        // correctness regression), not merely delay a duplicate. So the task stays one per
+        // push and every push's effects fire exactly once.
+        //
+        // #174 F2 / KTD-3: {bounded memory, no dropped effects, no handler latency} are
+        // jointly unsatisfiable by coalesce/shed/block, so instead of retaining the full
+        // object list we bound the thing that actually accumulates. The task captures only
+        // the small ref tuples and RE-DERIVES the object set inside the worker once a pin
+        // slot frees (see `pinata_object_list_for_refs`); the MB-scale OID list is never
+        // held by a parked task.
         {
             let pinata_jwt = state.config.pinata_jwt.clone();
             let pinata_upload_url = state.config.pinata_upload_url.clone();
@@ -1859,11 +1953,22 @@ pub async fn git_receive_pack(
             let owner_did_for_arweave = record.owner_did.clone();
             let self_public_url = state.config.public_url.clone();
             let node_keypair = Arc::clone(&state.node_keypair);
-            let object_list_pinata = object_list;
             let do_pinata_replication = withheld.is_some();
+            // #174 F2 / KTD-3: capture only the small inputs the re-derivation needs; the
+            // MB-scale object list is NOT moved in. `pinata_object_list_for_refs` recomputes
+            // it from these once a pin slot frees. rules/owner/is_public drive the fresh
+            // fail-closed withheld filter; encrypt_sem + git_bin + timeout keep the re-derive
+            // git children under the same INV-22 bounded, group-reaped scan admission.
+            let pinata_rules_opt = rules_opt.clone();
+            let pinata_owner_did = record.owner_did.clone();
+            let pinata_is_public = record.is_public;
+            let pinata_git_bin = state.git_bin.clone();
+            let pinata_git_timeout =
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+            let pinata_encrypt_sem = state.git_encrypt_semaphore.clone();
             // Same global pin-admission bound as the IPFS loop (#174 F6): the Pinata pin
-            // loop also holds this push's full object-id list while pinning it, so it must
-            // share the cap. It DEFERS on a full pool rather than dropping the pin.
+            // loop holds a re-derived object-id list while pinning it, so it shares the cap.
+            // It DEFERS on a full pool rather than dropping the pin.
             let pin_sem_pinata = state.pin_semaphore.clone();
             tokio::spawn(async move {
                 let pinned = if do_pinata_replication {
@@ -1871,12 +1976,28 @@ pub async fn git_receive_pack(
                         .acquire_owned()
                         .await
                         .expect("pin_semaphore is never closed");
+                    // Re-derive the object set now that a pin slot is free (#174 F2 /
+                    // KTD-3). A parked task retained only `ref_updates_clone` (O(ref
+                    // tuples)), never this list, so a slow Pinata backend cannot grow
+                    // outstanding memory O(pushes x object-list). Fresh + fail-closed;
+                    // each git child is INV-22 bounded and process-group reaped.
+                    let object_list = pinata_object_list_for_refs(
+                        pinata_encrypt_sem,
+                        repo_path_clone.clone(),
+                        &ref_updates_clone,
+                        pinata_rules_opt,
+                        pinata_is_public,
+                        pinata_owner_did,
+                        pinata_git_bin,
+                        pinata_git_timeout,
+                    )
+                    .await;
                     crate::pinata::pin_new_objects(
                         &http_client,
                         &pinata_upload_url,
                         &pinata_jwt,
                         &repo_path_clone,
-                        object_list_pinata,
+                        object_list,
                         &db_clone,
                     )
                     .await
@@ -6124,6 +6245,133 @@ mod tests {
             resolve_drain_object_list(&ctx, pending()).await.is_none(),
             "a repo no longer announceable under current rules drains to nothing \
              (fail closed)"
+        );
+    }
+
+    /// #174 F2 / KTD-3 re-derivation equivalence: the object set the Pinata worker
+    /// re-derives from ONLY the ref tuples (`pinata_object_list_for_refs`, run once a
+    /// pin slot frees) must equal exactly what the old retained `object_list` would
+    /// have pinned — the inline-resolved delta, filtered by the withheld set. If the
+    /// two differ, the memory fix changed what gets pinned; they must not.
+    #[tokio::test]
+    async fn f2_pinata_rederivation_equals_retained_object_list() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
+        let c2 = u5_commit_file(tmp.path(), "b.txt", "two\n");
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let timeout = std::time::Duration::from_secs(600);
+
+        // What the OLD retained-list task WOULD have pinned: the inline pipeline the
+        // receive-pack tail ran before moving `object_list` into the closure — the
+        // delta for main c1 -> c2, filtered by the (empty) withheld set.
+        let candidates = crate::git::push_delta::resolve_candidates_for_push(
+            sem.clone(),
+            tmp.path().to_path_buf(),
+            vec![c2.clone()],
+            vec![c1.clone()],
+            "git".to_string(),
+            timeout,
+            false,
+        )
+        .await;
+        assert!(
+            !candidates.full_scan,
+            "the c1 -> c2 push is a delta, not a full scan"
+        );
+        let retained: std::collections::HashSet<String> =
+            crate::git::visibility_pack::replicable_objects(
+                candidates.candidates,
+                &std::collections::HashSet::new(),
+            )
+            .into_iter()
+            .collect();
+
+        // What the worker re-derives from only the (ref, old, new) tuples. Empty rules
+        // + is_public => announceable, withheld = {} (the common Pinata case).
+        let ref_updates = vec![("refs/heads/main".to_string(), c1.clone(), c2.clone())];
+        let rederived: std::collections::HashSet<String> = pinata_object_list_for_refs(
+            sem.clone(),
+            tmp.path().to_path_buf(),
+            &ref_updates,
+            Some(Vec::new()),
+            true,
+            "z6MkPinataOwnerAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            "git".to_string(),
+            timeout,
+        )
+        .await
+        .into_iter()
+        .collect();
+
+        let new_blob = u5_git(tmp.path(), &["rev-parse", "HEAD:b.txt"]);
+        assert!(
+            retained.contains(&c2) && retained.contains(&new_blob),
+            "the push introduced the new commit and blob"
+        );
+        assert_eq!(
+            rederived, retained,
+            "the worker's git rev-list re-derivation must yield exactly the object set \
+             the retained list would have pinned — the memory fix must not change what pins"
+        );
+    }
+
+    /// #174 F2 / KTD-3 reaped + deadline-bounded: the worker's re-derivation git children
+    /// run through the same INV-22 bounded, process-group-reaped helpers the sibling scans
+    /// use. On a git that hangs on both `rev-list` and `--batch-all-objects`,
+    /// `pinata_object_list_for_refs` must RETURN within the watchdog budget (the group is
+    /// SIGKILLed + reaped at the deadline), not block. A bare `Command::output()` here
+    /// would hang past the ceiling (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn f2_pinata_rederivation_is_deadline_bounded_and_reaped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // Empty rules => replication_withheld_set short-circuits (no git). The tip
+        // peel (`cat-file -t`) reports a commit so the delta stage proceeds; rev-list
+        // and the full-scan `cat-file --batch-all-objects` both hang (bounded 30s so a
+        // broken test cannot leak a permanent orphan).
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in\n  \
+             cat-file) case \"$*\" in *--batch-all-objects*) i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done ;; *) echo commit ;; esac ;;\n  \
+             rev-list) i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done ;;\n  \
+             *) : ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+
+        let ref_updates = vec![(
+            "refs/heads/main".to_string(),
+            ZERO_SHA.to_string(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+        )];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pinata_object_list_for_refs(
+                std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+                dir.path().to_path_buf(),
+                &ref_updates,
+                Some(Vec::new()),
+                true,
+                "z6MkPinataOwnerAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                git_bin,
+                std::time::Duration::from_millis(400),
+            ),
+        )
+        .await
+        .expect(
+            "pinata_object_list_for_refs must return within the watchdog budget — a hang \
+             means the re-derivation git is not deadline-bounded / group-reaped (RED)",
+        );
+        assert!(
+            got.is_empty(),
+            "a hung git yields nothing this push (the reconciliation sweep backstops)"
         );
     }
 

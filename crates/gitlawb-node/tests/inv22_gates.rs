@@ -241,3 +241,68 @@ fn f6_ipfs_metadata_queries_are_deadline_wrapped() {
         );
     }
 }
+
+/// #174 F2 / KTD-3: the detached post-receive Pinata replication task must enqueue
+/// only the push's `(ref, old, new)` tuples and RE-DERIVE its object set inside the
+/// worker once a pin slot frees — it must NOT move the full per-push object list into
+/// the closure and hold it across the `pin_semaphore` acquire. Retaining the list makes
+/// every parked task (under a slow Pinata backend) hold an MB-scale OID list, so
+/// outstanding memory grows O(pushes x object-list). Coalescing/shedding the task is
+/// forbidden (its per-ref effects are non-idempotent), so the fix bounds the retained
+/// data, not the task count.
+///
+/// Two load-bearing checks, both against the PRODUCTION half of `api/repos.rs` (the
+/// `mod tests` half names the same identifiers in its own harness and would make the
+/// scan vacuous): (a) the closure-local `object_list_pinata` binding — the retain form —
+/// must be gone; reintroducing `let object_list_pinata = object_list;` turns this red.
+/// (b) the re-derivation (`pinata_object_list_for_refs`) must appear AFTER the Pinata
+/// pin permit is acquired, so the object list is materialized only inside the pin-bounded
+/// section and a parked task holds O(ref tuples).
+#[test]
+fn f2_pinata_enqueues_refs_not_retained_object_lists() {
+    let repos = src("api/repos.rs");
+    let production = repos
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields a first chunk");
+
+    // (a) the retained-list form must be gone from production.
+    assert!(
+        !production.contains("object_list_pinata"),
+        "F2/KTD-3 regression: the Pinata task retains a full per-push object list \
+         (`object_list_pinata`) across the pin-permit acquire. Enqueue only the ref \
+         tuples and re-derive the object set inside the worker (pinata_object_list_for_refs)."
+    );
+
+    // (b) the re-derivation runs AFTER the pin permit is acquired. Anchor on the
+    // Pinata pin-admission clone so the window is the Pinata task, not the sibling
+    // IPFS/encrypt spawn (which shares `pin_semaphore` but never re-derives).
+    let anchor = production
+        .find("let pin_sem_pinata")
+        .expect("F2 gate stale: the Pinata pin-admission clone (pin_sem_pinata) moved");
+    let tail = &production[anchor..];
+    let acquire = tail
+        .find(".acquire_owned()")
+        .expect("F2 gate: the Pinata task no longer acquires a pin permit (acquire_owned)");
+    let rederive = tail.find("pinata_object_list_for_refs(").expect(
+        "F2 gate missing: the Pinata task must re-derive its object set via \
+         pinata_object_list_for_refs; it can no longer move a pre-resolved list into the closure",
+    );
+    assert!(
+        acquire < rederive,
+        "F2 gate bypassed: the Pinata object-set re-derivation must run AFTER the pin \
+         permit is acquired, so a parked task never holds the MB-scale object list"
+    );
+
+    // The re-derivation is driven by the push's ref tuples (the enqueued unit), not a
+    // retained object list — tie "enqueue ref_updates" to the call explicitly.
+    assert!(
+        tail[rederive..].starts_with("pinata_object_list_for_refs(")
+            && tail[rederive..]
+                .get(..400)
+                .map(|w| w.contains("ref_updates_clone"))
+                .unwrap_or(false),
+        "F2 gate: pinata_object_list_for_refs must re-derive from the push's ref tuples \
+         (ref_updates_clone), the small unit the parked task retains"
+    );
+}
