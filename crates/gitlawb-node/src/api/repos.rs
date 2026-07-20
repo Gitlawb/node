@@ -1536,27 +1536,16 @@ pub async fn git_receive_pack(
     body: Bytes,
 ) -> Result<Response> {
     let name = smart_http_repo_name(&repo)?;
-    // Per-source write sub-cap (#174 P1-d): before the global write permit so one
-    // source IP cannot occupy the whole write pool via many slow authenticated pushes
-    // and 503 every other source. Owner enforcement defaults off, so any valid did:key
-    // is accepted (auth != authz), and the 600/hour push limiter bounds arrival RATE,
-    // not in-flight concurrency — so without this a single host minting disposable DIDs
-    // saturates the pool. Keyed on the resolved source IP, NEVER the signed DID (a DID
-    // farm defeats a DID key); no resolvable key -> global write pool only.
-    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
-    let _caller_permit = acquire_read_caller_permit(
-        &state.git_write_per_caller,
-        caller_key.as_deref(),
-        name,
-        "receive-pack",
-    )?;
-    // Shed with a 503 before spawning git when the concurrency cap is saturated.
-    // Pushes draw from the dedicated WRITE pool, separate from reads, so a flood of
-    // anonymous reads cannot shed an authenticated push (#174). Taken after the
-    // per-source cap above so one source cannot occupy global slots it would be
-    // sub-cap-denied for; still before the Tigris acquire_write, bounding concurrent
-    // fresh acquires (INV-10); held for the whole op.
-    let _permit = git_permit(&state.git_write_semaphore)?;
+    // Fast-path shed BEFORE the DB lookup when the write pool is saturated, so a push
+    // flood on a full pool does not hit Postgres per request. Best-effort (racy) and
+    // NON-holding: the authoritative, held permit is taken after the per-repo lease below
+    // (so a lease-blocked waiter pins no write slot — #174 F3 review). This peek only
+    // restores the cheap pre-DB shed the permit reorder would otherwise have lost.
+    if state.git_write_semaphore.available_permits() == 0 {
+        return Err(AppError::Overloaded(
+            "git service at capacity, retry shortly".into(),
+        ));
+    }
     tracing::info!(owner = %owner, repo = %name, "receive-pack request");
     let record = state
         .db
@@ -1644,6 +1633,31 @@ pub async fn git_receive_pack(
         .repo_write_leases
         .acquire(&record.id, lease_steal_after)
         .await;
+
+    // Admission permits are taken HERE, AFTER the per-repo lease and BEFORE acquire_write.
+    // Ordering is the fix (#174 P2 DoS): the lease is a block-and-wait serializer, so a
+    // second same-repo push can park on `acquire` above for up to steal_after. Taking the
+    // scarce write permits only once we own the lease means a lease-blocked waiter pins NO
+    // write-pool slot while it waits. Otherwise a few hostile sources could stack same-repo
+    // pushes, hold every global slot on zero-byte lease-waiters, and shed 503 on every push
+    // to every OTHER repo node-wide. Still before acquire_write, so the git op stays
+    // admission-gated (INV-10) and a saturated pool sheds 503 before spawning git.
+    //
+    // Per-source sub-cap first (#174 P1-d): one source IP cannot occupy the whole write
+    // pool via many slow pushes. Owner enforcement defaults off, so any valid did:key is
+    // accepted (auth != authz) and the push rate limiter bounds arrival RATE, not in-flight
+    // concurrency. Keyed on the resolved source IP, NEVER the signed DID (a DID farm defeats
+    // a DID key); no resolvable key -> global write pool only. Then the global write permit:
+    // pushes draw from the dedicated WRITE pool, separate from reads, and it is held for the
+    // whole op (moved into the AdmissionGuard below).
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+    let _caller_permit = acquire_read_caller_permit(
+        &state.git_write_per_caller,
+        caller_key.as_deref(),
+        name,
+        "receive-pack",
+    )?;
+    let _permit = git_permit(&state.git_write_semaphore)?;
 
     tracing::debug!(repo = %name, "acquiring write lock");
     // Bound the write acquire under `git_acquire_timeout_secs`. acquire_write's
@@ -6924,5 +6938,141 @@ mod tests {
             state.repo_write_leases.is_empty(),
             "the lease entry must be freed again after the second clean push"
         );
+    }
+
+    /// F3 DoS (P2, RED-before/GREEN-after): a second same-repo push that BLOCKS on the
+    /// per-repo write lease must hold NO global write permit while it waits. The lease
+    /// is a block-and-wait serializer, so a lease-blocked waiter can sit for up to
+    /// steal_after (~a full git_service_timeout window). If it grabs a scarce global
+    /// write-pool slot BEFORE blocking, a handful of hostile sources can stack same-repo
+    /// pushes, pin every write slot on lease-waiters sending zero bytes, and shed 503 on
+    /// every push to every OTHER repo node-wide. The fix acquires the lease BEFORE the
+    /// two write permits, so a blocked waiter pins no slot.
+    ///
+    /// Load-bearing invariant: with the write pool sized to 2, push A holds the lease and
+    /// is in-flight in receive-pack (1 permit held), and same-repo push B is blocked on
+    /// the lease, `git_write_semaphore.available_permits()` must stay 1 (only A holds).
+    /// Pre-fix B takes its permit BEFORE blocking on the lease, draining the pool to 0
+    /// (RED). With the reorder B blocks before any permit, so the pool stays at 1 (GREEN).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f3_lease_blocked_waiter_holds_no_write_permit(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let seq_a = tmp.path().join("seq_a"); // first receive-pack wins this mkdir = push A
+        let a_inpack = tmp.path().join("a.inpack"); // set when A reaches receive-pack (holds lease+permit)
+        let b_ran = tmp.path().join("b.ran"); // set when B's receive-pack runs (B got past the lease)
+                                              // receive-pack: first invocation (A) marks that it reached the pack and hangs in a
+                                              // bounded loop (so a RED run leaks no permanent orphan); second (B) marks it ran.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               receive-pack)\n\
+                 cat >/dev/null 2>/dev/null\n\
+                 if mkdir \"{seq}\" 2>/dev/null; then\n\
+                   echo 1 > \"{ainp}\"\n\
+                   i=0; while [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n\
+                 else\n\
+                   echo 1 > \"{bran}\"\n\
+                 fi ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            seq = seq_a.display(),
+            ainp = a_inpack.display(),
+            bran = b_ran.display(),
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3dos", "d1", false).await;
+        // Size the write pool to 2 so one in-flight holder (A) leaves exactly one slot
+        // free, and a pool-holding waiter (B, pre-fix) would drain it to zero. Sizing to
+        // 1 would 503 B on the pool before it could block on the lease, hiding the bug.
+        state.git_write_semaphore = Arc::new(Semaphore::new(2));
+        let did = "did:key:z6MkF3DosPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Push A: drive its handler future in slices until it reaches receive-pack (it now
+        // holds the lease and one write permit and is hung). available_permits() drops to 1.
+        let mut fut_a = Box::pin(git_receive_pack(
+            State(state.clone()),
+            Path(("z6f3dos".to_string(), "d1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.71:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        for _ in 0..1000 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut_a).await;
+            if a_inpack.exists() {
+                break;
+            }
+        }
+        assert!(
+            a_inpack.exists(),
+            "push A must reach receive-pack and hold the lease"
+        );
+        assert_eq!(
+            state.git_write_semaphore.available_permits(),
+            1,
+            "with the pool sized to 2, the single in-flight holder (A) leaves one slot free"
+        );
+
+        // Push B: a DIFFERENT source, same repo. It blocks on the lease A holds.
+        let state_b = state.clone();
+        let handle_b = tokio::spawn(async move {
+            git_receive_pack(
+                State(state_b),
+                Path(("z6f3dos".to_string(), "d1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(
+                    "203.0.113.72:5000".parse::<SocketAddr>().unwrap(),
+                )),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            )
+            .await
+        });
+
+        // Load-bearing check: while B is a lease-blocked waiter the pool must stay at 1
+        // (only A holds a permit). Poll the invariant across a full window; pre-fix B
+        // grabs the last slot within ms and the pool falls to 0 (RED), post-fix it never
+        // does (GREEN). A stable state, not a one-shot race: B stays blocked on the lease
+        // (steal_after is far larger than this window) so once it settles the pool holds.
+        for _ in 0..100 {
+            assert_eq!(
+                state.git_write_semaphore.available_permits(),
+                1,
+                "F3 DoS RED: a lease-blocked same-repo waiter took a global write permit \
+                 while sending zero bytes, draining the pool — a blocked waiter must pin \
+                 no write-pool slot"
+            );
+            assert!(
+                !b_ran.exists(),
+                "B must not have run receive-pack while A holds the lease"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Non-vacuous: B is genuinely parked on the lease, not returned early.
+        assert!(
+            !handle_b.is_finished(),
+            "push B must still be blocked on the lease at this point"
+        );
+
+        // Client disconnect on A: drop its future. The write-path AdmissionGuard rides the
+        // reaper, freeing the lease once A's group is reaped; B then proceeds.
+        drop(fut_a);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("push B must complete once A's group is reaped and the lease frees")
+            .expect("push B task must not panic")
+            .expect("push B must succeed");
+        assert_eq!(resp.status(), 200, "push B lands 200 after serialization");
+        assert!(b_ran.exists(), "push B ran its receive-pack once unblocked");
     }
 }
