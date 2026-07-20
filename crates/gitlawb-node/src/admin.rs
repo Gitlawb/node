@@ -172,11 +172,15 @@ where
 /// bare-repo markers (`HEAD` file + `objects/` dir) before trusting any count;
 /// anything else fails closed (treated non-empty, skipped).
 /// Local ref state for selection: `Some(n)` when a local bare repo exists (n
-/// refs), `None` when there is no local copy. `None` is what lets selection
-/// distinguish a missing-local repo (a remote-unverified candidate when a store
-/// is configured) from a one-ref repo — both of which `ref_count_on_disk`
-/// collapses to a non-zero count. An unsafe name or an unreadable repo fails
-/// closed to `Some(1)` so it is skipped, never admitted as remote-unverified.
+/// refs), `None` ONLY when the path is verifiably absent (a `NotFound` from
+/// `symlink_metadata`). `None` is what lets selection distinguish a truly
+/// missing-local repo (a remote-unverified candidate when a store is configured)
+/// from a one-ref repo — both of which `ref_count_on_disk` collapses to a
+/// non-zero count. Everything else fails closed to `Some(1)` so it is skipped and
+/// never admitted as remote-unverified: an unsafe name, an unreadable/unstat-able
+/// path, a dangling symlink, or an existing directory that is not a bare git repo
+/// (returning `None` for the latter would promote it, and the remote_unverified
+/// refresh's `remove_dir_all` would overwrite that non-repository directory).
 fn local_refs_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> Option<usize> {
     // Fail closed on an unsafe repo name BEFORE building any on-disk path (a
     // peer-mirror row can carry a `../` name). Report it as non-empty so it is
@@ -187,9 +191,27 @@ fn local_refs_on_disk(repos_dir: &Path, owner_did: &str, name: &str) -> Option<u
         return Some(1);
     }
     let path = store::repo_disk_path(repos_dir, owner_did, name);
+    // Only a VERIFIED NotFound (the path truly does not exist) may return None,
+    // which promotes the repo to remote_unverified — and that refresh path does a
+    // remove_dir_all on the target. Use `symlink_metadata` (not `metadata`) so a
+    // dangling symlink counts as PRESENT, not NotFound. Any existing path, or any
+    // stat error other than NotFound, fails closed to Some(1) so the refresh never
+    // overwrites a non-repository directory sitting at the target.
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(path = %path.display(), err = %e,
+                "purge-spam: could not stat path — treating as non-empty (skipped)");
+            return Some(1);
+        }
+        Ok(_) => {}
+    }
     if !path.join("HEAD").is_file() || !path.join("objects").is_dir() {
-        // No local bare repo at the expected path.
-        return None;
+        // The path exists but is not a bare repo — fail closed as present so it is
+        // never promoted to remote_unverified and overwritten by a refresh.
+        warn!(path = %path.display(),
+            "purge-spam: path exists but is not a bare git repo — treating as non-empty (skipped)");
+        return Some(1);
     }
     match store::list_refs(&path) {
         Ok(refs) => Some(refs.len()),
@@ -1014,17 +1036,26 @@ mod db_tests {
         let repo = rec("t-x", SPAM_BURST_TARGET_DID, "spam1");
         let path = store::repo_disk_path(tmp.path(), &repo.owner_did, &repo.name);
 
-        // (a) Path exists as a plain (non-git) directory under the git ancestor.
-        // Without the marker guard, git discovery would read the ancestor's 0
-        // refs and this repo would be deleted. local_refs_on_disk must report no
-        // local repo (None) WITHOUT running list_refs — never the ancestor's 0.
-        // None is skipped unless a store is configured, and the under-lock
-        // recheck (ref_count_on_disk) fails closed on the same markers regardless.
-        std::fs::create_dir_all(&path).unwrap();
+        // (a0) A genuinely MISSING path is a verified NotFound — the only case that
+        // returns None (eligible for a remote-unverified archive refresh).
+        assert!(!path.exists());
         assert_eq!(
             local_refs_on_disk(tmp.path(), &repo.owner_did, &repo.name),
             None,
-            "a non-git dir under a git ancestor must report no local repo, not read the ancestor's refs"
+            "a verifiably-absent path must return None (eligible for archive refresh)"
+        );
+
+        // (a) Path exists as a plain (non-git) directory under the git ancestor.
+        // Without the marker guard, git discovery would read the ancestor's 0 refs
+        // and this repo would be deleted. It must fail CLOSED to Some(1) — NOT
+        // None: returning None would promote it to remote_unverified, and the
+        // refresh's remove_dir_all would overwrite this existing directory. And it
+        // must never run list_refs to read the ancestor's 0.
+        std::fs::create_dir_all(&path).unwrap();
+        assert_eq!(
+            local_refs_on_disk(tmp.path(), &repo.owner_did, &repo.name),
+            Some(1),
+            "an existing non-git dir must fail closed to Some(1), never None (which would overwrite it)"
         );
         assert_eq!(
             ref_count_on_disk(tmp.path(), &repo.owner_did, &repo.name),
@@ -1386,6 +1417,59 @@ mod db_tests {
         );
         assert_eq!(summary.deleted, 0);
         assert_eq!(summary.skipped_not_empty, 1);
+    }
+
+    // U7/R7: an existing NON-repository directory (holding operator data) sits at
+    // the exact target path. It is not a bare git repo, so it must fail CLOSED —
+    // never be admitted remote-unverified, because that promotion drives
+    // refresh_from_archive, whose remove_dir_all + extract would OVERWRITE the
+    // directory. Load-bearing: on base, local_refs_on_disk returns None for a
+    // non-bare path, the candidate is promoted, refresh wipes the dir and the row
+    // is deleted (RED). After the fix, Some(1) keeps it out entirely (GREEN).
+    #[sqlx::test]
+    async fn purge_does_not_overwrite_non_repo_dir_at_target(pool: PgPool) {
+        let db = db(&pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = rec("t-nonrepo", SPAM_BURST_TARGET_DID, "spam1");
+        db.create_repo(&target).await.unwrap();
+
+        // A plain directory with a file — deliberately NOT a bare git repo.
+        let path = store::repo_disk_path(tmp.path(), &target.owner_did, &target.name);
+        std::fs::create_dir_all(&path).unwrap();
+        let sentinel = path.join("keep.txt");
+        std::fs::write(&sentinel, b"operator data").unwrap();
+
+        let (f, deleted) = fake(true, false, false, false); // archive exists, empty
+        let repo_store = store_backed(tmp.path(), &pool, f);
+        let summary = run_purge_spam(&db, &repo_store, tmp.path(), true)
+            .await
+            .unwrap();
+
+        assert!(
+            sentinel.exists(),
+            "an existing non-repo dir must not be overwritten by the purge refresh"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).unwrap(),
+            b"operator data",
+            "the non-repo dir's contents must be intact"
+        );
+        assert!(
+            db.get_repo(SPAM_BURST_TARGET_DID, "spam1")
+                .await
+                .unwrap()
+                .is_some(),
+            "a repo whose disk path is a non-bare dir must not be purged"
+        );
+        assert_eq!(summary.deleted, 0);
+        assert_eq!(
+            summary.remote_unverified, 0,
+            "a non-bare existing dir must never be admitted remote-unverified"
+        );
+        assert!(
+            !deleted.load(std::sync::atomic::Ordering::SeqCst),
+            "the archive must not be deleted"
+        );
     }
 
     // AE5/R5: no local copy AND no archive — the candidate is admitted (a store is
