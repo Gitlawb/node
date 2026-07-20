@@ -1007,10 +1007,13 @@ async fn resolve_drain_object_list(
 /// retained object list is dropped here, not the task, so every push's effects
 /// still fire exactly once.
 ///
-/// Fresh by design, exactly like `resolve_drain_object_list`: the withheld set
-/// and candidate set are recomputed from the current rules, so a rule tightened
-/// since the push is honored and fails closed (a newly-withheld blob is not
-/// pinned; a no-longer-announceable repo pins nothing). Every git child runs
+/// Exactly like `resolve_drain_object_list`: the withheld and candidate sets are
+/// recomputed from the rules snapshot captured at post-receive tail start (NOT a
+/// fresh read at pin-worker time), so a rule tightened up to that point is honored
+/// and the filter always fails closed (a newly-withheld blob is not pinned; a
+/// no-longer-announceable repo pins nothing). A tightening AFTER tail-start — before
+/// a slow re-derivation runs — is not reflected, matching the old retained-list
+/// behavior; the reconciliation sweep is the backstop. Every git child runs
 /// through the same INV-22 bounded, process-group-reaped helpers the sibling
 /// post-receive scans use (`replication_withheld_set`,
 /// `resolve_candidates_for_push`, `fail_closed_full_scan_objects`).
@@ -1624,9 +1627,14 @@ pub async fn git_receive_pack(
     // no pooled pg connection while it waits. The lease rides the write-path
     // AdmissionGuard into the reaper (clone (a)) and spans the clean-path Tigris upload
     // in guard.release (clone (b)); it frees only when the LAST clone drops. steal_after
-    // is set well above any legitimate hold (a full receive-pack under
-    // git_service_timeout + the ~4s reaper cap + the Tigris upload), so the bounded-wait
-    // reclaim only ever fires for a genuinely leaked lease, never a merely-slow push.
+    // is sized above ONE legitimate hold (a full receive-pack under git_service_timeout +
+    // the ~4s reaper cap + the Tigris upload). It is NOT a guarantee that only a leaked
+    // lease is reclaimed: a waiter's timeout starts at acquire(), not at the head of the
+    // FIFO queue, so a same-repo backlog whose CUMULATIVE wait exceeds steal_after can
+    // steal while an earlier waiter is still writing. Correctness does not rest on the
+    // bound — on the non-disconnect path the retained pg advisory lock still serializes
+    // the stealer at acquire_write (a spurious 503, not a race); the only corruption-capable
+    // overlap is the ~4s disconnect/reap window, which the reaper-carried clone (a) covers.
     let lease_steal_after =
         std::time::Duration::from_secs(state.config.git_service_timeout_secs * 2 + 60);
     let lease = state
