@@ -1371,13 +1371,14 @@ fn publish_key_atomically(
 /// (Unsupported/EPERM on some network and overlay mounts, or a transient link
 /// error): create the FINAL path directly with `create_new(true).mode(0o600)`
 /// (the INV-23 creation pattern) and write the PEM into it. `AlreadyExists`
-/// still routes to the lost-race path, so no-clobber holds. Split-phase error
-/// handling, mirroring the Won arm's fsync policy in `publish_key_atomically`:
-/// a failed `write_all` removes the final (partial content cannot parse and
-/// would wedge every later start), but a failed file- or dir-fsync does NOT
-/// (the content is complete, and a concurrent loser may already have loaded
-/// it). Every error context chains `link_err` so a two-step failure is
-/// diagnosable.
+/// still routes to the lost-race path, so no-clobber holds. Error handling: a
+/// failed `write_all` OR file `sync_all` removes the final (#194 F1) — the
+/// `create_new` already made the final NAME durable, so a name left over
+/// non-durable content lets a later crash leave a truncated final that wedges
+/// every later start; removal lets the next start regenerate. Only a failed
+/// parent-DIR fsync keeps the final (the content is complete and data-synced,
+/// and a lost directory entry just disappears -> clean regen, no wedge). Every
+/// error context chains `link_err` so a two-step failure is diagnosable.
 fn publish_key_fallback(
     final_path: &std::path::Path,
     pem: &[u8],
@@ -1418,6 +1419,8 @@ fn publish_key_fallback(
     tighten_and_verify_created(final_path, faults.fallback_mode_verify).with_context(|| {
         format!("secure identity key in hard_link fallback (link failed: {link_err})")
     })?;
+    // A failed write removes the final (partial content cannot parse and would
+    // wedge every later start).
     write_key_or_cleanup(
         final_path,
         (faults.fallback_write)().and_then(|()| f.write_all(pem)),
@@ -1428,14 +1431,25 @@ fn publish_key_fallback(
             final_path.display()
         )
     })?;
-    (faults.fallback_fsync)()
-        .and_then(|()| f.sync_all())
-        .with_context(|| {
-            format!(
-                "fsync identity key {} in hard_link fallback (link failed: {link_err})",
-                final_path.display()
-            )
-        })?;
+    // Fsync the file, and REMOVE the final on failure too (#194 F1). Unlike the
+    // hard-link path (which fsyncs a TEMP, so the final NAME only ever appears
+    // over a durable inode), the fallback's `create_new` already made the final
+    // name durable, so a bytes-accepted-but-not-durable final would let a later
+    // crash leave a truncated file that `load_or_create_keypair` parses forever
+    // via the existing-file path instead of regenerating -> permanent startup
+    // wedge. Removing it mirrors the hard-link temp policy and lets the next
+    // start regenerate. A DISTINCT context is kept so an operator debugging
+    // ENOSPC/EIO can tell "durability failed" (bytes accepted, not synced) from
+    // the write-rejected case above. Only the parent-DIR fsync below keeps the
+    // final on failure (a lost directory entry just disappears -> clean regen).
+    if let Err(e) = (faults.fallback_fsync)().and_then(|()| f.sync_all()) {
+        let _ = std::fs::remove_file(final_path);
+        return Err(anyhow::Error::new(e).context(format!(
+            "fsync identity key {} in hard_link fallback (durability failed, \
+             removed; link failed: {link_err})",
+            final_path.display()
+        )));
+    }
     drop(f);
     // Fsync the parent directory so the new name is durable before success is
     // reported, as on the hard-link path. Same policy on failure: the final is
@@ -2125,11 +2139,15 @@ mod identity_key_tests {
         );
     }
 
-    // A failed fallback FSYNC after a complete write errors the start but
-    // leaves the final in place: the content is complete, and a concurrent
-    // loser may already have loaded it (mirrors the Won arm's fsync policy).
+    // A failed fallback FILE fsync must REMOVE the final: create_new has already
+    // made the final NAME durable, so a name left over non-durable content lets a
+    // later crash leave a truncated final that load_or_create_keypair parses
+    // forever (existing-file path) instead of regenerating -> permanent startup
+    // wedge (#194 F1, jatmn). The fallback now mirrors the hard-link temp policy
+    // (write_key_or_cleanup removes on write OR fsync failure); removal makes the
+    // next start regenerate cleanly. Only the parent-DIR fsync keeps on failure.
     #[test]
-    fn failed_fallback_fsync_keeps_the_complete_final() {
+    fn failed_fallback_fsync_removes_the_unsynced_final() {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = dir.path().join("identity.pem");
         let pem = Keypair::generate().to_pem().expect("pem");
@@ -2148,16 +2166,10 @@ mod identity_key_tests {
             msg.contains("injected fsync failure"),
             "the error must surface the fsync failure: {msg}"
         );
-        let body = std::fs::read_to_string(&key_path)
-            .expect("an fsync failure after a complete write must NOT remove the final");
-        assert_eq!(
-            body.as_str(),
-            pem.as_str(),
-            "the surviving final must hold the complete PEM"
-        );
         assert!(
-            Keypair::from_pem(&body).is_ok(),
-            "the surviving final must be loadable at the next start"
+            !key_path.exists(),
+            "an fsync failure on the fallback must remove the un-synced final so \
+             the next start regenerates instead of wedging on a truncated file"
         );
     }
 
