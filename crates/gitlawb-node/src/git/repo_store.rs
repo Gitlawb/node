@@ -293,13 +293,24 @@ impl RepoStore {
         owner_did: &str,
         repo_name: &str,
     ) -> Result<Option<RepoLockGuard>> {
+        self.try_lock_repo_on(&self.lock_pool, owner_did, repo_name)
+            .await
+    }
+
+    /// [`try_lock_repo`](Self::try_lock_repo) against a caller-chosen pool. The
+    /// Postgres advisory lock is DATABASE-global, so the lock still mutually
+    /// excludes holders of the same key from any other pool — only the connection
+    /// the guard pins comes from `pool`. `create_repo` uses this with the app pool
+    /// so its transient lock never draws from the write `lock_pool`.
+    async fn try_lock_repo_on(
+        &self,
+        pool: &PgPool,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
         let (owner_slug, _local) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
-        let mut conn = self
-            .lock_pool
-            .acquire()
-            .await
-            .context("acquiring lock connection")?;
+        let mut conn = pool.acquire().await.context("acquiring lock connection")?;
         let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&mut *conn)
@@ -432,8 +443,25 @@ impl RepoStore {
         owner_did: &str,
         repo_name: &str,
     ) -> Result<Option<RepoLockGuard>> {
+        self.lock_repo_blocking_on(&self.lock_pool, owner_did, repo_name)
+            .await
+    }
+
+    /// [`lock_repo_blocking`](Self::lock_repo_blocking) against a caller-chosen
+    /// pool. `create_repo` passes the app pool so its transient serialization lock
+    /// (check-exists -> init -> insert) does not draw a connection from the write
+    /// `lock_pool` — a receive-pack burst that pins every lock-pool connection
+    /// must not starve repo creation. The advisory lock is DB-global, so this
+    /// still serializes create against a same-key purge that holds the lock from
+    /// the lock pool.
+    pub async fn lock_repo_blocking_on(
+        &self,
+        pool: &PgPool,
+        owner_did: &str,
+        repo_name: &str,
+    ) -> Result<Option<RepoLockGuard>> {
         for attempt in 0..30 {
-            if let Some(g) = self.try_lock_repo(owner_did, repo_name).await? {
+            if let Some(g) = self.try_lock_repo_on(pool, owner_did, repo_name).await? {
                 return Ok(Some(g));
             }
             if attempt < 29 {

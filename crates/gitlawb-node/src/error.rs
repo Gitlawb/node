@@ -35,9 +35,6 @@ pub enum AppError {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
-    #[error("too many requests: {0}")]
-    TooManyRequests(String),
-
     #[error("incomplete: {0}")]
     Incomplete(String),
 
@@ -132,9 +129,6 @@ impl IntoResponse for AppError {
             // IcaptchaProofRequired is handled above (it carries extra headers/fields).
             AppError::IcaptchaProofRequired { .. } => unreachable!("handled before this match"),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
-            AppError::TooManyRequests(msg) => {
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
-            }
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }

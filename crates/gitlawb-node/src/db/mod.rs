@@ -247,12 +247,13 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool. Test-only: production DB
-    /// access goes through `Db`'s methods, and the advisory-lock subsystem now
-    /// uses its own pool (`connect_lock_pool`), so nothing outside tests reaches
-    /// for the raw app pool.
-    #[cfg(test)]
-    pub fn pool(&self) -> &PgPool {
+    /// Access the underlying Postgres connection pool. Most DB access goes through
+    /// `Db`'s methods; the write advisory-lock subsystem uses its own pool
+    /// (`connect_lock_pool`). `create_repo` is the one production caller: its
+    /// transient serialization lock is taken on THIS app pool rather than the
+    /// write lock pool, so a write burst that pins the lock pool cannot starve
+    /// repo creation.
+    pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
     }
 
