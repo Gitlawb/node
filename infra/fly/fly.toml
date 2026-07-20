@@ -38,6 +38,16 @@ primary_region = "iad"
     # slots (hard_limit) — root factor in the 2026-06-12 prod outage
     idle_timeout = 120
 
+  [[http_service.checks]]
+    # Gate routing (and deploys) on real readiness: /ready probes the DB, so a
+    # node stuck retrying a dead or misconfigured database is never routed to,
+    # and a deploy with a bad DATABASE_URL fails visibly instead of going green.
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "75s"
+    method = "GET"
+    path = "/ready"
+
 [[services]]
   protocol = "udp"
   internal_port = 7546

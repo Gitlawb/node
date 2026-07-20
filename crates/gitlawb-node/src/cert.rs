@@ -52,6 +52,7 @@ pub async fn issue_ref_certificate(
         issued_at,
     };
 
-    state.db.insert_ref_certificate(&cert).await?;
-    Ok(cert)
+    // Persist and return the row as it exists in the database (on a
+    // conflict the existing row survives when it is newer).
+    state.db.insert_ref_certificate(&cert).await
 }

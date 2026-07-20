@@ -487,6 +487,17 @@ pub async fn get_tree(
 
 // ── Git smart HTTP endpoints ──────────────────────────────────────────────
 
+fn smart_http_repo_name(repo: &str) -> Result<&str> {
+    // Strip at most one ".git" suffix: trim_end_matches strips repeatedly,
+    // which would misdirect a repo literally named "foo.git" (creatable via
+    // the peer mirror path, which skips API name validation) to repo "foo".
+    let name = repo.strip_suffix(".git").unwrap_or(repo);
+    if name.is_empty() {
+        return Err(AppError::BadRequest("missing repository name".into()));
+    }
+    Ok(name)
+}
+
 /// GET /:owner/:repo.git/info/refs?service=git-upload-pack|git-receive-pack
 pub async fn git_info_refs(
     State(state): State<AppState>,
@@ -496,7 +507,7 @@ pub async fn git_info_refs(
     headers: axum::http::HeaderMap,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
-    let name = repo.trim_end_matches(".git");
+    let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
     let record = state
         .db
@@ -578,6 +589,26 @@ pub async fn git_info_refs(
         })
 }
 
+/// Map an error from a `smart_http` git service call to the right `AppError`:
+/// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
+/// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
+/// callers add their own tracing.
+fn git_service_app_error(err: &anyhow::Error) -> AppError {
+    if err
+        .downcast_ref::<smart_http::GitServiceTimeout>()
+        .is_some()
+    {
+        AppError::Timeout("git service timed out".into())
+    } else {
+        let msg = err.to_string();
+        if msg.contains("bad line length") || msg.contains("protocol error") {
+            AppError::BadRequest(msg)
+        } else {
+            AppError::Git(msg)
+        }
+    }
+}
+
 /// POST /:owner/:repo.git/git-upload-pack
 pub async fn git_upload_pack(
     State(state): State<AppState>,
@@ -585,7 +616,7 @@ pub async fn git_upload_pack(
     auth: Option<Extension<AuthenticatedDid>>,
     body: Bytes,
 ) -> Result<Response> {
-    let name = repo.trim_end_matches(".git");
+    let name = smart_http_repo_name(&repo)?;
     let record = state
         .db
         .get_repo(&owner, name)
@@ -615,8 +646,9 @@ pub async fn git_upload_pack(
     // No path-scoped rule can withhold an individual blob, and the whole-repo
     // "/" gate above already enforced repo-level access. Skip the per-blob
     // withheld walk and serve the pack directly.
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     let resp = if !visibility_pack::has_path_scoped_rule(&rules) {
-        smart_http::upload_pack(&disk_path, body).await
+        smart_http::upload_pack(&disk_path, body, git_timeout).await
     } else {
         // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
         // that off the async worker thread.
@@ -641,21 +673,22 @@ pub async fn git_upload_pack(
         };
 
         if withheld.is_empty() {
-            smart_http::upload_pack(&disk_path, body).await
+            smart_http::upload_pack(&disk_path, body, git_timeout).await
         } else {
             tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
             smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
         }
     }
     .map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("bad line length") || msg.contains("protocol error") {
-            tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request");
-            AppError::BadRequest(msg)
-        } else {
-            tracing::error!(repo = %name, err = %msg, "git-upload-pack failed");
-            AppError::Git(msg)
+        let app = git_service_app_error(&e);
+        match &app {
+            AppError::Timeout(_) => tracing::warn!(repo = %name, "git-upload-pack timed out"),
+            AppError::BadRequest(msg) => {
+                tracing::warn!(repo = %name, err = %msg, "git-upload-pack: bad client request")
+            }
+            _ => tracing::error!(repo = %name, err = %e, "git-upload-pack failed"),
         }
+        app
     })?;
     crate::metrics::record_fetch(&format!("{owner}/{name}"));
     crate::metrics::observe_pack_size(body_len as f64);
@@ -820,7 +853,7 @@ pub async fn git_receive_pack(
     Extension(auth): Extension<AuthenticatedDid>,
     body: Bytes,
 ) -> Result<Response> {
-    let name = repo.trim_end_matches(".git");
+    let name = smart_http_repo_name(&repo)?;
     tracing::info!(owner = %owner, repo = %name, "receive-pack request");
     let record = state
         .db
@@ -902,7 +935,8 @@ pub async fn git_receive_pack(
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
-    let receive_result = smart_http::receive_pack(&disk_path, body).await;
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let receive_result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
@@ -910,8 +944,15 @@ pub async fn git_receive_pack(
     guard.release(receive_result.is_ok()).await;
 
     let result = receive_result.map_err(|e| {
-        tracing::error!(repo = %name, err = %e, "git receive-pack failed");
-        AppError::Git(e.to_string())
+        let app = git_service_app_error(&e);
+        match &app {
+            AppError::Timeout(_) => tracing::warn!(repo = %name, "git receive-pack timed out"),
+            AppError::BadRequest(msg) => {
+                tracing::warn!(repo = %name, err = %msg, "git receive-pack: bad client request")
+            }
+            _ => tracing::error!(repo = %name, err = %e, "git receive-pack failed"),
+        }
+        app
     })?;
 
     // Update the repo's updated_at timestamp after a successful push
@@ -1795,6 +1836,32 @@ mod tests {
     const OWNER_SHORT: &str = "z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH";
     const STRANGER_DID: &str = "did:key:z6Mkffonly5tranger0000000000000000000000000000000";
 
+    #[test]
+    fn git_service_app_error_classifies_timeout_bad_request_and_git() {
+        // GitServiceTimeout carried through anyhow -> 504 Timeout.
+        let timeout_err: anyhow::Error = smart_http::GitServiceTimeout.into();
+        assert!(matches!(
+            git_service_app_error(&timeout_err),
+            AppError::Timeout(_)
+        ));
+        // A malformed client request -> 400.
+        let bad = anyhow::anyhow!("fatal: bad line length character: 0000");
+        assert!(matches!(
+            git_service_app_error(&bad),
+            AppError::BadRequest(_)
+        ));
+        // The `protocol error` marker (with no "bad line length" substring) also
+        // -> 400, exercising the second arm of the classifier independently.
+        let proto = anyhow::anyhow!("fatal: protocol error: unexpected flush packet");
+        assert!(matches!(
+            git_service_app_error(&proto),
+            AppError::BadRequest(_)
+        ));
+        // Anything else -> 500 git error.
+        let other = anyhow::anyhow!("some other git failure");
+        assert!(matches!(git_service_app_error(&other), AppError::Git(_)));
+    }
+
     fn repo_owned_by(owner_did: &str) -> crate::db::RepoRecord {
         let now = chrono::Utc::now();
         crate::db::RepoRecord {
@@ -1845,6 +1912,23 @@ mod tests {
             matches!(rejection, Some(AppError::Forbidden(_))),
             "expected Some(Forbidden), got {rejection:?}"
         );
+    }
+
+    #[test]
+    fn smart_http_repo_name_rejects_empty_after_git_suffix() {
+        assert_eq!(smart_http_repo_name("demo.git").unwrap(), "demo");
+        assert_eq!(smart_http_repo_name("demo").unwrap(), "demo");
+        // Only one suffix is stripped: a repo literally named "demo.git"
+        // stays addressable and never aliases to "demo".
+        assert_eq!(smart_http_repo_name("demo.git.git").unwrap(), "demo.git");
+        assert!(matches!(
+            smart_http_repo_name(".git"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            smart_http_repo_name(""),
+            Err(AppError::BadRequest(_))
+        ));
     }
 
     #[test]
@@ -2492,6 +2576,53 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "receive-pack advertisement must be throttled before the Tigris acquire"
+        );
+    }
+
+    /// Repo creation must be throttled by the per-IP creation limiter BEFORE
+    /// signature verification — otherwise a DID farm (one throwaway did:key per
+    /// repo, each carrying a valid but machine-solved iCaptcha proof) walks past
+    /// the per-DID limiter and floods the network, as in the recurring spam-repo
+    /// incidents. A 429 (not a 401) on an unsigned request from an exhausted IP
+    /// proves the IP brake runs outermost, ahead of auth.
+    #[sqlx::test]
+    async fn repo_creation_is_rate_limited_by_ip(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Tiny limit, keyed on the socket peer (no trusted proxy).
+        state.create_ip_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let peer: SocketAddr = "203.0.113.77:7000".parse().unwrap();
+        // Exhaust this peer's single-request budget up front.
+        assert!(
+            state
+                .create_ip_rate_limiter
+                .check(&peer.ip().to_string())
+                .await
+        );
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/repos")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"flood","is_public":true}"#))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let status = router.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "repo creation must be IP-throttled before signature verification"
         );
     }
 }

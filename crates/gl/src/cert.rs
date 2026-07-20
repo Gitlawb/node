@@ -186,7 +186,7 @@ async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str)
         return Ok(id.to_string());
     }
 
-    let path = format!("/api/v1/repos/{owner}/{name}/certs");
+    let path = format!("/api/v1/repos/{owner}/{name}/certs?prefix={id}");
     let resp: Value = client
         .get_authed(&path)
         .await?
@@ -200,7 +200,6 @@ async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str)
     let matches: Vec<String> = certs
         .iter()
         .filter_map(|cert| cert["id"].as_str())
-        .filter(|cert_id| cert_id.starts_with(id))
         .map(ToString::to_string)
         .collect();
 

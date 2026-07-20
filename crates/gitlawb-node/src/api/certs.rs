@@ -1,23 +1,44 @@
 //! API handlers for ref certificates.
 
-use axum::extract::{Extension, Path, State};
+use std::collections::HashMap;
+
+use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 
 use crate::auth::AuthenticatedDid;
 use crate::error::{AppError, Result};
 use crate::state::AppState;
 
-/// GET /api/v1/repos/{owner}/{repo}/certs
+/// GET /api/v1/repos/{owner}/{repo}/certs?limit=50
 pub async fn list_certs(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v.max(1))
+        .unwrap_or(50)
+        .min(200);
+
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
-    let certs = state.db.list_ref_certificates(&record.id).await?;
+    // When a prefix is given (short-ID resolution from the CLI) use a
+    // generous limit and delegate to the prefix-matched query so the
+    // caller can resolve IDs regardless of how many certs exist.
+    let prefix = params.get("prefix").filter(|p| !p.is_empty());
+    let certs = if let Some(prefix) = prefix {
+        state
+            .db
+            .list_ref_certificates_by_prefix(&record.id, prefix, 200)
+            .await?
+    } else {
+        state.db.list_ref_certificates(&record.id, limit).await?
+    };
     let certs_json: Vec<serde_json::Value> = certs
         .iter()
         .map(|c| {
@@ -35,7 +56,10 @@ pub async fn list_certs(
         })
         .collect();
 
-    Ok(Json(serde_json::json!({ "certificates": certs_json })))
+    let count = certs_json.len();
+    Ok(Json(
+        serde_json::json!({ "certificates": certs_json, "count": count }),
+    ))
 }
 
 /// GET /api/v1/repos/{owner}/{repo}/certs/{id}

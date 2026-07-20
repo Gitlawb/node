@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
@@ -265,11 +266,40 @@ impl Db {
         self.migrate().await
     }
 
-    pub async fn connect(database_url: &str) -> Result<Self> {
-        let pool = PgPool::connect(database_url).await?;
+    /// Connect the pool and run migrations. The initial connection is bounded
+    /// by `acquire_timeout` (sqlx routes pool connects through the acquire
+    /// path); migrations are unbounded here — the caller wraps the whole call
+    /// in its own attempt timeout, since the migration advisory lock can
+    /// legitimately block while another instance migrates.
+    pub async fn connect(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<Self> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "connecting to postgres"
+        );
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect(database_url)
+            .await
+            .context("connecting to postgres")?;
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Cheap liveness probe against the pool, for readiness checks: one
+    /// `SELECT 1` that fails fast when the database is unreachable.
+    pub async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .context("db ping")?;
+        Ok(())
     }
 
     /// Run all pending versioned migrations in order, inside a single
@@ -821,6 +851,25 @@ const MIGRATIONS: &[Migration] = &[
             // until an operator releases it. Default false; only the mirror
             // admission path sets it true.
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE",
+        ],
+    },
+    Migration {
+        version: 10,
+        name: "ref_cert_unique_per_ref",
+        stmts: &[
+            // Dedup before the unique index: keep only the most recent row per
+            // (repo_id, ref_name) so the CREATE UNIQUE INDEX below does not fail
+            // on existing databases that accumulated duplicates.
+            r#"DELETE FROM ref_certificates
+               WHERE id IN (
+                   SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY repo_id, ref_name ORDER BY issued_at DESC, id DESC
+                        ) AS rn
+                       FROM ref_certificates
+                   ) dups WHERE dups.rn > 1
+               )"#,
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_ref ON ref_certificates(repo_id, ref_name)",
         ],
     },
 ];
@@ -1921,11 +1970,31 @@ impl Db {
 // ── Ref Certificates ──────────────────────────────────────────────────────────
 
 impl Db {
-    pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<()> {
-        sqlx::query(
+    /// Insert a ref certificate, or update it if a row for `(repo_id, ref_name)`
+    /// already exists.  The update only applies when the incoming row is newer
+    /// (compared by `issued_at`, which assumes a monotonic wall clock), so a
+    /// late-landing older cert cannot regress a ref's persisted state.  Returns
+    /// the full row as it now exists in the database (the original row on a
+    /// rejected upsert; the passed row on insert).
+    pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
+        let row = sqlx::query(
             "INSERT INTO ref_certificates
              (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (repo_id, ref_name) DO UPDATE SET
+                old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
+                new_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.new_sha   ELSE ref_certificates.new_sha   END,
+                pusher_did = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                  THEN EXCLUDED.pusher_did ELSE ref_certificates.pusher_did END,
+                node_did  = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.node_did  ELSE ref_certificates.node_did  END,
+                signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.signature ELSE ref_certificates.signature END,
+                issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
+                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
+             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -1936,17 +2005,49 @@ impl Db {
         .bind(&cert.node_did)
         .bind(&cert.signature)
         .bind(&cert.issued_at)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(())
+        Ok(row_to_cert(row))
     }
 
-    pub async fn list_ref_certificates(&self, repo_id: &str) -> Result<Vec<RefCertificate>> {
+    pub async fn list_ref_certificates(
+        &self,
+        repo_id: &str,
+        limit: i64,
+    ) -> Result<Vec<RefCertificate>> {
+        // Clamp at the DB boundary so every caller (present and future) stays
+        // bounded even if a raw/negative value slips through the handler layer.
+        let limit = limit.max(1);
         let rows = sqlx::query(
             "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC",
+             FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC LIMIT $2",
         )
         .bind(repo_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_cert).collect())
+    }
+
+    /// Look up ref certificates whose id starts with the given prefix.
+    /// Used by the CLI for short-ID resolution where the caller does not know
+    /// the full UUID.  Bounded by `limit` for safety — the caller should pass a
+    /// generous cap (e.g. 200) since prefix-matching narrows the result set.
+    pub async fn list_ref_certificates_by_prefix(
+        &self,
+        repo_id: &str,
+        prefix: &str,
+        limit: i64,
+    ) -> Result<Vec<RefCertificate>> {
+        let limit = limit.max(1);
+        let pattern = format!("{}%", prefix);
+        let rows = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY issued_at DESC LIMIT $3",
+        )
+        .bind(repo_id)
+        .bind(&pattern)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(row_to_cert).collect())
@@ -4607,6 +4708,558 @@ mod ref_update_keyset_same_timestamp_tests {
             uniq.len(),
             4,
             "no dup or skip across a same-timestamp page boundary"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ref_certificate_tests {
+    use super::{Db, RefCertificate, RepoRecord};
+    use chrono::Utc;
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn make_cert(
+        id: &str,
+        repo_id: &str,
+        ref_name: &str,
+        old_sha: &str,
+        new_sha: &str,
+        issued_at: &str,
+    ) -> RefCertificate {
+        RefCertificate {
+            id: id.to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: old_sha.to_string(),
+            new_sha: new_sha.to_string(),
+            pusher_did: "did:key:zPUSHER".to_string(),
+            node_did: "did:key:zNODE".to_string(),
+            signature: "sig".to_string(),
+            issued_at: issued_at.to_string(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_respects_limit(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        // Create a repo to satisfy FK
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "limit-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/limit-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Insert 5 certs with descending issued_at
+        for i in 0..5 {
+            db.insert_ref_certificate(&make_cert(
+                &format!("cert-{i}"),
+                &repo_id,
+                &format!("refs/heads/feature-{i}"),
+                "0000",
+                "1111",
+                &format!("2026-07-03T20:0{i}:00Z"),
+            ))
+            .await
+            .unwrap();
+        }
+
+        // limit=2 returns only 2
+        let certs = db.list_ref_certificates(&repo_id, 2).await.unwrap();
+        assert_eq!(certs.len(), 2, "LIMIT 2 must return exactly 2 certs");
+        assert_eq!(certs[0].id, "cert-4", "most recent first");
+        assert_eq!(certs[1].id, "cert-3", "second most recent");
+
+        // limit=10 returns all 5 (no padding)
+        let all = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(all.len(), 5, "LIMIT >= row count returns all rows");
+    }
+
+    #[sqlx::test]
+    async fn insert_ref_certificate_upserts_on_repo_ref(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "upsert-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/upsert-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // First insert
+        db.insert_ref_certificate(&make_cert(
+            "cert-original",
+            &repo_id,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-03T20:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        // Upsert same ref with new values
+        db.insert_ref_certificate(&make_cert(
+            "cert-upserted",
+            &repo_id,
+            "refs/heads/main",
+            "aaaa",
+            "bbbb",
+            "2026-07-03T21:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        // Only one row exists for this ref
+        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "upsert must not create a duplicate row");
+        assert_eq!(
+            certs[0].id, "cert-original",
+            "upsert must preserve the original ID across re-pushes"
+        );
+        assert_eq!(certs[0].old_sha, "aaaa", "old_sha updated");
+        assert_eq!(certs[0].new_sha, "bbbb", "new_sha updated");
+        assert_eq!(
+            certs[0].issued_at, "2026-07-03T21:00:00Z",
+            "newer issued_at overwrites older"
+        );
+
+        // Now try to overwrite with an OLDER cert — the guard must reject it.
+        db.insert_ref_certificate(&make_cert(
+            "stale-id",
+            &repo_id,
+            "refs/heads/main",
+            "stale",
+            "stale",
+            "2026-07-03T19:00:00Z",
+        ))
+        .await
+        .unwrap();
+        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "no extra row from stale cert");
+        assert_eq!(
+            certs[0].id, "cert-original",
+            "stale cert does not change the original id"
+        );
+        assert_eq!(
+            certs[0].old_sha, "aaaa",
+            "stale cert does not regress old_sha"
+        );
+        assert_eq!(
+            certs[0].new_sha, "bbbb",
+            "stale cert does not regress new_sha"
+        );
+        assert_eq!(
+            certs[0].issued_at, "2026-07-03T21:00:00Z",
+            "stale cert does not regress issued_at"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_clamps_negative_limit(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "clamp-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/clamp-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        db.insert_ref_certificate(&make_cert(
+            "clamp-1",
+            &repo_id,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-03T20:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        // Negative limit is clamped to 1 at the DB boundary
+        let certs = db.list_ref_certificates(&repo_id, -5).await.unwrap();
+        assert_eq!(certs.len(), 1, "negative limit clamped to min 1");
+        assert_eq!(certs[0].id, "clamp-1");
+
+        // Zero limit also clamped to 1
+        let certs = db.list_ref_certificates(&repo_id, 0).await.unwrap();
+        assert_eq!(certs.len(), 1, "zero limit clamped to min 1");
+        assert_eq!(certs[0].id, "clamp-1");
+    }
+
+    #[sqlx::test]
+    async fn list_ref_certificates_empty_repo_returns_empty(pool: PgPool) {
+        let db = db(pool).await;
+        let certs = db
+            .list_ref_certificates("nonexistent-repo-id", 10)
+            .await
+            .unwrap();
+        assert!(certs.is_empty());
+    }
+
+    /// NOTE: this test hand-copies the migration SQL as string literals and will
+    /// silently drift if the v10 migration block changes.  The load-bearing
+    /// upgrade-path test is `v10_upgrade_dedup_via_migration`, which fires the
+    /// real MIGRATIONS[v10] entry via run_migrations().
+    #[sqlx::test]
+    async fn v10_dedup_removes_old_duplicates(pool: PgPool) {
+        let db = db(pool.clone()).await;
+
+        // Drop the unique index so we can simulate pre-v10 duplicate rows.
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "dedup-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/dedup-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Insert two rows for the same (repo_id, ref_name) with raw INSERT
+        // (no ON CONFLICT — the unique index was dropped above to simulate a
+        // pre-v10 database). The second row has the newer timestamp and should
+        // survive the dedup.
+        sqlx::query(
+            "INSERT INTO ref_certificates
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("keep-id")
+        .bind(&repo_id)
+        .bind("refs/heads/main")
+        .bind("0000")
+        .bind("1111")
+        .bind("did:key:zPUSHER")
+        .bind("did:key:zNODE")
+        .bind("sig-first")
+        .bind("2026-07-03T20:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO ref_certificates
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("remove-id")
+        .bind(&repo_id)
+        .bind("refs/heads/main")
+        .bind("aaaa")
+        .bind("bbbb")
+        .bind("did:key:zPUSHER")
+        .bind("did:key:zNODE")
+        .bind("sig-dup")
+        .bind("2026-07-03T19:00:00Z") // older timestamp → should be removed
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Apply the v10 dedup logic: keep the most recent per (repo_id, ref_name).
+        sqlx::query(
+            "DELETE FROM ref_certificates
+             WHERE id IN (
+                 SELECT id FROM (
+                     SELECT id, ROW_NUMBER() OVER (
+                         PARTITION BY repo_id, ref_name ORDER BY issued_at DESC, id DESC
+                     ) AS rn
+                     FROM ref_certificates
+                 ) dups WHERE dups.rn > 1
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Re-create the unique index — must succeed after dedup.
+        sqlx::query("CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_ref ON ref_certificates(repo_id, ref_name)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Only the most recent row survives.
+        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
+        assert_eq!(certs.len(), 1, "dedup leaves one row per ref");
+        assert_eq!(
+            certs[0].id, "keep-id",
+            "dedup keeps the most recent (later issued_at)"
+        );
+    }
+
+    /// INV-7: upgrade-path test — seed a database at v9 with duplicate
+    /// ref_certificates, then let the real v10 migration fire via
+    /// run_migrations().  This exercises the migration code path rather than
+    /// hand-copying its SQL, so the test stays in sync with MIGRATIONS[v10].
+    #[sqlx::test]
+    async fn v10_upgrade_dedup_via_migration(pool: PgPool) {
+        // 1. Bootstrap schema via the full migration chain.
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        // 2. Roll back to v9: remove the v10-unique index and the
+        //    schema_migrations record so that run_migrations() re-applies v10.
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 10")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 3. Seed repos and duplicate certs (raw INSERT — no ON CONFLICT
+        //    since the index is gone).
+        let r1 = uuid::Uuid::new_v4().to_string();
+        let r2 = uuid::Uuid::new_v4().to_string();
+        for (id, name) in [(&r1, "upgrade-repo-a"), (&r2, "upgrade-repo-b")] {
+            db.create_repo(&RepoRecord {
+                id: id.clone(),
+                name: name.into(),
+                owner_did: "did:key:zOWNER".into(),
+                description: None,
+                is_public: true,
+                default_branch: "main".into(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                disk_path: format!("/tmp/{name}"),
+                forked_from: None,
+                machine_id: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // Helper macro for raw INSERT.
+        macro_rules! insert_cert {
+            ($id:expr, $repo_id:expr, $ref_name:expr, $old_sha:expr, $new_sha:expr, $issued_at:expr) => {
+                sqlx::query(
+                    "INSERT INTO ref_certificates
+                     (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                )
+                .bind($id)
+                .bind($repo_id)
+                .bind($ref_name)
+                .bind($old_sha)
+                .bind($new_sha)
+                .bind("did:key:zPUSHER")
+                .bind("did:key:zNODE")
+                .bind("sig")
+                .bind($issued_at)
+                .execute(&pool)
+                .await
+                .unwrap();
+            };
+        }
+
+        // Repo A, ref "main": two rows with distinct timestamps.
+        insert_cert!(
+            "dup-a-old",
+            &r1,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-a-new",
+            &r1,
+            "refs/heads/main",
+            "aaaa",
+            "bbbb",
+            "2026-07-02T10:00:00Z"
+        );
+
+        // Repo A, ref "feature": two rows with IDENTICAL timestamps — the
+        // id-DESC tiebreaker must choose the higher id (alphabetical: "z" > "a").
+        insert_cert!(
+            "dup-feat-a",
+            &r1,
+            "refs/heads/feature",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-feat-z",
+            &r1,
+            "refs/heads/feature",
+            "cccc",
+            "dddd",
+            "2026-07-01T10:00:00Z"
+        );
+
+        // Repo B, ref "main": two rows with distinct timestamps.
+        insert_cert!(
+            "dup-b-old",
+            &r2,
+            "refs/heads/main",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+        insert_cert!(
+            "dup-b-new",
+            &r2,
+            "refs/heads/main",
+            "eeee",
+            "ffff",
+            "2026-07-02T10:00:00Z"
+        );
+
+        // A non-duplicate singleton row (single row per ref) — must survive
+        // untouched.
+        insert_cert!(
+            "singleton",
+            &r2,
+            "refs/heads/singleton",
+            "0000",
+            "1111",
+            "2026-07-01T10:00:00Z"
+        );
+
+        // 4. Run migrations — the v10 dedup fires inside run_pending_migrations.
+        db.run_migrations().await.unwrap();
+
+        // 5. Assert each ref has exactly one survivor.
+        let all_r1 = db.list_ref_certificates(&r1, 10).await.unwrap();
+        assert_eq!(all_r1.len(), 2, "repo A: 2 refs, 1 survivor each");
+
+        let r1_main: Vec<_> = all_r1
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
+        assert_eq!(r1_main.len(), 1, "repo A main deduped to one row");
+        assert_eq!(r1_main[0].id, "dup-a-new", "newer timestamp survives");
+        assert_eq!(r1_main[0].old_sha, "aaaa");
+        assert_eq!(r1_main[0].new_sha, "bbbb");
+
+        let r1_feat: Vec<_> = all_r1
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/feature")
+            .collect();
+        assert_eq!(r1_feat.len(), 1, "repo A feature deduped to one row");
+        assert_eq!(
+            r1_feat[0].id, "dup-feat-z",
+            "same-timestamp tiebreaker: higher id wins (id DESC)"
+        );
+
+        let all_r2 = db.list_ref_certificates(&r2, 10).await.unwrap();
+        assert_eq!(all_r2.len(), 2, "repo B: 2 refs, 1 survivor each");
+
+        let r2_main: Vec<_> = all_r2
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
+        assert_eq!(r2_main.len(), 1, "repo B main deduped to one row");
+        assert_eq!(r2_main[0].id, "dup-b-new", "newer timestamp survives");
+
+        let all_r2 = db.list_ref_certificates(&r2, 10).await.unwrap();
+        assert_eq!(
+            all_r2.iter().filter(|c| c.id == "singleton").count(),
+            1,
+            "non-duplicate singleton untouched"
+        );
+
+        // 6. Verify the unique index exists: the upsert helper must succeed
+        //    (exercises ON CONFLICT) and a direct duplicate INSERT must fail.
+        db.insert_ref_certificate(&make_cert(
+            "post-migration-upsert",
+            &r1,
+            "refs/heads/main",
+            "1111",
+            "2222",
+            "2026-07-03T10:00:00Z",
+        ))
+        .await
+        .unwrap();
+        let after_upsert = db.list_ref_certificates(&r1, 10).await.unwrap();
+        let r1_main_after: Vec<_> = after_upsert
+            .iter()
+            .filter(|c| c.ref_name == "refs/heads/main")
+            .collect();
+        assert_eq!(
+            r1_main_after.len(),
+            1,
+            "upsert keeps exactly one row for main"
+        );
+        assert_eq!(
+            r1_main_after[0].id, "dup-a-new",
+            "upsert preserves original id"
+        );
+        assert_eq!(r1_main_after[0].old_sha, "1111", "upsert updated old_sha");
+
+        // A raw INSERT for the same (repo_id, ref_name) must now fail.
+        let err = sqlx::query(
+            "INSERT INTO ref_certificates
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("should-fail")
+        .bind(&r1)
+        .bind("refs/heads/main")
+        .bind("xxxx")
+        .bind("yyyy")
+        .bind("did:key:zPUSHER")
+        .bind("did:key:zNODE")
+        .bind("sig")
+        .bind("2026-07-04T10:00:00Z")
+        .execute(&pool)
+        .await;
+        assert!(
+            err.is_err(),
+            "raw duplicate INSERT must be rejected by the unique index"
         );
     }
 }

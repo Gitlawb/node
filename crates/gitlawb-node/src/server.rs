@@ -81,8 +81,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/tasks", get(tasks::list_tasks))
         .route("/api/v1/tasks/{id}", get(tasks::get_task));
 
-    // ── Rate-limited creation routes — require HTTP Signature + per-DID throttle
+    // ── Rate-limited creation routes — require HTTP Signature, plus a per-DID
+    // throttle AND a per-IP flood brake. The per-DID limiter (inner) caps a
+    // single identity; the per-IP limiter (outer) caps a DID farm that mints a
+    // fresh throwaway did:key per repo to slip past both the per-DID limit and
+    // the iCaptcha gate — the mechanism behind the recurring spam-repo floods.
+    // The per-IP layer wraps the auth layer (outermost = runs first) so flood
+    // traffic is rejected before signature verification burns CPU, matching the
+    // push path.
     let limiter = state.rate_limiter.clone();
+    let create_ip_limiter = rate_limit::IpRateLimiter {
+        limiter: state.create_ip_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
     let creation_routes = add_auth_layers(
         Router::new()
             .route("/api/v1/repos", post(repos::create_repo))
@@ -96,7 +107,9 @@ pub fn build_router(state: AppState) -> Router {
             .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
             .layer(axum::Extension(limiter)),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(create_ip_limiter));
 
     // ── Write routes — require HTTP Signature (no rate limit) ─────────────
     let write_routes = add_auth_layers(
@@ -442,6 +455,7 @@ pub fn build_router(state: AppState) -> Router {
     let meta_routes = Router::new()
         .route("/", get(node_info))
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/api/v1/p2p/info", get(p2p_info))
         .route("/api/v1/stats", get(stats))
         .route("/api/v1/contracts", get(contracts_info));
@@ -482,6 +496,26 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
+}
+
+/// Readiness = "this node can serve real traffic", and every real endpoint
+/// depends on the database, so probe it rather than reporting a constant.
+/// The probe gets its own short bound so a wedged pool can't hang the health
+/// check for the full acquire timeout.
+async fn ready(State(state): State<AppState>) -> axum::response::Response {
+    let probe = tokio::time::timeout(std::time::Duration::from_secs(2), state.db.ping()).await;
+    match probe {
+        Ok(Ok(())) => Json(json!({ "status": "ready" })).into_response(),
+        _ => (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "degraded",
+                "error": crate::error::DB_UNAVAILABLE_CODE,
+                "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn node_info(State(state): State<AppState>) -> Json<serde_json::Value> {

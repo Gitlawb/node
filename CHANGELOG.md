@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.1](https://github.com/Gitlawb/node/compare/v0.5.0...v0.5.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* **bounties:** add tests for claim_bounty repo-read gate ([#160](https://github.com/Gitlawb/node/issues/160)) ([#169](https://github.com/Gitlawb/node/issues/169)) ([6bafaa6](https://github.com/Gitlawb/node/commit/6bafaa6dc5f05c0dcd61c708397afddbcf8c2e3f))
+* **deps:** bump crossbeam-epoch to 0.9.20 for RUSTSEC-2026-0204 ([#162](https://github.com/Gitlawb/node/issues/162)) ([#163](https://github.com/Gitlawb/node/issues/163)) ([67ad2b8](https://github.com/Gitlawb/node/commit/67ad2b876c8d9a336219d1016968de7a88fc4e75))
+* **node,git:** bound a hung served git with a total-duration timeout ([#62](https://github.com/Gitlawb/node/issues/62)) ([#165](https://github.com/Gitlawb/node/issues/165)) ([cd67718](https://github.com/Gitlawb/node/commit/cd67718f49ec38726a40f6bcf36f539ccdb42969))
+* **node:** bound list_ref_certificates with LIMIT and add upsert to prevent unbounded growth ([#147](https://github.com/Gitlawb/node/issues/147)) ([#149](https://github.com/Gitlawb/node/issues/149)) ([6b5e5bc](https://github.com/Gitlawb/node/commit/6b5e5bc7aee00a2d03295d3620df1ee4d8c024a2))
+* **node:** gate POST /api/v1/sync/trigger and rate-limit the peer-sync routes ([#82](https://github.com/Gitlawb/node/issues/82)) ([#161](https://github.com/Gitlawb/node/issues/161)) ([d00d89a](https://github.com/Gitlawb/node/commit/d00d89ae5be992d1f63e95b714ae1bd3735e8457))
+* **node:** rate-limit repo/agent creation per client IP to stop DID-farm spam floods ([#180](https://github.com/Gitlawb/node/issues/180)) ([dfcaa22](https://github.com/Gitlawb/node/commit/dfcaa22b23ec91be4c75926956aa994ca89de8d5))
+* **release:** build aarch64-musl natively on arm64 runners, replace retired macos-13 ([#155](https://github.com/Gitlawb/node/issues/155)) ([6cff528](https://github.com/Gitlawb/node/commit/6cff5286b436fdee44ad881999e2a5f4bdba18f9))
+* **visibility:** gate repo-scoped read surfaces on visibility ([#120](https://github.com/Gitlawb/node/issues/120)) ([#157](https://github.com/Gitlawb/node/issues/157)) ([26bc3f6](https://github.com/Gitlawb/node/commit/26bc3f69870aa77e43c0d92115a5aa59555b7d88))
+
 ## [0.5.0](https://github.com/Gitlawb/node/compare/v0.4.0...v0.5.0) (2026-07-05)
 
 

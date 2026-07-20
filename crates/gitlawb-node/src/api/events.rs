@@ -129,6 +129,7 @@ pub async fn list_ref_updates(
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v.max(0))
         .unwrap_or(50)
         .clamp(0, MAX_VISIBLE_REF_UPDATES);
 
@@ -177,6 +178,7 @@ pub async fn list_repo_events(
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v.max(0))
         .unwrap_or(50)
         .clamp(0, MAX_VISIBLE_REF_UPDATES);
 
@@ -209,7 +211,7 @@ pub async fn list_repo_events(
     // into an empty 200, matching the gossip half below.
     let cert_events: Vec<serde_json::Value> = state
         .db
-        .list_ref_certificates(&record.id)
+        .list_ref_certificates(&record.id, limit)
         .await?
         .iter()
         .map(|c| {

@@ -166,6 +166,74 @@ pub struct Config {
     /// in flight and exits. Default: 30s.
     #[arg(long, env = "GITLAWB_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
     pub shutdown_grace_secs: u64,
+
+    /// Maximum wall-clock time a single served git operation (upload-pack /
+    /// receive-pack through `run_git_service`) may run before it is aborted and
+    /// its process group torn down, in seconds. Bounds a git that neither
+    /// finishes nor disconnects. Must be positive; set it very large to
+    /// effectively disable the bound. Default: 600s (10 min), generous for large
+    /// clones. Does not cover the ref advertisement (`info/refs`) or the
+    /// withheld-blob fetch path (`upload_pack_excluding`, a blocking
+    /// `spawn_blocking` a tokio timeout cannot cancel); both remain unbounded.
+    #[arg(
+        long,
+        env = "GITLAWB_GIT_SERVICE_TIMEOUT_SECS",
+        default_value_t = 600,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub git_service_timeout_secs: u64,
+
+    /// Maximum connections in the PostgreSQL pool. This is a cap, not a floor
+    /// (connections open lazily). Size against the database server's
+    /// max_connections, remembering admin tooling opens its own pool.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_MAX_CONNECTIONS",
+        default_value_t = 20,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub db_max_connections: u32,
+
+    /// Maximum time a request waits for a pool connection before failing with
+    /// 503, in seconds. Bounds queueing when the database is slow or down.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_ACQUIRE_TIMEOUT_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub db_acquire_timeout_secs: u64,
+
+    /// Upper bound on each startup connect-and-migrate attempt, in seconds.
+    /// Migrations wait on a cross-instance advisory lock, so this must be
+    /// generous enough for a peer instance to finish migrating; on expiry the
+    /// attempt is retried (migrations are idempotent).
+    #[arg(
+        long,
+        env = "GITLAWB_DB_CONNECT_TIMEOUT_SECS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub db_connect_timeout_secs: u64,
+
+    /// First retry delay when the database is unavailable at startup, in
+    /// seconds. Doubles each attempt up to --db-retry-max-secs.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_RETRY_INITIAL_SECS",
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub db_retry_initial_secs: u64,
+
+    /// Ceiling on the startup retry delay, in seconds.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_RETRY_MAX_SECS",
+        default_value_t = 60,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub db_retry_max_secs: u64,
 }
 
 impl Config {
@@ -181,5 +249,27 @@ impl Config {
             }
         }
         PathBuf::from(&self.key_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_service_timeout_defaults_to_600_and_rejects_zero() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).git_service_timeout_secs,
+            600
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--git-service-timeout-secs", "30"])
+                .git_service_timeout_secs,
+            30
+        );
+        // 0 is a footgun (immediate-504 on every request); clap must reject it.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
     }
 }

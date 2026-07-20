@@ -76,6 +76,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         machine_id: None,
         repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+        create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
@@ -4632,5 +4633,351 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn claim_bounty_gate_denies_non_reader_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCLAIMDENYOWNERRRRRRRRRRRRRRRRRRRRRRRRR";
+        state
+            .db
+            .create_repo(&seed_private_repo(owner, "secret-repo"))
+            .await
+            .unwrap();
+        let bounty = crate::db::BountyRecord {
+            id: "claim-bounty-deny".into(),
+            repo_owner: owner.into(),
+            repo_name: "secret-repo".into(),
+            issue_id: None,
+            title: "Secret Claim Bounty".into(),
+            amount: 100,
+            creator_did: owner.into(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.unwrap();
+
+        // A stranger (not repo owner/reader) tries to claim the bounty
+        let stranger_kp = gitlawb_core::identity::Keypair::generate();
+        let uri = "/api/v1/bounties/claim-bounty-deny/claim";
+        let body = b"{}";
+        let sig = gitlawb_core::http_sig::sign_request(&stranger_kp, "POST", uri, body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    async fn claim_bounty_gate_admits_owner_on_private(pool: PgPool) {
+        let state = test_state(pool).await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let owner = kp.did().to_string();
+        state
+            .db
+            .create_repo(&seed_private_repo(&owner, "secret-repo"))
+            .await
+            .unwrap();
+        let bounty = crate::db::BountyRecord {
+            id: "claim-bounty-admit".into(),
+            repo_owner: owner.clone(),
+            repo_name: "secret-repo".into(),
+            issue_id: None,
+            title: "Owner Claim Bounty".into(),
+            amount: 200,
+            creator_did: owner.clone(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 86400,
+            tx_hash: None,
+        };
+        state.db.create_bounty(&bounty).await.unwrap();
+
+        // The owner claims their own bounty
+        let uri = "/api/v1/bounties/claim-bounty-admit/claim";
+        let body = b"{}";
+        let sig = gitlawb_core::http_sig::sign_request(&kp, "POST", uri, body);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("content-digest", sig.content_digest)
+            .header("signature-input", sig.signature_input)
+            .header("signature", sig.signature)
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+
+        let router = crate::server::build_router(state);
+        let resp = router.oneshot(req).await.unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    // ── #147: list_certs respects ?limit ──────────────────────────────────────
+
+    fn seed_cert(
+        id: &str,
+        repo_id: &str,
+        ref_name: &str,
+        issued_at: &str,
+    ) -> crate::db::RefCertificate {
+        crate::db::RefCertificate {
+            id: id.to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            old_sha: "0000".into(),
+            new_sha: "1111".into(),
+            pusher_did: "did:key:zPUSHER".into(),
+            node_did: "did:key:zNODE".into(),
+            signature: "sig".into(),
+            issued_at: issued_at.to_string(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn list_certs_respects_limit_param(pool: PgPool) {
+        let owner = "did:key:zCERTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "cert-repo"))
+            .await
+            .expect("seed repo");
+        let repo = state
+            .db
+            .get_repo(owner, "cert-repo")
+            .await
+            .unwrap()
+            .expect("repo must exist");
+
+        for i in 0..10u64 {
+            state
+                .db
+                .insert_ref_certificate(&seed_cert(
+                    &format!("cert-{i}"),
+                    &repo.id,
+                    &format!("refs/heads/feature-{i}"),
+                    &format!("2026-07-03T20:{i:02}:00Z"),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs",
+                    axum::routing::get(crate::api::certs::list_certs),
+                )
+                .with_state(state.clone())
+        };
+
+        // No limit param → default 50, returns all 10
+        let resp = router()
+            .oneshot(anon_get(&format!("/api/v1/repos/{owner}/cert-repo/certs")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 10, "default limit returns all rows");
+        assert_eq!(
+            body["certificates"].as_array().unwrap().len(),
+            10,
+            "all certs in response"
+        );
+
+        // limit=3 returns exactly 3
+        let resp = router()
+            .oneshot(anon_get(&format!(
+                "/api/v1/repos/{owner}/cert-repo/certs?limit=3"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 3, "limit=3 returns 3 certs");
+        let certs = body["certificates"].as_array().unwrap();
+        assert_eq!(certs.len(), 3);
+        assert_eq!(certs[0]["id"], "cert-9", "most recent cert first");
+        assert_eq!(certs[2]["id"], "cert-7", "third most recent cert");
+
+        // limit=0 is clamped to min 1, returns 1 cert
+        let resp = router()
+            .oneshot(anon_get(&format!(
+                "/api/v1/repos/{owner}/cert-repo/certs?limit=0"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"], 1, "limit=0 clamped to min 1");
+        assert_eq!(
+            body["certificates"].as_array().unwrap().len(),
+            1,
+            "one cert when limit=0"
+        );
+        assert_eq!(body["certificates"][0]["id"], "cert-9", "most recent");
+
+        // limit=200+ is capped at 200
+        let resp = router()
+            .oneshot(anon_get(&format!(
+                "/api/v1/repos/{owner}/cert-repo/certs?limit=300"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(
+            body["count"], 10,
+            "limit=300 capped to 200, still returns all 10"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_certs_returns_count_field(pool: PgPool) {
+        let owner = "did:key:zCERTCOUNTAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "count-repo"))
+            .await
+            .expect("seed repo");
+        let repo = state
+            .db
+            .get_repo(owner, "count-repo")
+            .await
+            .unwrap()
+            .unwrap();
+
+        state
+            .db
+            .insert_ref_certificate(&seed_cert(
+                "cnt-1",
+                &repo.id,
+                "refs/heads/main",
+                "2026-07-03T20:00:00Z",
+            ))
+            .await
+            .unwrap();
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/certs",
+                axum::routing::get(crate::api::certs::list_certs),
+            )
+            .with_state(state);
+
+        let resp = router
+            .oneshot(anon_get(&format!("/api/v1/repos/{owner}/count-repo/certs")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert!(body.get("count").is_some(), "response must include `count`");
+        assert_eq!(body["count"], 1);
+        assert_eq!(
+            body["certificates"].as_array().unwrap().len(),
+            1,
+            "certificates array length matches count"
+        );
+    }
+
+    #[sqlx::test]
+    async fn list_certs_prefix_resolves_deep_cert(pool: PgPool) {
+        let owner = "did:key:zPREFIXDEEPTESTAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&seed_repo(owner, "deep-repo"))
+            .await
+            .expect("seed repo");
+        let repo = state
+            .db
+            .get_repo(owner, "deep-repo")
+            .await
+            .unwrap()
+            .expect("repo must exist");
+
+        // Insert 55 certs with distinct refs — only the newest 50 fit in a
+        // default list_certs response, so a short-ID for cert #0 requires the
+        // prefix query to reach it.
+        for i in 0..55u64 {
+            state
+                .db
+                .insert_ref_certificate(&seed_cert(
+                    &format!("deep-{i:04}"),
+                    &repo.id,
+                    &format!("refs/heads/feature-{i}"),
+                    &format!("2026-07-03T20:{i:02}:00Z"),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/certs",
+                    axum::routing::get(crate::api::certs::list_certs),
+                )
+                .with_state(state.clone())
+        };
+
+        // Default list (no prefix) returns only the 50 newest — cert-0000 is absent.
+        let body = json_body(
+            router()
+                .oneshot(anon_get(&format!("/api/v1/repos/{owner}/deep-repo/certs")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["count"].as_u64().unwrap(), 50, "default limit 50");
+
+        // Prefix lookup finds the deep cert by short prefix.
+        let body = json_body(
+            router()
+                .oneshot(anon_get(&format!(
+                    "/api/v1/repos/{owner}/deep-repo/certs?prefix=deep-0"
+                )))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            body["count"].as_u64().unwrap_or(0) >= 1,
+            "prefix query returns at least one result"
+        );
+        let ids: Vec<&str> = body["certificates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["id"].as_str())
+            .collect();
+        assert!(
+            ids.iter().any(|id| id.starts_with("deep-0")),
+            "result includes the deep cert matching the prefix"
+        );
     }
 }
