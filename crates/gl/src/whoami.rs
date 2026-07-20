@@ -1,6 +1,6 @@
 //! `gl whoami` — print current identity and optional node registration info.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -51,11 +51,21 @@ pub async fn run(args: WhoamiArgs) -> Result<()> {
                     }
                 }
             }
-            Ok(_) => {
+            Ok(resp) if resp.status().as_u16() == 404 => {
                 registered = Some(false);
             }
-            Err(_) => {
-                registered = Some(false);
+            Ok(resp) => {
+                let status = resp.status();
+                let msg = resp
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| v["message"].as_str().map(String::from))
+                    .unwrap_or_else(|| "request failed".to_string());
+                bail!("agent lookup failed ({status}): {msg}");
+            }
+            Err(e) => {
+                bail!("agent lookup failed: {e}");
             }
         }
     }
@@ -193,6 +203,80 @@ mod tests {
             json: false,
         };
         run(args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_whoami_with_node_forbidden() {
+        let dir = TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+        let did = kp.did().to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _agent = server
+            .mock("GET", format!("/api/v1/agents/{did}").as_str())
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"forbidden"}"#)
+            .create_async()
+            .await;
+
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(server.url()),
+            json: false,
+        };
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("403"), "expected 403 error, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_whoami_with_node_server_error() {
+        let dir = TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+        let did = kp.did().to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _agent = server
+            .mock("GET", format!("/api/v1/agents/{did}").as_str())
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"internal error"}"#)
+            .create_async()
+            .await;
+
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(server.url()),
+            json: false,
+        };
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("500"), "expected 500 error, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_whoami_with_node_transport_error() {
+        let dir = TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some("http://127.0.0.1:1".to_string()),
+            json: false,
+        };
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("agent lookup failed"),
+            "expected transport error, got: {msg}"
+        );
     }
 
     #[tokio::test]
