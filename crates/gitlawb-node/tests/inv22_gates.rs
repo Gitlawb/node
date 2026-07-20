@@ -200,3 +200,44 @@ fn f4_release_keeps_conn_owned_until_unlock_resolves() {
          unlock await resolves."
     );
 }
+
+/// F6/KTD-5 (initial IPFS metadata queries deadline-wrapped): `get_by_cid` acquires
+/// the scarce walk permits (RAII, held for the whole request) BEFORE its two initial
+/// metadata queries, and the per-repo loop's first budget gate runs only later. So
+/// both `list_all_repos` and `list_visibility_rules_for_repos` must be clamped to the
+/// remaining request budget — otherwise a query blocked in Postgres pins the walk slot
+/// for the whole stall, past the budget. This scans the PRODUCTION half of `api/ipfs.rs`
+/// (the `mod tests` half names the same calls in its own harness and would make the
+/// check vacuous) and asserts each query call is immediately preceded by a
+/// `tokio::time::timeout(` wrapper. Removing either wrapper turns this red (proven
+/// load-bearing).
+#[test]
+fn f6_ipfs_metadata_queries_are_deadline_wrapped() {
+    let ipfs = src("api/ipfs.rs");
+    let production = ipfs
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields a first chunk");
+
+    for call in [".list_all_repos()", ".list_visibility_rules_for_repos("] {
+        assert_eq!(
+            production.matches(call).count(),
+            1,
+            "F6 guard stale: `{call}` must appear exactly once in the production half \
+             of api/ipfs.rs (the deadline-wrapped handler call) — update this guard"
+        );
+        let idx = production
+            .find(call)
+            .unwrap_or_else(|| panic!("F6 gate: api/ipfs.rs no longer calls `{call}`"));
+        // The wrapper opens a few lines above the call (match tokio::time::timeout( ...
+        // remaining budget ..., <query> )); a 240-char lookback covers it without
+        // reaching the previous statement.
+        let window = &production[idx.saturating_sub(240)..idx];
+        assert!(
+            window.contains("tokio::time::timeout("),
+            "F6 gate missing: `{call}` must be wrapped in tokio::time::timeout(...) \
+             clamped to the remaining request budget. An unwrapped await pins the held \
+             walk permit for the whole DB stall, past GITLAWB_IPFS_REQUEST_BUDGET_SECS."
+        );
+    }
+}

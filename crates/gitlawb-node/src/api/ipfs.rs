@@ -148,22 +148,65 @@ pub async fn get_by_cid(
         None => None,
     };
 
-    // 2. Search all repos for an object with this SHA-256
-    let repos = state
-        .db
-        .list_all_repos()
-        .await
-        .map_err(AppError::Internal)?;
+    // 2. Search all repos for an object with this SHA-256.
+    //
+    // F6/KTD-5: both initial metadata queries run while the scarce walk permits
+    // acquired above are ALREADY held (RAII, for the whole request) and BEFORE the
+    // per-repo loop's first budget gate. With no pool statement_timeout, a query
+    // blocked in Postgres would otherwise pin those walk slots for the entire stall
+    // — past the request budget — capacity-503'ing later requests. Clamp BOTH to the
+    // remaining request budget. On timeout return the same retryable budget 503 the
+    // later stages shed (the "budget" source); returning here drops the RAII permits,
+    // freeing the slot. list_visibility_rules_for_repos is the access-control query,
+    // so its timeout returns BEFORE the loop — the scan can NEVER run with an empty
+    // rule map and serve an unfiltered listing that exposes private repos (FAIL CLOSED).
+    let repos = match tokio::time::timeout(
+        request_deadline.saturating_duration_since(std::time::Instant::now()),
+        state.db.list_all_repos(),
+    )
+    .await
+    {
+        Ok(Ok(repos)) => repos,
+        Ok(Err(e)) => return Err(AppError::Internal(e)),
+        Err(_elapsed) => {
+            tracing::warn!(
+                budget_secs = state.config.ipfs_request_budget_secs,
+                "/ipfs list_all_repos exceeded the request budget \
+                 (GITLAWB_IPFS_REQUEST_BUDGET_SECS); shedding a retryable 503 and freeing the walk permit"
+            );
+            return Err(AppError::Overloaded(format!(
+                "ipfs scan incomplete (budget) for CID {cid_str}; retry shortly"
+            )));
+        }
+    };
 
     // Fetch every repo's visibility rules in one query rather than one per row
     // (the gate runs each row against its OWN rules — KTD2a). A row absent from
     // the map has no rules.
     let repo_ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
-    let rules_by_repo = state
-        .db
-        .list_visibility_rules_for_repos(&repo_ids)
-        .await
-        .map_err(AppError::Internal)?;
+    let rules_by_repo = match tokio::time::timeout(
+        request_deadline.saturating_duration_since(std::time::Instant::now()),
+        state.db.list_visibility_rules_for_repos(&repo_ids),
+    )
+    .await
+    {
+        Ok(Ok(rules)) => rules,
+        Ok(Err(e)) => return Err(AppError::Internal(e)),
+        // FAIL CLOSED (security-critical): a timeout on the access-control query must
+        // DENY. Returning here — before the loop — means the scan can never fall
+        // through and apply an empty rule map, which would serve an unfiltered listing
+        // exposing private repos. It sheds the same retryable budget 503 as above.
+        Err(_elapsed) => {
+            tracing::warn!(
+                budget_secs = state.config.ipfs_request_budget_secs,
+                "/ipfs list_visibility_rules_for_repos exceeded the request budget \
+                 (GITLAWB_IPFS_REQUEST_BUDGET_SECS); denying (fail closed) and freeing the walk permit"
+            );
+            return Err(AppError::Overloaded(format!(
+                "ipfs scan incomplete (budget) for CID {cid_str}; retry shortly"
+            )));
+        }
+    };
 
     // Request-scoped memo of the per-repo allowed-blob set (KTD1, #126). The
     // caller is constant for one request, so `repo.id` alone is a safe,
@@ -2415,5 +2458,203 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "a different IP must not be braked by another IP's exhausted bucket"
         );
+    }
+
+    /// F6/KTD-5: the two initial metadata queries (`list_all_repos`,
+    /// `list_visibility_rules_for_repos`) run AFTER the scarce walk permits are
+    /// acquired (held RAII for the whole request) but BEFORE the per-repo loop's
+    /// first budget gate. Pre-fix they were bare awaits with no deadline, so a query
+    /// blocked in Postgres pinned the walk slot for the whole stall, past the request
+    /// budget. Here we hold an ACCESS EXCLUSIVE lock on `repos` so `list_all_repos`
+    /// blocks; with the budget clamp the request sheds a retryable budget 503 within
+    /// ~budget and FREES the walk permit, and a follow-up (lock released) is served.
+    ///
+    /// Load-bearing: pre-fix the bare await blocks on the lock until the 10s wrapping
+    /// timeout fires (RED — "never returned within budget"). After the fix it returns
+    /// the 503 at ~1s and the permit is free again. MUTATION (RED): drop the
+    /// `tokio::time::timeout` around `list_all_repos` and this hangs past the wrap.
+    #[sqlx::test]
+    async fn get_by_cid_stalled_metadata_query_frees_walk_permit(pool: sqlx::PgPool) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Global walk pool of 1 so the held/freed permit is directly observable;
+        // per-source cap permissive so only the global pool matters.
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_request_budget_secs = 1;
+        state.config = Arc::new(cfg);
+
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        let router = ipfs_router(state);
+
+        // Hold an ACCESS EXCLUSIVE lock on `repos` on a dedicated pooled connection:
+        // `list_all_repos`' SELECT needs ACCESS SHARE, which conflicts, so it blocks
+        // at lock acquisition regardless of row count.
+        let mut lock_conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN; LOCK TABLE repos IN ACCESS EXCLUSIVE MODE;")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.80:5000".parse().unwrap();
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.clone().oneshot(get_cid(&valid_cid(), Some(peer))),
+        )
+        .await
+        .expect("the budget clamp must return within budget; a bare await hangs on the lock")
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a metadata query blocked past the request budget must shed a retryable 503"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the clamp must end the request at ~budget (1s); got {elapsed:?} \
+             (pre-fix the bare await blocks on the lock for the whole stall)"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("budget"),
+            "the shed must name the budget taint so it maps to \
+             GITLAWB_IPFS_REQUEST_BUDGET_SECS; got: {body}"
+        );
+        // The scarce walk permit was RAII-dropped on the early return, not pinned for
+        // the stall: the slot is free again the instant the request returns.
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the walk permit must be freed on the budget-shed path, not held for the stall"
+        );
+
+        // Release the lock; a follow-up request is now SERVED (404 — empty DB), never
+        // capacity-503'd, proving the slot was not left pinned.
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+        drop(lock_conn);
+        let resp2 = router
+            .oneshot(get_cid(&valid_cid(), Some(peer)))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp2.status(),
+            StatusCode::NOT_FOUND,
+            "with the permit freed and the lock released, a follow-up is served (404), \
+             not capacity-503'd"
+        );
+    }
+
+    /// F6/KTD-5 FAIL CLOSED (security-critical): `list_visibility_rules_for_repos` is
+    /// the access-control query. If its timeout let the handler fall through with an
+    /// empty rule map, the loop would apply no visibility rules and serve an unfiltered
+    /// listing — exposing a public repo's path-restricted blob. Here a PUBLIC repo
+    /// carries the blob under a path-scoped rule that denies anon; `visibility_rules`
+    /// is locked ACCESS EXCLUSIVE so the rule query blocks. The fix returns the budget
+    /// 503 BEFORE the loop, so the handler NEVER serves (never 200).
+    ///
+    /// Load-bearing: pre-fix the bare await blocks on the lock until the 10s wrap fires
+    /// (RED). After the fix it sheds the 503 at ~1s. The `assert_ne!(200)` is the
+    /// fail-closed guard: a naive fix that `unwrap_or_default()`s the rules on timeout
+    /// and falls through would serve the blob 200 and trip it.
+    #[sqlx::test]
+    async fn get_by_cid_visibility_rule_timeout_fails_closed(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone());
+        state.git_ipfs_walk_semaphore = Arc::new(Semaphore::new(1));
+        state.git_ipfs_walk_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+
+        // A PUBLIC repo (upsert_mirror_repo sets is_public=true) carrying the blob,
+        // with a path-scoped rule restricting src/** to a reader that is NOT the anon
+        // caller. Rules applied => the blob is denied; rules skipped (fall-through) =>
+        // the public repo serves it (the exposure this guard forbids).
+        let (repo_id, oid) =
+            seed_repo_with_blob(&state, tmp.path(), "z6f3failclosed", "gated", b"private\n").await;
+        state
+            .db
+            .set_visibility_rule(
+                &repo_id,
+                "src/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkU3IpfsReaderDDDDDDDDDDDDDDDDDDDDDDDD".to_string()],
+                "z6f3failclosed",
+            )
+            .await
+            .unwrap();
+
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_request_budget_secs = 1;
+        state.config = Arc::new(cfg);
+        let sem = state.git_ipfs_walk_semaphore.clone();
+        let router = ipfs_router(state);
+
+        // Lock `visibility_rules` ACCESS EXCLUSIVE: list_all_repos (on `repos`) still
+        // succeeds, but list_visibility_rules_for_repos blocks on the rule query.
+        let mut lock_conn = pool.acquire().await.unwrap();
+        sqlx::raw_sql("BEGIN; LOCK TABLE visibility_rules IN ACCESS EXCLUSIVE MODE;")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.81:5000".parse().unwrap();
+        let started = std::time::Instant::now();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            router.oneshot(get_cid(&cid_for_oid(&oid), Some(peer))),
+        )
+        .await
+        .expect("the budget clamp must return within budget; a bare await hangs on the lock")
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        let status = resp.status();
+        // Fail closed: the handler must NEVER emit the listing with no rules applied.
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a visibility-rule query timeout must DENY, never serve the path-restricted \
+             blob from the public repo (that would expose private content)"
+        );
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a visibility-rule query blocked past the budget must shed the retryable budget 503"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "the clamp must end the request at ~budget (1s); got {elapsed:?}"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("budget"),
+            "the fail-closed shed must name the budget taint; got: {body}"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "the walk permit must be freed on the fail-closed budget-shed path"
+        );
+
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+        drop(lock_conn);
     }
 }
