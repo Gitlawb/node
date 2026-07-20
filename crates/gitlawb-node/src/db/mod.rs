@@ -5712,7 +5712,10 @@ mod arweave_anchor_tests {
 
         db.record_arweave_anchor(&input).await.unwrap();
 
-        let anchors = db.list_arweave_anchors(Some("alice/myrepo"), 10).await.unwrap();
+        let anchors = db
+            .list_arweave_anchors(Some("alice/myrepo"), 10)
+            .await
+            .unwrap();
         assert_eq!(anchors.len(), 1, "one anchor recorded");
         assert_eq!(anchors[0].status, "pending", "default status is pending");
         assert_eq!(anchors[0].arweave_tx_id, "test-tx-id-123");
@@ -5734,14 +5737,20 @@ mod arweave_anchor_tests {
         };
         db.record_arweave_anchor(&input).await.unwrap();
 
-        let anchors = db.list_arweave_anchors(Some("bob/myrepo"), 10).await.unwrap();
+        let anchors = db
+            .list_arweave_anchors(Some("bob/myrepo"), 10)
+            .await
+            .unwrap();
         let id = &anchors[0].id;
 
         db.confirm_arweave_anchor(id, 1234567, "receipt-sig-value")
             .await
             .unwrap();
 
-        let updated = db.list_arweave_anchors(Some("bob/myrepo"), 10).await.unwrap();
+        let updated = db
+            .list_arweave_anchors(Some("bob/myrepo"), 10)
+            .await
+            .unwrap();
         assert_eq!(updated[0].status, "confirmed");
         assert_eq!(updated[0].deadline_height, Some(1234567));
         assert_eq!(updated[0].receipt_sig, Some("receipt-sig-value".into()));
@@ -5763,12 +5772,18 @@ mod arweave_anchor_tests {
         };
         db.record_arweave_anchor(&input).await.unwrap();
 
-        let anchors = db.list_arweave_anchors(Some("carol/myrepo"), 10).await.unwrap();
+        let anchors = db
+            .list_arweave_anchors(Some("carol/myrepo"), 10)
+            .await
+            .unwrap();
         let id = &anchors[0].id;
 
         db.fail_arweave_anchor(id).await.unwrap();
 
-        let updated = db.list_arweave_anchors(Some("carol/myrepo"), 10).await.unwrap();
+        let updated = db
+            .list_arweave_anchors(Some("carol/myrepo"), 10)
+            .await
+            .unwrap();
         assert_eq!(updated[0].status, "failed");
     }
 
@@ -5811,7 +5826,9 @@ mod arweave_anchor_tests {
 
         // Confirm one anchor
         let first_id = pending[0].id.clone();
-        db.confirm_arweave_anchor(&first_id, 100, "sig").await.unwrap();
+        db.confirm_arweave_anchor(&first_id, 100, "sig")
+            .await
+            .unwrap();
 
         let pending_after = db.list_pending_anchors().await.unwrap();
         assert_eq!(pending_after.len(), 1, "only one pending remains");

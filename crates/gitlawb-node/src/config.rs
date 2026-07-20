@@ -93,7 +93,11 @@ pub struct Config {
 
     /// Arweave gateway URL for resolving arweave_tx_id to data items.
     /// Used by the verify endpoint. Default: https://arweave.net
-    #[arg(long, env = "GITLAWB_ARWEAVE_GATEWAY", default_value = "https://arweave.net")]
+    #[arg(
+        long,
+        env = "GITLAWB_ARWEAVE_GATEWAY",
+        default_value = "https://arweave.net"
+    )]
     pub arweave_gateway: String,
 
     /// Base L2 DID registry contract address (0x...)

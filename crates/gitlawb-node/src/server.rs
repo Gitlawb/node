@@ -222,7 +222,10 @@ pub fn build_router(state: AppState) -> Router {
     // ── Arweave permanent anchors ──────────────────────────────────────────
     let arweave_routes = Router::new()
         .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
-        .route("/api/v1/arweave/verify/{tx_id}", get(arweave::verify_anchor_endpoint));
+        .route(
+            "/api/v1/arweave/verify/{tx_id}",
+            get(arweave::verify_anchor_endpoint),
+        );
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(

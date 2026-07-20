@@ -249,11 +249,9 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     request
         .extensions_mut()
         .insert(AuthenticatedDid(sig.key_id.to_string()));
-    request
-        .extensions_mut()
-        .insert(PusherSignature(
-            base64::engine::general_purpose::STANDARD.encode(&sig.signature_bytes),
-        ));
+    request.extensions_mut().insert(PusherSignature(
+        base64::engine::general_purpose::STANDARD.encode(&sig.signature_bytes),
+    ));
     next.run(request).await
 }
 
