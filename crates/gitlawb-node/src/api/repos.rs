@@ -199,6 +199,27 @@ pub async fn create_repo(
     // Owner is the authenticated agent's DID
     let owner_did = auth.0;
 
+    // Serialize against a concurrent purge of the SAME owner/name. The purge holds
+    // this per-repo advisory lock across its delete-row + remove-dir, so without
+    // taking the same lock here a create could slip into the row-deleted-but-dir-
+    // not-yet-removed window and land a repos row pointing at a directory the purge
+    // then removes (a dangling row). Held across the existence-check -> init ->
+    // create_repo sequence so the two operations cannot interleave; released
+    // explicitly on the success path, and its guard's Drop frees the lock on every
+    // error path below. Bounded-wait (no object-store I/O), so the uncontended hot
+    // path returns on the first attempt. (KTD6, R6.)
+    let repo_lock = state
+        .repo_store
+        .lock_repo_blocking(&owner_did, &req.name)
+        .await
+        .map_err(|e| AppError::Git(e.to_string()))?
+        .ok_or_else(|| {
+            AppError::Git(format!(
+                "could not acquire repo lock for {owner_did}/{} — held by a live writer or purge",
+                req.name
+            ))
+        })?;
+
     // Check it doesn't already exist
     if state.db.get_repo(&owner_did, &req.name).await?.is_some() {
         return Err(AppError::RepoExists(req.name));
@@ -234,6 +255,10 @@ pub async fn create_repo(
     };
 
     state.db.create_repo(&record).await?;
+
+    // Row + on-disk dir now both exist consistently; the race window is closed, so
+    // release the per-repo lock before the (best-effort) proof recording below.
+    repo_lock.release().await;
 
     // Persist the proof so it can travel with the repo and a mirroring peer can
     // re-verify it (enforce-mode origins only; off/shadow yield no proof here).
@@ -3470,5 +3495,164 @@ mod tests {
                 "under-limit write to {uri} must pass the brake, not 429"
             );
         }
+    }
+
+    // ── U6/R6: create_repo serializes against a same-key purge ───────────────
+
+    // create_repo must take the SAME per-owner/name advisory lock the purge holds
+    // (try_lock_repo / RepoLockGuard), so a create cannot slip into the purge's
+    // delete-row -> [window] -> remove-dir gap and land a repos row pointing at a
+    // directory the purge then removes (a dangling row). Deterministic form of the
+    // race: hold the purge lock, then prove create BLOCKS on it rather than
+    // proceeding into the window — it must not insert its row while the lock is
+    // held, and must complete cleanly (row + on-disk dir both present) once the
+    // lock frees. RED on base (create takes no lock): the row lands while the lock
+    // is held. GREEN after (create serializes on the same key).
+    #[sqlx::test]
+    async fn create_repo_serializes_against_purge_lock(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use axum::extract::State;
+        use axum::Extension;
+        use std::time::Duration;
+
+        // Multi-connection pool: while the purge guard pins one connection for the
+        // held lock, create's own try_lock_repo attempt must get a DIFFERENT
+        // connection and observe the advisory lock held (Ok(None) -> it retries),
+        // not merely block on pool exhaustion.
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+
+        let owner = "did:key:z6MkCreatePurgeRaceAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "racerepo";
+
+        // The purge path holds this exact per-repo advisory lock across its
+        // delete-row + remove-dir. Take it via the same helper the purge uses.
+        let purge_guard = state
+            .repo_store
+            .try_lock_repo(owner, name)
+            .await
+            .unwrap()
+            .expect("lock is free before the create");
+
+        // Kick off a create for the SAME owner/name while the purge holds the lock.
+        let state2 = state.clone();
+        let owner2 = owner.to_string();
+        let handle = tokio::spawn(async move {
+            super::create_repo(
+                State(state2),
+                Extension(crate::auth::AuthenticatedDid(owner2)),
+                axum::http::HeaderMap::new(),
+                Json(CreateRepoRequest {
+                    name: name.to_string(),
+                    description: None,
+                    is_public: true,
+                    default_branch: "main".to_string(),
+                }),
+            )
+            .await
+        });
+
+        // While the purge lock is held, create must NOT complete its init+insert.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            state.db.get_repo(owner, name).await.unwrap().is_none(),
+            "create_repo must not insert a repos row while a purge holds the same-key \
+             lock (RED on base: create takes no lock and the row lands in the window)"
+        );
+        assert!(
+            !handle.is_finished(),
+            "create must be blocked on the purge lock, not have completed"
+        );
+
+        // Purge releases; create can now proceed and create cleanly.
+        purge_guard.release().await;
+
+        let created = tokio::time::timeout(Duration::from_secs(8), handle)
+            .await
+            .expect("create should finish once the lock frees")
+            .expect("create task join")
+            .expect("create_repo returns Ok once it wins the lock");
+        assert_eq!(created.0, StatusCode::CREATED);
+
+        // End state is consistent: the row AND its on-disk dir are both present —
+        // never a row pointing at a removed directory.
+        assert!(
+            state.db.get_repo(owner, name).await.unwrap().is_some(),
+            "repos row must be present after the create wins the lock"
+        );
+        let dir = repos_dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        assert!(
+            dir.exists(),
+            "the created repo's on-disk dir must be present — no dangling row"
+        );
+    }
+
+    // U6 no-regression: with no concurrent purge, create_repo still succeeds and
+    // leaves a consistent row + on-disk dir. Guards against the lock acquisition
+    // wedging the uncontended hot path.
+    #[sqlx::test]
+    async fn create_repo_succeeds_without_lock_contention(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use axum::extract::State;
+        use axum::Extension;
+
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+
+        let owner = "did:key:z6MkCreateNoContendBBBBBBBBBBBBBBBBBBBBBBBB";
+        let name = "solo";
+
+        let created = super::create_repo(
+            State(state.clone()),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            axum::http::HeaderMap::new(),
+            Json(CreateRepoRequest {
+                name: name.to_string(),
+                description: None,
+                is_public: true,
+                default_branch: "main".to_string(),
+            }),
+        )
+        .await
+        .expect("uncontended create_repo must succeed");
+        assert_eq!(created.0, StatusCode::CREATED);
+
+        assert!(
+            state.db.get_repo(owner, name).await.unwrap().is_some(),
+            "row present after an uncontended create"
+        );
+        let dir = repos_dir
+            .path()
+            .join(owner.replace([':', '/'], "_"))
+            .join(format!("{name}.git"));
+        assert!(
+            dir.exists(),
+            "on-disk dir present after an uncontended create"
+        );
     }
 }
