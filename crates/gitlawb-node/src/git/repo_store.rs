@@ -602,11 +602,21 @@ impl RepoWriteGuard {
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(mut self, success: bool) {
+    pub async fn release(mut self, success: bool) -> bool {
+        // Whether the durable copy is safe. Stays `true` when there is nothing to
+        // upload (no object store, or `success == false` where no upload is
+        // attempted) — those are not upload failures. Only an upload that was
+        // ATTEMPTED and then errored or timed out flips it `false`, which the
+        // caller surfaces as a FAILED push so the client re-pushes rather than
+        // trusting a commit that never reached durable storage. (P1 data-loss.)
+        let mut upload_ok = true;
+
         // Upload to Tigris only on success. Bound the upload so a stalled PUT
         // cannot pin the guard's advisory-lock connection indefinitely — on
         // timeout we log and fall through to the unlock, returning the
-        // connection to the pool within the bound. (INV-22.)
+        // connection to the pool within the bound. (INV-22.) The lock is freed on
+        // EVERY arm below regardless of `upload_ok`; only the return value tells
+        // the caller whether the durable write landed.
         if success {
             if let Some(ref tigris) = self.object_store {
                 match tokio::time::timeout(
@@ -617,9 +627,11 @@ impl RepoWriteGuard {
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
+                        upload_ok = false;
                         warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
                     }
                     Err(_) => {
+                        upload_ok = false;
                         warn!(repo = %self.repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
                             "tigris upload timed out after write — releasing the advisory lock without a completed upload");
                     }
@@ -640,6 +652,8 @@ impl RepoWriteGuard {
                 .execute(&mut *conn)
                 .await;
         }
+
+        upload_ok
     }
 }
 
