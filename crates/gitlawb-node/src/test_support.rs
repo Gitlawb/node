@@ -13943,6 +13943,9 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -13978,6 +13981,9 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -14487,6 +14493,9 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -15343,6 +15352,9 @@ mod tests {
             node_did: "did:key:zNODE".into(),
             signature: "sig".into(),
             issued_at: issued_at.to_string(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
         }
     }
 

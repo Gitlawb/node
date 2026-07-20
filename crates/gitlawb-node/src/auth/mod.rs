@@ -17,6 +17,12 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// The raw RFC 9421 HTTP Signature value (the `Signature` header), injected into
+/// request extensions by `require_signature`. Pushers sign the request, and the
+/// node persists this signature so it can be presented as proof of authorization.
+#[derive(Clone, Debug)]
+pub struct PusherSignature(pub String);
+
 /// Whether `caller` is authorized to push to `record`.
 ///
 /// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only, via the canonical
@@ -29,6 +35,7 @@ pub fn caller_authorized_to_push(record: &crate::db::RepoRecord, caller: &str) -
     crate::api::did_matches(caller, &record.owner_did)
 }
 
+use base64::Engine as _;
 use gitlawb_core::http_sig::{
     build_signing_string, compute_content_digest, HttpSignature, COVERED_COMPONENTS,
 };
@@ -242,6 +249,11 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     request
         .extensions_mut()
         .insert(AuthenticatedDid(sig.key_id.to_string()));
+    request
+        .extensions_mut()
+        .insert(PusherSignature(
+            base64::engine::general_purpose::STANDARD.encode(&sig.signature_bytes),
+        ));
     next.run(request).await
 }
 

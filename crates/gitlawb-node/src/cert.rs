@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::db::RefCertificate;
@@ -22,19 +23,46 @@ pub async fn issue_ref_certificate(
     old_sha: &str,
     new_sha: &str,
     pusher_did: &str,
+    pusher_sig: Option<String>,
 ) -> Result<RefCertificate> {
     let node_did = state.node_did.to_string();
     let issued_at = Utc::now().to_rfc3339();
 
-    // Build the canonical signing payload.
+    // Look up the previous certificate to chain from it.
+    let prev_cert = state.db.get_most_recent_cert(repo_id).await?;
+    let seq = match &prev_cert {
+        Some(c) => c.seq + 1,
+        None => 1,
+    };
+    let prev = match &prev_cert {
+        Some(c) => {
+            let prev_payload = serde_json::json!({
+                "repo_id": c.repo_id,
+                "ref":     c.ref_name,
+                "old":     c.old_sha,
+                "new":     c.new_sha,
+                "pusher":  c.pusher_did,
+                "node":    c.node_did,
+                "ts":      c.issued_at,
+            });
+            let prev_bytes = serde_json::to_vec(&prev_payload)?;
+            hex::encode(Sha256::digest(&prev_bytes))
+        }
+        None => "0".repeat(64),
+    };
+
+    // Build the canonical signing payload with chain info.
     let payload = serde_json::json!({
-        "repo_id": repo_id,
-        "ref":     ref_name,
-        "old":     old_sha,
-        "new":     new_sha,
-        "pusher":  pusher_did,
-        "node":    node_did,
-        "ts":      issued_at,
+        "repo_id":    repo_id,
+        "ref":        ref_name,
+        "old":        old_sha,
+        "new":        new_sha,
+        "pusher":     pusher_did,
+        "node":       node_did,
+        "ts":         issued_at,
+        "seq":        seq,
+        "prev":       prev,
+        "pusher_sig": pusher_sig,
     });
     let payload_bytes = serde_json::to_vec(&payload)?;
 
@@ -50,6 +78,9 @@ pub async fn issue_ref_certificate(
         node_did,
         signature,
         issued_at,
+        seq,
+        prev,
+        pusher_sig,
     };
 
     // Persist and return the row as it exists in the database (on a
