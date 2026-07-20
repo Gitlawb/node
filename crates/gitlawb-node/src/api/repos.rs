@@ -1626,6 +1626,25 @@ pub async fn git_receive_pack(
         }
     }
 
+    // Per-repo in-process write lease (#174 U2/F3): SUPPLEMENTS the cluster-wide pg
+    // advisory lock. Acquire it BEFORE acquire_write (one consistent order everywhere,
+    // so the two serializers can never invert into a self-hang) so a second SAME-NODE
+    // push to this repo blocks here rather than racing a disconnected first push's git
+    // group while its detached reaper is still tearing it down over the shared local
+    // objects/ dir. Taking it before the pg lock also means a blocked second writer pins
+    // no pooled pg connection while it waits. The lease rides the write-path
+    // AdmissionGuard into the reaper (clone (a)) and spans the clean-path Tigris upload
+    // in guard.release (clone (b)); it frees only when the LAST clone drops. steal_after
+    // is set well above any legitimate hold (a full receive-pack under
+    // git_service_timeout + the ~4s reaper cap + the Tigris upload), so the bounded-wait
+    // reclaim only ever fires for a genuinely leaked lease, never a merely-slow push.
+    let lease_steal_after =
+        std::time::Duration::from_secs(state.config.git_service_timeout_secs * 2 + 60);
+    let lease = state
+        .repo_write_leases
+        .acquire(&record.id, lease_steal_after)
+        .await;
+
     tracing::debug!(repo = %name, "acquiring write lock");
     // Bound the write acquire under `git_acquire_timeout_secs`. acquire_write's
     // advisory-lock loop already caps at ~60s, but its per-iteration
@@ -1661,7 +1680,13 @@ pub async fn git_receive_pack(
     // instant a disconnect drops this future while the detached reaper runs (#174 P1-a).
     // The handler keeps no copy. This is independent of the write-lock `guard.release`
     // below: admission tracks the git process lifetime, the write lock tracks the repo.
-    let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+    // Clone (a) of the write lease rides this AdmissionGuard: on a client disconnect the
+    // guard moves into KillGroupOnDrop's detached reaper, so the lease frees only after
+    // the receive-pack group is reaped — NOT at the disconnect instant (which is exactly
+    // when RepoWriteGuard::Drop frees the pg lock). Tying the lease to RepoWriteGuard
+    // instead would drop it at disconnect and reopen the F3 race.
+    let admission =
+        smart_http::AdmissionGuard::new(_permit, _caller_permit).with_lease(lease.clone());
     let receive_result = smart_http::receive_pack(
         &state.git_bin,
         &disk_path,
@@ -1675,6 +1700,12 @@ pub async fn git_receive_pack(
     // from blocking subsequent pushes. Only upload to Tigris when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
     guard.release(receive_result.is_ok()).await;
+    // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
+    // group was reaped; clone (b) held here spanned the success-only Tigris upload that
+    // ran inside release() above. Drop it now so a second same-repo push proceeds the
+    // moment this write is durable, rather than at end of the (longer) handler tail. On
+    // the disconnect path this line is never reached — clone (a) rides the reaper (F3).
+    drop(lease);
 
     let result = receive_result.map_err(|e| {
         let app = git_service_app_error(&e);
@@ -6663,6 +6694,235 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "repo creation must be IP-throttled before signature verification"
+        );
+    }
+
+    // ── #174 U2 / F3: second same-repo push serialized until a disconnected first ──
+    // push's git process GROUP is reaped (RepoWriteLease riding the disconnect reaper).
+
+    /// `kill(pid, 0)` liveness probe (same-uid here, so EPERM never applies).
+    #[cfg(unix)]
+    fn f3_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// F3 (P1, RED-before/GREEN-after): on a client disconnect DURING receive-pack the
+    /// disconnected push's git group is torn down by KillGroupOnDrop's detached reaper
+    /// (~4s TERM/grace/KILL/reap), while RepoWriteGuard::Drop releases the pg advisory
+    /// lock at the disconnect INSTANT. Without the in-process write lease, a second
+    /// same-node push then acquires the freed pg lock and mutates the shared local repo
+    /// WHILE the first group is still writing — a torn snapshot. The lease is held by the
+    /// write-path AdmissionGuard, which rides that reaper, so the second push must not run
+    /// its receive-pack (mutate the repo) until the first group is reaped.
+    ///
+    /// The fake git labels the pushes by receive-pack arrival order (atomic mkdir): the
+    /// first (push A) forks a SIGTERM-IGNORING descendant, records its pid, then hangs
+    /// (so A can be dropped mid-transfer and its group survives the SIGTERM grace); the
+    /// second (push B, a DIFFERENT source) records that its receive-pack ran — i.e. that
+    /// B mutated the repo. The load-bearing invariant is strictly ordered, not
+    /// time-windowed: B's marker must NEVER appear while A's descendant is still alive.
+    ///
+    /// Load-bearing: pre-fix (no lease) A's disconnect frees the pg lock, B's
+    /// acquire_write succeeds within its ~1s retry, and B's receive-pack runs (marker
+    /// appears) WHILE A's descendant is still alive — RED. With the lease the reaper
+    /// holds it until the group is ESRCH-gone, so B's marker appears only AFTER — GREEN.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f3_second_push_serialized_until_disconnected_group_reaped(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let seq_a = tmp.path().join("seq_a"); // first receive-pack wins this mkdir = push A
+        let descfile = tmp.path().join("desc.pid"); // A's SIGTERM-ignoring descendant pid
+        let b_ran = tmp.path().join("b.ran"); // set when B's receive-pack runs (B mutates)
+                                              // receive-pack: first invocation (A) forks a TERM-ignoring descendant (bounded
+                                              // loop so a RED run leaks no permanent orphan), records its pid, and hangs in
+                                              // `wait`; second (B) records that it ran. rev-parse feeds any tail probe.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               receive-pack)\n\
+                 cat >/dev/null 2>/dev/null\n\
+                 if mkdir \"{seq}\" 2>/dev/null; then\n\
+                   sh -c 'trap \"\" TERM; echo $$ > \"{desc}\"; i=0; while [ $i -lt 60 ]; do sleep 0.1; i=$((i+1)); done' &\n\
+                   wait\n\
+                 else\n\
+                   echo 1 > \"{bran}\"\n\
+                 fi ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            seq = seq_a.display(),
+            desc = descfile.display(),
+            bran = b_ran.display(),
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        // One repo; A and B push to it (same record.id -> same lease key). Non-path-scoped
+        // + flush-only body -> no post-receive scans to muddy the observation.
+        let state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3repo", "r1", false).await;
+        let did = "did:key:z6MkF3PusherAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Push A: drive its handler future in slices until it reaches receive-pack and the
+        // fake records its descendant pid (A now holds the lease and is hung).
+        let mut fut_a = Box::pin(git_receive_pack(
+            State(state.clone()),
+            Path(("z6f3repo".to_string(), "r1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.81:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        let mut desc: Option<i32> = None;
+        for _ in 0..1000 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut_a).await;
+            if let Some(p) = std::fs::read_to_string(&descfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                desc = Some(p);
+                break;
+            }
+        }
+        let desc = desc.expect("push A must reach receive-pack and record its descendant pid");
+        assert!(
+            f3_alive(desc),
+            "A's descendant must be alive before the disconnect"
+        );
+
+        // Push B: a DIFFERENT source, same repo. It blocks on the lease A holds.
+        let state_b = state.clone();
+        let handle_b = tokio::spawn(async move {
+            git_receive_pack(
+                State(state_b),
+                Path(("z6f3repo".to_string(), "r1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(
+                    "203.0.113.82:5000".parse::<SocketAddr>().unwrap(),
+                )),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            )
+            .await
+        });
+        // Give B time to reach and block on the lease acquire.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !b_ran.exists(),
+            "B must not have mutated the repo while A legitimately holds the lease"
+        );
+
+        // Client disconnect on A: drop its future. RepoWriteGuard::Drop frees the pg lock
+        // immediately; the write-path AdmissionGuard (carrying the lease's clone (a))
+        // rides KillGroupOnDrop's detached reaper, which now tears down A's group.
+        drop(fut_a);
+
+        // Load-bearing ordering invariant: while A's descendant is still alive (group not
+        // yet reaped), B must NOT have run its receive-pack. Poll until the descendant is
+        // gone; every step it is alive, B's marker must be absent. Pre-fix, B's marker
+        // appears here (RED); with the lease it can only appear after the reap (GREEN).
+        let mut reaped = false;
+        for _ in 0..800 {
+            if !f3_alive(desc) {
+                reaped = true;
+                break;
+            }
+            assert!(
+                !b_ran.exists(),
+                "F3 RED: push B mutated the repo while push A's disconnected git group \
+                 was still alive (descendant pid {desc}) — the second writer must be \
+                 serialized until the first group is reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Safety net so a RED run never leaks the orphan.
+        unsafe {
+            libc::kill(desc, libc::SIGKILL);
+        }
+        assert!(
+            reaped,
+            "A's disconnected group must be reaped within the teardown cap"
+        );
+
+        // GREEN tail: once the group is reaped the lease frees and B proceeds — its
+        // receive-pack runs (marker appears) and it returns 200.
+        let mut b_mutated = false;
+        for _ in 0..1000 {
+            if b_ran.exists() {
+                b_mutated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            b_mutated,
+            "push B must proceed and mutate the repo once A's group is reaped"
+        );
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("push B must complete once the lease frees")
+            .expect("push B task must not panic")
+            .expect("push B must succeed");
+        assert_eq!(resp.status(), 200, "push B lands 200 after serialization");
+    }
+
+    /// F3 clean-path no-regression: a clean push (no disconnect) releases the lease after
+    /// the receive-pack group is reaped and the (success-only) Tigris upload in
+    /// guard.release runs, so the per-repo lease entry is GC'd and a second same-repo
+    /// push proceeds immediately. A lease that failed to free on the clean path would
+    /// wedge every subsequent push to the repo.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f3_clean_push_frees_lease_and_second_push_proceeds(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Clean receive-pack: drain stdin, exit 0. No hang, no descendant.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  receive-pack) cat >/dev/null 2>/dev/null ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3clean", "c1", false).await;
+        let did = "did:key:z6MkF3CleanPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let push = |st: AppState, peer: &'static str| async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                git_receive_pack(
+                    State(st),
+                    Path(("z6f3clean".to_string(), "c1".to_string())),
+                    Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::from_static(b"0000"),
+                ),
+            )
+            .await
+            .expect("a clean push must not wedge on the lease")
+            .expect("the push must succeed")
+        };
+
+        let a = push(state.clone(), "203.0.113.91:5000").await;
+        assert_eq!(a.status(), 200, "clean push A lands 200");
+        // The clean push freed its lease (both clones dropped) -> the entry GC'd.
+        assert!(
+            state.repo_write_leases.is_empty(),
+            "a clean push must free the per-repo lease (Drop-frees-key) so it never wedges"
+        );
+
+        let b = push(state.clone(), "203.0.113.92:5000").await;
+        assert_eq!(
+            b.status(),
+            200,
+            "a second same-repo push proceeds after a clean first"
+        );
+        assert!(
+            state.repo_write_leases.is_empty(),
+            "the lease entry must be freed again after the second clean push"
         );
     }
 }

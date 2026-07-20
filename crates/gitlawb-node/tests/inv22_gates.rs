@@ -306,3 +306,53 @@ fn f2_pinata_enqueues_refs_not_retained_object_lists() {
          (ref_updates_clone), the small unit the parked task retains"
     );
 }
+
+/// #174 U2 / F3 (second same-repo writer serialized until a disconnected first push's
+/// git group is reaped): `git_receive_pack` must take the per-repo in-process write
+/// lease and CARRY it on the write-path `AdmissionGuard` (via `.with_lease`), so the
+/// lease rides `KillGroupOnDrop`'s detached reaper and frees only after the group is
+/// reaped — supplementing the pg advisory lock, which `RepoWriteGuard::Drop` releases at
+/// the disconnect instant. Tying the lease to `RepoWriteGuard` instead (or dropping the
+/// `.with_lease` carry) reopens the race; the behavioral RED/GREEN test
+/// (`f3_second_push_serialized_until_disconnected_group_reaped`) is the real bar, this
+/// is the completeness tripwire. Scanned against the PRODUCTION half of `api/repos.rs`
+/// (the `mod tests` half names these identifiers in its own harness).
+#[test]
+fn f3_second_writer_leased_until_reap() {
+    let repos = src("api/repos.rs");
+    let smart_http = src("git/smart_http.rs");
+    let repos_production = repos
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields a first chunk");
+
+    // The lease is acquired, then carried by the AdmissionGuard (.with_lease), before
+    // receive_pack runs the write. Severing any of the three turns this red.
+    let lease_acquire = repos_production.find("repo_write_leases").expect(
+        "F3 gate missing: git_receive_pack no longer takes the per-repo write lease \
+         (state.repo_write_leases)",
+    );
+    let with_lease = repos_production.find(".with_lease(").expect(
+        "F3 gate missing: the write-path AdmissionGuard no longer carries the lease \
+         (.with_lease). The lease must ride the disconnect reaper via the AdmissionGuard, \
+         NOT RepoWriteGuard (which drops at the disconnect instant, reopening F3).",
+    );
+    let receive = repos_production
+        .find("smart_http::receive_pack(")
+        .expect("F3 gate stale: git_receive_pack no longer calls smart_http::receive_pack");
+    assert!(
+        lease_acquire < with_lease && with_lease < receive,
+        "F3 gate bypassed: the write lease must be acquired, then carried by the \
+         AdmissionGuard (.with_lease), BEFORE receive_pack runs the write"
+    );
+
+    // The AdmissionGuard must actually hold the lease (Option<RepoWriteLease>) via a
+    // with_lease setter, so it travels into the detached reaper. Removing the field or
+    // method turns this red.
+    assert!(
+        smart_http.contains("_lease: Option<crate::state::RepoWriteLease>")
+            && smart_http.contains("pub fn with_lease("),
+        "F3 gate missing: AdmissionGuard must hold an Option<RepoWriteLease> set via \
+         with_lease, so the lease rides the guard into KillGroupOnDrop's reaper"
+    );
+}

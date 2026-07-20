@@ -410,6 +410,11 @@ async fn main() -> Result<()> {
         // P2-2). No knob: it is a natural cap (one entry per distinct repo), not a
         // sized pool.
         encrypt_inflight: crate::state::EncryptInflight::new(),
+        // Per-repo in-process write-lease serializer (#174 U2/F3): supplements the pg
+        // advisory lock so a disconnected push's still-reaping git group can't be raced
+        // by a second same-node push. Natural cap (one entry per contended repo, freed
+        // when unreferenced), no sized knob.
+        repo_write_leases: crate::state::RepoWriteLeases::new(),
         git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             config.max_concurrent_reads_per_caller,
         ),
