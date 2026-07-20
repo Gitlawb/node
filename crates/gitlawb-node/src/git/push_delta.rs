@@ -29,9 +29,9 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 
 /// Env var that forces the push path to always full-scan, bypassing the delta
 /// optimization (KTD7 kill-switch). Reuses the already-tested fallback branch
@@ -64,11 +64,21 @@ pub enum PinCandidates {
 /// Fail-closed: any condition where the introduced set cannot be safely
 /// determined returns [`PinCandidates::FullScanRequired`] rather than a partial
 /// set, so the caller full-scans instead of silently under-pinning.
-pub fn resolve_push_delta(repo_path: &Path, new_tips: &[&str], old_tips: &[&str]) -> PinCandidates {
-    // KTD7 kill-switch: force the (already-tested) full-scan fallback. The env
-    // read is split out from the pure logic so the resolver stays unit-testable
-    // without touching process-global state.
-    resolve_push_delta_inner(repo_path, new_tips, old_tips, force_full_scan())
+pub fn resolve_push_delta(
+    repo_path: &Path,
+    new_tips: &[&str],
+    old_tips: &[&str],
+    git_bin: &str,
+    deadline: Instant,
+) -> PinCandidates {
+    resolve_push_delta_inner(
+        repo_path,
+        new_tips,
+        old_tips,
+        force_full_scan(),
+        git_bin,
+        deadline,
+    )
 }
 
 /// Whether the force-full-scan kill-switch env var is set.
@@ -83,6 +93,8 @@ fn resolve_push_delta_inner(
     new_tips: &[&str],
     old_tips: &[&str],
     force_full_scan: bool,
+    git_bin: &str,
+    deadline: Instant,
 ) -> PinCandidates {
     if force_full_scan {
         tracing::debug!("{FORCE_FULL_SCAN_ENV} set — forcing full scan");
@@ -102,7 +114,7 @@ fn resolve_push_delta_inner(
     // commit). Bare `cat-file -t` returns `tag` for an annotated tag, and
     // `for-each-ref %(*objecttype)` peels only one level — neither is correct.
     for tip in new_tips {
-        match peeled_object_type(repo_path, tip) {
+        match peeled_object_type(repo_path, tip, git_bin, deadline) {
             Some(t) if t == "commit" => {}
             other => {
                 tracing::debug!(
@@ -115,7 +127,7 @@ fn resolve_push_delta_inner(
         }
     }
 
-    match rev_list_delta(repo_path, new_tips, old_tips) {
+    match rev_list_delta(repo_path, new_tips, old_tips, git_bin, deadline) {
         Ok(oids) => PinCandidates::Delta(oids),
         Err(e) => {
             tracing::debug!(err = %e, "push-delta rev-list failed — forcing full scan");
@@ -126,41 +138,43 @@ fn resolve_push_delta_inner(
 
 /// Return the fully-peeled object type of `sha` (e.g. `commit`, `tree`,
 /// `blob`), or `None` if the object is missing/unpeelable or git errored.
-fn peeled_object_type(repo_path: &Path, sha: &str) -> Option<String> {
-    let output = Command::new("git")
-        .args(["cat-file", "-t", &format!("{sha}^{{}}")])
-        .current_dir(repo_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+fn peeled_object_type(
+    repo_path: &Path,
+    sha: &str,
+    git_bin: &str,
+    deadline: Instant,
+) -> Option<String> {
+    let peel = format!("{sha}^{{}}");
+    let out = crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &["cat-file", "-t", &peel],
+        repo_path,
+        b"",
+        deadline,
+    )
+    .ok()?;
+    Some(String::from_utf8_lossy(&out).trim().to_string())
 }
 
 /// Run `git rev-list --objects --no-object-names <new> --not <old>` and return
 /// the bare OID set. Decides on `status.success()` *before* parsing stdout, so
 /// a walk that prints a valid prefix then errors mid-walk is discarded.
-fn rev_list_delta(repo_path: &Path, new_tips: &[&str], old_tips: &[&str]) -> Result<Vec<String>> {
+fn rev_list_delta(
+    repo_path: &Path,
+    new_tips: &[&str],
+    old_tips: &[&str],
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<Vec<String>> {
     let mut args: Vec<&str> = vec!["rev-list", "--objects", "--no-object-names"];
     args.extend_from_slice(new_tips);
     if !old_tips.is_empty() {
         args.push("--not");
         args.extend_from_slice(old_tips);
     }
-
-    let output = Command::new("git")
-        .args(&args)
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git rev-list for push delta")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git rev-list failed: {stderr}");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let out =
+        crate::git::visibility_pack::run_bounded_git(git_bin, &args, repo_path, b"", deadline)?;
+    let stdout = String::from_utf8_lossy(&out);
     Ok(stdout
         .lines()
         .map(|l| l.trim().to_string())
@@ -175,23 +189,19 @@ fn rev_list_delta(repo_path: &Path, new_tips: &[&str], old_tips: &[&str]) -> Res
 /// reconciliation sweep relies on. It returns *all* objects (including
 /// unreachable/dangling ones), which is what the sweep needs to catch
 /// stragglers — do not swap it for a reachability walk.
-pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args([
+pub fn list_all_objects(repo_path: &Path, git_bin: &str, deadline: Instant) -> Result<Vec<String>> {
+    let out = crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &[
             "cat-file",
             "--batch-all-objects",
             "--batch-check=%(objectname)",
-        ])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git cat-file")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git cat-file failed: {stderr}");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        ],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let stdout = String::from_utf8_lossy(&out);
     Ok(stdout
         .lines()
         .map(|l| l.trim().to_string())
@@ -203,23 +213,23 @@ pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
 /// `--batch-check='%(objectname) %(objecttype)'`. The pin path's fail-closed
 /// filter needs to tell blobs (content, withholdable) from commits/trees
 /// (structural, never withheld) without typing the candidate list itself.
-pub fn list_all_objects_with_type(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    let output = Command::new("git")
-        .args([
+pub fn list_all_objects_with_type(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<Vec<(String, String)>> {
+    let out = crate::git::visibility_pack::run_bounded_git(
+        git_bin,
+        &[
             "cat-file",
             "--batch-all-objects",
             "--batch-check=%(objectname) %(objecttype)",
-        ])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git cat-file")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git cat-file failed: {stderr}");
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+        ],
+        repo_path,
+        b"",
+        deadline,
+    )?;
+    let stdout = String::from_utf8_lossy(&out);
     Ok(stdout
         .lines()
         .filter_map(|l| {
@@ -235,8 +245,12 @@ pub fn list_all_objects_with_type(repo_path: &Path) -> Result<Vec<(String, Strin
 /// fail-closed pin filter drops any candidate blob absent from the reachable,
 /// visibility-allowed set; a dangling private blob is in this set but not the
 /// allowed set, so it never replicates (#99).
-pub fn all_blob_oids(repo_path: &Path) -> Result<HashSet<String>> {
-    Ok(list_all_objects_with_type(repo_path)?
+pub fn all_blob_oids(
+    repo_path: &Path,
+    git_bin: &str,
+    deadline: Instant,
+) -> Result<HashSet<String>> {
+    Ok(list_all_objects_with_type(repo_path, git_bin, deadline)?
         .into_iter()
         .filter(|(_, ty)| ty == "blob")
         .map(|(oid, _)| oid)
@@ -268,22 +282,68 @@ pub struct PinCandidateSet {
 /// it can never leak because the withheld/fail-closed filter still runs on
 /// whatever set is returned. `full_scan` rides on the returned set so the caller
 /// knows when the dangling-inclusive filter is required.
+///
+/// `scan_sem` is the post-receive scan admission pool (`git_encrypt_semaphore`,
+/// #174 F4): both git-spawning stages — the per-tip `cat-file` probe + delta
+/// rev-list, and the full-scan fallback — run under ONE permit held for the
+/// whole blocking scan. The deletion-only fast path (no new tips) spawns no git
+/// and never parks.
+///
+/// `force_full_scan` forces the full-scan fallback regardless of the tips — the
+/// coalesced-drain `PendingWork::FullScan` marker (#174 F5). It composes with
+/// the env kill-switch (either forces), and it disqualifies the empty-tips fast
+/// path: a forced-scan call with no tips must still enumerate the repo, never
+/// silently resolve to an empty delta (which would pin nothing and lose the
+/// drained pushes' work — the F5 bug shape).
 pub async fn resolve_candidates_for_push(
+    scan_sem: std::sync::Arc<tokio::sync::Semaphore>,
     repo_path: PathBuf,
     new_tips: Vec<String>,
     old_tips: Vec<String>,
+    git_bin: String,
+    timeout: Duration,
+    force_full_scan: bool,
 ) -> PinCandidateSet {
+    let force = force_full_scan || self::force_full_scan();
+    // No-git fast path: a deletion-only push resolves to an empty delta without
+    // spawning any git child, so it must not park on the scan pool. A forced
+    // full scan (caller flag or kill-switch) disqualifies it — the scan spawns git.
+    if new_tips.is_empty() && !force {
+        tracing::info!(delta = 0usize, repo = %repo_path.display(), "pin candidate set from push delta");
+        return PinCandidateSet {
+            candidates: Vec::new(),
+            full_scan: false,
+        };
+    }
+    // Scan admission (#174 F4): DEFER, never shed — a dropped scan would
+    // silently under-pin this push. The permit moves into the blocking closure
+    // so a started scan always completes holding it. Residuals at
+    // `acquire_scan_permit`.
+    let permit =
+        crate::state::acquire_scan_permit(scan_sem, &repo_path, "pin-candidate scan").await;
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        // ONE shared deadline for the whole scan, per jatmn ("the same deadline").
+        let deadline = Instant::now() + timeout;
         let new_refs: Vec<&str> = new_tips.iter().map(String::as_str).collect();
         let old_refs: Vec<&str> = old_tips.iter().map(String::as_str).collect();
-        match resolve_push_delta(&repo_path, &new_refs, &old_refs) {
+        // `force` already folds in the env kill-switch, so the forced arm skips the
+        // delta machinery outright; the unforced arm goes through the normal
+        // resolver (whose own env read is false here by construction).
+        let resolved = if force {
+            tracing::debug!("full scan forced (coalesced-drain marker or kill-switch)");
+            PinCandidates::FullScanRequired
+        } else {
+            resolve_push_delta(&repo_path, &new_refs, &old_refs, &git_bin, deadline)
+        };
+        match resolved {
             PinCandidates::Delta(objs) => {
                 tracing::info!(delta = objs.len(), repo = %repo_path.display(), "pin candidate set from push delta");
                 PinCandidateSet { candidates: objs, full_scan: false }
             }
             PinCandidates::FullScanRequired => {
                 tracing::warn!(repo = %repo_path.display(), "pin delta unavailable (non-commit tip, git error, or force-full-scan) — full-scan fallback");
-                match list_all_objects(&repo_path) {
+                match list_all_objects(&repo_path, &git_bin, deadline) {
                     Ok(objs) => PinCandidateSet { candidates: objs, full_scan: true },
                     Err(e) => {
                         tracing::warn!(repo = %repo_path.display(), err = %e, "full-scan fallback failed; pinning nothing this push (reconciliation sweep backstops)");
@@ -304,7 +364,12 @@ pub async fn resolve_candidates_for_push(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::process::Command;
     use tempfile::TempDir;
+
+    fn td() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(600)
+    }
 
     /// Minimal git helper for building test repos.
     struct Repo {
@@ -363,9 +428,10 @@ mod tests {
         let repo = Repo::new();
         let c1 = repo.commit_file("a.txt", "one\n");
         let c2 = repo.commit_file("b.txt", "two\n");
-        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&c2], &[&c1]))
-            .into_iter()
-            .collect();
+        let got: HashSet<String> =
+            delta(resolve_push_delta(&repo.path, &[&c2], &[&c1], "git", td()))
+                .into_iter()
+                .collect();
         // The new blob b.txt and commit c2 are in the delta; the old blob a.txt
         // and commit c1 are not.
         let new_blob = repo.rev("HEAD:b.txt");
@@ -383,7 +449,7 @@ mod tests {
         // genuinely new objects, never fewer.
         let repo = Repo::new();
         let c1 = repo.commit_file("a.txt", "one\n");
-        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&c1], &[]))
+        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&c1], &[], "git", td()))
             .into_iter()
             .collect();
         assert!(got.contains(&c1));
@@ -399,9 +465,15 @@ mod tests {
         // Rewrite history: reset to base, commit a different file.
         repo.git(&["reset", "-q", "--hard", &base]);
         let new_tip = repo.commit_file("c.txt", "three\n");
-        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&new_tip], &[&old_tip]))
-            .into_iter()
-            .collect();
+        let got: HashSet<String> = delta(resolve_push_delta(
+            &repo.path,
+            &[&new_tip],
+            &[&old_tip],
+            "git",
+            td(),
+        ))
+        .into_iter()
+        .collect();
         assert!(got.contains(&new_tip), "new tip in delta");
         assert!(got.contains(&repo.rev(&format!("{new_tip}:c.txt"))));
         // No error; force-push computes new-minus-old cleanly.
@@ -413,7 +485,7 @@ mod tests {
         repo.commit_file("a.txt", "one\n");
         // All updates were deletions => new_tips empty after the caller strips zeros.
         assert_eq!(
-            resolve_push_delta(&repo.path, &[], &[ZERO]),
+            resolve_push_delta(&repo.path, &[], &[ZERO], "git", td()),
             PinCandidates::Delta(Vec::new())
         );
     }
@@ -424,7 +496,7 @@ mod tests {
         repo.commit_file("a.txt", "one\n");
         let blob = repo.rev("HEAD:a.txt");
         assert_eq!(
-            resolve_push_delta(&repo.path, &[&blob], &[]),
+            resolve_push_delta(&repo.path, &[&blob], &[], "git", td()),
             PinCandidates::FullScanRequired,
             "a blob tip must force full scan (rev-list would exit 0 and walk it)"
         );
@@ -436,7 +508,7 @@ mod tests {
         repo.commit_file("a.txt", "one\n");
         let tree = repo.rev("HEAD^{tree}");
         assert_eq!(
-            resolve_push_delta(&repo.path, &[&tree], &[]),
+            resolve_push_delta(&repo.path, &[&tree], &[], "git", td()),
             PinCandidates::FullScanRequired
         );
     }
@@ -449,7 +521,7 @@ mod tests {
         repo.git(&["tag", "-a", "treetag", "-m", "x", &tree]);
         let tag = repo.rev("treetag");
         assert_eq!(
-            resolve_push_delta(&repo.path, &[&tag], &[]),
+            resolve_push_delta(&repo.path, &[&tag], &[], "git", td()),
             PinCandidates::FullScanRequired,
             "annotated tag peeling to a tree must force full scan"
         );
@@ -465,7 +537,7 @@ mod tests {
         repo.git(&["tag", "-a", "t2", "-m", "x", &t1]);
         let t2 = repo.rev("t2");
         assert_eq!(
-            resolve_push_delta(&repo.path, &[&t2], &[]),
+            resolve_push_delta(&repo.path, &[&t2], &[], "git", td()),
             PinCandidates::FullScanRequired
         );
     }
@@ -480,7 +552,7 @@ mod tests {
         let c1 = repo.commit_file("a.txt", "one\n");
         repo.git(&["tag", "-a", "rel", "-m", "release", &c1]);
         let tag = repo.rev("rel");
-        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&tag], &[]))
+        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&tag], &[], "git", td()))
             .into_iter()
             .collect();
         assert!(
@@ -501,7 +573,7 @@ mod tests {
         let t1 = repo.rev("t1");
         repo.git(&["tag", "-a", "t2", "-m", "x", &t1]);
         let t2 = repo.rev("t2");
-        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&t2], &[]))
+        let got: HashSet<String> = delta(resolve_push_delta(&repo.path, &[&t2], &[], "git", td()))
             .into_iter()
             .collect();
         assert!(
@@ -516,9 +588,16 @@ mod tests {
         let repo = Repo::new();
         let c1 = repo.commit_file("a.txt", "one\n");
         let c2 = repo.commit_file("b.txt", "two\n");
-        let set =
-            resolve_candidates_for_push(repo.path.clone(), vec![c2.clone()], vec![c1.clone()])
-                .await;
+        let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            repo.path.clone(),
+            vec![c2.clone()],
+            vec![c1.clone()],
+            "git".to_string(),
+            std::time::Duration::from_secs(600),
+            false,
+        )
+        .await;
         assert!(!set.full_scan, "happy-path delta is not a full scan");
         let got: HashSet<String> = set.candidates.into_iter().collect();
         let new_blob = repo.rev("HEAD:b.txt");
@@ -536,11 +615,197 @@ mod tests {
         let repo = Repo::new();
         repo.commit_file("a.txt", "one\n");
         let blob = repo.rev("HEAD:a.txt");
-        let all: HashSet<String> = list_all_objects(&repo.path).unwrap().into_iter().collect();
-        let set = resolve_candidates_for_push(repo.path.clone(), vec![blob], vec![]).await;
+        let all: HashSet<String> = list_all_objects(&repo.path, "git", td())
+            .unwrap()
+            .into_iter()
+            .collect();
+        let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            repo.path.clone(),
+            vec![blob],
+            vec![],
+            "git".to_string(),
+            std::time::Duration::from_secs(600),
+            false,
+        )
+        .await;
         assert!(set.full_scan, "non-commit tip is signalled as a full scan");
         let got: HashSet<String> = set.candidates.into_iter().collect();
         assert_eq!(got, all, "non-commit tip falls back to full repo scan");
+    }
+
+    /// F4 defer proof 2: `resolve_candidates_for_push`'s git stages (the per-tip
+    /// cat-file type probe + delta rev-list, and the full-scan fallback) run under a
+    /// scan-admission permit: with a zero-permit pool the call parks and spawns no
+    /// git; once a permit is available the SAME call runs (defer, not shed). On
+    /// ungated code the git runs regardless of the pool (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_candidates_defers_when_scan_pool_exhausted() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("git.ran");
+        // Fake git records ANY invocation; cat-file reports a commit tip so the
+        // delta stage proceeds, rev-list yields an empty delta.
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  cat-file) echo commit ;;\n  *) : ;;\nesac\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+        let tip = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(0));
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            resolve_candidates_for_push(
+                sem.clone(),
+                dir.path().to_path_buf(),
+                vec![tip.clone()],
+                vec![],
+                git_bin.clone(),
+                Duration::from_secs(5),
+                false,
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the pin-candidate scan must defer (park on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the scan's git must not spawn while its admission permit is unavailable (F4)"
+        );
+
+        // Release admission: the SAME scan now runs (defer, not shed).
+        sem.add_permits(1);
+        let set = resolve_candidates_for_push(
+            sem,
+            dir.path().to_path_buf(),
+            vec![tip],
+            vec![],
+            git_bin,
+            Duration::from_secs(5),
+            false,
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred scan runs its git"
+        );
+        assert!(!set.full_scan, "commit tip + empty rev-list is a delta");
+        assert!(set.candidates.is_empty());
+    }
+
+    /// F4 fast-path negative arm: a deletion-only push (no new tips, kill-switch
+    /// off) computes its empty delta without spawning ANY git child, so it must
+    /// complete without acquiring from the scan pool — even at zero permits. The
+    /// per-tip cat-file probe means every push with a non-empty new tip DOES spawn
+    /// git, so this is the only genuinely git-free stage.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_candidates_no_git_fast_path_skips_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("git.ran");
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho ran >> \"{}\"\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let set = tokio::time::timeout(
+            Duration::from_millis(500),
+            resolve_candidates_for_push(
+                Arc::new(Semaphore::new(0)),
+                dir.path().to_path_buf(),
+                vec![],
+                vec!["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()],
+                fake.to_str().unwrap().to_string(),
+                Duration::from_secs(5),
+                false,
+            ),
+        )
+        .await
+        .expect("the no-new-tips fast path must not park on the scan pool");
+        assert_eq!(
+            set,
+            PinCandidateSet {
+                candidates: Vec::new(),
+                full_scan: false
+            }
+        );
+        assert!(!marker.exists(), "the fast path must spawn no git at all");
+    }
+
+    /// #174 F5: the coalesced-drain FullScan marker is signalled via the explicit
+    /// `force_full_scan` flag, and a flagged call with NO tips must still enumerate
+    /// the whole repo (full_scan=true, non-empty candidates). The RED arm of the
+    /// encoding question: if the marker were encoded as a plain empty-tips call
+    /// (flag off — the fast path), the drain would resolve to an empty delta and
+    /// pin nothing, silently losing the coalesced pushes' work.
+    #[tokio::test]
+    async fn forced_full_scan_with_no_tips_enumerates_the_repo() {
+        let repo = Repo::new();
+        repo.commit_file("a.txt", "one\n");
+        let all: HashSet<String> = list_all_objects(&repo.path, "git", td())
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(!all.is_empty(), "fixture repo has objects");
+
+        let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            repo.path.clone(),
+            vec![],
+            vec![],
+            "git".to_string(),
+            std::time::Duration::from_secs(600),
+            true,
+        )
+        .await;
+        assert!(set.full_scan, "the forced call is signalled as a full scan");
+        let got: HashSet<String> = set.candidates.into_iter().collect();
+        assert_eq!(
+            got, all,
+            "a forced full scan with no tips enumerates the repo — never an empty delta"
+        );
+
+        // The discriminator: the SAME empty-tips call without the flag is the
+        // deletion-only fast path (empty delta, pin nothing). The two must differ,
+        // or the marker encoding has collapsed into the silent-loss shape.
+        let unforced = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            repo.path.clone(),
+            vec![],
+            vec![],
+            "git".to_string(),
+            std::time::Duration::from_secs(600),
+            false,
+        )
+        .await;
+        assert!(!unforced.full_scan);
+        assert!(unforced.candidates.is_empty());
     }
 
     #[test]
@@ -549,7 +814,7 @@ mod tests {
         repo.commit_file("a.txt", "one\n");
         let bogus = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
         assert_eq!(
-            resolve_push_delta(&repo.path, &[bogus], &[]),
+            resolve_push_delta(&repo.path, &[bogus], &[], "git", td()),
             PinCandidates::FullScanRequired,
             "a missing/corrupt tip OID must force full scan"
         );
@@ -564,7 +829,7 @@ mod tests {
         let c1 = repo.commit_file("a.txt", "one\n");
         let c2 = repo.commit_file("b.txt", "two\n");
         let old_tree = repo.rev(&format!("{c1}^{{tree}}"));
-        let result = resolve_push_delta(&repo.path, &[&c2], &[&old_tree]);
+        let result = resolve_push_delta(&repo.path, &[&c2], &[&old_tree], "git", td());
         match result {
             PinCandidates::FullScanRequired => {} // safe: caller full-scans
             PinCandidates::Delta(objs) => {
@@ -583,10 +848,15 @@ mod tests {
         // branch2 from base advances independently
         repo.git(&["checkout", "-q", "-b", "branch2", &base]);
         let b2 = repo.commit_file("c.txt", "three\n");
-        let got: HashSet<String> =
-            delta(resolve_push_delta(&repo.path, &[&b1, &b2], &[&base, &base]))
-                .into_iter()
-                .collect();
+        let got: HashSet<String> = delta(resolve_push_delta(
+            &repo.path,
+            &[&b1, &b2],
+            &[&base, &base],
+            "git",
+            td(),
+        ))
+        .into_iter()
+        .collect();
         assert!(got.contains(&b1), "branch1 new commit");
         assert!(got.contains(&b2), "branch2 new commit");
     }
@@ -595,7 +865,7 @@ mod tests {
     fn empty_repo_no_tips_yields_empty_delta() {
         let repo = Repo::new();
         assert_eq!(
-            resolve_push_delta(&repo.path, &[], &[]),
+            resolve_push_delta(&repo.path, &[], &[], "git", td()),
             PinCandidates::Delta(Vec::new())
         );
     }
@@ -609,12 +879,12 @@ mod tests {
         let repo = Repo::new();
         let c1 = repo.commit_file("a.txt", "one\n");
         assert_eq!(
-            resolve_push_delta_inner(&repo.path, &[&c1], &[], true),
+            resolve_push_delta_inner(&repo.path, &[&c1], &[], true, "git", td()),
             PinCandidates::FullScanRequired
         );
         // And with the flag off, the same push yields a Delta.
         assert!(matches!(
-            resolve_push_delta_inner(&repo.path, &[&c1], &[], false),
+            resolve_push_delta_inner(&repo.path, &[&c1], &[], false, "git", td()),
             PinCandidates::Delta(_)
         ));
     }
@@ -624,7 +894,7 @@ mod tests {
         let repo = Repo::new();
         repo.commit_file("a.txt", "one\n");
         repo.commit_file("b.txt", "two\n");
-        let all = list_all_objects(&repo.path).unwrap();
+        let all = list_all_objects(&repo.path, "git", td()).unwrap();
         // 2 commits + 2 trees + 2 blobs = 6 objects.
         assert_eq!(all.len(), 6, "got: {all:?}");
     }
@@ -642,7 +912,7 @@ mod tests {
         std::fs::write(repo.path.join("orphan.bin"), b"dangling\n").unwrap();
         let dangling = repo.git(&["hash-object", "-w", "orphan.bin"]);
 
-        let blobs = all_blob_oids(&repo.path).unwrap();
+        let blobs = all_blob_oids(&repo.path, "git", td()).unwrap();
         assert!(blobs.contains(&reachable_blob), "reachable blob present");
         assert!(
             blobs.contains(&dangling),
@@ -652,12 +922,104 @@ mod tests {
         assert!(!blobs.contains(&tree), "tree is not a blob");
 
         // The typed lister tags each object; spot-check the dangling blob's type.
-        let typed = list_all_objects_with_type(&repo.path).unwrap();
+        let typed = list_all_objects_with_type(&repo.path, "git", td()).unwrap();
         assert!(
             typed
                 .iter()
                 .any(|(oid, ty)| oid == &dangling && ty == "blob"),
             "dangling object is typed as a blob"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_all_objects_times_out_on_a_hung_git_instead_of_blocking() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::TempDir::new().unwrap();
+        // Fake git: hang on cat-file (bounded to 30s so a broken test can't wedge).
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in\n  cat-file) i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done ;;\n  *) : ;;\nesac\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(list_all_objects(
+                &path,
+                &git_bin,
+                Instant::now() + Duration::from_millis(150),
+            ));
+        });
+        let res = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "list_all_objects must return within the watchdog budget, not block on a hung git",
+        );
+        assert!(
+            res.is_err(),
+            "a hung git must make list_all_objects error out, not hang"
+        );
+    }
+
+    /// #174 finding 2: the DELTA-path children — `peeled_object_type` (cat-file),
+    /// `rev_list_delta` (rev-list) — and `list_all_objects_with_type` (cat-file) are
+    /// the remaining candidate-discovery execs (the common push path). Each must
+    /// return within the watchdog budget on a hung git rather than block and pin the
+    /// write permit. Revert any one to a bare `Command::output()` and its arm blocks
+    /// past the recv budget (RED).
+    #[cfg(unix)]
+    #[test]
+    fn delta_path_exec_fns_time_out_on_a_hung_git() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::TempDir::new().unwrap();
+        // Fake git hangs on BOTH cat-file and rev-list (bounded 30s so a broken
+        // test can't leak a permanent orphan or wedge the suite).
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in\n  cat-file|rev-list) i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done ;;\n  *) : ;;\nesac\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+        let path = dir.path().to_path_buf();
+
+        // Run `f` on a thread and require it to RETURN (not block) within 10s.
+        fn returns_within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            rx.recv_timeout(Duration::from_secs(10)).expect(
+                "a delta-path exec fn must return within the watchdog budget, not block on a hung git",
+            )
+        }
+        let dl = || Instant::now() + Duration::from_millis(150);
+        let sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let (p, g, d) = (path.clone(), git_bin.clone(), dl());
+        assert!(
+            returns_within(move || peeled_object_type(&p, sha, &g, d)).is_none(),
+            "peeled_object_type must time out to None on a hung cat-file"
+        );
+        let (p, g, d) = (path.clone(), git_bin.clone(), dl());
+        assert!(
+            returns_within(move || rev_list_delta(&p, &[sha], &[], &g, d)).is_err(),
+            "rev_list_delta must error out on a hung rev-list"
+        );
+        let (p, g, d) = (path.clone(), git_bin.clone(), dl());
+        assert!(
+            returns_within(move || list_all_objects_with_type(&p, &g, d)).is_err(),
+            "list_all_objects_with_type must error out on a hung cat-file"
         );
     }
 }

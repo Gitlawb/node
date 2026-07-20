@@ -520,6 +520,22 @@ mod tests {
             sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
             peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
+            git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            pin_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            encrypt_inflight: crate::state::EncryptInflight::new(),
+            repo_write_leases: crate::state::RepoWriteLeases::new(),
+            git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+            git_push_advert_per_caller:
+                crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
+            git_write_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),
+            git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            git_ipfs_walk_per_caller:
+                crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
+            ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+            git_bin: "git".to_string(),
         }
     }
 

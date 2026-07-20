@@ -271,7 +271,8 @@ pub struct TreeEntry {
 /// `/ipfs/<cid>` is computed from these same content bytes via
 /// `gitlawb_core::cid::Cid::from_git_object_bytes`.
 ///
-/// Get just the object type. Returns `None` if the object doesn't exist.
+/// Get just the object type. Returns `None` if the object doesn't exist; a
+/// probe that could not examine the object store is `Err`, never `None`.
 pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>> {
     let type_output = Command::new("git")
         .args(["cat-file", "-t", sha256_hex])
@@ -280,6 +281,19 @@ pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>>
         .context("failed to run git cat-file -t")?;
 
     if !type_output.status.success() {
+        // A nonzero exit is an ABSENCE verdict only when git could examine the
+        // object store: missing-object and invalid-oid probes die with a single
+        // clean `fatal:` line. A broken repo dir (`fatal: not a git repository`)
+        // or a corrupt object (`error: inflate` / `error: unable to unpack`
+        // lines before the fatal) proves nothing about absence, so it must
+        // surface as Err — the /ipfs scan taints on Err rather than treating
+        // the repo as probed-clean.
+        let stderr = String::from_utf8_lossy(&type_output.stderr);
+        if stderr.contains("not a git repository")
+            || stderr.lines().any(|l| l.starts_with("error:"))
+        {
+            bail!("git cat-file -t failed: {}", stderr.trim());
+        }
         return Ok(None);
     }
 
@@ -304,6 +318,227 @@ pub fn read_object_content(repo_path: &Path, sha256_hex: &str, obj_type: &str) -
     }
 
     Ok(content_output.stdout)
+}
+
+/// Why an `/ipfs` existence probe could not return an absence verdict (#174 F5/U4).
+/// The caller (`api::ipfs`) maps the variant to an HTTP status, and the split exists
+/// only for that mapping: a `Transient` fault is retryable (503), a `Deterministic`
+/// fault is terminal (500).
+///
+/// The discriminator is object-store readability, NOT any English `git` wording, so a
+/// future `git` message change cannot silently reclassify a fault (KTD-4): if the
+/// store cannot be read (an unreadable or mid-repack pack, a removed `objects/` dir,
+/// a permissions fault) the fault may clear on its own -> `Transient`; if the store IS
+/// readable yet `git` still fails (a corrupt repo, a bad `.git/config`) a retry cannot
+/// fix it -> `Deterministic`, so a conformant client is told not to retry-storm a
+/// fresh `git cat-file` per attempt against a persistently broken repo.
+#[derive(Debug)]
+pub enum ProbeError {
+    /// Retryable (-> 503): the object store could not be read right now.
+    Transient(anyhow::Error),
+    /// Terminal (-> 500): a persistent, deterministic fault a retry cannot fix.
+    Deterministic(anyhow::Error),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeError::Transient(e) => write!(f, "transient probe fault: {e}"),
+            ProbeError::Deterministic(e) => write!(f, "deterministic probe fault: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ProbeError {}
+
+/// Structured outcome of one `git cat-file --batch-check` existence probe.
+enum BatchProbe {
+    /// Present: git printed `<oid> <type> <size>` on exit 0.
+    Present(String),
+    /// A structured, CLEAN absence: git printed `<oid> missing` on exit 0 with no
+    /// `error:` diagnostics on stderr. This is the ONLY signal that can become an
+    /// `Ok(None)` (404) absence verdict — and even then only after the store-readable
+    /// disambiguation below, since an unreadable pack ALSO prints a clean `missing`.
+    Missing,
+    /// git could not honestly examine the object store: a hard exit (bad config, not a
+    /// git repo) OR an exit-0 `missing` accompanied by `error:` diagnostics (a corrupt
+    /// loose object still prints `missing` on stdout but complains on stderr). Never an
+    /// absence verdict. Carries the raw git detail for the server log only.
+    Fault(anyhow::Error),
+}
+
+/// One bounded, reaped `git cat-file --batch-check` probe (the oid is fed on stdin, so
+/// no prose is matched to decide presence — the `missing` token and the exit code are
+/// the structured signal). See [`object_type_bounded`] for the surrounding teardown
+/// guarantees.
+fn batch_check_probe(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    deadline: std::time::Instant,
+) -> std::result::Result<BatchProbe, ProbeError> {
+    let stdin = format!("{sha256_hex}\n");
+    let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &["cat-file", "--batch-check"],
+        repo_path,
+        stdin.as_bytes(),
+        deadline,
+    )
+    // A spawn/timeout failure of the reaped child is not deterministic — retry it.
+    .map_err(ProbeError::Transient)?;
+
+    let stderr = String::from_utf8_lossy(&stderr);
+    // A corrupt object makes `--batch-check` print `missing` on stdout (exit 0) yet
+    // emit `error:` lines on stderr; those diagnostics disqualify a clean-absence read
+    // regardless of the exit code, so they are checked before anything else.
+    let has_error_diag = stderr.lines().any(|l| l.starts_with("error:"));
+
+    if status.success() && !has_error_diag {
+        let line = String::from_utf8_lossy(&stdout);
+        let line = line.trim();
+        // `<oid> missing` is the structured absence token; `<oid> <type> <size>` is a
+        // hit. Anything else on a "success" exit is unexpected and not an absence.
+        if line
+            .rsplit(' ')
+            .next()
+            .is_some_and(|last| last == "missing")
+        {
+            return Ok(BatchProbe::Missing);
+        }
+        let mut parts = line.split_whitespace();
+        if let (Some(_oid), Some(ty), Some(_size)) = (parts.next(), parts.next(), parts.next()) {
+            return Ok(BatchProbe::Present(ty.to_string()));
+        }
+        return Ok(BatchProbe::Fault(anyhow::anyhow!(
+            "unexpected git cat-file --batch-check output: {line:?}"
+        )));
+    }
+
+    Ok(BatchProbe::Fault(anyhow::anyhow!(
+        "git cat-file --batch-check failed (exit {:?}): {}",
+        status.code(),
+        stderr.trim()
+    )))
+}
+
+/// Bounded, reaped variant of [`object_type`] for the async `/ipfs` serve path
+/// (#174 F3/F5): runs `git cat-file --batch-check` off the caller's runtime through the
+/// process-group + watchdog reaper, so a hung or corrupt object store cannot pin a
+/// runtime worker or an IPFS admission permit past `deadline`.
+///
+/// Absence is keyed on `--batch-check`'s STRUCTURED `<oid> missing` token on exit 0,
+/// never on any English `fatal:` wording (KTD-4): a genuinely-absent object is the only
+/// `Ok(None)` (404) path. A probe that could not honestly examine the store is a
+/// [`ProbeError`], split by object-store readability into `Transient` (retryable 503)
+/// and `Deterministic` (terminal 500) so the serve path can shed the right status.
+pub fn object_type_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    deadline: std::time::Instant,
+) -> std::result::Result<Option<String>, ProbeError> {
+    match batch_check_probe(git_bin, repo_path, sha256_hex, deadline)? {
+        BatchProbe::Present(ty) => Ok(Some(ty)),
+        BatchProbe::Fault(detail) => Err(classify_store_fault(repo_path, detail)),
+        BatchProbe::Missing => {
+            // A clean `missing` is the absence-vs-unreadable-pack COLLISION (#174 F5):
+            // a genuinely missing object AND a packed object whose pack/idx is
+            // unreadable (permissions, or a mid-repack race) both print an identical
+            // clean `missing`. Disambiguate OUT OF BAND on store readability — an
+            // unreadable store is not an absence verdict (taint -> retryable 503).
+            if !object_store_readable(repo_path) {
+                return Err(ProbeError::Transient(anyhow::anyhow!(
+                    "git cat-file inconclusive: object store not readable at {} (not an absence verdict)",
+                    repo_path.display()
+                )));
+            }
+            // Store readable: re-probe once. Still `missing` on a confirmed-readable
+            // store is very likely truly absent (Ok(None)); a mid-repack race that
+            // resolved returns the type. This narrows, but cannot fully close, the
+            // concurrent-repack window (the readability check samples a different
+            // instant than the failing probe).
+            match batch_check_probe(git_bin, repo_path, sha256_hex, deadline)? {
+                BatchProbe::Present(ty) => Ok(Some(ty)),
+                BatchProbe::Fault(detail) => Err(classify_store_fault(repo_path, detail)),
+                BatchProbe::Missing => Ok(None),
+            }
+        }
+    }
+}
+
+/// Classify a probe fault by object-store readability (#174 F5/U4). An unreadable store
+/// may be a transient permissions/mid-repack condition (retryable 503); a readable
+/// store on which git still fails is a persistent, deterministic fault — a corrupt repo
+/// or a bad `.git/config` — that a retry cannot fix (terminal 500). The `detail` is
+/// carried for the server log; the client-facing body is opaque (set by the caller).
+fn classify_store_fault(repo_path: &Path, detail: anyhow::Error) -> ProbeError {
+    if object_store_readable(repo_path) {
+        ProbeError::Deterministic(detail)
+    } else {
+        ProbeError::Transient(detail)
+    }
+}
+
+/// Best-effort check that a repo's object store is readable, used to disambiguate a
+/// genuine missing-object `git cat-file` fatal from an unreadable or racing pack
+/// (both emit "could not get object info"). Returns false on any unreadable
+/// `objects/` dir or any pack/idx that cannot be opened (EACCES / EIO), so the
+/// caller surfaces an error rather than a false absence. Cheap — a couple of readdir
+/// plus open probes. It narrows, but does not close, the concurrent-repack TOCTOU: it
+/// samples a different instant than the failing cat-file.
+fn object_store_readable(repo_path: &Path) -> bool {
+    let objects = repo_path.join("objects");
+    // The objects dir itself must be listable; drain the iterator so a mid-listing
+    // EACCES/EIO surfaces, not just the initial open.
+    let Ok(entries) = std::fs::read_dir(&objects) else {
+        return false;
+    };
+    for entry in entries {
+        if entry.is_err() {
+            return false;
+        }
+    }
+    // Every pack file and its index must be openable for read. A loose-only store
+    // (no pack dir) is fine — the objects readdir above already proved reachability.
+    if let Ok(pack_entries) = std::fs::read_dir(objects.join("pack")) {
+        for entry in pack_entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let path = entry.path();
+            if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("pack") | Some("idx")
+            ) && std::fs::File::open(&path).is_err()
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Bounded, reaped variant of [`read_object_content`] for the async `/ipfs` serve
+/// path (#174 F3). Same teardown guarantees as [`object_type_bounded`].
+pub fn read_object_content_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    obj_type: &str,
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>> {
+    let (status, stdout, stderr) = crate::git::visibility_pack::run_bounded_git_raw(
+        git_bin,
+        &["cat-file", obj_type, sha256_hex],
+        repo_path,
+        &[],
+        deadline,
+    )?;
+    if !status.success() {
+        bail!("git cat-file failed: {}", String::from_utf8_lossy(&stderr));
+    }
+    Ok(stdout)
 }
 
 /// Read a git object by its SHA-256 hex object ID.
@@ -499,6 +734,291 @@ mod tests {
         assert!(
             !names.iter().any(|p| p == "base.txt"),
             "unchanged file must not appear: {names:?}"
+        );
+    }
+
+    /// #174 F5 (RED-before/GREEN-after): a packed object whose pack/idx is unreadable
+    /// makes `git cat-file -t` emit "could not get object info" — byte-identical to a
+    /// genuine miss. `object_type_bounded` must report absence ONLY when the object
+    /// store is confirmed readable; an unreadable store is Err (-> retryable 503),
+    /// never Ok(None) (-> a wrong 404 for a present object).
+    #[cfg(unix)]
+    #[test]
+    fn object_type_bounded_unreadable_pack_is_error_not_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("work");
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        g(&["init", "-q", "--object-format=sha256", "."], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("file.txt"), b"packed f5 content\n").unwrap();
+        g(&["add", "file.txt"], &work);
+        g(&["commit", "-qm", "c1"], &work);
+        let blob = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD:file.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td.path(),
+        );
+        g(&["gc", "-q"], &bare);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        // Readable store: the packed blob probes present; a genuine miss is Ok(None).
+        assert_eq!(
+            super::object_type_bounded("git", &bare, &blob, deadline)
+                .unwrap()
+                .as_deref(),
+            Some("blob"),
+            "a packed blob on a readable store must probe present"
+        );
+        assert!(
+            super::object_type_bounded("git", &bare, &"0".repeat(64), deadline)
+                .unwrap()
+                .is_none(),
+            "a genuinely-absent object on a readable store must be Ok(None)"
+        );
+
+        // Make the pack unreadable: cat-file -t now emits the collided fatal for the
+        // PRESENT blob. It must surface as Err, not a false Ok(None).
+        let pack_dir = bare.join("objects").join("pack");
+        let set_pack_mode = |mode: u32| {
+            for e in std::fs::read_dir(&pack_dir).unwrap() {
+                let p = e.unwrap().path();
+                if matches!(
+                    p.extension().and_then(|s| s.to_str()),
+                    Some("pack") | Some("idx")
+                ) {
+                    let mut perms = std::fs::metadata(&p).unwrap().permissions();
+                    perms.set_mode(mode);
+                    std::fs::set_permissions(&p, perms).unwrap();
+                }
+            }
+        };
+        set_pack_mode(0o000);
+        // Root bypasses file permissions, so the chmod won't block reads there; only
+        // assert the error path when the pack is genuinely unreadable to this process.
+        let a_pack = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("pack"));
+        let genuinely_unreadable = a_pack
+            .as_ref()
+            .map(|p| std::fs::File::open(p).is_err())
+            .unwrap_or(false);
+        let res = super::object_type_bounded("git", &bare, &blob, deadline);
+        set_pack_mode(0o644); // restore so TempDir cleanup succeeds
+
+        if genuinely_unreadable {
+            assert!(
+                res.is_err(),
+                "an unreadable pack must surface as Err (-> retryable 503), not Ok(None) \
+                 (-> a wrong 404 for a present object); got {res:?}"
+            );
+        }
+    }
+
+    /// Shared setup: a bare sha256 repo carrying one committed blob. Returns the repo
+    /// path and the blob's oid.
+    #[cfg(unix)]
+    fn bare_repo_with_blob(td: &std::path::Path) -> (std::path::PathBuf, String) {
+        let work = td.join("work");
+        let bare = td.join("bare.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str], dir: &Path| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        g(&["init", "-q", "--object-format=sha256", "."], &work);
+        g(&["config", "user.email", "t@t"], &work);
+        g(&["config", "user.name", "t"], &work);
+        std::fs::write(work.join("file.txt"), b"f5 u4 content\n").unwrap();
+        g(&["add", "file.txt"], &work);
+        g(&["commit", "-qm", "c1"], &work);
+        let blob = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD:file.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        g(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            td,
+        );
+        (bare, blob)
+    }
+
+    /// #174 F5/U4 (RED-before/GREEN-after, the CORE regression guard): a repo with a
+    /// corrupt `.git/config` makes `git cat-file` die with `fatal: bad config line N`
+    /// (exit 128, NO `error:` line) while `objects/` stays fully readable. The old
+    /// `-t` path let that fall through to `Ok(None)` — a false 404 for content that
+    /// may well exist. `object_type_bounded` must instead classify it as a
+    /// DETERMINISTIC fault (a retry cannot fix it) so the serve path renders a
+    /// terminal 500, never a 404 and never a retryable 503.
+    ///
+    /// LOAD-BEARING: revert the classification (route `BatchProbe::Fault` on a readable
+    /// store back to `Ok(None)`, or drop the `has_error_diag`/exit checks so a hard
+    /// `fatal:` is read as `missing`) and this goes RED — the probe reports the corrupt
+    /// repo as an absent object.
+    #[cfg(unix)]
+    #[test]
+    fn object_type_bounded_bad_config_is_deterministic_not_absence() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (bare, blob) = bare_repo_with_blob(td.path());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        // Baseline on the healthy repo: present blob probes present, genuine miss is
+        // the clean Ok(None) absence verdict.
+        assert_eq!(
+            super::object_type_bounded("git", &bare, &blob, deadline)
+                .unwrap()
+                .as_deref(),
+            Some("blob"),
+            "a present blob on a healthy readable store must probe present"
+        );
+        assert!(
+            super::object_type_bounded("git", &bare, &"0".repeat(64), deadline)
+                .unwrap()
+                .is_none(),
+            "a genuinely-absent object on a healthy readable store must be Ok(None) (404)"
+        );
+
+        // Corrupt the config; objects/ is untouched (and stays readable).
+        {
+            use std::io::Write;
+            let mut cfg = std::fs::OpenOptions::new()
+                .append(true)
+                .open(bare.join("config"))
+                .unwrap();
+            cfg.write_all(b"\n[broken section\nnot a valid = = = line\n")
+                .unwrap();
+        }
+        assert!(
+            super::object_store_readable(&bare),
+            "config corruption must leave objects/ readable (that is the whole point: \
+             a readable store + a git failure == deterministic, not transient)"
+        );
+
+        // Probing the PRESENT blob under the bad config must be a DETERMINISTIC fault,
+        // never Ok(None) (the old false 404) and never a Transient (retryable 503).
+        let res = super::object_type_bounded("git", &bare, &blob, deadline);
+        assert!(
+            matches!(res, Err(super::ProbeError::Deterministic(_))),
+            "a bad-config fatal on a readable store must be a terminal Deterministic \
+             fault (-> 500), never Ok(None) (-> false 404) or Transient (-> 503); got {res:?}"
+        );
+        // And a genuinely-absent oid under the bad config is ALSO not an absence verdict.
+        let res_absent = super::object_type_bounded("git", &bare, &"0".repeat(64), deadline);
+        assert!(
+            matches!(res_absent, Err(super::ProbeError::Deterministic(_))),
+            "even a would-be-absent oid must not read as Ok(None) once the config is \
+             corrupt; got {res_absent:?}"
+        );
+    }
+
+    /// #174 F5/U4: a corrupt LOOSE object makes `git cat-file --batch-check` print
+    /// `<oid> missing` on stdout (exit 0) yet emit `error:` diagnostics on stderr. The
+    /// clean-`missing` absence path must NOT fire here — the `error:` line disqualifies
+    /// a clean-absence read — so the probe surfaces a fault, not a false Ok(None) 404.
+    /// The object store is readable (a corrupt object file still opens), so this is a
+    /// Deterministic fault. LOAD-BEARING: drop the `has_error_diag` guard and a corrupt
+    /// object reads as `missing` -> Ok(None) -> false 404 (RED).
+    #[cfg(unix)]
+    #[test]
+    fn object_type_bounded_corrupt_loose_object_is_fault_not_absence() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let work = td.path().join("loose");
+        std::fs::create_dir_all(&work).unwrap();
+        let g = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&work)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        g(&["init", "-q", "--object-format=sha256", "."]);
+        g(&["config", "user.email", "t@t"]);
+        g(&["config", "user.name", "t"]);
+        std::fs::write(work.join("f.txt"), b"loose object content\n").unwrap();
+        g(&["add", "f.txt"]);
+        g(&["commit", "-qm", "c1"]);
+        let blob = String::from_utf8(
+            Command::new("git")
+                .args(["rev-parse", "HEAD:f.txt"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        // Overwrite the loose object file with non-zlib garbage (it is 0o444 by default).
+        let obj = work.join(".git/objects").join(&blob[0..2]).join(&blob[2..]);
+        let mut perms = std::fs::metadata(&obj).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&obj, perms).unwrap();
+        std::fs::write(&obj, b"garbage not a zlib stream").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let res = super::object_type_bounded("git", &work, &blob, deadline);
+        assert!(
+            res.is_err(),
+            "a corrupt loose object (error: on stderr, `missing` on stdout) must be Err, \
+             never a false Ok(None) 404; got {res:?}"
         );
     }
 }

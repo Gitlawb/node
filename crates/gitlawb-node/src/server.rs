@@ -214,9 +214,20 @@ pub fn build_router(state: AppState) -> Router {
     // identity and can apply per-repo visibility (#110); anonymous callers stay
     // anonymous and still read genuinely public content. `/api/v1/ipfs/pins`
     // stays unsigned — gating the pin index is tracked separately (#121).
+    // `/ipfs/{cid}` also carries a per-IP flood brake: it is anon-reachable and each
+    // request can drive a full-history git walk, so the per-IP rate limiter is the
+    // outermost layer (rejects a flood before the walk-admission work), mirroring the
+    // push/create routers. The extension MUST be attached or rate_limit_by_ip is a
+    // silent no-op. `/api/v1/ipfs/pins` (no walk) is merged in unbraked, as before.
+    let ipfs_limiter = rate_limit::IpRateLimiter {
+        limiter: state.ipfs_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
     let ipfs_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
         .layer(middleware::from_fn(auth::optional_signature))
+        .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(ipfs_limiter))
         .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────

@@ -132,6 +132,96 @@ impl RateLimiter {
     }
 }
 
+/// A bounded per-caller CONCURRENCY limiter — distinct from [`RateLimiter`], which
+/// caps request RATE. Each caller key may hold at most `per_caller` in-flight
+/// permits at once; beyond that [`try_acquire`](Self::try_acquire) returns `None`
+/// and the caller sheds. Used to stop one caller (a single anonymous source-IP or
+/// DID) monopolizing the served-git read pool (#174).
+///
+/// The key map is self-bounding: a key is removed the instant its in-flight count
+/// reaches zero, so it never holds more keys than there are concurrently-active
+/// callers (itself bounded by the read semaphore). A `max_keys` reject-before-insert
+/// backstop guarantees a key farm can never grow the map even if that invariant
+/// weakened — a NEW key at the cap is rejected WITHOUT allocating an entry (INV-15).
+///
+/// Uses a `std::sync::Mutex` (not the file's `tokio::sync::Mutex`) because the
+/// permit's `Drop` must release synchronously; the critical section holds no await.
+#[derive(Clone)]
+pub struct PerCallerConcurrency {
+    state: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    per_caller: usize,
+    max_keys: usize,
+}
+
+/// RAII permit from [`PerCallerConcurrency::try_acquire`]. On drop it decrements
+/// the caller's in-flight count and removes the key when it reaches zero.
+pub struct PerCallerPermit {
+    state: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    key: String,
+}
+
+impl PerCallerConcurrency {
+    pub fn new(per_caller: usize, max_keys: usize) -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            per_caller: per_caller.max(1),
+            max_keys: max_keys.max(1),
+        }
+    }
+
+    /// Convenience constructor with the default key bound.
+    pub fn with_default_max_keys(per_caller: usize) -> Self {
+        Self::new(per_caller, DEFAULT_MAX_KEYS)
+    }
+
+    /// `Some(permit)` when the caller is under its cap and the map has room;
+    /// `None` (shed) otherwise. Reject-before-insert: a new key at `max_keys` is
+    /// rejected without allocating.
+    pub fn try_acquire(&self, key: &str) -> Option<PerCallerPermit> {
+        // Recover from a poisoned lock rather than panicking: the critical section
+        // is pure counter arithmetic and cannot itself panic, so a poisoned mutex
+        // would only ever come from an unrelated abort, and a slightly-off count
+        // self-heals as permits drop. A panic here would instead brick the limiter
+        // for every caller (each subsequent lock re-panics).
+        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get_mut(key) {
+            Some(count) => {
+                if *count >= self.per_caller {
+                    return None;
+                }
+                *count += 1;
+            }
+            None => {
+                if map.len() >= self.max_keys {
+                    return None;
+                }
+                map.insert(key.to_string(), 1);
+            }
+        }
+        Some(PerCallerPermit {
+            state: self.state.clone(),
+            key: key.to_string(),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn tracked_keys(&self) -> usize {
+        self.state.lock().unwrap().len()
+    }
+}
+
+impl Drop for PerCallerPermit {
+    fn drop(&mut self) {
+        let mut map = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.key);
+            }
+        }
+    }
+}
+
 pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
     let limiter = request.extensions().get::<RateLimiter>().cloned();
 
@@ -287,6 +377,63 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_caller_concurrency_caps_one_caller_and_frees_on_drop() {
+        let lim = PerCallerConcurrency::new(2, 100);
+        let p1 = lim.try_acquire("did:key:zA").expect("first under cap");
+        let p2 = lim.try_acquire("did:key:zA").expect("second under cap");
+        assert!(
+            lim.try_acquire("did:key:zA").is_none(),
+            "a third in-flight op for the same caller sheds (over the per-caller cap)"
+        );
+        // A DIFFERENT caller is unaffected — the cap is per-caller, not global.
+        let _other = lim
+            .try_acquire("did:key:zB")
+            .expect("a different caller has its own budget");
+        drop(p1);
+        assert!(
+            lim.try_acquire("did:key:zA").is_some(),
+            "freeing one in-flight slot lets the same caller back in"
+        );
+        drop(p2);
+    }
+
+    #[test]
+    fn per_caller_concurrency_map_is_self_bounding_and_reject_before_insert() {
+        // Self-bounding: acquire+drop many distinct keys — the map never grows
+        // because a key is removed the instant its in-flight count hits zero.
+        let lim = PerCallerConcurrency::new(4, 3);
+        for i in 0..50 {
+            let _p = lim.try_acquire(&format!("k{i}"));
+        }
+        assert_eq!(
+            lim.tracked_keys(),
+            0,
+            "keys with zero in-flight ops are removed, so an acquire+drop flood leaves the map empty"
+        );
+        // Reject-before-insert: HOLD max_keys distinct keys, then a new key sheds
+        // WITHOUT growing the map past the cap (INV-15 — a rejected request never
+        // allocates an entry).
+        let held: Vec<_> = (0..3)
+            .map(|i| lim.try_acquire(&format!("h{i}")).unwrap())
+            .collect();
+        assert_eq!(
+            lim.tracked_keys(),
+            3,
+            "three distinct callers held concurrently"
+        );
+        assert!(
+            lim.try_acquire("h3").is_none(),
+            "a new key at max_keys is rejected"
+        );
+        assert_eq!(
+            lim.tracked_keys(),
+            3,
+            "the rejected new key did not allocate an entry (reject-before-insert)"
+        );
+        drop(held);
+    }
 
     #[tokio::test]
     async fn allows_within_limit() {

@@ -13,7 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::{PgPool, Postgres};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -157,13 +158,44 @@ impl RepoStore {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
-        // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
-        // to avoid blocking indefinitely on stale locks from crashed connections.
+        // Pin a dedicated pooled connection and build the guard holding it BEFORE
+        // issuing the lock query. Session-level pg advisory locks are
+        // connection-affine (they can only be released on the session that took
+        // them), so the guard must own the locking connection; and building the
+        // guard first means any cancellation after the lock is taken — a
+        // `tokio::time::timeout` firing during the Tigris download below — drops a
+        // guard that CAN release, closing the leak the outer timeout otherwise
+        // opened (#174 F1).
+        let conn = self
+            .pool
+            .acquire()
+            .await
+            .context("acquiring db connection for the write advisory lock")?;
+        let mut guard = RepoWriteGuard {
+            owner_slug: owner_slug.clone(),
+            repo_name: repo_name.to_string(),
+            local_path: local_path.clone(),
+            lock_key,
+            conn: Some(conn),
+            locked: false,
+            released: false,
+            tigris: self.tigris.clone(),
+            #[cfg(test)]
+            test_pre_unlock_gate: None,
+        };
+
+        // Acquire the advisory lock with retry, through the guard's OWN connection,
+        // so the matching unlock (in release, or the Drop backstop) runs on the same
+        // session — pg_advisory_unlock on a different pooled connection is a no-op.
         let mut acquired = false;
         for attempt in 0..60 {
+            let c = guard
+                .conn
+                .as_deref_mut()
+                .expect("write guard holds its connection during acquisition");
             let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_key)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *c)
                 .await
                 .context("trying advisory lock")?;
             if row.0 {
@@ -177,9 +209,11 @@ impl RepoStore {
         if !acquired {
             anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
         }
+        guard.locked = true;
 
-        // Always download the latest from Tigris before writing.
-        // Local disk may be stale if another machine pushed since our last access.
+        // Always download the latest from Tigris before writing. Local disk may be
+        // stale if another machine pushed since our last access. The guard already
+        // owns the lock + its connection, so a cancellation here drops through Drop.
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
@@ -197,14 +231,7 @@ impl RepoStore {
             }
         }
 
-        Ok(RepoWriteGuard {
-            owner_slug,
-            repo_name: repo_name.to_string(),
-            local_path,
-            lock_key,
-            pool: self.pool.clone(),
-            tigris: self.tigris.clone(),
-        })
+        Ok(guard)
     }
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
@@ -354,8 +381,24 @@ pub struct RepoWriteGuard {
     repo_name: String,
     pub local_path: PathBuf,
     lock_key: i64,
-    pool: PgPool,
+    /// The pooled connection that took the advisory lock. Session-level pg
+    /// advisory locks are connection-affine, so the guard pins that connection
+    /// for its whole lifetime and unlocks on it (in `release`, or the `Drop`
+    /// backstop). `None` only after the connection has been taken to unlock.
+    conn: Option<PoolConnection<Postgres>>,
+    /// Set once the advisory lock has actually been taken. A guard dropped
+    /// before the lock is held (or after `release`) performs no unlock.
+    locked: bool,
+    /// Set once `release` has run its unlock, making the `Drop` backstop inert.
+    released: bool,
     tigris: Option<TigrisClient>,
+    /// Test-only seam: when set, `release` parks on this gate at the exact point
+    /// it is about to await `pg_advisory_unlock` (connection still owned, not yet
+    /// released). Dropping the `release` future while it is parked reproduces a
+    /// mid-unlock cancellation, so a test can assert the `Drop` backstop still
+    /// frees the session lock. Never set outside tests.
+    #[cfg(test)]
+    test_pre_unlock_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RepoWriteGuard {
@@ -369,7 +412,7 @@ impl RepoWriteGuard {
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(self, success: bool) {
+    pub async fn release(mut self, success: bool) {
         // Upload to Tigris only on success.
         if success {
             if let Some(ref tigris) = self.tigris {
@@ -384,11 +427,72 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
-        // Release advisory lock
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(self.lock_key)
-            .execute(&self.pool)
-            .await;
+        // Release the advisory lock on the SAME connection that took it (session
+        // advisory locks are connection-affine). Unlock through the connection
+        // while it is STILL owned by `self` — do not `take()` it first. If this
+        // future is cancelled during the unlock await, `self` is dropped with
+        // `conn == Some(..)` and `released == false`, so the `Drop` backstop still
+        // runs the detached unlock. `released` is set only AFTER the await
+        // resolves, so a cancellation cannot make the backstop inert (#174 F4).
+        if self.locked {
+            #[cfg(test)]
+            let pre_unlock_gate = self.test_pre_unlock_gate.clone();
+            if let Some(conn) = self.conn.as_deref_mut() {
+                // Test-only: park right before the unlock await so a test can drop
+                // this future mid-unlock (connection owned, not yet released).
+                #[cfg(test)]
+                if let Some(gate) = pre_unlock_gate {
+                    gate.notified().await;
+                }
+                let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                    .bind(self.lock_key)
+                    .execute(&mut *conn)
+                    .await;
+            }
+        }
+        self.released = true;
+    }
+}
+
+impl Drop for RepoWriteGuard {
+    /// Cancellation-safe backstop: if the guard is dropped while still holding the
+    /// advisory lock (a `tokio::time::timeout` cancelled `acquire_write`, or a
+    /// handler future was dropped before `release`), unlock on the pinned
+    /// connection. `Drop` cannot await, so spawn a detached unlock — it runs on the
+    /// same session (connection-affine). An off-runtime drop falls back to a log;
+    /// the ~60s stale-lock retry loop in `acquire_write` reclaims it. On runtime
+    /// SHUTDOWN the spawned unlock task may be dropped before it polls, so the unlock
+    /// may not run — but shutdown tears down the pool, and closing the connection
+    /// releases the session-level advisory lock server-side, so this too is bounded.
+    fn drop(&mut self) {
+        if self.released || !self.locked {
+            return;
+        }
+        let Some(mut conn) = self.conn.take() else {
+            return;
+        };
+        let lock_key = self.lock_key;
+        let repo_name = self.repo_name.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                        .bind(lock_key)
+                        .execute(&mut *conn)
+                        .await
+                    {
+                        warn!(repo = %repo_name, err = %e, "detached advisory-unlock on write-guard drop failed");
+                    }
+                });
+            }
+            Err(_) => {
+                warn!(
+                    repo = %repo_name,
+                    "RepoWriteGuard dropped off a Tokio runtime; advisory lock not released \
+                     synchronously — the stale-lock retry loop will reclaim it"
+                );
+            }
+        }
     }
 }
 
@@ -561,5 +665,206 @@ mod tests {
                 "owner_did={bad:?} must be rejected"
             );
         }
+    }
+
+    // ── advisory-lock cancellation-safety (#174 F1, RED-before/GREEN-after) ──
+
+    /// F1 (P1): dropping a `RepoWriteGuard` WITHOUT calling `release()` — the
+    /// state a `tokio::time::timeout` cancellation leaves `acquire_write` in when
+    /// it fires during the Tigris await — must still release the session advisory
+    /// lock. A checker connection is held OUT of the pool first, so `acquire_write`
+    /// is forced onto a distinct session; the checker (a different session) then
+    /// probes the lock, so advisory-lock re-entrancy cannot mask a leak.
+    ///
+    /// Load-bearing: RED today (no `Drop` releases the lock → held by
+    /// `acquire_write`'s session → checker's `pg_try_advisory_lock` returns
+    /// false). GREEN after the connection-affine `Drop` backstop.
+    #[sqlx::test]
+    async fn write_guard_drop_without_release_frees_the_lock(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let owner = "did:key:z6MkDropBackstopProofAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "leaktest";
+        let slug = owner.replace([':', '/'], "_");
+        let key = advisory_lock_key(&slug, name);
+
+        // Distinct session for the probe: hold it out of the pool BEFORE acquiring,
+        // so acquire_write cannot use it and a re-entrant probe cannot falsely read free.
+        let mut checker = pool.acquire().await.expect("checker connection");
+
+        let guard = store.acquire_write(owner, name).await.expect("acquire");
+        // The cancellation shape: drop without release().
+        drop(guard);
+        // Let the detached unlock task run.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *checker)
+            .await
+            .unwrap();
+        assert!(
+            free,
+            "advisory lock must be released when the guard is dropped without release()"
+        );
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *checker)
+            .await;
+    }
+
+    /// F1 (latent non-affine release): `release()` must unlock on the SAME
+    /// session that locked, so the lock is freed regardless of which pooled
+    /// connection would service a fresh query. Observed from a distinct session.
+    #[sqlx::test]
+    async fn write_guard_release_frees_the_lock_from_a_distinct_session(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let owner = "did:key:z6MkAffineReleaseProofBBBBBBBBBBBBBBBBBBBB";
+        let name = "affinetest";
+        let slug = owner.replace([':', '/'], "_");
+        let key = advisory_lock_key(&slug, name);
+
+        let mut checker = pool.acquire().await.expect("checker connection");
+        let guard = store.acquire_write(owner, name).await.expect("acquire");
+        guard.release(false).await;
+
+        let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *checker)
+            .await
+            .unwrap();
+        assert!(
+            free,
+            "release() must free the advisory lock via connection-affine unlock"
+        );
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *checker)
+            .await;
+    }
+
+    // ── cancellation-safe unlock (#174 F4, RED-before/GREEN-after) ──────────
+
+    /// F4 (P1): a cancellation DURING the unlock await must still free the session
+    /// advisory lock. `release` unlocks through the connection while `self` still
+    /// owns it, so if the future is dropped mid-unlock, `Drop` sees `conn == Some`
+    /// + `locked && !released` and runs its detached-unlock backstop. A test-only
+    /// gate parks `release` at the exact pre-unlock point; dropping the future
+    /// there reproduces the cancellation.
+    ///
+    /// Load-bearing: RED on the original ordering (`self.conn.take()` before the
+    /// await → at cancellation `self.conn == None` → `Drop` skips → the local
+    /// connection returns to the pool with the session lock still held → the
+    /// checker's `pg_try_advisory_lock` returns false). GREEN after the reorder.
+    #[sqlx::test]
+    async fn write_guard_release_cancelled_mid_unlock_frees_the_lock(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let owner = "did:key:z6MkCancelMidUnlockProofCCCCCCCCCCCCCCCCCC";
+        let name = "canceltest";
+        let slug = owner.replace([':', '/'], "_");
+        let key = advisory_lock_key(&slug, name);
+
+        // Distinct session for the probe, held out of the pool before acquiring.
+        let mut checker = pool.acquire().await.expect("checker connection");
+
+        let mut guard = store.acquire_write(owner, name).await.expect("acquire");
+        // Arm the pre-unlock gate; it is never notified, so `release` parks on it
+        // with the connection still owned and `released` still false.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        guard.test_pre_unlock_gate = Some(gate);
+
+        // Box the future so we can drop it ourselves (tokio::pin! keeps it alive to
+        // end of scope, which would defer the guard's Drop past the assertions).
+        let mut fut = Box::pin(guard.release(false));
+        let parked =
+            tokio::time::timeout(std::time::Duration::from_millis(300), fut.as_mut()).await;
+        assert!(
+            parked.is_err(),
+            "release should park on the pre-unlock gate, not complete"
+        );
+        // Cancel mid-unlock: dropping the boxed future runs RepoWriteGuard::drop.
+        drop(fut);
+
+        // Let the Drop backstop's detached unlock task run.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *checker)
+            .await
+            .unwrap();
+        assert!(
+            free,
+            "advisory lock must be freed when release is cancelled mid-unlock — the \
+             connection must stay owned by the guard so Drop's backstop can run"
+        );
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *checker)
+            .await;
+    }
+
+    /// F4: the ordinary success path still frees the lock, and a second write
+    /// acquire on the same repo returns promptly (no stale-lock retry loop).
+    #[sqlx::test]
+    async fn write_guard_release_true_frees_lock_and_second_acquire_succeeds(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let owner = "did:key:z6MkReleaseTrueProofDDDDDDDDDDDDDDDDDDDDDD";
+        let name = "reltruetest";
+
+        let guard = store
+            .acquire_write(owner, name)
+            .await
+            .expect("first acquire");
+        guard.release(true).await;
+
+        let again = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.acquire_write(owner, name),
+        )
+        .await
+        .expect("second acquire_write must not hit the ~60s stale-lock retry loop")
+        .expect("second acquire");
+        again.release(true).await;
+    }
+
+    /// F4: releasing a guard that never took the lock (`locked == false`, the state
+    /// acquire_write leaves after a failed acquisition) must not unlock or panic.
+    #[sqlx::test]
+    async fn write_guard_release_when_not_locked_does_not_unlock_or_panic(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let owner = "did:key:z6MkNotLockedProofEEEEEEEEEEEEEEEEEEEEEE";
+        let name = "notlockedtest";
+        let slug = owner.replace([':', '/'], "_");
+        let key = advisory_lock_key(&slug, name);
+
+        let guard = RepoWriteGuard {
+            owner_slug: slug,
+            repo_name: name.to_string(),
+            local_path: dir.path().to_path_buf(),
+            lock_key: key,
+            conn: Some(pool.acquire().await.expect("conn")),
+            locked: false,
+            released: false,
+            tigris: None,
+            test_pre_unlock_gate: None,
+        };
+        // Must complete without panic and issue no unlock.
+        guard.release(false).await;
+
+        let mut checker = pool.acquire().await.expect("checker");
+        let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut *checker)
+            .await
+            .unwrap();
+        assert!(free, "release on an unlocked guard must not touch the key");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *checker)
+            .await;
     }
 }

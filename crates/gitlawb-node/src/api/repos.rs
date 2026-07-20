@@ -39,11 +39,21 @@ const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
 /// `withheld` is `None`, so an unvetted push neither replicates blobs nor
 /// announces. Returning both keeps the gate's announce decision a single
 /// source rather than recomputing it at each call site.
+///
+/// The walk arm runs under a `git_encrypt_semaphore` admission permit (#174 F4):
+/// by the time the receive-pack tail calls this, the handler's write permit has
+/// already been released (receive_pack's AdmissionGuard drops when the git group
+/// is reaped), so without the gate a burst of completed pushes accumulates
+/// unbounded concurrent full-history walks. `encrypt_sem` is threaded in so the
+/// no-walk fast paths (not announceable; no path-scoped rule) never touch it.
 async fn replication_withheld_set(
+    encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
     rules: Option<Vec<crate::db::VisibilityRule>>,
     owner_did: &str,
     is_public: bool,
     disk_path: std::path::PathBuf,
+    git_bin: String,
+    timeout: std::time::Duration,
 ) -> (bool, Option<std::collections::HashSet<String>>) {
     let announce = match &rules {
         Some(rules) => crate::visibility::listable_at_root(rules, is_public, owner_did, None),
@@ -64,9 +74,17 @@ async fn replication_withheld_set(
         // that off the async worker thread.
         Some(rules) => {
             let owner_did = owner_did.to_string();
+            // Scan admission (#174 F4): DEFER, never shed — dropping the walk
+            // would skip the vetting and fail the push's replication closed for
+            // no reason. Residuals at `acquire_scan_permit`.
+            let permit =
+                crate::state::acquire_scan_permit(encrypt_sem, &disk_path, "withheld walk").await;
             tokio::task::spawn_blocking(move || {
-                crate::git::visibility_pack::withheld_blob_oids(
-                    &disk_path, &rules, is_public, &owner_did, None,
+                // The permit lives inside the blocking closure: a started walk
+                // always completes holding it.
+                let _permit = permit;
+                crate::git::visibility_pack::withheld_blob_oids_bounded(
+                    &disk_path, &git_bin, timeout, &rules, is_public, &owner_did, None,
                 )
             })
             .await
@@ -100,18 +118,46 @@ async fn replication_withheld_set(
 /// non-blobs plus allowed blobs. Any error in either walk (or a task panic)
 /// pins nothing this push, mirroring the degraded-path shape of
 /// `replication_withheld_set`.
+///
+/// Always walks (there is no no-git arm), so the whole blocking scan runs under
+/// one `git_encrypt_semaphore` admission permit (#174 F4) — see
+/// `acquire_scan_permit` for the defer rationale and the honest residuals.
+#[allow(clippy::too_many_arguments)]
 async fn fail_closed_full_scan_objects(
+    encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
     disk_path: std::path::PathBuf,
     rules: Vec<crate::db::VisibilityRule>,
     is_public: bool,
     owner_did: String,
     candidates: Vec<String>,
+    git_bin: String,
+    timeout: std::time::Duration,
 ) -> Vec<String> {
+    // Scan admission (#174 F4): DEFER, never shed; the permit moves into the
+    // closure so a started scan always completes holding it.
+    let permit =
+        crate::state::acquire_scan_permit(encrypt_sem, &disk_path, "fail-closed full scan").await;
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-        let allowed = crate::git::visibility_pack::replicable_blob_set(
-            &disk_path, &rules, is_public, &owner_did,
+        let _permit = permit;
+        // One whole-scan deadline shared across both phases (#174 F4). A fresh
+        // `Instant::now() + timeout` for phase 2 let a large-but-successful phase 1 plus
+        // a full phase 2 hold the scan permit ~2x the configured budget. Sharing the
+        // deadline caps total occupancy at ~1x: phase 1 runs against the remaining
+        // budget, and if it consumes the budget phase 2 gets what is left and fails
+        // closed (pins nothing) rather than over-holding — the safe direction. The cost
+        // is honest: a genuinely large repo whose phase 1 nears the budget under-pins
+        // this push rather than the previous silent ~2x hold; size the budget so both
+        // phases normally fit.
+        let deadline = std::time::Instant::now() + timeout;
+        let allowed = crate::git::visibility_pack::replicable_blob_set_bounded(
+            &disk_path,
+            &git_bin,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            &rules,
+            is_public,
+            &owner_did,
         )?;
-        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path)?;
+        let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path, &git_bin, deadline)?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
             candidates, &allowed, &all_blobs,
         ))
@@ -508,6 +554,43 @@ pub async fn git_info_refs(
     auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Response> {
     let name = smart_http_repo_name(&repo)?;
+    let service = query
+        .service
+        .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
+    // Reject an unsupported service BEFORE taking a read slot or doing any DB/Tigris
+    // work (#174 P2-1). git_info_refs otherwise treats everything that is not
+    // git-receive-pack as a read op, so an unauthenticated `?service=anything` to a
+    // public repo would consume a read permit and the visibility/Tigris work before
+    // validate_service rejected it downstream in smart_http.
+    if service != "git-upload-pack" && service != "git-receive-pack" {
+        return Err(AppError::BadRequest(format!(
+            "unsupported git service: {service}"
+        )));
+    }
+    // #62 cheap pre-DB load shed: if the pool this service draws from is already
+    // saturated, shed with 503 before any DB/disk work. Best-effort (holds no
+    // permit); the authoritative hold is `git_permit` below, after the per-source
+    // cap. Restores the shed-before-DB property the reordered held acquire alone
+    // would drop, while the reorder still prevents one source from occupying global
+    // slots during the DB/visibility window.
+    {
+        // The receive-pack advertisement peeks its DEDICATED advert pool, not the
+        // write pool the authenticated POST uses (#174) — matching the held acquire
+        // below, so the pre-DB shed and the authoritative hold agree on the pool.
+        let pool = if service == "git-receive-pack" {
+            &state.git_push_advert_semaphore
+        } else {
+            &state.git_read_semaphore
+        };
+        if pool.available_permits() == 0 {
+            tracing::warn!(
+                "served-git concurrency cap reached; shedding request with 503 (pre-DB)"
+            );
+            return Err(AppError::Overloaded(
+                "git service at capacity, retry shortly".into(),
+            ));
+        }
+    }
     tracing::info!(owner = %owner, repo = %name, "info/refs request");
     let record = state
         .db
@@ -521,9 +604,6 @@ pub async fn git_info_refs(
         return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
 
-    let service = query
-        .service
-        .ok_or_else(|| AppError::BadRequest("missing ?service= parameter".into()))?;
     tracing::debug!(service = %service, repo = %name, "info/refs service");
 
     // Enforce read visibility on the ref advertisement, for BOTH services. The
@@ -563,30 +643,555 @@ pub async fn git_info_refs(
         }
     }
 
+    // Per-source concurrency sub-cap (#174), keyed on the resolved source IP and
+    // acquired AFTER the visibility + push-rate gates (KTD7) so a denied or
+    // rate-limited request never consumes a slot; held for the whole op. The
+    // upload-pack advertisement is bounded on the read pool (git_read_per_caller).
+    // The receive-pack advertisement draws from the write pool, so it is bounded per
+    // source (git_push_advert_per_caller) instead: without this, an anonymous
+    // multi-source flood of push-handshake advertisements could hold the write pool's
+    // slots across acquire_fresh and shed authenticated pushes, since the per-IP push
+    // rate limiter caps rate, not concurrency (#174 review fix).
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+    let _caller_permit = if service == "git-receive-pack" {
+        acquire_read_caller_permit(
+            &state.git_push_advert_per_caller,
+            caller_key.as_deref(),
+            name,
+            "receive-pack advert",
+        )?
+    } else {
+        acquire_read_caller_permit(
+            &state.git_read_per_caller,
+            caller_key.as_deref(),
+            name,
+            "info/refs",
+        )?
+    };
+
+    // Shed with a 503 before spawning git when the concurrency cap is saturated;
+    // held for the whole op (incl. the smart_http call), released on return. Taken
+    // AFTER the per-source cap above so one source cannot occupy global slots it
+    // would be sub-cap-denied for during the DB/visibility window and starve other
+    // sources; still before acquire_fresh/git so it bounds the fresh Tigris acquire
+    // and git exec (INV-10). The receive-pack advertisement is phase one of a push,
+    // but it is ANON-reachable, so it draws from the dedicated advert pool
+    // (`git_push_advert_semaphore`), NOT the write pool the authenticated POST uses:
+    // an advert flood can at worst exhaust the advert pool, never a permit a push
+    // POST needs at admission (#174 U2). A clone flood on the read pool likewise
+    // can't touch either. The upload-pack advertisement stays on the read pool with
+    // its per-caller sub-cap.
+    let _permit = if service == "git-receive-pack" {
+        git_permit(&state.git_push_advert_semaphore)?
+    } else {
+        git_permit(&state.git_read_semaphore)?
+    };
+
     // For receive-pack (push), download the latest from Tigris so the client
     // sees the same refs that acquire_write() will operate on.
-    let disk_path = if service == "git-receive-pack" {
-        state
-            .repo_store
-            .acquire_fresh(&record.owner_did, &record.name)
-            .await
-    } else {
-        state
-            .repo_store
-            .acquire(&record.owner_did, &record.name)
-            .await
-    }
-    .map_err(|e| {
-        tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
-        AppError::Git(e.to_string())
-    })?;
+    //
+    // Bound the acquire under `git_acquire_timeout_secs`: the concurrency permit is
+    // already held above, and `git_service_timeout_secs` only starts once git spawns,
+    // so an un-deadlined acquire (a hung Tigris HEAD/GET here) pins the permit until
+    // the pool drains (#174 P1-2). On expiry the handler-local `_permit`/`_caller_permit`
+    // drop on the early return (the AdmissionGuard is not built until after acquire),
+    // so the shed frees the slot; return a bounded 503.
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let acquire_fut = async {
+        if service == "git-receive-pack" {
+            state
+                .repo_store
+                .acquire_fresh(&record.owner_did, &record.name)
+                .await
+        } else {
+            state
+                .repo_store
+                .acquire(&record.owner_did, &record.name)
+                .await
+        }
+    };
+    let disk_path = tokio::time::timeout(acquire_deadline, acquire_fut)
+        .await
+        .map_err(|_elapsed| {
+            tracing::warn!(repo = %name, service = %service, "repo acquire timed out; shedding with 503");
+            AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+        })?
+        .map_err(|e| {
+            tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
+            AppError::Git(e.to_string())
+        })?;
 
-    smart_http::info_refs(&disk_path, &service)
+    // Move the admission permits into the guard so they release only after the spawned
+    // git process group is confirmed reaped, on complete/timeout/disconnect — not the
+    // instant a disconnect drops this future while the detached reaper is still tearing
+    // the group down (#174 P1-a). The handler keeps no copy: `_permit`/`_caller_permit`
+    // are moved in, so admission tracks the real process lifetime.
+    let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+    let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    smart_http::info_refs("git", &service, &disk_path, git_timeout, Some(admission))
         .await
         .map_err(|e| {
-            tracing::error!(repo = %name, service = %service, err = %e, "info_refs git failed");
-            AppError::Git(e.to_string())
+            let app = git_service_app_error(&e);
+            match &app {
+                AppError::Timeout(_) => {
+                    tracing::warn!(repo = %name, service = %service, "info/refs advertisement timed out")
+                }
+                _ => {
+                    tracing::error!(repo = %name, service = %service, err = %e, "info_refs git failed")
+                }
+            }
+            app
         })
+}
+
+/// Acquire a permit from the served-git concurrency semaphore, or shed the
+/// request with a 503 + Retry-After when every slot is in use. Bind the returned
+/// permit to a named local so it is held for the whole git op (it releases on
+/// drop); a bare `_` would release it immediately.
+fn git_permit(
+    sem: &std::sync::Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    sem.clone().try_acquire_owned().map_err(|_| {
+        // Surface the shed so operators can see the cap engaging, mirroring the
+        // receive-pack rate-limit warn above. A silent 503 makes a saturated or
+        // misconfigured cap look like a client problem instead of a capacity one.
+        tracing::warn!("served-git concurrency cap reached; shedding request with 503");
+        AppError::Overloaded("git service at capacity, retry shortly".into())
+    })
+}
+
+/// Resolve the per-caller key for the read sub-cap (#174): always the resolved
+/// source IP (`client_key`), never the signed DID. Public read routes accept any
+/// valid `did:key` via `optional_signature` with no admission step, so keying on
+/// the DID would let one host mint disposable DIDs to multiply its per-source
+/// budget; the push path already throttles on the resolved source IP for exactly
+/// this DID-farm reason (`rate_limit.rs`, `IpRateLimiter`). `None` when no key
+/// resolves (no trusted header and no peer): such a request is bounded by the
+/// global read pool only, never a 500. The per-source-IP key is only as granular
+/// as `trust`; see the `max_concurrent_reads_per_caller` config doc.
+fn read_caller_key(
+    headers: &axum::http::HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    trust: crate::rate_limit::TrustedProxy,
+) -> Option<String> {
+    crate::rate_limit::client_key(headers, peer, trust)
+}
+
+/// Acquire the per-caller read sub-cap permit (#174), or shed with a 503. `key` is
+/// `None` when no caller key resolves — that request is bounded by the global read
+/// pool only and is never shed here (returns `Ok(None)`). `handler` labels the shed
+/// log line. Shared by both read handlers so the two acquire sites cannot drift.
+fn acquire_read_caller_permit(
+    limiter: &crate::rate_limit::PerCallerConcurrency,
+    key: Option<&str>,
+    repo: &str,
+    handler: &str,
+) -> Result<Option<crate::rate_limit::PerCallerPermit>> {
+    match key {
+        Some(k) => match limiter.try_acquire(k) {
+            Some(p) => Ok(Some(p)),
+            None => {
+                tracing::warn!(repo = %repo, caller = %k, handler, "per-caller cap reached; shedding with 503");
+                Err(AppError::Overloaded(
+                    "git service at capacity for this caller, retry shortly".into(),
+                ))
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+/// Acquire an encryption-walk admission permit, then run the bounded withheld-blob
+/// recipients walk. Blocks (defers) when `git_encrypt_semaphore` is full rather than
+/// shedding — the walk is background so added latency is fine, and dropping it would
+/// lose the withheld-blob recovery copy (#174 P1-e). Bounds the number of concurrent
+/// post-push encryption walks so N fast completed pushes cannot spawn N concurrent
+/// full-history git walks. Mirrors the original `spawn_blocking(...).await` return
+/// shape so the caller's `Ok(Ok(recipients))` match is unchanged.
+async fn withheld_recipients_gated(
+    encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
+    repo_path: std::path::PathBuf,
+    git_bin: String,
+    timeout: std::time::Duration,
+    rules: Vec<crate::db::VisibilityRule>,
+    is_public: bool,
+    owner_did: String,
+) -> std::result::Result<
+    anyhow::Result<std::collections::HashMap<String, std::collections::BTreeSet<String>>>,
+    tokio::task::JoinError,
+> {
+    let _permit = encrypt_sem
+        .acquire_owned()
+        .await
+        .expect("git_encrypt_semaphore is never closed");
+    tokio::task::spawn_blocking(move || {
+        crate::git::visibility_pack::withheld_blob_recipients_bounded(
+            &repo_path, &git_bin, timeout, &rules, is_public, &owner_did,
+        )
+    })
+    .await
+}
+
+/// Everything the detached post-push pin/encrypt task needs, cloned once at spawn
+/// and shared by the snapshot iteration and every coalesced-drain iteration
+/// (#174 F5).
+struct EncryptTaskCtx {
+    ipfs_api: String,
+    repo_path: std::path::PathBuf,
+    db: Arc<crate::db::Db>,
+    repo_id: String,
+    owner_did: String,
+    repo_name: String,
+    irys_url: String,
+    http_client: Arc<reqwest::Client>,
+    node_did: String,
+    node_keypair: Arc<gitlawb_core::identity::Keypair>,
+    git_bin: String,
+    git_timeout: std::time::Duration,
+    encrypt_sem: Arc<tokio::sync::Semaphore>,
+    pin_sem: Arc<tokio::sync::Semaphore>,
+}
+
+/// The detached post-push pin/encrypt task (#174 P2-2 + F5): run this push's own
+/// pre-resolved snapshot through the pipeline, then loop-drain every push that
+/// coalesced against the in-flight key until a finish attempt finds nothing
+/// pending (which releases the key in the same critical section).
+///
+/// The loop holds NO encrypt-pool permit at the task level: each helper it calls
+/// (`replication_withheld_set`, `resolve_candidates_for_push`,
+/// `fail_closed_full_scan_objects`, `withheld_recipients_gated`) acquires and
+/// releases its own walk permit, so the drain makes progress at pool size 1 — a
+/// task-level permit would nest over those same-semaphore acquires and deadlock.
+async fn run_encrypt_pin_task(
+    ctx: EncryptTaskCtx,
+    guard: crate::state::EncryptInflightGuard,
+    snapshot_objects: Vec<String>,
+    snapshot_rules: Option<Vec<crate::db::VisibilityRule>>,
+    snapshot_is_public: bool,
+) {
+    pin_and_encrypt_objects(&ctx, snapshot_objects, snapshot_rules, snapshot_is_public).await;
+    let mut guard = guard;
+    loop {
+        match guard.finish_or_take_pending() {
+            crate::state::FinishOutcome::Finished(_) => break,
+            crate::state::FinishOutcome::Pending(g, pending) => {
+                guard = g;
+                if let Some((object_list, rules, is_public)) =
+                    resolve_drain_object_list(&ctx, pending).await
+                {
+                    pin_and_encrypt_objects(&ctx, object_list, rules, is_public).await;
+                }
+            }
+        }
+    }
+}
+
+/// Resolve a coalesced-drain iteration's replicable object list. Re-fetches the
+/// repo record and visibility rules FRESH — rules tightened between the coalesced
+/// push and its drain must be honored, fail closed: a newly-withheld blob is not
+/// pinned, and a repo that is no longer announceable (or whose record cannot be
+/// re-read) pins nothing at all (`None`). Returns the filtered object list plus
+/// the fresh rules/is_public snapshot for the encrypt stage — the same
+/// resolution → withheld-filter pipeline the receive-pack tail runs.
+async fn resolve_drain_object_list(
+    ctx: &EncryptTaskCtx,
+    pending: crate::state::PendingWork,
+) -> Option<(Vec<String>, Option<Vec<crate::db::VisibilityRule>>, bool)> {
+    let record = match ctx.db.get_repo(&ctx.owner_did, &ctx.repo_name).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            tracing::warn!(
+                repo = %ctx.repo_id,
+                "coalesced drain: repo record is gone; dropping the pending work"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(
+                repo = %ctx.repo_id,
+                err = %e,
+                "coalesced drain: repo re-fetch failed; pinning nothing (fail closed)"
+            );
+            return None;
+        }
+    };
+    // record.id, never the spawn-time ctx.repo_id: the record above is re-fetched
+    // fresh by owner/name, and a delete+re-create between spawn and drain gives
+    // the row a NEW id — rules read against the stale id come back empty and
+    // would fail open for the new row.
+    let rules_opt = ctx.db.list_visibility_rules(&record.id).await.ok();
+    let (_announce, withheld) = replication_withheld_set(
+        ctx.encrypt_sem.clone(),
+        rules_opt.clone(),
+        &record.owner_did,
+        record.is_public,
+        ctx.repo_path.clone(),
+        ctx.git_bin.clone(),
+        ctx.git_timeout,
+    )
+    .await;
+    let withheld_set = match withheld {
+        Some(w) => w,
+        None => {
+            tracing::info!(
+                repo = %ctx.repo_id,
+                "coalesced drain: repo is not announceable under current rules; \
+                 pinning nothing (fail closed)"
+            );
+            return None;
+        }
+    };
+    let (new_tips, old_tips, force_full_scan) = match pending {
+        crate::state::PendingWork::Tips(pairs) => {
+            let new_tips: Vec<String> = pairs
+                .iter()
+                .map(|(_, n)| n.clone())
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            let old_tips: Vec<String> = pairs
+                .into_iter()
+                .map(|(o, _)| o)
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            (new_tips, old_tips, false)
+        }
+        // The overflow marker forces the full scan via the explicit flag. It must
+        // never be encoded as a plain empty-tips call: empty tips resolve to an
+        // empty delta and would pin nothing (the F5 silent loss again).
+        crate::state::PendingWork::FullScan => (Vec::new(), Vec::new(), true),
+    };
+    let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+        ctx.encrypt_sem.clone(),
+        ctx.repo_path.clone(),
+        new_tips,
+        old_tips,
+        ctx.git_bin.clone(),
+        ctx.git_timeout,
+        force_full_scan,
+    )
+    .await;
+    let object_list = if pin_set.full_scan {
+        fail_closed_full_scan_objects(
+            ctx.encrypt_sem.clone(),
+            ctx.repo_path.clone(),
+            rules_opt.clone().unwrap_or_default(),
+            record.is_public,
+            record.owner_did.clone(),
+            pin_set.candidates,
+            ctx.git_bin.clone(),
+            ctx.git_timeout,
+        )
+        .await
+    } else {
+        crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
+    };
+    Some((object_list, rules_opt, record.is_public))
+}
+
+/// Re-derive the Pinata replication object set for a push from its ref-update
+/// tuples (#174 F2 / KTD-3).
+///
+/// The detached Pinata task used to MOVE the push's full pre-resolved object list
+/// into its closure and hold it across the `pin_semaphore` await. Under a slow
+/// Pinata backend every later push then parked a fresh task each still retaining
+/// an MB-scale OID list, so outstanding memory grew O(pushes x object-list) —
+/// unbounded. The task now captures only the small `(ref, old, new)` tuples and
+/// calls this once a pin slot frees, re-deriving the SAME OID set via
+/// `git rev-list` (the delta scan) filtered by the current withheld set. Retained
+/// memory is O(ref tuples); the object list is materialized only inside the
+/// pin-bounded section, so at most `pin_semaphore` permits' worth exist at once.
+///
+/// Coalescing / shedding were rejected because the task's per-ref work is
+/// non-idempotent (branch->CID upsert, gossip, GraphQL broadcast, Arweave anchor,
+/// peer-notify); dropping a later push's task drops its announcements. Only the
+/// retained object list is dropped here, not the task, so every push's effects
+/// still fire exactly once.
+///
+/// Exactly like `resolve_drain_object_list`: the withheld and candidate sets are
+/// recomputed from the rules snapshot captured at post-receive tail start (NOT a
+/// fresh read at pin-worker time), so a rule tightened up to that point is honored
+/// and the filter always fails closed (a newly-withheld blob is not pinned; a
+/// no-longer-announceable repo pins nothing). A tightening AFTER tail-start — before
+/// a slow re-derivation runs — is not reflected, matching the old retained-list
+/// behavior; the reconciliation sweep is the backstop. Every git child runs
+/// through the same INV-22 bounded, process-group-reaped helpers the sibling
+/// post-receive scans use (`replication_withheld_set`,
+/// `resolve_candidates_for_push`, `fail_closed_full_scan_objects`).
+#[allow(clippy::too_many_arguments)]
+async fn pinata_object_list_for_refs(
+    encrypt_sem: Arc<tokio::sync::Semaphore>,
+    disk_path: std::path::PathBuf,
+    ref_updates: &[(String, String, String)],
+    rules_opt: Option<Vec<crate::db::VisibilityRule>>,
+    is_public: bool,
+    owner_did: String,
+    git_bin: String,
+    timeout: std::time::Duration,
+) -> Vec<String> {
+    let (_announce, withheld) = replication_withheld_set(
+        encrypt_sem.clone(),
+        rules_opt.clone(),
+        &owner_did,
+        is_public,
+        disk_path.clone(),
+        git_bin.clone(),
+        timeout,
+    )
+    .await;
+    // Not announceable, or the withheld walk failed: replicate nothing (fail
+    // closed) — mirrors the receive-pack tail's `withheld == None` handling.
+    let withheld_set = match withheld {
+        Some(w) => w,
+        None => return Vec::new(),
+    };
+    let new_tips: Vec<String> = ref_updates
+        .iter()
+        .map(|(_, _, new)| new.clone())
+        .filter(|s| s != ZERO_SHA)
+        .collect();
+    let old_tips: Vec<String> = ref_updates
+        .iter()
+        .map(|(_, old, _)| old.clone())
+        .filter(|s| s != ZERO_SHA)
+        .collect();
+    let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+        encrypt_sem.clone(),
+        disk_path.clone(),
+        new_tips,
+        old_tips,
+        git_bin.clone(),
+        timeout,
+        false,
+    )
+    .await;
+    if pin_set.full_scan {
+        fail_closed_full_scan_objects(
+            encrypt_sem,
+            disk_path,
+            rules_opt.unwrap_or_default(),
+            is_public,
+            owner_did,
+            pin_set.candidates,
+            git_bin,
+            timeout,
+        )
+        .await
+    } else {
+        crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
+    }
+}
+
+/// The pin/encrypt pipeline shared by the snapshot iteration and the
+/// coalesced-drain iterations: local IPFS pin, then (path-scoped rules only) the
+/// admission-gated recipients walk → encrypt-then-pin → Arweave manifest anchor.
+/// Pin `object_list` to the local IPFS node under the global pin-admission permit
+/// (#174 F6). `EncryptInflight` bounds the pin-task COUNT to one per repo, but each
+/// pin loop holds a full per-push object-id list while walking it; this permit bounds
+/// how many such MB-scale lists are held at once across all repos. DEFERS (waits) when
+/// the pool is full — never drops, since a dropped pin loses the replication copy.
+async fn pin_new_objects_gated(
+    pin_sem: &Arc<tokio::sync::Semaphore>,
+    ipfs_api: &str,
+    repo_path: &std::path::Path,
+    object_list: Vec<String>,
+    db: &Arc<crate::db::Db>,
+) -> Vec<(String, String)> {
+    let _permit = pin_sem
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("pin_semaphore is never closed");
+    crate::ipfs_pin::pin_new_objects(ipfs_api, repo_path, object_list, db).await
+}
+
+async fn pin_and_encrypt_objects(
+    ctx: &EncryptTaskCtx,
+    object_list: Vec<String>,
+    rules: Option<Vec<crate::db::VisibilityRule>>,
+    is_public: bool,
+) {
+    let pinned = pin_new_objects_gated(
+        &ctx.pin_sem,
+        &ctx.ipfs_api,
+        &ctx.repo_path,
+        object_list,
+        &ctx.db,
+    )
+    .await;
+    if !pinned.is_empty() {
+        tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
+        for (sha, cid) in &pinned {
+            tracing::info!(sha = %sha, %cid, "pinned");
+        }
+    }
+
+    // Option B1: encrypt-then-pin the withheld blobs so authorized readers can
+    // recover them when the origin cannot serve them. No path-scoped rule can
+    // withhold a blob, so withheld_blob_recipients would return an empty map
+    // after a full per-ref walk; skip it. Mirrors the has_path_scoped_rule gate
+    // on the other two withheld-walk sites.
+    if let Some(rules) = rules.filter(|r| visibility_pack::has_path_scoped_rule(r)) {
+        // Bound the number of concurrent post-push encryption walks (#174 P1-e):
+        // acquire an admission permit before the full-history walk, deferring
+        // when the pool is full rather than shedding the recovery pin.
+        let recip = withheld_recipients_gated(
+            ctx.encrypt_sem.clone(),
+            ctx.repo_path.clone(),
+            ctx.git_bin.clone(),
+            ctx.git_timeout,
+            rules,
+            is_public,
+            ctx.owner_did.clone(),
+        )
+        .await;
+        if let Ok(Ok(recipients)) = recip {
+            let node_seed = ctx.node_keypair.to_seed();
+            let delta = crate::encrypted_pin::encrypt_and_pin(
+                &ctx.ipfs_api,
+                &ctx.repo_path,
+                &ctx.db,
+                &ctx.repo_id,
+                &node_seed,
+                &recipients,
+            )
+            .await;
+
+            // Option B3: anchor a per-push manifest of the blobs sealed this
+            // push to Arweave, so the oid->cid index survives total node loss.
+            // Best-effort; never fails the push.
+            if !delta.is_empty() && !ctx.irys_url.is_empty() {
+                let owner_short = crate::db::normalize_owner_key(&ctx.owner_did);
+                let repo_slug = format!("{owner_short}/{}", ctx.repo_name);
+                let ts = chrono::Utc::now().to_rfc3339();
+                let manifest = crate::arweave::EncryptedManifest {
+                    repo: &repo_slug,
+                    owner_did: &ctx.owner_did,
+                    node_did: &ctx.node_did,
+                    timestamp: &ts,
+                    blobs: &delta,
+                };
+                match crate::arweave::anchor_encrypted_manifest(
+                    &ctx.http_client,
+                    &ctx.irys_url,
+                    &manifest,
+                )
+                .await
+                {
+                    Ok(tx) if !tx.is_empty() => tracing::info!(
+                        repo = %repo_slug,
+                        tx_id = %tx,
+                        "anchored encrypted manifest to Arweave"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        repo = %repo_slug,
+                        err = %e,
+                        "encrypted manifest anchor failed"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 /// Map an error from a `smart_http` git service call to the right `AppError`:
@@ -614,8 +1219,19 @@ pub async fn git_upload_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     auth: Option<Extension<AuthenticatedDid>>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
+    // #62 cheap pre-DB load shed (see git_info_refs): shed before DB when the read
+    // pool is saturated; the authoritative hold is `git_permit` below, after the
+    // per-source cap.
+    if state.git_read_semaphore.available_permits() == 0 {
+        tracing::warn!("served-git concurrency cap reached; shedding request with 503 (pre-DB)");
+        return Err(AppError::Overloaded(
+            "git service at capacity, retry shortly".into(),
+        ));
+    }
     let name = smart_http_repo_name(&repo)?;
     let record = state
         .db
@@ -636,11 +1252,41 @@ pub async fn git_upload_pack(
         return Err(AppError::RepoNotFound(format!("{owner}/{name}")));
     }
 
-    let disk_path = state
-        .repo_store
-        .acquire(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+    // Per-caller read sub-cap (#174): after the visibility gate (KTD7) so a
+    // visibility-denied caller never consumes a scarce read slot. Keyed on the
+    // resolved source IP (never the signed DID, #174 U1); no resolvable key ->
+    // global read pool only.
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+    let _caller_permit = acquire_read_caller_permit(
+        &state.git_read_per_caller,
+        caller_key.as_deref(),
+        name,
+        "upload-pack",
+    )?;
+
+    // Shed with a 503 before spawning git when the concurrency cap is saturated;
+    // held for the whole op (incl. the smart_http call), released on return. Taken
+    // AFTER the per-source cap above so one source cannot occupy global slots it
+    // would be sub-cap-denied for during the DB/visibility window and starve other
+    // sources; still before acquire/git so it bounds the Tigris acquire and git
+    // exec (INV-10).
+    let _permit = git_permit(&state.git_read_semaphore)?;
+
+    // Bound the acquire under `git_acquire_timeout_secs` so a hung Tigris HEAD/GET
+    // cannot pin the read permit indefinitely (#174 P1-2). The permit is a handler
+    // local here (moved into the AdmissionGuard only below, once git is spawned), so
+    // the early return on timeout drops it and frees the slot; shed a bounded 503.
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let disk_path = tokio::time::timeout(
+        acquire_deadline,
+        state.repo_store.acquire(&record.owner_did, &record.name),
+    )
+    .await
+    .map_err(|_elapsed| {
+        tracing::warn!(repo = %name, "repo acquire timed out; shedding with 503");
+        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+    })?
+    .map_err(|e| AppError::Git(e.to_string()))?;
     let body_len = body.len();
 
     // No path-scoped rule can withhold an individual blob, and the whole-repo
@@ -648,35 +1294,72 @@ pub async fn git_upload_pack(
     // withheld walk and serve the pack directly.
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     let resp = if !visibility_pack::has_path_scoped_rule(&rules) {
-        smart_http::upload_pack(&disk_path, body, git_timeout).await
+        // Plain (non-path-scoped) serve: move both admission permits into the guard so
+        // they release only after the spawned git group is reaped, on
+        // complete/timeout/disconnect — not the instant a disconnect drops this future
+        // (#174 P1-a). The handler keeps no copy.
+        let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+        smart_http::upload_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await
     } else {
-        // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep
-        // that off the async worker thread.
-        let withheld = {
+        // withheld_blob_oids walks every ref with blocking `git ls-tree`; keep that
+        // off the async worker thread. Move BOTH admission permits INTO the blocking
+        // task so they are held for the walk's real duration: spawn_blocking cannot be
+        // cancelled, so on a client disconnect the handler future drops but the walk
+        // keeps running — and now so do its permits, released only when the walk
+        // finishes rather than the instant the future drops (#174 P1-b). On success the
+        // task hands the permits back so the serve phase below keeps them; on a
+        // dropped future the returned tuple (with the permits) is discarded only when
+        // the blocking task completes, so admission tracks the real git work.
+        let (withheld, _permit, _caller_permit) = {
             let path = disk_path.clone();
             let rules = rules.clone();
             let owner_did = record.owner_did.clone();
             let caller_owned = caller.map(str::to_string);
             let is_public = record.is_public;
+            let git_bin = state.git_bin.clone();
             tokio::task::spawn_blocking(move || {
-                visibility_pack::withheld_blob_oids(
+                let withheld = visibility_pack::withheld_blob_oids_bounded(
                     &path,
+                    &git_bin,
+                    git_timeout,
                     &rules,
                     is_public,
                     &owner_did,
                     caller_owned.as_deref(),
-                )
+                );
+                (withheld, _permit, _caller_permit)
             })
             .await
             .map_err(|e| AppError::Git(e.to_string()))?
-            .map_err(|e| AppError::Git(e.to_string()))?
         };
+        // A walk that hit its deadline carries GitServiceTimeout; map it to 504 like
+        // the smart_http paths, not a generic 500 (#174 U3).
+        let withheld = withheld.map_err(|e| git_service_app_error(&e))?;
 
+        // Move the permits returned by the walk into the guard, ONE construction
+        // site for both serve arms below, so admission tracks the served git group's
+        // reap (complete/timeout/disconnect) whether the pack is plain or filtered.
+        // The handler keeps no copy (F1: handler-local permits would drop the
+        // instant a disconnect drops this future, mid-reap).
+        let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
         if withheld.is_empty() {
-            smart_http::upload_pack(&disk_path, body, git_timeout).await
+            // No blobs to withhold: serve the plain pack (the walk already held the
+            // permits per be0cdd6; the guard hands them to the serve).
+            smart_http::upload_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await
         } else {
             tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
-            smart_http::upload_pack_excluding(&disk_path, body, &withheld).await
+            // The guard threads through both filtered-pack stages (rev-list, then
+            // pack-objects), so a disconnect mid-stage keeps the permits held until
+            // that stage's process group is reaped (F1).
+            smart_http::upload_pack_excluding(
+                &state.git_bin,
+                &disk_path,
+                body,
+                &withheld,
+                git_timeout,
+                Some(admission),
+            )
+            .await
         }
     }
     .map_err(|e| {
@@ -851,9 +1534,21 @@ pub async fn git_receive_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Extension(auth): Extension<AuthenticatedDid>,
+    crate::rate_limit::PeerAddr(peer): crate::rate_limit::PeerAddr,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
     let name = smart_http_repo_name(&repo)?;
+    // Fast-path shed BEFORE the DB lookup when the write pool is saturated, so a push
+    // flood on a full pool does not hit Postgres per request. Best-effort (racy) and
+    // NON-holding: the authoritative, held permit is taken after the per-repo lease below
+    // (so a lease-blocked waiter pins no write slot — #174 F3 review). This peek only
+    // restores the cheap pre-DB shed the permit reorder would otherwise have lost.
+    if state.git_write_semaphore.available_permits() == 0 {
+        return Err(AppError::Overloaded(
+            "git service at capacity, retry shortly".into(),
+        ));
+    }
     tracing::info!(owner = %owner, repo = %name, "receive-pack request");
     let record = state
         .db
@@ -923,25 +1618,116 @@ pub async fn git_receive_pack(
         }
     }
 
+    // Per-repo in-process write lease (#174 U2/F3): SUPPLEMENTS the cluster-wide pg
+    // advisory lock. Acquire it BEFORE acquire_write (one consistent order everywhere,
+    // so the two serializers can never invert into a self-hang) so a second SAME-NODE
+    // push to this repo blocks here rather than racing a disconnected first push's git
+    // group while its detached reaper is still tearing it down over the shared local
+    // objects/ dir. Taking it before the pg lock also means a blocked second writer pins
+    // no pooled pg connection while it waits. The lease rides the write-path
+    // AdmissionGuard into the reaper (clone (a)) and spans the clean-path Tigris upload
+    // in guard.release (clone (b)); it frees only when the LAST clone drops. steal_after
+    // is sized above ONE legitimate hold (a full receive-pack under git_service_timeout +
+    // the ~4s reaper cap + the Tigris upload). It is NOT a guarantee that only a leaked
+    // lease is reclaimed: a waiter's timeout starts at acquire(), not at the head of the
+    // FIFO queue, so a same-repo backlog whose CUMULATIVE wait exceeds steal_after can
+    // steal while an earlier waiter is still writing. Correctness does not rest on the
+    // bound — on the non-disconnect path the retained pg advisory lock still serializes
+    // the stealer at acquire_write (a spurious 503, not a race); the only corruption-capable
+    // overlap is the ~4s disconnect/reap window, which the reaper-carried clone (a) covers.
+    let lease_steal_after =
+        std::time::Duration::from_secs(state.config.git_service_timeout_secs * 2 + 60);
+    let lease = state
+        .repo_write_leases
+        .acquire(&record.id, lease_steal_after)
+        .await;
+
+    // Admission permits are taken HERE, AFTER the per-repo lease and BEFORE acquire_write.
+    // Ordering is the fix (#174 P2 DoS): the lease is a block-and-wait serializer, so a
+    // second same-repo push can park on `acquire` above for up to steal_after. Taking the
+    // scarce write permits only once we own the lease means a lease-blocked waiter pins NO
+    // write-pool slot while it waits. Otherwise a few hostile sources could stack same-repo
+    // pushes, hold every global slot on zero-byte lease-waiters, and shed 503 on every push
+    // to every OTHER repo node-wide. Still before acquire_write, so the git op stays
+    // admission-gated (INV-10) and a saturated pool sheds 503 before spawning git.
+    //
+    // Per-source sub-cap first (#174 P1-d): one source IP cannot occupy the whole write
+    // pool via many slow pushes. Owner enforcement defaults off, so any valid did:key is
+    // accepted (auth != authz) and the push rate limiter bounds arrival RATE, not in-flight
+    // concurrency. Keyed on the resolved source IP, NEVER the signed DID (a DID farm defeats
+    // a DID key); no resolvable key -> global write pool only. Then the global write permit:
+    // pushes draw from the dedicated WRITE pool, separate from reads, and it is held for the
+    // whole op (moved into the AdmissionGuard below).
+    let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
+    let _caller_permit = acquire_read_caller_permit(
+        &state.git_write_per_caller,
+        caller_key.as_deref(),
+        name,
+        "receive-pack",
+    )?;
+    let _permit = git_permit(&state.git_write_semaphore)?;
+
     tracing::debug!(repo = %name, "acquiring write lock");
-    let guard = state
-        .repo_store
-        .acquire_write(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| {
-            tracing::error!(repo = %name, err = %e, "acquire_write failed");
-            AppError::Git(e.to_string())
-        })?;
+    // Bound the write acquire under `git_acquire_timeout_secs`. acquire_write's
+    // advisory-lock loop already caps at ~60s, but its per-iteration
+    // `pg_try_advisory_lock().fetch_one(&pool)` can block indefinitely on a hung /
+    // exhausted Postgres pool (so the 60-count never advances) — and the write permit
+    // is held the whole time, draining the pool (#174 P1-2). The outer
+    // `tokio::time::timeout` cancels a mid-sleep/mid-`fetch_one` future, so it bounds
+    // both the loop and a hung iteration without any repo_store.rs change (KTD3). The
+    // permit is a handler local here (moved into the AdmissionGuard only after this),
+    // so the early return on timeout drops it and frees the slot; shed a bounded 503.
+    let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
+    let guard = tokio::time::timeout(
+        acquire_deadline,
+        state
+            .repo_store
+            .acquire_write(&record.owner_did, &record.name),
+    )
+    .await
+    .map_err(|_elapsed| {
+        tracing::warn!(repo = %name, "acquire_write timed out; shedding with 503");
+        AppError::Overloaded("git service acquisition timed out, retry shortly".into())
+    })?
+    .map_err(|e| {
+        tracing::error!(repo = %name, err = %e, "acquire_write failed");
+        AppError::Git(e.to_string())
+    })?;
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
     let body_len = body.len();
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-    let receive_result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
+    // Move both admission permits into the guard so they release only after the spawned
+    // receive-pack process group is reaped, on complete/timeout/disconnect — not the
+    // instant a disconnect drops this future while the detached reaper runs (#174 P1-a).
+    // The handler keeps no copy. This is independent of the write-lock `guard.release`
+    // below: admission tracks the git process lifetime, the write lock tracks the repo.
+    // Clone (a) of the write lease rides this AdmissionGuard: on a client disconnect the
+    // guard moves into KillGroupOnDrop's detached reaper, so the lease frees only after
+    // the receive-pack group is reaped — NOT at the disconnect instant (which is exactly
+    // when RepoWriteGuard::Drop frees the pg lock). Tying the lease to RepoWriteGuard
+    // instead would drop it at disconnect and reopen the F3 race.
+    let admission =
+        smart_http::AdmissionGuard::new(_permit, _caller_permit).with_lease(lease.clone());
+    let receive_result = smart_http::receive_pack(
+        &state.git_bin,
+        &disk_path,
+        body,
+        git_timeout,
+        Some(admission),
+    )
+    .await;
 
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
     guard.release(receive_result.is_ok()).await;
+    // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
+    // group was reaped; clone (b) held here spanned the success-only Tigris upload that
+    // ran inside release() above. Drop it now so a second same-repo push proceeds the
+    // moment this write is durable, rather than at end of the (longer) handler tail. On
+    // the disconnect path this line is never reached — clone (a) rides the reaper (F3).
+    drop(lease);
 
     let result = receive_result.map_err(|e| {
         let app = git_service_app_error(&e);
@@ -1044,331 +1830,376 @@ pub async fn git_receive_pack(
         }
     }
 
-    // Replication enforcement (Phase 2): decide once per push whether the public
-    // may read this repo at all and, if so, which blob OIDs must not leave the
-    // node. `withheld == None` means replicate nothing (private / mode A /
-    // undetermined): skip every pin so even commit and tree objects (which
-    // withheld_blob_oids never lists) stay local. `announce` gates the
-    // network-facing announcements. Fail closed: a private or undetermined repo
-    // never leaks.
-    let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
-    let (announce, withheld) = replication_withheld_set(
-        rules_opt.clone(),
-        &record.owner_did,
-        record.is_public,
-        disk_path.clone(),
-    )
-    .await;
-
-    // Resolve the per-push pin candidate set once, off the async worker, then
-    // filter to what may actually replicate. Delta path: the reachable-only
-    // `withheld` set suffices (delta objects are reachable). Full-scan path: the
-    // candidate set can include dangling blobs the withheld set never classified,
-    // so fail closed — replicate a blob only if it is reachable AND
-    // visibility-allowed (#99). Only computed when something will actually
-    // replicate; every degraded path logs rather than failing silently.
-    let object_list: Vec<String> = if let Some(withheld_set) = withheld.clone() {
-        let new_tips: Vec<String> = ref_updates
-            .iter()
-            .map(|u| u.new_sha.clone())
-            .filter(|s| s != ZERO_SHA)
-            .collect();
-        let old_tips: Vec<String> = ref_updates
-            .iter()
-            .map(|u| u.old_sha.clone())
-            .filter(|s| s != ZERO_SHA)
-            .collect();
-        let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+    // #174 F2: move the whole post-receive replication tail into an independently owned
+    // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
+    // resolution), so leaving it in the request future means a client/proxy disconnect
+    // while parked silently drops this push's pins, recovery copy, and announcements —
+    // the residual `state.rs` documented, because the durable `try_begin` gate sat after
+    // the park. The request future now returns the git response immediately and the tail
+    // runs detached; a disconnect can no longer drop it. Each push owns its own tail,
+    // including its own always-spawned announce, so per-push announcements are never
+    // coalesced away (the announce spawn stays out of the per-repo encrypt coalescing).
+    let did = did.to_string();
+    tokio::spawn(async move {
+        // Replication enforcement (Phase 2): decide once per push whether the public
+        // may read this repo at all and, if so, which blob OIDs must not leave the
+        // node. `withheld == None` means replicate nothing (private / mode A /
+        // undetermined): skip every pin so even commit and tree objects (which
+        // withheld_blob_oids never lists) stay local. `announce` gates the
+        // network-facing announcements. Fail closed: a private or undetermined repo
+        // never leaks.
+        let rules_opt = state.db.list_visibility_rules(&record.id).await.ok();
+        let (announce, withheld) = replication_withheld_set(
+            state.git_encrypt_semaphore.clone(),
+            rules_opt.clone(),
+            &record.owner_did,
+            record.is_public,
             disk_path.clone(),
-            new_tips,
-            old_tips,
+            state.git_bin.clone(),
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
         )
         .await;
-        if pin_set.full_scan {
-            fail_closed_full_scan_objects(
-                disk_path.clone(),
-                rules_opt.clone().unwrap_or_default(),
-                record.is_public,
-                record.owner_did.clone(),
-                pin_set.candidates,
-            )
-            .await
-        } else {
-            crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
-        }
-    } else {
-        Vec::new()
-    };
 
-    // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
-    // Skipped entirely when the public cannot read the repo (withheld == None).
-    if withheld.is_some() {
-        let object_list_ipfs = object_list.clone();
-        let ipfs_api = state.config.ipfs_api.clone();
-        let repo_path_clone = disk_path.clone();
-        let db_clone = state.db.clone();
-        let rules_for_enc = rules_opt.clone();
-        let repo_id = record.id.clone();
-        let owner_did = record.owner_did.clone();
-        let is_public = record.is_public;
-        let irys_url = state.config.irys_url.clone();
-        let http_client = std::sync::Arc::clone(&state.http_client);
-        let node_did_str = state.node_did.to_string();
-        let node_seed = state.node_keypair.to_seed();
-        let repo_name = record.name.clone();
-        tokio::spawn(async move {
-            let pinned = crate::ipfs_pin::pin_new_objects(
-                &ipfs_api,
-                &repo_path_clone,
-                object_list_ipfs,
-                &db_clone,
+        // Resolve the per-push pin candidate set once, off the async worker, then
+        // filter to what may actually replicate. Delta path: the reachable-only
+        // `withheld` set suffices (delta objects are reachable). Full-scan path: the
+        // candidate set can include dangling blobs the withheld set never classified,
+        // so fail closed — replicate a blob only if it is reachable AND
+        // visibility-allowed (#99). Only computed when something will actually
+        // replicate; every degraded path logs rather than failing silently.
+        let object_list: Vec<String> = if let Some(withheld_set) = withheld.clone() {
+            let new_tips: Vec<String> = ref_updates
+                .iter()
+                .map(|u| u.new_sha.clone())
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            let old_tips: Vec<String> = ref_updates
+                .iter()
+                .map(|u| u.old_sha.clone())
+                .filter(|s| s != ZERO_SHA)
+                .collect();
+            let pin_set = crate::git::push_delta::resolve_candidates_for_push(
+                state.git_encrypt_semaphore.clone(),
+                disk_path.clone(),
+                new_tips,
+                old_tips,
+                state.git_bin.clone(),
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                false,
             )
             .await;
-            if !pinned.is_empty() {
-                tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
-                for (sha, cid) in &pinned {
-                    tracing::info!(sha = %sha, %cid, "pinned");
-                }
-            }
-
-            // Option B1: encrypt-then-pin the withheld blobs so authorized
-            // readers can recover them when the origin cannot serve them.
-            // No path-scoped rule can withhold a blob, so withheld_blob_recipients
-            // would return an empty map after a full per-ref walk; skip it. Mirrors
-            // the has_path_scoped_rule gate on the other two withheld-walk sites.
-            if let Some(rules) = rules_for_enc.filter(|r| visibility_pack::has_path_scoped_rule(r))
-            {
-                let p = repo_path_clone.clone();
-                let owner = owner_did.clone();
-                let recip = tokio::task::spawn_blocking(move || {
-                    crate::git::visibility_pack::withheld_blob_recipients(
-                        &p, &rules, is_public, &owner,
-                    )
-                })
-                .await;
-                if let Ok(Ok(recipients)) = recip {
-                    let delta = crate::encrypted_pin::encrypt_and_pin(
-                        &ipfs_api,
-                        &repo_path_clone,
-                        &db_clone,
-                        &repo_id,
-                        &node_seed,
-                        &recipients,
-                    )
-                    .await;
-
-                    // Option B3: anchor a per-push manifest of the blobs sealed
-                    // this push to Arweave, so the oid->cid index survives total
-                    // node loss. Best-effort; never fails the push.
-                    if !delta.is_empty() && !irys_url.is_empty() {
-                        let owner_short = crate::db::normalize_owner_key(&owner_did);
-                        let repo_slug = format!("{owner_short}/{repo_name}");
-                        let ts = chrono::Utc::now().to_rfc3339();
-                        let manifest = crate::arweave::EncryptedManifest {
-                            repo: &repo_slug,
-                            owner_did: &owner_did,
-                            node_did: &node_did_str,
-                            timestamp: &ts,
-                            blobs: &delta,
-                        };
-                        match crate::arweave::anchor_encrypted_manifest(
-                            &http_client,
-                            &irys_url,
-                            &manifest,
-                        )
-                        .await
-                        {
-                            Ok(tx) if !tx.is_empty() => tracing::info!(
-                                repo = %repo_slug,
-                                tx_id = %tx,
-                                "anchored encrypted manifest to Arweave"
-                            ),
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(
-                                repo = %repo_slug,
-                                err = %e,
-                                "encrypted manifest anchor failed"
-                            ),
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    // Pin new git objects to Pinata, then record branch→CID and gossip
-    {
-        let pinata_jwt = state.config.pinata_jwt.clone();
-        let pinata_upload_url = state.config.pinata_upload_url.clone();
-        let repo_path_clone = disk_path.clone();
-        let db_clone = state.db.clone();
-        let http_client = Arc::clone(&state.http_client);
-        let node_did_str = state.node_did.to_string();
-        let repo_slug = format!(
-            "{}/{}",
-            crate::db::normalize_owner_key(&record.owner_did),
-            record.name
-        );
-        let ref_updates_clone = ref_updates
-            .iter()
-            .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
-            .collect::<Vec<_>>();
-        let p2p_handle = state.p2p.clone();
-        let pusher_did_clone = did.to_string();
-        let db_for_peers = state.db.clone();
-        let ref_update_tx = state.ref_update_tx.clone();
-        let irys_url = state.config.irys_url.clone();
-        let owner_did_for_arweave = record.owner_did.clone();
-        let self_public_url = state.config.public_url.clone();
-        let node_keypair = Arc::clone(&state.node_keypair);
-        let object_list_pinata = object_list;
-        let do_pinata_replication = withheld.is_some();
-        tokio::spawn(async move {
-            let pinned = if do_pinata_replication {
-                crate::pinata::pin_new_objects(
-                    &http_client,
-                    &pinata_upload_url,
-                    &pinata_jwt,
-                    &repo_path_clone,
-                    object_list_pinata,
-                    &db_clone,
+            if pin_set.full_scan {
+                fail_closed_full_scan_objects(
+                    state.git_encrypt_semaphore.clone(),
+                    disk_path.clone(),
+                    rules_opt.clone().unwrap_or_default(),
+                    record.is_public,
+                    record.owner_did.clone(),
+                    pin_set.candidates,
+                    state.git_bin.clone(),
+                    std::time::Duration::from_secs(state.config.git_service_timeout_secs),
                 )
                 .await
             } else {
-                Vec::new()
-            };
-
-            if !pinned.is_empty() {
-                tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
+                crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
             }
+        } else {
+            Vec::new()
+        };
 
-            // Build sha→cid map from pinned objects
-            let cid_map: std::collections::HashMap<String, String> = pinned.into_iter().collect();
+        // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
+        // Skipped entirely when the public cannot read the repo (withheld == None).
+        //
+        // Coalesce-and-requeue per repo (#174 P2-2 + F5): the spawned task's walks park
+        // on `git_encrypt_semaphore` (which DEFERS when the pool is full rather than
+        // dropping the recovery copy). To bound the OUTSTANDING task set, at most one
+        // task per repo is in flight; a push arriving while one is in flight does NOT
+        // spawn a duplicate — and is NOT dropped either. The in-flight task pins only
+        // its own pre-spawn object-list snapshot, so this push's (old, new) tip pairs
+        // are merged into the in-flight key's pending slot in the same critical section
+        // as the presence check, and the task loop-drains them (fresh rules, fail
+        // closed) before releasing the key. Without the requeue a coalesced push's pins
+        // and recovery copies would be silently absent until an unrelated later push
+        // (the F5 loss). The guard still releases the key on panic (Drop on unwind), so
+        // a crashed walk never permanently locks the repo out.
+        if withheld.is_some() {
+            let tip_pairs: Vec<(String, String)> = ref_updates
+                .iter()
+                .map(|u| (u.old_sha.clone(), u.new_sha.clone()))
+                .collect();
+            match state.encrypt_inflight.try_begin(&record.id, tip_pairs) {
+                crate::state::BeginOutcome::Coalesced => {
+                    tracing::debug!(
+                        repo = %record.id,
+                        "post-push encryption task already in flight for this repo; coalesced \
+                         — this push's tip pairs are queued for that task's drain"
+                    );
+                }
+                crate::state::BeginOutcome::Admitted(inflight_guard) => {
+                    let ctx = EncryptTaskCtx {
+                        ipfs_api: state.config.ipfs_api.clone(),
+                        repo_path: disk_path.clone(),
+                        db: state.db.clone(),
+                        repo_id: record.id.clone(),
+                        owner_did: record.owner_did.clone(),
+                        repo_name: record.name.clone(),
+                        irys_url: state.config.irys_url.clone(),
+                        http_client: std::sync::Arc::clone(&state.http_client),
+                        node_did: state.node_did.to_string(),
+                        node_keypair: std::sync::Arc::clone(&state.node_keypair),
+                        git_bin: state.git_bin.clone(),
+                        git_timeout: std::time::Duration::from_secs(
+                            state.config.git_service_timeout_secs,
+                        ),
+                        encrypt_sem: state.git_encrypt_semaphore.clone(),
+                        pin_sem: state.pin_semaphore.clone(),
+                    };
+                    tokio::spawn(run_encrypt_pin_task(
+                        ctx,
+                        inflight_guard,
+                        object_list.clone(),
+                        rules_opt.clone(),
+                        record.is_public,
+                    ));
+                }
+            }
+        }
 
-            // Record branch→CID for each ref update and publish gossip
-            for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                let cid = cid_map.get(new_sha).map(|s| s.as_str());
+        // Pin new git objects to Pinata, then record branch→CID and gossip.
+        //
+        // #174 P2-2 scope note: this SECOND detached spawn is deliberately NOT brought
+        // under the per-repo encryption coalescing above, because unlike the idempotent
+        // recovery-copy walk it does PER-PUSH, PER-REF work — branch→CID upserts, gossip
+        // publish, GraphQL subscription broadcast, Arweave anchoring, and peer notify, each
+        // keyed to THIS push's ref_updates. Coalescing (or shedding) it against an in-flight
+        // task for the same repo would DROP a later push's ref-update announcements (a
+        // correctness regression), not merely delay a duplicate. So the task stays one per
+        // push and every push's effects fire exactly once.
+        //
+        // #174 F2 / KTD-3: {bounded memory, no dropped effects, no handler latency} are
+        // jointly unsatisfiable by coalesce/shed/block, so instead of retaining the full
+        // object list we bound the thing that actually accumulates. The task captures only
+        // the small ref tuples and RE-DERIVES the object set inside the worker once a pin
+        // slot frees (see `pinata_object_list_for_refs`); the MB-scale OID list is never
+        // held by a parked task.
+        {
+            let pinata_jwt = state.config.pinata_jwt.clone();
+            let pinata_upload_url = state.config.pinata_upload_url.clone();
+            let repo_path_clone = disk_path.clone();
+            let db_clone = state.db.clone();
+            let http_client = Arc::clone(&state.http_client);
+            let node_did_str = state.node_did.to_string();
+            let repo_slug = format!(
+                "{}/{}",
+                crate::db::normalize_owner_key(&record.owner_did),
+                record.name
+            );
+            let ref_updates_clone = ref_updates
+                .iter()
+                .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
+                .collect::<Vec<_>>();
+            let p2p_handle = state.p2p.clone();
+            let pusher_did_clone = did.to_string();
+            let db_for_peers = state.db.clone();
+            let ref_update_tx = state.ref_update_tx.clone();
+            let irys_url = state.config.irys_url.clone();
+            let owner_did_for_arweave = record.owner_did.clone();
+            let self_public_url = state.config.public_url.clone();
+            let node_keypair = Arc::clone(&state.node_keypair);
+            let do_pinata_replication = withheld.is_some();
+            // #174 F2 / KTD-3: capture only the small inputs the re-derivation needs; the
+            // MB-scale object list is NOT moved in. `pinata_object_list_for_refs` recomputes
+            // it from these once a pin slot frees. rules/owner/is_public drive the fresh
+            // fail-closed withheld filter; encrypt_sem + git_bin + timeout keep the re-derive
+            // git children under the same INV-22 bounded, group-reaped scan admission.
+            let pinata_rules_opt = rules_opt.clone();
+            let pinata_owner_did = record.owner_did.clone();
+            let pinata_is_public = record.is_public;
+            let pinata_git_bin = state.git_bin.clone();
+            let pinata_git_timeout =
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+            let pinata_encrypt_sem = state.git_encrypt_semaphore.clone();
+            // Same global pin-admission bound as the IPFS loop (#174 F6): the Pinata pin
+            // loop holds a re-derived object-id list while pinning it, so it shares the cap.
+            // It DEFERS on a full pool rather than dropping the pin.
+            let pin_sem_pinata = state.pin_semaphore.clone();
+            tokio::spawn(async move {
+                let pinned = if do_pinata_replication {
+                    let _pin_permit = pin_sem_pinata
+                        .acquire_owned()
+                        .await
+                        .expect("pin_semaphore is never closed");
+                    // Re-derive the object set now that a pin slot is free (#174 F2 /
+                    // KTD-3). A parked task retained only `ref_updates_clone` (O(ref
+                    // tuples)), never this list, so a slow Pinata backend cannot grow
+                    // outstanding memory O(pushes x object-list). Fresh + fail-closed;
+                    // each git child is INV-22 bounded and process-group reaped.
+                    let object_list = pinata_object_list_for_refs(
+                        pinata_encrypt_sem,
+                        repo_path_clone.clone(),
+                        &ref_updates_clone,
+                        pinata_rules_opt,
+                        pinata_is_public,
+                        pinata_owner_did,
+                        pinata_git_bin,
+                        pinata_git_timeout,
+                    )
+                    .await;
+                    crate::pinata::pin_new_objects(
+                        &http_client,
+                        &pinata_upload_url,
+                        &pinata_jwt,
+                        &repo_path_clone,
+                        object_list,
+                        &db_clone,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                };
 
-                if let Some(cid_str) = cid {
-                    let _ = db_clone
-                        .upsert_branch_cid(&repo_slug, ref_name, new_sha, cid_str, &node_did_str)
-                        .await;
+                if !pinned.is_empty() {
+                    tracing::info!(count = pinned.len(), "pinned git objects to Pinata");
                 }
 
+                // Build sha→cid map from pinned objects
+                let cid_map: std::collections::HashMap<String, String> =
+                    pinned.into_iter().collect();
+
+                // Record branch→CID for each ref update and publish gossip
+                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                    let cid = cid_map.get(new_sha).map(|s| s.as_str());
+
+                    if let Some(cid_str) = cid {
+                        let _ = db_clone
+                            .upsert_branch_cid(
+                                &repo_slug,
+                                ref_name,
+                                new_sha,
+                                cid_str,
+                                &node_did_str,
+                            )
+                            .await;
+                    }
+
+                    if announce {
+                        if let Some(p2p) = &p2p_handle {
+                            p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
+                                node_did: node_did_str.clone(),
+                                pusher_did: pusher_did_clone.clone(),
+                                repo: repo_slug.clone(),
+                                ref_name: ref_name.clone(),
+                                old_sha: old_sha.clone(),
+                                new_sha: new_sha.clone(),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                cert_id: None,
+                                cid: cid.map(|s| s.to_string()),
+                            })
+                            .await;
+                        }
+                    }
+                }
+
+                // Broadcast ref update to GraphQL subscription listeners — one per ref.
+                // Gated on `announce`: /graphql/ws is unauthenticated (mounted after
+                // the optional_signature layer), and the subscription resolver has no
+                // caller to gate against, so only publicly-readable ref updates may
+                // reach anonymous subscribers. Mirrors the gossip (above) and Arweave
+                // (below) sends, which are already `announce`-gated. Without this a
+                // private-repo push would leak live ref metadata over the socket —
+                // the subscription analog of #112/#114.
+                let now_ts = chrono::Utc::now().to_rfc3339();
                 if announce {
-                    if let Some(p2p) = &p2p_handle {
-                        p2p.publish_ref_update(crate::p2p::RefUpdateEvent {
-                            node_did: node_did_str.clone(),
-                            pusher_did: pusher_did_clone.clone(),
+                    for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                        let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
                             repo: repo_slug.clone(),
                             ref_name: ref_name.clone(),
                             old_sha: old_sha.clone(),
                             new_sha: new_sha.clone(),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                            cert_id: None,
-                            cid: cid.map(|s| s.to_string()),
-                        })
-                        .await;
+                            pusher_did: pusher_did_clone.clone(),
+                            node_did: node_did_str.clone(),
+                            timestamp: now_ts.clone(),
+                        });
                     }
                 }
-            }
 
-            // Broadcast ref update to GraphQL subscription listeners — one per ref.
-            // Gated on `announce`: /graphql/ws is unauthenticated (mounted after
-            // the optional_signature layer), and the subscription resolver has no
-            // caller to gate against, so only publicly-readable ref updates may
-            // reach anonymous subscribers. Mirrors the gossip (above) and Arweave
-            // (below) sends, which are already `announce`-gated. Without this a
-            // private-repo push would leak live ref metadata over the socket —
-            // the subscription analog of #112/#114.
-            let now_ts = chrono::Utc::now().to_rfc3339();
-            if announce {
-                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                    let _ = ref_update_tx.send(crate::state::RefUpdateBroadcast {
-                        repo: repo_slug.clone(),
-                        ref_name: ref_name.clone(),
-                        old_sha: old_sha.clone(),
-                        new_sha: new_sha.clone(),
-                        pusher_did: pusher_did_clone.clone(),
-                        node_did: node_did_str.clone(),
-                        timestamp: now_ts.clone(),
-                    });
-                }
-            }
-
-            // Arweave permanent anchoring — fire for each ref update.
-            // Suppressed for repos the public cannot read (public permanent ledger).
-            if announce && !irys_url.is_empty() {
-                for (ref_name, old_sha, new_sha) in &ref_updates_clone {
-                    let cid = cid_map.get(new_sha).cloned();
-                    let anchor = crate::arweave::RefAnchor {
-                        repo: repo_slug.clone(),
-                        owner_did: owner_did_for_arweave.clone(),
-                        ref_name: ref_name.clone(),
-                        old_sha: old_sha.clone(),
-                        new_sha: new_sha.clone(),
-                        cid: cid.clone(),
-                        timestamp: now_ts.clone(),
-                        node_did: node_did_str.clone(),
-                    };
-                    match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor).await
-                    {
-                        Ok(tx_id) if !tx_id.is_empty() => {
-                            let arweave_url = crate::arweave::arweave_url(&tx_id);
-                            let _ = db_clone
-                                .record_arweave_anchor(&crate::db::RecordAnchorInput {
-                                    repo: &repo_slug,
-                                    owner_did: &owner_did_for_arweave,
-                                    ref_name,
-                                    old_sha,
-                                    new_sha,
-                                    cid: cid.as_deref(),
-                                    irys_tx_id: &tx_id,
-                                    arweave_url: &arweave_url,
-                                    node_did: &node_did_str,
-                                })
-                                .await;
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed"),
-                    }
-                }
-            }
-
-            // HTTP peer notification — notify all known peers to pull from us.
-            // This is the reliable fallback when Gossipsub p2p is not yet connected.
-            // Suppressed for repos the public cannot read. Runs last so a slow or
-            // unreachable peer cannot delay the local GraphQL broadcast or Arweave
-            // anchoring above; this is the lowest-priority best-effort step.
-            if announce {
-                if let Ok(peers) = db_for_peers.list_peers().await {
-                    for peer in peers {
-                        if peer.http_url.is_empty() {
-                            continue;
-                        }
-                        let peer_url = peer.http_url.trim_end_matches('/');
-                        if let Some(self_url) = self_public_url.as_deref() {
-                            if peer_url == self_url.trim_end_matches('/') {
-                                continue;
+                // Arweave permanent anchoring — fire for each ref update.
+                // Suppressed for repos the public cannot read (public permanent ledger).
+                if announce && !irys_url.is_empty() {
+                    for (ref_name, old_sha, new_sha) in &ref_updates_clone {
+                        let cid = cid_map.get(new_sha).cloned();
+                        let anchor = crate::arweave::RefAnchor {
+                            repo: repo_slug.clone(),
+                            owner_did: owner_did_for_arweave.clone(),
+                            ref_name: ref_name.clone(),
+                            old_sha: old_sha.clone(),
+                            new_sha: new_sha.clone(),
+                            cid: cid.clone(),
+                            timestamp: now_ts.clone(),
+                            node_did: node_did_str.clone(),
+                        };
+                        match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor)
+                            .await
+                        {
+                            Ok(tx_id) if !tx_id.is_empty() => {
+                                let arweave_url = crate::arweave::arweave_url(&tx_id);
+                                let _ = db_clone
+                                    .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                                        repo: &repo_slug,
+                                        owner_did: &owner_did_for_arweave,
+                                        ref_name,
+                                        old_sha,
+                                        new_sha,
+                                        cid: cid.as_deref(),
+                                        irys_tx_id: &tx_id,
+                                        arweave_url: &arweave_url,
+                                        node_did: &node_did_str,
+                                    })
+                                    .await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed")
                             }
                         }
-                        let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
-                        notify_peer_of_refs(
-                            &http_client,
-                            node_keypair.as_ref(),
-                            &peer.did,
-                            &notify_url,
-                            &repo_slug,
-                            &ref_updates_clone,
-                            &node_did_str,
-                            &pusher_did_clone,
-                        )
-                        .await;
                     }
                 }
-            }
-        });
-    }
+
+                // HTTP peer notification — notify all known peers to pull from us.
+                // This is the reliable fallback when Gossipsub p2p is not yet connected.
+                // Suppressed for repos the public cannot read. Runs last so a slow or
+                // unreachable peer cannot delay the local GraphQL broadcast or Arweave
+                // anchoring above; this is the lowest-priority best-effort step.
+                if announce {
+                    if let Ok(peers) = db_for_peers.list_peers().await {
+                        for peer in peers {
+                            if peer.http_url.is_empty() {
+                                continue;
+                            }
+                            let peer_url = peer.http_url.trim_end_matches('/');
+                            if let Some(self_url) = self_public_url.as_deref() {
+                                if peer_url == self_url.trim_end_matches('/') {
+                                    continue;
+                                }
+                            }
+                            let notify_url = format!("{peer_url}{SYNC_NOTIFY_PATH}");
+                            notify_peer_of_refs(
+                                &http_client,
+                                node_keypair.as_ref(),
+                                &peer.did,
+                                &notify_url,
+                                &repo_slug,
+                                &ref_updates_clone,
+                                &node_did_str,
+                                &pusher_did_clone,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            });
+        }
+    });
 
     Ok(result)
 }
@@ -1862,6 +2693,17 @@ mod tests {
         assert!(matches!(git_service_app_error(&other), AppError::Git(_)));
     }
 
+    #[test]
+    fn git_permit_sheds_at_capacity_and_releases() {
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let p1 = git_permit(&sem).expect("first acquire succeeds");
+        // At capacity the next request is shed with Overloaded (-> 503), not queued.
+        assert!(matches!(git_permit(&sem), Err(AppError::Overloaded(_))));
+        // Releasing the permit frees the slot for the next request.
+        drop(p1);
+        assert!(git_permit(&sem).is_ok());
+    }
+
     fn repo_owned_by(owner_did: &str) -> crate::db::RepoRecord {
         let now = chrono::Utc::now();
         crate::db::RepoRecord {
@@ -1892,16 +2734,42 @@ mod tests {
         let dummy = std::path::PathBuf::from("/nonexistent");
 
         // Private: no rules at all.
-        let (announce, _) = replication_withheld_set(None, OWNER_DID, false, dummy.clone()).await;
+        let (announce, _) = replication_withheld_set(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            None,
+            OWNER_DID,
+            false,
+            dummy.clone(),
+            "git".into(),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
         assert!(!announce, "private repo (no rules) must not announce");
 
         // Private: empty rule set, is_public=false → still not listable at root.
-        let (announce, _) =
-            replication_withheld_set(Some(vec![]), OWNER_DID, false, dummy.clone()).await;
+        let (announce, _) = replication_withheld_set(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            Some(vec![]),
+            OWNER_DID,
+            false,
+            dummy.clone(),
+            "git".into(),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
         assert!(!announce, "private repo (empty rules) must not announce");
 
         // Public: empty rule set, is_public=true → listable at root, announces.
-        let (announce, _) = replication_withheld_set(Some(vec![]), OWNER_DID, true, dummy).await;
+        let (announce, _) = replication_withheld_set(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            Some(vec![]),
+            OWNER_DID,
+            true,
+            dummy,
+            "git".into(),
+            std::time::Duration::from_secs(600),
+        )
+        .await;
         assert!(announce, "public repo must announce");
     }
 
@@ -1991,6 +2859,151 @@ mod tests {
             created_by: OWNER_DID.into(),
             created_at: chrono::Utc::now(),
         }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_git(dir: &std::path::Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fakegit");
+        std::fs::write(&p, body).unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    /// #174 (write-pool twin, vetted by execution not reasoning): the receive-pack
+    /// post-push replication walk is bounded. Drive `replication_withheld_set` with an
+    /// injected fake git that hangs on `rev-list` and a short budget: it must RETURN
+    /// within the budget (so `git_receive_pack` releases the write permit it holds
+    /// across this await, rather than pinning it for the hang) AND fail closed
+    /// (announce suppressed) because the walk could not be vetted. Proves this path
+    /// funnels through the bounded `blob_paths`, on the write-permit-holding side.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replication_walk_is_bounded_and_fails_closed_on_a_hung_git() {
+        use std::time::Duration;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) sleep 30 ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        // Public root (announceable) + a path-scoped rule, so the walk actually runs
+        // rather than taking the has_path_scoped_rule short-circuit.
+        let rules = Some(vec![vis_rule("/secret/**", &[])]);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            replication_withheld_set(
+                std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+                rules,
+                OWNER_DID,
+                true,
+                tmp.path().to_path_buf(),
+                git_bin,
+                Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect(
+            "replication_withheld_set must return within the budget; a hung walk must \
+             not pin the write permit git_receive_pack holds across it",
+        );
+        assert_eq!(
+            result,
+            (false, None),
+            "a walk that could not be vetted must suppress the announce (fail closed)"
+        );
+    }
+
+    /// #174 (serve-path 504, vetted by execution): a hung withheld-blob walk on the
+    /// upload-pack POST maps to 504, not a generic 500. Real repo dir on disk (so
+    /// acquire's fast path returns it) + a path-scoped rule (so the walk runs) +
+    /// an injected fake git that hangs on rev-list. The handler must return 504,
+    /// proving git_upload_pack routes the walk's GitServiceTimeout through
+    /// git_service_app_error end to end.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn upload_pack_hung_withheld_walk_returns_504(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-list) sleep 30 ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n";
+        let fake = write_fake_git(tmp.path(), body);
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_bin = fake;
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = 1;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo("z6srv504", "sv", "/tmp/z6srv504-sv", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6srv504", "sv").await.unwrap().unwrap();
+        // Path-scoped rule so has_path_scoped_rule() is true and the walk runs; the
+        // public root still lets an anonymous caller past the "/" gate.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[],
+                OWNER_DID,
+            )
+            .await
+            .unwrap();
+        // acquire()'s fast path returns the local path when it exists on disk.
+        let disk = std::path::Path::new("/tmp/z6srv504/sv.git");
+        std::fs::create_dir_all(disk).unwrap();
+
+        let peer: SocketAddr = "203.0.113.91:7000".parse().unwrap();
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/z6srv504/sv/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let status = router.oneshot(req).await.unwrap().status();
+        let _ = std::fs::remove_dir_all("/tmp/z6srv504");
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "a hung withheld-blob walk must surface as 504, not a generic 500"
+        );
+    }
+
+    /// #174 (F2 sizing edge, vetted by execution): the receive-pack advertisement
+    /// per-source cap is derived in main.rs as `(max_concurrent_git_pushes / 8).max(1)`,
+    /// so it is never 0 even at the minimum write-pool size (1). A 0 cap would make
+    /// PerCallerConcurrency shed EVERY receive-pack advertisement and break all pushes.
+    #[test]
+    fn advert_per_caller_cap_sizing_is_never_zero() {
+        let cap = |pushes: usize| (pushes / 8).max(1);
+        for pushes in [1usize, 4, 8, 32, 256] {
+            assert!(
+                cap(pushes) >= 1,
+                "advert cap must be >= 1 for pushes={pushes}"
+            );
+        }
+        assert_eq!(cap(1), 1, "minimum write pool must derive cap 1, not 0");
+        assert_eq!(
+            cap(32),
+            4,
+            "default write pool 32 derives cap 4 (~8 source IPs to fill)"
+        );
+        // A cap of 1 admits one and sheds the second from the same source.
+        let lim = crate::rate_limit::PerCallerConcurrency::new(cap(1), 100);
+        let _held = lim.try_acquire("src").expect("first advert admitted");
+        assert!(
+            lim.try_acquire("src").is_none(),
+            "second advert from the same source is shed"
+        );
     }
 
     #[test]
@@ -2579,6 +3592,3086 @@ mod tests {
         );
     }
 
+    /// #174 P2-1: an unsupported `?service=` must be rejected with 400 BEFORE taking a
+    /// read slot or doing DB/Tigris work. Isolate it: exhaust the read pool so a read
+    /// op WOULD shed 503 at the pre-DB check — a garbage service must still return 400
+    /// (validation runs first), proving `?service=anything` cannot consume the read
+    /// pool. Removing the validation makes this 503 (RED).
+    #[sqlx::test]
+    async fn info_refs_rejects_unsupported_service_before_the_read_slot(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state
+            .db
+            .upsert_mirror_repo("z6svcowner", "svc", "/tmp/svc", None, false)
+            .await
+            .unwrap();
+        // Exhaust the read pool: a read op would shed 503 at the pre-DB check.
+        state.git_read_semaphore = Arc::new(Semaphore::new(0));
+
+        let router = crate::server::build_router(state);
+        let peer: SocketAddr = "203.0.113.90:7000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6svcowner/svc/info/refs?service=git-explode")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let status = router.oneshot(req).await.unwrap().status();
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unsupported ?service= must be 400 before the read-pool shed, not 503"
+        );
+    }
+
+    /// #174 (jatmn P1): the anon-reachable receive-pack advertisement
+    /// (`GET info/refs?service=git-receive-pack`) draws from a DEDICATED advert pool
+    /// (`git_push_advert_semaphore`), NOT the write pool the authenticated POST uses.
+    /// Proven at the handler by saturating each pool to zero and checking who shares
+    /// it (INV-10, across the auth boundary). The load-bearing pair:
+    ///   * advert pool at 0 -> the advert SHEDS 503 (it is bound to that pool);
+    ///   * write pool at 0 -> the advert SURVIVES (it can NOT consume a permit the
+    ///     authenticated POST needs — the reservation jatmn asked for).
+    /// Revert the branch to `git_write_semaphore` and BOTH flip: the advert-pool-0
+    /// case stops shedding and the write-pool-0 case starts shedding (the exact
+    /// anon-sheds-authed-push starvation).
+    #[sqlx::test]
+    async fn receive_pack_advertisement_draws_from_dedicated_advert_pool(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        // Build a fresh state with the three pools sized independently, then drive one
+        // info/refs advertisement for `service` and return its handler status.
+        async fn advert_status(
+            pool: &sqlx::PgPool,
+            read_permits: usize,
+            write_permits: usize,
+            advert_permits: usize,
+            service: &str,
+        ) -> StatusCode {
+            let mut state = crate::test_support::test_state(pool.clone()).await;
+            state.git_read_semaphore = Arc::new(Semaphore::new(read_permits));
+            state.git_write_semaphore = Arc::new(Semaphore::new(write_permits));
+            state.git_push_advert_semaphore = Arc::new(Semaphore::new(advert_permits));
+            state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+            state
+                .db
+                .upsert_mirror_repo("z6wpadv", "wp", "/tmp/wp-nonexistent", None, false)
+                .await
+                .unwrap();
+            let peer: SocketAddr = "203.0.113.61:6000".parse().unwrap();
+            let router = crate::server::build_router(state);
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/z6wpadv/wp/info/refs?service={service}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            router.oneshot(req).await.unwrap().status()
+        }
+
+        // Advert pool saturated (read + write free): the receive-pack advert SHEDS,
+        // proving it is bound to the dedicated advert pool.
+        assert_eq!(
+            advert_status(&pool, 8, 8, 0, "git-receive-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement draws from the dedicated advert pool: a saturated advert pool sheds it 503"
+        );
+        // WRITE pool saturated (advert + read free): the advert SURVIVES. This is the
+        // reservation — an advert flood can never occupy a permit the authenticated
+        // push POST relies on at admission.
+        assert_ne!(
+            advert_status(&pool, 8, 0, 8, "git-receive-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement must NOT draw from the write pool: a saturated write pool must not shed it"
+        );
+        // Read pool saturated (advert + write free): the advert SURVIVES (never on the read pool).
+        assert_ne!(
+            advert_status(&pool, 0, 8, 8, "git-receive-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement must not draw from the read pool"
+        );
+        // Read pool saturated: the upload-pack advertisement still SHEDS (unchanged).
+        assert_eq!(
+            advert_status(&pool, 0, 8, 8, "git-upload-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upload-pack advertisement stays on the read pool: a saturated read pool sheds it 503"
+        );
+        // Write + advert pools saturated, read free: the upload-pack advertisement is
+        // UNAFFECTED, proving reads never touch either write-side pool.
+        assert_ne!(
+            advert_status(&pool, 8, 0, 0, "git-upload-pack").await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "upload-pack advertisement never touches the write or advert pool"
+        );
+    }
+
+    /// #174 U2: the receive-pack advertisement is a write-path op, so it must not be
+    /// shed by the READ per-caller sub-cap even when the caller's source IP has
+    /// exhausted its read budget (e.g. concurrent clones from the same host). Fill
+    /// the IP's read per-caller slot, then the receive-pack advertisement from that
+    /// same IP must still get through. Restore the unconditional read-cap acquire on
+    /// the receive-pack branch and this goes 503.
+    #[sqlx::test]
+    async fn receive_pack_advertisement_ignores_read_per_caller_cap(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6wpc", "wp", "/tmp/wp-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.71:6000".parse().unwrap();
+        // Exhaust the source IP's single READ per-caller slot, as concurrent clones
+        // from the same host would.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("fill the IP's read per-caller slot");
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6wpc/wp/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_ne!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "receive-pack advertisement must not be shed by the read per-caller cap: it is a write-path op"
+        );
+    }
+
+    /// #174 (review fix): the anon-reachable receive-pack advertisement draws from
+    /// the write pool, so it is bounded per source by `git_push_advert_per_caller` to
+    /// stop one source from monopolizing the write pool and shedding authenticated
+    /// pushes. Fill one source IP's advert slot; its next receive-pack advertisement
+    /// sheds 503, while a different source and the upload-pack advertisement are
+    /// unaffected. Remove the advert-cap acquisition and the same-source assertion
+    /// goes green-not-503.
+    #[sqlx::test]
+    async fn receive_pack_advertisement_capped_per_source(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_push_advert_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6advcap", "ac", "/tmp/ac-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.81:6000".parse().unwrap();
+        // Fill this source IP's single receive-pack-advertisement slot.
+        let _slot = state
+            .git_push_advert_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first advert slot for this source IP");
+
+        // Same source: the receive-pack advertisement sheds 503 (advert cap full).
+        let router = crate::server::build_router(state.clone());
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advcap/ac/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its receive-pack advertisement cap must shed 503, so it cannot monopolize the write pool"
+        );
+
+        // A DIFFERENT source keeps its own advert budget -> not shed.
+        let other: SocketAddr = "203.0.113.82:6000".parse().unwrap();
+        let router2 = crate::server::build_router(state.clone());
+        let mut req2 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advcap/ac/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(other));
+        assert_ne!(
+            router2.oneshot(req2).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a different source must keep its own receive-pack advertisement budget"
+        );
+
+        // The upload-pack advertisement is NOT bounded by the receive-pack advert cap.
+        let router3 = crate::server::build_router(state);
+        let mut req3 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6advcap/ac/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req3.extensions_mut().insert(ConnectInfo(peer));
+        assert_ne!(
+            router3.oneshot(req3).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the upload-pack advertisement must not be shed by the receive-pack advert cap"
+        );
+    }
+
+    /// #174 SC2 (info_refs probe): the per-caller read sub-cap sheds a caller that
+    /// is already at its concurrency budget on the upload-pack advertisement, while
+    /// a DIFFERENT caller still enters. Remove the sub-cap from `git_info_refs` and
+    /// the same-caller assertion goes green-not-503 — this is the info_refs half of
+    /// the two-handler mutation probe.
+    #[sqlx::test]
+    async fn info_refs_per_caller_cap_sheds_one_caller_not_others(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6pcadv", "pc", "/tmp/pc-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.31:5000".parse().unwrap();
+        // Fill this caller's single read slot (a clone shares the Arc-backed map).
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first slot for this caller");
+
+        // Same caller (IP) at its cap -> shed 503 before the git/Tigris work.
+        let router = crate::server::build_router(state.clone());
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcadv/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a caller already at its per-caller read cap must shed the advertisement with 503"
+        );
+
+        // A DIFFERENT caller (IP) has its own budget -> not shed by the per-caller cap.
+        let other: SocketAddr = "203.0.113.32:5000".parse().unwrap();
+        let router2 = crate::server::build_router(state.clone());
+        let mut req2 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcadv/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(other));
+        assert_ne!(
+            router2.oneshot(req2).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a different caller must not be shed by another caller's saturated budget"
+        );
+    }
+
+    /// #174 SC2 (upload_pack probe): the same per-caller shed on the POST
+    /// upload-pack path. Remove the sub-cap from `git_upload_pack` and this goes
+    /// green-not-503 — the upload_pack half of the two-handler mutation probe.
+    #[sqlx::test]
+    async fn upload_pack_per_caller_cap_sheds_one_caller_not_others(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6pcupl", "pc", "/tmp/pc-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.41:5000".parse().unwrap();
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first slot for this caller");
+
+        let router = crate::server::build_router(state.clone());
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/z6pcupl/pc/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a caller already at its per-caller read cap must shed upload-pack with 503"
+        );
+
+        let other: SocketAddr = "203.0.113.42:5000".parse().unwrap();
+        let router2 = crate::server::build_router(state.clone());
+        let mut req2 = Request::builder()
+            .method(Method::POST)
+            .uri("/z6pcupl/pc/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(other));
+        assert_ne!(
+            router2.oneshot(req2).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a different caller must not be shed by another caller's saturated budget"
+        );
+    }
+
+    /// #174 (review fix): the per-source caller cap is an independent brake that
+    /// sheds a capped source even when the global pool has free capacity — the
+    /// sub-cap is not a mere pre-filter for pool exhaustion. Proven by leaving the
+    /// global read pool with capacity (so the pre-DB early shed passes) AND
+    /// pre-holding the source's upload-pack read sub-cap: the request reaches the
+    /// caller cap and sheds there, so its 503 body reads "for this caller". Remove
+    /// the `acquire_read_caller_permit` call and the capped source falls through to
+    /// the git op instead of shedding with "for this caller" — this is the
+    /// caller-cap acquire probe for the info/refs upload-pack branch.
+    #[sqlx::test]
+    async fn info_refs_upload_pack_per_source_cap_sheds_with_global_capacity(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Global read pool has free capacity (early shed passes); source pre-held at
+        // its per-caller cap so it sheds on the caller cap, not the global pool.
+        state.git_read_semaphore = Arc::new(Semaphore::new(4));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6ordir", "oi", "/tmp/oi-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.91:5000".parse().unwrap();
+        // Pin this source at its single upload-pack read slot.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first read slot for this source IP");
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6ordir/oi/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its read sub-cap must shed 503 even with global pool capacity"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("for this caller"),
+            "the per-source cap is an independent brake: with global capacity free, the capped source must still shed with the caller-cap body, got {body}"
+        );
+    }
+
+    /// #174 (review fix): same independent-brake guarantee for the receive-pack
+    /// advertisement branch of info/refs — its per-source cap
+    /// (`git_push_advert_per_caller`) sheds a capped source even when the global
+    /// write pool has capacity. Leave the global write pool with capacity (so the
+    /// pre-DB early shed passes) and pre-hold the source's advert slot: the request
+    /// reaches the caller cap, so the 503 body reads "for this caller". Remove the
+    /// caller-cap acquire and the capped source falls through instead of shedding
+    /// with "for this caller". The push rate limiter is left permissive so the
+    /// request reaches the caller cap.
+    #[sqlx::test]
+    async fn info_refs_receive_pack_per_source_cap_sheds_with_global_capacity(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Global write pool has free capacity (early shed passes); source pre-held at
+        // its advert sub-cap so it sheds on the caller cap, not the global pool.
+        state.git_write_semaphore = Arc::new(Semaphore::new(4));
+        state.git_push_advert_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        // Permissive push rate limiter so the advertisement passes the rate gate and
+        // reaches the per-source concurrency cap.
+        state.push_rate_limiter = crate::rate_limit::RateLimiter::new(100, Duration::from_secs(60));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6ordrp", "or", "/tmp/or-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.92:5000".parse().unwrap();
+        // Pin this source at its single receive-pack advertisement slot.
+        let _slot = state
+            .git_push_advert_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first advert slot for this source IP");
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6ordrp/or/info/refs?service=git-receive-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its advert sub-cap must shed 503 even with global write pool capacity"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("for this caller"),
+            "the per-source advert cap is an independent brake: with global write capacity free, the capped source must still shed with the caller-cap body, got {body}"
+        );
+    }
+
+    /// #174 (review fix): same independent-brake guarantee for the POST upload-pack
+    /// handler — its per-source read cap sheds a capped source even when the global
+    /// read pool has capacity. Leave the global read pool with capacity (so the
+    /// pre-DB early shed passes) and pre-hold the source's read slot: the request
+    /// reaches the caller cap, so the 503 body reads "for this caller". Remove the
+    /// caller-cap acquire and the capped source falls through instead of shedding
+    /// with "for this caller".
+    #[sqlx::test]
+    async fn upload_pack_per_source_cap_sheds_with_global_capacity(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Global read pool has free capacity (early shed passes); source pre-held at
+        // its per-caller cap so it sheds on the caller cap, not the global pool.
+        state.git_read_semaphore = Arc::new(Semaphore::new(4));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6ordup", "ou", "/tmp/ou-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let peer: SocketAddr = "203.0.113.93:5000".parse().unwrap();
+        // Pin this source at its single read slot.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first read slot for this source IP");
+
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/z6ordup/ou/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a source at its read sub-cap must shed 503 even with global pool capacity"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains("for this caller"),
+            "the per-source cap is an independent brake: with global capacity free, the capped source must still shed with the caller-cap body, got {body}"
+        );
+    }
+
+    /// #174 U3 (P1-b, RED-before/GREEN-after): a client disconnect during the
+    /// path-scoped withheld-blob walk must NOT release the read admission while the
+    /// uncancellable `spawn_blocking` walk is still running. The handler takes the
+    /// global read permit, enters the walk (a fake git hangs on rev-list), then the
+    /// request future is dropped mid-walk. With both permits moved into the blocking
+    /// task the global slot stays occupied until the walk finishes; on the pre-fix code
+    /// the handler-local permits drop on future-drop and the slot frees instantly (RED),
+    /// letting disconnect-spam exceed the cap while real git work keeps running.
+    #[sqlx::test]
+    async fn upload_pack_permit_held_through_walk_after_disconnect(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let revlist_pid = tmp.path().join("revlist.pid");
+        // Fake git: resolve refs fast, hang on rev-list (recording its pid first). The
+        // ~6s sleep bounds the walk so a broken fix cannot wedge the suite.
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo $$ > \"{}\" ; sleep 6 ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n",
+            revlist_pid.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        // Root the repo store at this test's TempDir so the bare repo is isolated per
+        // run (the default for_testing store uses a fixed /tmp path that would collide
+        // across runs).
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.git_read_semaphore = Arc::new(Semaphore::new(1));
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let owner = "z6up3rd";
+        let name = "up3";
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // Real bare repo at the path acquire() computes, so the handler reaches the walk.
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        // A path-scoped rule so has_path_scoped_rule() is true (the walk path) without
+        // denying the "/" gate for the public repo.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "src/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkU3ReaderAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+
+        let sem = state.git_read_semaphore.clone();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one read slot before the request"
+        );
+
+        let router = crate::server::build_router(state);
+        let peer: SocketAddr = "203.0.113.77:5000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/{owner}/{name}/git-upload-pack"))
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+
+        let mut fut = Box::pin(router.oneshot(req));
+        // Drive until the walk's rev-list starts (its pidfile appears) — i.e. the
+        // request is inside the spawn_blocking walk, holding the global read permit.
+        let mut in_walk = false;
+        for _ in 0..500 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if revlist_pid.exists() {
+                in_walk = true;
+                break;
+            }
+        }
+        assert!(
+            in_walk,
+            "the walk's rev-list must start (request reached the spawn_blocking walk)"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the read slot is held while the walk runs"
+        );
+
+        // Client disconnect: drop the request future mid-walk.
+        drop(fut);
+
+        // Load-bearing: the slot must STAY held while the uncancellable walk runs. On
+        // the pre-fix code the handler-local permits drop here and the slot frees at
+        // once (RED).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "on disconnect the read admission must be held until the spawn_blocking walk \
+             finishes, not released the instant the future drops (P1-b)"
+        );
+
+        // Cleanup: let the walk finish so the slot releases and no blocking task leaks.
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        if let Some(p) = std::fs::read_to_string(&revlist_pid)
+            .ok()
+            .and_then(|s| s.trim().parse::<i32>().ok())
+        {
+            unsafe {
+                libc::kill(p, libc::SIGKILL);
+            }
+        }
+    }
+
+    /// #174 U1 (P1-a, plain-spawn residual, RED-before/GREEN-after): on the PLAIN
+    /// (non-path-scoped) upload-pack path a client disconnect must NOT release the
+    /// global read admission while the detached process-group reaper is still tearing
+    /// down a git group that ignores SIGTERM. The `be0cdd6` fix moved permits into the
+    /// path-scoped `spawn_blocking` walk; this closes the residual plain path, where the
+    /// permits were handler-locals that dropped the instant the future was dropped.
+    ///
+    /// Isolate the GLOBAL pool: read pool = 1, per-source cap + rate limiter permissive,
+    /// so the only thing that can shed a replacement is the leaked global permit. Drive
+    /// the handler until git spawns, disconnect, then assert the global slot stays held
+    /// (`available_permits() == 0`) AND a replacement sheds 503 while the group is alive;
+    /// after the reaper SIGKILLs+reaps the group the slot frees and a replacement is no
+    /// longer shed by the global cap. On the pre-fix code the handler-local permit drops
+    /// on future-drop and the slot frees at once (RED).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn upload_pack_plain_permit_held_through_group_reap_after_disconnect(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descfile = tmp.path().join("desc.pid");
+        // Fake git for the plain upload-pack path (invoked as `git upload-pack
+        // --stateless-rpc <repo>`). It forks a descendant that TRAPS SIGTERM, records its
+        // pid, and loops ~20s, then `wait`s — so on disconnect the group leader dies on
+        // the reaper's SIGTERM but the descendant survives until the reaper escalates to
+        // SIGKILL, keeping the group alive (ESRCH not reached) across the observation
+        // window. Bounded so a broken fix leaks no permanent orphan.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               upload-pack)\n\
+                 sh -c 'trap \"\" TERM; echo $$ > \"{}\"; i=0; while [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done' &\n\
+                 wait ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            descfile.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        // Isolate the global read pool: size 1; per-source cap + rate limiter permissive
+        // so only the leaked global permit can shed the replacement.
+        state.git_read_semaphore = Arc::new(Semaphore::new(1));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let owner = "z6up1st";
+        let name = "up1";
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // Real bare repo at the path acquire() computes, so the handler reaches the
+        // spawn. No path-scoped rule -> the PLAIN serve branch (this test's target).
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+
+        let sem = state.git_read_semaphore.clone();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one read slot before the request"
+        );
+
+        let router = crate::server::build_router(state);
+        let make_req = |peer: SocketAddr| {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{owner}/{name}/git-upload-pack"))
+                .body(Body::from(&b"0000"[..]))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let peer: SocketAddr = "203.0.113.71:5000".parse().unwrap();
+        let mut fut = Box::pin(router.clone().oneshot(make_req(peer)));
+        // Drive until git spawns (the descendant records its pid) — the request is
+        // inside the plain serve, holding the global read permit. Stop polling the
+        // instant the future completes (re-polling a completed oneshot panics); read the
+        // descfile first so a spawn that recorded its pid then returned is still caught.
+        let mut spawned: Option<i32> = None;
+        let mut early = None;
+        for _ in 0..500 {
+            let done = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&descfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                spawned = Some(p);
+                break;
+            }
+            if let Ok(resp) = done {
+                early = Some(resp.map(|r| r.status()));
+                break;
+            }
+        }
+        let desc = spawned
+            .unwrap_or_else(|| panic!("the fake git must have spawned; early finish: {early:?}"));
+        // Kill the descendant regardless of outcome so a RED run leaks no orphan.
+        struct ReapOnDrop(i32);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapOnDrop(desc);
+        assert!(
+            unsafe { libc::kill(desc, 0) == 0 },
+            "descendant should be running before the disconnect"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the read slot is held while the git op runs"
+        );
+
+        // Client disconnect: drop the request future. The detached reaper now owns the
+        // AdmissionGuard and will not drop it until the group is ESRCH-confirmed reaped.
+        drop(fut);
+
+        // Load-bearing: the slot must STAY held while the SIGTERM-ignoring group is still
+        // alive. On the pre-fix code the handler-local permit drops here and the slot
+        // frees at once (RED). Check quickly (before the reaper's ~2s SIGKILL escalation).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            unsafe { libc::kill(desc, 0) == 0 },
+            "the SIGTERM-ignoring descendant must still be alive during the hold window"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "on disconnect the read admission must be HELD until the process group is \
+             reaped, not released the instant the future drops (P1-a)"
+        );
+        // A replacement request from a DIFFERENT source must shed 503 — the only pool
+        // that can shed it is the leaked global permit (per-source cap is permissive).
+        let peer2: SocketAddr = "203.0.113.72:5000".parse().unwrap();
+        let resp = router.clone().oneshot(make_req(peer2)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "while the prior group is still alive the held global permit must shed a \
+             replacement with 503"
+        );
+
+        // After the reaper SIGKILLs + reaps the group the AdmissionGuard drops and the
+        // slot frees. Poll for recovery.
+        let mut freed = false;
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "once the reaper confirms the group gone the admission guard must drop and \
+             free the global slot"
+        );
+        // A replacement is now no longer shed by the global cap (it proceeds past
+        // admission; it then fails downstream on the fake git, which is not a 503).
+        let peer3: SocketAddr = "203.0.113.73:5000".parse().unwrap();
+        let resp = router.oneshot(make_req(peer3)).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "after the group is reaped the freed slot must admit a replacement"
+        );
+    }
+
+    /// F1 (filtered-serve residual of #174 P1-a, RED-before/GREEN-after): on the
+    /// FILTERED (path-scoped, non-empty withheld) upload-pack branch a client
+    /// disconnect mid-pack-objects must NOT release the read admission while the
+    /// detached reaper is still tearing down the git group. Pre-fix the handler held
+    /// the permits as locals (`_hold`) across `upload_pack_excluding`, so dropping
+    /// the future released them instantly and disconnect-spam could exceed the read
+    /// caps during each reap window (RED). The fix threads the AdmissionGuard through
+    /// both filtered-pack stages so it rides `KillGroupOnDrop` into the reaper.
+    ///
+    /// Same isolation as the plain-path test above: read pool = 1, per-source cap
+    /// permissive, so only the global permit can shed a replacement. The fake git
+    /// serves the withheld walk (for-each-ref/rev-parse/rev-list/ls-tree) with a blob
+    /// under the denied `/src/**` subtree so the filtered branch is taken, answers
+    /// the pack build's rev-list fast, and hangs pack-objects in a SIGTERM-trapping
+    /// descendant. The descendant hang is first-invocation-only (keyed on the
+    /// pidfile's existence) so the post-reap replacement request completes fast.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn upload_pack_filtered_permit_held_through_group_reap_after_disconnect(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let descfile = tmp.path().join("desc.pid");
+        let commit = "1111111111111111111111111111111111111111";
+        let blob = "2222222222222222222222222222222222222222";
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               rev-parse) echo {commit} ;;\n\
+               rev-list) echo {commit} ;;\n\
+               ls-tree) printf '100644 blob {blob}\\tsrc/x.txt' ;;\n\
+               pack-objects)\n\
+                 if [ ! -e \"{desc}\" ]; then\n\
+                   sh -c 'trap \"\" TERM; echo $$ > \"{desc}\"; i=0; while [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done' &\n\
+                   wait\n\
+                 fi ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            desc = descfile.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        // Isolate the global read pool: size 1; per-source cap + rate limiter permissive
+        // so only the leaked global permit can shed the replacement.
+        state.git_read_semaphore = Arc::new(Semaphore::new(1));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let owner = "z6upf1";
+        let name = "upf";
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        // Real bare repo at the path acquire() computes, so the handler reaches the
+        // walk and the filtered serve.
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        // Path-scoped rule denying the anonymous caller under /src, matching the
+        // fake ls-tree's blob path, so the withheld set is NON-EMPTY and the
+        // filtered (upload_pack_excluding) branch is taken.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/src/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkUF1ReaderAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+
+        let sem = state.git_read_semaphore.clone();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one read slot before the request"
+        );
+
+        let router = crate::server::build_router(state);
+        let make_req = |peer: SocketAddr| {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(format!("/{owner}/{name}/git-upload-pack"))
+                .body(Body::from(&b"0000"[..]))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+
+        let peer: SocketAddr = "203.0.113.81:5000".parse().unwrap();
+        let mut fut = Box::pin(router.clone().oneshot(make_req(peer)));
+        // Drive until the pack-objects descendant records its pid: the request is
+        // past the walk, inside the filtered serve's stage 2, holding the read permit.
+        // Stop polling the instant the future completes (re-polling a completed
+        // oneshot panics); read the descfile first so a spawn that recorded its pid
+        // then returned is still caught.
+        let mut spawned: Option<i32> = None;
+        let mut early = None;
+        for _ in 0..500 {
+            let done = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&descfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                spawned = Some(p);
+                break;
+            }
+            if let Ok(resp) = done {
+                early = Some(resp.map(|r| r.status()));
+                break;
+            }
+        }
+        let desc = spawned.unwrap_or_else(|| {
+            panic!("the fake pack-objects must have spawned; early finish: {early:?}")
+        });
+        // Kill the descendant regardless of outcome so a RED run leaks no orphan.
+        struct ReapOnDrop(i32);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapOnDrop(desc);
+        assert!(
+            unsafe { libc::kill(desc, 0) == 0 },
+            "descendant should be running before the disconnect"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the read slot is held while the filtered serve runs"
+        );
+
+        // Client disconnect: drop the request future mid-pack-objects. The detached
+        // reaper must now own the AdmissionGuard and hold it until ESRCH.
+        drop(fut);
+
+        // Load-bearing: the slot must STAY held while the SIGTERM-ignoring group is
+        // still alive. On the pre-fix code the handler-local `_hold` drops here and
+        // the slot frees at once (RED). Check quickly (before the reaper's ~2s
+        // SIGKILL escalation).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            unsafe { libc::kill(desc, 0) == 0 },
+            "the SIGTERM-ignoring descendant must still be alive during the hold window"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "on disconnect the read admission must be HELD until the filtered serve's \
+             process group is reaped, not released the instant the future drops (F1)"
+        );
+        // A replacement request from a DIFFERENT source must shed 503: the only pool
+        // that can shed it is the held global permit (per-source cap is permissive).
+        let peer2: SocketAddr = "203.0.113.82:5000".parse().unwrap();
+        let resp = router.clone().oneshot(make_req(peer2)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "while the prior group is still alive the held global permit must shed a \
+             replacement with 503"
+        );
+
+        // After the reaper SIGKILLs + reaps the group the AdmissionGuard drops and
+        // the slot frees. Poll for recovery.
+        let mut freed = false;
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "once the reaper confirms the group gone the admission guard must drop and \
+             free the global slot"
+        );
+        // A replacement is now admitted and completes: the fake pack-objects takes
+        // its fast path (the descfile exists), so the filtered serve returns instead
+        // of hanging.
+        let peer3: SocketAddr = "203.0.113.83:5000".parse().unwrap();
+        let resp = router.oneshot(make_req(peer3)).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "after the group is reaped the freed slot must admit a replacement"
+        );
+    }
+
+    /// #174 U1 (P1-a): the `None`-key arm — a request with no resolvable source key
+    /// (no trusted-proxy header, no peer) is bounded by the GLOBAL read pool only, never
+    /// a per-source cap. With the global read pool exhausted such a request still sheds
+    /// 503, proving the plain path admits/sheds on the global pool for the `None` arm
+    /// (the counterpart to the `Some(ip)` arm above). Complements the resolver-arm rule:
+    /// neither arm is vacuous.
+    #[tokio::test]
+    async fn upload_pack_plain_none_key_arm_sheds_on_global_pool() {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use axum::Router;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state_lazy();
+        // Global read pool exhausted; per-source cap permissive so only the global pool
+        // can shed. No ConnectInfo + no trusted header -> read_caller_key resolves None.
+        state.git_read_semaphore = Arc::new(Semaphore::new(0));
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/git-upload-pack",
+                axum::routing::post(crate::api::repos::git_upload_pack),
+            )
+            .with_state(state);
+        // No ConnectInfo extension and no XFF header: the caller key is None.
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/alice/repo.git/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a None-key request must still shed 503 on the exhausted GLOBAL read pool"
+        );
+    }
+
+    /// #174 U4 (P1-d, RED-before/GREEN-after): the authenticated receive-pack POST
+    /// carries a per-source WRITE sub-cap so one source IP cannot monopolize the write
+    /// pool with many slow pushes (owner enforcement defaults off, so disposable DIDs
+    /// are free). Global write pool has capacity; the source is pre-held at its single
+    /// write slot. A push from THAT source sheds (Overloaded/503) — which also proves
+    /// the PeerAddr+HeaderMap extractors resolve a key (without them the key is None and
+    /// the cap is inert, never shedding). A push from a DIFFERENT source is NOT shed by
+    /// the cap. Called directly so the test needs no signed request; the handler is
+    /// where the cap lives. Remove the `git_write_per_caller` acquire and the capped
+    /// source no longer sheds (RED).
+    #[sqlx::test]
+    async fn receive_pack_per_source_write_cap_sheds_capped_source_not_others(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        // Global write pool has capacity; the per-source cap is 1.
+        state.git_write_semaphore = Arc::new(Semaphore::new(4));
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6rp4wr", "rp4", "/tmp/rp4-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let did = "did:key:z6MkReceivePackWriteCapProofDidAAAAAAAAAA";
+        let capped: SocketAddr = "203.0.113.44:5000".parse().unwrap();
+        let other: SocketAddr = "203.0.113.45:5000".parse().unwrap();
+
+        // Pin the capped source at its single write slot.
+        let _slot = state
+            .git_write_per_caller
+            .try_acquire(&capped.ip().to_string())
+            .expect("first write slot for the capped source IP");
+
+        // A push from the capped source must shed on the per-source write cap even with
+        // global write capacity free. The shed also proves the source-IP key resolved
+        // via the extractors (an inert None key would fall through to Ok(None)).
+        let capped_result = git_receive_pack(
+            State(state.clone()),
+            Path(("z6rp4wr".to_string(), "rp4".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(capped)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            matches!(capped_result, Err(AppError::Overloaded(_))),
+            "a source at its per-source write cap must shed (Overloaded/503) with global \
+             pool capacity free; got {capped_result:?}"
+        );
+
+        // A push from a DIFFERENT source must NOT be shed by the per-source cap — it
+        // proceeds past admission (and fails later on the nonexistent repo, which is not
+        // an Overloaded error).
+        let other_result = git_receive_pack(
+            State(state.clone()),
+            Path(("z6rp4wr".to_string(), "rp4".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(other)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            !matches!(other_result, Err(AppError::Overloaded(_))),
+            "a different source must not be shed by the per-source write cap while the \
+             capped source holds its slot; got {other_result:?}"
+        );
+    }
+
+    /// #174 U2 (P1-2, RED-before/GREEN-after): the storage-acquisition phase is bounded
+    /// by `git_acquire_timeout_secs`, so a stalled backend releases the admission permit
+    /// and sheds a 503 instead of pinning the pool. The permit is taken BEFORE
+    /// `acquire_write`, whose advisory-lock loop can spin ~60s (and whose per-iteration
+    /// `pg_try_advisory_lock` can block indefinitely on a hung pool), so without the
+    /// `tokio::time::timeout` wrapper the permit is held far past the deadline.
+    ///
+    /// Real stall (no `RepoStore` trait to fake): hold the SAME session-level advisory
+    /// lock `acquire_write` derives (`advisory_lock_key(owner_slug, repo_name)`, where
+    /// `owner_slug = owner_did.replace([':','/'], "_")`) on a second pooled connection,
+    /// so the handler's `pg_try_advisory_lock` returns false every iteration and the loop
+    /// must retry against the deadline. `git_acquire_timeout_secs = 2`; the request must
+    /// return 503 (Overloaded) at ~2s (NOT ~59s), and the write permit must be released
+    /// (`available_permits()` recovers to full once the shed returns). Covers R2.
+    ///
+    /// Load-bearing / mutation: remove the `tokio::time::timeout` wrapper on
+    /// `acquire_write` and the loop runs to ~59s with the permit held the whole time —
+    /// the `< DEADLINE_CEILING` timing assertion goes RED (observed ~59s) and the permit
+    /// stays pinned past the deadline. Restore to return GREEN.
+    #[sqlx::test]
+    async fn receive_pack_acquire_deadline_sheds_and_releases_permit(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        // Reproduce acquire_write's session-level advisory-lock key exactly so the
+        // second-connection lock collides with the handler's pg_try_advisory_lock
+        // (repo_store.rs: advisory_lock_key over owner_slug then repo_name).
+        fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            owner_slug.hash(&mut hasher);
+            repo_name.hash(&mut hasher);
+            hasher.finish() as i64
+        }
+
+        let owner = "z6acqdead";
+        let name = "acq1";
+        // owner_slug as local_path() computes it from the record's owner_did. The
+        // mirror row stores the short owner as owner_did, so slug == owner (no ':'/'/').
+        let owner_slug = owner.replace([':', '/'], "_");
+        let lock_key = advisory_lock_key(&owner_slug, name);
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        // Isolate the write pool at size 1 so available_permits() cleanly reports
+        // held (0) vs released (1). Per-source cap + trust permissive so only the
+        // write pool / acquire path can gate.
+        state.git_write_semaphore = Arc::new(Semaphore::new(1));
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1000, 1000);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Short acquire deadline: the fix must shed here, well before acquire_write's
+        // ~59s advisory-lock loop would bail on its own.
+        const ACQUIRE_TIMEOUT_SECS: u64 = 2;
+        let mut cfg = (*state.config).clone();
+        cfg.git_acquire_timeout_secs = ACQUIRE_TIMEOUT_SECS;
+        // Keep the git-service timeout large so the deadline under test is the acquire
+        // one, not git execution (which is never reached on the stalled path anyway).
+        cfg.git_service_timeout_secs = 600;
+        state.config = std::sync::Arc::new(cfg);
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, "/tmp/z6acqdead-acq1", None, false)
+            .await
+            .unwrap();
+
+        // Hold the advisory lock on a dedicated pooled connection (a distinct session),
+        // so the handler's pg_try_advisory_lock($lock_key) returns false every iteration
+        // and acquire_write's real loop must retry against the deadline. Released when
+        // this connection drops at end of test.
+        let mut lock_conn = pool
+            .acquire()
+            .await
+            .expect("second connection for the lock");
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("hold the advisory lock on the second connection");
+
+        let did = "did:key:z6MkAcquireDeadlineProofDidAAAAAAAAAAAAAAAA";
+        let peer: SocketAddr = "203.0.113.61:5000".parse().unwrap();
+
+        let sem = state.git_write_semaphore.clone();
+        assert_eq!(
+            sem.available_permits(),
+            1,
+            "one write slot before the request"
+        );
+
+        // Drive the authenticated push in the background so we can observe the permit is
+        // held while acquire_write stalls, then that it is released on the shed.
+        let state_for_task = state.clone();
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            git_receive_pack(
+                State(state_for_task),
+                Path((owner.to_string(), name.to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(peer)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            )
+            .await
+        });
+
+        // The handler takes the write permit BEFORE acquire_write, so once it is stalled
+        // in the advisory-lock loop the pool reports 0 available. Wait for that to prove
+        // the permit is genuinely held during the stall (and the request really reached
+        // acquire_write, not an earlier reject).
+        let mut held = false;
+        for _ in 0..200 {
+            if sem.available_permits() == 0 {
+                held = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            held,
+            "the write permit must be held while acquire_write stalls on the advisory lock"
+        );
+
+        // The bounded acquire deadline must shed with 503 (Overloaded), NOT wait out the
+        // ~59s advisory-lock loop. Ceiling is comfortably above the 2s deadline + task
+        // scheduling but far below 59s, so a RED run (no wrapper -> ~59s) fails here.
+        const DEADLINE_CEILING: std::time::Duration = std::time::Duration::from_secs(20);
+        let result = tokio::time::timeout(
+            DEADLINE_CEILING + std::time::Duration::from_secs(10),
+            handle,
+        )
+        .await
+        .expect("the handler must return within the ceiling — a hang means the acquire deadline is missing (RED)")
+        .expect("the receive-pack task must not panic");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(AppError::Overloaded(_))),
+            "a stalled acquire_write must shed with Overloaded/503 at the acquire deadline; \
+             got {result:?}"
+        );
+        assert!(
+            elapsed < DEADLINE_CEILING,
+            "the shed must land at ~{ACQUIRE_TIMEOUT_SECS}s (the acquire deadline), not ~59s \
+             (the advisory-lock loop). Observed {elapsed:?}; without the timeout wrapper this \
+             is ~59s (RED)"
+        );
+
+        // Permit release on expiry: the Overloaded return drops the handler-local permit,
+        // so the isolated write pool must recover to full. A leaked permit here means the
+        // pool drains under a stalled backend (the #174 P1-2 bug).
+        let mut freed = false;
+        for _ in 0..200 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            freed,
+            "on the acquire-deadline shed the write permit must be released; the pool did \
+             not recover to full (permit leaked)"
+        );
+
+        // Follow-up admits once the contended lock is released: release the second-conn
+        // lock, then a fresh push proceeds PAST admission (it fails later on the
+        // nonexistent on-disk repo, which is NOT an Overloaded/503). Proves the freed
+        // slot is usable, not merely counted.
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(lock_key)
+            .execute(&mut *lock_conn)
+            .await
+            .expect("release the advisory lock");
+        let followup = git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.62:5000".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            !matches!(followup, Err(AppError::Overloaded(_))),
+            "once the lock frees, a follow-up push must admit past the (recovered) write \
+             pool and acquire; got {followup:?}"
+        );
+    }
+
+    /// #174 U5 (P1-e, RED-before/GREEN-after): the post-push encryption walk acquires a
+    /// `git_encrypt_semaphore` permit before running, so completed pushes cannot spawn
+    /// unbounded concurrent full-history walks. With the pool exhausted the gated walk
+    /// must DEFER (block on admission) and NOT run its rev-list; on the pre-fix code
+    /// (no acquire) the walk runs regardless of the pool (RED). It defers rather than
+    /// sheds — releasing the permit lets the SAME walk run and pin (durability stays
+    /// fail-closed). Exercises the gating seam directly; the detached push task calls
+    /// this exact helper.
+    #[tokio::test]
+    async fn encrypt_walk_defers_when_pool_exhausted() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("revlist.ran");
+        // Fake git records when rev-list runs (the walk's first git call).
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  rev-list) echo ran > \"{}\" ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+        let git_bin = git_path.to_str().unwrap().to_string();
+        let owner = "did:key:z6MkEncWalkOwnerAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+
+        // Exhaust the pool: hold its only permit so a gated walk must defer.
+        let sem = Arc::new(Semaphore::new(1));
+        let held = sem.clone().acquire_owned().await.unwrap();
+
+        // Blocked: the gated walk must NOT complete or run rev-list while exhausted.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            withheld_recipients_gated(
+                sem.clone(),
+                tmp.path().to_path_buf(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+                Vec::new(),
+                true,
+                owner.clone(),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the encryption walk must defer (block on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the walk's rev-list must not run while its admission permit is unavailable (P1-e)"
+        );
+
+        // Release admission: the SAME walk now runs (defer, not shed) — rev-list fires.
+        drop(held);
+        let ran = withheld_recipients_gated(
+            sem,
+            tmp.path().to_path_buf(),
+            git_bin,
+            Duration::from_secs(5),
+            Vec::new(),
+            true,
+            owner,
+        )
+        .await;
+        assert!(
+            ran.is_ok(),
+            "with a permit the walk runs and joins: {ran:?}"
+        );
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred walk runs its rev-list"
+        );
+    }
+
+    /// F4 defer proof 1: `replication_withheld_set`'s WALK arm acquires a
+    /// `git_encrypt_semaphore` permit before its spawn_blocking git walk, deferring
+    /// (never shedding) when the pool is exhausted — while its no-walk fast paths
+    /// (no path-scoped rule; not announceable) complete WITHOUT touching the pool.
+    /// On ungated code the walk runs regardless of a zero-permit pool (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replication_walk_defers_when_scan_pool_exhausted() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("git.ran");
+        // Fake git records ANY invocation (the walk's first call is rev-parse), then
+        // behaves well enough for a successful empty walk: HEAD probe succeeds,
+        // rev-list lists no commits.
+        let body = format!(
+            "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let scoped_rules = || Some(vec![vis_rule("/secret/**", &[])]);
+
+        // Zero-permit pool: every gated walk must park forever.
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(0));
+
+        // Fast path A (negative arm): announceable, NO path-scoped rule -> zero git
+        // work, must complete immediately without acquiring from the empty pool.
+        let fast = tokio::time::timeout(
+            Duration::from_millis(500),
+            replication_withheld_set(
+                sem.clone(),
+                Some(vec![]),
+                OWNER_DID,
+                true,
+                tmp.path().to_path_buf(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the no-path-scoped-rule fast path must not park on the scan pool");
+        assert_eq!(fast, (true, Some(std::collections::HashSet::new())));
+
+        // Fast path B (negative arm): not announceable (no rules) -> zero git work,
+        // must complete immediately without acquiring.
+        let fast = tokio::time::timeout(
+            Duration::from_millis(500),
+            replication_withheld_set(
+                sem.clone(),
+                None,
+                OWNER_DID,
+                false,
+                tmp.path().to_path_buf(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("the not-announceable fast path must not park on the scan pool");
+        assert_eq!(fast, (false, None));
+        assert!(!marker.exists(), "the fast paths must spawn no git at all");
+
+        // Walk arm with the pool exhausted: must DEFER (park), spawning no git.
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            replication_withheld_set(
+                sem.clone(),
+                scoped_rules(),
+                OWNER_DID,
+                true,
+                tmp.path().to_path_buf(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the withheld walk must defer (park on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the withheld walk's git must not spawn while its admission permit is unavailable (F4)"
+        );
+
+        // Release admission: the SAME walk now runs (defer, not shed) and succeeds.
+        sem.add_permits(1);
+        let ran = replication_withheld_set(
+            sem,
+            scoped_rules(),
+            OWNER_DID,
+            true,
+            tmp.path().to_path_buf(),
+            git_bin,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred withheld walk runs its git"
+        );
+        assert_eq!(
+            ran,
+            (true, Some(std::collections::HashSet::new())),
+            "the released walk completes and vets the (empty) withheld set"
+        );
+    }
+
+    /// F4 defer proof 3: `fail_closed_full_scan_objects` ALWAYS walks, so its
+    /// spawn_blocking is always admission-gated: with the pool exhausted it defers
+    /// and spawns no git; with a permit the same call runs. Ungated it runs
+    /// regardless (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_scan_pin_walk_defers_when_scan_pool_exhausted() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("git.ran");
+        let body = format!(
+            "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let candidates = vec!["3333333333333333333333333333333333333333".to_string()];
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(0));
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            fail_closed_full_scan_objects(
+                sem.clone(),
+                tmp.path().to_path_buf(),
+                vec![vis_rule("/secret/**", &[])],
+                true,
+                OWNER_DID.to_string(),
+                candidates.clone(),
+                git_bin.clone(),
+                Duration::from_secs(5),
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the fail-closed full scan must defer (park on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the full scan's git must not spawn while its admission permit is unavailable (F4)"
+        );
+
+        // Release admission: the SAME scan now runs (defer, not shed).
+        sem.add_permits(1);
+        let _objs = fail_closed_full_scan_objects(
+            sem,
+            tmp.path().to_path_buf(),
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            OWNER_DID.to_string(),
+            candidates,
+            git_bin,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred full scan runs its git"
+        );
+    }
+
+    /// #174 F4 (RED-before/GREEN-after): the two full-scan phases share ONE whole-scan
+    /// deadline. Phase 1 (`replicable_blob_set_bounded`) succeeds but consumes almost
+    /// the whole budget; phase 2 (`all_blob_oids`) then gets only the remainder. With a
+    /// shared deadline phase 2 is reaped and the scan fails closed (pins nothing) — the
+    /// safe direction. With a FRESH `Instant::now() + timeout` for phase 2 (pre-fix) it
+    /// gets a full second budget, completes with an empty blob set, and the non-blob
+    /// candidate is kept — so the result is NON-empty (RED) and the permit is held ~2x.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_scan_shares_one_deadline_across_both_phases() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Phase 1 (ls-tree) sleeps 1.5s and succeeds (empty tree); phase 2
+        // (cat-file --batch-all-objects) sleeps 1.5s. With a 2s whole-scan budget the
+        // shared deadline leaves phase 2 only ~0.5s, so it is reaped; a fresh 2s budget
+        // would let it finish.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) echo deadbeef ;;\n  rev-list) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n  ls-tree) sleep 1.5 ;;\n  cat-file) case \"$*\" in *--batch-all-objects*) sleep 1.5 ;; *) : ;; esac ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        // A candidate that is NOT a blob (never appears in all_blob_oids): kept by
+        // replicable_objects_fail_closed only if phase 2 actually ran to completion.
+        let candidates = vec!["cccccccccccccccccccccccccccccccccccccccc".to_string()];
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(1));
+        let objs = fail_closed_full_scan_objects(
+            sem,
+            tmp.path().to_path_buf(),
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            OWNER_DID.to_string(),
+            candidates,
+            git_bin,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            objs.is_empty(),
+            "a large-but-successful phase 1 must leave phase 2 only the SHARED whole-scan \
+             remainder, so it reaps and the scan fails closed; got {objs:?} (a fresh phase-2 \
+             budget completed the scan and kept the candidate — the ~2x-budget bug)"
+        );
+    }
+
+    /// #174 F6 (RED-before/GREEN-after): a post-push pin loop holds this push's full
+    /// object-id list while walking it, so concurrent pin loops across many repos must
+    /// be bounded by a global permit, not just the per-repo task count. `pin_new_objects_gated`
+    /// DEFERS (waits) when the pin pool is exhausted rather than running unbounded.
+    ///
+    /// Load-bearing: without the permit acquire the pin loop runs immediately even with
+    /// the pool held (RED — the deferral assertion fails). With it, it parks.
+    #[sqlx::test]
+    async fn pin_new_objects_gated_defers_when_pin_pool_exhausted(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let state = crate::test_support::test_state(pool).await;
+        let db = state.db.clone();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pin_sem = Arc::new(Semaphore::new(1));
+        // Hold the only pin permit.
+        let held = pin_sem.clone().acquire_owned().await.unwrap();
+
+        // Empty ipfs_api makes the pin itself a no-op, but the loop must still DEFER on
+        // the exhausted pin pool rather than run.
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            pin_new_objects_gated(&pin_sem, "", tmp.path(), vec![], &db),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a pin loop must defer while the pin pool is exhausted (#174 F6)"
+        );
+
+        // Release admission: the SAME call now completes.
+        drop(held);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pin_new_objects_gated(&pin_sem, "", tmp.path(), vec![], &db),
+        )
+        .await
+        .expect("the pin loop completes once admission frees");
+        assert!(out.is_empty(), "an empty ipfs_api pins nothing");
+    }
+
+    /// Shared fixture for the F4 handler-layer tests: a state whose repo_store and
+    /// git_bin point at the given tempdir/fake-git, plus a seeded on-disk repo,
+    /// optionally with a path-scoped rule (so the post-receive walks actually run).
+    #[cfg(unix)]
+    async fn f4_state_with_repo(
+        pool: sqlx::PgPool,
+        tmp: &std::path::Path,
+        git_bin: &str,
+        owner: &str,
+        name: &str,
+        path_scoped: bool,
+    ) -> AppState {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.git_bin = git_bin.to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        if path_scoped {
+            state
+                .db
+                .set_visibility_rule(
+                    &rec.id,
+                    "/secret/**",
+                    crate::db::VisibilityMode::B,
+                    &["did:key:z6MkF4ReaderAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                    &rec.owner_did,
+                )
+                .await
+                .unwrap();
+        }
+        state
+    }
+
+    /// A pkt-line receive-pack body carrying one branch-create ref update, so the
+    /// handler's post-receive tail resolves a non-empty new-tip set (the delta
+    /// scan's git stages run).
+    fn ref_update_body(new_sha: &str) -> axum::body::Bytes {
+        let line = format!("{ZERO_SHA} {new_sha} refs/heads/main");
+        axum::body::Bytes::from(format!("{:04x}{}0000", line.len() + 4, line))
+    }
+
+    /// F4 scenario 2 — push-burst bound at the handler layer: with a scan pool of
+    /// ONE, two concurrent pushes to two path-scoped repos never have more than one
+    /// scan's git alive at a time (an atomic mkdir lock in the fake git detects any
+    /// overlap), and BOTH pushes still succeed 200 — defer, not shed. Two distinct
+    /// repos on purpose: the per-repo advisory write lock must not be what
+    /// serializes the scans.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_burst_scans_serialized_and_both_pushes_succeed(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lockdir = tmp.path().join("scan.lock");
+        let ranfile = tmp.path().join("scan.ran");
+        let overlap = tmp.path().join("scan.overlap");
+        // receive-pack succeeds instantly; every candidate-scan git op (cat-file /
+        // rev-list / ls-tree) holds an atomic mkdir lock for 150ms — a second scan
+        // process alive at the same instant records an overlap.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               receive-pack) cat > /dev/null 2>/dev/null ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               cat-file|rev-list|ls-tree)\n\
+                 if mkdir \"{lock}\" 2>/dev/null; then\n\
+                   echo 1 >> \"{ran}\"\n\
+                   sleep 0.15\n\
+                   rmdir \"{lock}\"\n\
+                 else\n\
+                   echo 1 >> \"{over}\"\n\
+                 fi\n\
+                 if [ \"$1\" = cat-file ]; then echo commit; fi ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            lock = lockdir.display(),
+            ran = ranfile.display(),
+            over = overlap.display(),
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f4burst1", "b1", true).await;
+        // Second path-scoped repo on the same state/store.
+        state
+            .db
+            .upsert_mirror_repo("z6f4burst2", "b2", "/unused-z6f4burst2-b2", None, false)
+            .await
+            .unwrap();
+        let rec2 = state
+            .db
+            .get_repo("z6f4burst2", "b2")
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .repo_store
+            .init(&rec2.owner_did, &rec2.name)
+            .await
+            .unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &rec2.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkF4ReaderAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec2.owner_did,
+            )
+            .await
+            .unwrap();
+        // Scan pool of ONE: at most one post-receive walk may run at a time.
+        state.git_encrypt_semaphore = Arc::new(Semaphore::new(1));
+
+        let did = "did:key:z6MkF4BurstPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+        let new_sha = "1111111111111111111111111111111111111111";
+        let push = |owner: &'static str, name: &'static str, peer: &'static str| {
+            let state = state.clone();
+            tokio::spawn(async move {
+                git_receive_pack(
+                    State(state),
+                    Path((owner.to_string(), name.to_string())),
+                    Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
+                    axum::http::HeaderMap::new(),
+                    ref_update_body(new_sha),
+                )
+                .await
+            })
+        };
+
+        let (a, b) = (
+            push("z6f4burst1", "b1", "203.0.113.71:5000"),
+            push("z6f4burst2", "b2", "203.0.113.72:5000"),
+        );
+        let a = tokio::time::timeout(std::time::Duration::from_secs(60), a)
+            .await
+            .expect("push A must complete — a scan gate must defer, never wedge")
+            .expect("push A task must not panic");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(60), b)
+            .await
+            .expect("push B must complete — a scan gate must defer, never wedge")
+            .expect("push B task must not panic");
+        let a = a.expect("push A must succeed");
+        let b = b.expect("push B must succeed");
+        assert_eq!(a.status(), 200, "push A lands 200 despite scan contention");
+        assert_eq!(b.status(), 200, "push B lands 200 despite scan contention");
+
+        // Wait for both pushes' detached scan tails to drain through the pool of 1
+        // before reading the detector files. The WHOLE tail (withheld walk included) now
+        // runs detached (#174 F2), so poll until every expected scan has run rather than a
+        // fixed sleep, which is load-sensitive under a parallel test run.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let ran = std::fs::read_to_string(&ranfile)
+                .unwrap_or_default()
+                .lines()
+                .count();
+            if ran >= 6 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // Small settle so the last scan's rmdir has landed before the overlap check.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !overlap.exists(),
+            "with a scan pool of 1, no two scans' git may ever be alive at once \
+             (found overlap records: {:?})",
+            std::fs::read_to_string(&overlap).unwrap_or_default()
+        );
+        let ran = std::fs::read_to_string(&ranfile).unwrap_or_default();
+        assert!(
+            ran.lines().count() >= 6,
+            "both pushes' scans must actually have run (withheld walk + delta probe + \
+             delta rev-list each); got {} runs",
+            ran.lines().count()
+        );
+    }
+
+    /// F4 scenario 3 — fast-path non-acquisition at the handler layer: a push to a
+    /// public repo with NO path-scoped rules does zero post-receive git scanning
+    /// (the withheld short-circuit; a deletion-free flush-only body resolves no new
+    /// tips), so it must complete 200 even with the scan pool at ZERO permits.
+    /// A gate that wrongly captured a no-walk path would park this push forever.
+    /// Note: `resolve_candidates_for_push` spawns git for ANY non-empty new-tip set
+    /// (the per-tip cat-file probe), so the genuinely git-free negative arm is the
+    /// no-ref-update body, not a branch-create push.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_no_scan_fast_path_completes_with_zero_scan_permits(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("scan.ran");
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  receive-pack) cat > /dev/null 2>/dev/null ;;\n  cat-file|rev-list|ls-tree) echo 1 >> \"{}\" ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f4fast", "f1", false).await;
+        state.git_encrypt_semaphore = Arc::new(Semaphore::new(0));
+
+        let peer: SocketAddr = "203.0.113.73:5000".parse().unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            git_receive_pack(
+                State(state),
+                Path(("z6f4fast".to_string(), "f1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(
+                    "did:key:z6MkF4FastPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                )),
+                crate::rate_limit::PeerAddr(Some(peer)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            ),
+        )
+        .await
+        .expect("a no-scan push must not park on the (empty) scan pool")
+        .expect("the push must succeed");
+        assert_eq!(resp.status(), 200);
+        assert!(
+            !marker.exists(),
+            "the no-walk fast paths must spawn no scan git at all"
+        );
+    }
+
+    /// F4 scenario 4 — landed-push-never-fails: a push whose post-receive walk must
+    /// park (pool held elsewhere) DEFERS and then returns the receive-pack success
+    /// once admission frees; contention never converts the landed push into a 5xx.
+    /// #174 F2 (RED-before/GREEN-after): the post-receive replication tail parks on
+    /// `git_encrypt_semaphore` (withheld/candidate/full-scan resolution). Leaving it in the
+    /// request future means a client/proxy disconnect while parked silently loses this
+    /// push's pins, recovery copy, and announcements (state.rs documented this residual).
+    /// The fix moves the whole tail into an independently owned task, so the handler
+    /// returns its receive-pack 200 WITHOUT waiting on the scan pool and a disconnect can
+    /// no longer drop the work.
+    ///
+    /// Load-bearing: with the tail inline (pre-fix) the handler parks while the pool is
+    /// held and does NOT return within the bound (RED — the timeout fires). With the
+    /// detached tail it returns 200 promptly (GREEN).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_landed_push_returns_without_parking_on_scan_pool(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "#!/bin/sh\ncase \"$1\" in\n  receive-pack) cat > /dev/null 2>/dev/null ;;\n  rev-parse) echo deadbeef ;;\n  cat-file) echo commit ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f4park", "p1", true).await;
+        let sem = Arc::new(Semaphore::new(1));
+        state.git_encrypt_semaphore = sem.clone();
+        // Hold the pool's only permit: the post-receive scan would park if it ran in the
+        // request future.
+        let held = sem.clone().acquire_owned().await.unwrap();
+
+        let peer: SocketAddr = "203.0.113.74:5000".parse().unwrap();
+        // The handler must return its receive-pack 200 WITHOUT waiting on the held scan
+        // pool — the tail is owned by a detached task. Pre-fix this times out.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            git_receive_pack(
+                State(state),
+                Path(("z6f4park".to_string(), "p1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(
+                    "did:key:z6MkF4ParkPusherAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                )),
+                crate::rate_limit::PeerAddr(Some(peer)),
+                axum::http::HeaderMap::new(),
+                ref_update_body("2222222222222222222222222222222222222222"),
+            ),
+        )
+        .await
+        .expect("the handler must return without parking on the held scan pool")
+        .expect("contention must never convert a landed push into an error");
+        assert_eq!(
+            resp.status(),
+            200,
+            "the response is the receive-pack success, returned before the detached tail runs"
+        );
+
+        // The detached tail is still owned: release admission and let it drain cleanly.
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    // ---- #174 U4 (P2-2): post-push encryption task set bounded by per-repo coalescing ----
+    //
+    // The residual jatmn found is not the WALK (bounded by `git_encrypt_semaphore`,
+    // proven by `encrypt_walk_defers_when_pool_exhausted` above) but the OUTER
+    // `tokio::spawn` + its parked `acquire_owned().await` waiters: N rapid pushes to a
+    // repo spawn N tasks that each park holding cloned object lists/rules/keys — an
+    // unbounded outstanding set. U4 bounds it by coalescing per repo: before spawning,
+    // if a task for the repo is in flight, skip the duplicate. Crucially this DEFERS a
+    // duplicate walk (the newer push's objects are covered by the pending one) and does
+    // NOT shed — there is no reconciliation sweep, so a dropped job would permanently
+    // lose the withheld-blob recovery copy (`2a54c15`'s fail-closed durability stance).
+    //
+    // These drive the coalescing seam (`EncryptInflight`) that the detached spawn at
+    // `repos.rs` consults directly (the try_begin gate on the in-flight set, guarded by
+    // `withheld.is_some()`). Observing `encrypt_and_pin`'s IPFS effect end-to-end needs a live IPFS node
+    // (`pin_git_object` hits the API), so the durability property is proven at this
+    // layer: a coalesced repo's key is released when its task ends, so a later push for
+    // that repo is processed once — NOT permanently skipped, which is exactly what a
+    // coalesce->shed mutation would break by dropping the job with no sweep to recover it.
+
+    /// Bounded outstanding set under saturation (R4). Simulate K rapid path-scoped
+    /// pushes to the SAME repo while the encrypt pool is saturated (every spawned task
+    /// would park, so none has finished and removed its key): the first `try_begin`
+    /// admits (spawns), the rest coalesce (skip). The in-flight set holds at 1, not K.
+    ///
+    /// MUTATION (RED): removing the coalescing check makes every push spawn — modeled by
+    /// `simulate_without_coalescing`, which reaches K. If the coalesced count equaled the
+    /// un-coalesced one the gate would be a no-op; the strict inequality proves it bites.
+    #[test]
+    fn u4_outstanding_encrypt_set_is_bounded_to_one_per_repo_under_saturation() {
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkRepoOwnerAAAAAAAAAAAAAAAAAAAAAAAAAAAA/proj";
+        const K: usize = 32;
+
+        // Hold every admitted guard so the tasks are "still in flight" (the saturated
+        // case: all parked on acquire_owned().await, none finished, none removed a key).
+        let mut admitted = Vec::new();
+        let mut coalesced = 0usize;
+        for _ in 0..K {
+            match inflight.try_begin(repo, vec![]) {
+                crate::state::BeginOutcome::Admitted(g) => admitted.push(g),
+                crate::state::BeginOutcome::Coalesced => coalesced += 1,
+            }
+        }
+
+        assert_eq!(
+            admitted.len(),
+            1,
+            "exactly ONE detached task may spawn per repo while one is in flight — the \
+             outstanding set is bounded to 1, not K parked waiters"
+        );
+        assert_eq!(
+            coalesced,
+            K - 1,
+            "the other K-1 rapid pushes to the same repo coalesce (skip spawning)"
+        );
+        assert_eq!(
+            inflight.len(),
+            1,
+            "the in-flight set holds at most one entry per repo under saturation"
+        );
+
+        let no_coalesce = simulate_without_coalescing(K);
+        assert_eq!(
+            no_coalesce, K,
+            "sanity: without the coalescing check all K pushes spawn (the unbounded set \
+             the fix prevents) — proves the bound above is not vacuously 1"
+        );
+        assert!(
+            admitted.len() < no_coalesce,
+            "coalesced set ({}) must be strictly smaller than the un-coalesced one ({})",
+            admitted.len(),
+            no_coalesce
+        );
+    }
+
+    /// Coalescing is PER-REPO: distinct repos are never coalesced against each other, so
+    /// one repo in flight cannot starve a second repo's recovery copy.
+    #[test]
+    fn u4_distinct_repos_each_admit_one_encrypt_task() {
+        use crate::state::BeginOutcome;
+        let inflight = crate::state::EncryptInflight::new();
+        let a = inflight.try_begin("owner/repo-a", vec![]);
+        let b = inflight.try_begin("owner/repo-b", vec![]);
+        let c = inflight.try_begin("owner/repo-c", vec![]);
+        assert!(
+            matches!(&a, BeginOutcome::Admitted(_))
+                && matches!(&b, BeginOutcome::Admitted(_))
+                && matches!(&c, BeginOutcome::Admitted(_)),
+            "three distinct repos each admit their own encryption task"
+        );
+        assert_eq!(inflight.len(), 3, "one in-flight entry per distinct repo");
+    }
+
+    /// NO LOST RECOVERY COPY — the security guard (R4/R6). Coalescing must DELAY a
+    /// duplicate walk, never permanently drop a repo's recovery copy. Observable
+    /// property: once an in-flight task ENDS (its guard drops — completion, error, or
+    /// panic-unwind) the repo key is released, so the NEXT push for that repo is admitted
+    /// and processed again. A coalesce->shed mutation would drop the job AND never
+    /// re-admit — with no reconciliation sweep the copy is lost forever. Here re-admission
+    /// survives normal completion AND a panic, so no permanent skip / no leaked key.
+    #[test]
+    fn u4_coalesced_repo_is_reprocessed_after_task_ends_not_permanently_skipped() {
+        use crate::state::{BeginOutcome, FinishOutcome};
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkDurableRepoBBBBBBBBBBBBBBBBBBBBBBBBB/repo";
+
+        // Push #1 admits and "spawns". A concurrent push #2 (task #1 still in flight)
+        // coalesces — no duplicate spawn; its (empty) tip set is recorded, not lost.
+        let guard1 = admit(&inflight, repo);
+        assert!(
+            matches!(inflight.try_begin(repo, vec![]), BeginOutcome::Coalesced),
+            "while task #1 is in flight, push #2 to the same repo coalesces"
+        );
+
+        // Task #1 finishes normally: nothing pending (push #2 carried no tips), so
+        // the empty-pending check removes the key in its critical section.
+        assert!(
+            matches!(guard1.finish_or_take_pending(), FinishOutcome::Finished(_)),
+            "no pending tips — the task exits and releases the key"
+        );
+        assert_eq!(
+            inflight.len(),
+            0,
+            "when the in-flight task ends its repo key is released — the set does not leak"
+        );
+
+        // A LATER push for the SAME repo is admitted again (processed, not skipped
+        // forever). This is what coalesce->shed breaks: shed drops the job and no sweep
+        // re-derives the missing copy, so the recovery copy is permanently lost.
+        let guard2 = admit(&inflight, repo);
+        // An errored task (guard dropped without finishing) still releases the key.
+        drop(guard2);
+        assert_eq!(inflight.len(), 0);
+
+        // Durability across PANIC: a task that panics mid-walk must still release its
+        // key (the still-armed guard's Drop runs on unwind), so one crashed walk never
+        // permanently locks a repo out of future recovery copies. Coalesce real tips
+        // first: the panic loses them (logged), and the loss must not corrupt the set.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = admit(&inflight, repo);
+            assert!(matches!(
+                inflight.try_begin(repo, vec![("old1".to_string(), "new1".to_string())]),
+                BeginOutcome::Coalesced
+            ));
+            assert_eq!(inflight.len(), 1);
+            panic!("simulate the detached encryption task panicking mid-walk");
+        }));
+        assert!(panicked.is_err(), "the simulated task panicked");
+        assert_eq!(
+            inflight.len(),
+            0,
+            "a panicked encryption task still releases its repo key (Drop on unwind) — no \
+             permanent leak that would block every future recovery copy for the repo"
+        );
+        // The next push is re-admitted, and the panicked task's pending tips did NOT
+        // survive into it (they are lost-and-logged, recovered only by a later push).
+        let guard3 = admit(&inflight, repo);
+        assert!(
+            matches!(guard3.finish_or_take_pending(), FinishOutcome::Finished(_)),
+            "the pre-panic pending tips must not leak into the re-admitted task"
+        );
+    }
+
+    /// Degenerate state: the first push on a cold/empty in-flight set always admits
+    /// (never a false coalesce on an empty set).
+    #[test]
+    fn u4_first_push_on_a_cold_set_always_admits() {
+        let inflight = crate::state::EncryptInflight::new();
+        assert!(inflight.is_empty(), "cold set is empty");
+        assert!(
+            matches!(
+                inflight.try_begin("owner/first", vec![]),
+                crate::state::BeginOutcome::Admitted(_)
+            ),
+            "the first push on a cold in-flight set must admit (never falsely coalesce)"
+        );
+    }
+
+    /// Unwrap an Admitted outcome (panic on Coalesced) — the u4/u5 suites' shorthand.
+    fn admit(
+        inflight: &crate::state::EncryptInflight,
+        repo: &str,
+    ) -> crate::state::EncryptInflightGuard {
+        match inflight.try_begin(repo, vec![]) {
+            crate::state::BeginOutcome::Admitted(g) => g,
+            crate::state::BeginOutcome::Coalesced => panic!("expected {repo} to admit"),
+        }
+    }
+
+    /// Model of the pre-fix / mutated code: no coalescing check, so every push spawns.
+    /// Returns the count of tasks spawned (== the size of the unbounded outstanding set
+    /// the fix prevents), used as the RED comparison in the bound test above.
+    fn simulate_without_coalescing(pushes: usize) -> usize {
+        (0..pushes).count()
+    }
+
+    // ---- #174 U5 (F5): a push that loses try_begin is REQUEUED, never dropped ----
+    //
+    // F5: the in-flight task pins only its own pre-spawn object-list snapshot, so a
+    // push B arriving while task A is in flight used to be SKIPPED outright (the old
+    // None arm) — B's pins and recovery copies were silently absent until an
+    // unrelated later push re-walked the repo. U5 records B's (old, new) tip pairs
+    // into the in-flight key's pending slot in the SAME critical section as the
+    // presence check, and A's task loop-drains them before releasing the key.
+
+    /// The F5 lost-update repro. Task A is in flight past its snapshot; push B
+    /// coalesces carrying its tip pair; when A finishes its snapshot iteration the
+    /// tracker must hand A exactly B's recorded work with the key retained — and only
+    /// an empty pending check may remove the key. On pre-U5 code this is RED: the
+    /// coalesce arm records B's work nowhere and there is no drain surface at all.
+    #[test]
+    fn u5_coalesced_push_work_is_drained_by_the_inflight_task() {
+        use crate::state::{BeginOutcome, FinishOutcome, PendingWork};
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkF5LostUpdateCCCCCCCCCCCCCCCCCCCCCCCC/repo";
+
+        // Push A admits; its spawned task is "in flight past its snapshot".
+        let guard_a = match inflight.try_begin(repo, vec![]) {
+            BeginOutcome::Admitted(g) => g,
+            BeginOutcome::Coalesced => panic!("first push must admit"),
+        };
+
+        // Push B lands while A is in flight: coalesced, tip pair recorded.
+        let b_pair = (
+            "b0ldb0ldb0ldb0ldb0ldb0ldb0ldb0ldb0ldb0ld".to_string(),
+            "bnewbnewbnewbnewbnewbnewbnewbnewbnewbnew".to_string(),
+        );
+        match inflight.try_begin(repo, vec![b_pair.clone()]) {
+            BeginOutcome::Coalesced => {}
+            BeginOutcome::Admitted(_) => panic!("push B must coalesce while A is in flight"),
+        }
+
+        // A finishes its snapshot iteration: it must be handed B's work (drained),
+        // not exit — an exit here is exactly the F5 silent loss.
+        match guard_a.finish_or_take_pending() {
+            FinishOutcome::Pending(guard_a, work) => {
+                assert_eq!(
+                    work,
+                    PendingWork::Tips(vec![b_pair]),
+                    "A drains exactly B's recorded tip pair"
+                );
+                assert_eq!(inflight.len(), 1, "the key is retained while A iterates");
+                // Nothing further pending: A now exits and releases the key.
+                match guard_a.finish_or_take_pending() {
+                    FinishOutcome::Finished(_) => {}
+                    FinishOutcome::Pending(..) => panic!("no second batch was recorded"),
+                }
+                assert_eq!(
+                    inflight.len(),
+                    0,
+                    "an empty pending check at task end releases the key"
+                );
+            }
+            FinishOutcome::Finished(_) => panic!(
+                "F5: B's coalesced work vanished — the in-flight task exited without draining it"
+            ),
+        }
+    }
+
+    /// Drain-vs-admit race, both orderings driven deterministically through the lock
+    /// API (the check+merge and check+remove are each ONE critical section, so a push
+    /// can only land on one side of A's final pending check — never inside it):
+    /// before it, the push is merged and A drains it; after it, the key is gone and
+    /// the push is admitted as a fresh task. Neither ordering loses the work. A
+    /// check-then-record split (merge moved outside try_begin's critical section)
+    /// turns ordering 1 RED: the work recorded after A's check is never drained.
+    #[test]
+    fn u5_drain_vs_admit_race_loses_no_work_in_either_ordering() {
+        use crate::state::{BeginOutcome, FinishOutcome, PendingWork};
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkF5RaceOrderDDDDDDDDDDDDDDDDDDDDDDDDD/repo";
+        let pair = ("cold".to_string(), "cnew".to_string());
+
+        // Ordering 1: push C lands BEFORE A's final pending check → merged in
+        // try_begin's critical section → A must drain it (key retained).
+        let guard_a = admit(&inflight, repo);
+        assert!(matches!(
+            inflight.try_begin(repo, vec![pair.clone()]),
+            BeginOutcome::Coalesced
+        ));
+        match guard_a.finish_or_take_pending() {
+            FinishOutcome::Pending(g, work) => {
+                assert_eq!(work, PendingWork::Tips(vec![pair.clone()]));
+                assert!(matches!(
+                    g.finish_or_take_pending(),
+                    FinishOutcome::Finished(_)
+                ));
+            }
+            FinishOutcome::Finished(_) => {
+                panic!("a push merged before the final check must be drained, not lost")
+            }
+        }
+        assert!(inflight.is_empty());
+
+        // Ordering 2: push C lands AFTER A's final pending check removed the key →
+        // it must be ADMITTED as a fresh task (its own snapshot covers its work).
+        let guard_a = admit(&inflight, repo);
+        assert!(matches!(
+            guard_a.finish_or_take_pending(),
+            FinishOutcome::Finished(_)
+        ));
+        match inflight.try_begin(repo, vec![pair]) {
+            BeginOutcome::Admitted(g) => drop(g),
+            BeginOutcome::Coalesced => panic!(
+                "a push landing after the key was removed must admit a new task — a \
+                 coalesce here records work no task will ever drain"
+            ),
+        }
+    }
+
+    /// Exit-vs-successor (the double-remove hazard). A's normal exit removes the key
+    /// and disarms the guard in ONE critical section, and the disarmed guard is
+    /// handed back — so its eventual Drop lands in the real remove→drop window. A
+    /// successor task B admitted inside that window must keep ITS key when A's guard
+    /// finally drops. With the disarm reverted (Drop removing unconditionally) this
+    /// is RED: dropping A's guard deletes B's key and the third push falsely admits
+    /// a second task for the repo.
+    #[test]
+    fn u5_disarmed_guard_drop_never_removes_a_successor_key() {
+        use crate::state::{BeginOutcome, FinishOutcome};
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkF5DisarmEEEEEEEEEEEEEEEEEEEEEEEEEEEE/repo";
+
+        // A admits and exits normally; HOLD the disarmed guard to keep the window open.
+        let guard_a = admit(&inflight, repo);
+        let disarmed = match guard_a.finish_or_take_pending() {
+            FinishOutcome::Finished(g) => g,
+            FinishOutcome::Pending(..) => panic!("nothing was pending"),
+        };
+        assert!(inflight.is_empty(), "A's exit released the key");
+
+        // Successor B is admitted inside the remove→drop window.
+        let guard_b = admit(&inflight, repo);
+        assert_eq!(inflight.len(), 1);
+
+        // A's disarmed guard now drops. B's key must SURVIVE: a third push still
+        // coalesces against B's in-flight task.
+        drop(disarmed);
+        assert_eq!(
+            inflight.len(),
+            1,
+            "dropping A's disarmed guard must not remove successor B's key"
+        );
+        assert!(
+            matches!(inflight.try_begin(repo, vec![]), BeginOutcome::Coalesced),
+            "B's task is still the (only) in-flight task — at-most-one-per-repo holds"
+        );
+        drop(guard_b);
+        assert!(inflight.is_empty());
+    }
+
+    /// Pending overflow: past the 1024-pair bound the slot degrades to the FullScan
+    /// marker (bounded memory under a hostile push burst); at exactly the bound it
+    /// stays a Tips batch. The marker is an explicit variant, never an empty tip
+    /// list — an empty-tips encoding would drain to an empty delta and pin nothing.
+    #[test]
+    fn u5_pending_overflow_degrades_to_full_scan_marker() {
+        use crate::state::{BeginOutcome, FinishOutcome, PendingWork};
+        let inflight = crate::state::EncryptInflight::new();
+        let pair = |i: usize| (format!("old{i}"), format!("new{i}"));
+
+        // At the bound: exactly 1024 pairs stay a Tips batch.
+        let repo_at = "owner/at-bound";
+        let g = admit(&inflight, repo_at);
+        assert!(matches!(
+            inflight.try_begin(repo_at, (0..1024).map(pair).collect()),
+            BeginOutcome::Coalesced
+        ));
+        match g.finish_or_take_pending() {
+            FinishOutcome::Pending(g, PendingWork::Tips(v)) => {
+                assert_eq!(v.len(), 1024, "at the bound the pairs are kept verbatim");
+                assert!(matches!(
+                    g.finish_or_take_pending(),
+                    FinishOutcome::Finished(_)
+                ));
+            }
+            other => panic!(
+                "expected a Tips batch at the bound, got {:?}",
+                match other {
+                    FinishOutcome::Pending(_, w) => Some(w),
+                    FinishOutcome::Finished(_) => None,
+                }
+            ),
+        }
+
+        // Past the bound: the accumulated slot degrades to FullScan and later
+        // merges are absorbed (still one bounded marker, not a growing list).
+        let repo_over = "owner/over-bound";
+        let g = admit(&inflight, repo_over);
+        assert!(matches!(
+            inflight.try_begin(repo_over, (0..1024).map(pair).collect()),
+            BeginOutcome::Coalesced
+        ));
+        assert!(matches!(
+            inflight.try_begin(repo_over, vec![pair(9999)]),
+            BeginOutcome::Coalesced
+        ));
+        assert!(matches!(
+            inflight.try_begin(repo_over, vec![pair(10000)]),
+            BeginOutcome::Coalesced
+        ));
+        match g.finish_or_take_pending() {
+            FinishOutcome::Pending(g, work) => {
+                assert_eq!(
+                    work,
+                    PendingWork::FullScan,
+                    "overflow degrades to the explicit FullScan marker"
+                );
+                assert!(matches!(
+                    g.finish_or_take_pending(),
+                    FinishOutcome::Finished(_)
+                ));
+            }
+            FinishOutcome::Finished(_) => panic!("the overflowed pending work vanished"),
+        }
+    }
+
+    // ---- u5 drain-pipeline fixtures: a real git repo + a DB repo row ----
+
+    fn u5_git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn u5_init_repo(dir: &std::path::Path) {
+        u5_git(dir, &["init", "-q", "-b", "main"]);
+        u5_git(dir, &["config", "user.email", "t@t"]);
+        u5_git(dir, &["config", "user.name", "t"]);
+    }
+
+    /// Commit `name` (parent dirs created) with `body`; returns the commit sha.
+    fn u5_commit_file(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, body).unwrap();
+        u5_git(dir, &["add", name]);
+        u5_git(dir, &["commit", "-qm", &format!("add {name}")]);
+        u5_git(dir, &["rev-parse", "HEAD"])
+    }
+
+    /// A drain-task context over the test state and an on-disk repo. Empty
+    /// `ipfs_api`/`irys_url` keep the pin/anchor stages inert (no network).
+    fn u5_ctx(
+        state: &AppState,
+        rec: &crate::db::RepoRecord,
+        repo_path: std::path::PathBuf,
+        git_bin: &str,
+        sem: std::sync::Arc<tokio::sync::Semaphore>,
+    ) -> EncryptTaskCtx {
+        EncryptTaskCtx {
+            ipfs_api: String::new(),
+            repo_path,
+            db: state.db.clone(),
+            repo_id: rec.id.clone(),
+            owner_did: rec.owner_did.clone(),
+            repo_name: rec.name.clone(),
+            irys_url: String::new(),
+            http_client: std::sync::Arc::clone(&state.http_client),
+            node_did: state.node_did.to_string(),
+            node_keypair: std::sync::Arc::clone(&state.node_keypair),
+            git_bin: git_bin.to_string(),
+            git_timeout: std::time::Duration::from_secs(600),
+            encrypt_sem: sem,
+            pin_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+        }
+    }
+
+    /// The drain resolves a coalesced push's tip pair to exactly that push's
+    /// introduced objects (delta semantics — the F5 observable: push B's pins are
+    /// recorded by the drain, and pre-existing objects are not re-listed).
+    #[sqlx::test]
+    async fn u5_drain_resolves_coalesced_tips_to_their_objects(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
+        let c2 = u5_commit_file(tmp.path(), "b.txt", "two\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5delta", "d", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5delta", "d").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            "git",
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+
+        // Push B advanced main c1 -> c2 and lost try_begin; its pair was coalesced.
+        let (list, _rules, is_public) = resolve_drain_object_list(
+            &ctx,
+            crate::state::PendingWork::Tips(vec![(c1.clone(), c2.clone())]),
+        )
+        .await
+        .expect("a public repo drains to a pin list");
+        assert!(is_public, "mirror rows are public");
+        let got: std::collections::HashSet<String> = list.into_iter().collect();
+        let new_blob = u5_git(tmp.path(), &["rev-parse", "HEAD:b.txt"]);
+        let old_blob = u5_git(tmp.path(), &["rev-parse", &format!("{c1}:a.txt")]);
+        assert!(
+            got.contains(&c2) && got.contains(&new_blob),
+            "B's commit and blob are in the drained pin list (the F5 fix)"
+        );
+        assert!(
+            !got.contains(&c1) && !got.contains(&old_blob),
+            "pre-existing objects are not re-listed (delta, not full scan)"
+        );
+    }
+
+    /// The FullScan marker drains through the FLAGGED full-scan path to a NON-EMPTY
+    /// candidate set. RED arm of the encoding: were the marker a plain empty-tips
+    /// call, the deletion-only fast path would return an empty delta and the drain
+    /// would pin nothing (the F5 silent loss resurfacing).
+    #[sqlx::test]
+    async fn u5_drain_full_scan_marker_yields_nonempty_candidates(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5full", "f", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5full", "f").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            "git",
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+
+        let (list, _rules, _pub) =
+            resolve_drain_object_list(&ctx, crate::state::PendingWork::FullScan)
+                .await
+                .expect("a public repo drains to a pin list");
+        let got: std::collections::HashSet<String> = list.into_iter().collect();
+        assert!(
+            !got.is_empty(),
+            "the FullScan drain must enumerate the repo — an empty list means the \
+             marker collapsed into the empty-tips fast path"
+        );
+        let blob = u5_git(tmp.path(), &["rev-parse", "HEAD:a.txt"]);
+        assert!(
+            got.contains(&c1) && got.contains(&blob),
+            "the full-scan drain covers the repo's commit and blob"
+        );
+    }
+
+    /// Rules tightened between the coalesced push and its drain are honored, fail
+    /// closed: the drain re-fetches rules/is_public fresh, so (1) a newly-withheld
+    /// blob is NOT pinned, and (2) a repo whose root became unreadable to the
+    /// anonymous public drains to nothing at all.
+    #[sqlx::test]
+    async fn u5_drain_honors_rules_tightened_after_the_push(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        u5_commit_file(tmp.path(), "pub.txt", "public\n");
+        let c2 = u5_commit_file(tmp.path(), "secret/hidden.txt", "sealed\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5tight", "t", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5tight", "t").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            "git",
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        let pending = || crate::state::PendingWork::Tips(vec![(ZERO_SHA.to_string(), c2.clone())]);
+
+        // At push time the repo had no rules. TIGHTEN before the drain: /secret/**
+        // becomes reader-gated. The drain must re-fetch and withhold the new blob.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[READER_DID.to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        let (list, _rules, _pub) = resolve_drain_object_list(&ctx, pending())
+            .await
+            .expect("still announceable at root");
+        let got: std::collections::HashSet<String> = list.into_iter().collect();
+        let pub_blob = u5_git(tmp.path(), &["rev-parse", "HEAD:pub.txt"]);
+        let secret_blob = u5_git(tmp.path(), &["rev-parse", "HEAD:secret/hidden.txt"]);
+        assert!(
+            got.contains(&pub_blob),
+            "the still-public blob is pinned by the drain"
+        );
+        assert!(
+            !got.contains(&secret_blob),
+            "a blob withheld by a rule added AFTER the push must NOT be pinned by \
+             the drain (fresh rules, fail closed)"
+        );
+
+        // Tighten further: root becomes reader-gated → not announceable to the
+        // anonymous public → the drain pins nothing at all.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/",
+                crate::db::VisibilityMode::A,
+                &[READER_DID.to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        assert!(
+            resolve_drain_object_list(&ctx, pending()).await.is_none(),
+            "a repo no longer announceable under current rules drains to nothing \
+             (fail closed)"
+        );
+    }
+
+    /// #174 F2 / KTD-3 re-derivation equivalence: the object set the Pinata worker
+    /// re-derives from ONLY the ref tuples (`pinata_object_list_for_refs`, run once a
+    /// pin slot frees) must equal exactly what the old retained `object_list` would
+    /// have pinned — the inline-resolved delta, filtered by the withheld set. If the
+    /// two differ, the memory fix changed what gets pinned; they must not.
+    #[tokio::test]
+    async fn f2_pinata_rederivation_equals_retained_object_list() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
+        let c2 = u5_commit_file(tmp.path(), "b.txt", "two\n");
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let timeout = std::time::Duration::from_secs(600);
+
+        // What the OLD retained-list task WOULD have pinned: the inline pipeline the
+        // receive-pack tail ran before moving `object_list` into the closure — the
+        // delta for main c1 -> c2, filtered by the (empty) withheld set.
+        let candidates = crate::git::push_delta::resolve_candidates_for_push(
+            sem.clone(),
+            tmp.path().to_path_buf(),
+            vec![c2.clone()],
+            vec![c1.clone()],
+            "git".to_string(),
+            timeout,
+            false,
+        )
+        .await;
+        assert!(
+            !candidates.full_scan,
+            "the c1 -> c2 push is a delta, not a full scan"
+        );
+        let retained: std::collections::HashSet<String> =
+            crate::git::visibility_pack::replicable_objects(
+                candidates.candidates,
+                &std::collections::HashSet::new(),
+            )
+            .into_iter()
+            .collect();
+
+        // What the worker re-derives from only the (ref, old, new) tuples. Empty rules
+        // + is_public => announceable, withheld = {} (the common Pinata case).
+        let ref_updates = vec![("refs/heads/main".to_string(), c1.clone(), c2.clone())];
+        let rederived: std::collections::HashSet<String> = pinata_object_list_for_refs(
+            sem.clone(),
+            tmp.path().to_path_buf(),
+            &ref_updates,
+            Some(Vec::new()),
+            true,
+            "z6MkPinataOwnerAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            "git".to_string(),
+            timeout,
+        )
+        .await
+        .into_iter()
+        .collect();
+
+        let new_blob = u5_git(tmp.path(), &["rev-parse", "HEAD:b.txt"]);
+        assert!(
+            retained.contains(&c2) && retained.contains(&new_blob),
+            "the push introduced the new commit and blob"
+        );
+        assert_eq!(
+            rederived, retained,
+            "the worker's git rev-list re-derivation must yield exactly the object set \
+             the retained list would have pinned — the memory fix must not change what pins"
+        );
+    }
+
+    /// #174 F2 / KTD-3 reaped + deadline-bounded: the worker's re-derivation git children
+    /// run through the same INV-22 bounded, process-group-reaped helpers the sibling scans
+    /// use. On a git that hangs on both `rev-list` and `--batch-all-objects`,
+    /// `pinata_object_list_for_refs` must RETURN within the watchdog budget (the group is
+    /// SIGKILLed + reaped at the deadline), not block. A bare `Command::output()` here
+    /// would hang past the ceiling (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn f2_pinata_rederivation_is_deadline_bounded_and_reaped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        // Empty rules => replication_withheld_set short-circuits (no git). The tip
+        // peel (`cat-file -t`) reports a commit so the delta stage proceeds; rev-list
+        // and the full-scan `cat-file --batch-all-objects` both hang (bounded 30s so a
+        // broken test cannot leak a permanent orphan).
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\ncase \"$1\" in\n  \
+             cat-file) case \"$*\" in *--batch-all-objects*) i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done ;; *) echo commit ;; esac ;;\n  \
+             rev-list) i=0; while [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done ;;\n  \
+             *) : ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+
+        let ref_updates = vec![(
+            "refs/heads/main".to_string(),
+            ZERO_SHA.to_string(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+        )];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pinata_object_list_for_refs(
+                std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+                dir.path().to_path_buf(),
+                &ref_updates,
+                Some(Vec::new()),
+                true,
+                "z6MkPinataOwnerAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                git_bin,
+                std::time::Duration::from_millis(400),
+            ),
+        )
+        .await
+        .expect(
+            "pinata_object_list_for_refs must return within the watchdog budget — a hang \
+             means the re-derivation git is not deadline-bounded / group-reaped (RED)",
+        );
+        assert!(
+            got.is_empty(),
+            "a hung git yields nothing this push (the reconciliation sweep backstops)"
+        );
+    }
+
+    /// Hot-repo drain at encrypt-pool size 1: the task loop holds NO task-level
+    /// permit, so per-iteration helper acquires (withheld walk, candidate scan,
+    /// recipients walk) each get the pool's single permit in turn and BOTH the
+    /// snapshot iteration and the coalesced-drain iteration complete. RED if the
+    /// loop takes a task-level permit: the first helper acquire nests over the
+    /// same exhausted semaphore and the task parks forever.
+    #[sqlx::test]
+    async fn u5_hot_repo_drain_completes_at_pool_size_one(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        u5_commit_file(tmp.path(), "pub.txt", "public\n");
+        let c2 = u5_commit_file(tmp.path(), "secret/hidden.txt", "sealed\n");
+        state
+            .db
+            .upsert_mirror_repo("z6u5hot", "h", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5hot", "h").await.unwrap().unwrap();
+        // A path-scoped rule so every gated walk actually runs (withheld walk on
+        // the drain, recipients walk on both iterations). READER_DID carries no
+        // resolvable key, so the encrypt stage plans no seal and stays offline.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[READER_DID.to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        let rules = state.db.list_visibility_rules(&rec.id).await.unwrap();
+
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let ctx = u5_ctx(&state, &rec, tmp.path().to_path_buf(), "git", sem);
+
+        let inflight = crate::state::EncryptInflight::new();
+        let guard = admit(&inflight, &rec.id);
+        assert!(matches!(
+            inflight.try_begin(&rec.id, vec![(ZERO_SHA.to_string(), c2)]),
+            crate::state::BeginOutcome::Coalesced
+        ));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_encrypt_pin_task(ctx, guard, Vec::new(), Some(rules), true),
+        )
+        .await
+        .expect(
+            "the drain must complete at pool size 1 — a task-level permit would \
+             deadlock the helper-internal acquires",
+        );
+        assert!(
+            inflight.is_empty(),
+            "the drained task released its repo key on exit"
+        );
+    }
+
+    /// The task LOOP is load-bearing: work coalesced during the snapshot iteration
+    /// is drained (its candidate scan runs git) before the task exits. RED under
+    /// the drain-loop revert (task drops its guard after the snapshot without
+    /// checking pending): the fake git never runs and the marker is absent.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn u5_task_drains_coalesced_work_before_exiting(pool: sqlx::PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let marker = tmp.path().join("git.ran");
+        // The drain's candidate scan probes the tip type then walks: report a
+        // commit tip and an empty rev-list, recording every invocation.
+        let body = format!(
+            "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  cat-file) echo commit ;;\n  *) : ;;\nesac\nexit 0\n",
+            marker.display()
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        state
+            .db
+            .upsert_mirror_repo("z6u5loop", "l", "/unused", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6u5loop", "l").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &rec,
+            tmp.path().to_path_buf(),
+            &git_bin,
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+
+        let inflight = crate::state::EncryptInflight::new();
+        let guard = admit(&inflight, &rec.id);
+        // Push B coalesces mid-flight with a real (created-ref) tip pair.
+        assert!(matches!(
+            inflight.try_begin(
+                &rec.id,
+                vec![(
+                    ZERO_SHA.to_string(),
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+                )]
+            ),
+            crate::state::BeginOutcome::Coalesced
+        ));
+
+        // Snapshot: empty object list, no rules — the snapshot iteration itself
+        // spawns no git, so any git invocation below belongs to the DRAIN.
+        run_encrypt_pin_task(ctx, guard, Vec::new(), None, true).await;
+        assert!(
+            marker.exists(),
+            "the task must drain B's coalesced tips (candidate scan runs git) \
+             before exiting — an absent marker is the F5 skip"
+        );
+        assert!(
+            inflight.is_empty(),
+            "the empty pending check at task end released the key"
+        );
+    }
+
+    /// #174 SC2 (per-source key, U1): the per-caller read sub-cap keys on the
+    /// resolved source IP, NOT the signed DID, so a disposable-DID farm cannot
+    /// multiply its budget. Fill the source IP's single read slot, then drive two
+    /// requests signed under DIFFERENT DIDs from that SAME IP: both must shed 503
+    /// (keyed by the saturated IP, not their own free DID slots). A signed request
+    /// from a DIFFERENT source IP keeps its own budget. Revert `read_caller_key` to
+    /// prefer the DID and the same-IP assertions go green-not-503 (each fresh DID
+    /// gets a free slot) -- the farm-defeat mutation probe.
+    #[sqlx::test]
+    async fn info_refs_per_caller_cap_keys_on_ip_not_did(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6pcip", "pc", "/tmp/pc-nonexistent", None, false)
+            .await
+            .unwrap();
+
+        let did_a = "did:key:z6MkPerCallerKeyingProofDidAAAAAAAAAAAAAAAA";
+        let did_b = "did:key:z6MkPerCallerKeyingProofDidBBBBBBBBBBBBBBBB";
+        let peer: SocketAddr = "203.0.113.51:5000".parse().unwrap();
+
+        // Fill the SOURCE IP's single read slot; both DIDs' own slots stay free.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire(&peer.ip().to_string())
+            .expect("first slot for this source IP");
+
+        // Signed as DID_A from `peer`: keyed by the saturated source IP -> shed 503.
+        let router = crate::server::build_router(state.clone());
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcip/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        req.extensions_mut()
+            .insert(crate::auth::AuthenticatedDid(did_a.to_string()));
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a signed caller must be keyed by its source IP, not its DID: the saturated IP must shed it 503"
+        );
+
+        // Same IP, a DIFFERENT DID: still keyed by the same saturated IP -> also shed.
+        // The farm defeat: minting a fresh DID buys no fresh per-source budget.
+        let router2 = crate::server::build_router(state.clone());
+        let mut req2 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcip/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut().insert(ConnectInfo(peer));
+        req2.extensions_mut()
+            .insert(crate::auth::AuthenticatedDid(did_b.to_string()));
+        assert_eq!(
+            router2.oneshot(req2).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a second DID from the same source IP must also shed 503: a DID farm cannot multiply the per-source budget"
+        );
+
+        // A signed caller from a DIFFERENT source IP keeps its own budget -> not shed.
+        let other: SocketAddr = "203.0.113.52:5000".parse().unwrap();
+        let router3 = crate::server::build_router(state.clone());
+        let mut req3 = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcip/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        req3.extensions_mut().insert(ConnectInfo(other));
+        req3.extensions_mut()
+            .insert(crate::auth::AuthenticatedDid(did_a.to_string()));
+        assert_ne!(
+            router3.oneshot(req3).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a signed caller from a different source IP must keep its own per-source budget"
+        );
+    }
+
+    /// #174 SC2 (None-key): a request with no resolvable caller key (no ConnectInfo,
+    /// no trusted header) must NOT be shed by the per-caller cap even when another
+    /// caller's budget is full — it is bounded by the global read pool only. A None
+    /// key never keys into the map, so it never 503s from the per-caller sub-cap.
+    #[sqlx::test]
+    async fn info_refs_none_key_bypasses_per_caller_cap(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::http::{Method, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_read_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6pcnone", "pc", "/tmp/pc-nonexistent", None, false)
+            .await
+            .unwrap();
+        // Saturate an unrelated caller's budget; the None-key request must be
+        // unaffected because it never keys into the per-caller map.
+        let _slot = state
+            .git_read_per_caller
+            .try_acquire("203.0.113.99")
+            .expect("hold an unrelated caller's slot");
+
+        // No ConnectInfo inserted -> PeerAddr is None -> no per-caller key.
+        let router = crate::server::build_router(state.clone());
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/z6pcnone/pc/info/refs?service=git-upload-pack")
+            .body(Body::empty())
+            .unwrap();
+        assert_ne!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a request with no resolvable caller key must not be shed by the per-caller cap"
+        );
+    }
+
     /// Repo creation must be throttled by the per-IP creation limiter BEFORE
     /// signature verification — otherwise a DID farm (one throwaway did:key per
     /// repo, each carrying a valid but machine-solved iCaptcha proof) walks past
@@ -2624,5 +6717,370 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "repo creation must be IP-throttled before signature verification"
         );
+    }
+
+    // ── #174 U2 / F3: second same-repo push serialized until a disconnected first ──
+    // push's git process GROUP is reaped (RepoWriteLease riding the disconnect reaper).
+
+    /// `kill(pid, 0)` liveness probe (same-uid here, so EPERM never applies).
+    #[cfg(unix)]
+    fn f3_alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// F3 (P1, RED-before/GREEN-after): on a client disconnect DURING receive-pack the
+    /// disconnected push's git group is torn down by KillGroupOnDrop's detached reaper
+    /// (~4s TERM/grace/KILL/reap), while RepoWriteGuard::Drop releases the pg advisory
+    /// lock at the disconnect INSTANT. Without the in-process write lease, a second
+    /// same-node push then acquires the freed pg lock and mutates the shared local repo
+    /// WHILE the first group is still writing — a torn snapshot. The lease is held by the
+    /// write-path AdmissionGuard, which rides that reaper, so the second push must not run
+    /// its receive-pack (mutate the repo) until the first group is reaped.
+    ///
+    /// The fake git labels the pushes by receive-pack arrival order (atomic mkdir): the
+    /// first (push A) forks a SIGTERM-IGNORING descendant, records its pid, then hangs
+    /// (so A can be dropped mid-transfer and its group survives the SIGTERM grace); the
+    /// second (push B, a DIFFERENT source) records that its receive-pack ran — i.e. that
+    /// B mutated the repo. The load-bearing invariant is strictly ordered, not
+    /// time-windowed: B's marker must NEVER appear while A's descendant is still alive.
+    ///
+    /// Load-bearing: pre-fix (no lease) A's disconnect frees the pg lock, B's
+    /// acquire_write succeeds within its ~1s retry, and B's receive-pack runs (marker
+    /// appears) WHILE A's descendant is still alive — RED. With the lease the reaper
+    /// holds it until the group is ESRCH-gone, so B's marker appears only AFTER — GREEN.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f3_second_push_serialized_until_disconnected_group_reaped(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let seq_a = tmp.path().join("seq_a"); // first receive-pack wins this mkdir = push A
+        let descfile = tmp.path().join("desc.pid"); // A's SIGTERM-ignoring descendant pid
+        let b_ran = tmp.path().join("b.ran"); // set when B's receive-pack runs (B mutates)
+                                              // receive-pack: first invocation (A) forks a TERM-ignoring descendant (bounded
+                                              // loop so a RED run leaks no permanent orphan), records its pid, and hangs in
+                                              // `wait`; second (B) records that it ran. rev-parse feeds any tail probe.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               receive-pack)\n\
+                 cat >/dev/null 2>/dev/null\n\
+                 if mkdir \"{seq}\" 2>/dev/null; then\n\
+                   sh -c 'trap \"\" TERM; echo $$ > \"{desc}\"; i=0; while [ $i -lt 60 ]; do sleep 0.1; i=$((i+1)); done' &\n\
+                   wait\n\
+                 else\n\
+                   echo 1 > \"{bran}\"\n\
+                 fi ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            seq = seq_a.display(),
+            desc = descfile.display(),
+            bran = b_ran.display(),
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        // One repo; A and B push to it (same record.id -> same lease key). Non-path-scoped
+        // + flush-only body -> no post-receive scans to muddy the observation.
+        let state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3repo", "r1", false).await;
+        let did = "did:key:z6MkF3PusherAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Push A: drive its handler future in slices until it reaches receive-pack and the
+        // fake records its descendant pid (A now holds the lease and is hung).
+        let mut fut_a = Box::pin(git_receive_pack(
+            State(state.clone()),
+            Path(("z6f3repo".to_string(), "r1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.81:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        let mut desc: Option<i32> = None;
+        for _ in 0..1000 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut_a).await;
+            if let Some(p) = std::fs::read_to_string(&descfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                desc = Some(p);
+                break;
+            }
+        }
+        let desc = desc.expect("push A must reach receive-pack and record its descendant pid");
+        assert!(
+            f3_alive(desc),
+            "A's descendant must be alive before the disconnect"
+        );
+
+        // Push B: a DIFFERENT source, same repo. It blocks on the lease A holds.
+        let state_b = state.clone();
+        let handle_b = tokio::spawn(async move {
+            git_receive_pack(
+                State(state_b),
+                Path(("z6f3repo".to_string(), "r1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(
+                    "203.0.113.82:5000".parse::<SocketAddr>().unwrap(),
+                )),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            )
+            .await
+        });
+        // Give B time to reach and block on the lease acquire.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !b_ran.exists(),
+            "B must not have mutated the repo while A legitimately holds the lease"
+        );
+
+        // Client disconnect on A: drop its future. RepoWriteGuard::Drop frees the pg lock
+        // immediately; the write-path AdmissionGuard (carrying the lease's clone (a))
+        // rides KillGroupOnDrop's detached reaper, which now tears down A's group.
+        drop(fut_a);
+
+        // Load-bearing ordering invariant: while A's descendant is still alive (group not
+        // yet reaped), B must NOT have run its receive-pack. Poll until the descendant is
+        // gone; every step it is alive, B's marker must be absent. Pre-fix, B's marker
+        // appears here (RED); with the lease it can only appear after the reap (GREEN).
+        let mut reaped = false;
+        for _ in 0..800 {
+            if !f3_alive(desc) {
+                reaped = true;
+                break;
+            }
+            assert!(
+                !b_ran.exists(),
+                "F3 RED: push B mutated the repo while push A's disconnected git group \
+                 was still alive (descendant pid {desc}) — the second writer must be \
+                 serialized until the first group is reaped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Safety net so a RED run never leaks the orphan.
+        unsafe {
+            libc::kill(desc, libc::SIGKILL);
+        }
+        assert!(
+            reaped,
+            "A's disconnected group must be reaped within the teardown cap"
+        );
+
+        // GREEN tail: once the group is reaped the lease frees and B proceeds — its
+        // receive-pack runs (marker appears) and it returns 200.
+        let mut b_mutated = false;
+        for _ in 0..1000 {
+            if b_ran.exists() {
+                b_mutated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            b_mutated,
+            "push B must proceed and mutate the repo once A's group is reaped"
+        );
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("push B must complete once the lease frees")
+            .expect("push B task must not panic")
+            .expect("push B must succeed");
+        assert_eq!(resp.status(), 200, "push B lands 200 after serialization");
+    }
+
+    /// F3 clean-path no-regression: a clean push (no disconnect) releases the lease after
+    /// the receive-pack group is reaped and the (success-only) Tigris upload in
+    /// guard.release runs, so the per-repo lease entry is GC'd and a second same-repo
+    /// push proceeds immediately. A lease that failed to free on the clean path would
+    /// wedge every subsequent push to the repo.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f3_clean_push_frees_lease_and_second_push_proceeds(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Clean receive-pack: drain stdin, exit 0. No hang, no descendant.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  receive-pack) cat >/dev/null 2>/dev/null ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3clean", "c1", false).await;
+        let did = "did:key:z6MkF3CleanPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        let push = |st: AppState, peer: &'static str| async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                git_receive_pack(
+                    State(st),
+                    Path(("z6f3clean".to_string(), "c1".to_string())),
+                    Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    crate::rate_limit::PeerAddr(Some(peer.parse::<SocketAddr>().unwrap())),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::from_static(b"0000"),
+                ),
+            )
+            .await
+            .expect("a clean push must not wedge on the lease")
+            .expect("the push must succeed")
+        };
+
+        let a = push(state.clone(), "203.0.113.91:5000").await;
+        assert_eq!(a.status(), 200, "clean push A lands 200");
+        // The clean push freed its lease (both clones dropped) -> the entry GC'd.
+        assert!(
+            state.repo_write_leases.is_empty(),
+            "a clean push must free the per-repo lease (Drop-frees-key) so it never wedges"
+        );
+
+        let b = push(state.clone(), "203.0.113.92:5000").await;
+        assert_eq!(
+            b.status(),
+            200,
+            "a second same-repo push proceeds after a clean first"
+        );
+        assert!(
+            state.repo_write_leases.is_empty(),
+            "the lease entry must be freed again after the second clean push"
+        );
+    }
+
+    /// F3 DoS (P2, RED-before/GREEN-after): a second same-repo push that BLOCKS on the
+    /// per-repo write lease must hold NO global write permit while it waits. The lease
+    /// is a block-and-wait serializer, so a lease-blocked waiter can sit for up to
+    /// steal_after (~a full git_service_timeout window). If it grabs a scarce global
+    /// write-pool slot BEFORE blocking, a handful of hostile sources can stack same-repo
+    /// pushes, pin every write slot on lease-waiters sending zero bytes, and shed 503 on
+    /// every push to every OTHER repo node-wide. The fix acquires the lease BEFORE the
+    /// two write permits, so a blocked waiter pins no slot.
+    ///
+    /// Load-bearing invariant: with the write pool sized to 2, push A holds the lease and
+    /// is in-flight in receive-pack (1 permit held), and same-repo push B is blocked on
+    /// the lease, `git_write_semaphore.available_permits()` must stay 1 (only A holds).
+    /// Pre-fix B takes its permit BEFORE blocking on the lease, draining the pool to 0
+    /// (RED). With the reorder B blocks before any permit, so the pool stays at 1 (GREEN).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f3_lease_blocked_waiter_holds_no_write_permit(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let seq_a = tmp.path().join("seq_a"); // first receive-pack wins this mkdir = push A
+        let a_inpack = tmp.path().join("a.inpack"); // set when A reaches receive-pack (holds lease+permit)
+        let b_ran = tmp.path().join("b.ran"); // set when B's receive-pack runs (B got past the lease)
+                                              // receive-pack: first invocation (A) marks that it reached the pack and hangs in a
+                                              // bounded loop (so a RED run leaks no permanent orphan); second (B) marks it ran.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               receive-pack)\n\
+                 cat >/dev/null 2>/dev/null\n\
+                 if mkdir \"{seq}\" 2>/dev/null; then\n\
+                   echo 1 > \"{ainp}\"\n\
+                   i=0; while [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n\
+                 else\n\
+                   echo 1 > \"{bran}\"\n\
+                 fi ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            seq = seq_a.display(),
+            ainp = a_inpack.display(),
+            bran = b_ran.display(),
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f3dos", "d1", false).await;
+        // Size the write pool to 2 so one in-flight holder (A) leaves exactly one slot
+        // free, and a pool-holding waiter (B, pre-fix) would drain it to zero. Sizing to
+        // 1 would 503 B on the pool before it could block on the lease, hiding the bug.
+        state.git_write_semaphore = Arc::new(Semaphore::new(2));
+        let did = "did:key:z6MkF3DosPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Push A: drive its handler future in slices until it reaches receive-pack (it now
+        // holds the lease and one write permit and is hung). available_permits() drops to 1.
+        let mut fut_a = Box::pin(git_receive_pack(
+            State(state.clone()),
+            Path(("z6f3dos".to_string(), "d1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.71:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        for _ in 0..1000 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut_a).await;
+            if a_inpack.exists() {
+                break;
+            }
+        }
+        assert!(
+            a_inpack.exists(),
+            "push A must reach receive-pack and hold the lease"
+        );
+        assert_eq!(
+            state.git_write_semaphore.available_permits(),
+            1,
+            "with the pool sized to 2, the single in-flight holder (A) leaves one slot free"
+        );
+
+        // Push B: a DIFFERENT source, same repo. It blocks on the lease A holds.
+        let state_b = state.clone();
+        let handle_b = tokio::spawn(async move {
+            git_receive_pack(
+                State(state_b),
+                Path(("z6f3dos".to_string(), "d1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(
+                    "203.0.113.72:5000".parse::<SocketAddr>().unwrap(),
+                )),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            )
+            .await
+        });
+
+        // Load-bearing check: while B is a lease-blocked waiter the pool must stay at 1
+        // (only A holds a permit). Poll the invariant across a full window; pre-fix B
+        // grabs the last slot within ms and the pool falls to 0 (RED), post-fix it never
+        // does (GREEN). A stable state, not a one-shot race: B stays blocked on the lease
+        // (steal_after is far larger than this window) so once it settles the pool holds.
+        for _ in 0..100 {
+            assert_eq!(
+                state.git_write_semaphore.available_permits(),
+                1,
+                "F3 DoS RED: a lease-blocked same-repo waiter took a global write permit \
+                 while sending zero bytes, draining the pool — a blocked waiter must pin \
+                 no write-pool slot"
+            );
+            assert!(
+                !b_ran.exists(),
+                "B must not have run receive-pack while A holds the lease"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Non-vacuous: B is genuinely parked on the lease, not returned early.
+        assert!(
+            !handle_b.is_finished(),
+            "push B must still be blocked on the lease at this point"
+        );
+
+        // Client disconnect on A: drop its future. The write-path AdmissionGuard rides the
+        // reaper, freeing the lease once A's group is reaped; B then proceeds.
+        drop(fut_a);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("push B must complete once A's group is reaped and the lease frees")
+            .expect("push B task must not panic")
+            .expect("push B must succeed");
+        assert_eq!(resp.status(), 200, "push B lands 200 after serialization");
+        assert!(b_ran.exists(), "push B ran its receive-pack once unblocked");
     }
 }

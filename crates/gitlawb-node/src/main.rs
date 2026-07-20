@@ -74,6 +74,13 @@ async fn main() -> Result<()> {
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
     bootstrap::merge_seeds(&mut config);
 
+    // Fail fast on config combinations that are individually in-range but jointly
+    // unsafe — notably a DB pool too small for the concurrent-write cap, which
+    // would let a push burst starve every other DB path (#174 F1).
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
+
     if !config.public_read {
         warn!(
             "GITLAWB_PUBLIC_READ=false is reserved; per-repository private-read enforcement is not wired in alpha"
@@ -378,7 +385,72 @@ async fn main() -> Result<()> {
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Anon receive-pack advertisements get their OWN pool, same size as the
+        // write pool but disjoint, so filling it (which takes many source IPs, each
+        // capped by git_push_advert_per_caller) never occupies a permit the
+        // authenticated POST needs (#174).
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds concurrent detached post-push encryption walks, sized from the push
+        // pool (no separate knob — Q1): completed pushes cannot outnumber active
+        // encryption walks past this (#174 P1-e).
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds concurrent post-push pin loops (their MB-scale object-id lists) across
+        // all repos (#174 F6), independent of the per-repo encrypt-task coalescing below.
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_pin_tasks)),
+        // Coalesces the DETACHED post-push encryption tasks per repo so a rapid pusher
+        // cannot grow the outstanding parked-waiter set past one task per repo (#174
+        // P2-2). No knob: it is a natural cap (one entry per distinct repo), not a
+        // sized pool.
+        encrypt_inflight: crate::state::EncryptInflight::new(),
+        // Per-repo in-process write-lease serializer (#174 U2/F3): supplements the pg
+        // advisory lock so a disconnected push's still-reaping git group can't be raced
+        // by a second same-node push. Natural cap (one entry per contended repo, freed
+        // when unreferenced), no sized knob.
+        repo_write_leases: crate::state::RepoWriteLeases::new(),
+        git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.max_concurrent_reads_per_caller,
+        ),
+        // Per-source cap on the receive-pack advertisement, sized to an eighth of the
+        // write pool (min 1): a single source can hold at most this many write-pool
+        // slots via the anon advertisement, so saturating the pool takes ~8 distinct
+        // source IPs, each also rate-limited (#174).
+        git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            (config.max_concurrent_git_pushes / 8).max(1),
+        ),
+        // Per-source cap on the authenticated receive-pack POST, sized like the advert
+        // cap: one source IP can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct source IPs, each also rate-limited
+        // (#174 P1-d).
+        git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            (config.max_concurrent_git_pushes / 8).max(1),
+        ),
+        // Bounds concurrent /ipfs visibility walks — a distinct public cost center, so
+        // its own pool + per-source sub-cap + per-IP rate limiter, never a git pool
+        // (#174 P1-3). The per-source map is bounded (reject-before-insert, INV-15).
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_ipfs_walks,
+        )),
+        git_ipfs_walk_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.ipfs_walk_per_source,
+        ),
+        ipfs_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        git_bin: "git".to_string(),
     };
+    if config.ipfs_rate_limit == 0 {
+        tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
     // we still set the gauge to 0 so dashboards don't show "no data".

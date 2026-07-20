@@ -343,7 +343,14 @@ Important node settings:
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
-| `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack/receive-pack may run before it is aborted (504). Default 600. Does not bound `info/refs` or the withheld-blob path. |
+| `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack, receive-pack, or `info/refs` advertisement may run before it is aborted (504). Default 600. Also bounds the withheld-blob classification walk (on both the upload-pack serve and receive-pack replication paths) and the push-side pin-candidate discovery (`rev-list` / `cat-file`), each reaped via process-group teardown at the deadline. |
+| `GITLAWB_GIT_ACQUIRE_TIMEOUT_SECS` | Max seconds the storage-acquisition phase (Tigris HEAD/GET, push advisory-lock) of a served git op may run before the request is shed with a 503, separate from the git-run timeout. The concurrency permit is released on expiry so a stalled backend cannot pin the pool. Default 30. |
+| `GITLAWB_MAX_CONCURRENT_IPFS_WALKS` | Max concurrent `GET /ipfs/{cid}` visibility walks across all callers (own pool, disjoint from the served-git pools); over-cap sheds 503. Default 32. |
+| `GITLAWB_IPFS_WALK_PER_SOURCE` | Max concurrent `/ipfs` walks a single source IP may hold. Default 4. |
+| `GITLAWB_IPFS_MAX_REPOS_WALKED` | Max expensive path-scope visibility walks per `/ipfs/{cid}` request; over-cap repos are skipped and the scan continues, shedding a retryable 503 (not a false 404) if the object is then found nowhere. Default 64. |
+| `GITLAWB_IPFS_MAX_REPO_VISITS` | Ceiling on repos one `/ipfs/{cid}` request may visit (acquire + probe) past the visibility gate — also the worst-case per-request Tigris fetch count. On exhaustion the scan stops with a retryable 503. Default 1024. |
+| `GITLAWB_IPFS_REQUEST_BUDGET_SECS` | Absolute wall-clock budget for one admitted `/ipfs/{cid}` request's acquire+walk lifetime. Per-stage clamps bound the acquire and walk stages to the remaining budget, and no stage starts once it is exhausted; the scan then stops with a retryable 503. The object-type probe and content-read `cat-file` subprocesses are budget-checked before starting but have no duration bound of their own, so a hung git probe (corrupt pack, stuck filesystem) holds the request's walk slot for the full duration of the hang. Default 600. |
+| `GITLAWB_IPFS_RATE_LIMIT` | Max `/ipfs/{cid}` requests per client IP per hour (route flood brake). 0 disables. Default 600. |
 | `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
 | `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
 | `GITLAWB_IRYS_URL` | Optional Irys/Arweave permanent anchoring. |
