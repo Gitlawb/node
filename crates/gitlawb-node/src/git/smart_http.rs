@@ -33,16 +33,36 @@ pub struct AdmissionGuard {
     // 'static` so the guard can move into the detached reaper task.
     _global: Option<Box<dyn Send + 'static>>,
     _caller: Option<Box<dyn Send + 'static>>,
+    // Per-repo write lease (#174 U2/F3), `Some` ONLY on the receive-pack write path
+    // (via [`with_lease`](Self::with_lease)); `None` on every read path and every
+    // non-receive-pack write path. It rides this guard into `KillGroupOnDrop`'s detached
+    // reaper, so on a client disconnect the lease frees only after the disconnected
+    // push's git group is reaped — serializing a second same-node push against the
+    // still-writing group. A `RepoWriteLease` clone is `Send + 'static` and holds no pg
+    // connection, so it travels with the reaper cleanly. A stray `Some` on a READ path
+    // would wrongly serialize upload-pack against pushes, hence the None-everywhere-else
+    // discipline.
+    _lease: Option<crate::state::RepoWriteLease>,
 }
 
 impl AdmissionGuard {
     /// Take ownership of the global permit and an optional per-caller permit. Both are
     /// erased to `Box<dyn Send>` — the guard's only job is to hold them until it drops.
+    /// No lease is attached here; the receive-pack write path adds one via
+    /// [`with_lease`](Self::with_lease), so every other call site is lease-free.
     pub fn new(global: impl Send + 'static, caller: Option<impl Send + 'static>) -> Self {
         Self {
             _global: Some(Box::new(global)),
             _caller: caller.map(|c| Box::new(c) as Box<dyn Send + 'static>),
+            _lease: None,
         }
+    }
+
+    /// Attach the per-repo write lease (#174 U2/F3). Called ONLY on the receive-pack
+    /// write path, so the lease rides the disconnect reaper; read paths never call this.
+    pub fn with_lease(mut self, lease: crate::state::RepoWriteLease) -> Self {
+        self._lease = Some(lease);
+        self
     }
 }
 
