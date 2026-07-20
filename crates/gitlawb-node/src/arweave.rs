@@ -312,7 +312,7 @@ pub async fn verify_anchor(
             .map_err(|e| anyhow::anyhow!("unresolvable node DID: {e}"))?;
 
         let sig_array: [u8; 64] =
-            match base64::engine::general_purpose::STANDARD.decode(&c.signature) {
+            match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&c.signature) {
                 Ok(bytes) => match bytes.as_slice().try_into() {
                     Ok(a) => a,
                     Err(_) => {
@@ -340,18 +340,17 @@ pub async fn verify_anchor(
             errors.push(format!("certificate signature verification failed: {e}"));
         }
 
-        // 2. Verify prev hash linkage against the most recent local cert
-        if let Ok(Some(local_cert)) = db.get_most_recent_cert(&c.repo_id).await {
-            if c.seq <= local_cert.seq {
-                // Check that the claimed prev matches the local chain
+        // 2. Verify prev hash linkage against the predecessor at seq - 1
+        if c.seq > 1 {
+            if let Ok(Some(pred)) = db.get_cert_by_seq(&c.repo_id, c.seq - 1).await {
                 let prev_payload = serde_json::json!({
-                    "repo_id":    local_cert.repo_id,
-                    "ref":        local_cert.ref_name,
-                    "old":        local_cert.old_sha,
-                    "new":        local_cert.new_sha,
-                    "pusher":     local_cert.pusher_did,
-                    "node":       local_cert.node_did,
-                    "ts":         local_cert.issued_at,
+                    "repo_id":    pred.repo_id,
+                    "ref":        pred.ref_name,
+                    "old":        pred.old_sha,
+                    "new":        pred.new_sha,
+                    "pusher":     pred.pusher_did,
+                    "node":       pred.node_did,
+                    "ts":         pred.issued_at,
                 });
                 let prev_bytes = serde_json::to_vec(&prev_payload)?;
                 let expected_prev = hex::encode(sha2::Sha256::digest(&prev_bytes));
