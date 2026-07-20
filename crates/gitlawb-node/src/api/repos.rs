@@ -989,7 +989,7 @@ pub async fn git_receive_pack(
         // to prevent stale locks and to avoid holding the write lock across the
         // fan-out. Only upload to Tigris when the push succeeded; uploading a
         // half-applied repo would propagate corruption.
-        guard.release(result.is_ok()).await;
+        let upload_ok = guard.release(result.is_ok()).await;
 
         // On receive-pack error, deliver the classified error to the client and run
         // NO tail. On success, hand report-status to the client now, then continue
@@ -1011,6 +1011,24 @@ pub async fn git_receive_pack(
                 return;
             }
         };
+
+        // The refs applied locally, but the durable upload to object storage
+        // FAILED or timed out. Report the push as failed (5xx) instead of 200 so
+        // the idempotent client re-pushes and re-uploads: otherwise the next
+        // acquire_write downloads the STALE pre-push archive over local disk and
+        // reverts these refs, silently losing the commit the client believes it
+        // landed. Skip the whole success tail — a push whose durable copy never
+        // landed must not be recorded/broadcast as accepted. (P1 data-loss fix.)
+        if !upload_ok {
+            tracing::error!(repo = %record.name,
+                "durable upload failed after receive-pack — reporting push failure so the client retries");
+            let _ = report_tx.send(Err(AppError::Git(format!(
+                "durable storage upload failed for {}",
+                record.name
+            ))));
+            return;
+        }
+
         let _ = report_tx.send(Ok(response));
 
         // Update the repo's updated_at timestamp after a successful push
@@ -3093,6 +3111,170 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         assert_eq!(pushes, 1, "the tail must run on a connected push too");
+    }
+
+    // P1 data-loss regression: when the durable (Tigris) upload in release()
+    // times out, the refs are applied on local disk but never persisted to
+    // object storage. The pre-fix handler still reported 200 to the client AND
+    // ran the success tail, so the client trusted a push that the NEXT
+    // acquire_write would revert from the stale pre-push archive — silent data
+    // loss. The fix surfaces a failed/timed-out upload as a FAILED push (5xx) so
+    // the idempotent client re-pushes, and skips the whole success tail. Here we
+    // stall the upload past a tiny release timeout, drive a fully-applied push,
+    // and assert (a) the client gets a non-2xx and (b) the tail did NOT run
+    // (no push record). RED pre-fix: 200 + push record present.
+    #[sqlx::test]
+    async fn durable_upload_timeout_fails_push_and_skips_tail(pool: sqlx::PgPool) {
+        use axum::extract::{Path as AxPath, State};
+        use axum::response::IntoResponse;
+        use axum::Extension;
+        use std::path::Path as StdPath;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        // Object store whose upload() parks forever: the release() timeout is the
+        // only thing that unblocks it. `exists()` is false so acquire_write never
+        // downloads over the fresh local bare repo.
+        struct StallStore;
+        #[async_trait::async_trait]
+        impl crate::git::tigris::ObjectStore for StallStore {
+            async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn upload(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+            async fn download(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(std::sync::Arc::new(StallStore)),
+            pool.clone(),
+        )
+        .with_release_upload_timeout(Duration::from_millis(200));
+
+        let owner = "z6durablefailowner";
+        let name = "durablefail";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let bare = repos_dir
+            .path()
+            .join(&owner_slug)
+            .join(format!("{name}.git"));
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
+            .await
+            .unwrap();
+
+        fn git(args: &[&str], dir: &std::path::Path) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let work = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q", "-b", "main", "."], work.path());
+        git(&["config", "user.email", "t@t"], work.path());
+        git(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "hi").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c"], work.path());
+        let oid = git(&["rev-parse", "HEAD"], work.path());
+
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &work.path().to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone --bare failed");
+        git(
+            &[
+                "-C",
+                &bare.to_string_lossy(),
+                "update-ref",
+                "-d",
+                "refs/heads/main",
+            ],
+            work.path(),
+        );
+
+        // No hook: the push applies immediately; the stall is entirely in release().
+        let zero = "0".repeat(40);
+        let cmd = format!("{zero} {oid} refs/heads/main\0report-status\n");
+        let mut body = Vec::new();
+        let len = cmd.len() + 4;
+        body.extend_from_slice(format!("{len:04x}").as_bytes());
+        body.extend_from_slice(cmd.as_bytes());
+        body.extend_from_slice(b"0000");
+        let pack = Command::new("git")
+            .args([
+                "-C",
+                &bare.to_string_lossy(),
+                "pack-objects",
+                "--stdout",
+                "-q",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(pack.status.success(), "pack-objects failed");
+        body.extend_from_slice(&pack.stdout);
+        let body = Bytes::from(body);
+
+        // Await the handler: acquire → receive-pack (applies) → release (upload
+        // stalls, timing out after 200ms). The client MUST see a failure, not 200.
+        let resp = super::git_receive_pack(
+            State(state.clone()),
+            AxPath((owner.to_string(), format!("{name}.git"))),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            body,
+        )
+        .await;
+        let status = match resp {
+            Ok(r) => r.status(),
+            Err(e) => e.into_response().status(),
+        };
+        assert!(
+            status.is_server_error(),
+            "a timed-out durable upload must fail the push (5xx) so the client \
+             retries — got {status}, which the client trusts as a landed push \
+             that a later acquire_write would silently revert"
+        );
+
+        // And the success tail must NOT have run: no push record for a push whose
+        // durable copy never landed. Give the (detached) tail time to run if it
+        // were going to, then assert it did not.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let pushes = state.db.get_push_count(owner).await.unwrap();
+        assert_eq!(
+            pushes, 0,
+            "the success tail (record_push) must NOT run when the durable upload \
+             failed — the push was not durably accepted"
+        );
     }
 
     /// Repo creation must be throttled by the per-IP creation limiter BEFORE
