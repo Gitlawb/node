@@ -396,6 +396,11 @@ pub struct Config {
     /// concurrency cap above (a rate limit bounds request *rate*, the semaphore
     /// bounds concurrent slow holds — different axes). Keyed on the resolved client
     /// IP via `GITLAWB_TRUSTED_PROXY`. `0` disables. Default: 600.
+    ///
+    /// This is the pure once-per-request ROUTE brake. The resolver's internal
+    /// per-probe/per-walk WORK budget is a SEPARATE bucket whose capacity is DERIVED
+    /// from this value (`AppState::ipfs_work_budget`), not a knob of its own; `0` here
+    /// disables that derived bucket too.
     #[arg(long, env = "GITLAWB_IPFS_RATE_LIMIT", default_value_t = 600)]
     pub ipfs_rate_limit: usize,
 }
@@ -581,10 +586,84 @@ mod tests {
         // Ceiling guard: the knob never governs the history-walk ceiling, which must
         // stay at MAX_PIN_SOURCES + 1 or a provenanced full source set false-503s.
         assert!(
-            crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST
-                >= crate::db::MAX_PIN_SOURCES as u32 + 1,
+            crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST > crate::db::MAX_PIN_SOURCES as u32,
             "the history-walk ceiling is independent of the repos-walked knob"
         );
+    }
+
+    /// The `/ipfs` work-budget capacity is DERIVED from the route limit (R6, KTD6), with
+    /// a hard floor of one full legacy search per window (the effective
+    /// `ipfs_max_legacy_probes`). This guards the derived default so a single
+    /// default-config deep search never self-throttles mid-scan and recreates the F6
+    /// admit-then-429 for a legitimate caller. A `RateLimiter` sized to the derived
+    /// budget must admit the whole probe budget back to back.
+    #[test]
+    fn ipfs_work_budget_derives_from_route_limit_and_clears_the_probe_floor() {
+        use crate::state::AppState;
+
+        // Default config: derived work budget = max(route 600, probe budget 256) = 600,
+        // comfortably above the 256-probe floor.
+        let default = Config::parse_from(["gitlawb-node"]);
+        let budget = AppState::ipfs_work_budget(&default);
+        assert_eq!(budget, 600, "default derives max(route 600, probe 256)");
+        assert!(
+            budget >= AppState::ipfs_legacy_probe_budget(&default) as usize,
+            "the work budget must clear one full legacy search per window"
+        );
+
+        // Tight route limit (1): the floor lifts the work budget to the probe budget
+        // (256), NOT down to 1 — a single deep search still completes its full scan.
+        let tight = Config::parse_from(["gitlawb-node", "--ipfs-rate-limit", "1"]);
+        assert_eq!(
+            AppState::ipfs_work_budget(&tight),
+            256,
+            "a tight route limit is floored at the 256-probe budget, not clamped to 1"
+        );
+
+        // Raised probe budget lifts the floor with it (the work budget tracks the
+        // effective probe budget, not the constant).
+        let raised = Config::parse_from([
+            "gitlawb-node",
+            "--ipfs-rate-limit",
+            "10",
+            "--ipfs-max-repos-walked",
+            "1000",
+        ]);
+        assert_eq!(
+            AppState::ipfs_work_budget(&raised),
+            1000,
+            "the floor tracks the operator-raised legacy-probe budget"
+        );
+
+        // 0 route limit disables the derived bucket too (a 0-capacity limiter admits all).
+        let disabled = Config::parse_from(["gitlawb-node", "--ipfs-rate-limit", "0"]);
+        assert_eq!(
+            AppState::ipfs_work_budget(&disabled),
+            0,
+            "route limit 0 disables the derived work bucket alongside the route brake"
+        );
+
+        // Behavioral floor: a limiter sized to the derived (tight-route) budget admits
+        // the whole probe budget back to back for one source, then sheds the next.
+        let budget = AppState::ipfs_work_budget(&tight);
+        let limiter =
+            crate::rate_limit::RateLimiter::new(budget, std::time::Duration::from_secs(3600));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for i in 0..budget {
+                assert!(
+                    limiter.check("1.2.3.4").await,
+                    "probe {i} of one full default-config scan must be admitted (no mid-scan throttle)"
+                );
+            }
+            assert!(
+                !limiter.check("1.2.3.4").await,
+                "the probe past the derived budget is shed"
+            );
+        });
     }
 
     #[test]

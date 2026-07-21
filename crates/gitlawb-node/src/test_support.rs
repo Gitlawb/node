@@ -79,6 +79,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        ipfs_work_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
         ipfs_max_legacy_probes: crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
         ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
@@ -3285,7 +3286,8 @@ mod tests {
         let slug = owner_did.replace([':', '/'], "_");
         let short = owner_did.split(':').next_back().unwrap().to_string();
         let mut state = test_state(pool).await;
-        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let fx = seed_cid_repos(&slug, &short, &["provthrottle"]);
@@ -3455,7 +3457,8 @@ mod tests {
         let slug = owner_did.replace([':', '/'], "_");
         let short = owner_did.split(':').next_back().unwrap().to_string();
         let mut state = test_state(pool).await;
-        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let fx = seed_cid_repos(&slug, &short, &["fanout"]);
@@ -3498,7 +3501,7 @@ mod tests {
     /// fresh batch of `acquire` + `cat-file` probes every request with zero limiter
     /// contact, unbounded anonymous amplification against Tigris. Charging every
     /// legacy probe from the first one makes those probes accumulate against the
-    /// per-IP `ipfs_rate_limiter` ACROSS requests. Four repos, none holding the CID,
+    /// per-IP `ipfs_work_rate_limiter` ACROSS requests. Four repos, none holding the CID,
     /// so a full scan probes all four; the per-IP budget is sized to exactly ONE such
     /// scan (4 tokens). req1 (a genuine absence) fully scans and 404s, spending the
     /// budget; req2 from the SAME IP is shed at the first probe → 429 (it never
@@ -3515,7 +3518,8 @@ mod tests {
         let mut state = test_state(pool).await;
         // Budget = one full scan of the four seeded repos. A repeat scan from the same
         // IP then finds it spent. Keyed on XFF so `oneshot` can choose the source IP.
-        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(4, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(4, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let names = ["a0", "a1", "a2", "a3"];
@@ -3578,7 +3582,8 @@ mod tests {
         let short = owner_did.split(':').next_back().unwrap().to_string();
         let mut state = test_state(pool).await;
         // Budget 1, keyed on XFF so `oneshot` can choose the source IP.
-        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let _fx = seed_cid_repos(&slug, &short, &["r0"]);
@@ -5298,7 +5303,8 @@ mod tests {
         // size the per-IP budget to admit exactly one full scan (2 probes). A repeat
         // scan from the same IP then finds the bucket spent. Keyed on the rightmost
         // X-Forwarded-For hop so the test can choose a source IP under `oneshot`.
-        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let fx = seed_cid_repos(&slug, &short, &["walklimit"]);
@@ -5504,7 +5510,8 @@ mod tests {
         // Budget = one full two-repo scan (2 probes), keyed on the rightmost XFF hop
         // so `oneshot` can choose a source IP (no socket peer). A repeat scan from the
         // same IP then finds the budget spent.
-        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(2, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         // Identical secret-blob content in both bare clones → one CID resolves to
@@ -5578,10 +5585,11 @@ mod tests {
     }
 
     /// INV-10 amplification bound: a single `GET /ipfs/{cid}` must not fan out an
-    /// unbounded number of full-history walks. The per-request `ipfs_rate_limiter`
-    /// check only brakes REPEAT requests (it fires once per request); within one
-    /// request the same object can exist under path-scoped rules in many repos,
-    /// each paying its own walk. `MAX_HISTORY_WALKS_PER_REQUEST` caps that fan-out.
+    /// unbounded number of full-history walks. The route brake (`ipfs_rate_limiter`)
+    /// fires once per request and the per-walk `ipfs_work_rate_limiter` charge bounds
+    /// walk work across requests, but within ONE request the same object can exist under
+    /// path-scoped rules in many repos, each paying its own walk.
+    /// `MAX_HISTORY_WALKS_PER_REQUEST` caps that fan-out.
     ///
     /// Load-bearing witness (#173, F4): a readable public copy (no path rule →
     /// served via the no-walk path, exactly like
@@ -5784,7 +5792,8 @@ mod tests {
         let short = owner_did.split(':').next_back().unwrap().to_string();
 
         let mut state = test_state(pool).await;
-        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
 
         let fx = seed_cid_repos(&slug, &short, &["w0", "w1"]);
@@ -5848,6 +5857,155 @@ mod tests {
             state.ipfs_rate_limiter.tracked_keys().await,
             0,
             "the periodic sweep must evict the ipfs limiter's expired entries"
+        );
+    }
+
+    /// U5 (R6, KTD6), the observed defect: the `/ipfs` route rate limit and the
+    /// resolver's per-probe WORK budget are SEPARATE buckets, so a single request with
+    /// one probe COMPLETES even at route limit = 1. Through the production router the
+    /// `rate_limit_by_ip` middleware charges `ipfs_rate_limiter` once (its 1-slot bucket
+    /// is now full); the handler's legacy pre-scan peek and per-probe charge then draw
+    /// from `ipfs_work_rate_limiter`, a different bucket, so the walk-free public copy
+    /// still serves 200. RED before the split (both charges on `ipfs_rate_limiter`): the
+    /// middleware fills the one slot, the pre-scan peek reads it throttled, nothing is
+    /// servable → 429 on the FIRST request. Trust None so the middleware and the handler
+    /// resolve the same `ConnectInfo` peer IP.
+    #[sqlx::test]
+    async fn ipfs_route_limit_1_still_serves_one_probe(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(600, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        // Public, no-rule legacy pin (NULL provenance) → the resolver takes the scan
+        // fallback and serves walk-free (exactly one probe).
+        let fx = seed_cid_repos(&slug, &short, &["routeone"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("routeone.git");
+        let repo = seed_repo(&owner_did, "routeone");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+
+        let router = crate::server::build_router(state);
+        let peer: std::net::SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/ipfs/{cid}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a single /ipfs request with one probe must serve even at route limit = 1 \
+             (the route brake and the resolver's work budget are separate buckets)"
+        );
+    }
+
+    /// U5 (R6): the two buckets are independent — the WORK budget can be exhausted
+    /// (429) WITHOUT draining the ROUTE bucket. Through the production router, route
+    /// generous (5) but work tight (1): one request drives two legacy probes, so the
+    /// second probe finds the work bucket spent → 429 (the route middleware admitted it).
+    /// The route bucket, charged once by the middleware, still has room afterward — the
+    /// work charges never touched it, so it admits four more direct checks.
+    #[sqlx::test]
+    async fn ipfs_work_exhaustion_leaves_route_bucket_intact(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_rate_limiter = crate::rate_limit::RateLimiter::new(5, Duration::from_secs(3600));
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+
+        // A legacy pin absent from every repo so the scan probes both seeded repos: two
+        // probes, work budget 1 → the second probe is shed → 429.
+        let names = ["we0", "we1"];
+        let _fx = seed_cid_repos(&slug, &short, &names);
+        for n in names {
+            state
+                .db
+                .create_repo(&seed_repo(&owner_did, n))
+                .await
+                .expect("seed repo");
+        }
+        let bogus_oid = "0".repeat(64);
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(b"work-exhaustion").to_string();
+        state
+            .db
+            .record_pinned_cid(&bogus_oid, &cid, None)
+            .await
+            .expect("legacy pin");
+
+        let route_bucket = state.ipfs_rate_limiter.clone();
+        let peer_ip = "203.0.113.8";
+        let peer: std::net::SocketAddr = format!("{peer_ip}:5000").parse().unwrap();
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/ipfs/{cid}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a request whose probes exceed the work budget is shed 429 (work bucket), \
+             not blocked at the route (route bucket generous)"
+        );
+        // The route bucket recorded only the single request the middleware charged; the
+        // work charges did not drain it. Sized 5, one used by the request → four left.
+        for i in 0..4 {
+            assert!(
+                route_bucket.check(peer_ip).await,
+                "route check {i} must still admit — work charges never drained the route bucket"
+            );
+        }
+    }
+
+    /// U5 (R6): the periodic cleanup task sweeps the NEW work-budget limiter too, not
+    /// only the route limiter and its siblings. Mirrors
+    /// `sweep_rate_limiters_includes_ipfs_limiter`: drive `sweep_rate_limiters` and
+    /// assert the work limiter's expired entry is evicted. Dropping the
+    /// `ipfs_work_rate_limiter.cleanup()` call from that method leaves the entry in place
+    /// (`tracked_keys` stays 1): the RED proof the sweep covers it.
+    #[sqlx::test]
+    async fn sweep_rate_limiters_includes_ipfs_work_limiter(pool: PgPool) {
+        let mut state = test_state(pool).await;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(5, Duration::from_millis(50));
+
+        assert!(
+            state.ipfs_work_rate_limiter.check("1.2.3.4").await,
+            "record a hit on the work limiter"
+        );
+        assert_eq!(
+            state.ipfs_work_rate_limiter.tracked_keys().await,
+            1,
+            "the source-IP key is tracked before the sweep"
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        state.sweep_rate_limiters().await;
+
+        assert_eq!(
+            state.ipfs_work_rate_limiter.tracked_keys().await,
+            0,
+            "the periodic sweep must evict the work limiter's expired entries"
         );
     }
 

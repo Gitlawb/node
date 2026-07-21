@@ -38,11 +38,12 @@ use crate::state::AppState;
 use crate::visibility::{visibility_check, Decision};
 
 /// Hard ceiling on the number of full-history reachability walks a single
-/// `GET /ipfs/{cid}` request may spawn. The per-request `ipfs_rate_limiter`
-/// check brakes *repeat* requests, but within one request the object can exist
-/// under path-scoped rules in many repos, and each distinct repo pays its own
-/// `spawn_blocking` walk (the memo only dedups the same repo). Without a ceiling
-/// a single request fans out to O(repos) walks for one rate-limiter token — an
+/// `GET /ipfs/{cid}` request may spawn. The route brake (`ipfs_rate_limiter`, charged
+/// once per request by the middleware) caps request RATE, and the per-walk charge on
+/// the separate `ipfs_work_rate_limiter` bounds the walk work across requests, but
+/// within ONE request the object can exist under path-scoped rules in many repos, and
+/// each distinct repo pays its own `spawn_blocking` walk (the memo only dedups the same
+/// repo). Without a ceiling a single request fans out to O(repos) walks — an
 /// amplification sink (INV-10). Once this many walks have run, no further walk is
 /// spawned for the rest of the request: any remaining candidate that still needs
 /// a walk is skipped (and, with nothing else readable, the request falls through
@@ -335,14 +336,18 @@ pub async fn get_by_cid(
                     .await
                     .map_err(AppError::Internal)?;
             if needs_scan {
-                // F3 (#173, INV-10/INV-15): peek the per-IP limiter WITHOUT consuming a token
-                // so an already-throttled source is shed BEFORE the O(repos) preload; the
-                // consuming per-probe charge inside gate_and_serve is left UNCHANGED (it is
-                // load-bearing for the across-request bound), so this adds no double-charge.
+                // F3 (#173, INV-10/INV-15): peek the per-IP WORK-budget limiter WITHOUT
+                // consuming a token so an already-throttled source is shed BEFORE the
+                // O(repos) preload; the consuming per-probe charge inside gate_and_serve is
+                // left UNCHANGED (it is load-bearing for the across-request bound), so this
+                // adds no double-charge. This peeks `ipfs_work_rate_limiter`, the SAME bucket
+                // the per-probe charge below debits — NOT the route limiter (`ipfs_rate_limiter`,
+                // charged once per request by the middleware): peeking the route bucket here
+                // would re-shed a request the route already admitted (R6, U5).
                 if let Some(key) =
                     crate::rate_limit::client_key(rctx.headers, rctx.peer, state.push_limiter_trust)
                 {
-                    if state.ipfs_rate_limiter.is_throttled(&key).await {
+                    if state.ipfs_work_rate_limiter.is_throttled(&key).await {
                         throttled = true;
                         continue;
                     }
@@ -536,9 +541,10 @@ async fn gate_and_serve(
     // reset each request, leaving a NULL-provenance CID open to unbounded ACROSS-
     // request amplification: N requests spending N x budget cold `acquire` calls
     // against Tigris with zero limiter contact (#173, F3, jatmn). Charging the first
-    // probe makes those requests accumulate against the per-IP `ipfs_rate_limiter`,
-    // closing that path. The per-request cap below stays as the second bound (a
-    // single request's ceiling). A spent quota is the same non-fatal Throttled as the
+    // probe makes those requests accumulate against the per-IP `ipfs_work_rate_limiter`
+    // (the resolver's WORK bucket, separate from the once-per-request route brake
+    // `ipfs_rate_limiter` — R6, U5), closing that path. The per-request cap below stays
+    // as the second bound (a single request's ceiling). A spent quota is the same non-fatal Throttled as the
     // walk brake: keep scanning for a walk-free copy, and only a wholly-unservable
     // request becomes the 429. No resolvable key (a test oneshot with no peer/header)
     // skips the brake, as the walk brake does. The provenance path targets one repo
@@ -553,7 +559,7 @@ async fn gate_and_serve(
         if let Some(key) =
             crate::rate_limit::client_key(ctx.headers, ctx.peer, state.push_limiter_trust)
         {
-            if !state.ipfs_rate_limiter.check(&key).await {
+            if !state.ipfs_work_rate_limiter.check(&key).await {
                 return GateOutcome::Throttled;
             }
         }
@@ -658,7 +664,7 @@ async fn gate_and_serve(
                 if let Some(key) =
                     crate::rate_limit::client_key(ctx.headers, ctx.peer, state.push_limiter_trust)
                 {
-                    if !state.ipfs_rate_limiter.check(&key).await {
+                    if !state.ipfs_work_rate_limiter.check(&key).await {
                         return GateOutcome::Throttled;
                     }
                 }

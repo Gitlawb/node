@@ -65,13 +65,29 @@ pub struct AppState {
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
     /// push path throttles on the resolved client IP instead.
     pub push_rate_limiter: RateLimiter,
-    /// Per-client-IP rate limiter for the `GET /ipfs/{cid}` full-history walk.
-    /// The route is anonymous and a valid tree CID (exposed by the public pins
-    /// index) makes each repeat request pay a fresh allowed-set walk (rev-list +
-    /// ls-tree per commit), memoized only per request — unbounded amplification
-    /// (INV-10). Braking the walk on the non-farmable source IP caps that cost
-    /// without touching cheap non-walk fetches. Keyed by `push_limiter_trust`.
+    /// Per-client-IP ROUTE brake for `GET /ipfs/{cid}`: charged ONCE per request by the
+    /// `rate_limit_by_ip` middleware (server.rs), never inside the handler. It bounds
+    /// request RATE (the "requests per hour" contract of `GITLAWB_IPFS_RATE_LIMIT`) on
+    /// the non-farmable source IP, so an anonymous flood of the public route is capped.
+    /// The per-probe/per-walk WORK accounting the resolver does WITHIN a request draws
+    /// from the SEPARATE `ipfs_work_rate_limiter` below — the two cannot share one bucket
+    /// or a single request that spends a route token and then its own probe token off the
+    /// same bucket is admitted at the route and falsely shed mid-request (#173 round-10,
+    /// R6). Keyed by `push_limiter_trust`.
     pub ipfs_rate_limiter: RateLimiter,
+    /// Per-client-IP WORK-budget limiter for the `GET /ipfs/{cid}` resolver's internal
+    /// fan-out: charged per legacy (NULL-provenance) PROBE (`acquire` + `cat-file`) and
+    /// per provenance-path WALK, and peeked non-consuming before the O(repos) legacy
+    /// preload. A legacy CID from the public pins index otherwise lets one request drive
+    /// O(repos) subprocess spawns and cold Tigris fetches, and repeat requests amplify
+    /// that across requests with zero limiter contact (INV-10, F3). Charging the work to
+    /// the non-farmable source IP bounds it. A bucket DISTINCT from the route brake above:
+    /// one request legitimately spends many work tokens (a full legacy scan is up to
+    /// `ipfs_max_legacy_probes` probes), so it must not double as the once-per-request
+    /// route bucket. Capacity is DERIVED from the route limit (`AppState::ipfs_work_budget`,
+    /// no separate operator knob), floored at the legacy-probe budget so a single default-
+    /// config deep search never self-throttles mid-scan. Keyed by `push_limiter_trust`.
+    pub ipfs_work_rate_limiter: RateLimiter,
     /// Per-request ceiling on full-history reachability walks the CID resolver
     /// may spawn (default `api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST`). A field,
     /// not a bare const, so tests can shrink it to exercise the cap cheaply;
@@ -218,6 +234,7 @@ impl AppState {
         self.create_ip_rate_limiter.cleanup().await;
         self.push_rate_limiter.cleanup().await;
         self.ipfs_rate_limiter.cleanup().await;
+        self.ipfs_work_rate_limiter.cleanup().await;
         self.sync_trigger_rate_limiter.cleanup().await;
         self.peer_write_rate_limiter.cleanup().await;
     }
@@ -253,6 +270,23 @@ impl AppState {
     /// (1_048_576) keeps the cast lossless.
     pub(crate) fn ipfs_legacy_probe_budget(config: &crate::config::Config) -> u32 {
         config.ipfs_max_repos_walked as u32
+    }
+
+    /// Work-budget capacity for [`ipfs_work_rate_limiter`](Self#structfield.ipfs_work_rate_limiter)
+    /// (R6, KTD6), DERIVED from the route limit rather than a new operator knob. The route
+    /// limiter (`ipfs_rate_limiter`) charges once per request; this separate bucket absorbs
+    /// the resolver's per-probe/per-walk work charges so both the route "requests per hour"
+    /// contract and the amplification bound hold. Floor: at least one full legacy search per
+    /// window — the effective `ipfs_max_legacy_probes` (the `GITLAWB_IPFS_MAX_REPOS_WALKED`
+    /// knob, U4) — so a single default-config deep search cannot self-throttle mid-scan and
+    /// recreate the F6 admit-then-429 for a legitimate caller. `GITLAWB_IPFS_RATE_LIMIT=0`
+    /// disables the route brake and this derived bucket alike (a 0-capacity limiter admits
+    /// everything).
+    pub(crate) fn ipfs_work_budget(config: &crate::config::Config) -> usize {
+        if config.ipfs_rate_limit == 0 {
+            return 0;
+        }
+        config.ipfs_rate_limit.max(config.ipfs_max_repos_walked)
     }
 }
 
