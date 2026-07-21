@@ -372,17 +372,20 @@ pub struct Config {
     )]
     pub ipfs_walk_per_source: usize,
 
-    /// Upper bound on the number of candidate repos a single `/ipfs/{cid}` request
-    /// will walk before giving up (returning the opaque 404). The handler already
-    /// short-circuits the moment it serves the object, but a CID that is present in
-    /// (or path-gated out of) many repos could otherwise serialize one full-history
-    /// walk per repo inside a single held admission slot. Capping the count bounds
-    /// the worst-case work one request can pin its slot with. Must be between 1 and
-    /// 1_048_576. Default: 64.
+    /// Per-request ceiling on the number of legacy (NULL-provenance) repos the
+    /// `/ipfs/{cid}` resolver's scan fallback will PROBE (`acquire` + `git cat-file
+    /// -t`) before giving up. The provenance path targets one repo; the legacy scan,
+    /// absent this bound, fans one anonymous request out to O(repos) subprocess spawns
+    /// and cold-cache fetches for a CID enumerable from the public pins index (#173,
+    /// INV-10). A truncated scan surfaces as a retryable 503, never a false 404. Wired
+    /// into `AppState::ipfs_max_legacy_probes` at construction; the history-walk ceiling
+    /// stays constant (`MAX_HISTORY_WALKS_PER_REQUEST`) and is NOT governed by this knob
+    /// (a smaller value would falsely 503 a provenanced request). Must be between 1 and
+    /// 1_048_576. Default: 256.
     #[arg(
         long,
         env = "GITLAWB_IPFS_MAX_REPOS_WALKED",
-        default_value_t = 64,
+        default_value_t = crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST as usize,
         value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
     )]
     pub ipfs_max_repos_walked: usize,
@@ -534,7 +537,7 @@ mod tests {
     fn ipfs_max_repos_walked_defaults_and_rejects_out_of_range() {
         assert_eq!(
             Config::parse_from(["gitlawb-node"]).ipfs_max_repos_walked,
-            64
+            256
         );
         assert_eq!(
             Config::parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "8"])
@@ -545,6 +548,42 @@ mod tests {
         assert!(Config::try_parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "0"]).is_err());
         assert!(
             Config::try_parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "1048577"]).is_err()
+        );
+    }
+
+    /// The `GITLAWB_IPFS_MAX_REPOS_WALKED` knob must actually reach the legacy-probe
+    /// budget it advertises (R5, KTD5): production seeds `ipfs_max_legacy_probes` from
+    /// this helper, so the knob is a no-op unless the helper reflects it. RED while the
+    /// helper returns the hardcoded `MAX_LEGACY_PROBES_PER_REQUEST` (256 regardless of
+    /// the knob), GREEN once it reads the knob.
+    #[test]
+    fn ipfs_max_repos_walked_wires_the_legacy_probe_budget() {
+        use crate::state::AppState;
+        // Knob set to 1 → a one-probe legacy budget.
+        let one = Config::parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "1"]);
+        assert_eq!(
+            AppState::ipfs_legacy_probe_budget(&one),
+            1,
+            "the knob must control the legacy-probe budget, not be ignored"
+        );
+        // Unset knob preserves the shipped 256-probe behaviour.
+        let default = Config::parse_from(["gitlawb-node"]);
+        assert_eq!(
+            AppState::ipfs_legacy_probe_budget(&default),
+            256,
+            "the default knob keeps the shipped 256-probe budget"
+        );
+        assert_eq!(
+            AppState::ipfs_legacy_probe_budget(&default),
+            crate::api::ipfs::MAX_LEGACY_PROBES_PER_REQUEST,
+            "the default budget equals the constant it replaced"
+        );
+        // Ceiling guard: the knob never governs the history-walk ceiling, which must
+        // stay at MAX_PIN_SOURCES + 1 or a provenanced full source set false-503s.
+        assert!(
+            crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST
+                >= crate::db::MAX_PIN_SOURCES as u32 + 1,
+            "the history-walk ceiling is independent of the repos-walked knob"
         );
     }
 
