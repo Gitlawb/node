@@ -9,6 +9,44 @@
 
 use anyhow::Result;
 use gitlawb_core::cid::Cid;
+use std::time::Duration;
+
+/// Attempts (including the first) for a transient DB-record retry.
+const PIN_RECORD_ATTEMPTS: u32 = 3;
+/// Backoff between DB-record retry attempts.
+const PIN_RECORD_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Run an idempotent DB-record operation with a bounded retry so a sub-second
+/// transient error does not silently leave the pin-source set permanently
+/// incomplete. The resolver treats a nonempty below-cap source set as complete,
+/// so a dropped `record_pin_source`/`record_pinned_cid` makes `GET /ipfs/{cid}`
+/// 404 a valid public copy. Every wrapped insert is idempotent (`ON CONFLICT DO
+/// NOTHING` / provenance-preserving upsert), so re-running is safe. On exhausted
+/// attempts the last error is returned and the caller keeps its warn — behavior
+/// degrades to the pre-retry state, not worse. Process death mid-retry or a DB
+/// outage outlasting the backoff horizon leaves the same residual hole (no
+/// persisted marker to reconcile from at startup), retired only by a future
+/// reconciliation sweep. Runs inside the already-detached post-push task, so the
+/// backoff adds no push latency.
+async fn retry_db_record<F, Fut>(mut op: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut attempt = 1;
+    loop {
+        match op().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt >= PIN_RECORD_ATTEMPTS {
+                    return Err(e);
+                }
+                tokio::time::sleep(PIN_RECORD_BACKOFF).await;
+                attempt += 1;
+            }
+        }
+    }
+}
 
 /// Pin a single git object to the local IPFS/Kubo node.
 ///
@@ -134,7 +172,7 @@ pub async fn pin_new_objects(
                 // and without it `GET /ipfs/{cid}` only ever knows the first pinner, so a
                 // shared object first pinned from a private/quarantined repo 404s even
                 // when this repo would serve it. Bounded per object (MAX_PIN_SOURCES).
-                if let Err(e) = db.record_pin_source(&sha, repo_id).await {
+                if let Err(e) = retry_db_record(|| db.record_pin_source(&sha, repo_id)).await {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
                 }
                 continue;
@@ -167,12 +205,14 @@ pub async fn pin_new_objects(
                 // verifies them against the requested CID, so the raw CID is the correct
                 // key. Mirrors the pinata twin, which already records the raw CID.
                 let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&data).to_string();
-                if let Err(e) = db.record_pinned_cid(&sha, &raw_cid, Some(repo_id)).await {
+                if let Err(e) =
+                    retry_db_record(|| db.record_pinned_cid(&sha, &raw_cid, Some(repo_id))).await
+                {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinned CID in DB");
                 }
                 // F1 (#173 round 8): also record the first pinner in pin_repo_sources so
                 // every source (first and subsequent) is tried uniformly by the resolver.
-                if let Err(e) = db.record_pin_source(&sha, repo_id).await {
+                if let Err(e) = retry_db_record(|| db.record_pin_source(&sha, repo_id)).await {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
                 }
                 // Return the provider Hash (not the resolver key), mirroring the pinata
@@ -189,4 +229,93 @@ pub async fn pin_new_objects(
     }
 
     pinned
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // The retry helper is the load-bearing unit: it converts a sub-second
+    // transient DB error at the three warn-only record sites into a landed row,
+    // instead of a permanently incomplete pin-source set. These drive the helper
+    // directly against a controlled closure (the record sites take a concrete
+    // `&Db` over a `PgPool`, so a failing-first wrapper cannot slot in without
+    // changing signatures — see U6 seam note).
+
+    #[tokio::test]
+    async fn retry_lands_after_transient_failures() {
+        let calls = Cell::new(0u32);
+        let result = retry_db_record(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                if n < PIN_RECORD_ATTEMPTS {
+                    Err(anyhow::anyhow!("transient failure on attempt {n}"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "retry lands the row after transient failures"
+        );
+        assert_eq!(
+            calls.get(),
+            PIN_RECORD_ATTEMPTS,
+            "op is retried until it succeeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_returns_last_err_after_exhaustion() {
+        let calls = Cell::new(0u32);
+        let result = retry_db_record(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move { Err::<(), _>(anyhow::anyhow!("attempt {n} failed")) }
+        })
+        .await;
+
+        let err = result.expect_err("all attempts fail so the last error surfaces");
+        assert_eq!(
+            calls.get(),
+            PIN_RECORD_ATTEMPTS,
+            "attempts are bounded to the cap"
+        );
+        assert_eq!(
+            err.to_string(),
+            "attempt 3 failed",
+            "the LAST error is returned, not the first"
+        );
+    }
+
+    // Happy path against a real DB: a single-attempt success lands the row, and a
+    // redundant call is idempotent (`ON CONFLICT DO NOTHING`), so the source set
+    // holds exactly one row.
+    #[sqlx::test]
+    async fn retry_records_pin_source_once(pool: sqlx::PgPool) {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        let sha = "a".repeat(64);
+        let repo_id = "repo-retry-1";
+
+        retry_db_record(|| db.record_pin_source(&sha, repo_id))
+            .await
+            .expect("happy-path record succeeds in one attempt");
+        retry_db_record(|| db.record_pin_source(&sha, repo_id))
+            .await
+            .expect("a redundant record is idempotent");
+
+        let sources = db.pin_sources_for_oid(&sha).await.unwrap();
+        assert_eq!(
+            sources,
+            vec![repo_id.to_string()],
+            "exactly one source row lands under ON CONFLICT DO NOTHING"
+        );
+    }
 }
