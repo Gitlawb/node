@@ -65,6 +65,40 @@ enum DownloadOutcome {
     Skipped,
 }
 
+/// RAII cleanup for a read-path download temp dir (finding 1). Its `Drop`
+/// removes the dir (best effort), so a handler future cancelled mid-download
+/// (axum drops it on client disconnect, the same hazard `RepoWriteGuard` /
+/// `RepoLockGuard` Drop impls exist for) cannot leak a fully-populated repo
+/// dir. `disarm` forgets the dir once the publish rename has consumed it.
+struct TempDownloadDir {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempDownloadDir {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Disarm: the temp has been consumed (renamed into place), so `Drop` must
+    /// not try to remove it.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempDownloadDir {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 impl RepoStore {
     #[cfg(test)]
     pub fn for_testing(repos_dir: PathBuf, lock_pool: PgPool) -> Self {
@@ -155,7 +189,14 @@ impl RepoStore {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "cache miss — downloading from tigris");
                 match self
-                    .download_published(owner_did, repo_name, &owner_slug, &local_path, tigris)
+                    .download_published(
+                        owner_did,
+                        repo_name,
+                        &owner_slug,
+                        &local_path,
+                        tigris,
+                        false,
+                    )
                     .await
                     .context("downloading repo from tigris")?
                 {
@@ -193,7 +234,14 @@ impl RepoStore {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
                 match self
-                    .download_published(owner_did, repo_name, &owner_slug, &local_path, tigris)
+                    .download_published(
+                        owner_did,
+                        repo_name,
+                        &owner_slug,
+                        &local_path,
+                        tigris,
+                        true,
+                    )
                     .await
                 {
                     // Published covers both the refreshed copy and a concurrent
@@ -241,6 +289,7 @@ impl RepoStore {
         owner_slug: &str,
         local_path: &Path,
         store: &Arc<dyn ObjectStore>,
+        local_existed_at_entry: bool,
     ) -> Result<DownloadOutcome> {
         let map_key = format!("{owner_slug}/{repo_name}");
         let entry = {
@@ -261,11 +310,28 @@ impl RepoStore {
                     return Ok(DownloadOutcome::Published);
                 }
                 // The holder degraded without publishing; this reader takes over.
+                // The prior holder removed the map entry on its way out, so
+                // re-register THIS entry before downloading, so readers arriving
+                // now coalesce onto it instead of starting a duplicate download
+                // (finding 3). Narrows the duplicate-download window; publishes
+                // stay serialized by the advisory lock regardless.
+                {
+                    let mut map = self.download_locks.lock().await;
+                    map.entry(map_key.clone())
+                        .or_insert_with(|| Arc::clone(&entry));
+                }
                 g
             }
         };
         let outcome = self
-            .download_and_publish(owner_did, repo_name, owner_slug, local_path, store)
+            .download_and_publish(
+                owner_did,
+                repo_name,
+                owner_slug,
+                local_path,
+                store,
+                local_existed_at_entry,
+            )
             .await;
         self.remove_download_entry(&map_key, &entry).await;
         drop(held);
@@ -292,6 +358,12 @@ impl RepoStore {
     /// the temp copy into place, release. Advisory contention or a lock-pool
     /// error discards the temp copy and degrades — no blocking lock or pool
     /// wait exists anywhere on the read path.
+    ///
+    /// `local_existed_at_entry` selects the stale-swap guard (finding 2): a cold
+    /// `acquire` passes `false`, an `acquire_fresh` refresh passes `true`. Under
+    /// the lock, before the swap, we detect a writer that published a fresher
+    /// copy during our unlocked download window and serve theirs instead of
+    /// clobbering it with our now-stale temp.
     async fn download_and_publish(
         &self,
         owner_did: &str,
@@ -299,6 +371,7 @@ impl RepoStore {
         owner_slug: &str,
         local_path: &Path,
         store: &Arc<dyn ObjectStore>,
+        local_existed_at_entry: bool,
     ) -> Result<DownloadOutcome> {
         let parent = local_path.parent().context("repo path has no parent")?;
         std::fs::create_dir_all(parent).context("creating repo parent dir")?;
@@ -306,32 +379,56 @@ impl RepoStore {
             .file_name()
             .context("repo path has no file name")?
             .to_string_lossy();
+
+        // Best-effort sweep of leftover temp siblings from a prior download whose
+        // RAII guard dropped, or whose extract spawn_blocking completed
+        // uninterruptibly AFTER that guard's Drop ran (finding 1). Serialized per
+        // repo by the download mutex, so no concurrent same-repo download owns a
+        // live temp here; scoped to THIS repo's prefix, so other repos are
+        // untouched.
+        let tmp_prefix = format!(".{file_name}.tmp-download.");
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(&tmp_prefix) {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+
+        // Stale-swap signal (finding 2): capture the local dir's mtime BEFORE the
+        // unlocked download. Under the lock, a changed mtime (acquire_fresh,
+        // refreshing over an existing copy) or the dir's mere appearance (cold
+        // acquire) means a writer published a fresher copy during our download
+        // window, so we serve theirs rather than swap our stale temp over it.
+        let entry_mtime = std::fs::metadata(local_path)
+            .and_then(|m| m.modified())
+            .ok();
+
         // Unique per-download temp target (same parent as local_path so the
         // publish rename stays on one filesystem); mirrors the extract temp
-        // naming in tigris.rs.
-        let tmp_path = parent.join(format!(
+        // naming in tigris.rs. Wrapped in an RAII guard so a handler future
+        // cancelled mid-download (axum drops it on client disconnect) cannot
+        // leak the populated temp dir (the same hazard the guard Drop impls
+        // below exist for, finding 1).
+        let temp = TempDownloadDir::new(parent.join(format!(
             ".{file_name}.tmp-download.{}",
             uuid::Uuid::new_v4()
-        ));
+        )));
 
         // Bound the network download: a stalled GET would park this reader (and,
         // via the per-repo download mutex, every coalesced reader) indefinitely.
-        // A timeout takes the SAME cleanup arm as a download error — drop the
-        // temp dir and return Err — so `download_published` frees the map entry
-        // and wakes waiters rather than leaving them parked forever.
+        // A timeout takes the SAME cleanup arm as a download error (return Err,
+        // the temp guard's Drop removes the dir), so `download_published` frees
+        // the map entry and wakes waiters rather than leaving them parked forever.
         match tokio::time::timeout(
             self.release_upload_timeout,
-            store.download(owner_slug, repo_name, &tmp_path),
+            store.download(owner_slug, repo_name, temp.path()),
         )
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = std::fs::remove_dir_all(&tmp_path);
-                return Err(e);
-            }
+            Ok(Err(e)) => return Err(e),
             Err(_) => {
-                let _ = std::fs::remove_dir_all(&tmp_path);
                 warn!(repo = %repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
                     "read download timed out — discarding");
                 return Err(anyhow::anyhow!("read download timed out"));
@@ -343,13 +440,11 @@ impl RepoStore {
             Ok(None) => {
                 debug!(repo = %repo_name,
                     "read download discarded — repo lock held by a live writer or purge");
-                let _ = std::fs::remove_dir_all(&tmp_path);
                 return Ok(DownloadOutcome::Skipped);
             }
             Err(e) => {
                 warn!(repo = %repo_name, err = %e,
                     "read download discarded — could not acquire repo lock");
-                let _ = std::fs::remove_dir_all(&tmp_path);
                 return Ok(DownloadOutcome::Skipped);
             }
         };
@@ -370,23 +465,50 @@ impl RepoStore {
         if !archive_present {
             warn!(repo = %repo_name,
                 "read download discarded — archive gone under lock (purged?)");
-            let _ = std::fs::remove_dir_all(&tmp_path);
             guard.release().await;
             return Ok(DownloadOutcome::Skipped);
         }
+
+        // Stale-swap guard (finding 2): a writer that locked, published a fresher
+        // copy, and released during our unlocked download window must not have
+        // its work clobbered by our now-stale temp. The only concurrent mutator
+        // of local_path is a writer or a purge (readers of the same repo
+        // serialize on the download mutex), so the signals below unambiguously
+        // mean "a writer published here."
+        let writer_published = match (local_existed_at_entry, entry_mtime) {
+            // acquire_fresh over an existing copy: presence is always true, so it
+            // cannot signal a writer; a CHANGED mtime can (the writer replaced
+            // the dir via rename, minting a fresh mtime).
+            (true, Some(entry_m)) => std::fs::metadata(local_path)
+                .and_then(|m| m.modified())
+                .map(|now| now != entry_m)
+                .unwrap_or(false),
+            // Cold acquire, or acquire_fresh whose dir was absent at entry: the
+            // dir being present now means a writer published it during the window.
+            _ => local_path.exists(),
+        };
+        if writer_published {
+            warn!(repo = %repo_name,
+                "read download discarded: a writer published a fresher copy during the download window");
+            guard.release().await;
+            // temp guard's Drop removes the stale temp; serve the fresher local copy.
+            return Ok(DownloadOutcome::Published);
+        }
+
         let swapped = (|| -> std::io::Result<()> {
             if local_path.exists() {
                 std::fs::remove_dir_all(local_path)?;
             }
-            std::fs::rename(&tmp_path, local_path)
+            std::fs::rename(temp.path(), local_path)
         })();
         guard.release().await;
         match swapped {
-            Ok(()) => Ok(DownloadOutcome::Published),
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(&tmp_path);
-                Err(e).context("publishing downloaded repo into place")
+            Ok(()) => {
+                temp.disarm(); // the rename consumed the temp; nothing to clean up
+                Ok(DownloadOutcome::Published)
             }
+            // temp guard's Drop removes the temp if the rename left it behind.
+            Err(e) => Err(e).context("publishing downloaded repo into place"),
         }
     }
 
@@ -2418,6 +2540,284 @@ mod tests {
         .expect("a dir-present acquire must not wait on the held advisory lock")
         .unwrap();
         assert_eq!(res, dir);
+
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut observer)
+            .await;
+    }
+
+    // ── Finding 2: stale-swap over a fresher writer copy ────────────────────
+
+    // A cold `acquire` reader downloads to a temp holding NO advisory lock;
+    // during that window a writer can lock, publish a fresher on-disk copy, and
+    // release. When the reader finally takes the lock, a presence-only check
+    // would swap its now-stale temp over the writer's fresher dir. The guard
+    // detects the writer's dir (absent at entry, present under the lock) and
+    // serves it instead. Pre-fix the reader swaps and the writer's copy is lost
+    // -> RED (the sentinel disappears).
+    #[sqlx::test]
+    async fn cold_read_defers_to_writer_published_during_download(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let uploads = ts.uploads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkColdDeferAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "colddefer";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+
+        // Cache miss: the reader enters the download path and parks (no local dir).
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the reader's download must be in flight"
+        );
+
+        // A writer publishes a fresher copy onto the local path during the
+        // window (simulated directly: the writer would hold the lock only while
+        // it works, which is over before the reader takes the lock).
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("writer_sentinel"), b"fresher").unwrap();
+
+        gate.notify_one();
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(res, dir);
+        assert!(
+            dir.join("writer_sentinel").exists(),
+            "the reader must serve the writer's fresher copy, not swap its stale temp over it"
+        );
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "the read path must never upload"
+        );
+        assert_eq!(downloads.lock().unwrap().len(), 1, "exactly one download");
+    }
+
+    // acquire_fresh refreshes over an EXISTING local copy, so a presence check
+    // cannot detect a concurrent writer (the dir is always present). The guard
+    // compares the local dir's mtime captured at entry against its value under
+    // the lock; a writer that replaced the dir during the window changed the
+    // mtime, so the reader serves the writer's copy rather than swapping its
+    // stale refresh over it. Pre-fix the reader swaps -> RED (version B lost).
+    #[sqlx::test]
+    async fn fresh_refresh_defers_to_writer_published_during_download(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkFreshDeferAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "freshdefer";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+
+        // Version A already on disk when the refresh starts.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("version_a"), b"A").unwrap();
+        let mtime_before = std::fs::metadata(&dir).unwrap().modified().unwrap();
+
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire_fresh(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the refresh download must be in flight"
+        );
+
+        // Cross a filesystem mtime tick, then a writer replaces the dir with
+        // version B. The long sleep guarantees B's mtime differs from A's even
+        // on a coarse-granularity filesystem, so the comparison is deterministic.
+        tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("version_b"), b"B").unwrap();
+        let mtime_after = std::fs::metadata(&dir).unwrap().modified().unwrap();
+        assert!(
+            mtime_after != mtime_before,
+            "precondition: the writer's replacement must change the dir mtime for the guard to fire"
+        );
+
+        gate.notify_one();
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(res, dir);
+        assert!(
+            dir.join("version_b").exists(),
+            "the refresh must serve the writer's fresher copy (B), not swap version A's stale temp over it"
+        );
+        assert!(
+            !dir.join("version_a").exists(),
+            "version A must be gone; the writer replaced it, and the reader must not resurrect it"
+        );
+        assert_eq!(downloads.lock().unwrap().len(), 1, "exactly one download");
+    }
+
+    // ── Finding 4: the try_lock_repo Ok(None) contention degrade ────────────
+
+    fn has_leftover_temp(parent: &std::path::Path) -> bool {
+        std::fs::read_dir(parent)
+            .map(|rd| {
+                rd.flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(".tmp-download."))
+            })
+            .unwrap_or(false)
+    }
+
+    // KTD-3 degrade: while a live writer/purge holds the repo's advisory lock, a
+    // read-path downloader that reaches try_lock AFTER its fetch must discard its
+    // temp and degrade. This exercises the Ok(None) arm the six U4 tests never
+    // reach (they simulate purge via delete_archive and never hold the lock
+    // while a downloader reaches try_lock). An out-of-pool observer holds the
+    // lock; GatedStore.download_gate parks the reader past the fetch so it
+    // reaches try_lock while the observer still holds it.
+    //
+    // acquire variant: degrades to the missing path, publishes nothing.
+    #[sqlx::test]
+    async fn acquire_download_degrades_when_writer_holds_lock(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use sqlx::ConnectOptions;
+        let pool = no_reap_pool(pool_opts, &connect_opts).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let uploads = ts.uploads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkAcquireDegradeAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "acqdegrade";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        let key = lock_key_for(owner, name);
+
+        // An out-of-pool observer holds the repo's advisory lock for the window.
+        let mut observer = connect_opts.connect().await.unwrap();
+        let (got,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+        assert!(got, "observer must win the free lock");
+
+        // Cache miss: reader downloads to temp (no lock held), parks on the gate.
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the reader's download must be in flight"
+        );
+
+        // Release the gate: the reader reaches try_lock while the observer holds
+        // the lock -> Ok(None) -> discard temp, degrade to the missing path.
+        gate.notify_one();
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(
+            res, dir,
+            "degraded acquire returns the missing path, not an error"
+        );
+        assert!(!dir.exists(), "the contended download must publish nothing");
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "the read path must never upload"
+        );
+        assert_eq!(
+            downloads.lock().unwrap().len(),
+            1,
+            "exactly one download attempt"
+        );
+        assert!(
+            !has_leftover_temp(dir.parent().unwrap()),
+            "the discarded download temp must be cleaned up"
+        );
+
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut observer)
+            .await;
+    }
+
+    // acquire_fresh variant: degrades to serving the existing local copy.
+    #[sqlx::test]
+    async fn fresh_download_degrades_to_local_copy_when_writer_holds_lock(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use sqlx::ConnectOptions;
+        let pool = no_reap_pool(pool_opts, &connect_opts).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let uploads = ts.uploads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkFreshDegradeAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "freshdegrade";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        let key = lock_key_for(owner, name);
+
+        // An existing local copy is present when the refresh starts.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("local_copy"), b"keep").unwrap();
+
+        let mut observer = connect_opts.connect().await.unwrap();
+        let (got,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+        assert!(got, "observer must win the free lock");
+
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire_fresh(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the refresh download must be in flight"
+        );
+
+        gate.notify_one();
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(res, dir, "degraded acquire_fresh returns the local path");
+        assert!(
+            dir.join("local_copy").exists(),
+            "the contended refresh must serve the existing local copy untouched"
+        );
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "the read path must never upload"
+        );
+        assert_eq!(
+            downloads.lock().unwrap().len(),
+            1,
+            "exactly one download attempt"
+        );
+        assert!(
+            !has_leftover_temp(dir.parent().unwrap()),
+            "the discarded download temp must be cleaned up"
+        );
 
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(key)
