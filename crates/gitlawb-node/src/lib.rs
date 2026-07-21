@@ -1059,74 +1059,6 @@ fn write_key_or_cleanup(path: &std::path::Path, write_result: std::io::Result<()
     })
 }
 
-/// Remove `final_path` after a failed fallback write or file fsync ONLY if
-/// the name still refers to the inode this publish created (#194). A
-/// recovery that claimed this publisher's round has quarantined our inode
-/// away by rename and may have republished a LIVE key at the name; removing
-/// by name there would unlink the recoverer's final and destroy an identity
-/// whose owner already returned Won. On Unix the guard compares dev+ino of
-/// our open handle against `symlink_metadata` of the name and removes only
-/// on a match; a mismatch or NotFound means the name is no longer ours, so
-/// the removal is skipped with a warn carrying both identities. Any stat
-/// failure also skips: ownership of the name cannot be proven, and the worst
-/// a skipped removal costs is the loud invalid-PEM error at the next start,
-/// while a wrong removal destroys a live key. Best-effort throughout, like
-/// every other cleanup here. On non-Unix the by-name removal stands
-/// (reasoned, not run: no non-Unix target is exercised by these tests).
-fn remove_final_if_still_ours(final_path: &std::path::Path, file: &std::fs::File) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let ours = match file.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    path = %final_path.display(),
-                    err = %e,
-                    "skipping failed-publish cleanup: could not stat our own key handle"
-                );
-                return;
-            }
-        };
-        match std::fs::symlink_metadata(final_path) {
-            Ok(named) if named.dev() == ours.dev() && named.ino() == ours.ino() => {
-                let _ = std::fs::remove_file(final_path);
-            }
-            Ok(named) => {
-                warn!(
-                    path = %final_path.display(),
-                    our_dev = ours.dev(),
-                    our_ino = ours.ino(),
-                    named_dev = named.dev(),
-                    named_ino = named.ino(),
-                    "skipping failed-publish cleanup: the final name no longer holds our \
-                     inode (a recovery claimed this round and republished)"
-                );
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                warn!(
-                    path = %final_path.display(),
-                    our_dev = ours.dev(),
-                    our_ino = ours.ino(),
-                    "skipping failed-publish cleanup: the final name is already gone"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    path = %final_path.display(),
-                    err = %e,
-                    "skipping failed-publish cleanup: could not stat the final name"
-                );
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = file;
-        let _ = std::fs::remove_file(final_path);
-    }
-}
-
 /// Verify an identity key file is not world/group-readable (#194, F2). A `chmod`
 /// that failed or silently no-op'd (read-only mount, ACL mismatch) must not leave
 /// a readable private key in use, so this is checked after any tightening attempt
@@ -1806,35 +1738,46 @@ fn publish_key_atomically(
 /// (Unsupported/EPERM on some network and overlay mounts, or a transient link
 /// error): create the FINAL path directly with `create_new(true).mode(0o600)`
 /// (the INV-23 creation pattern) and write the PEM into it. `AlreadyExists`
-/// still routes to the lost-race path, so no-clobber holds. Error handling: a
-/// failed `write_all` OR file `sync_all` removes the final (#194 F1), guarded
-/// by inode identity (`remove_final_if_still_ours`): only the inode this
-/// publish created is removed, never a key a claiming recovery republished
-/// at the name. Removal is needed at all because the
-/// `create_new` already made the final NAME durable, so a name left over
-/// non-durable content lets a later crash leave a truncated final that wedges
-/// every later start; removal lets the next start regenerate. Only a failed
-/// parent-DIR fsync keeps the final (the content is complete and data-synced,
-/// and a lost directory entry just disappears -> clean regen, no wedge). Every
-/// error context chains `link_err` so a two-step failure is diagnosable.
+/// still routes to the lost-race path, so no-clobber holds. Error handling
+/// splits at the first PEM byte. PRE-write failures (marker create, final
+/// create, tighten/mode-verify) remove the just-created EMPTY final and
+/// dispose the marker: nothing recoverable exists yet, and those arms
+/// complete within `CRASH_SIGNATURE_MIN_PERSIST` of the final's creation,
+/// so no recovery can have claimed the round. POST-write failures
+/// (`write_all` or the file `sync_all`) remove NOTHING: the partial final
+/// and its marker are left in place together and the error surfaces naming
+/// the handoff. That pair is exactly the crash state boot-time recovery
+/// handles (claim, quarantine, regenerate), while an unlink here is a
+/// stat-then-unlink race against a recovery that already claimed this round
+/// and republished a live key at the name, and a marker disposed beside a
+/// kept partial final recreates the marker-less wedge the bracket below
+/// exists to prevent. The complete-but-unsynced `sync_all`-failure state is
+/// safe too: a later healthy load fsyncs the final ITSELF before sweeping
+/// the marker (`sweep_stale_markers`' durability gate), and a crash before
+/// then re-enters recovery via the surviving marker. A failed parent-DIR
+/// fsync also keeps the final but DOES dispose the marker (the content is
+/// complete and data-synced, and a lost directory entry just disappears ->
+/// clean regen, no wedge). Every error context chains `link_err` so a
+/// two-step failure is diagnosable.
 ///
 /// The whole non-atomic window is bracketed by a durable publish marker
 /// (`.{stem}.publishing.{pid}.{attempt}`, empty, same dir as the final): the
 /// marker is created and its NAME fsynced BEFORE the final can exist, and it
-/// is removed only once the final is complete-and-durable (success) or
-/// disposed of (error / lost race). On success the removal doubles as the
-/// COMMIT CHECK (#194, U3): a removal that fails means a recovering peer
-/// claimed this round, and the publish demotes itself to Lost (see the
-/// success arm). A crash inside the window therefore
+/// is removed only once the final is complete-and-durable (success) or the
+/// exit leaves nothing needing vouching (pre-write error / lost race /
+/// dir-fsync failure); on a post-write error the marker intentionally
+/// OUTLIVES the attempt to vouch for the partial final beside it. On success
+/// the removal doubles as the COMMIT CHECK (#194, U3): a removal that fails
+/// means a recovering peer claimed this round, and the publish demotes
+/// itself to Lost (see the success arm). A crash inside the window therefore
 /// leaves marker+final together, so a later boot can tell "partial final from
 /// a crashed fallback publish" from a key an operator corrupted (#194, U1).
 /// Two constraints:
-///   - Disposal ORDER is pinned: wherever the error policy removes the final,
-///     that removal is ISSUED BEFORE the marker's. Cleanup is deliberately
-///     NOT a Drop guard: a drop guard can run ahead of the final's disposal
-///     on an early exit, and a crash between the reordered unlinks would
-///     recreate exactly the marker-less partial final this bracket exists to
-///     prevent.
+///   - Disposal ORDER on the pre-write arms is pinned: the empty final's
+///     removal is ISSUED BEFORE the marker's. Cleanup is deliberately NOT a
+///     Drop guard: a drop guard can run ahead of the final's disposal on an
+///     early exit, and it would also fire on the post-write error exits,
+///     whose whole point is that the marker survives.
 ///   - The marker dir fsync is warn-and-continue, not a hard gate: on
 ///     dir-fsync-hostile mounts a hard failure would turn "wedge once, then
 ///     recover" into "never provisions". Without that durability the marker
@@ -1902,8 +1845,9 @@ fn publish_key_fallback(
             dir.display()
         );
     };
-    // Marker disposal is explicit at every exit, never a Drop guard; see the
-    // order constraint in the doc comment.
+    // Marker disposal is explicit at every disposing exit, never a Drop
+    // guard; see the order constraint in the doc comment (the post-write
+    // error exits deliberately keep the marker).
     let dispose_marker = || {
         let _ = std::fs::remove_file(&marker);
     };
@@ -1953,13 +1897,14 @@ fn publish_key_fallback(
     };
     // Secure the empty final BEFORE the PEM bytes hit it (#194, U2). The
     // helper's fail-closed removal is what keeps a retry from wedging on
-    // AlreadyExists, and is safe here for the same reason as everywhere: the
-    // file is still empty, so the split-phase keep-the-final rule below does
-    // not apply yet. The helper removes the final before returning Err, so
-    // the pinned final-before-marker disposal order holds. By-name removal
-    // (no inode guard) stays right on this and the other pre-write arms
-    // (create/mode-verify): they run within CRASH_SIGNATURE_MIN_PERSIST of
-    // the final's creation, so no recovery can have claimed this round yet.
+    // AlreadyExists, and is safe here for the same reason as on every
+    // pre-write arm: the file is still empty, so the post-write
+    // keep-everything rule below does not apply yet. The helper removes the
+    // final before returning Err, so the pinned final-before-marker disposal
+    // order holds. By-name removal stays right on this and the other
+    // pre-write arms (create/mode-verify): they run within
+    // CRASH_SIGNATURE_MIN_PERSIST of the final's creation, so no recovery
+    // can have claimed this round yet.
     #[cfg(unix)]
     {
         if let Err(e) = tighten_and_verify_created(final_path, faults.fallback_mode_verify)
@@ -1971,44 +1916,43 @@ fn publish_key_fallback(
             return Err(e);
         }
     }
-    // A failed write removes the final (partial content cannot parse and would
-    // wedge every later start), but only if the name still holds OUR inode:
-    // a recovery that claimed this round may have quarantined our inode away
-    // and republished a live key at the name, which a by-name removal would
-    // destroy (see remove_final_if_still_ours). Not write_key_or_cleanup,
+    // A failed write LEAVES the partial final and its marker in place and
+    // only surfaces the error: marker+final together is exactly the crash
+    // state the next boot recovers from (claim, quarantine, regenerate).
+    // Any removal here would be a stat-then-unlink race against a recovery
+    // that already claimed this round and republished a live key at the
+    // name, and disposing the marker while the partial final stays would
+    // recreate the marker-less wedge the bracket exists to prevent, so this
+    // exit removes nothing and disposes nothing. Not write_key_or_cleanup,
     // whose by-name removal stays right for the primary path's TEMP file
-    // (a private name no recovery can race). Final removal is issued first,
-    // marker disposal second (pinned order).
+    // (a private name no recovery can race).
     if let Err(e) = (faults.fallback_write)().and_then(|()| f.write_all(pem)) {
-        remove_final_if_still_ours(final_path, &f);
-        dispose_marker();
         return Err(anyhow::Error::new(e)
-            .context(format!("failed to write key to {}", final_path.display()))
+            .context(format!(
+                "failed to write key to {}; the partial final and its publish marker \
+                 are left in place for boot-time crash recovery",
+                final_path.display()
+            ))
             .context(format!(
                 "hard_link fallback publish to {} (link failed: {link_err})",
                 final_path.display()
             )));
     }
-    // Fsync the file, and REMOVE the final on failure too (#194 F1). Unlike the
-    // hard-link path (which fsyncs a TEMP, so the final NAME only ever appears
-    // over a durable inode), the fallback's `create_new` already made the final
-    // name durable, so a bytes-accepted-but-not-durable final would let a later
-    // crash leave a truncated file that `load_or_create_keypair` parses forever
-    // via the existing-file path instead of regenerating -> permanent startup
-    // wedge. Removing it mirrors the hard-link temp policy and lets the next
-    // start regenerate. A DISTINCT context is kept so an operator debugging
-    // ENOSPC/EIO can tell "durability failed" (bytes accepted, not synced) from
-    // the write-rejected case above. Only the parent-DIR fsync below keeps the
-    // final on failure (a lost directory entry just disappears -> clean regen).
-    // Final removal is issued first, marker disposal second (pinned order),
-    // and is inode-guarded like the write arm's: the name may hold a
-    // recoverer's republished key by now.
+    // A failed file fsync takes the same keep-everything exit as the failed
+    // write: the bytes were accepted but may not be durable, and marker+
+    // final left together is the recoverable crash state (the next boot's
+    // load either parses the complete content, after which the sweep's
+    // durability gate fsyncs the final BEFORE removing the marker, or
+    // content-fails beside the marker and recovers). A DISTINCT context is
+    // kept so an operator debugging ENOSPC/EIO can tell "durability failed"
+    // (bytes accepted, not synced) from the write-rejected case above. Only
+    // the parent-DIR fsync below keeps the final while disposing the marker
+    // (a lost directory entry just disappears -> clean regen).
     if let Err(e) = (faults.fallback_fsync)().and_then(|()| f.sync_all()) {
-        remove_final_if_still_ours(final_path, &f);
-        dispose_marker();
         return Err(anyhow::Error::new(e).context(format!(
-            "fsync identity key {} in hard_link fallback (durability failed, \
-             removed if still ours; link failed: {link_err})",
+            "fsync identity key {} in hard_link fallback (durability failed; the \
+             final and its publish marker are left in place for boot-time crash \
+             recovery; link failed: {link_err})",
             final_path.display()
         )));
     }
@@ -2225,6 +2169,27 @@ fn recover_crashed_publish(
             }
             match std::fs::rename(item, &dest) {
                 Ok(()) => {
+                    // The rename preserves the SOURCE's mtime, but the G1
+                    // sweep gate reads the CLAIM file's mtime: a claim made
+                    // from an aged stale marker would be born already past
+                    // CLAIM_SWEEP_MIN_AGE, and a concurrent healthy boot
+                    // could sweep this LIVE claim mid-round, early-waking
+                    // the demoted publisher it gates. The age gate needs
+                    // claim-time freshness, so stamp it now. Best-effort:
+                    // on failure the worst case is today's bounded-wait
+                    // degradation, so warn and continue.
+                    if let Err(e) = std::fs::File::options()
+                        .write(true)
+                        .open(&dest)
+                        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                    {
+                        warn!(
+                            claim = %dest.display(),
+                            err = %e,
+                            "could not refresh a recovery claim's mtime; a concurrent \
+                             healthy boot may sweep the claim early"
+                        );
+                    }
                     claims.push(dest);
                     break;
                 }
@@ -3170,12 +3135,16 @@ mod identity_key_tests {
         );
     }
 
-    // A failed fallback WRITE removes the final: partial content cannot parse
-    // and would wedge every later start on `invalid PEM key`. The error must
-    // surface the write failure AND the original link error, so a two-step
-    // failure is diagnosable.
+    // A failed fallback WRITE leaves the partial final AND its marker in
+    // place: the pair is exactly the crash state boot-time recovery handles
+    // (claim, quarantine, regenerate), while an unlink here is a
+    // stat-then-unlink race against a recovery that already claimed this
+    // round and republished a live key at the name, and a marker disposed
+    // beside a kept partial final recreates the marker-less wedge the
+    // bracket exists to prevent. The error must surface the write failure
+    // AND the original link error, so a two-step failure is diagnosable.
     #[test]
-    fn failed_fallback_write_removes_the_partial_final() {
+    fn failed_fallback_write_leaves_the_partial_final_for_recovery() {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = dir.path().join("identity.pem");
         let pem = Keypair::generate().to_pem().expect("pem");
@@ -3200,8 +3169,14 @@ mod identity_key_tests {
             "the error must chain the original link failure ({link_display}): {msg}"
         );
         assert!(
-            !key_path.exists(),
-            "a failed fallback write must remove the partial final"
+            key_path.exists(),
+            "a failed fallback write must leave the partial final for boot-time recovery"
+        );
+        assert!(
+            std::fs::read(&key_path)
+                .expect("read partial final")
+                .is_empty(),
+            "the write fault fires before any byte lands, so the partial final is empty"
         );
     }
 
@@ -3241,15 +3216,15 @@ mod identity_key_tests {
         );
     }
 
-    // A failed fallback FILE fsync must REMOVE the final: create_new has already
-    // made the final NAME durable, so a name left over non-durable content lets a
-    // later crash leave a truncated final that load_or_create_keypair parses
-    // forever (existing-file path) instead of regenerating -> permanent startup
-    // wedge (#194 F1, jatmn). The fallback now mirrors the hard-link temp policy
-    // (write_key_or_cleanup removes on write OR fsync failure); removal makes the
-    // next start regenerate cleanly. Only the parent-DIR fsync keeps on failure.
+    // A failed fallback FILE fsync takes the same keep-everything exit as
+    // the failed write: the final (complete but possibly non-durable bytes)
+    // and its marker stay in place for boot-time recovery. The
+    // complete-but-unsynced state is safe because a later healthy load
+    // fsyncs the final ITSELF before sweeping the marker
+    // (sweep_stale_markers' durability gate), and a crash before then
+    // re-enters recovery via the surviving marker.
     #[test]
-    fn failed_fallback_fsync_removes_the_unsynced_final() {
+    fn failed_fallback_fsync_leaves_the_final_for_recovery() {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = dir.path().join("identity.pem");
         let pem = Keypair::generate().to_pem().expect("pem");
@@ -3269,9 +3244,13 @@ mod identity_key_tests {
             "the error must surface the fsync failure: {msg}"
         );
         assert!(
-            !key_path.exists(),
-            "an fsync failure on the fallback must remove the un-synced final so \
-             the next start regenerates instead of wedging on a truncated file"
+            key_path.exists(),
+            "an fsync failure must leave the final in place for boot-time recovery"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).expect("read final"),
+            pem.as_bytes(),
+            "the fsync fault fires after write_all, so the final holds the full PEM"
         );
     }
 
@@ -3632,10 +3611,12 @@ mod identity_key_tests {
         );
     }
 
-    /// Shared body for the fallback error-arm marker tests (#194, U1): with the
+    /// Shared body for the PRE-write fallback error arms (#194, U1): with the
     /// link fault plus one injected fallback fault, the error must surface as
-    /// today, the final must be absent (today's removal policy for every one of
-    /// these arms), and no publish marker may remain.
+    /// today, the final must be absent (nothing recoverable exists before the
+    /// first PEM byte, so those arms remove it), and no publish marker may
+    /// remain. The POST-write arms (write/fsync) have the opposite contract;
+    /// see `assert_post_write_failure_leaves_marker_and_final`.
     fn assert_fallback_error_leaves_no_marker_or_final(faults: PublishFaults, injected: &str) {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = dir.path().join("identity.pem");
@@ -3673,9 +3654,44 @@ mod identity_key_tests {
         );
     }
 
+    /// Shared body for the POST-write fallback error arms (write/fsync): the
+    /// error must surface the injected fault AND name the boot-time recovery
+    /// handoff, the final must SURVIVE, and its `.publishing.` marker must
+    /// SURVIVE beside it: marker+final together is the recoverable crash
+    /// state, and marker-less partial final is the permanent wedge.
+    fn assert_post_write_failure_leaves_marker_and_final(faults: PublishFaults, injected: &str) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("the injected fallback fault must error the publish"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(injected),
+            "the error must surface the injected fault: {msg}"
+        );
+        assert!(
+            msg.contains("left in place for boot-time crash recovery"),
+            "the error must name the recovery handoff: {msg}"
+        );
+        assert!(
+            key_path.exists(),
+            "the final must survive a post-write failure for boot-time recovery"
+        );
+        let markers = publishing_markers(dir.path());
+        assert_eq!(
+            markers.len(),
+            1,
+            "the marker must survive to vouch for the partial final, found {markers:?}"
+        );
+    }
+
     #[test]
-    fn failed_fallback_write_leaves_no_marker() {
-        assert_fallback_error_leaves_no_marker_or_final(
+    fn failed_fallback_write_leaves_the_marker_and_final() {
+        assert_post_write_failure_leaves_marker_and_final(
             PublishFaults {
                 link: || Err(std::io::ErrorKind::Unsupported.into()),
                 fallback_write: || Err(std::io::Error::other("injected write failure")),
@@ -3686,14 +3702,62 @@ mod identity_key_tests {
     }
 
     #[test]
-    fn failed_fallback_fsync_leaves_no_marker() {
-        assert_fallback_error_leaves_no_marker_or_final(
+    fn failed_fallback_fsync_leaves_the_marker_and_final() {
+        assert_post_write_failure_leaves_marker_and_final(
             PublishFaults {
                 link: || Err(std::io::ErrorKind::Unsupported.into()),
                 fallback_fsync: || Err(std::io::Error::other("injected fsync failure")),
                 ..PublishFaults::NONE
             },
             "injected fsync failure",
+        );
+    }
+
+    // The handoff the post-write arms promise must actually work: take the
+    // exact state a failed fallback write leaves behind (partial final plus
+    // its marker) and run a fresh boot over it. The boot must classify the
+    // crash signature, claim the marker, quarantine the partial final, and
+    // regenerate: no wedge, no leftover marker or claim.
+    #[test]
+    fn post_write_failure_state_is_recoverable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            fallback_write: || Err(std::io::Error::other("injected write failure")),
+            ..PublishFaults::NONE
+        };
+        if publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults).is_ok() {
+            panic!("the injected write fault must error the publish");
+        }
+        assert!(
+            key_path.exists() && publishing_markers(dir.path()).len() == 1,
+            "precondition: the failed publish leaves final plus marker"
+        );
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("the left-behind crash state must recover, not wedge the start");
+
+        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the returned identity must match the regenerated on-disk key"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the partial final must be quarantined: {quarantined:?}"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "recovery must consume the publish marker"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "the recovery claim must be released"
         );
     }
 
@@ -4638,6 +4702,50 @@ mod identity_key_tests {
         );
     }
 
+    // The G1 age gate reads the CLAIM file's mtime, but a claim is made by
+    // RENAMING a marker, and rename preserves the source's mtime: a claim
+    // made from an hours-old stale marker would be born already past
+    // CLAIM_SWEEP_MIN_AGE, so a concurrent healthy boot's sweep could remove
+    // the LIVE claim mid-round and early-wake the demoted publisher it
+    // gates. Recovery must therefore stamp each claim's mtime fresh at
+    // claim time. RED before the fix: the claim inherits the aged mtime.
+    #[test]
+    fn claim_freshness_is_stamped_at_claim_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        let marker = dir.path().join(".identity.pem.publishing.99999.0");
+        age_beyond_claim_sweep(&marker);
+
+        let recovery = super::recover_crashed_publish(
+            &key_path,
+            anyhow::anyhow!("synthetic crash signature"),
+            RecoverySeam::NONE,
+        )
+        .expect("recovery over an aged marker must not error");
+        let claims = match recovery {
+            super::Recovery::Claimed(claims) => claims,
+            super::Recovery::Reloaded(_) => {
+                panic!("an aged marker beside an empty final must be claimed")
+            }
+        };
+        assert!(!claims.is_empty(), "the aged marker must produce a claim");
+        for claim in &claims {
+            let mtime = std::fs::metadata(claim)
+                .expect("stat claim")
+                .modified()
+                .expect("claim mtime");
+            let age = std::time::SystemTime::now()
+                .duration_since(mtime)
+                .unwrap_or_default();
+            assert!(
+                age < super::CLAIM_SWEEP_MIN_AGE,
+                "a claim must be born fresh, not inherit the aged marker mtime \
+                 through the rename: age {age:?} at {claim:?}"
+            );
+        }
+        super::release_recovery_claims(&key_path, &claims);
+    }
+
     // #194 (U4): the generate path must sweep too. A crash between the
     // marker's durability fsync and the final's `create_new` leaves a durable
     // marker with NO final; only the Won arm of a later boot can ever clean
@@ -5266,16 +5374,17 @@ mod identity_key_tests {
         );
     }
 
-    // R2: a fallback publisher whose round was claimed by a recovery (its
-    // inode quarantined away, a live key B republished at the name) must NOT
-    // let its own failure cleanup unlink B: the removal on the write/fsync
-    // error arms is guarded by inode identity, not name. The interleave runs
-    // inside the fallback_fsync fault (before_commit never fires on the error
-    // arms), step for step what a claiming recovery does: claim A's marker,
-    // quarantine A's final by rename, republish B, clear the claim; then the
-    // injected Err forces A's fsync-failure arm. RED before the fix: A's
-    // by-name removal deletes B, destroying the live identity whose owner
-    // already returned Won.
+    // Regression guard: a fallback publisher whose round was claimed by a
+    // recovery (its inode quarantined away, a live key B republished at the
+    // name) must NOT let its own failure cleanup unlink B. The post-write
+    // error arms now remove nothing at all (any unlink there is a
+    // stat-then-unlink race against the recoverer), which this interleave
+    // pins. It runs inside the fallback_fsync fault (before_commit never
+    // fires on the error arms), step for step what a claiming recovery does:
+    // claim A's marker, quarantine A's final by rename, republish B, clear
+    // the claim; then the injected Err forces A's fsync-failure arm. RED if
+    // any by-name removal returns to that arm: A deletes B, destroying the
+    // live identity whose owner already returned Won.
     #[test]
     fn failed_publisher_cleanup_spares_a_republished_final() {
         thread_local! {
