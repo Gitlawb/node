@@ -1303,6 +1303,45 @@ fn boot_load_key(
     }
 }
 
+/// Wait until no `.{stem}.recovering.*` claim remains beside `final_path`,
+/// polling on `load_racing_key`'s cadence (~2ms), bounded by
+/// `KEY_RACE_DEADLINE` (#194, U3). Why the wait exists: a fallback winner
+/// that failed its commit check was demoted by a recovering peer, and that
+/// peer is mid-round — it quarantines the (old) final, republishes a fresh
+/// key, and only then clears its claim. A demoted winner that re-loaded
+/// before the claim cleared could observe the pre-quarantine key and diverge
+/// from what the peer ends up publishing; waiting for claim clearance makes
+/// the follow-up load observe the settled state. Deadline expiry is NOT an
+/// error: a claim left by a recovery that itself crashed never clears, and
+/// the caller's load path copes with whatever state remains (loudly, if the
+/// key is unreadable). An unreadable directory reads as no claims, matching
+/// `list_publish_markers`' policy.
+fn wait_for_recovery_claims(final_path: &std::path::Path) {
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.pem");
+    let prefix = format!(".{stem}.recovering.");
+    let deadline = std::time::Instant::now() + KEY_RACE_DEADLINE;
+    loop {
+        let claimed = std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.filter_map(|e| e.ok()).any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&prefix))
+            })
+        });
+        if !claimed || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
 /// Compile-time fault-injection seam for `publish_key_atomically`, extending
 /// the `before_link` closure precedent: every hook is a no-op `Ok` in
 /// production (`PublishFaults::NONE`); tests swap in a hook returning `Err` to
@@ -1390,13 +1429,28 @@ impl PublishFaults {
 /// the failure mode is the same LOUD invalid-PEM (or mode) error at the next
 /// start, never a silently used key.
 ///
+/// Against the boot-time crash RECOVERY race (#194, U3) the fallback's marker
+/// protocol restores (b)-style convergence: removing the publish marker is
+/// the winner's commit check, and recovery claims a round by renaming that
+/// same marker, so exactly one side takes the round. A winner that loses its
+/// marker demotes itself to Lost, waits out any `.recovering.` claim
+/// (bounded by `KEY_RACE_DEADLINE`), and re-loads the settled key. Honest
+/// residuals: a winner stalled past `KEY_RACE_DEADLINE` that loads in the
+/// sub-ms window before a recoverer's claim exists, and a crash-interrupted
+/// recovery whose stale claim just expires the bounded wait — both degrade
+/// to a loud error or a re-load, never silent two-sided divergence.
+///
 /// `before_link` is a no-op in production; tests use it to widen the
-/// post-write / pre-link window deterministically. `faults` is the
-/// compile-time fault-injection seam (`PublishFaults::NONE` in production).
+/// post-write / pre-link window deterministically. `before_commit` runs
+/// between the fallback final's dir fsync and the marker-removal commit
+/// check — a no-op in production; tests use it to interleave a concurrent
+/// recovery into that window (#194, U3). `faults` is the compile-time
+/// fault-injection seam (`PublishFaults::NONE` in production).
 fn publish_key_atomically(
     final_path: &std::path::Path,
     pem: &[u8],
     before_link: &dyn Fn(),
+    before_commit: &dyn Fn(),
     faults: PublishFaults,
 ) -> Result<KeyPublish> {
     use std::io::Write;
@@ -1477,7 +1531,7 @@ fn publish_key_atomically(
             Ok(KeyPublish::Won)
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(KeyPublish::Lost),
-        Err(e) => publish_key_fallback(final_path, pem, e, faults),
+        Err(e) => publish_key_fallback(final_path, pem, e, before_commit, faults),
     }
 }
 
@@ -1498,7 +1552,10 @@ fn publish_key_atomically(
 /// (`.{stem}.publishing.{pid}.{attempt}`, empty, same dir as the final): the
 /// marker is created and its NAME fsynced BEFORE the final can exist, and it
 /// is removed only once the final is complete-and-durable (success) or
-/// disposed of (error / lost race). A crash inside the window therefore
+/// disposed of (error / lost race). On success the removal doubles as the
+/// COMMIT CHECK (#194, U3): a removal that fails means a recovering peer
+/// claimed this round, and the publish demotes itself to Lost (see the
+/// success arm). A crash inside the window therefore
 /// leaves marker+final together, so a later boot can tell "partial final from
 /// a crashed fallback publish" from a key an operator corrupted (#194, U1).
 /// Two constraints:
@@ -1517,6 +1574,7 @@ fn publish_key_fallback(
     final_path: &std::path::Path,
     pem: &[u8],
     link_err: std::io::Error,
+    before_commit: &dyn Fn(),
     faults: PublishFaults,
 ) -> Result<KeyPublish> {
     use std::io::Write;
@@ -1691,16 +1749,37 @@ fn publish_key_fallback(
             return Err(e);
         }
     }
-    // Success: the final is complete and durable, so the bracket closes.
-    // Remove the marker, then best-effort fsync the removal so it tends to be
-    // durable too. (A later unit turns this removal into a commit check; U1
-    // keeps it best-effort.)
-    dispose_marker();
-    #[cfg(unix)]
-    {
-        let _ = fsync_parent_dir(final_path);
+    // Success: the final is complete and durable. Removing our OWN marker is
+    // the COMMIT CHECK (#194, U3): recovery claims a round by renaming this
+    // exact marker, so a successful removal proves no recovery can ever claim
+    // it and linearizes this winner ahead of any recoverer. Any failure
+    // (NotFound after a peer's claim rename, or any other error) means
+    // ownership of the round cannot be proven: a recovering peer may have
+    // quarantined our final and republished, so returning Won could report
+    // key A while disk holds key B. Demote to Lost instead; demotion is
+    // always safe, because absent real interference the caller's Lost arm
+    // re-loads our own just-published key (same identity).
+    before_commit();
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {
+            // Best-effort fsync so the marker's removal tends to be durable.
+            #[cfg(unix)]
+            {
+                let _ = fsync_parent_dir(final_path);
+            }
+            Ok(KeyPublish::Won)
+        }
+        Err(e) => {
+            warn!(
+                marker = %marker.display(),
+                err = %e,
+                "fallback publish lost its marker before commit; a recovering peer owns \
+                 this round, demoting the publish to lost"
+            );
+            wait_for_recovery_claims(final_path);
+            Ok(KeyPublish::Lost)
+        }
     }
-    Ok(KeyPublish::Won)
 }
 
 /// Compile-time test seam for the load-side crash recovery in
@@ -1728,6 +1807,7 @@ impl RecoverySeam<'_> {
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
     load_or_create_keypair_with(
         &config.resolved_key_path(),
+        &|| {},
         &|| {},
         PublishFaults::NONE,
         RecoverySeam::NONE,
@@ -1858,9 +1938,9 @@ fn recover_crashed_publish(
 }
 
 /// Body of `load_or_create_keypair` with the test seams threaded in (#194,
-/// U2): `before_link` and `faults` pass through to `publish_key_atomically`
-/// (production: no-op / `NONE`), `seam` is the load-side recovery seam
-/// (production: `RecoverySeam::NONE`).
+/// U2): `before_link`, `before_commit`, and `faults` pass through to
+/// `publish_key_atomically` (production: no-op / `NONE`), `seam` is the
+/// load-side recovery seam (production: `RecoverySeam::NONE`).
 ///
 /// Load-or-generate with AT MOST ONE crash recovery per start: a load
 /// failure recovers — claim a marker, quarantine the final, regenerate —
@@ -1872,6 +1952,7 @@ fn recover_crashed_publish(
 fn load_or_create_keypair_with(
     key_path: &std::path::Path,
     before_link: &dyn Fn(),
+    before_commit: &dyn Fn(),
     faults: PublishFaults,
     seam: RecoverySeam<'_>,
 ) -> Result<Keypair> {
@@ -1929,7 +2010,8 @@ fn load_or_create_keypair_with(
 
         // Publish atomically: the final path only ever appears complete, and a
         // lost race loads the winner's key rather than overwriting it.
-        match publish_key_atomically(key_path, pem.as_bytes(), before_link, faults)? {
+        match publish_key_atomically(key_path, pem.as_bytes(), before_link, before_commit, faults)?
+        {
             KeyPublish::Won => {
                 remove_claim(&claim);
                 info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
@@ -2054,8 +2136,14 @@ mod identity_key_tests {
         let writer_path = key_path.clone();
         let writer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(250));
-            publish_key_atomically(&writer_path, pem.as_bytes(), &|| {}, PublishFaults::NONE)
-                .expect("publish");
+            publish_key_atomically(
+                &writer_path,
+                pem.as_bytes(),
+                &|| {},
+                &|| {},
+                PublishFaults::NONE,
+            )
+            .expect("publish");
         });
 
         let started = std::time::Instant::now();
@@ -2085,8 +2173,14 @@ mod identity_key_tests {
         let pem_b = Keypair::generate().to_pem().expect("pem b");
         assert_ne!(pem_a.as_str(), pem_b.as_str(), "fixtures must differ");
 
-        let out = publish_key_atomically(&key_path, pem_a.as_bytes(), &|| {}, PublishFaults::NONE)
-            .expect("publish a");
+        let out = publish_key_atomically(
+            &key_path,
+            pem_a.as_bytes(),
+            &|| {},
+            &|| {},
+            PublishFaults::NONE,
+        )
+        .expect("publish a");
         assert!(matches!(out, KeyPublish::Won), "first publish wins");
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap().as_str(),
@@ -2094,8 +2188,14 @@ mod identity_key_tests {
             "final holds the full PEM"
         );
 
-        let out = publish_key_atomically(&key_path, pem_b.as_bytes(), &|| {}, PublishFaults::NONE)
-            .expect("publish b");
+        let out = publish_key_atomically(
+            &key_path,
+            pem_b.as_bytes(),
+            &|| {},
+            &|| {},
+            PublishFaults::NONE,
+        )
+        .expect("publish b");
         assert!(matches!(out, KeyPublish::Lost), "second publish loses");
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap().as_str(),
@@ -2134,6 +2234,7 @@ mod identity_key_tests {
                 &|| {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                 },
+                &|| {},
                 PublishFaults::NONE,
             )
             .expect("publish");
@@ -2189,8 +2290,14 @@ mod identity_key_tests {
         std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o600))
             .expect("stale temp perms");
 
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, PublishFaults::NONE)
-            .expect("publish must recover from a stale temp, not wedge the start");
+        let out = publish_key_atomically(
+            &key_path,
+            pem.as_bytes(),
+            &|| {},
+            &|| {},
+            PublishFaults::NONE,
+        )
+        .expect("publish must recover from a stale temp, not wedge the start");
         assert!(matches!(out, KeyPublish::Won), "publish wins");
         assert_eq!(
             std::fs::read_to_string(&key_path).unwrap().as_str(),
@@ -2217,11 +2324,16 @@ mod identity_key_tests {
             std::fs::write(&tmp, b"taken").expect("seed taken temp");
         }
 
-        let err =
-            match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, PublishFaults::NONE) {
-                Err(e) => e,
-                Ok(_) => panic!("publish must fail when every temp name is taken"),
-            };
+        let err = match publish_key_atomically(
+            &key_path,
+            pem.as_bytes(),
+            &|| {},
+            &|| {},
+            PublishFaults::NONE,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("publish must fail when every temp name is taken"),
+        };
         let msg = format!("{err:#}");
         assert!(
             msg.contains(&format!(".identity.pem.tmp.{}", std::process::id()))
@@ -2414,7 +2526,7 @@ mod identity_key_tests {
         let kp = Keypair::generate();
         let pem = kp.to_pem().expect("pem");
 
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
             .expect("a failed hard_link must fall back to a direct publish, not fail the start");
         assert!(matches!(out, KeyPublish::Won), "fallback publish wins");
 
@@ -2469,6 +2581,7 @@ mod identity_key_tests {
             &key_path,
             pem_winner.as_bytes(),
             &|| {},
+            &|| {},
             PublishFaults::NONE,
         )
         .expect("winner publishes");
@@ -2479,7 +2592,7 @@ mod identity_key_tests {
             link: || Err(std::io::ErrorKind::PermissionDenied.into()),
             ..PublishFaults::NONE
         };
-        let out = publish_key_atomically(&key_path, pem_loser.as_bytes(), &|| {}, faults)
+        let out = publish_key_atomically(&key_path, pem_loser.as_bytes(), &|| {}, &|| {}, faults)
             .expect("an existing final must read as a lost race, not an error");
         assert!(
             matches!(out, KeyPublish::Lost),
@@ -2519,7 +2632,7 @@ mod identity_key_tests {
                     };
                     // Release both threads at once to maximize the race.
                     b.wait();
-                    match publish_key_atomically(&kp, pem.as_bytes(), &|| {}, faults)
+                    match publish_key_atomically(&kp, pem.as_bytes(), &|| {}, &|| {}, faults)
                         .expect("fallback publish")
                     {
                         KeyPublish::Won => (true, format!("{}", me.did())),
@@ -2565,7 +2678,7 @@ mod identity_key_tests {
             fallback_write: || Err(std::io::Error::other("injected write failure")),
             ..PublishFaults::NONE
         };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
             Err(e) => e,
             Ok(_) => panic!("a failed fallback write must error the start"),
         };
@@ -2601,7 +2714,7 @@ mod identity_key_tests {
             fallback_create: || Err(std::io::Error::other("injected fallback create failure")),
             ..PublishFaults::NONE
         };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
             Err(e) => e,
             Ok(_) => panic!("a failed fallback create must error the start"),
         };
@@ -2639,7 +2752,7 @@ mod identity_key_tests {
             fallback_fsync: || Err(std::io::Error::other("injected fsync failure")),
             ..PublishFaults::NONE
         };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
             Err(e) => e,
             Ok(_) => panic!("a failed fallback fsync must error the start"),
         };
@@ -2775,7 +2888,7 @@ mod identity_key_tests {
         let pem = kp.to_pem().expect("pem");
         unsafe { libc::umask(mask) };
 
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
             .expect("publish must succeed: the tighten repairs the umask-narrowed create mode");
         assert!(matches!(out, KeyPublish::Won), "publish wins");
 
@@ -2848,7 +2961,7 @@ mod identity_key_tests {
             temp_mode_verify: || Err(std::io::Error::other("injected mode-ignoring mount")),
             ..PublishFaults::NONE
         };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
             Err(e) => e,
             Ok(_) => panic!("an unverifiable temp mode must fail the publish closed"),
         };
@@ -2885,7 +2998,7 @@ mod identity_key_tests {
             fallback_mode_verify: || Err(std::io::Error::other("injected mode-ignoring mount")),
             ..PublishFaults::NONE
         };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
             Err(e) => e,
             Ok(_) => panic!("an unverifiable final mode must fail the publish closed"),
         };
@@ -2918,7 +3031,7 @@ mod identity_key_tests {
             link: || Err(std::io::ErrorKind::Unsupported.into()),
             ..PublishFaults::NONE
         };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, retry_faults)
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, retry_faults)
             .expect("a retry after the fail-closed publish must not be wedged");
         assert!(matches!(out, KeyPublish::Won), "retry wins cleanly");
         let loaded = super::load_existing_key(&key_path).expect("retried key loads");
@@ -2956,7 +3069,7 @@ mod identity_key_tests {
             link: || Err(std::io::ErrorKind::Unsupported.into()),
             ..PublishFaults::NONE
         };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
             .expect("fallback publish");
         assert!(matches!(out, KeyPublish::Won), "fallback publish wins");
         let loaded = super::load_existing_key(&key_path).expect("published key loads");
@@ -2985,6 +3098,7 @@ mod identity_key_tests {
             &key_path,
             pem_winner.as_bytes(),
             &|| {},
+            &|| {},
             PublishFaults::NONE,
         )
         .expect("winner publishes");
@@ -2995,7 +3109,7 @@ mod identity_key_tests {
             link: || Err(std::io::ErrorKind::PermissionDenied.into()),
             ..PublishFaults::NONE
         };
-        let out = publish_key_atomically(&key_path, pem_loser.as_bytes(), &|| {}, faults)
+        let out = publish_key_atomically(&key_path, pem_loser.as_bytes(), &|| {}, &|| {}, faults)
             .expect("an existing final must read as a lost race, not an error");
         assert!(matches!(out, KeyPublish::Lost), "fallback loses");
         let loaded = load_racing_key(&key_path).expect("lost race loads the winner");
@@ -3020,7 +3134,7 @@ mod identity_key_tests {
         let key_path = dir.path().join("identity.pem");
         let pem = Keypair::generate().to_pem().expect("pem");
 
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
             Err(e) => e,
             Ok(_) => panic!("the injected fallback fault must error the publish"),
         };
@@ -3109,7 +3223,7 @@ mod identity_key_tests {
             link: || Err(std::io::ErrorKind::Unsupported.into()),
             ..PublishFaults::NONE
         };
-        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
             Err(e) => e,
             Ok(_) => panic!("the fallback must fail when every marker name is taken"),
         };
@@ -3141,7 +3255,7 @@ mod identity_key_tests {
             marker_fsync: || Err(std::io::Error::other("injected marker dir fsync failure")),
             ..PublishFaults::NONE
         };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
             .expect("a marker dir fsync failure must not fail the publish");
         assert!(matches!(out, KeyPublish::Won), "publish still wins");
         let loaded = super::load_existing_key(&key_path).expect("published key loads");
@@ -3172,7 +3286,7 @@ mod identity_key_tests {
             marker_create: || Err(std::io::Error::other("marker created on the primary path")),
             ..PublishFaults::NONE
         };
-        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
             .expect("the primary path must never reach the marker machinery");
         assert!(matches!(out, KeyPublish::Won), "primary publish wins");
         let loaded = super::load_existing_key(&key_path).expect("published key loads");
@@ -3377,10 +3491,12 @@ mod identity_key_tests {
             ..RecoverySeam::NONE
         };
 
-        let err = match load_or_create_keypair_with(&key_path, &|| {}, PublishFaults::NONE, seam) {
-            Err(e) => e,
-            Ok(_) => panic!("a transient-class load failure must stay loud, never recover"),
-        };
+        let err =
+            match load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
+            {
+                Err(e) => e,
+                Ok(_) => panic!("a transient-class load failure must stay loud, never recover"),
+            };
         assert!(
             format!("{err:#}").contains("injected transient load failure"),
             "the transient failure must surface: {err:#}"
@@ -3426,10 +3542,14 @@ mod identity_key_tests {
             ..RecoverySeam::NONE
         };
 
-        let err = match load_or_create_keypair_with(&key_path, &|| {}, PublishFaults::NONE, seam) {
-            Err(e) => e,
-            Ok(_) => panic!("a second crash state in the same start must error, not recover again"),
-        };
+        let err =
+            match load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
+            {
+                Err(e) => e,
+                Ok(_) => {
+                    panic!("a second crash state in the same start must error, not recover again")
+                }
+            };
         assert!(
             err.to_string().contains("invalid PEM key"),
             "the second load failure must surface unchanged: {err:#}"
@@ -3516,8 +3636,14 @@ mod identity_key_tests {
             ..PublishFaults::NONE
         };
 
-        let kp = load_or_create_keypair_with(&key_path, &before_link, faults, RecoverySeam::NONE)
-            .expect("a lost race onto a crash-state final must recover, not fail the start");
+        let kp = load_or_create_keypair_with(
+            &key_path,
+            &before_link,
+            &|| {},
+            faults,
+            RecoverySeam::NONE,
+        )
+        .expect("a lost race onto a crash-state final must recover, not fail the start");
 
         let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
         assert_eq!(
@@ -3538,6 +3664,238 @@ mod identity_key_tests {
         assert!(
             names_containing(dir.path(), ".recovering.").is_empty(),
             "no recovery claims may remain"
+        );
+    }
+
+    // #194 (U3): THE divergence race. A fallback winner whose final is already
+    // durable but which stalls before removing its marker can have its round
+    // stolen by a recovering peer: the peer claims the winner's marker,
+    // quarantines the winner's final, and republishes key B. The winner's
+    // OWN-MARKER removal is the commit check; losing it must demote the winner
+    // to Lost so it converges on B, never returning Won with key A while disk
+    // holds B. RED before U3: the publish returns Won with the quarantined key
+    // A while the final holds B (two-sided divergence).
+    #[test]
+    fn stalled_winner_demotes_when_recovery_claims_its_round() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp_b = Keypair::generate();
+        let pem_b = kp_b.to_pem().expect("pem b");
+
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let steal_dir = dir.path().to_path_buf();
+        let steal_path = key_path.clone();
+        let before_commit = move || {
+            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // A full concurrent recovery inside A's stall window (post
+            // final-fsync, pre commit check), step for step what
+            // recover_crashed_publish does: claim A's marker by rename,
+            // quarantine A's final, republish key B, clear the claim.
+            let markers = names_containing(&steal_dir, ".publishing.");
+            assert_eq!(
+                markers.len(),
+                1,
+                "A's window must be bracketed: {markers:?}"
+            );
+            let claim = steal_dir.join(".identity.pem.recovering.55555");
+            std::fs::rename(steal_dir.join(&markers[0]), &claim).expect("claim A's marker");
+            std::fs::rename(
+                &steal_path,
+                steal_dir.join(".identity.pem.quarantined.55555.0"),
+            )
+            .expect("quarantine A's final");
+            let out = publish_key_atomically(
+                &steal_path,
+                pem_b.as_bytes(),
+                &|| {},
+                &|| {},
+                PublishFaults::NONE,
+            )
+            .expect("peer republishes key B");
+            assert!(matches!(out, KeyPublish::Won), "peer's republish wins");
+            std::fs::remove_file(&claim).expect("clear the claim");
+        };
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+
+        let kp = load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &before_commit,
+            faults,
+            RecoverySeam::NONE,
+        )
+        .expect("a demoted winner must converge, not fail the start");
+
+        let on_disk = super::load_existing_key(&key_path).expect("final parses");
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", kp_b.did()),
+            "the demoted winner must converge on the recovering peer's key B"
+        );
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp_b.did()),
+            "the final must hold key B"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "no recovery claims may remain"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one live identity: A's old final stays quarantined: {quarantined:?}"
+        );
+    }
+
+    // #194 (U3): with no interference the commit check is invisible. The
+    // winner removes its own marker, returns Won, and behaves exactly as U1's
+    // success test: the key round-trips and no marker is left. Also pins that
+    // the pre-commit seam runs on the fallback success path.
+    #[test]
+    fn winner_commits_first_without_interference() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let before_commit = || {
+            fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        };
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &before_commit, faults)
+            .expect("uncontended fallback publish");
+        assert!(
+            matches!(out, KeyPublish::Won),
+            "the uncontended winner commits and wins"
+        );
+        assert!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the pre-commit seam must run on the fallback success path"
+        );
+        let loaded = super::load_existing_key(&key_path).expect("published key loads");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "the committed publish must round-trip the same identity"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no marker may remain after commit"
+        );
+    }
+
+    // #194 (U3): a recovery attempt arriving AFTER the winner committed finds
+    // no marker to claim and must abort into a plain re-load: no quarantine,
+    // the winner's identity returned. Honest scope: recover_crashed_publish
+    // is invoked directly with a synthetic load error, the way the boot loop
+    // would after observing a (by now resolved) crash signature; the final on
+    // disk is GOOD here, so the vanished-marker arm's re-load succeeds.
+    #[test]
+    fn late_recovery_aborts_after_winner_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, &|| {}, faults)
+            .expect("winner publishes and commits");
+        assert!(matches!(out, KeyPublish::Won), "winner commits");
+
+        let recovery = super::recover_crashed_publish(
+            &key_path,
+            anyhow::anyhow!("synthetic post-commit crash signature"),
+        )
+        .expect("a late recovery must not error");
+        let loaded = match recovery {
+            super::Recovery::Reloaded(result) => {
+                result.expect("the vanished-marker arm re-loads the winner's key")
+            }
+            super::Recovery::Claimed(claim) => {
+                panic!("no marker exists to claim after commit, got claim {claim:?}")
+            }
+        };
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "late recovery must resolve to the committed winner's identity"
+        );
+        assert!(
+            names_containing(dir.path(), ".quarantined.").is_empty(),
+            "a committed final must never be quarantined"
+        );
+    }
+
+    // #194 (U3): a demoted winner facing a STALE `.recovering.` claim (a
+    // recovery that crashed before clearing it) must wait the claim out on
+    // the bounded KEY_RACE_DEADLINE and then return Lost, not error. The
+    // marker is stolen WITHOUT a real recovery (final left in place), so the
+    // follow-up load resolves the winner's OWN key: the demotion-is-safe
+    // property. RED before U3: the publish returns Won immediately and the
+    // elapsed floor fails.
+    #[test]
+    fn demoted_winner_waits_out_a_stale_claim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let steal_dir = dir.path().to_path_buf();
+        let before_commit = move || {
+            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let markers = names_containing(&steal_dir, ".publishing.");
+            assert_eq!(
+                markers.len(),
+                1,
+                "A's window must be bracketed: {markers:?}"
+            );
+            std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
+            std::fs::write(steal_dir.join(".identity.pem.recovering.44444"), b"")
+                .expect("plant stale claim");
+        };
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+
+        let started = std::time::Instant::now();
+        let kp = load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &before_commit,
+            faults,
+            RecoverySeam::NONE,
+        )
+        .expect("a demoted winner behind a stale claim must still resolve a key");
+        let waited = started.elapsed();
+
+        assert!(
+            waited >= std::time::Duration::from_secs(4),
+            "the demotion must wait out the stale claim on the deadline, waited {waited:?}"
+        );
+        let on_disk = super::load_existing_key(&key_path).expect("final parses");
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", on_disk.did()),
+            "with the final untouched the demoted winner must resolve its own key"
         );
     }
 }
