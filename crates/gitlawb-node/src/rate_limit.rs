@@ -209,12 +209,7 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
 
     if let (Some(limiter), Some(did)) = (limiter, did) {
         if let Some(retry_after) = limiter.check_retry(&did).await {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", retry_after.as_secs().to_string())],
-                "rate limit exceeded — try again later",
-            )
-                .into_response();
+            return too_many_requests(retry_after);
         }
     }
 
@@ -317,9 +312,9 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
-/// The shared 429 response for the per-IP flood brakes. Route-agnostic: this
-/// middleware now serves the push path AND the peer-sync routes, so the message
-/// stays generic (the offending path is recorded in the warn log below).
+/// The shared 429 response for the rate-limit middlewares (per-DID and per-IP
+/// alike). Route-agnostic: the message stays generic (the offending path, when
+/// logged, is recorded at the call site).
 pub fn too_many_requests(retry_after: Duration) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
