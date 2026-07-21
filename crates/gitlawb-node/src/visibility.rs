@@ -437,6 +437,31 @@ mod tests {
         );
     }
 
+    // #135 T1: a Mode-B rule on `/secret/**` must DENY the withheld directory's
+    // OWN path `/secret` (the `path == prefix` arm), not just strict descendants —
+    // otherwise get_by_cid's tree gate would serve the /secret tree object and leak
+    // its children. Pins parity with get_tree, which denies the /secret path.
+    #[test]
+    fn subtree_rule_denies_the_withheld_directory_itself() {
+        let reader = "did:key:z6MkReader";
+        let rules = [rule("/secret/**", VisibilityMode::B, &[reader])];
+        assert_eq!(
+            visibility_check(&rules, true, OWNER, None, "/secret"),
+            Decision::Deny,
+            "anon denied at the withheld directory's OWN path /secret"
+        );
+        assert_eq!(
+            visibility_check(&rules, true, OWNER, None, "/public"),
+            Decision::Allow,
+            "anon allowed at a sibling path outside the withheld subtree"
+        );
+        assert_eq!(
+            visibility_check(&rules, true, OWNER, Some(reader), "/secret"),
+            Decision::Allow,
+            "listed reader allowed at the withheld directory (caller-aware)"
+        );
+    }
+
     // #153 regression: cross-method DID must still be denied even when the
     // trailing segment collides with a bare owner key.
     #[test]

@@ -374,11 +374,83 @@ async fn main() -> Result<()> {
         rate_limiter,
         create_ip_rate_limiter,
         push_rate_limiter,
+        ipfs_max_history_walks: crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+        // The legacy-probe budget is operator-tunable via GITLAWB_IPFS_MAX_REPOS_WALKED
+        // (R5); the history-walk ceiling above stays constant (a smaller value false-503s
+        // a provenanced request). Default 256 preserves the shipped behaviour.
+        ipfs_max_legacy_probes: AppState::ipfs_legacy_probe_budget(&config),
+        ipfs_max_served_object_bytes: crate::api::ipfs::MAX_SERVED_OBJECT_BYTES,
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
+        git_read_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_git_ops)),
+        git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Anon receive-pack advertisements get their OWN pool, same size as the
+        // write pool but disjoint, so filling it (which takes many source IPs, each
+        // capped by git_push_advert_per_caller) never occupies a permit the
+        // authenticated POST needs (#174).
+        git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Bounds concurrent detached post-push encryption walks, sized from the push
+        // pool (no separate knob — Q1): completed pushes cannot outnumber active
+        // encryption walks past this (#174 P1-e).
+        git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_git_pushes,
+        )),
+        // Coalesces the DETACHED post-push encryption tasks per repo so a rapid pusher
+        // cannot grow the outstanding parked-waiter set past one task per repo (#174
+        // P2-2). No knob: it is a natural cap (one entry per distinct repo), not a
+        // sized pool.
+        encrypt_inflight: crate::state::EncryptInflight::new(),
+        git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.max_concurrent_reads_per_caller,
+        ),
+        // Per-source cap on the receive-pack advertisement, sized to an eighth of the
+        // write pool (min 1): a single source can hold at most this many write-pool
+        // slots via the anon advertisement, so saturating the pool takes ~8 distinct
+        // source IPs, each also rate-limited (#174).
+        git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            (config.max_concurrent_git_pushes / 8).max(1),
+        ),
+        // Per-source cap on the authenticated receive-pack POST, sized like the advert
+        // cap: one source IP can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct source IPs, each also rate-limited
+        // (#174 P1-d).
+        git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            (config.max_concurrent_git_pushes / 8).max(1),
+        ),
+        // Bounds concurrent /ipfs visibility walks — a distinct public cost center, so
+        // its own pool + per-source sub-cap + per-IP rate limiter, never a git pool
+        // (#174 P1-3). The per-source map is bounded (reject-before-insert, INV-15).
+        git_ipfs_walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.max_concurrent_ipfs_walks,
+        )),
+        git_ipfs_walk_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
+            config.ipfs_walk_per_source,
+        ),
+        ipfs_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        // Separate WORK-budget bucket for the resolver's per-probe/per-walk charges (R6).
+        // Its capacity is DERIVED from the route limit (no new knob) and floored at the
+        // legacy-probe budget, so one full default-config legacy scan never self-throttles
+        // mid-request while the route brake above stays the pure once-per-request cap.
+        ipfs_work_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            AppState::ipfs_work_budget(&config),
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        git_bin: "git".to_string(),
     };
+    if config.ipfs_rate_limit == 0 {
+        tracing::warn!("GITLAWB_IPFS_RATE_LIMIT=0 — per-IP /ipfs rate limiting disabled");
+    }
 
     // Periodic peer-count poll for the metrics gauge. If p2p is disabled
     // we still set the gauge to 0 so dashboards don't show "no data".
@@ -408,22 +480,16 @@ async fn main() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let rl = state.rate_limiter.clone();
-        let create_ip_rl = state.create_ip_rate_limiter.clone();
-        let push_rl = state.push_rate_limiter.clone();
-        let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
-        let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let cleanup_state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        rl.cleanup().await;
-                        create_ip_rl.cleanup().await;
-                        push_rl.cleanup().await;
-                        sync_trigger_rl.cleanup().await;
-                        peer_write_rl.cleanup().await;
+                        // Sweep every per-IP/DID limiter (incl. the ipfs walk brake)
+                        // so bounded maps shed stale keys instead of sitting at cap.
+                        cleanup_state.sweep_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)

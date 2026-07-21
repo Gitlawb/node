@@ -343,12 +343,19 @@ Important node settings:
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
-| `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack/receive-pack may run before it is aborted (504). Default 600. Does not bound `info/refs` or the withheld-blob path. |
+| `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack, receive-pack, or `info/refs` advertisement may run before it is aborted (504). Default 600. Also bounds the withheld-blob classification walk (on both the upload-pack serve and receive-pack replication paths) and the push-side pin-candidate discovery (`rev-list` / `cat-file`), each reaped via process-group teardown at the deadline. |
+| `GITLAWB_GIT_ACQUIRE_TIMEOUT_SECS` | Max seconds the storage-acquisition phase (Tigris HEAD/GET, push advisory-lock) of a served git op may run before the request is shed with a 503, separate from the git-run timeout. The concurrency permit is released on expiry so a stalled backend cannot pin the pool. Default 30. |
+| `GITLAWB_MAX_CONCURRENT_IPFS_WALKS` | Max concurrent `GET /ipfs/{cid}` visibility walks across all callers (own pool, disjoint from the served-git pools); over-cap sheds 503. Default 32. |
+| `GITLAWB_IPFS_WALK_PER_SOURCE` | Max concurrent `/ipfs` walks a single source IP may hold. Default 4. |
+| `GITLAWB_IPFS_MAX_REPOS_WALKED` | Max legacy (NULL-provenance) repos probed per `/ipfs/{cid}` request, bounding the scan-fallback fan-out. A truncated scan returns a retryable 503, not a false 404. Default 256. |
+| `GITLAWB_IPFS_RATE_LIMIT` | Max `/ipfs/{cid}` requests per client IP per hour (route flood brake). 0 disables. Default 600. |
 | `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
 | `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
 | `GITLAWB_IRYS_URL` | Optional Irys/Arweave permanent anchoring. |
 
 Production note: change the default Postgres password before exposing a node publicly.
+
+Legacy-pin window: releases before the CID-resolver work stored the provider CID (Kubo dag-pb / Pinata) as a pinned object's resolver key. The `/ipfs/{cid}` resolver now recomputes the raw-content CID from the object bytes and refuses to serve a key that does not match, so `GET /api/v1/ipfs/pins` can still advertise an unrepaired legacy CID that 404s. Such a row is repaired opportunistically the next time a push carries the object again (its key is rewritten to the raw CID, the old value kept in `legacy_provider_cid`), but git negotiation omits objects the node already has, so most legacy rows never re-enter a push delta. A deferred one-shot startup sweep, not this opportunistic path, is what fully retires the advertise-then-404 window. Rows whose object bytes are gone stay withheld.
 
 ---
 

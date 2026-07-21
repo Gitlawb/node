@@ -64,6 +64,19 @@ impl Cid {
     }
 }
 
+/// True when `s` parses as a CIDv1 with the raw codec — the exact shape
+/// [`Cid::from_git_object_bytes`] produces and the `/ipfs` resolver looks up.
+/// A legacy provider CID (Kubo dag-pb, Pinata CIDv0) parses to a different
+/// version or codec and returns `false`, marking it an opportunistic-repair
+/// candidate. Decidable from the string alone (no object bytes), so the pin path
+/// can gate the byte-read/recompute cost on it and leave non-legacy rows at the
+/// existing DB-only skip cost. An unparseable string is non-canonical (`false`).
+pub fn is_raw_cidv1(s: &str) -> bool {
+    s.parse::<CidGeneric<64>>()
+        .map(|c| c.version() == cid::Version::V1 && c.codec() == RAW)
+        .unwrap_or(false)
+}
+
 impl fmt::Display for Cid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
@@ -175,6 +188,38 @@ mod tests {
     fn sha256_hex_to_bytes_rejects_wrong_length() {
         let result = sha256_hex_to_bytes("deadbeef");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn is_raw_cidv1_classifies_codec_from_string() {
+        // The canonical resolver key: CIDv1 + raw codec → not a repair candidate.
+        let raw = Cid::from_git_object_bytes(b"blob 5\0hello");
+        assert!(
+            is_raw_cidv1(raw.as_str()),
+            "from_git_object_bytes output is CIDv1/raw"
+        );
+
+        // A CIDv0 (Pinata dag-pb legacy shape) → repair candidate.
+        assert!(
+            !is_raw_cidv1("QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG"),
+            "a CIDv0 dag-pb value is a legacy-repair candidate"
+        );
+
+        // A CIDv1 with the dag-pb codec (the Kubo above-block-size root) over the
+        // same multihash → still a repair candidate (codec, not just version).
+        let parsed = raw.as_str().parse::<CidGeneric<64>>().unwrap();
+        const DAG_PB: u64 = 0x70;
+        let dagpb = CidGeneric::<64>::new_v1(DAG_PB, *parsed.hash()).to_string();
+        assert!(
+            !is_raw_cidv1(&dagpb),
+            "a CIDv1 dag-pb value is a legacy-repair candidate"
+        );
+
+        // Garbage is non-canonical.
+        assert!(
+            !is_raw_cidv1("not-a-cid"),
+            "an unparseable string is non-canonical"
+        );
     }
 
     #[test]
