@@ -75,13 +75,17 @@ jobs:
             // #[test]. Anchor to a leading #[ (horizontal whitespace only, so the attribute
             // itself must be on the added line) so ::test in ordinary code (indexing,
             // comments, strings) doesn't count, require cfg(test) to close before accepting
-            // it as a test gate, and allow the whitespace Rust permits around :: and cfg(.
+            // it as a test gate, allow the whitespace Rust permits around :: and cfg(, and
+            // allow an optional leading :: for absolute-path attributes (::tokio::test).
             const testAttrRe =
-              /#[ \s]*\[[ \s]*(?:cfg[ \s]*\([ \s]*test[ \s]*\)|(?:[\w-]+(?:[ \s]*::[ \s]*[\w-]+)*[ \s]*::[ \s]*)?test\b[ \s]*[\]\()])/g;
+              /#[ \s]*\[[ \s]*(?:cfg[ \s]*\([ \s]*test[ \s]*\)|(?:[ \s]*::[ \s]*)?(?:[\w-]+(?:[ \s]*::[ \s]*[\w-]+)*[ \s]*::[ \s]*)?test\b[ \s]*[\]\()])/g;
 
             // Strip comments and string contents from a file of Rust, carrying lexical
             // state (open block comment / raw string / normal string) and tracking
-            // original line mapping.
+            // original line mapping. Each skipped comment/string/char-literal leaves a single
+            // non-whitespace placeholder behind so tokens on either side of it can't glue
+            // together into a false attribute match (e.g. a macro arg list containing a
+            // stray "#" and a string literal must not read as "#[test]" once stripped).
             function stripRustFile(fileContent) {
               let stripped = "";
               const lineMap = [];
@@ -125,22 +129,30 @@ jobs:
                     }
                     if (content.slice(i, i + 2) === "/*") {
                       state.blockCommentDepth = 1;
+                      stripped += "\0";
+                      lineMap.push(lineNo);
                       i += 2;
                       continue;
                     }
                     const charMatch = content.slice(i).match(/^'(?:[^'\\]|\\.)'/);
                     if (charMatch) {
+                      stripped += "\0";
+                      lineMap.push(lineNo);
                       i += charMatch[0].length;
                       continue;
                     }
                     const rawMatch = content.slice(i).match(/^r(#*)"/);
                     if (rawMatch) {
                       state.rawStringDelim = '"' + rawMatch[1];
+                      stripped += "\0";
+                      lineMap.push(lineNo);
                       i += rawMatch[0].length;
                       continue;
                     }
                     if (content[i] === '"') {
                       state.inNormalString = true;
+                      stripped += "\0";
+                      lineMap.push(lineNo);
                       i += 1;
                       continue;
                     }
@@ -196,16 +208,28 @@ jobs:
               );
               if (!patchHasPotentialTest) continue;
 
+              // Bound the API work, but don't abort the whole job when a large PR exceeds it:
+              // that would skip label reconciliation and the guidance comment for every
+              // managed label, not just needs-tests. Stop scanning further candidates and
+              // fall through with whatever inline-test evidence we've already found.
               if (contentFetchCount >= 15) {
-                throw new Error("PR is too large: exceeded maximum number of file content fetches (15) for inline test analysis.");
+                core.warning(
+                  "More than 15 candidate Rust files touch tests/cfg; stopping inline-test analysis early."
+                );
+                break;
               }
               contentFetchCount++;
 
+              // Use the Git Data API (blob sha from the diff) rather than the Contents API:
+              // the Contents API returns encoding "none" (no content) for files between 1-100MB,
+              // which the Git Data API supports directly.
               let fileContent;
               try {
-                const res = await github.rest.repos.getContent({
-                  owner, repo, path: f.filename, ref: pr.head.sha,
-                });
+                const res = await github.rest.git.getBlob({ owner, repo, file_sha: f.sha });
+                if (res.data.encoding !== "base64") {
+                  core.warning(`Unsupported content encoding for ${f.filename}; skipping inline-test analysis for this file.`);
+                  continue;
+                }
                 fileContent = Buffer.from(res.data.content, "base64").toString("utf8");
               } catch (e) {
                 if (e.status === 404) {
@@ -224,7 +248,10 @@ jobs:
                 const start = match.index;
                 const end = testAttrRe.lastIndex;
                 for (let k = start; k < end; k++) {
-                  if (added.has(lineMap[k])) {
+                  // Require an actual attribute token (not just whitespace the match
+                  // spans, e.g. a blank line inserted inside an otherwise unchanged
+                  // multiline attribute) to be on an added line.
+                  if (added.has(lineMap[k]) && !/\s/.test(stripped[k])) {
                     addsInlineTest = true;
                     break;
                   }
