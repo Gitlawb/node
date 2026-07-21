@@ -355,6 +355,8 @@ Important node settings:
 
 Production note: change the default Postgres password before exposing a node publicly.
 
+Legacy-pin window: releases before the CID-resolver work stored the provider CID (Kubo dag-pb / Pinata) as a pinned object's resolver key. The `/ipfs/{cid}` resolver now recomputes the raw-content CID from the object bytes and refuses to serve a key that does not match, so `GET /api/v1/ipfs/pins` can still advertise an unrepaired legacy CID that 404s. Such a row is repaired opportunistically the next time a push carries the object again (its key is rewritten to the raw CID, the old value kept in `legacy_provider_cid`), but git negotiation omits objects the node already has, so most legacy rows never re-enter a push delta. A deferred one-shot startup sweep, not this opportunistic path, is what fully retires the advertise-then-404 window. Rows whose object bytes are gone stay withheld.
+
 ---
 
 ## Optional node staking

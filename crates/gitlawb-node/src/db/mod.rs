@@ -921,6 +921,22 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_pin_repo_sources_sha ON pin_repo_sources(sha256_hex)",
         ],
     },
+    Migration {
+        version: 14,
+        name: "pinned_cids_legacy_provider_cid",
+        stmts: &[
+            // R8 (#173, jatmn round 10): the opportunistic legacy provider-CID repair
+            // rewrites `pinned_cids.cid` from a stored PROVIDER CID (Kubo dag-pb /
+            // Pinata CIDv0) to the raw-content resolver key and stashes the OLD value
+            // here, so the rewrite is auditable and the row's legacy origin survives.
+            // Distinct from `pinata_cid` on purpose: `has_pinata_cid` gates the Pinata
+            // pin-skip, so parking a Kubo-legacy CID there would make Pinata forever
+            // skip re-pinning that object. NEW versioned migration (never appended to an
+            // applied block, INV-7) so a node past v13 actually gets the column.
+            // Nullable: only a repaired row sets it.
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS legacy_provider_cid TEXT",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -2282,6 +2298,47 @@ impl Db {
         .bind(cid)
         .bind(Utc::now().to_rfc3339())
         .bind(repo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The resolver key currently stored for a pinned object (`pinned_cids.cid`),
+    /// or `None` for an unpinned oid. The opportunistic legacy-repair path reads
+    /// it to decide candidacy from the codec of the string alone (no object bytes)
+    /// before it recomputes anything.
+    pub async fn cid_for_oid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("cid")))
+    }
+
+    /// Rewrite a legacy provider-CID row to the raw-content resolver key, stashing
+    /// the old provider value in `legacy_provider_cid` (#173 R8, KTD8). Before this
+    /// branch the pin path stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in
+    /// `cid`; the `/ipfs` resolver recomputes the raw CID and 404s a mismatched key
+    /// even though `list_pinned_cids` still advertises it. The `WHERE cid =
+    /// $old_provider_cid` guard makes a concurrent double-repair a no-op (the second
+    /// writer sees the already-rewritten key and matches nothing) and never touches
+    /// a row keyed on a different value. Stashed in `legacy_provider_cid`, NOT
+    /// `pinata_cid`: the latter gates the Pinata pin-skip (`has_pinata_cid`), so a
+    /// Kubo-legacy CID parked there would make Pinata permanently skip the object.
+    pub async fn repair_legacy_provider_cid(
+        &self,
+        sha256_hex: &str,
+        raw_cid: &str,
+        old_provider_cid: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE pinned_cids
+                SET cid = $2, legacy_provider_cid = $3
+              WHERE sha256_hex = $1 AND cid = $3",
+        )
+        .bind(sha256_hex)
+        .bind(raw_cid)
+        .bind(old_provider_cid)
         .execute(&self.pool)
         .await?;
         Ok(())
