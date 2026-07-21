@@ -76,7 +76,19 @@ pub async fn create_issue(
     // next acquire_write would revert it from the stale archive. Report 5xx so
     // the client retries rather than trusting an issue that never landed durably,
     // and skip the trust bump below. (Same P1 data-loss guard as receive-pack.)
-    let upload_ok = guard.release(create_result.is_ok()).await;
+    // On that failure, roll back the local ref BEFORE the lock releases — an
+    // orphan ref would make the retry a duplicate, and in an unlock-to-delete
+    // window a concurrent same-repo write could upload an archive still
+    // carrying it. Best-effort: a failed delete logs and the 5xx still returns.
+    let upload_ok = guard
+        .release_with_failure_cleanup(create_result.is_ok(), |path| {
+            if let Err(e) = git_issues::delete_issue_ref(path, &issue_id) {
+                tracing::warn!(issue = %issue_id, err = %e,
+                    "failed to roll back local issue ref after failed durable upload; \
+                     a retry may duplicate this issue");
+            }
+        })
+        .await;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;
 
@@ -337,6 +349,189 @@ mod tests {
         async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    // Object store whose upload succeeds immediately. exists() is false so
+    // acquire_write never performs a reverting refresh over the local dir —
+    // the retry test below pins that contract explicitly.
+    struct OkStore;
+    #[async_trait::async_trait]
+    impl crate::git::tigris::ObjectStore for OkStore {
+        async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn upload(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn download(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Shared setup for the failed-upload rollback tests: a state whose repo
+    // store stalls uploads (200ms release timeout), a public repo row for
+    // `owner/name`, and an initialized bare repo at the returned path.
+    async fn stall_state_with_repo(
+        pool: sqlx::PgPool,
+        repos_dir: &tempfile::TempDir,
+        owner: &str,
+        name: &str,
+    ) -> (crate::state::AppState, std::path::PathBuf) {
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(std::sync::Arc::new(StallStore)),
+            pool.clone(),
+        )
+        .with_release_upload_timeout(Duration::from_millis(200));
+
+        let owner_slug = owner.replace([':', '/'], "_");
+        let bare = repos_dir
+            .path()
+            .join(&owner_slug)
+            .join(format!("{name}.git"));
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
+            .await
+            .unwrap();
+
+        std::fs::create_dir_all(&bare).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "--bare", "-q", &bare.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init --bare failed");
+
+        (state, bare)
+    }
+
+    async fn create_issue_status(
+        state: &crate::state::AppState,
+        owner: &str,
+        name: &str,
+    ) -> axum::http::StatusCode {
+        use axum::response::IntoResponse;
+        let resp = super::create_issue(
+            State(state.clone()),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            AxPath((owner.to_string(), name.to_string())),
+            axum::Json(CreateIssueRequest {
+                title: "t".into(),
+                body: None,
+                signed_payload: None,
+            }),
+        )
+        .await;
+        match resp {
+            Ok((code, _)) => code,
+            Err(e) => e.into_response().status(),
+        }
+    }
+
+    fn issue_refs(bare: &StdPath) -> Vec<String> {
+        let out = std::process::Command::new("git")
+            .args([
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/gitlawb/issues/",
+            ])
+            .current_dir(bare)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git for-each-ref failed");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    // Rollback half of the #196 round-four issue-create fix. When the durable
+    // upload fails/times out, the handler 500s (covered below) — but the issue
+    // ref it wrote to LOCAL disk must also be rolled back, while the advisory
+    // lock is still held. An orphan ref makes the 500 dishonest: a retry
+    // re-creates the issue under a new uuid while the orphan is still listed,
+    // and a concurrent same-repo write can upload an archive carrying it.
+    // RED pre-fix: the orphan ref survives the failed create.
+    #[sqlx::test]
+    async fn issue_create_failed_upload_rolls_back_local_ref(pool: sqlx::PgPool) {
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let owner = "z6issuerollbackowner";
+        let name = "issuerollback";
+        let (state, bare) = stall_state_with_repo(pool, &repos_dir, owner, name).await;
+
+        let status = create_issue_status(&state, owner, name).await;
+        assert!(
+            status.is_server_error(),
+            "stalled upload must 500, got {status}"
+        );
+
+        let refs = issue_refs(&bare);
+        assert!(
+            refs.is_empty(),
+            "a failed durable upload must roll back the local issue ref while \
+             the advisory lock is held; orphan ref(s) survived: {refs:?}"
+        );
+    }
+
+    // Retry half: after the failed-upload 500, a retry with a WORKING store
+    // must yield exactly one issue. Pre-fix the orphan ref from the failed
+    // attempt makes the retry a duplicate (two issues in list_issues).
+    #[sqlx::test]
+    async fn issue_create_failed_upload_retry_does_not_duplicate(pool: sqlx::PgPool) {
+        use crate::git::tigris::ObjectStore as _;
+
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let owner = "z6issueretryowner";
+        let name = "issueretry";
+        let (state, bare) = stall_state_with_repo(pool.clone(), &repos_dir, owner, name).await;
+
+        let status = create_issue_status(&state, owner, name).await;
+        assert!(
+            status.is_server_error(),
+            "stalled upload must 500, got {status}"
+        );
+
+        // PIN the double's contract: exists() stays false after the failed
+        // upload, so the retry's acquire_write performs no reverting refresh
+        // from a stale archive. Without this pin, a download could revert the
+        // orphan ref and the assertion below would pass without the rollback
+        // fix — it must rest on the rollback, not a stale-archive revert.
+        let owner_slug = owner.replace([':', '/'], "_");
+        assert!(
+            !OkStore.exists(&owner_slug, name).await.unwrap(),
+            "test double contract broken: exists() must stay false"
+        );
+
+        // Retry with a store whose upload succeeds.
+        let mut retry_state = state.clone();
+        retry_state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(std::sync::Arc::new(OkStore)),
+            pool.clone(),
+        )
+        .with_release_upload_timeout(Duration::from_millis(200));
+
+        let status = create_issue_status(&retry_state, owner, name).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "retry with working store must 201"
+        );
+
+        let issues = crate::git::issues::list_issues(&bare).unwrap();
+        assert_eq!(
+            issues.len(),
+            1,
+            "retry after a failed-upload 500 must yield exactly ONE issue; the \
+             failed attempt's orphan ref duplicated it (got {} issues)",
+            issues.len()
+        );
     }
 
     // P1-class data-loss regression, issue-create path. create_issue writes the

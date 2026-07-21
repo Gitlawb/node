@@ -631,7 +631,23 @@ impl RepoWriteGuard {
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
     #[must_use = "a false return means the durable upload failed; the write must be reported as failed, not 2xx"]
-    pub async fn release(mut self, success: bool) -> bool {
+    pub async fn release(self, success: bool) -> bool {
+        self.release_with_failure_cleanup(success, |_| {}).await
+    }
+
+    /// Like [`release`](Self::release), but when an ATTEMPTED upload fails or
+    /// times out, runs `cleanup` on the local repo path BEFORE the advisory
+    /// lock is freed. Lets a caller roll back a local write that never reached
+    /// durable storage without an unlock-to-cleanup window in which a
+    /// concurrent same-repo write could upload an archive still carrying it.
+    /// `cleanup` does NOT run when `success == false` (the write itself
+    /// failed, no upload attempted) or when the upload succeeded.
+    #[must_use = "a false return means the durable upload failed; the write must be reported as failed, not 2xx"]
+    pub async fn release_with_failure_cleanup(
+        mut self,
+        success: bool,
+        cleanup: impl FnOnce(&Path),
+    ) -> bool {
         // Whether the durable copy is safe. Stays `true` when there is nothing to
         // upload (no object store, or `success == false` where no upload is
         // attempted) — those are not upload failures. Only an upload that was
@@ -668,6 +684,14 @@ impl RepoWriteGuard {
             }
         } else {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
+        }
+
+        // Failed-upload cleanup runs HERE, while the advisory lock is still
+        // held: after the unlock below, a concurrent same-repo write could
+        // upload an archive still carrying the state the caller is rolling
+        // back, which a later download would resurrect.
+        if !upload_ok {
+            cleanup(&self.local_path);
         }
 
         // Unlock on the SAME connection that took the lock, then TAKE the
