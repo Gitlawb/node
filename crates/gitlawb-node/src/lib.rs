@@ -1342,6 +1342,76 @@ fn wait_for_recovery_claims(final_path: &std::path::Path) {
     }
 }
 
+/// Best-effort sweep of stale `.{stem}.publishing.*` markers and
+/// `.{stem}.recovering.*` claims beside a healthy final, run on both
+/// healthy-boot arms of `load_or_create_keypair_with` (#194, U4). Without it
+/// a marker orphaned by a crash between its durability fsync and the final's
+/// `create_new`, or a claim left by a crashed recovery, outlives every
+/// healthy boot and later misclassifies a real corruption of a good key as
+/// an interrupted first write (quarantine-and-regenerate instead of the loud
+/// error a corrupted good key deserves).
+///
+/// DURABILITY PRECONDITION (critical, the reason this is not a bare unlink
+/// loop): a loadable final is not necessarily durable — a racing fallback
+/// winner's `write_all` is visible via the page cache before its `sync_all`,
+/// so sweeping on loadability alone could remove a marker ahead of the
+/// content it vouches for and let a power loss recreate exactly the
+/// marker-less partial final the bracket exists to prevent. The sweeper
+/// therefore makes the content durable ITSELF before touching any marker:
+/// open the final read-only, `sync_all` it, then `fsync_parent_dir` (Unix).
+/// If either step fails the sweep is skipped entirely — every marker stays
+/// in place, at most a warn. Only after both succeed is every matching entry
+/// removed (each best-effort), followed by a best-effort dir fsync. On
+/// non-Unix the dir-fsync halves are skipped like every other dir fsync here
+/// (reasoned, not run: no non-Unix target is exercised by these tests).
+///
+/// Sweeping a FOREIGN marker is safe once durability holds: the swept
+/// publisher's own disposal tolerates NotFound on every arm; a live
+/// publisher still before its final `create_new` hits AlreadyExists and
+/// routes to Lost regardless of its marker; and the content the marker
+/// vouched for is durable by the sweeper's own hand. `sweep_sync` is the
+/// `RecoverySeam` test hook, run before the final's `sync_all` with an `Err`
+/// taken as that sync's result; production passes a no-op `Ok`.
+fn sweep_stale_markers(final_path: &std::path::Path, sweep_sync: fn() -> std::io::Result<()>) {
+    let durable = std::fs::File::open(final_path)
+        .and_then(|f| sweep_sync().and_then(|()| f.sync_all()))
+        .map_err(anyhow::Error::new);
+    #[cfg(unix)]
+    let durable = durable.and_then(|()| fsync_parent_dir(final_path));
+    if let Err(e) = durable {
+        warn!(
+            path = %final_path.display(),
+            err = %e,
+            "skipping stale publish-marker sweep: could not make the final key durable"
+        );
+        return;
+    }
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.pem");
+    let publishing = format!(".{stem}.publishing.");
+    let recovering = format!(".{stem}.recovering.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with(&publishing) || name.starts_with(&recovering) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    #[cfg(unix)]
+    {
+        let _ = fsync_parent_dir(final_path);
+    }
+}
+
 /// Compile-time fault-injection seam for `publish_key_atomically`, extending
 /// the `before_link` closure precedent: every hook is a no-op `Ok` in
 /// production (`PublishFaults::NONE`); tests swap in a hook returning `Err` to
@@ -1419,15 +1489,19 @@ impl PublishFaults {
 /// without hard-link support, or a transient link error), the publish falls
 /// back to `create_new(0o600)` directly on the final path
 /// (`publish_key_fallback`). The fallback keeps (b): `create_new` still admits
-/// exactly one winner and a lost race loads the existing key. It weakens (a),
-/// (c), and (d): the final name is visible while the PEM is being written, a
+/// exactly one winner and a lost race loads the existing key. It weakens (a)
+/// and (d): the final name is visible while the PEM is being written, a
 /// window concurrent readers ride out via `load_racing_key`'s wall-clock
-/// deadline; a crash mid-write leaves a partial final that fails loudly
-/// (`invalid PEM key`) at the next start rather than being cleaned up; and the
-/// final name can become durable before the PEM bytes are fsynced, so a power
-/// loss can additionally leave a durable empty/truncated final. In every case
-/// the failure mode is the same LOUD invalid-PEM (or mode) error at the next
-/// start, never a silently used key.
+/// deadline; and the final name can become durable before the PEM bytes are
+/// fsynced, so a power loss can additionally leave a durable empty/truncated
+/// final. Guarantee (c) now holds on the fallback too, via the marker
+/// protocol (#194, U2/U4): a crash inside the non-atomic window leaves
+/// marker+final together, and the next boot claims the marker, quarantines
+/// the partial final, and regenerates instead of wedging. Honest residual on
+/// top of the U3 list below: that recovery runs at the next boot, not at
+/// crash time, so the partial final persists until then. In every unrecovered
+/// case the failure mode is the same LOUD invalid-PEM (or mode) error at the
+/// next start, never a silently used key.
 ///
 /// Against the boot-time crash RECOVERY race (#194, U3) the fallback's marker
 /// protocol restores (b)-style convergence: removing the publish marker is
@@ -1794,6 +1868,10 @@ struct RecoverySeam<'a> {
     /// Runs at the top of each generate+publish pass, so a test can mutate
     /// on-disk state between a completed recovery and the retry publish.
     before_publish: &'a dyn Fn(),
+    /// Runs inside `sweep_stale_markers` before the final's `sync_all`; an
+    /// `Err` is taken as that sync's result, so a test can fail the sweep's
+    /// durability gate deterministically (#194, U4).
+    sweep_sync: fn() -> std::io::Result<()>,
 }
 
 impl RecoverySeam<'_> {
@@ -1801,6 +1879,7 @@ impl RecoverySeam<'_> {
     const NONE: RecoverySeam<'static> = RecoverySeam {
         load_fault: || Ok(()),
         before_publish: &|| {},
+        sweep_sync: || Ok(()),
     };
 }
 
@@ -1979,6 +2058,7 @@ fn load_or_create_keypair_with(
             match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
                 BootLoad::Loaded(kp) => {
                     remove_claim(&claim);
+                    sweep_stale_markers(key_path, seam.sweep_sync);
                     return Ok(*kp);
                 }
                 // Only emitted while recovery is still allowed (crash_exit is
@@ -2014,6 +2094,7 @@ fn load_or_create_keypair_with(
         {
             KeyPublish::Won => {
                 remove_claim(&claim);
+                sweep_stale_markers(key_path, seam.sweep_sync);
                 info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
                 return Ok(kp);
             }
@@ -2021,6 +2102,7 @@ fn load_or_create_keypair_with(
                 match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
                     BootLoad::Loaded(kp) => {
                         remove_claim(&claim);
+                        sweep_stale_markers(key_path, seam.sweep_sync);
                         return Ok(*kp);
                     }
                     // Only emitted while recovery is still allowed (crash_exit
@@ -3896,6 +3978,133 @@ mod identity_key_tests {
             format!("{}", kp.did()),
             format!("{}", on_disk.did()),
             "with the final untouched the demoted winner must resolve its own key"
+        );
+    }
+
+    // #194 (U4): a HEALTHY load must sweep stale `.publishing.` markers and
+    // `.recovering.` claims, or they linger to misclassify a much-later real
+    // corruption of a good key as an interrupted first write. RED before U4:
+    // all three files survive the load.
+    #[test]
+    fn healthy_load_sweeps_stale_markers_and_claims() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = Keypair::generate();
+        let pem = existing.to_pem().expect("pem");
+        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
+        std::fs::write(dir.path().join(".identity.pem.publishing.88888.1"), b"")
+            .expect("seed second stale marker");
+        std::fs::write(dir.path().join(".identity.pem.recovering.77777"), b"")
+            .expect("seed stale recovery claim");
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("a valid final with stale markers must load");
+
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", existing.did()),
+            "the pre-existing identity must be preserved, not regenerated"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "a healthy load must sweep stale publish markers"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "a healthy load must sweep stale recovery claims"
+        );
+    }
+
+    // #194 (U4): the generate path must sweep too. A crash between the
+    // marker's durability fsync and the final's `create_new` leaves a durable
+    // marker with NO final; only the Won arm of a later boot can ever clean
+    // that state, since no load will ever succeed beside it. RED before U4
+    // (the marker survives); RED again under a load-arm-only implementation
+    // (mutation check: with the Won-arm call site removed this test must
+    // fail while healthy_load_sweeps_stale_markers_and_claims stays green).
+    #[test]
+    fn generate_path_sweeps_stale_markers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        std::fs::write(dir.path().join(".identity.pem.publishing.66666.0"), b"")
+            .expect("seed stale marker without a final");
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("a stale marker with no final must not block generation");
+
+        let on_disk = super::load_existing_key(&key_path).expect("published key loads");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the generated identity must be on disk"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "a Won publish on a healthy boot must sweep the stale marker"
+        );
+    }
+
+    // #194 (U4) MUST-NOT: the sweep must never remove a marker ahead of the
+    // content it vouches for. With the seam failing the sweep's durability
+    // sync, the load still succeeds but the marker SURVIVES. Vacuously green
+    // before U4 (no sweep exists, so the marker trivially survives); its
+    // load-bearing proof is the mutation check: with the durability gate
+    // removed (sweep unconditionally) this test must fail.
+    #[test]
+    fn sweep_durability_gate_leaves_markers_on_sync_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = Keypair::generate();
+        let pem = existing.to_pem().expect("pem");
+        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
+        let seam = RecoverySeam {
+            sweep_sync: || Err(std::io::Error::other("injected sweep sync failure")),
+            ..RecoverySeam::NONE
+        };
+
+        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
+            .expect("a failed sweep durability sync must not fail the load");
+
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", existing.did()),
+            "the identity must still load when the sweep is skipped"
+        );
+        assert_eq!(
+            names_containing(dir.path(), ".publishing."),
+            vec![".identity.pem.publishing.99999.0".to_string()],
+            "the marker must survive when the sweep cannot make the final durable"
+        );
+    }
+
+    // #194 (U4): the sweep's removals are best-effort; unremovable markers
+    // must never fail an otherwise healthy load. The key directory is made
+    // read-only (0555): the durability gate still passes (the file sync_all
+    // and the dir fsync both open read-only) but every remove_file fails
+    // EACCES. Vacuously green before U4 (no sweep exists); load-bearing once
+    // the sweep runs, since a sweep that surfaced removal errors would fail
+    // this load.
+    #[test]
+    fn sweep_failure_tolerated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = Keypair::generate();
+        let pem = existing.to_pem().expect("pem");
+        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("read-only key dir");
+
+        let result = load_or_create_keypair(&key_config(&key_path));
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("restore key dir");
+        let kp = result.expect("unremovable markers must not fail the load");
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", existing.did()),
+            "the identity must load despite the failed sweep removals"
+        );
+        assert_eq!(
+            names_containing(dir.path(), ".publishing."),
+            vec![".identity.pem.publishing.99999.0".to_string()],
+            "the unremovable marker survives, harmlessly"
         );
     }
 }
