@@ -48,6 +48,74 @@ where
     }
 }
 
+/// Opportunistically repair a legacy provider-CID row on the already-pinned skip
+/// path (#173 R8, KTD8). Releases before this branch stored the PROVIDER CID
+/// (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`; the `/ipfs` resolver
+/// recomputes the raw CID from object bytes and 404s any row whose key does not
+/// match, yet `list_pinned_cids` still advertises the stored key — so a client
+/// gets a CID the resolver deliberately withholds. When a re-push carries the
+/// object again, rewrite the key to the raw CID and stash the old provider value
+/// in `legacy_provider_cid`.
+///
+/// COST GATE: candidacy is decided from the stored key's codec alone — a
+/// CIDv1/raw key is already the resolver key and reads NO bytes, keeping the
+/// steady-state skip cost DB-only. Only a legacy-codec row reads the object to
+/// recompute. A row whose bytes are gone stays withheld (no destructive rewrite).
+async fn repair_legacy_provider_cid(
+    repo_path: &std::path::Path,
+    sha: &str,
+    db: &crate::db::Db,
+) -> Result<()> {
+    let stored = match db.cid_for_oid(sha).await? {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    // Cost gate: a canonical raw CIDv1 key is already correct — never read bytes.
+    if gitlawb_core::cid::is_raw_cidv1(&stored) {
+        return Ok(());
+    }
+    // Legacy-codec row: read the object to recompute. Counted so a test can prove
+    // the gate above spares non-legacy rows this read.
+    #[cfg(test)]
+    note_legacy_repair_read();
+    let data = match crate::git::store::read_object(repo_path, sha)? {
+        Some((_ty, bytes)) => bytes,
+        // Bytes gone: the row stays withheld, never destructively rewritten.
+        None => return Ok(()),
+    };
+    let raw = Cid::from_git_object_bytes(&data).to_string();
+    if raw == stored {
+        return Ok(());
+    }
+    db.repair_legacy_provider_cid(sha, &raw, &stored).await
+}
+
+// Test-only cost-gate counter (R8, U7): how many times the opportunistic repair
+// read an object's bytes on the skip path. The codec gate must spare a CIDv1/raw
+// row this read; the counter is the both-ways guard (removing the gate reads the
+// raw row and increments it). Same thread_local discipline as the serve-path
+// oversize counter — the pin tests await `pin_new_objects` on a current-thread
+// runtime, so the increment and the assertion share one thread.
+#[cfg(test)]
+thread_local! {
+    static LEGACY_REPAIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_legacy_repair_reads() {
+    LEGACY_REPAIR_READS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_repair_reads() -> usize {
+    LEGACY_REPAIR_READS.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn note_legacy_repair_read() {
+    LEGACY_REPAIR_READS.with(|c| c.set(c.get() + 1));
+}
+
 /// Pin a single git object to the local IPFS/Kubo node.
 ///
 /// - `ipfs_api`: base URL of the Kubo HTTP API, e.g. `http://127.0.0.1:5001`.
@@ -174,6 +242,14 @@ pub async fn pin_new_objects(
                 // when this repo would serve it. Bounded per object (MAX_PIN_SOURCES).
                 if let Err(e) = retry_db_record(|| db.record_pin_source(&sha, repo_id)).await {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                }
+                // R8 (#173 round 10): opportunistically repair a legacy provider-CID
+                // row (Kubo dag-pb / Pinata) to the raw-content resolver key on this
+                // re-push. Cost-gated on the stored key's codec — a non-legacy row
+                // reads no bytes. Warn-only: a failure leaves the row as-is for a
+                // later re-push or the deferred one-shot sweep.
+                if let Err(e) = repair_legacy_provider_cid(repo_path, &sha, db).await {
+                    tracing::warn!(sha = %sha, err = %e, "failed to repair legacy provider CID");
                 }
                 continue;
             }

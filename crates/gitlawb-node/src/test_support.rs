@@ -3271,6 +3271,335 @@ mod tests {
         );
     }
 
+    /// Build a legacy provider CID (CIDv1 dag-pb — the Kubo above-block-size root
+    /// shape, and codec-equivalent to the Pinata CIDv0 legacy key for the cost
+    /// gate) over the object's own multihash. Non-raw codec, so `is_raw_cidv1`
+    /// flags it a repair candidate, and a different string from the raw key, so a
+    /// repair rewrites it. The existing `ipfs_cid_legacy_provider_cid_row_not_served`
+    /// fixture seeds a raw-codec decoy (an integrity negative the cost gate treats
+    /// as non-legacy on purpose); this produces the genuine dag-pb legacy shape the
+    /// repair path targets. Uses only the `cid` crate (already a node dep).
+    fn legacy_dagpb_cid(raw_cid: &str) -> String {
+        const DAG_PB: u64 = 0x70;
+        let parsed = raw_cid
+            .parse::<cid::CidGeneric<64>>()
+            .expect("the raw CID parses");
+        cid::CidGeneric::<64>::new_v1(DAG_PB, *parsed.hash()).to_string()
+    }
+
+    /// #173 R8 (jatmn round 10, U7 — load-bearing): a legacy row keyed on a PROVIDER
+    /// CID (Kubo dag-pb / Pinata) is opportunistically rewritten to the raw-content
+    /// key on a re-push whose pack carries the object, stashing the old value in
+    /// `legacy_provider_cid`. The advertised key 404s while the row is legacy (the
+    /// resolver recomputes the raw CID and the stored key does not match) and serves
+    /// after repair. RED before the skip-branch repair lands (the raw key 404s post
+    /// pin). Also asserts the repair leaves `pinata_cid` NULL (scenario 3) and that
+    /// the retired provider CID still refuses to serve (scenario 6, integrity).
+    #[sqlx::test]
+    async fn ipfs_cid_legacy_provider_cid_repaired_on_repush(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["provsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("provsrc.git");
+        let repo = seed_repo(&owner_did, "provsrc"); // public, no rule
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // The canonical raw key the resolver accepts once the row is repaired.
+        let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(
+            &crate::git::store::read_object(&bare, &fx.public_oid)
+                .unwrap()
+                .unwrap()
+                .1,
+        )
+        .to_string();
+        // The key stored today: a genuine legacy dag-pb provider CID.
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        assert_ne!(
+            provider_cid, raw_cid,
+            "the provider CID differs from the raw resolver key"
+        );
+
+        // Legacy-shape row: cid = the PROVIDER CID (raw SQL — the helpers store the
+        // raw CID). The object itself is public and servable.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&fx.public_oid)
+        .bind(&provider_cid)
+        .bind("2020-01-01T00:00:00Z")
+        .bind(&repo.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // RED baseline: the raw key a correct client sends 404s while the row is legacy.
+        let (st_before, _) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&raw_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(
+            st_before,
+            StatusCode::OK,
+            "the raw key 404s while the row is keyed on the provider CID"
+        );
+
+        // Re-push carries the object again: `pin_new_objects` hits the already-pinned
+        // skip branch and repairs the row. The `/add` mock must NOT fire — the object
+        // is already on IPFS, never re-pinned.
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        crate::ipfs_pin::pin_new_objects(
+            &server.url(),
+            &bare,
+            vec![fx.public_oid.clone()],
+            &state.db,
+            &repo.id,
+        )
+        .await;
+        m.assert_async().await;
+
+        // GREEN: the key is repaired to the raw CID and the old value is stashed.
+        let (stored_cid, stashed): (String, Option<String>) = sqlx::query_as(
+            "SELECT cid, legacy_provider_cid FROM pinned_cids WHERE sha256_hex = $1",
+        )
+        .bind(&fx.public_oid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored_cid, raw_cid,
+            "the key is repaired to the raw-content CID"
+        );
+        assert_eq!(
+            stashed.as_deref(),
+            Some(provider_cid.as_str()),
+            "the old provider CID is stashed in legacy_provider_cid"
+        );
+
+        // The advertised (raw) key now serves 200.
+        let (st_after, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&raw_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st_after,
+            StatusCode::OK,
+            "the repaired raw key serves after the re-push"
+        );
+        assert!(body.contains("public bytes"), "the object's bytes serve");
+
+        // Scenario 3: repair never wrote `pinata_cid`, so the Pinata pin-skip gate
+        // (`has_pinata_cid`) is untouched and Pinata still pins the object.
+        assert!(
+            !state.db.has_pinata_cid(&fx.public_oid).await.unwrap(),
+            "repair leaves pinata_cid NULL"
+        );
+
+        // Scenario 6 (integrity negative): the retired provider CID still 404s — no
+        // serve-path alias for a CID the bytes do not hash to.
+        let (st_old, body_old) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&provider_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(
+            st_old,
+            StatusCode::OK,
+            "the retired provider CID must not serve after repair"
+        );
+        assert!(
+            !body_old.contains("public bytes"),
+            "no bytes egress under the retired provider CID"
+        );
+    }
+
+    /// #173 R8 (U7 cost gate): a well-formed CIDv1/raw already-pinned row triggers NO
+    /// object read on the skip path — the codec check decides candidacy from the
+    /// stored string alone, so a non-legacy row keeps the DB-only skip cost. Also
+    /// covers the small-object equivalence: a small legacy object Kubo pins under the
+    /// raw key (raw-leaves) is already CIDv1/raw and needs no repair. The read counter
+    /// is the both-ways guard: removing the codec gate reads the raw row and trips it.
+    #[sqlx::test]
+    async fn ipfs_cid_repair_codec_gate_skips_raw_row(pool: PgPool) {
+        let state = test_state(pool).await;
+        let fx = seed_cid_repos("codecgate", "cg", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("codecgate")
+            .join("pinsrc.git");
+
+        // A correct raw-CID row (steady state), recorded via the production helper.
+        let raw_cid = pin_cid_for(&bare, &fx.public_oid, &state.db).await;
+        assert!(
+            gitlawb_core::cid::is_raw_cidv1(&raw_cid),
+            "the helper records a CIDv1/raw key"
+        );
+
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"x"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        crate::ipfs_pin::pin_new_objects(
+            &server.url(),
+            &bare,
+            vec![fx.public_oid.clone()],
+            &state.db,
+            "repoCG",
+        )
+        .await;
+        m.assert_async().await;
+
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "a CIDv1/raw row triggers no object read on the skip path (cost gate)"
+        );
+        assert_eq!(
+            state
+                .db
+                .cid_for_oid(&fx.public_oid)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(raw_cid.as_str()),
+            "the raw row is left as-is"
+        );
+    }
+
+    /// #173 R8 (U7): a legacy row whose object bytes are gone stays withheld — the
+    /// repair never destructively rewrites it, so the row is preserved for a future
+    /// re-push or the deferred one-shot sweep.
+    #[sqlx::test]
+    async fn ipfs_cid_repair_unrepairable_row_stays_withheld(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let _fx = seed_cid_repos("unrep", "ur", &["pinsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join("unrep")
+            .join("pinsrc.git");
+
+        // A legacy dag-pb row for an oid whose bytes are NOT in this bare repo.
+        let phantom_oid = "b".repeat(64);
+        let raw_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"bytes that live nowhere").to_string();
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+            .bind(&phantom_oid)
+            .bind(&provider_cid)
+            .bind("2020-01-01T00:00:00Z")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"x"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        // Skip-branch runs (is_pinned true) but read_object returns None (bytes gone),
+        // so the repair returns without touching the row.
+        crate::ipfs_pin::pin_new_objects(
+            &server.url(),
+            &bare,
+            vec![phantom_oid.clone()],
+            &state.db,
+            "repoUR",
+        )
+        .await;
+
+        let (stored, stashed): (String, Option<String>) = sqlx::query_as(
+            "SELECT cid, legacy_provider_cid FROM pinned_cids WHERE sha256_hex = $1",
+        )
+        .bind(&phantom_oid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stored, provider_cid,
+            "an unrepairable row keeps its provider CID (no destructive rewrite)"
+        );
+        assert_eq!(
+            stashed, None,
+            "no legacy_provider_cid is stashed when the bytes are gone"
+        );
+    }
+
+    /// #173 R8 (U7, INV-7 upgrade path): a node already at the prior-max schema (v13)
+    /// gets `pinned_cids.legacy_provider_cid` from the NEW v14 migration. Simulate the
+    /// pre-v14 node by dropping the column and un-applying v14, then re-migrate and
+    /// assert a repair round-trips through the column. RED before the v14 migration
+    /// exists (the column is never re-added → the repair UPDATE errors).
+    #[sqlx::test]
+    async fn pinned_cids_legacy_provider_cid_upgrade_path(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+
+        // Pre-v14 shape: drop the column and forget v14 was applied.
+        sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS legacy_provider_cid")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 14")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Upgrade: re-run migrations → v14 re-adds the column.
+        state.db.run_migrations().await.expect("migrate to v14");
+
+        // A repair round-trips through the v14 column.
+        state
+            .db
+            .record_pinned_cid("upg_oid", "QmProviderLegacy", None)
+            .await
+            .unwrap();
+        state
+            .db
+            .repair_legacy_provider_cid("upg_oid", "bRawContentKey", "QmProviderLegacy")
+            .await
+            .unwrap();
+        let (cid, stashed): (String, Option<String>) = sqlx::query_as(
+            "SELECT cid, legacy_provider_cid FROM pinned_cids WHERE sha256_hex = 'upg_oid'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cid, "bRawContentKey", "v14 lets the repair rewrite the key");
+        assert_eq!(
+            stashed.as_deref(),
+            Some("QmProviderLegacy"),
+            "the v14 legacy_provider_cid column is present after upgrade"
+        );
+    }
+
     /// #173 (provenance-path throttle): a walk-requiring provenanced candidate whose
     /// per-IP walk quota is spent returns 429 (the provenance arm's Throttled outcome,
     /// then the fall-through). quota=1, keyed on XFF. The first reader request runs the
