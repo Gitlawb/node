@@ -51,9 +51,14 @@ pub struct RepoStore {
     /// same repo serialize here so only one runs the network download while
     /// the rest await it and serve what the winner published. Entries are
     /// created only after a caller has confirmed the archive exists (reached
-    /// the download branch) and are removed when the holder finishes, so
-    /// permissionless requests for arbitrary names cannot grow the map.
-    download_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// the download branch) and are removed when the holder finishes (on every
+    /// exit, including handler cancellation, via `DownloadEntryGuard`), so
+    /// permissionless requests for arbitrary names cannot grow the map. The
+    /// OUTER map is a std::sync::Mutex (only ever held briefly for a get/insert/
+    /// remove, never across an await), so the RAII entry guard's synchronous
+    /// `Drop` can prune it. The INNER per-repo `Arc<Mutex<()>>` stays a
+    /// tokio::sync::Mutex — it is the async serialization primitive readers await.
+    download_locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl RepoStore {
@@ -65,7 +70,7 @@ impl RepoStore {
             lock_pool,
             release_upload_timeout: DEFAULT_RELEASE_UPLOAD_TIMEOUT,
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
-            download_locks: Arc::new(Mutex::new(HashMap::new())),
+            download_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -80,7 +85,7 @@ impl RepoStore {
             lock_pool,
             release_upload_timeout: DEFAULT_RELEASE_UPLOAD_TIMEOUT,
             migrated: Arc::new(Mutex::new(HashSet::new())),
-            download_locks: Arc::new(Mutex::new(HashMap::new())),
+            download_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -298,20 +303,45 @@ impl RepoStore {
 
         // Always download the latest from the object store before writing.
         // Local disk may be stale if another machine pushed since our last access.
+        //
+        // Both the exists() re-check and the download() are bounded by
+        // release_upload_timeout (INV-22): they run while the write advisory lock
+        // is held on a pinned lock-pool connection, so a stalled (never-erroring)
+        // GET would pin the lock and its connection indefinitely, and the local-
+        // copy fallback below (which only fires on Err) would never trigger on a
+        // hang. On timeout, exists() collapses to "not present" (skip the
+        // download, matching download_and_publish's bounded exists re-check), and
+        // download() takes the SAME arm as a download error so a hang bails
+        // instead of hanging. The guard was wrapped before this await (KTD-2), so
+        // every bail here still frees the lock via the guard's Drop.
         if let Some(ref store) = self.object_store {
-            if store
-                .exists(&guard.owner_slug, &guard.repo_name)
-                .await
-                .unwrap_or(false)
-            {
+            let archive_present = matches!(
+                tokio::time::timeout(
+                    self.release_upload_timeout,
+                    store.exists(&guard.owner_slug, &guard.repo_name),
+                )
+                .await,
+                Ok(Ok(true))
+            );
+            if archive_present {
                 debug!(repo = %guard.repo_name, "write acquire: downloading latest from object store");
-                if let Err(e) = store
-                    .download(&guard.owner_slug, &guard.repo_name, &guard.local_path)
-                    .await
+                let download_result = match tokio::time::timeout(
+                    self.release_upload_timeout,
+                    store.download(&guard.owner_slug, &guard.repo_name, &guard.local_path),
+                )
+                .await
                 {
+                    Ok(res) => res,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "object-store download timed out after {}s under the write lock",
+                        self.release_upload_timeout.as_secs()
+                    )),
+                };
+                if let Err(e) = download_result {
                     // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
-                    // archive must not block a write when a valid local copy
-                    // exists — release(success) will re-upload a good archive.
+                    // archive OR a stalled-then-timed-out GET must not block a write
+                    // when a valid local copy exists — release(success) will re-upload
+                    // a good archive.
                     if guard.local_path.exists() {
                         warn!(repo = %guard.repo_name, err = %e,
                             "write acquire: object-store download failed — falling back to local copy");
@@ -1899,6 +1929,61 @@ mod tests {
         );
     }
 
+    // FINDING 3 / R2 / INV-22: acquire_write's under-lock freshness DOWNLOAD must
+    // be bounded, not just release()'s upload. acquire_write holds the write
+    // advisory lock on a pinned lock-pool connection, then does store.exists() +
+    // store.download() before returning the guard. A stalled (never-erroring) GET
+    // would pin that lock and its connection forever, and the local-copy fallback
+    // (which only fires on Err) never triggers on a hang. With a short bound and a
+    // download that never completes, acquire_write returns within the bound and
+    // the lock is freed. Pre-fix (untimed download) acquire_write hangs on the
+    // stalled GET and never returns -> the outer 5s timeout fires -> RED.
+    #[sqlx::test]
+    async fn acquire_write_download_stall_is_bounded(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use sqlx::ConnectOptions;
+        let pool = no_reap_pool(pool_opts, &connect_opts).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        // The download parks forever; the acquire bound is what must unblock it.
+        ts.download_gate = Some(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        )
+        .with_release_upload_timeout(std::time::Duration::from_millis(300));
+        let owner = "did:key:z6MkAcquireWriteStallAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "acqwritestall";
+        let key = lock_key_for(owner, name);
+        let mut observer = connect_opts.connect().await.unwrap();
+
+        // No local copy exists, so the timed-out download has nothing to fall back
+        // to and bails; the guard drops and its Drop frees the advisory lock. The
+        // call must RETURN within the bound rather than hang on the stalled GET.
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.acquire_write(owner, name),
+        )
+        .await
+        .expect("acquire_write must return within the download bound, not hang on the stalled GET");
+        assert!(
+            res.is_err(),
+            "with no local copy to fall back to, a timed-out download must bail"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "acquire_write must return within the download bound"
+        );
+        assert!(
+            poll_until_free(&mut observer, key).await,
+            "the advisory lock must be freed after the bounded (timed-out) download"
+        );
+    }
+
     // R2/INV-22: the OTHER under-lock upload path — upload_locked's PUT (init's
     // background upload, wait=true) — must be bounded exactly like release()'s.
     // With a stalled PUT, upload_locked acquires the advisory lock, parks on the
@@ -2542,5 +2627,57 @@ mod tests {
             .bind(key)
             .execute(&mut observer)
             .await;
+    }
+
+    // ── Finding 4: the download-coordination map entry is freed on cancellation ─
+
+    // A cold-read holder parks mid-download, then its handler future is dropped
+    // (axum cancels it on client disconnect). The per-repo map entry must be
+    // removed anyway — the pre-fix code removed it only at explicit return points,
+    // which a cancelled future skips, so a permissionless caller could fan cold
+    // GETs across many public repos and disconnect to grow the map. The RAII
+    // DownloadEntryGuard's Drop closes that gap. This reads the private
+    // download_locks map directly (the test module is a child of RepoStore's
+    // module). Pre-fix: after abort the entry LEAKS -> still present -> RED.
+    #[sqlx::test]
+    async fn cancelled_cold_read_frees_the_map_entry(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkCancelMapEntryAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "cancelmapentry";
+        let map_key = format!("{}/{name}", owner.replace([':', '/'], "_"));
+
+        // Cache miss: the holder enters download_published, registers the map
+        // entry, and parks mid-download on the gate.
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the reader's download must be in flight"
+        );
+        // Precondition: the map entry is registered while the holder runs.
+        assert!(
+            store.download_locks.lock().unwrap().contains_key(&map_key),
+            "the coordination entry must be registered while the holder downloads"
+        );
+
+        // Cancel the handler future mid-download (the client-disconnect hazard).
+        h.abort();
+
+        // The RAII guard's Drop must remove the entry despite the cancellation.
+        let freed = poll_until_true(|| store.download_locks.lock().unwrap().is_empty()).await;
+        assert!(
+            freed,
+            "a cold-read future cancelled mid-download must still free its map entry"
+        );
     }
 }

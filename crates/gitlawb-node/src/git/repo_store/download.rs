@@ -56,6 +56,35 @@ impl Drop for TempDownloadDir {
     }
 }
 
+/// RAII removal of a download-coordination map entry (finding 4). Its `Drop`
+/// removes the entry from `download_locks` whenever the map still holds THIS
+/// Arc (ptr_eq-guarded so a newer entry inserted after an earlier removal is
+/// never clobbered). Removing on every exit — normal return, `?`, or a handler
+/// future cancelled mid cold-read (axum drops it on client disconnect) — is
+/// what keeps the map from growing per arbitrary requested name: the pre-fix
+/// explicit removals ran only at the labelled return points, which a cancelled
+/// future skipped, leaking the entry. The outer map is a std::sync::Mutex so
+/// this Drop can prune it synchronously (Drop cannot be async); it is only ever
+/// held briefly for a get/insert/remove, never across an await.
+struct DownloadEntryGuard {
+    locks: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    key: String,
+    entry: Arc<Mutex<()>>,
+}
+
+impl Drop for DownloadEntryGuard {
+    fn drop(&mut self) {
+        // A poisoned map is still safe to prune — recover the guard and remove.
+        let mut map = self.locks.lock().unwrap_or_else(|p| p.into_inner());
+        if map
+            .get(&self.key)
+            .is_some_and(|cur| Arc::ptr_eq(cur, &self.entry))
+        {
+            map.remove(&self.key);
+        }
+    }
+}
+
 impl RepoStore {
     /// Coordinated read-path download (KTD-3). Serializes concurrent readers
     /// of the same repo on a per-repo async mutex: the first one in becomes
@@ -76,11 +105,22 @@ impl RepoStore {
     ) -> Result<DownloadOutcome> {
         let map_key = format!("{owner_slug}/{repo_name}");
         let entry = {
-            let mut map = self.download_locks.lock().await;
+            let mut map = self.download_locks.lock().unwrap();
             Arc::clone(
                 map.entry(map_key.clone())
                     .or_insert_with(|| Arc::new(Mutex::new(()))),
             )
+        };
+        // RAII: remove the map entry on EVERY exit of this function — normal
+        // return, `?`, or handler cancellation (finding 4). Its Drop is ptr_eq-
+        // guarded, so it never clobbers a newer entry, and it subsumes the
+        // pre-fix explicit removals (which a cancelled future skipped, leaking
+        // the entry). Declared here so it outlives `held` below and prunes the
+        // map only after the inner per-repo lock has been released.
+        let _entry_guard = DownloadEntryGuard {
+            locks: Arc::clone(&self.download_locks),
+            key: map_key.clone(),
+            entry: Arc::clone(&entry),
         };
         let held = match entry.try_lock() {
             Ok(g) => g,
@@ -88,8 +128,7 @@ impl RepoStore {
                 let g = entry.lock().await;
                 if local_path.exists() {
                     // A concurrent reader published while we waited — serve it.
-                    drop(g);
-                    self.remove_download_entry(&map_key, &entry).await;
+                    // `_entry_guard`'s Drop removes the map entry on return.
                     return Ok(DownloadOutcome::Published);
                 }
                 // The holder degraded without publishing; this reader takes over.
@@ -99,7 +138,7 @@ impl RepoStore {
                 // (finding 3). Narrows the duplicate-download window; publishes
                 // stay serialized by the advisory lock regardless.
                 {
-                    let mut map = self.download_locks.lock().await;
+                    let mut map = self.download_locks.lock().unwrap();
                     map.entry(map_key.clone())
                         .or_insert_with(|| Arc::clone(&entry));
                 }
@@ -116,19 +155,10 @@ impl RepoStore {
                 local_existed_at_entry,
             )
             .await;
-        self.remove_download_entry(&map_key, &entry).await;
         drop(held);
         outcome
-    }
-
-    /// Remove a completed download-coordination entry, but only when the map
-    /// still holds THIS entry — a newer entry inserted after an earlier
-    /// removal must not be clobbered.
-    async fn remove_download_entry(&self, key: &str, entry: &Arc<Mutex<()>>) {
-        let mut map = self.download_locks.lock().await;
-        if map.get(key).is_some_and(|cur| Arc::ptr_eq(cur, entry)) {
-            map.remove(key);
-        }
+        // `_entry_guard`'s Drop removes the map entry here (after `held` and on
+        // every early return above), including when this future is cancelled.
     }
 
     /// The holder's half of the coordinated download: fetch and extract the
