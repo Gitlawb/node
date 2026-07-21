@@ -196,9 +196,13 @@ pub async fn get_by_cid(
     // instant the handler future is torn down while a spawn_blocking git probe/walk/read
     // is still alive (the disconnect-spam cap bypass this closes, the /ipfs half of #174
     // P1-a). Every git child on this pipeline is duration-bounded (the run_bounded_git
-    // probe/read twins + the bounded walk), so the detached task cannot hold admission
-    // past ~git_service_timeout_secs. The client key is already captured (`source_key`)
-    // before the spawn; the detached task has no request extractors.
+    // probe/read twins + the bounded walk), and each candidate's size+content read shares
+    // one deadline; so admission is bounded per candidate. The legacy scan can still
+    // iterate up to `ipfs_max_legacy_probes` candidates serially, so the worst-case hold
+    // is O(candidates x git_service_timeout_secs), NOT a single timeout — what actually
+    // bounds cancel-spam is the walk concurrency cap (global + per-source), not the
+    // per-child deadline. The client key is already captured (`source_key`) before the
+    // spawn; the detached task has no request extractors.
     let admission =
         crate::git::smart_http::AdmissionGuard::new(ipfs_walk_permit, ipfs_caller_permit);
     let serve: tokio::task::JoinHandle<Result<Response>> = tokio::spawn(async move {
@@ -759,9 +763,14 @@ async fn gate_and_serve(
     // deadline rather than left to pin the held /ipfs walk permit (#173 round-10, KTD2).
     // No outer timeout, mirroring the bounded walk; a `GitServiceTimeout` from either
     // twin surfaces as `ServedRead::ReadErr` -> truncated (retryable 503).
-    let read_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    // ONE deadline spans the size and content reads, so a single served candidate
+    // holds the /ipfs walk permit for at most `git_service_timeout_secs` total, not
+    // one full timeout per stage (mirrors `build_filtered_pack`'s shared deadline).
+    let read_deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(state.config.git_service_timeout_secs);
     let read = tokio::task::spawn_blocking(move || -> ServedRead {
-        match store::object_size_bounded(&git_bin, &read_repo, &read_sha, read_timeout) {
+        let size_budget = read_deadline.saturating_duration_since(std::time::Instant::now());
+        match store::object_size_bounded(&git_bin, &read_repo, &read_sha, size_budget) {
             Ok(Some(size)) if size > max_bytes => return ServedRead::TooLarge(size),
             Ok(Some(_)) => {}
             // git ran and reported no such object (or an unparseable size): genuine
@@ -771,12 +780,13 @@ async fn gate_and_serve(
             // infra/timeout failure, not a not-found.
             Err(e) => return ServedRead::ReadErr(e.to_string()),
         }
+        let content_budget = read_deadline.saturating_duration_since(std::time::Instant::now());
         let content = match store::read_object_content_bounded(
             &git_bin,
             &read_repo,
             &read_sha,
             &read_type,
-            read_timeout,
+            content_budget,
         ) {
             Ok(c) => c,
             Err(e) => return ServedRead::ReadErr(e.to_string()),
