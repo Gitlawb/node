@@ -1212,6 +1212,20 @@ fn load_existing_key(path: &std::path::Path) -> Result<Keypair> {
     Ok(kp)
 }
 
+/// `".{stem}.publishing."`: the single source of truth for the publish
+/// marker name class (#194, U1). Every production site that constructs a
+/// marker name or prefix goes through here; the test module keeps raw
+/// literals on purpose, as a guard against prefix drift.
+fn publishing_prefix(stem: &str) -> String {
+    format!(".{stem}.publishing.")
+}
+
+/// `".{stem}.recovering."`: the single source of truth for the recovery
+/// claim name class (#194, F3). Same policy as `publishing_prefix`.
+fn recovering_prefix(stem: &str) -> String {
+    format!(".{stem}.recovering.")
+}
+
 /// The publish markers (`.{stem}.publishing.*`) beside `final_path`, sorted:
 /// U1's crash signature for a fallback publish interrupted mid-window (#194,
 /// U2). An unreadable directory reads as no markers, so recovery stays off
@@ -1226,7 +1240,7 @@ fn list_publish_markers(final_path: &std::path::Path) -> Vec<std::path::PathBuf>
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.pem");
-    let prefix = format!(".{stem}.publishing.");
+    let prefix = publishing_prefix(stem);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1260,8 +1274,8 @@ fn list_recovery_claimables(final_path: &std::path::Path) -> Vec<std::path::Path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.pem");
-    let publishing = format!(".{stem}.publishing.");
-    let recovering = format!(".{stem}.recovering.");
+    let publishing = publishing_prefix(stem);
+    let recovering = recovering_prefix(stem);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1372,7 +1386,7 @@ fn wait_for_recovery_claims(final_path: &std::path::Path) {
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.pem");
-    let prefix = format!(".{stem}.recovering.");
+    let prefix = recovering_prefix(stem);
     let deadline = std::time::Instant::now() + KEY_RACE_DEADLINE;
     loop {
         let claimed = std::fs::read_dir(dir).is_ok_and(|entries| {
@@ -1441,8 +1455,8 @@ fn sweep_stale_markers(final_path: &std::path::Path, sweep_sync: fn() -> std::io
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.pem");
-    let publishing = format!(".{stem}.publishing.");
-    let recovering = format!(".{stem}.recovering.");
+    let publishing = publishing_prefix(stem);
+    let recovering = recovering_prefix(stem);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1544,7 +1558,12 @@ impl PublishFaults {
 /// final. Guarantee (c) now holds on the fallback too, via the marker
 /// protocol (#194, U2/U4): a crash inside the non-atomic window leaves
 /// marker+final together, and the next boot claims the marker, quarantines
-/// the partial final, and regenerates instead of wedging. Honest residual on
+/// the partial final, and regenerates instead of wedging. On
+/// dir-fsync-hostile mounts the marker dir fsync is warn-and-continue (see
+/// `publish_key_fallback`), so there the recovery guarantee narrows to
+/// non-power-loss (SIGKILL-class) crashes: a power loss can drop the
+/// undurable marker name and leave the partial final to the loud
+/// invalid-PEM error instead. Honest residual on
 /// top of the U3 list below: that recovery runs at the next boot, not at
 /// crash time, so the partial final persists until then. In every unrecovered
 /// case the failure mode is the same LOUD invalid-PEM (or mode) error at the
@@ -1722,12 +1741,10 @@ fn publish_key_fallback(
     // the restart, and a stale marker is indistinguishable from a live
     // concurrent publisher's, so never delete a name this call did not
     // create; just skip to the next one (#194, U1).
+    let marker_prefix = publishing_prefix(stem);
     let mut marker = None;
     for attempt in 0..KEY_TEMP_ATTEMPTS {
-        let candidate = dir.join(format!(
-            ".{stem}.publishing.{}.{attempt}",
-            std::process::id()
-        ));
+        let candidate = dir.join(format!("{marker_prefix}{}.{attempt}", std::process::id()));
         match (faults.marker_create)().and_then(|()| {
             std::fs::OpenOptions::new()
                 .write(true)
@@ -1752,7 +1769,7 @@ fn publish_key_fallback(
     }
     let Some(marker) = marker else {
         anyhow::bail!(
-            "all {KEY_TEMP_ATTEMPTS} publish marker names .{stem}.publishing.{}.* in {} are \
+            "all {KEY_TEMP_ATTEMPTS} publish marker names {marker_prefix}{}.* in {} are \
              taken; remove the stale marker files and restart (link failed: {link_err})",
             std::process::id(),
             dir.display()
@@ -2032,14 +2049,12 @@ fn recover_crashed_publish(
     // skipped. Names are never reused or clobbered: the monotonic counter
     // plus the exists() probe keeps every destination fresh, bounded per
     // item like the temp/marker/quarantine probes.
+    let claim_prefix = recovering_prefix(stem);
     let mut claims: Vec<std::path::PathBuf> = Vec::new();
     let mut next_name = 0u32;
     for item in &claimables {
         for _ in 0..KEY_TEMP_ATTEMPTS {
-            let dest = dir.join(format!(
-                ".{stem}.recovering.{}.{next_name}",
-                std::process::id()
-            ));
+            let dest = dir.join(format!("{claim_prefix}{}.{next_name}", std::process::id()));
             next_name = next_name.wrapping_add(1);
             if dest.exists() {
                 continue;
@@ -3578,8 +3593,18 @@ mod identity_key_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = seed_crash_state(dir.path(), b"");
 
+        let started = std::time::Instant::now();
         let kp = load_or_create_keypair(&key_config(&key_path))
             .expect("a crash-marked empty final must recover, not wedge the start");
+        let elapsed = started.elapsed();
+        // The crash signature short-circuits after two ~2ms polls; 2s is
+        // generous for CI machines yet far under the 5s KEY_RACE_DEADLINE a
+        // deadline-riding load would burn before recovery could even start.
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "recovery must short-circuit on the crash signature, not ride \
+             KEY_RACE_DEADLINE: took {elapsed:?}"
+        );
 
         let mode = std::fs::metadata(&key_path)
             .expect("regenerated final exists")
@@ -3642,6 +3667,133 @@ mod identity_key_tests {
         assert_eq!(
             bytes, truncated,
             "the quarantine must hold exactly the truncated input bytes"
+        );
+    }
+
+    // #194 (U2): quarantine-name probing is bounded like the temp and marker
+    // names. With EVERY candidate quarantine name taken, recovery must fall
+    // back to REMOVING the corrupt final (not rename it, not clobber a stale
+    // quarantine) and still regenerate successfully. Sentinel bytes in each
+    // stale quarantine prove no rename landed. Load-bearing by mutation
+    // check: with the remove_file fallback disabled, the corrupt final
+    // survives, the retry publish loses to it, and the boot fails loudly.
+    #[test]
+    fn quarantine_exhaustion_falls_back_to_removal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        for n in 0..KEY_TEMP_ATTEMPTS {
+            let stale = dir.path().join(format!(
+                ".identity.pem.quarantined.{}.{n}",
+                std::process::id()
+            ));
+            std::fs::write(&stale, b"sentinel").expect("seed stale quarantine");
+        }
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("an exhausted quarantine probe must fall back to removal, not wedge");
+
+        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the returned identity must match the regenerated on-disk key"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            KEY_TEMP_ATTEMPTS as usize,
+            "the final must be removed, not quarantined under a fresh name: {quarantined:?}"
+        );
+        for name in &quarantined {
+            let bytes = std::fs::read(dir.path().join(name)).expect("read stale quarantine");
+            assert_eq!(
+                bytes, b"sentinel",
+                "no stale quarantine may be clobbered by a rename: {name}"
+            );
+        }
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "recovery must consume the publish marker(s)"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "the recovery claim must be released after the publish resolves"
+        );
+    }
+
+    // #194 (U2/F1): with every quarantine name taken AND removal blocked,
+    // recovery must surface the loud chained error, never a silent success.
+    // The dir turns read-only via the before_reparse seam (after the claim
+    // rename lands; a dir made read-only up front would fail the claim step
+    // and never reach the quarantine arm at all). The same read-only dir
+    // necessarily blocks the claim release too, so phase two restores
+    // permissions and proves the leftover claim is itself recoverable (F3):
+    // the next boot claims it, removes the final, and regenerates cleanly.
+    #[test]
+    fn quarantine_and_removal_both_blocked_errors_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        for n in 0..KEY_TEMP_ATTEMPTS {
+            let stale = dir.path().join(format!(
+                ".identity.pem.quarantined.{}.{n}",
+                std::process::id()
+            ));
+            std::fs::write(&stale, b"sentinel").expect("seed stale quarantine");
+        }
+        let lock_path = dir.path().to_path_buf();
+        let lock_dir = move || {
+            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o555))
+                .expect("read-only key dir inside the claim window");
+        };
+        let seam = RecoverySeam {
+            before_reparse: &lock_dir,
+            ..RecoverySeam::NONE
+        };
+
+        let result =
+            load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam);
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("restore key dir");
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a blocked quarantine AND removal must fail loudly, not resolve"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not quarantine or remove")
+                && msg.contains(&key_path.display().to_string())
+                && msg.contains("invalid PEM key"),
+            "the error must chain the recovery failure and the load failure: {msg}"
+        );
+        assert!(
+            key_path.exists(),
+            "the corrupt final must survive for post-mortem when nothing can dispose of it"
+        );
+
+        // Phase two: the claim left behind (the read-only dir blocked its
+        // release too) must make the state recoverable, not wedge it.
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("the leftover claim must be claimable by the next boot, not a wedge");
+        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the returned identity must match the regenerated on-disk key"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "the follow-up boot must consume and release every claim"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            KEY_TEMP_ATTEMPTS as usize,
+            "the follow-up boot must also fall back to removal: {quarantined:?}"
         );
     }
 
