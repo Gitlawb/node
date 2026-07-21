@@ -1059,6 +1059,74 @@ fn write_key_or_cleanup(path: &std::path::Path, write_result: std::io::Result<()
     })
 }
 
+/// Remove `final_path` after a failed fallback write or file fsync ONLY if
+/// the name still refers to the inode this publish created (#194). A
+/// recovery that claimed this publisher's round has quarantined our inode
+/// away by rename and may have republished a LIVE key at the name; removing
+/// by name there would unlink the recoverer's final and destroy an identity
+/// whose owner already returned Won. On Unix the guard compares dev+ino of
+/// our open handle against `symlink_metadata` of the name and removes only
+/// on a match; a mismatch or NotFound means the name is no longer ours, so
+/// the removal is skipped with a warn carrying both identities. Any stat
+/// failure also skips: ownership of the name cannot be proven, and the worst
+/// a skipped removal costs is the loud invalid-PEM error at the next start,
+/// while a wrong removal destroys a live key. Best-effort throughout, like
+/// every other cleanup here. On non-Unix the by-name removal stands
+/// (reasoned, not run: no non-Unix target is exercised by these tests).
+fn remove_final_if_still_ours(final_path: &std::path::Path, file: &std::fs::File) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let ours = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    path = %final_path.display(),
+                    err = %e,
+                    "skipping failed-publish cleanup: could not stat our own key handle"
+                );
+                return;
+            }
+        };
+        match std::fs::symlink_metadata(final_path) {
+            Ok(named) if named.dev() == ours.dev() && named.ino() == ours.ino() => {
+                let _ = std::fs::remove_file(final_path);
+            }
+            Ok(named) => {
+                warn!(
+                    path = %final_path.display(),
+                    our_dev = ours.dev(),
+                    our_ino = ours.ino(),
+                    named_dev = named.dev(),
+                    named_ino = named.ino(),
+                    "skipping failed-publish cleanup: the final name no longer holds our \
+                     inode (a recovery claimed this round and republished)"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    path = %final_path.display(),
+                    our_dev = ours.dev(),
+                    our_ino = ours.ino(),
+                    "skipping failed-publish cleanup: the final name is already gone"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    path = %final_path.display(),
+                    err = %e,
+                    "skipping failed-publish cleanup: could not stat the final name"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        let _ = std::fs::remove_file(final_path);
+    }
+}
+
 /// Verify an identity key file is not world/group-readable (#194, F2). A `chmod`
 /// that failed or silently no-op'd (read-only mount, ACL mismatch) must not leave
 /// a readable private key in use, so this is checked after any tightening attempt
@@ -1739,7 +1807,10 @@ fn publish_key_atomically(
 /// error): create the FINAL path directly with `create_new(true).mode(0o600)`
 /// (the INV-23 creation pattern) and write the PEM into it. `AlreadyExists`
 /// still routes to the lost-race path, so no-clobber holds. Error handling: a
-/// failed `write_all` OR file `sync_all` removes the final (#194 F1) — the
+/// failed `write_all` OR file `sync_all` removes the final (#194 F1), guarded
+/// by inode identity (`remove_final_if_still_ours`): only the inode this
+/// publish created is removed, never a key a claiming recovery republished
+/// at the name. Removal is needed at all because the
 /// `create_new` already made the final NAME durable, so a name left over
 /// non-durable content lets a later crash leave a truncated final that wedges
 /// every later start; removal lets the next start regenerate. Only a failed
@@ -1885,7 +1956,10 @@ fn publish_key_fallback(
     // AlreadyExists, and is safe here for the same reason as everywhere: the
     // file is still empty, so the split-phase keep-the-final rule below does
     // not apply yet. The helper removes the final before returning Err, so
-    // the pinned final-before-marker disposal order holds.
+    // the pinned final-before-marker disposal order holds. By-name removal
+    // (no inode guard) stays right on this and the other pre-write arms
+    // (create/mode-verify): they run within CRASH_SIGNATURE_MIN_PERSIST of
+    // the final's creation, so no recovery can have claimed this round yet.
     #[cfg(unix)]
     {
         if let Err(e) = tighten_and_verify_created(final_path, faults.fallback_mode_verify)
@@ -1898,20 +1972,22 @@ fn publish_key_fallback(
         }
     }
     // A failed write removes the final (partial content cannot parse and would
-    // wedge every later start). The helper removes the final before returning
-    // Err, so the pinned final-before-marker disposal order holds.
-    if let Err(e) = write_key_or_cleanup(
-        final_path,
-        (faults.fallback_write)().and_then(|()| f.write_all(pem)),
-    )
-    .with_context(|| {
-        format!(
-            "hard_link fallback publish to {} (link failed: {link_err})",
-            final_path.display()
-        )
-    }) {
+    // wedge every later start), but only if the name still holds OUR inode:
+    // a recovery that claimed this round may have quarantined our inode away
+    // and republished a live key at the name, which a by-name removal would
+    // destroy (see remove_final_if_still_ours). Not write_key_or_cleanup,
+    // whose by-name removal stays right for the primary path's TEMP file
+    // (a private name no recovery can race). Final removal is issued first,
+    // marker disposal second (pinned order).
+    if let Err(e) = (faults.fallback_write)().and_then(|()| f.write_all(pem)) {
+        remove_final_if_still_ours(final_path, &f);
         dispose_marker();
-        return Err(e);
+        return Err(anyhow::Error::new(e)
+            .context(format!("failed to write key to {}", final_path.display()))
+            .context(format!(
+                "hard_link fallback publish to {} (link failed: {link_err})",
+                final_path.display()
+            )));
     }
     // Fsync the file, and REMOVE the final on failure too (#194 F1). Unlike the
     // hard-link path (which fsyncs a TEMP, so the final NAME only ever appears
@@ -1924,13 +2000,15 @@ fn publish_key_fallback(
     // ENOSPC/EIO can tell "durability failed" (bytes accepted, not synced) from
     // the write-rejected case above. Only the parent-DIR fsync below keeps the
     // final on failure (a lost directory entry just disappears -> clean regen).
-    // Final removal is issued first, marker disposal second (pinned order).
+    // Final removal is issued first, marker disposal second (pinned order),
+    // and is inode-guarded like the write arm's: the name may hold a
+    // recoverer's republished key by now.
     if let Err(e) = (faults.fallback_fsync)().and_then(|()| f.sync_all()) {
-        let _ = std::fs::remove_file(final_path);
+        remove_final_if_still_ours(final_path, &f);
         dispose_marker();
         return Err(anyhow::Error::new(e).context(format!(
             "fsync identity key {} in hard_link fallback (durability failed, \
-             removed; link failed: {link_err})",
+             removed if still ours; link failed: {link_err})",
             final_path.display()
         )));
     }
@@ -2007,6 +2085,15 @@ struct RecoverySeam<'a> {
     /// (#194, G2a). Narrower than `load_fault`, which only reaches
     /// `boot_load_key`'s attempts, never this re-parse.
     reparse_fault: fn() -> std::io::Result<()>,
+    /// Runs inside `recover_crashed_publish` between the quarantine's
+    /// completed-parse and the restore of the completed key to the final
+    /// name, so a test can interleave a concurrent starter's publish into
+    /// exactly the quarantine-to-restore window (#194, G2b follow-up).
+    before_restore: &'a dyn Fn(),
+    /// Faults threaded into the restore's republish of a completed
+    /// quarantined key, so a test can force the restore onto its link-hostile
+    /// degradation tier (production: `PublishFaults::NONE`).
+    restore_faults: PublishFaults,
     /// Runs inside `recover_crashed_publish` between the post-claim re-parse
     /// and the quarantine rename, so a test can land a publisher's completed
     /// write in exactly the re-parse-to-rename window (#194, G2b).
@@ -2021,6 +2108,8 @@ impl RecoverySeam<'_> {
         sweep_sync: || Ok(()),
         before_reparse: &|| {},
         reparse_fault: || Ok(()),
+        before_restore: &|| {},
+        restore_faults: PublishFaults::NONE,
         before_quarantine: &|| {},
     };
 }
@@ -2261,38 +2350,57 @@ fn recover_crashed_publish(
     // publisher already resolved the round, and its key is restored to the
     // final name instead of being replaced by a regeneration, which would
     // diverge from the Won the publisher already reported. The restore is a
-    // no-clobber hard_link plus unlink of the quarantine name, not a rename:
-    // the final name is expected free (our own rename freed it and the round
-    // is claimed), but a fresh start that saw no final may have republished
-    // it; AlreadyExists leaves the quarantine behind as forensics and the
-    // follow-up load defers to the republished key. On link-hostile mounts
-    // (where hard_link cannot work) a plain rename restores instead,
-    // mirroring publish_key_fallback's weakened no-clobber on the same
-    // mounts; if even that fails the quarantine stays as forensics and the
-    // follow-up load fails loudly, nothing destroyed. An unparseable
-    // quarantine is the expected crash state and falls through to
-    // regenerate.
+    // REPUBLISH of the quarantined PEM through publish_key_atomically, which
+    // holds no-clobber on EVERY tier: the hard-link tier refuses an existing
+    // final, and so does the fallback's create_new on link-hostile mounts (a
+    // plain rename here would clobber a final a fresh start published into
+    // the freed name on exactly those mounts). Won means the completed key
+    // is durably back at the final; the quarantine is then removed, because
+    // its bytes are an exact copy of what now lives at the final, so keeping
+    // it buys no forensics. The keypair returned is the one already parsed
+    // from the quarantined bytes, not a re-read of the final, which could
+    // race a writer that lands after our republish. Lost means someone else
+    // durably published meanwhile: keep the quarantine as forensics and
+    // defer to the settled final. A publish error keeps the quarantine,
+    // releases the claims, and surfaces loudly, nothing destroyed. An
+    // unparseable quarantine is the expected crash state and falls through
+    // to regenerate.
     if let Some(quarantine) = &quarantined_at {
-        let completed =
-            std::fs::read_to_string(quarantine).is_ok_and(|pem| Keypair::from_pem(&pem).is_ok());
-        if completed {
-            match std::fs::hard_link(quarantine, final_path) {
-                Ok(()) => {
+        let completed = std::fs::read_to_string(quarantine)
+            .ok()
+            .and_then(|pem| Keypair::from_pem(&pem).ok().map(|kp| (pem, kp)));
+        if let Some((pem, kp)) = completed {
+            (seam.before_restore)();
+            match publish_key_atomically(
+                final_path,
+                pem.as_bytes(),
+                &|| {},
+                &|| {},
+                seam.restore_faults,
+            ) {
+                Ok(KeyPublish::Won) => {
                     let _ = std::fs::remove_file(quarantine);
+                    #[cfg(unix)]
+                    {
+                        let _ = fsync_parent_dir(final_path);
+                    }
+                    release_recovery_claims(final_path, &claims);
+                    return Ok(Recovery::Reloaded(Box::new(Ok(kp))));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Someone republished the final concurrently; keep it.
+                Ok(KeyPublish::Lost) => {
+                    release_recovery_claims(final_path, &claims);
+                    return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
                 }
-                Err(_) => {
-                    let _ = std::fs::rename(quarantine, final_path);
+                Err(e) => {
+                    release_recovery_claims(final_path, &claims);
+                    return Err(e.context(format!(
+                        "could not restore the completed identity key to {} during crash \
+                         recovery; quarantine kept at {}",
+                        final_path.display(),
+                        quarantine.display()
+                    )));
                 }
             }
-            #[cfg(unix)]
-            {
-                let _ = fsync_parent_dir(final_path);
-            }
-            release_recovery_claims(final_path, &claims);
-            return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
         }
     }
 
@@ -5066,7 +5174,7 @@ mod identity_key_tests {
         );
         assert!(
             names_containing(dir.path(), ".quarantined.").is_empty(),
-            "the quarantine must be renamed back to the final, not left behind"
+            "the quarantine must be removed once its key is republished at the final"
         );
         assert!(
             names_containing(dir.path(), ".recovering.").is_empty(),
@@ -5075,6 +5183,177 @@ mod identity_key_tests {
         assert!(
             names_containing(dir.path(), ".publishing.").is_empty(),
             "the claimed markers must not reappear"
+        );
+    }
+
+    // R1: the post-quarantine restore must hold no-clobber on EVERY tier. A
+    // completed key A is swept into quarantine (G2b), a concurrent starter
+    // publishes a fresh key B at the freed final name inside the
+    // quarantine-to-restore window (before_restore), and the restore's link
+    // tier is forced onto its link-hostile degradation (restore_faults.link).
+    // The restore must defer to B (keep the quarantine as forensics, converge
+    // on B), never replace B with A: B's owner already holds B in memory, so
+    // a clobber leaves that node's memory and disk diverged. RED before the
+    // fix: the old restore ladder degraded to a plain rename(quarantine ->
+    // final), which clobbered B with A.
+    #[test]
+    fn restore_never_clobbers_a_concurrent_winner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        let completed = Keypair::generate();
+        let pem_a = completed.to_pem().expect("pem a");
+        let kp_b = Keypair::generate();
+        let pem_b = kp_b.to_pem().expect("pem b");
+
+        let heal_path = key_path.clone();
+        let before_quarantine = move || {
+            std::fs::write(&heal_path, pem_a.as_bytes())
+                .expect("complete the final inside the re-parse-to-rename window");
+        };
+        let steal_path = key_path.clone();
+        let pem_b_disk = pem_b.clone();
+        let before_restore = move || {
+            let out = publish_key_atomically(
+                &steal_path,
+                pem_b_disk.as_bytes(),
+                &|| {},
+                &|| {},
+                PublishFaults::NONE,
+            )
+            .expect("concurrent starter republishes key B at the freed name");
+            assert!(
+                matches!(out, KeyPublish::Won),
+                "B's publish wins the free name"
+            );
+        };
+        let seam = RecoverySeam {
+            before_quarantine: &before_quarantine,
+            before_restore: &before_restore,
+            restore_faults: PublishFaults {
+                link: || Err(std::io::ErrorKind::Unsupported.into()),
+                ..PublishFaults::NONE
+            },
+            ..RecoverySeam::NONE
+        };
+
+        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
+            .expect("the restore must converge on B, not fail the start");
+
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", kp_b.did()),
+            "the recovering boot must converge on the concurrent winner's key B"
+        );
+        let on_disk = super::load_existing_key(&key_path).expect("final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp_b.did()),
+            "key B must survive at the final name on every restore tier"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "the losing restore must keep A's quarantine as forensics: {quarantined:?}"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "the recovery must release its claims"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
+        );
+    }
+
+    // R2: a fallback publisher whose round was claimed by a recovery (its
+    // inode quarantined away, a live key B republished at the name) must NOT
+    // let its own failure cleanup unlink B: the removal on the write/fsync
+    // error arms is guarded by inode identity, not name. The interleave runs
+    // inside the fallback_fsync fault (before_commit never fires on the error
+    // arms), step for step what a claiming recovery does: claim A's marker,
+    // quarantine A's final by rename, republish B, clear the claim; then the
+    // injected Err forces A's fsync-failure arm. RED before the fix: A's
+    // by-name removal deletes B, destroying the live identity whose owner
+    // already returned Won.
+    #[test]
+    fn failed_publisher_cleanup_spares_a_republished_final() {
+        thread_local! {
+            static STEAL: std::cell::RefCell<
+                Option<(std::path::PathBuf, std::path::PathBuf, String)>,
+            > = const { std::cell::RefCell::new(None) };
+        }
+        fn steal_round_then_fail_fsync() -> std::io::Result<()> {
+            STEAL.with(|s| {
+                if let Some((dir, key_path, pem_b)) = s.borrow_mut().take() {
+                    let markers = names_containing(&dir, ".publishing.");
+                    assert_eq!(
+                        markers.len(),
+                        1,
+                        "A's window must be bracketed: {markers:?}"
+                    );
+                    let claim = dir.join(".identity.pem.recovering.55555");
+                    std::fs::rename(dir.join(&markers[0]), &claim).expect("claim A's marker");
+                    std::fs::rename(&key_path, dir.join(".identity.pem.quarantined.55555.0"))
+                        .expect("quarantine A's inode away");
+                    let out = publish_key_atomically(
+                        &key_path,
+                        pem_b.as_bytes(),
+                        &|| {},
+                        &|| {},
+                        PublishFaults::NONE,
+                    )
+                    .expect("recoverer republishes key B");
+                    assert!(matches!(out, KeyPublish::Won), "recoverer's republish wins");
+                    std::fs::remove_file(&claim).expect("clear the claim");
+                }
+            });
+            Err(std::io::Error::other("injected fsync failure"))
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp_b = Keypair::generate();
+        let pem_b = kp_b.to_pem().expect("pem b");
+        STEAL.with(|s| {
+            *s.borrow_mut() = Some((dir.path().to_path_buf(), key_path.clone(), (*pem_b).clone()));
+        });
+        let pem_a = Keypair::generate().to_pem().expect("pem a");
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            fallback_fsync: steal_round_then_fail_fsync,
+            ..PublishFaults::NONE
+        };
+
+        let err = match publish_key_atomically(&key_path, pem_a.as_bytes(), &|| {}, &|| {}, faults)
+        {
+            Err(e) => e,
+            Ok(_) => panic!("A's failed fsync must still error A's publish"),
+        };
+        assert!(
+            format!("{err:#}").contains("injected fsync failure"),
+            "the fsync failure must surface: {err:#}"
+        );
+        let on_disk = super::load_existing_key(&key_path)
+            .expect("the republished final must survive A's cleanup");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp_b.did()),
+            "A's error-arm cleanup must spare the recoverer's key B"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "A's quarantined inode stays where the recoverer put it: {quarantined:?}"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "no recovery claims may remain"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
         );
     }
 }
