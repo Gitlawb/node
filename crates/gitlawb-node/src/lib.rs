@@ -2082,6 +2082,84 @@ enum Recovery {
     Reloaded(Box<Result<Keypair>>),
 }
 
+/// The per-process nonce embedded in recovery-claim names
+/// (`.{stem}.recovering.{pid}.{nonce}.{n}`). The pid alone is NOT unique
+/// across recoverers on a shared volume: two containers each running as
+/// PID 1 (the same restart topology `KEY_TEMP_ATTEMPTS`' stale-name
+/// discipline already handles) can recover the same directory concurrently
+/// and derive identical destination names, and `rename` REPLACES an
+/// existing destination, so the second recoverer's claim rename would
+/// clobber the first's LIVE claim inode (the claim loop's `exists()` probe
+/// is check-then-act, not an arbiter). Both would then track the same
+/// path, and the first release would unlink the other's live claim,
+/// early-waking the demoted publisher that claim gates. The nonce makes
+/// the two name sequences disjoint. Std-only seeding: boot-time nanos
+/// XORed with this static's address (ASLR-shifted per process), folded to
+/// 32 bits; uniqueness is probabilistic-by-construction, which suffices
+/// because a collision needs the same pid AND the same nonce against the
+/// same directory at the same time. Threads within one process share the
+/// nonce; intra-process claim arbitration remains the per-source rename
+/// (production calls this once, at boot).
+fn claim_nonce() -> u32 {
+    static NONCE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mixed = nanos ^ (&NONCE as *const _ as u64);
+        (mixed ^ (mixed >> 32)) as u32
+    })
+}
+
+/// Production primary stamp for `refresh_claim_mtime`: set the file's mtime
+/// to now via `set_modified`.
+fn set_mtime_now(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::options()
+        .write(true)
+        .open(path)?
+        .set_modified(std::time::SystemTime::now())
+}
+
+/// Stamp `claim`'s mtime fresh, for the G1 age gate (see the call site in
+/// `recover_crashed_publish`). `primary_stamp` is `set_mtime_now` in
+/// production (injectable, the file's fn-pointer seam style; some
+/// filesystems reject explicit timestamps while honoring write-driven
+/// updates). If the primary fails, fall back to appending one byte, which
+/// updates the mtime on effectively every filesystem, plus a best-effort
+/// data sync. The claim is then no longer empty, which is safe: claims
+/// vouch for no content and every consumer matches them by NAME only
+/// (`list_recovery_claimables`, `sweep_stale_markers`,
+/// `wait_for_recovery_claims`); nothing reads a claim's bytes. Errs only
+/// when BOTH rungs fail, carrying both failures in the message.
+fn refresh_claim_mtime(
+    claim: &std::path::Path,
+    primary_stamp: fn(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let primary_err = match primary_stamp(claim) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    std::fs::File::options()
+        .append(true)
+        .open(claim)
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(b".")?;
+            let _ = f.sync_data();
+            Ok(())
+        })
+        .map_err(|fallback_err| {
+            std::io::Error::new(
+                fallback_err.kind(),
+                format!(
+                    "set_modified failed ({primary_err}) and the write fallback \
+                     failed ({fallback_err})"
+                ),
+            )
+        })
+}
+
 /// Best-effort removal of the claim files a recovery created, plus a
 /// best-effort dir fsync. Claims vouch for NO on-disk content (unlike
 /// publish markers, whose disposal order against the final is pinned): they
@@ -2162,7 +2240,16 @@ fn recover_crashed_publish(
     let mut next_name = 0u32;
     for item in &claimables {
         for _ in 0..KEY_TEMP_ATTEMPTS {
-            let dest = dir.join(format!("{claim_prefix}{}.{next_name}", std::process::id()));
+            // The name carries a per-process nonce beside the pid: pid alone
+            // is not unique across recoverers (two PID-1 containers on one
+            // shared volume), and a colliding destination would let one
+            // recoverer's rename clobber the other's live claim; see
+            // `claim_nonce`.
+            let dest = dir.join(format!(
+                "{claim_prefix}{}.{:08x}.{next_name}",
+                std::process::id(),
+                claim_nonce()
+            ));
             next_name = next_name.wrapping_add(1);
             if dest.exists() {
                 continue;
@@ -2175,19 +2262,21 @@ fn recover_crashed_publish(
                     // CLAIM_SWEEP_MIN_AGE, and a concurrent healthy boot
                     // could sweep this LIVE claim mid-round, early-waking
                     // the demoted publisher it gates. The age gate needs
-                    // claim-time freshness, so stamp it now. Best-effort:
-                    // on failure the worst case is today's bounded-wait
-                    // degradation, so warn and continue.
-                    if let Err(e) = std::fs::File::options()
-                        .write(true)
-                        .open(&dest)
-                        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
-                    {
+                    // claim-time freshness, so stamp it now (two rungs; see
+                    // refresh_claim_mtime). Only if both rungs fail is the
+                    // live claim left exposed to the age-gated sweep, so
+                    // warn naming that hazard and continue: the exposure is
+                    // bounded to churn, not divergence, by the post-claim
+                    // re-parse and the restore's no-clobber republish.
+                    if let Err(e) = refresh_claim_mtime(&dest, set_mtime_now) {
                         warn!(
                             claim = %dest.display(),
                             err = %e,
-                            "could not refresh a recovery claim's mtime; a concurrent \
-                             healthy boot may sweep the claim early"
+                            "could not refresh a recovery claim's mtime by any rung: a \
+                             concurrent healthy boot's age-gated sweep may remove this \
+                             LIVE claim mid-round and early-wake the demoted publisher \
+                             it gates (bounded to churn, not divergence, by the \
+                             post-claim re-parse and the restore's no-clobber republish)"
                         );
                     }
                     claims.push(dest);
@@ -4744,6 +4833,144 @@ mod identity_key_tests {
             );
         }
         super::release_recovery_claims(&key_path, &claims);
+    }
+
+    // The G1 freshness stamp must survive a failing set_modified: some
+    // filesystems reject explicit timestamps while honoring write-driven
+    // mtime updates, and a claim left with its inherited aged mtime for the
+    // whole round is exposed to a concurrent healthy boot's age-gated sweep.
+    // The ladder's fallback appends a byte, which bumps the mtime on
+    // effectively every filesystem (claims are matched by name only, so a
+    // non-empty claim is safe). RED with the fallback rung absent: the
+    // claim keeps the aged mtime.
+    #[test]
+    fn stamp_fallback_bumps_mtime_by_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let claim = dir.path().join(".identity.pem.recovering.99999.deadbeef.0");
+        std::fs::write(&claim, b"").expect("seed claim");
+        age_beyond_claim_sweep(&claim);
+
+        super::refresh_claim_mtime(&claim, |_| Err(std::io::ErrorKind::Unsupported.into()))
+            .expect("the write fallback must stamp the mtime when the primary fails");
+
+        let mtime = std::fs::metadata(&claim)
+            .expect("stat claim")
+            .modified()
+            .expect("claim mtime");
+        let age = std::time::SystemTime::now()
+            .duration_since(mtime)
+            .unwrap_or_default();
+        assert!(
+            age < super::CLAIM_SWEEP_MIN_AGE,
+            "the fallback write must leave the claim fresh, age {age:?}"
+        );
+    }
+
+    // Claim destinations must carry a per-process nonce beyond the pid:
+    // `.{stem}.recovering.{pid}.{nonce}.{n}`. The pid alone is not unique
+    // across recoverers on a shared volume (two PID-1 containers), so two
+    // concurrent recoverers could derive the SAME destination name, and the
+    // second's claim rename would replace the first's live claim inode (the
+    // exists() probe is a check-then-act, not an arbiter); the first release
+    // would then unlink the other's LIVE claim and early-wake the demoted
+    // publisher it gates. The cross-process collision itself cannot be
+    // executed from one test process (one pid, one nonce), so this test
+    // fences the mechanism: every claim name must carry the process nonce
+    // field between the pid and the counter. RED under pid-only naming.
+    #[test]
+    fn same_pid_recoverers_get_unique_claim_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+
+        let recovery = super::recover_crashed_publish(
+            &key_path,
+            anyhow::anyhow!("synthetic crash signature"),
+            RecoverySeam::NONE,
+        )
+        .expect("recovery over a crash state must not error");
+        let claims = match recovery {
+            super::Recovery::Claimed(claims) => claims,
+            super::Recovery::Reloaded(_) => {
+                panic!("a marker beside an empty final must be claimed")
+            }
+        };
+        assert!(!claims.is_empty(), "the marker must produce a claim");
+        let pid_prefix = format!(".identity.pem.recovering.{}.", std::process::id());
+        for claim in &claims {
+            let name = claim
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("claim name is utf8");
+            let rest = name
+                .strip_prefix(&pid_prefix)
+                .unwrap_or_else(|| panic!("claim {name:?} must start with {pid_prefix:?}"));
+            let fields: Vec<&str> = rest.split('.').collect();
+            assert_eq!(
+                fields.len(),
+                2,
+                "claim {name:?} must end in {{nonce}}.{{counter}}, got {rest:?}"
+            );
+            assert_eq!(
+                fields[0],
+                format!("{:08x}", super::claim_nonce()),
+                "the field between pid and counter must be the process nonce"
+            );
+            assert!(
+                fields[1].parse::<u32>().is_ok(),
+                "the final field must be the claim counter, got {:?}",
+                fields[1]
+            );
+        }
+        super::release_recovery_claims(&key_path, &claims);
+    }
+
+    // A final that VANISHES between the claim renames and the post-claim
+    // re-parse (a competing recoverer disposed of it concurrently) must join
+    // the content class and regenerate, not surface as a loud transient
+    // error: there is nothing a quarantine could destroy, and the quarantine
+    // loop's own NotFound arm resolves it cleanly. Locks the NotFound arm of
+    // the re-parse match (anyhow's downcast_ref::<io::Error> sees the
+    // NotFound through the with_context layers). RED with NotFound routed
+    // into the transient arm (mutation check): the boot fails loudly.
+    #[test]
+    fn vanished_final_at_reparse_still_regenerates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        let vanish_path = key_path.clone();
+        let before_reparse = move || {
+            std::fs::remove_file(&vanish_path).expect("vanish the final inside the claim window");
+        };
+
+        let kp = load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &|| {},
+            PublishFaults::NONE,
+            RecoverySeam {
+                before_reparse: &before_reparse,
+                ..RecoverySeam::NONE
+            },
+        )
+        .expect("a final vanished at the re-parse must regenerate, not fail the start");
+
+        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the returned identity must match the regenerated on-disk key"
+        );
+        assert!(
+            names_containing(dir.path(), ".quarantined.").is_empty(),
+            "a vanished final leaves nothing to quarantine"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "no recovery claims may remain"
+        );
     }
 
     // #194 (U4): the generate path must sweep too. A crash between the
