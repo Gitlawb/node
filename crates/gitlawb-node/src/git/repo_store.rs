@@ -3,7 +3,8 @@
 //! Every handler that needs access to a git repo on disk goes through `RepoStore`:
 //!
 //! - `acquire()` — ensures the repo is on local disk (downloads from Tigris on cache miss).
-//! - `release_after_write()` — uploads the updated repo to Tigris after a write operation.
+//! - `upload_under_guard()`: uploads the updated repo to Tigris after a write, under a
+//!   per-repo advisory lock the caller already holds (the fork tail's durability step).
 //! - `init()` — creates a new bare repo locally and uploads to Tigris.
 //!
 //! When Tigris is disabled (bucket empty), this is a simple passthrough to local disk.
@@ -348,15 +349,66 @@ impl RepoStore {
         Ok(local_path)
     }
 
-    /// Upload a repo to Tigris after a write operation (fork, etc.). Call this
-    /// after any operation that modifies the git repo on disk. Uploads UNDER the
-    /// per-repo advisory lock so the PUT cannot race a concurrent purge (which
-    /// deletes the repo under the same lock) and resurrect a deleted archive.
-    /// Waits (bounded) for the lock — a skipped fork upload would have no later
-    /// retry; in practice the fork target's lock is uncontended (its DB row is
-    /// created after this upload).
-    pub async fn release_after_write(&self, owner_did: &str, repo_name: &str) {
-        self.upload_locked(owner_did, repo_name, true).await;
+    /// Upload a repo to the object store under a per-repo advisory lock the
+    /// CALLER already holds. The fork tail uses this: it takes the target's
+    /// lock before its conflict check and holds it through clone, upload, and
+    /// row insert, so the PUT cannot race a concurrent purge (which deletes the
+    /// repo under the same lock) and the repos row is only published after the
+    /// archive durably landed. The PUT is bounded by `release_upload_timeout`,
+    /// exactly as `RepoWriteGuard::release` bounds its upload: an unbounded PUT
+    /// under a held namespace lock is the INV-22 hazard. A timeout counts as an
+    /// attempted-and-failed upload.
+    ///
+    /// Return semantics follow [`RepoWriteGuard::release`], NOT `upload_locked`:
+    /// `false` only when an ATTEMPTED upload failed or timed out. No configured
+    /// object store means nothing to upload, so store-less nodes see success and
+    /// their writes proceed unchanged. The local dir gone under the lock (a
+    /// purge won the key before the caller took it) is likewise a skip, not a
+    /// failure: nothing exists to upload and a deleted archive must stay gone.
+    /// A path-validation failure returns `false` (fail closed: never report
+    /// durable success for a path we refused to touch).
+    #[must_use = "a false return means the durable upload failed; the write must be reported as failed, not 2xx"]
+    pub async fn upload_under_guard(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        _guard: &RepoLockGuard,
+    ) -> bool {
+        let Some(ref store) = self.object_store else {
+            // No durable backend configured: nothing to upload, nothing failed.
+            return true;
+        };
+        let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(repo = %repo_name, err = %e, "rejected unsafe path before object-store upload");
+                return false;
+            }
+        };
+        // Re-check under the lock: a purge removes the on-disk dir under this
+        // same lock, so a caller that took the key post-purge finds the dir gone
+        // and must NOT recreate the archive.
+        if !local_path.exists() {
+            warn!(repo = %repo_name, "object-store upload skipped: local repo dir gone under lock (purged?)");
+            return true;
+        }
+        match tokio::time::timeout(
+            self.release_upload_timeout,
+            store.upload(&owner_slug, repo_name, &local_path),
+        )
+        .await
+        {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                warn!(repo = %repo_name, err = %e, "failed to upload repo to object store");
+                false
+            }
+            Err(_) => {
+                warn!(repo = %repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
+                    "object-store upload timed out under the held repo lock");
+                false
+            }
+        }
     }
 
     /// Whether an object store is configured. Used by purge-spam to decide
@@ -374,12 +426,14 @@ impl RepoStore {
     /// the dir under its lock, so a post-purge uploader finds it gone and skips.
     /// Returns true iff a PUT was performed. A no-op when no store is configured.
     ///
-    /// `wait`: fork's foreground upload and init's background upload wait
-    /// (bounded) for the lock; a skipped upload on those paths has no later
-    /// retry (init's next re-upload is the first write's release, which may
-    /// never come). The background lazy-migration upload passes `false` and
-    /// skips on contention; that skip genuinely self-heals, since the next
-    /// `acquire` retries the migration.
+    /// `wait`: init's background upload waits (bounded) for the lock, since the
+    /// creator holds this key across create_repo's insert-and-release and a
+    /// skipped init upload has no later retry (the next re-upload is the first
+    /// write's release, which may never come). The background lazy-migration
+    /// upload passes `false` and skips on contention; that skip genuinely
+    /// self-heals, since the next `acquire` retries the migration. The fork
+    /// tail does NOT come through here: it already holds the target's lock and
+    /// uploads via `upload_under_guard` (a second acquire would self-contend).
     async fn upload_locked(&self, owner_did: &str, repo_name: &str, wait: bool) -> bool {
         let Some(ref store) = self.object_store else {
             return false;
@@ -434,13 +488,13 @@ impl RepoStore {
         uploaded
     }
 
-    /// Bounded-wait lock-only acquire — the fork foreground upload's counterpart
-    /// to `acquire_write`'s spin, without any object-store I/O. Retries
-    /// `try_lock_repo` with short backoff. In practice the fork target's lock is
-    /// uncontended (its DB row is created after the upload), so this returns on
-    /// the first attempt. Also used by `create_repo` to serialize its
-    /// existence-check -> init -> insert against a concurrent same-key purge
-    /// (which holds this same lock across delete-row + remove-dir).
+    /// Bounded-wait lock-only acquire, without any object-store I/O. Retries
+    /// `try_lock_repo` with short backoff. Used by `create_repo` and `fork_repo`
+    /// to serialize their existence-check -> write -> row-insert spans against a
+    /// concurrent same-key purge (which holds this same lock across delete-row +
+    /// remove-dir), and by init's background upload to wait out the creator's
+    /// own insert-and-release. A key held past the bounded wait surfaces as
+    /// `Ok(None)`, which the create/fork handlers map to a retryable 503.
     pub async fn lock_repo_blocking(
         &self,
         owner_did: &str,
@@ -1426,11 +1480,13 @@ mod tests {
         );
     }
 
-    // R8/AE6: fork's foreground upload (release_after_write) WAITS for the lock
-    // rather than skipping, then PUTs once after it frees. Pre-fix it PUTs
-    // immediately while the lock is held -> RED on the "still empty" assert.
+    // R8/AE6: the fork tail's lock acquire WAITS for a held target lock rather
+    // than skipping, then the under-guard upload PUTs once after it frees. This
+    // runs the exact lock_repo_blocking -> upload_under_guard sequence
+    // fork_repo runs (migrated from release_after_write when it was retired;
+    // assertions unchanged).
     #[sqlx::test]
-    async fn release_after_write_waits_then_uploads_after_lock_frees(
+    async fn under_guard_upload_waits_then_uploads_after_lock_frees(
         pool_opts: sqlx::postgres::PgPoolOptions,
         connect_opts: sqlx::postgres::PgConnectOptions,
     ) {
@@ -1456,7 +1512,16 @@ mod tests {
         let store2 = store.clone();
         let owner2 = owner.to_string();
         let name2 = name.to_string();
-        let h = tokio::spawn(async move { store2.release_after_write(&owner2, &name2).await });
+        let h = tokio::spawn(async move {
+            let g = store2
+                .lock_repo_blocking(&owner2, &name2)
+                .await
+                .unwrap()
+                .expect("target lock frees within the bounded wait");
+            let ok = store2.upload_under_guard(&owner2, &name2, &g).await;
+            g.release().await;
+            ok
+        });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(
             uploads.lock().unwrap().is_empty(),
@@ -1464,7 +1529,10 @@ mod tests {
         );
 
         held.release().await;
-        h.await.unwrap();
+        assert!(
+            h.await.unwrap(),
+            "the under-guard upload reports success once the lock frees"
+        );
         let ups = uploads.lock().unwrap();
         assert_eq!(
             ups.len(),
@@ -1496,7 +1564,9 @@ mod tests {
         let dir = repo_dir_of(tmp.path(), owner, name);
         std::fs::create_dir_all(&dir).unwrap();
 
-        store.release_after_write(owner, name).await;
+        let g = store.try_lock_repo(owner, name).await.unwrap().unwrap();
+        assert!(store.upload_under_guard(owner, name, &g).await);
+        g.release().await;
         assert!(exists.load(SeqCst), "archive exists after the first upload");
         assert_eq!(uploads.lock().unwrap().len(), 1);
 
@@ -1506,8 +1576,11 @@ mod tests {
         assert_eq!(deletes.lock().unwrap().len(), 1, "archive delete recorded");
         assert!(!exists.load(SeqCst), "archive is deleted by the purge");
 
-        // A late upload attempt must find the dir gone and skip, not resurrect.
-        store.release_after_write(owner, name).await;
+        // A late upload attempt must find the dir gone under the lock and skip,
+        // not resurrect. The skip is nothing-to-do (true), never a PUT.
+        let g = store.try_lock_repo(owner, name).await.unwrap().unwrap();
+        assert!(store.upload_under_guard(owner, name, &g).await);
+        g.release().await;
         assert!(
             !exists.load(SeqCst),
             "a purged archive must stay deleted — the upload found no dir and skipped"
@@ -1519,9 +1592,11 @@ mod tests {
         );
     }
 
-    // Negative: an uncontended fork upload PUTs exactly once (the lock is free).
+    // Negative: an uncontended fork upload PUTs exactly once (the lock is free,
+    // so the fork-tail sequence acquires it first try and uploads under it).
+    // Migrated from release_after_write when it was retired; assertion unchanged.
     #[sqlx::test]
-    async fn uncontended_release_after_write_uploads_once(pool: sqlx::PgPool) {
+    async fn uncontended_under_guard_upload_uploads_once(pool: sqlx::PgPool) {
         let tmp = tempfile::TempDir::new().unwrap();
         let ts = GatedStore::new(false);
         let uploads = ts.uploads.clone();
@@ -1534,7 +1609,16 @@ mod tests {
         let name = "uncontended";
         std::fs::create_dir_all(repo_dir_of(tmp.path(), owner, name)).unwrap();
 
-        store.release_after_write(owner, name).await;
+        let g = store
+            .lock_repo_blocking(owner, name)
+            .await
+            .unwrap()
+            .expect("uncontended lock acquires first try");
+        assert!(
+            store.upload_under_guard(owner, name, &g).await,
+            "an uncontended under-guard upload reports success"
+        );
+        g.release().await;
         assert_eq!(
             uploads.lock().unwrap().len(),
             1,
