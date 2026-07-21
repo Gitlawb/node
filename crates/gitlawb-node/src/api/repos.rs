@@ -1753,6 +1753,16 @@ pub async fn fork_repo(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // git clone --mirror can create the destination dir then exit non-zero
+        // (authz, corrupt/partial source), leaving a half-created mirror. Clear
+        // it best-effort and free the lock, matching the timeout/spawn arms, so
+        // a retry is not blocked by an existing dest and a same-name create sees
+        // an empty path.
+        if let Err(rm) = std::fs::remove_dir_all(&disk_path) {
+            tracing::warn!(fork = %fork_name, err = %rm,
+                "failed to remove fork mirror after a non-zero clone exit");
+        }
+        repo_lock.release().await;
         return Err(AppError::Git(format!(
             "git clone --mirror failed: {stderr}"
         )));
@@ -1794,7 +1804,28 @@ pub async fn fork_repo(
         machine_id: state.machine_id.clone(),
     };
 
-    state.db.create_repo(&record).await?;
+    // The mirror is cloned and (with a store configured) the durable archive is
+    // already uploaded, so a create_repo failure here would orphan BOTH with no
+    // repos row: a retry blocks on the existing dest, and a later same-key
+    // create could download the stale archive. Roll both back best-effort, free
+    // the lock, then fail the fork. delete_archive is a no-op on a store-less
+    // node, so this is safe regardless of configuration.
+    if let Err(e) = state.db.create_repo(&record).await {
+        if let Err(rm) = std::fs::remove_dir_all(&disk_path) {
+            tracing::warn!(fork = %fork_name, err = %rm,
+                "failed to remove fork mirror after a failed row insert");
+        }
+        if let Err(del) = state
+            .repo_store
+            .delete_archive(&forker_did, &fork_name)
+            .await
+        {
+            tracing::warn!(fork = %fork_name, err = %del,
+                "failed to delete fork archive after a failed row insert");
+        }
+        repo_lock.release().await;
+        return Err(e.into());
+    }
 
     // Row, archive, and on-disk dir now all exist consistently; the race window
     // is closed, so the target lock can be released before the best-effort tail.
@@ -4420,6 +4451,214 @@ mod tests {
         assert!(
             clone_dir.exists(),
             "cloned mirror present after the cold-source fork"
+        );
+    }
+
+    // Finding 1: a `git clone --mirror` that exits non-zero after the dest dir
+    // exists must clear that dest and free the lock, so a retry of the same fork
+    // name is not permanently blocked by a leftover half-mirror. Driven by
+    // pre-seeding the dest so the clone fails "destination already exists"
+    // (exit 128, the `!output.status.success()` arm, not the timeout/spawn
+    // arms). RED on base: the arm returns without removing the dest, so the dest
+    // survives and the second fork's clone fails the same way (5xx forever).
+    #[sqlx::test]
+    async fn fork_nonzero_clone_exit_cleans_dest_and_allows_retry(pool: sqlx::PgPool) {
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::for_testing(
+            repos_dir.path().to_path_buf(),
+            pool.clone(),
+        );
+        let state = fork_test_state(repos_dir.path(), repo_store, pool).await;
+
+        let forker = "did:key:z6MkForkCloneNonzeroAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "nonzerofork";
+
+        // Seed the dest as a non-empty dir so `git clone --mirror` refuses it and
+        // exits 128, standing in for a half-created mirror a prior failed clone
+        // (authz, corrupt source) would leave behind.
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+        std::fs::create_dir_all(&clone_dir).unwrap();
+        std::fs::write(clone_dir.join("stale.txt"), b"half-created mirror").unwrap();
+
+        let resp = call_fork(&state, forker, fork_name).await;
+        let status = match resp {
+            Ok(r) => r.status(),
+            Err(e) => {
+                use axum::response::IntoResponse;
+                e.into_response().status()
+            }
+        };
+        assert!(
+            status.is_server_error(),
+            "a non-zero clone exit must fail the fork (5xx); got {status}"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "the leftover dest must be removed after a non-zero clone exit \
+             (RED on base: the !success arm leaves it, blocking every retry)"
+        );
+
+        // The dest is clean and the lock freed, so re-forking the same name now
+        // clones fresh and succeeds.
+        let resp2 = call_fork(&state, forker, fork_name)
+            .await
+            .expect("a retry after the dest is cleaned must succeed");
+        assert_eq!(resp2.status(), StatusCode::CREATED);
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_some(),
+            "repos row present after the successful retry"
+        );
+        assert!(clone_dir.exists(), "cloned mirror present after the retry");
+    }
+
+    // Finding 2: when the row insert fails AFTER the durable upload landed, the
+    // fork must roll back BOTH the on-disk mirror and the just-uploaded archive,
+    // so no orphaned dest blocks a retry and no stale archive can be downloaded
+    // into a later same-key repo. The insert failure is injected deterministically
+    // via the `disk_path UNIQUE` constraint: a decoy row occupying the fork's
+    // exact disk_path passes the owner+name conflict guard (different owner/name)
+    // yet collides on insert, which happens only after upload_under_guard. RED on
+    // base: the `?` short-circuits, leaving the mirror dir and the archive behind.
+    #[sqlx::test]
+    async fn fork_row_insert_failure_rolls_back_mirror_and_archive(pool: sqlx::PgPool) {
+        use axum::response::IntoResponse;
+        use std::path::Path as StdPath;
+        use std::sync::{Arc, Mutex};
+
+        // Store double that uploads OK and records/removes the archive key so the
+        // test can assert the rollback deleted it. exists() is false so acquire
+        // never downloads over the local source.
+        type Archives = Arc<Mutex<std::collections::HashSet<(String, String)>>>;
+        struct TrackingStore {
+            archives: Archives,
+        }
+        #[async_trait::async_trait]
+        impl crate::git::tigris::ObjectStore for TrackingStore {
+            async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn upload(&self, o: &str, r: &str, _p: &StdPath) -> anyhow::Result<()> {
+                self.archives
+                    .lock()
+                    .unwrap()
+                    .insert((o.to_string(), r.to_string()));
+                Ok(())
+            }
+            async fn download(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, o: &str, r: &str) -> anyhow::Result<()> {
+                self.archives
+                    .lock()
+                    .unwrap()
+                    .remove(&(o.to_string(), r.to_string()));
+                Ok(())
+            }
+        }
+
+        let archives: Archives = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(Arc::new(TrackingStore {
+                archives: archives.clone(),
+            })),
+            pool.clone(),
+        );
+        let state = fork_test_state(repos_dir.path(), repo_store, pool).await;
+
+        let forker = "did:key:z6MkForkInsertFailAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "insertfailfork";
+        // The store keys on the slugified owner DID (`:`/`/` -> `_`), the same
+        // transform local_path applies. Track the FORK's archive specifically:
+        // the source repo is independently (re)uploaded via the read acquire, so
+        // the set is not empty even when the fork's archive is correctly rolled
+        // back.
+        let fork_archive = (forker.replace([':', '/'], "_"), fork_name.to_string());
+
+        // Pre-insert a decoy row that occupies the fork's exact disk_path but has
+        // a different owner/name, so the fork's own insert violates disk_path's
+        // UNIQUE constraint. get_repo(forker, fork_name) still returns None, so the
+        // handler proceeds past its conflict guard, clones, and uploads first.
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+        let now = Utc::now();
+        let decoy = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: "decoyname".to_string(),
+            owner_did: "did:key:z6MkDecoyOwnerBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: now,
+            updated_at: now,
+            disk_path: clone_dir.to_string_lossy().to_string(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&decoy).await.unwrap();
+
+        let resp = call_fork(&state, forker, fork_name).await;
+        let status = match resp {
+            Ok(r) => r.status(),
+            Err(e) => e.into_response().status(),
+        };
+        assert!(
+            status.is_server_error(),
+            "a row-insert failure must fail the fork (5xx); got {status}"
+        );
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_none(),
+            "no fork row may exist after the insert failure"
+        );
+        assert!(
+            !clone_dir.exists(),
+            "the cloned mirror must be removed after the failed insert \
+             (RED on base: the `?` short-circuits and leaves it)"
+        );
+        assert!(
+            !archives.lock().unwrap().contains(&fork_archive),
+            "the uploaded fork archive must be deleted after the failed insert \
+             (RED on base: the archive is orphaned)"
+        );
+
+        // The target lock must be free again for a retry.
+        let probe = state
+            .repo_store
+            .try_lock_repo(forker, fork_name)
+            .await
+            .unwrap()
+            .expect("target lock freed after the rolled-back fork");
+        probe.release().await;
+
+        // Remove the decoy so the retry's insert can land, then re-fork the same
+        // name: dest is clean, lock is free, and the archive is re-uploaded.
+        state.db.delete_repo_by_id(&decoy.id).await.unwrap();
+        let resp2 = call_fork(&state, forker, fork_name)
+            .await
+            .expect("a retry after the rollback must succeed");
+        assert_eq!(resp2.status(), StatusCode::CREATED);
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_some(),
+            "repos row present after the successful retry"
+        );
+        assert!(
+            archives.lock().unwrap().contains(&fork_archive),
+            "the retry re-uploads the fork archive"
         );
     }
 
