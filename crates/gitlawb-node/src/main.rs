@@ -437,6 +437,15 @@ async fn main() -> Result<()> {
             std::time::Duration::from_secs(3600),
             200_000,
         ),
+        // Separate WORK-budget bucket for the resolver's per-probe/per-walk charges (R6).
+        // Its capacity is DERIVED from the route limit (no new knob) and floored at the
+        // legacy-probe budget, so one full default-config legacy scan never self-throttles
+        // mid-request while the route brake above stays the pure once-per-request cap.
+        ipfs_work_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            AppState::ipfs_work_budget(&config),
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
         git_bin: "git".to_string(),
     };
     if config.ipfs_rate_limit == 0 {
