@@ -314,9 +314,28 @@ impl RepoStore {
             uuid::Uuid::new_v4()
         ));
 
-        if let Err(e) = store.download(owner_slug, repo_name, &tmp_path).await {
-            let _ = std::fs::remove_dir_all(&tmp_path);
-            return Err(e);
+        // Bound the network download: a stalled GET would park this reader (and,
+        // via the per-repo download mutex, every coalesced reader) indefinitely.
+        // A timeout takes the SAME cleanup arm as a download error — drop the
+        // temp dir and return Err — so `download_published` frees the map entry
+        // and wakes waiters rather than leaving them parked forever.
+        match tokio::time::timeout(
+            self.release_upload_timeout,
+            store.download(owner_slug, repo_name, &tmp_path),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = std::fs::remove_dir_all(&tmp_path);
+                return Err(e);
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&tmp_path);
+                warn!(repo = %repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
+                    "read download timed out — discarding");
+                return Err(anyhow::anyhow!("read download timed out"));
+            }
         }
 
         let guard = match self.try_lock_repo(owner_did, repo_name).await {
@@ -336,9 +355,19 @@ impl RepoStore {
         };
         // Re-check under the lock: the archive gone here means a purge won the
         // key mid-download — discard, never publish (the read-side twin of the
-        // upload paths' under-lock dir re-check). An exists() error degrades
-        // the same way: fail closed rather than publish unconfirmed state.
-        if !store.exists(owner_slug, repo_name).await.unwrap_or(false) {
+        // upload paths' under-lock dir re-check). Bounded so a stalled HEAD
+        // cannot pin the advisory lock + its lock-pool connection. Both a
+        // timeout and an exists() error collapse to "not present" and take the
+        // discard arm: fail closed rather than publish unconfirmed state.
+        let archive_present = matches!(
+            tokio::time::timeout(
+                self.release_upload_timeout,
+                store.exists(owner_slug, repo_name),
+            )
+            .await,
+            Ok(Ok(true))
+        );
+        if !archive_present {
             warn!(repo = %repo_name,
                 "read download discarded — archive gone under lock (purged?)");
             let _ = std::fs::remove_dir_all(&tmp_path);
@@ -557,6 +586,39 @@ impl RepoStore {
             // No durable backend configured: nothing to upload, nothing failed.
             return true;
         };
+        // Dir-gone-under-lock is SUCCESS here (`true`): the fork tail
+        // (api/repos.rs) treats a `false` return as a hard failure and deletes
+        // the freshly-cloned mirror, so a purge that removed the dir before this
+        // caller took the lock is nothing-to-upload, not a failed durable write.
+        self.upload_dir_locked(store, owner_did, repo_name, true)
+            .await
+    }
+
+    /// Shared under-lock upload body for [`upload_under_guard`](Self::upload_under_guard)
+    /// and [`upload_locked`](Self::upload_locked). Both resolve+validate the
+    /// local path, re-check the on-disk dir still exists UNDER the caller's
+    /// advisory lock (a purge removes the dir under the same lock, so a caller
+    /// that took the key post-purge must NOT recreate the archive), then upload
+    /// bounded by `release_upload_timeout`. An unbounded PUT under a held
+    /// namespace lock is the INV-22 hazard, so the bound guarantees the guard's
+    /// pinned lock connection returns to the pool within a fixed window even if
+    /// the PUT stalls. A path-validation failure, an upload error, and a timeout
+    /// all return `false` (fail closed: never report durable success for a write
+    /// that did not land).
+    ///
+    /// `dir_gone_is_success` threads the ONE place the two callers diverge, and
+    /// both values are load-bearing. `upload_under_guard` passes `true`: its
+    /// fork-tail caller reads `false` as a hard failure and deletes the mirror,
+    /// so a dir purged out from under it must read as nothing-to-upload success.
+    /// `upload_locked` passes `false`: its lazy-migration caller must then NOT
+    /// mark the repo migrated, so the next `acquire` retries the migration.
+    async fn upload_dir_locked(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        owner_did: &str,
+        repo_name: &str,
+        dir_gone_is_success: bool,
+    ) -> bool {
         let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
             Ok(p) => p,
             Err(e) => {
@@ -569,7 +631,7 @@ impl RepoStore {
         // and must NOT recreate the archive.
         if !local_path.exists() {
             warn!(repo = %repo_name, "object-store upload skipped: local repo dir gone under lock (purged?)");
-            return true;
+            return dir_gone_is_success;
         }
         match tokio::time::timeout(
             self.release_upload_timeout,
@@ -617,13 +679,6 @@ impl RepoStore {
         let Some(ref store) = self.object_store else {
             return false;
         };
-        let (owner_slug, local_path) = match self.local_path(owner_did, repo_name) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(repo = %repo_name, err = %e, "rejected unsafe path before object-store upload");
-                return false;
-            }
-        };
         let guard = if wait {
             match self.lock_repo_blocking(owner_did, repo_name).await {
                 Ok(Some(g)) => g,
@@ -649,20 +704,13 @@ impl RepoStore {
                 }
             }
         };
-        // Re-check under the lock: a purge removes the on-disk dir under its lock,
-        // so a post-purge uploader must find it gone and NOT recreate the archive.
-        if !local_path.exists() {
-            warn!(repo = %repo_name, "object-store upload skipped — local repo dir gone under lock (purged?)");
-            guard.release().await;
-            return false;
-        }
-        let uploaded = match store.upload(&owner_slug, repo_name, &local_path).await {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(repo = %repo_name, err = %e, "failed to upload repo to object store");
-                false
-            }
-        };
+        // Shared under-lock body: re-check the dir exists and PUT bounded by
+        // `release_upload_timeout` (INV-22 — an untimed PUT here would pin this
+        // guard's lock connection forever). Dir-gone returns `false` so the
+        // lazy-migration caller does NOT mark the repo migrated and retries.
+        let uploaded = self
+            .upload_dir_locked(store, owner_did, repo_name, false)
+            .await;
         guard.release().await;
         uploaded
     }
@@ -1363,6 +1411,16 @@ mod tests {
         false
     }
 
+    async fn poll_until_held(conn: &mut sqlx::PgConnection, key: i64) -> bool {
+        for _ in 0..50 {
+            if !advisory_lock_is_free(conn, key).await {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
     fn lock_key_for(owner: &str, name: &str) -> i64 {
         advisory_lock_key(&owner.replace([':', '/'], "_"), name)
     }
@@ -1997,6 +2055,53 @@ mod tests {
         assert!(
             poll_until_free(&mut observer, key).await,
             "the advisory lock must be freed after the bounded (timed-out) upload"
+        );
+    }
+
+    // R2/INV-22: the OTHER under-lock upload path — upload_locked's PUT (init's
+    // background upload, wait=true) — must be bounded exactly like release()'s.
+    // With a stalled PUT, upload_locked acquires the advisory lock, parks on the
+    // PUT, and the timeout is the only thing that frees the lock. Pre-fix
+    // (untimed store.upload) the lock is pinned forever -> poll_until_free RED.
+    #[sqlx::test]
+    async fn upload_locked_put_stall_is_bounded(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use sqlx::ConnectOptions;
+        let pool = no_reap_pool(pool_opts, &connect_opts).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(false);
+        // The PUT parks forever; the upload bound is what must unblock it.
+        ts.upload_gate = Some(std::sync::Arc::new(tokio::sync::Notify::new()));
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        )
+        .with_release_upload_timeout(std::time::Duration::from_millis(300));
+        let owner = "did:key:z6MkUploadLockedStallAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "uploadlockedstall";
+        let key = lock_key_for(owner, name);
+        let mut observer = connect_opts.connect().await.unwrap();
+
+        // init spawns upload_locked(wait=true); it inits the bare dir, acquires
+        // the lock, then parks on the stalled PUT.
+        store.init(owner, name).await.unwrap();
+
+        // The spawned upload must first take the advisory lock (then stall on the
+        // PUT) — proving the lock IS held, so the free-within-bound assert below
+        // is load-bearing and not vacuously green on a never-acquired lock.
+        assert!(
+            poll_until_held(&mut observer, key).await,
+            "the spawned init upload must acquire the advisory lock before its PUT"
+        );
+
+        // The PUT is parked forever: only the bound can free the lock. Pre-fix
+        // (untimed PUT) it never frees within the 5s poll window -> RED.
+        assert!(
+            poll_until_free(&mut observer, key).await,
+            "upload_locked's PUT must be bounded — the advisory lock must free within the timeout"
         );
     }
 
