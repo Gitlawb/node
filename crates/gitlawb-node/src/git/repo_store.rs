@@ -9,7 +9,7 @@
 //!
 //! When Tigris is disabled (bucket empty), this is a simple passthrough to local disk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,6 +44,25 @@ pub struct RepoStore {
     /// Tracks repos already confirmed to exist in the object store — avoids
     /// redundant HEAD checks and background uploads for repos we've migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
+    /// Per-repo async download coordination (KTD-3): concurrent readers of the
+    /// same repo serialize here so only one runs the network download while
+    /// the rest await it and serve what the winner published. Entries are
+    /// created only after a caller has confirmed the archive exists (reached
+    /// the download branch) and are removed when the holder finishes, so
+    /// permissionless requests for arbitrary names cannot grow the map.
+    download_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+/// Outcome of a coordinated read-path download (KTD-3).
+enum DownloadOutcome {
+    /// The local dir is present: this reader downloaded and published it under
+    /// the advisory lock, or a concurrent reader did and this one served it.
+    Published,
+    /// The download was discarded without publishing: the advisory lock was
+    /// contended (a live writer or purge holds it), the lock pool errored, or
+    /// the archive vanished under the lock (purged mid-download). The caller
+    /// degrades to its missing-path or serve-local-copy outcome.
+    Skipped,
 }
 
 impl RepoStore {
@@ -55,6 +74,7 @@ impl RepoStore {
             lock_pool,
             release_upload_timeout: DEFAULT_RELEASE_UPLOAD_TIMEOUT,
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            download_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -69,6 +89,7 @@ impl RepoStore {
             lock_pool,
             release_upload_timeout: DEFAULT_RELEASE_UPLOAD_TIMEOUT,
             migrated: Arc::new(Mutex::new(HashSet::new())),
+            download_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -133,16 +154,26 @@ impl RepoStore {
         if let Some(ref tigris) = self.object_store {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "cache miss — downloading from tigris");
-                tigris
-                    .download(&owner_slug, repo_name, &local_path)
+                match self
+                    .download_published(owner_did, repo_name, &owner_slug, &local_path, tigris)
                     .await
-                    .context("downloading repo from tigris")?;
-                // Mark as migrated since we just downloaded it
-                self.migrated
-                    .lock()
-                    .await
-                    .insert(format!("{owner_slug}/{repo_name}"));
-                return Ok(local_path);
+                    .context("downloading repo from tigris")?
+                {
+                    DownloadOutcome::Published => {
+                        // Mark as migrated since we just downloaded it
+                        self.migrated
+                            .lock()
+                            .await
+                            .insert(format!("{owner_slug}/{repo_name}"));
+                        return Ok(local_path);
+                    }
+                    DownloadOutcome::Skipped => {
+                        // Degraded: the archive vanished under the lock (purged
+                        // mid-download) or a writer/purge holds the advisory
+                        // lock. Publish nothing and fall through to the
+                        // missing-path outcome below.
+                    }
+                }
             }
         }
 
@@ -161,25 +192,173 @@ impl RepoStore {
         if let Some(ref tigris) = self.object_store {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
-                    // The Tigris archive is present (HEAD ok) but unreadable — a
-                    // corrupt/partial upload, or a transient GET failure. If we have a
-                    // valid local copy, proceed with it rather than blocking the write;
-                    // the post-write upload re-syncs (self-heals) Tigris. Only hard-fail
-                    // when there is no local copy to fall back to.
-                    if local_path.exists() {
-                        warn!(repo = %repo_name, err = %e,
-                            "acquire_fresh: tigris download failed — falling back to local copy");
+                match self
+                    .download_published(owner_did, repo_name, &owner_slug, &local_path, tigris)
+                    .await
+                {
+                    // Published covers both the refreshed copy and a concurrent
+                    // reader's just-published one. Skipped is the degraded
+                    // outcome: the archive vanished under the lock (purged) or
+                    // a writer/purge holds the advisory lock — serve the local
+                    // copy when one still exists (the same fallback as the
+                    // download-error arm), else the missing path.
+                    Ok(DownloadOutcome::Published) | Ok(DownloadOutcome::Skipped) => {
                         return Ok(local_path);
                     }
-                    return Err(e).context("downloading repo from tigris (fresh)");
+                    Err(e) => {
+                        // The Tigris archive is present (HEAD ok) but unreadable — a
+                        // corrupt/partial upload, or a transient GET failure. If we have a
+                        // valid local copy, proceed with it rather than blocking the write;
+                        // the post-write upload re-syncs (self-heals) Tigris. Only hard-fail
+                        // when there is no local copy to fall back to.
+                        if local_path.exists() {
+                            warn!(repo = %repo_name, err = %e,
+                                "acquire_fresh: tigris download failed — falling back to local copy");
+                            return Ok(local_path);
+                        }
+                        return Err(e).context("downloading repo from tigris (fresh)");
+                    }
                 }
-                return Ok(local_path);
             }
         }
 
         // Tigris disabled or repo not in Tigris — fall back to local
         Ok(local_path)
+    }
+
+    /// Coordinated read-path download (KTD-3). Serializes concurrent readers
+    /// of the same repo on a per-repo async mutex: the first one in becomes
+    /// the holder and runs [`download_and_publish`](Self::download_and_publish);
+    /// a contended reader awaits the holder, re-checks the local dir on wake,
+    /// and serves what the holder published instead of re-downloading. Only
+    /// callers that already confirmed the archive exists reach this, and the
+    /// map entry is removed on completion, so the map cannot grow per
+    /// arbitrary requested name.
+    async fn download_published(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        owner_slug: &str,
+        local_path: &Path,
+        store: &Arc<dyn ObjectStore>,
+    ) -> Result<DownloadOutcome> {
+        let map_key = format!("{owner_slug}/{repo_name}");
+        let entry = {
+            let mut map = self.download_locks.lock().await;
+            Arc::clone(
+                map.entry(map_key.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        let held = match entry.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                let g = entry.lock().await;
+                if local_path.exists() {
+                    // A concurrent reader published while we waited — serve it.
+                    drop(g);
+                    self.remove_download_entry(&map_key, &entry).await;
+                    return Ok(DownloadOutcome::Published);
+                }
+                // The holder degraded without publishing; this reader takes over.
+                g
+            }
+        };
+        let outcome = self
+            .download_and_publish(owner_did, repo_name, owner_slug, local_path, store)
+            .await;
+        self.remove_download_entry(&map_key, &entry).await;
+        drop(held);
+        outcome
+    }
+
+    /// Remove a completed download-coordination entry, but only when the map
+    /// still holds THIS entry — a newer entry inserted after an earlier
+    /// removal must not be clobbered.
+    async fn remove_download_entry(&self, key: &str, entry: &Arc<Mutex<()>>) {
+        let mut map = self.download_locks.lock().await;
+        if map.get(key).is_some_and(|cur| Arc::ptr_eq(cur, entry)) {
+            map.remove(key);
+        }
+    }
+
+    /// The holder's half of the coordinated download: fetch and extract the
+    /// archive into a temp sibling with NO advisory lock held (the network
+    /// phase must never pin a lock-pool connection — a cold-read burst across
+    /// distinct repos must not drain the writer-sized pool), then take the
+    /// per-repo advisory lock only around the publish: re-check the archive
+    /// still exists under the lock (a purge deletes it under this same lock,
+    /// so a post-purge downloader discards rather than resurrecting), swap
+    /// the temp copy into place, release. Advisory contention or a lock-pool
+    /// error discards the temp copy and degrades — no blocking lock or pool
+    /// wait exists anywhere on the read path.
+    async fn download_and_publish(
+        &self,
+        owner_did: &str,
+        repo_name: &str,
+        owner_slug: &str,
+        local_path: &Path,
+        store: &Arc<dyn ObjectStore>,
+    ) -> Result<DownloadOutcome> {
+        let parent = local_path.parent().context("repo path has no parent")?;
+        std::fs::create_dir_all(parent).context("creating repo parent dir")?;
+        let file_name = local_path
+            .file_name()
+            .context("repo path has no file name")?
+            .to_string_lossy();
+        // Unique per-download temp target (same parent as local_path so the
+        // publish rename stays on one filesystem); mirrors the extract temp
+        // naming in tigris.rs.
+        let tmp_path = parent.join(format!(
+            ".{file_name}.tmp-download.{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        if let Err(e) = store.download(owner_slug, repo_name, &tmp_path).await {
+            let _ = std::fs::remove_dir_all(&tmp_path);
+            return Err(e);
+        }
+
+        let guard = match self.try_lock_repo(owner_did, repo_name).await {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                debug!(repo = %repo_name,
+                    "read download discarded — repo lock held by a live writer or purge");
+                let _ = std::fs::remove_dir_all(&tmp_path);
+                return Ok(DownloadOutcome::Skipped);
+            }
+            Err(e) => {
+                warn!(repo = %repo_name, err = %e,
+                    "read download discarded — could not acquire repo lock");
+                let _ = std::fs::remove_dir_all(&tmp_path);
+                return Ok(DownloadOutcome::Skipped);
+            }
+        };
+        // Re-check under the lock: the archive gone here means a purge won the
+        // key mid-download — discard, never publish (the read-side twin of the
+        // upload paths' under-lock dir re-check). An exists() error degrades
+        // the same way: fail closed rather than publish unconfirmed state.
+        if !store.exists(owner_slug, repo_name).await.unwrap_or(false) {
+            warn!(repo = %repo_name,
+                "read download discarded — archive gone under lock (purged?)");
+            let _ = std::fs::remove_dir_all(&tmp_path);
+            guard.release().await;
+            return Ok(DownloadOutcome::Skipped);
+        }
+        let swapped = (|| -> std::io::Result<()> {
+            if local_path.exists() {
+                std::fs::remove_dir_all(local_path)?;
+            }
+            std::fs::rename(&tmp_path, local_path)
+        })();
+        guard.release().await;
+        match swapped {
+            Ok(()) => Ok(DownloadOutcome::Published),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp_path);
+                Err(e).context("publishing downloaded repo into place")
+            }
+        }
     }
 
     /// Take a write lock (Postgres advisory lock), ensure repo is local, return guard.
@@ -1093,6 +1272,10 @@ mod tests {
         upload_gate: Option<std::sync::Arc<tokio::sync::Notify>>,
         uploads: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
         deletes: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        // Records every download() call (pushed BEFORE the gate park, so a test
+        // can poll "a download is in flight" while the gate holds it). U4's
+        // concurrent-cold-read test counts these.
+        downloads: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
     }
 
     impl GatedStore {
@@ -1103,6 +1286,7 @@ mod tests {
                 upload_gate: None,
                 uploads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
                 deletes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                downloads: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
     }
@@ -1124,10 +1308,21 @@ mod tests {
             self.exists.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
-        async fn download(&self, _o: &str, _r: &str, _p: &std::path::Path) -> anyhow::Result<()> {
+        async fn download(&self, o: &str, r: &str, p: &std::path::Path) -> anyhow::Result<()> {
+            self.downloads
+                .lock()
+                .unwrap()
+                .push((o.to_string(), r.to_string()));
             if let Some(gate) = &self.download_gate {
                 gate.notified().await;
             }
+            // Materialize a valid bare repo at the target path so a published
+            // download is observable on disk (mirrors the real store's
+            // extract-then-swap, which replaces any existing copy).
+            if p.exists() {
+                std::fs::remove_dir_all(p)?;
+            }
+            crate::git::store::init_bare(p)?;
             Ok(())
         }
         async fn delete(&self, o: &str, r: &str) -> anyhow::Result<()> {
@@ -1803,5 +1998,325 @@ mod tests {
             poll_until_free(&mut observer, key).await,
             "the advisory lock must be freed after the bounded (timed-out) upload"
         );
+    }
+
+    // ── U4: read-path downloads participate in the purge lock (R5, R7) ──────
+
+    async fn poll_until_true(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..50 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    // R5: an in-flight cache-miss download must not resurrect a purged repo.
+    // The reader parks mid-download (holding NO advisory lock, so the purge
+    // proceeds), the purge runs to completion (archive deleted), and the
+    // resumed reader's under-lock exists() re-check must discard rather than
+    // publish. Pre-fix the resumed download publishes straight onto the local
+    // path and the repo dir returns -> RED.
+    #[sqlx::test]
+    async fn download_does_not_resurrect_a_purged_repo(pool: sqlx::PgPool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let exists = ts.exists.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkDlResurrectAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "dlresurrect";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+
+        // Cache miss: the reader enters the download path and parks on the gate.
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the reader's download must be in flight"
+        );
+
+        // Purge runs to completion while the download is parked (no local dir
+        // exists on this cache-miss path; the archive delete is the purge).
+        store.delete_archive(owner, name).await.unwrap();
+        assert!(!exists.load(SeqCst), "archive deleted by the purge");
+
+        // Resume the download; the reader must NOT publish the purged repo.
+        gate.notify_one();
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(res, dir);
+        assert!(
+            !dir.exists(),
+            "a purged repo must not be resurrected by an in-flight read download"
+        );
+    }
+
+    // R5: same interleaving through acquire_fresh's refresh-over-an-existing-
+    // copy arm — a local dir is present when the refresh starts, and the purge
+    // removes BOTH the dir and the archive mid-download. Pre-fix the resumed
+    // refresh publishes onto the purged path and the dir returns -> RED.
+    #[sqlx::test]
+    async fn fresh_refresh_does_not_resurrect_a_purged_repo(pool: sqlx::PgPool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let exists = ts.exists.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkFreshResurrectAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "freshresurrect";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The refresh always downloads, even over an existing local copy.
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire_fresh(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the refresh download must be in flight"
+        );
+
+        // Purge runs to completion mid-download: local dir AND archive removed.
+        std::fs::remove_dir_all(&dir).unwrap();
+        store.delete_archive(owner, name).await.unwrap();
+        assert!(!exists.load(SeqCst), "archive deleted by the purge");
+
+        gate.notify_one();
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(res, dir);
+        assert!(
+            !dir.exists(),
+            "a purged repo must not be resurrected by an in-flight refresh download"
+        );
+    }
+
+    // R5: the degraded outcome of the under-lock skip, pinned in full. The
+    // purge completes before the reader reaches the advisory lock; the
+    // reader's under-lock exists() re-check sees false and publishes nothing:
+    // Ok(missing path), no dir, no republished archive, exactly one download.
+    // Its RED form is the same interleaving as the two resurrection tests
+    // above; this test pins the post-fix outcome shape.
+    #[sqlx::test]
+    async fn post_purge_download_skips_under_lock(pool: sqlx::PgPool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let uploads = ts.uploads.clone();
+        let exists = ts.exists.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkPostPurgeSkipAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "postpurgeskip";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the reader's download must be in flight"
+        );
+        store.delete_archive(owner, name).await.unwrap();
+        gate.notify_one();
+
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(
+            res, dir,
+            "degraded read returns the missing path, not an error"
+        );
+        assert!(!dir.exists(), "the skipped download must publish nothing");
+        assert!(
+            !exists.load(SeqCst),
+            "the purged archive must stay deleted after the skip"
+        );
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "the read path must never upload"
+        );
+        assert_eq!(
+            downloads.lock().unwrap().len(),
+            1,
+            "exactly one download attempt was made"
+        );
+    }
+
+    // R7: two simultaneous cache-miss reads of the same repo coalesce on the
+    // per-repo download mutex: exactly one download occurs, both callers end
+    // with the published dir, neither errors. Pre-fix each caller runs its own
+    // download -> the count hits 2 -> RED.
+    #[sqlx::test]
+    async fn concurrent_cold_reads_download_once(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkColdCoalesceAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "coldcoalesce";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+
+        let store1 = store.clone();
+        let (o1, n1) = (owner.to_string(), name.to_string());
+        let h1 = tokio::spawn(async move { store1.acquire(&o1, &n1).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the first reader's download must be in flight"
+        );
+
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h2 = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+        // Give the second reader time to reach the coordination point.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            downloads.lock().unwrap().len(),
+            1,
+            "the second cold read must await the in-flight download, not start its own"
+        );
+
+        // Release the parked download. The second notify covers the pre-fix
+        // topology where both readers park on the gate; post-fix it leaves an
+        // unconsumed permit, which is harmless.
+        gate.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        gate.notify_one();
+
+        let p1 = h1.await.unwrap().unwrap();
+        let p2 = h2.await.unwrap().unwrap();
+        assert_eq!(p1, dir);
+        assert_eq!(p2, dir);
+        assert!(dir.exists(), "both callers end with the published dir");
+        assert_eq!(
+            downloads.lock().unwrap().len(),
+            1,
+            "exactly one download for two concurrent cold reads"
+        );
+    }
+
+    // R7/INV-15: the long network phase must not pin a lock-pool connection —
+    // while a download is parked mid-flight, that repo's advisory lock is
+    // observably FREE (out-of-pool observer). This is the distinct-repo-burst
+    // pool guard: N cold reads across N repos must not drain the writer-sized
+    // lock pool. GREEN by construction pre-fix too (the old download path held
+    // no lock either); it fences the new design against regression.
+    #[sqlx::test]
+    async fn no_advisory_lock_held_while_download_parked(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use sqlx::ConnectOptions;
+        let pool = no_reap_pool(pool_opts, &connect_opts).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ts = GatedStore::new(true);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        ts.download_gate = Some(gate.clone());
+        let downloads = ts.downloads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkNoLockParkedAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "nolockparked";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        let key = lock_key_for(owner, name);
+        let mut observer = connect_opts.connect().await.unwrap();
+
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.lock().unwrap().len() == 1).await,
+            "the reader's download must be in flight"
+        );
+
+        assert!(
+            advisory_lock_is_free(&mut observer, key).await,
+            "the repo's advisory lock must be free while the download is parked mid-flight"
+        );
+
+        gate.notify_one();
+        let res = h.await.unwrap().unwrap();
+        assert_eq!(res, dir);
+        assert!(dir.exists(), "the resumed download publishes normally");
+    }
+
+    // R7: acquire's local-dir hit path stays lock-free — deterministic form.
+    // An out-of-pool observer HOLDS the repo's advisory lock for the whole
+    // call window; a dir-present acquire must succeed promptly regardless (a
+    // lock-touching cache hit would park until the hold ends). GREEN by
+    // construction pre-fix (the hit path never locked); it fences the new
+    // design's promise that the hit path stays byte-identical and lock-free.
+    #[sqlx::test]
+    async fn cache_hit_never_touches_the_lock(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use sqlx::ConnectOptions;
+        let pool = no_reap_pool(pool_opts, &connect_opts).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        // exists=true so the lazy-migration spawn sees "already in tigris" and
+        // neither uploads nor waits on anything.
+        let ts = GatedStore::new(true);
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkCacheHitNoLockAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "cachehitnolock";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = lock_key_for(owner, name);
+
+        // The observer takes and HOLDS the repo's advisory lock.
+        let mut observer = connect_opts.connect().await.unwrap();
+        let (got,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut observer)
+            .await
+            .unwrap();
+        assert!(got, "observer must win the free lock");
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.acquire(owner, name),
+        )
+        .await
+        .expect("a dir-present acquire must not wait on the held advisory lock")
+        .unwrap();
+        assert_eq!(res, dir);
+
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut observer)
+            .await;
     }
 }
