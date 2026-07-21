@@ -61,6 +61,25 @@ pub fn create_issue(repo_path: &Path, issue_id: &str, json: &str) -> Result<()> 
     Ok(())
 }
 
+/// Delete an issue ref. Used to roll back a locally written issue whose
+/// durable upload failed, so a retry does not duplicate it. The dangling
+/// blob object is harmless.
+pub fn delete_issue_ref(repo_path: &Path, issue_id: &str) -> Result<()> {
+    let ref_name = format!("refs/gitlawb/issues/{issue_id}");
+    let output = Command::new("git")
+        .args(["update-ref", "-d", &ref_name])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git update-ref -d")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git update-ref -d failed: {stderr}");
+    }
+
+    Ok(())
+}
+
 /// List all issue refs and return their JSON content.
 pub fn list_issues(repo_path: &Path) -> Result<Vec<String>> {
     // List all refs under refs/gitlawb/issues/
