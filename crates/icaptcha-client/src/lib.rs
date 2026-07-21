@@ -19,6 +19,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::json;
 
+pub mod pow;
 pub mod solvers;
 
 /// Default iCaptcha service base URL (used when the node doesn't advertise one).
@@ -81,18 +82,42 @@ fn sanitize_excerpt(s: &str) -> String {
     out
 }
 
-/// Whether `u` parses as an `https` URL.
+/// Whether `u` parses as a trusted URL.
+///
+/// Production trusts only `https`.  When `GITLAWB_ICAPTCHA_INSECURE` is set (a
+/// runtime escape hatch for integration tests) the function also trusts
+/// `http://127.0.0.1` and `http://localhost` so the full iCaptcha retry path
+/// can be exercised against a local mockito server.
 fn is_https(u: &str) -> bool {
-    reqwest::Url::parse(u)
-        .map(|p| p.scheme() == "https")
-        .unwrap_or(false)
+    let Ok(parsed) = reqwest::Url::parse(u) else {
+        return false;
+    };
+    if parsed.scheme() == "https" {
+        return true;
+    }
+    if std::env::var_os("GITLAWB_ICAPTCHA_INSECURE").is_some()
+        && parsed.scheme() == "http"
+        && matches!(parsed.host_str(), Some("127.0.0.1" | "localhost"))
+    {
+        return true;
+    }
+    false
 }
 
-/// Lowercased host of a URL, if it parses and has one.
-fn host_of(u: &str) -> Option<String> {
-    reqwest::Url::parse(u)
-        .ok()
-        .and_then(|p| p.host_str().map(|h| h.to_ascii_lowercase()))
+/// Lowercased origin string (`scheme://host[:port]`) of a URL.
+///
+/// Includes the effective port so that `http://localhost:3000` and
+/// `http://localhost:9000` are treated as distinct origins — a hostile node
+/// cannot redirect the iCaptcha solve to a different loopback port.
+fn origin_key(u: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(u).ok()?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    let port = parsed
+        .port_or_known_default()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    Some(format!("{scheme}://{host}{port}"))
 }
 
 /// Decide which iCaptcha origin to actually talk to, and whether it is trusted
@@ -109,12 +134,13 @@ fn host_of(u: &str) -> Option<String> {
 /// exfiltrated to an origin the operator did not choose.
 fn resolve_solver_url(advertised: Option<&str>, operator: Option<&str>) -> (String, bool) {
     let operator = operator.filter(|u| is_https(u));
-    let operator_host = operator.and_then(host_of);
-    let default_host = host_of(DEFAULT_URL);
+    let operator_origin = operator.as_ref().and_then(|u| origin_key(u));
+    let default_origin = origin_key(DEFAULT_URL);
 
-    let allowed = |host: &Option<String>| -> bool {
-        host.as_ref()
-            .map(|h| Some(h) == default_host.as_ref() || Some(h) == operator_host.as_ref())
+    let allowed = |origin: &Option<String>| -> bool {
+        origin
+            .as_ref()
+            .map(|o| Some(o) == default_origin.as_ref() || Some(o) == operator_origin.as_ref())
             .unwrap_or(false)
     };
 
@@ -125,7 +151,7 @@ fn resolve_solver_url(advertised: Option<&str>, operator: Option<&str>) -> (Stri
     };
 
     let chosen = match advertised {
-        Some(a) if is_https(a) && allowed(&host_of(a)) => a.to_string(),
+        Some(a) if is_https(a) && allowed(&origin_key(a)) => a.to_string(),
         Some(a) => {
             tracing::warn!(
                 advertised = %a,
@@ -137,7 +163,7 @@ fn resolve_solver_url(advertised: Option<&str>, operator: Option<&str>) -> (Stri
     };
 
     // Key goes only to the operator's own configured origin.
-    let key_trusted = operator_host.is_some() && host_of(&chosen) == operator_host;
+    let key_trusted = operator_origin.is_some() && origin_key(&chosen) == operator_origin;
     (chosen, key_trusted)
 }
 
@@ -201,6 +227,10 @@ pub struct Challenge {
     pub difficulty: u32,
     pub prompt: String,
     pub token: String,
+    /// Proof-of-work to solve and echo back as `powNonce` on the answer. Present
+    /// only when the service has PoW enabled; absent/None means no PoW required.
+    #[serde(default)]
+    pub pow: Option<pow::PowChallenge>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,7 +267,28 @@ pub fn obtain_proof(cfg: &IcaptchaCfg, solver: Option<&Solver>) -> Result<String
                 )
             })?;
 
-        match submit_answer(&client, cfg, &challenge.token, &answer)? {
+        // Solve the proof-of-work bound to this challenge, if the service
+        // requires one. A required-but-unsolvable PoW (unknown algorithm or a
+        // difficulty above our cap) is a hard error — submitting without it
+        // would just be rejected.
+        let pow_nonce = match &challenge.pow {
+            Some(p) => Some(pow::solve(p).ok_or_else(|| {
+                anyhow!(
+                    "cannot solve iCaptcha proof-of-work (algorithm '{}', difficulty {})",
+                    p.algorithm,
+                    p.difficulty
+                )
+            })?),
+            None => None,
+        };
+
+        match submit_answer(
+            &client,
+            cfg,
+            &challenge.token,
+            &answer,
+            pow_nonce.as_deref(),
+        )? {
             AnswerResult::Passed { proof } => return Ok(proof),
             AnswerResult::Continue { challenge: next } => challenge = next,
             AnswerResult::Failed { reason } => {
@@ -273,11 +324,14 @@ fn submit_answer(
     cfg: &IcaptchaCfg,
     token: &str,
     answer: &str,
+    pow_nonce: Option<&str>,
 ) -> Result<AnswerResult> {
     let url = format!("{}/v1/answer", cfg.url.trim_end_matches('/'));
-    let mut req = client
-        .post(&url)
-        .json(&json!({ "token": token, "answer": answer }));
+    let mut body = json!({ "token": token, "answer": answer });
+    if let Some(nonce) = pow_nonce {
+        body["powNonce"] = json!(nonce);
+    }
+    let mut req = client.post(&url).json(&body);
     if let Some(key) = &cfg.api_key {
         req = req.bearer_auth(key);
     }
@@ -320,6 +374,37 @@ fn interactive_prompt(challenge: &Challenge) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes tests that touch the process-global
+    /// `GITLAWB_ICAPTCHA_INSECURE` env var so they never race.
+    static ICAPTCHA_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Set `GITLAWB_ICAPTCHA_INSECURE` for the test lifetime, restoring any
+    /// prior value on drop.
+    struct InsecureEnv {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<OsString>,
+    }
+
+    impl InsecureEnv {
+        fn new() -> Self {
+            let lock = ICAPTCHA_ENV_LOCK.lock().unwrap();
+            let prev = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
+            std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", "1");
+            InsecureEnv { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for InsecureEnv {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", v),
+                None => std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE"),
+            }
+        }
+    }
 
     // ── P1: hostile error bodies must not reach the terminal raw ──────────
 
@@ -402,5 +487,21 @@ mod tests {
         let (url, key_trusted) = resolve_solver_url(None, Some("http://icap.mynode.example"));
         assert_eq!(url, DEFAULT_URL);
         assert!(!key_trusted);
+    }
+
+    #[test]
+    fn rejects_insecure_advertised_url_on_different_port() {
+        // With GITLAWB_ICAPTCHA_INSECURE=1, two loopback URLs on different
+        // ports must be treated as distinct origins so a hostile node cannot
+        // redirect the bearer key to a different listener on localhost.
+        let _env = InsecureEnv::new();
+
+        let op = "http://localhost:3000";
+        let (url, key_trusted) = resolve_solver_url(Some("http://localhost:9000"), Some(op));
+        assert_eq!(
+            url, op,
+            "must fall back to operator origin, not use different port"
+        );
+        assert!(key_trusted, "key stays trusted with operator origin");
     }
 }
