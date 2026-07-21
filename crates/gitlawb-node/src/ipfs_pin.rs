@@ -63,6 +63,8 @@ where
 /// recompute. A row whose bytes are gone stays withheld (no destructive rewrite).
 async fn repair_legacy_provider_cid(
     repo_path: &std::path::Path,
+    git_bin: &str,
+    git_timeout: Duration,
     sha: &str,
     db: &crate::db::Db,
 ) -> Result<()> {
@@ -78,10 +80,18 @@ async fn repair_legacy_provider_cid(
     // the gate above spares non-legacy rows this read.
     #[cfg(test)]
     note_legacy_repair_read();
-    let data = match crate::git::store::read_object(repo_path, sha)? {
-        Some((_ty, bytes)) => bytes,
+    let data = match crate::git::store::read_object_bounded(git_bin, repo_path, sha, git_timeout) {
+        Ok(Some((_ty, bytes))) => bytes,
         // Bytes gone: the row stays withheld, never destructively rewritten.
-        None => return Ok(()),
+        Ok(None) => return Ok(()),
+        // A wedged/D-state `git cat-file` (timeout/infra): the repair is opportunistic
+        // and best-effort, so skip it and return Ok so the pin task PROCEEDS to
+        // requeue_or_release rather than hanging the coalescing key until process death
+        // (grok F2, #173). A later re-push or the deferred sweep retries the repair.
+        Err(e) => {
+            tracing::warn!(sha = %sha, err = %e, "skipping legacy provider-CID repair: bounded object read failed");
+            return Ok(());
+        }
     };
     let raw = Cid::from_git_object_bytes(&data).to_string();
     if raw == stored {
@@ -204,6 +214,8 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
 pub async fn pin_new_objects(
     ipfs_api: &str,
     repo_path: &std::path::Path,
+    git_bin: &str,
+    git_timeout: Duration,
     object_list: Vec<String>,
     db: &crate::db::Db,
     repo_id: &str,
@@ -248,7 +260,9 @@ pub async fn pin_new_objects(
                 // re-push. Cost-gated on the stored key's codec — a non-legacy row
                 // reads no bytes. Warn-only: a failure leaves the row as-is for a
                 // later re-push or the deferred one-shot sweep.
-                if let Err(e) = repair_legacy_provider_cid(repo_path, &sha, db).await {
+                if let Err(e) =
+                    repair_legacy_provider_cid(repo_path, git_bin, git_timeout, &sha, db).await
+                {
                     tracing::warn!(sha = %sha, err = %e, "failed to repair legacy provider CID");
                 }
                 continue;
@@ -260,15 +274,20 @@ pub async fn pin_new_objects(
             }
         }
 
-        // Read raw object content
-        let data = match crate::git::store::read_object(repo_path, &sha) {
-            Ok(Some((_obj_type, bytes))) => bytes,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(sha = %sha, err = %e, "failed to read git object for pinning");
-                continue;
-            }
-        };
+        // Read raw object content under a bounded read so a wedged/D-state `git
+        // cat-file` (stuck NFS/Tigris backend) is reaped at `git_timeout` instead of
+        // hanging pin_new_objects forever — which would pin the post-push coalescing
+        // key until process death (grok F2, #173). On Err the object is simply not
+        // pinned this pass; a later pass/push retries.
+        let data =
+            match crate::git::store::read_object_bounded(git_bin, repo_path, &sha, git_timeout) {
+                Ok(Some((_obj_type, bytes))) => bytes,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(sha = %sha, err = %e, "failed to read git object for pinning");
+                    continue;
+                }
+            };
 
         // Pin to IPFS
         match pin_git_object(ipfs_api, &sha, &data).await {

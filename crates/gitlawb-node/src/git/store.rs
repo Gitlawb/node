@@ -407,6 +407,42 @@ pub fn read_object(repo_path: &Path, sha256_hex: &str) -> Result<Option<(String,
     Ok(Some((obj_type, content)))
 }
 
+/// Bounded twin of [`read_object`] for write-side callers that must not hang on a
+/// wedged `git cat-file` (the post-push pin path, #173): composes
+/// [`object_type_bounded`] and [`read_object_content_bounded`] under ONE shared
+/// deadline (mirroring `get_by_cid`'s read stage and `build_filtered_pack`), so a
+/// single object read holds for at most `timeout` total, not one full timeout per
+/// stage. `Ok(Some((type, bytes)))` on success, `Ok(None)` when the object is absent,
+/// and `Err(`[`GitServiceTimeout`](crate::git::smart_http::GitServiceTimeout)`)` when
+/// either stage overruns the deadline. The bare [`read_object`] is an unbounded
+/// `Command::output` an async timeout cannot cancel, so a wedged `cat-file` there pins
+/// the post-push coalescing key until process death; this twin cannot.
+pub fn read_object_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<(String, Vec<u8>)>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let obj_type = match object_type_bounded(
+        git_bin,
+        repo_path,
+        sha256_hex,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    )? {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let content = read_object_content_bounded(
+        git_bin,
+        repo_path,
+        sha256_hex,
+        &obj_type,
+        deadline.saturating_duration_since(std::time::Instant::now()),
+    )?;
+    Ok(Some((obj_type, content)))
+}
+
 /// Get the diff between two branches: changes on source_branch not in target_branch.
 pub fn branch_diff(repo_path: &Path, target_branch: &str, source_branch: &str) -> Result<String> {
     let output = Command::new("git")
