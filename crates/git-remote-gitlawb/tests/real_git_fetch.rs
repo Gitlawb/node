@@ -287,10 +287,11 @@ fn exited_status() -> std::process::ExitStatus {
 #[cfg(not(unix))]
 fn exited_status() -> std::process::ExitStatus {
     // Non-unix has no ECHILD analog: a Windows `wait` is handle-based, so even
-    // after `reap_tree` has already reaped the leader on the timeout path, the
-    // later `wait` in `run_bounded` succeeds again against the still-open handle.
-    // This stays unreachable in practice; spawn a trivially-failing process to
-    // synthesize a nonzero status without an unstable constructor.
+    // after the job terminate (or the `reap_tree` fallback) has taken down the
+    // leader on the timeout path, the later `wait` in `run_bounded` succeeds again
+    // against the still-open handle. This stays unreachable in practice; spawn a
+    // trivially-failing process to synthesize a nonzero status without an unstable
+    // constructor.
     Command::new("cmd")
         .args(["/C", "exit 1"])
         .status()
@@ -332,21 +333,20 @@ fn reap_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Tear down the child's whole process tree on the timeout path (INV-22): the
-/// non-unix counterpart of `reap_group`.
+/// Fallback tree teardown for the non-unix timeout path (INV-22): the leader-only
+/// counterpart used only when the Job Object could not be established at spawn.
 ///
-/// `taskkill /T /F` walks the parent-pid tree from the leader and force-kills
-/// every member, so ALL inherited pipe write-ends (leader AND the
-/// git-remote-gitlawb descendant) are closed and the reader joins in
-/// `run_bounded` return promptly instead of waiting out the helper's ~300s HTTP
-/// timeout. taskkill ships in System32 on every supported Windows, which avoids
-/// both a windows-only dev-dependency (a Job Object binding) and `unsafe` in
-/// test code. Known caveat: /T resolves the parent-pid tree at invocation time,
-/// which is sufficient for this harness because git and the helper are both
-/// still alive (blocked, not exiting) at the deadline. The `child.kill()` below
-/// is a best-effort leader-only fallback for the taskkill-unavailable case;
-/// finally reap the leader so it does not linger, mirroring `reap_group`'s
-/// contract.
+/// The Job Object below is the correct primitive on Windows (it owns the tree
+/// regardless of leader liveness), so this is now a best-effort fallback rather
+/// than the main path. `taskkill /T /F` walks the parent-pid tree from the leader
+/// and force-kills every member reachable through it, closing the inherited pipe
+/// write-ends so the reader joins in `run_bounded` return instead of waiting out
+/// the helper's ~300s HTTP timeout. taskkill ships in System32 on every supported
+/// Windows and needs no `unsafe`. Its known limit is exactly why the job exists:
+/// /T resolves the parent-pid tree at invocation time and cannot reach a
+/// descendant once its leader has already exited. The `child.kill()` below is a
+/// further leader-only fallback for the taskkill-unavailable case; finally reap
+/// the leader so it does not linger, mirroring `reap_group`'s contract.
 #[cfg(not(unix))]
 fn reap_tree(child: &mut std::process::Child) {
     let _ = Command::new("taskkill")
@@ -354,6 +354,113 @@ fn reap_tree(child: &mut std::process::Child) {
         .output();
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Windows analog of the unix process group: a Job Object that owns the whole
+/// fetch tree so `git fetch` plus the `git-remote-gitlawb` helper it spawns can be
+/// torn down together on BOTH the timeout and clean-exit paths (INV-22). The unix
+/// path relies on `process_group(0)` + `reap_group`; Windows has no fork-style
+/// group, so the tree is bounded by assigning the leader to a job and terminating
+/// the job. Unlike `taskkill /T`, a job owns its members regardless of leader
+/// liveness, which is what closes the clean-exit gap: once `git fetch` exits, the
+/// parent-pid tree no longer reaches the still-blocked helper, but the job still
+/// does.
+///
+/// The handle is held in this RAII owner so `Drop` closes it. Configured with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, closing the last handle also kills any
+/// member not already terminated, a safety net for a stray the explicit
+/// `TerminateJobObject` did not cover.
+#[cfg(windows)]
+struct JobHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        // SAFETY: CloseHandle takes a single handle value and borrows no Rust
+        // memory. With KILL_ON_JOB_CLOSE, closing the last handle also kills any
+        // still-assigned member, the safety net for a member not explicitly torn
+        // down. Closing an already-closed-elsewhere job is not possible here since
+        // this owner holds the sole handle for its whole lifetime.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// Create a Job Object, configure `KILL_ON_JOB_CLOSE`, and assign the freshly
+/// spawned `child` to it, mirroring the unix `cmd.process_group(0)` at spawn.
+/// Returns `None` if any step fails, in which case the caller falls back to the
+/// leader-only `reap_tree` tree walk.
+///
+/// Honest caveat: this assigns the child right after `spawn` rather than via
+/// `CREATE_SUSPENDED` + resume (which std cannot do without exposing the main
+/// thread handle), so there is a tiny window between the process starting and the
+/// assignment landing. In this harness the child is `git`, which spawns the
+/// `git-remote-gitlawb` helper only after it parses config and reads the
+/// advertisement, so the assignment reliably lands before the helper exists and
+/// the helper is created inside the job. `KILL_ON_JOB_CLOSE` covers any stray that
+/// somehow raced ahead.
+#[cfg(windows)]
+fn assign_job(child: &std::process::Child) -> Option<JobHandle> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    // SAFETY: CreateJobObjectW(null, null) creates a new unnamed, unsecured job and
+    // returns its handle (or null on failure); the two null pointers are the
+    // documented "default attributes / no name" arguments and no Rust memory is
+    // borrowed.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return None;
+    }
+    // Own the handle now so an early return below still closes it via Drop.
+    let owner = JobHandle(job);
+
+    // SAFETY: `zeroed()` is a valid all-zero bit pattern for this plain-old-data
+    // struct (only integers and nested POD, no references or non-null invariants).
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: passes a pointer to a fully-initialized, correctly-sized
+    // JOBOBJECT_EXTENDED_LIMIT_INFORMATION together with its byte length; the call
+    // copies out of the buffer and retains no reference to it.
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None; // `owner` drops here -> CloseHandle.
+    }
+
+    // SAFETY: assigns the child's OS process handle to the job. Both arguments are
+    // raw handle values and no Rust memory is borrowed; the `Child` owns the
+    // process handle and outlives this call, so `as_raw_handle` is valid here.
+    let ok = unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) };
+    if ok == 0 {
+        return None;
+    }
+    Some(owner)
+}
+
+/// Terminate every member of the job (INV-22): the Windows analog of `reap_group`
+/// signalling `-pgid`, invoked on both the timeout and clean-exit teardown paths.
+#[cfg(windows)]
+fn terminate_job(job: &JobHandle) {
+    // SAFETY: TerminateJobObject takes the job handle and an integer exit code and
+    // borrows no Rust memory. Terminating an already-empty or already-terminated
+    // job is a harmless no-op, so this is safe to call on the clean-exit path where
+    // the descendant may already be gone.
+    unsafe {
+        windows_sys::Win32::System::JobObjects::TerminateJobObject(job.0, 1);
+    }
 }
 
 /// Spawn `cmd`, draining stdout and stderr CONCURRENTLY on reader threads while
@@ -379,6 +486,14 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn child");
 
+    // Windows analog of the unix `process_group(0)` above: Windows has no way to
+    // set a group before spawn, so assign the freshly spawned leader to a Job
+    // Object now. The job owns the whole fetch tree and is terminated on both
+    // teardown paths below (INV-22). `None` if the job could not be established, in
+    // which case teardown falls back to the taskkill tree walk.
+    #[cfg(windows)]
+    let job = assign_job(&child);
+
     let mut out_pipe = child.stdout.take().expect("stdout piped");
     let mut err_pipe = child.stderr.take().expect("stderr piped");
     let out_reader = std::thread::spawn(move || {
@@ -402,12 +517,23 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
             // helper is a descendant that inherited the stdout/stderr pipe write-ends,
             // so killing only `child` leaves those ends open and the reader joins wait
             // on the helper's ~300s HTTP timeout instead of returning at the deadline.
-            // Taking down every member (the unix group signal, the windows taskkill
-            // tree kill) closes every write-end so the readers finish promptly
+            // Taking down every member (the unix group signal, the windows job
+            // terminate) closes every write-end so the readers finish promptly
             // (INV-22, mirrors gitlawb-node/src/git/smart_http.rs).
             #[cfg(unix)]
             reap_group(&mut child);
-            #[cfg(not(unix))]
+            // Windows: terminate the whole job (every assigned member); the taskkill
+            // tree walk stays only as the fallback when the job was not established.
+            #[cfg(windows)]
+            match &job {
+                Some(job) => {
+                    terminate_job(job);
+                    let _ = child.wait();
+                }
+                None => reap_tree(&mut child),
+            }
+            // Any other non-unix target keeps the leader-only tree walk.
+            #[cfg(all(not(unix), not(windows)))]
             reap_tree(&mut child);
             break false; // timed out: the real deadlock signature
         }
@@ -438,6 +564,22 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
         // SAFETY: kill(-pgid, 0) only probes group liveness; it borrows no memory.
         if unsafe { libc::kill(-pgid, 0) } == 0 {
             reap_group(&mut child);
+        }
+    }
+
+    // Windows clean-exit sibling of the unix reap above, and the core of this fix
+    // (jatmn's [P2]): a leader (`git fetch`) that exits cleanly does NOT let
+    // `taskkill /T` reach a still-blocked helper descendant, because the parent-pid
+    // tree no longer connects them once the leader is gone. So on the clean path the
+    // reader joins below would stall on the helper's ~300s HTTP timeout past the
+    // bound this function promises. Terminating the job kills every member
+    // regardless of leader liveness, so the joins return at the leader's exit. This
+    // runs whether or not the descendant is still alive; terminating an
+    // already-empty job is a harmless no-op (INV-22).
+    #[cfg(windows)]
+    if completed {
+        if let Some(job) = &job {
+            terminate_job(job);
         }
     }
 
@@ -771,8 +913,8 @@ fn real_git_withheld_shaped_first_post() {
 /// the surviving grandchild would keep the pipes open and the reader joins would
 /// block for its full ~10s lifetime. Tearing down every member closes every
 /// write-end, so `run_bounded` returns promptly. This runs on every target, so
-/// the unix group signal and the windows taskkill tree kill are each covered on
-/// the platform where they compile. Reverting either teardown to a leader-only
+/// the unix group signal and the windows job terminate are each covered on the
+/// platform where they compile. Reverting either teardown to a leader-only
 /// `child.kill()` turns this RED there (elapsed ~10s, the assert below fires).
 #[test]
 fn run_bounded_reaps_descendants_holding_the_pipe() {
@@ -823,13 +965,16 @@ fn fixture_exit_leaving_pipe_holder() {
 /// (#192 F2). The leader spawns a pipe-holding descendant and returns immediately,
 /// so `try_wait` sees it gone and the loop breaks `completed` well before the
 /// deadline. The descendant still holds the reader pipes, so without closing the
-/// group on the clean-exit path the reader joins block on the descendant's full
-/// lifetime (~10s here; the real helper's ~300s HTTP timeout). Reverting the
-/// clean-path group reap in `run_bounded` turns this RED (elapsed ~10s). Unix-only:
-/// the fix relies on the process group staying reserved while a member is alive,
-/// and the Windows `taskkill /T` tree walk cannot reach a descendant once its
-/// leader has exited.
-#[cfg(unix)]
+/// group (unix) / terminating the job (windows) on the clean-exit path the reader
+/// joins block on the descendant's full lifetime (~10s here; the real helper's
+/// ~300s HTTP timeout). Reverting the clean-path teardown in `run_bounded` turns
+/// this RED (elapsed ~10s).
+///
+/// Runs on both platforms so a future Windows CI lane exercises the Job Object
+/// clean-exit teardown, which is exactly the case `taskkill /T` cannot cover: once
+/// the leader exits, the parent-pid tree no longer reaches the descendant, but the
+/// job still owns it. On this Linux box it runs the unix process-group path and
+/// passes; the Windows teardown here runs once issue #228's Windows CI lane exists.
 #[test]
 fn run_bounded_bounds_join_when_leader_exits_leaving_a_pipe_holder() {
     let cmd = fixture_command("fixture_exit_leaving_pipe_holder", "exit_holder");
@@ -849,6 +994,7 @@ fn run_bounded_bounds_join_when_leader_exits_leaving_a_pipe_holder() {
         elapsed < Duration::from_secs(5),
         "reader joins blocked on a descendant that outlived the leader: \
          elapsed={elapsed:?} (expected <5s; the clean-exit path must close the \
-         process group so the grandchild's held pipes do not stall the joins)"
+         process group (unix) / terminate the job (windows) so the grandchild's \
+         held pipes do not stall the joins)"
     );
 }
