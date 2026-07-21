@@ -253,24 +253,29 @@ impl AppState {
 /// repo spawn N parked tasks, each holding cloned object lists/rules/paths/keys — an
 /// unbounded outstanding set.
 ///
-/// This tracks the repo keys with an in-flight encryption task. Before spawning, the
-/// handler calls [`try_begin`](Self::try_begin): if a task for the repo is already
-/// in-flight it returns `None` and the handler SKIPS spawning a duplicate (coalesce —
-/// the newer push's objects are covered by the pending/next walk over the same repo's
-/// history). This bounds the outstanding set to <=1 pending task per repo WITHOUT
-/// dropping work: coalescing only delays a duplicate walk, it never sheds the recovery
-/// copy (there is no reconciliation sweep, so a *dropped* job would be lost forever).
+/// This tracks the repo keys with an in-flight encryption task, each carrying a
+/// DIRTY flag. Before spawning, the handler calls [`try_begin`](Self::try_begin): if
+/// a task for the repo is already in-flight it MARKS THE REPO DIRTY and returns `None`
+/// so the handler SKIPS spawning a duplicate (coalesce). The in-flight task consults
+/// the flag at its tail via [`requeue_or_release`](EncryptInflightGuard::requeue_or_release):
+/// a set flag makes it run ONE MORE pass (re-reading repo state) before it exits, so a
+/// push coalesced during the in-flight window is REQUEUED, never dropped. This bounds
+/// the outstanding set to <=1 task per repo without losing work: there is no
+/// reconciliation sweep, so a *dropped* job would be lost forever.
 ///
-/// The returned [`EncryptInflightGuard`] is moved into the detached task and removes
-/// the repo key on drop — on normal completion, error, OR panic (Drop runs on unwind)
-/// — so one crashed walk can never permanently lock a repo out of future recovery
-/// copies.
+/// The returned [`EncryptInflightGuard`] is moved into the detached task. The normal
+/// exit path is `requeue_or_release`, which removes the repo key ATOMICALLY with the
+/// "clean" decision — no push can land in the gap between "checked clean" and "task
+/// exits". `Drop` is a panic backstop only: if the task panics (or returns without
+/// calling `requeue_or_release`) it still removes the key so a crashed walk can never
+/// permanently lock a repo out of future recovery copies.
 #[derive(Clone, Default)]
 pub struct EncryptInflight {
-    // std::sync::Mutex: only ever held for O(1) HashSet insert/remove in a sync
-    // context (right before `tokio::spawn`, and in the guard's Drop) — never across
-    // an await, so a std Mutex is correct and cheaper than a tokio one.
-    repos: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    // std::sync::Mutex: only ever held for O(1) HashMap ops in a sync context (before
+    // `tokio::spawn`, at the task tail, and in Drop) — never across an await, so a std
+    // Mutex is correct and cheaper than a tokio one. The value is the DIRTY flag: a
+    // coalesced push flips it true so the in-flight task requeues one more pass.
+    repos: Arc<std::sync::Mutex<std::collections::HashMap<String, bool>>>,
 }
 
 impl EncryptInflight {
@@ -279,18 +284,24 @@ impl EncryptInflight {
     }
 
     /// Try to begin an encryption task for `repo_id`. Returns `Some(guard)` if no task
-    /// for the repo was in-flight (the caller should spawn), or `None` if one already
-    /// is (the caller should COALESCE — skip spawning a duplicate). The guard releases
-    /// the repo key on drop.
+    /// for the repo was in-flight (the caller should spawn). If one already is, MARKS
+    /// the repo dirty and returns `None` (the caller COALESCES — skips the duplicate
+    /// spawn; the in-flight task requeues one more pass to cover this push).
     pub fn try_begin(&self, repo_id: &str) -> Option<EncryptInflightGuard> {
-        let mut set = self.repos.lock().expect("encrypt_inflight mutex poisoned");
-        if set.insert(repo_id.to_string()) {
-            Some(EncryptInflightGuard {
-                repos: Arc::clone(&self.repos),
-                repo_id: repo_id.to_string(),
-            })
-        } else {
-            None
+        let mut map = self.repos.lock().expect("encrypt_inflight mutex poisoned");
+        match map.get_mut(repo_id) {
+            Some(dirty) => {
+                *dirty = true;
+                None
+            }
+            None => {
+                map.insert(repo_id.to_string(), false);
+                Some(EncryptInflightGuard {
+                    repos: Arc::clone(&self.repos),
+                    repo_id: repo_id.to_string(),
+                    released: false,
+                })
+            }
         }
     }
 
@@ -309,23 +320,66 @@ impl EncryptInflight {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Test-only: read the dirty flag for `repo_id` (`None` if no task is in-flight).
+    #[cfg(test)]
+    pub fn dirty(&self, repo_id: &str) -> Option<bool> {
+        self.repos
+            .lock()
+            .expect("encrypt_inflight mutex poisoned")
+            .get(repo_id)
+            .copied()
+    }
 }
 
-/// RAII guard removing a repo key from [`EncryptInflight`] when the detached
-/// encryption task finishes (drop on completion, error, or panic-unwind). Move-only —
-/// there is no reason to clone a guard, and cloning would double-remove.
+/// RAII guard for one in-flight encryption task's repo key. The task drives it at its
+/// tail with [`requeue_or_release`](Self::requeue_or_release); `Drop` is a panic
+/// backstop. Move-only — cloning would double-release.
 pub struct EncryptInflightGuard {
-    repos: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    repos: Arc<std::sync::Mutex<std::collections::HashMap<String, bool>>>,
     repo_id: String,
+    released: bool,
+}
+
+impl EncryptInflightGuard {
+    /// TASK-TAIL check-and-clear, atomic with the release decision. If a push
+    /// coalesced since the last pass (dirty), clear the flag and return `true` (the
+    /// task loops one more pass). Otherwise remove the key and return `false` (the task
+    /// exits). Atomic under the mutex: a concurrent push either sets the flag BEFORE
+    /// this reads it (-> requeue covers it) or arrives AFTER the key is removed (-> a
+    /// fresh `try_begin` spawns a new task) — there is no window where the key is
+    /// present-but-clean while the task exits.
+    pub fn requeue_or_release(&mut self) -> bool {
+        let mut map = self.repos.lock().expect("encrypt_inflight mutex poisoned");
+        match map.get_mut(&self.repo_id) {
+            Some(dirty) if *dirty => {
+                *dirty = false;
+                true
+            }
+            _ => {
+                map.remove(&self.repo_id);
+                self.released = true;
+                false
+            }
+        }
+    }
 }
 
 impl Drop for EncryptInflightGuard {
     fn drop(&mut self) {
-        // A poisoned lock (a prior panic while holding it) still lets us take the inner
-        // set via into_inner-on-guard; but poisoning here is not expected because the
-        // only critical sections are the O(1) ops above. Remove best-effort.
-        if let Ok(mut set) = self.repos.lock() {
-            set.remove(&self.repo_id);
+        // Panic backstop ONLY. The normal exit is `requeue_or_release` (which removed
+        // the key atomically and set `released`), so this does nothing then. If the
+        // task panicked or returned without releasing, remove the key so one crashed
+        // walk never permanently locks the repo out.
+        //
+        // Accepted residual: a panic with the dirty flag still set drops the requeued
+        // work — Drop cannot loop — the same loss class as the on-panic behavior before
+        // this change. No reconciliation sweep re-derives it.
+        if self.released {
+            return;
+        }
+        if let Ok(mut map) = self.repos.lock() {
+            map.remove(&self.repo_id);
         }
     }
 }

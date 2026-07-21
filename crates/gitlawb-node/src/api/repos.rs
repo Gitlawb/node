@@ -790,6 +790,269 @@ async fn withheld_recipients_gated(
     .await
 }
 
+/// Everything the detached post-push replication task needs that does not change
+/// between requeue passes. Cloned once from `AppState` at the spawn site so the task
+/// is self-contained (the handler keeps no copy).
+struct PostPushReplication {
+    db: std::sync::Arc<crate::db::Db>,
+    disk_path: std::path::PathBuf,
+    git_bin: String,
+    timeout: std::time::Duration,
+    ipfs_api: String,
+    repo_id: String,
+    encrypt_sem: std::sync::Arc<tokio::sync::Semaphore>,
+    node_seed: [u8; 32],
+    node_did: String,
+    repo_name: String,
+    irys_url: String,
+    http_client: std::sync::Arc<reqwest::Client>,
+}
+
+/// The requeue enumeration for the pin half: a fail-closed FULL scan of the current
+/// object DB under the REFRESHED rules. The coalesced push's ref tips are gone by the
+/// time we requeue, so the delta path is unavailable; the whole-repo scan is the safe
+/// superset. Never pins the bare `list_all_objects` output — that includes
+/// dangling/withheld blobs — it feeds it as CANDIDATES to the same fail-closed filter
+/// the push path's full-scan branch uses, which drops dangling and visibility-withheld
+/// blobs before anything is pinned.
+async fn requeue_full_scan_object_list(
+    disk_path: &std::path::Path,
+    git_bin: &str,
+    timeout: std::time::Duration,
+    rules: Vec<crate::db::VisibilityRule>,
+    is_public: bool,
+    owner_did: String,
+) -> Vec<String> {
+    let disk = disk_path.to_path_buf();
+    let gb = git_bin.to_string();
+    let candidates = tokio::task::spawn_blocking(move || {
+        crate::git::push_delta::list_all_objects(&disk, &gb, std::time::Instant::now() + timeout)
+    })
+    .await
+    .ok()
+    .and_then(|r| {
+        r.map_err(|e| {
+            tracing::warn!(err = %e, "requeue full-scan enumeration failed; pinning nothing this pass")
+        })
+        .ok()
+    })
+    .unwrap_or_default();
+    fail_closed_full_scan_objects(
+        disk_path.to_path_buf(),
+        rules,
+        is_public,
+        owner_did,
+        candidates,
+        git_bin.to_string(),
+        timeout,
+    )
+    .await
+}
+
+/// The detached post-push encryption + local-IPFS pin task, as a REQUEUE LOOP.
+///
+/// Pass one uses the spawn-time captures (`first_*`) — the delta the push handler
+/// already computed. At the TASK TAIL (unconditional on the encrypt gate below and on
+/// walk success) it consults the coalescing dirty flag: if a push coalesced during the
+/// window it re-reads repo state (rules, is_public, owner_did, withheld) FRESH from the
+/// DB, re-enumerates the pin set fail-closed, and runs another pass — so the coalesced
+/// push is covered before the task exits. Otherwise it releases the key and returns.
+///
+/// The tail placement is load-bearing: the encrypt+anchor block only runs under a
+/// path-scoped rule, so a check-and-clear placed inside that gate would never run for a
+/// public/rules-free repo or a failed walk, dropping exactly the pin-half push this
+/// requeue must cover.
+#[allow(clippy::too_many_arguments)]
+async fn run_post_push_replication(
+    mut guard: crate::state::EncryptInflightGuard,
+    ctx: PostPushReplication,
+    first_object_list: Vec<String>,
+    first_rules: Option<Vec<crate::db::VisibilityRule>>,
+    first_is_public: bool,
+    first_owner_did: String,
+    first_withheld: std::collections::HashSet<String>,
+) {
+    let mut object_list = first_object_list;
+    let mut rules_opt = first_rules;
+    let mut is_public = first_is_public;
+    let mut owner_did = first_owner_did;
+    // The task only spawns when `withheld.is_some()`, so pass one always replicates.
+    let mut withheld: Option<std::collections::HashSet<String>> = Some(first_withheld);
+
+    loop {
+        if withheld.is_some() {
+            // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
+            crate::ipfs_pin::pin_new_objects(
+                &ctx.ipfs_api,
+                &ctx.disk_path,
+                object_list.clone(),
+                &ctx.db,
+                &ctx.repo_id,
+            )
+            .await;
+
+            // Option B1: encrypt-then-pin the withheld blobs. No path-scoped rule can
+            // withhold a blob, so a rules-free repo has nothing to seal; skip. Mirrors
+            // the has_path_scoped_rule gate on the other two withheld-walk sites.
+            if let Some(rules) = rules_opt
+                .clone()
+                .filter(|r| visibility_pack::has_path_scoped_rule(r))
+            {
+                let recip = withheld_recipients_gated(
+                    ctx.encrypt_sem.clone(),
+                    ctx.disk_path.clone(),
+                    ctx.git_bin.clone(),
+                    ctx.timeout,
+                    rules,
+                    is_public,
+                    owner_did.clone(),
+                )
+                .await;
+                if let Ok(Ok(recipients)) = recip {
+                    let delta = crate::encrypted_pin::encrypt_and_pin(
+                        &ctx.ipfs_api,
+                        &ctx.disk_path,
+                        &ctx.db,
+                        &ctx.repo_id,
+                        &ctx.node_seed,
+                        &recipients,
+                    )
+                    .await;
+
+                    // Option B3: anchor a per-push manifest of the sealed blobs to
+                    // Arweave. Best-effort; never fails the push.
+                    if !delta.is_empty() && !ctx.irys_url.is_empty() {
+                        let owner_short = crate::db::normalize_owner_key(&owner_did);
+                        let repo_slug = format!("{owner_short}/{}", ctx.repo_name);
+                        let ts = chrono::Utc::now().to_rfc3339();
+                        let manifest = crate::arweave::EncryptedManifest {
+                            repo: &repo_slug,
+                            owner_did: &owner_did,
+                            node_did: &ctx.node_did,
+                            timestamp: &ts,
+                            blobs: &delta,
+                        };
+                        match crate::arweave::anchor_encrypted_manifest(
+                            &ctx.http_client,
+                            &ctx.irys_url,
+                            &manifest,
+                        )
+                        .await
+                        {
+                            Ok(tx) if !tx.is_empty() => tracing::info!(
+                                repo = %repo_slug,
+                                tx_id = %tx,
+                                "anchored encrypted manifest to Arweave"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                repo = %repo_slug,
+                                err = %e,
+                                "encrypted manifest anchor failed"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
+        // TASK TAIL — unconditional check-and-clear, atomic with the release decision.
+        if !guard.requeue_or_release() {
+            break;
+        }
+
+        // A push coalesced during this pass. Re-read repo state FRESH (never the stale
+        // spawn-time captures) so a coalesced push that changed `.gitlawb` withholding
+        // is walked under the new policy, then re-enumerate the pin set fail-closed.
+        let (r_rules, r_is_public, r_owner) = match ctx.db.get_repo_by_id(&ctx.repo_id).await {
+            Ok(Some(rec)) => (
+                ctx.db.list_visibility_rules(&ctx.repo_id).await.ok(),
+                rec.is_public,
+                rec.owner_did,
+            ),
+            Ok(None) => {
+                tracing::debug!(repo = %ctx.repo_id, "repo gone before requeue pass; releasing");
+                (None, false, String::new())
+            }
+            Err(e) => {
+                tracing::warn!(repo = %ctx.repo_id, err = %e, "requeue repo re-read failed; skipping this pass's work");
+                (None, false, String::new())
+            }
+        };
+        let (_announce, r_withheld) = replication_withheld_set(
+            r_rules.clone(),
+            &r_owner,
+            r_is_public,
+            ctx.disk_path.clone(),
+            ctx.git_bin.clone(),
+            ctx.timeout,
+        )
+        .await;
+        object_list = match &r_withheld {
+            Some(_) => {
+                requeue_full_scan_object_list(
+                    &ctx.disk_path,
+                    &ctx.git_bin,
+                    ctx.timeout,
+                    r_rules.clone().unwrap_or_default(),
+                    r_is_public,
+                    r_owner.clone(),
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
+        rules_opt = r_rules;
+        is_public = r_is_public;
+        owner_did = r_owner;
+        withheld = r_withheld;
+    }
+}
+
+/// Test-only entry point: build the `PostPushReplication` context from a test
+/// `AppState` (with an overridable `ipfs_api` for a mock Kubo server and an explicit
+/// `disk_path` for the fixture repo) and run the requeue loop. Keeps
+/// `PostPushReplication` and `run_post_push_replication` private to this module.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_post_push_replication_for_test(
+    state: &AppState,
+    guard: crate::state::EncryptInflightGuard,
+    disk_path: std::path::PathBuf,
+    repo_id: String,
+    ipfs_api: String,
+    is_public: bool,
+    owner_did: String,
+    object_list: Vec<String>,
+    rules: Option<Vec<crate::db::VisibilityRule>>,
+    withheld: std::collections::HashSet<String>,
+) {
+    let ctx = PostPushReplication {
+        db: state.db.clone(),
+        disk_path: disk_path.clone(),
+        git_bin: state.git_bin.clone(),
+        timeout: std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+        ipfs_api,
+        repo_id,
+        encrypt_sem: state.git_encrypt_semaphore.clone(),
+        node_seed: *state.node_keypair.to_seed(),
+        node_did: state.node_did.to_string(),
+        repo_name: String::new(),
+        irys_url: String::new(),
+        http_client: std::sync::Arc::clone(&state.http_client),
+    };
+    run_post_push_replication(
+        guard,
+        ctx,
+        object_list,
+        rules,
+        is_public,
+        owner_did,
+        withheld,
+    )
+    .await;
+}
+
 /// Map an error from a `smart_http` git service call to the right `AppError`:
 /// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
 /// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
@@ -1434,128 +1697,44 @@ pub async fn git_receive_pack(
     // Pin new git objects to the local IPFS node (no-op if ipfs_api is empty).
     // Skipped entirely when the public cannot read the repo (withheld == None).
     //
-    // Coalesce per repo (#174 P2-2): this task parks on `git_encrypt_semaphore`
-    // (which DEFERS when the pool is full rather than dropping the recovery copy). To
-    // bound the OUTSTANDING parked-task set, only spawn if no encryption task for this
-    // repo is already in flight; otherwise skip — the pending/next walk over this
-    // repo's history already covers the newer push's objects, so the recovery copy is
-    // delayed, never lost. The guard removes the repo key when the task ends (success,
-    // error, or panic), so a later push is re-admitted (no permanent skip).
-    if withheld.is_some() {
+    // Coalesce per repo (#174 P2-2): only spawn a task if none is in flight for this
+    // repo; otherwise `try_begin` marks the repo DIRTY and the in-flight task requeues
+    // one more pass (re-reading fresh repo state) before it exits. This bounds the
+    // outstanding parked-task set to one per repo while covering every coalesced push —
+    // there is no reconciliation sweep, so a dropped job would be lost forever (#173 F3).
+    if let Some(withheld_set) = withheld.clone() {
         match state.encrypt_inflight.try_begin(&record.id) {
             None => {
                 tracing::debug!(
                     repo = %record.id,
                     "post-push encryption task already in flight for this repo; coalescing \
-                     (the pending recovery-copy walk covers this push's objects)"
+                     (the in-flight task will requeue one more pass to cover this push)"
                 );
             }
             Some(inflight_guard) => {
-                let object_list_ipfs = object_list.clone();
-                let ipfs_api = state.config.ipfs_api.clone();
-                let repo_path_clone = disk_path.clone();
-                let db_clone = state.db.clone();
-                let rules_for_enc = rules_opt.clone();
-                let repo_id = record.id.clone();
-                let owner_did = record.owner_did.clone();
-                let is_public = record.is_public;
-                let irys_url = state.config.irys_url.clone();
-                let http_client = std::sync::Arc::clone(&state.http_client);
-                let node_did_str = state.node_did.to_string();
-                let node_seed = state.node_keypair.to_seed();
-                let repo_name = record.name.clone();
-                let enc_git_bin = state.git_bin.clone();
-                let enc_timeout =
-                    std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-                let encrypt_sem = state.git_encrypt_semaphore.clone();
-                tokio::spawn(async move {
-                    // Held for the whole task; drop (on completion/error/panic) releases the
-                    // repo's coalescing key so the next push for this repo can spawn again.
-                    let _inflight_guard = inflight_guard;
-                    let pinned = crate::ipfs_pin::pin_new_objects(
-                        &ipfs_api,
-                        &repo_path_clone,
-                        object_list_ipfs,
-                        &db_clone,
-                        &repo_id,
-                    )
-                    .await;
-                    if !pinned.is_empty() {
-                        tracing::info!(count = pinned.len(), "pinned git objects to IPFS");
-                        for (sha, cid) in &pinned {
-                            tracing::info!(sha = %sha, %cid, "pinned");
-                        }
-                    }
-
-                    // Option B1: encrypt-then-pin the withheld blobs so authorized
-                    // readers can recover them when the origin cannot serve them.
-                    // No path-scoped rule can withhold a blob, so withheld_blob_recipients
-                    // would return an empty map after a full per-ref walk; skip it. Mirrors
-                    // the has_path_scoped_rule gate on the other two withheld-walk sites.
-                    if let Some(rules) =
-                        rules_for_enc.filter(|r| visibility_pack::has_path_scoped_rule(r))
-                    {
-                        // Bound the number of concurrent post-push encryption walks (#174 P1-e):
-                        // acquire an admission permit before the full-history walk, deferring
-                        // when the pool is full rather than shedding the recovery pin.
-                        let recip = withheld_recipients_gated(
-                            encrypt_sem.clone(),
-                            repo_path_clone.clone(),
-                            enc_git_bin.clone(),
-                            enc_timeout,
-                            rules,
-                            is_public,
-                            owner_did.clone(),
-                        )
-                        .await;
-                        if let Ok(Ok(recipients)) = recip {
-                            let delta = crate::encrypted_pin::encrypt_and_pin(
-                                &ipfs_api,
-                                &repo_path_clone,
-                                &db_clone,
-                                &repo_id,
-                                &node_seed,
-                                &recipients,
-                            )
-                            .await;
-
-                            // Option B3: anchor a per-push manifest of the blobs sealed
-                            // this push to Arweave, so the oid->cid index survives total
-                            // node loss. Best-effort; never fails the push.
-                            if !delta.is_empty() && !irys_url.is_empty() {
-                                let owner_short = crate::db::normalize_owner_key(&owner_did);
-                                let repo_slug = format!("{owner_short}/{repo_name}");
-                                let ts = chrono::Utc::now().to_rfc3339();
-                                let manifest = crate::arweave::EncryptedManifest {
-                                    repo: &repo_slug,
-                                    owner_did: &owner_did,
-                                    node_did: &node_did_str,
-                                    timestamp: &ts,
-                                    blobs: &delta,
-                                };
-                                match crate::arweave::anchor_encrypted_manifest(
-                                    &http_client,
-                                    &irys_url,
-                                    &manifest,
-                                )
-                                .await
-                                {
-                                    Ok(tx) if !tx.is_empty() => tracing::info!(
-                                        repo = %repo_slug,
-                                        tx_id = %tx,
-                                        "anchored encrypted manifest to Arweave"
-                                    ),
-                                    Ok(_) => {}
-                                    Err(e) => tracing::warn!(
-                                        repo = %repo_slug,
-                                        err = %e,
-                                        "encrypted manifest anchor failed"
-                                    ),
-                                }
-                            }
-                        }
-                    }
-                });
+                let ctx = PostPushReplication {
+                    db: state.db.clone(),
+                    disk_path: disk_path.clone(),
+                    git_bin: state.git_bin.clone(),
+                    timeout: std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                    ipfs_api: state.config.ipfs_api.clone(),
+                    repo_id: record.id.clone(),
+                    encrypt_sem: state.git_encrypt_semaphore.clone(),
+                    node_seed: *state.node_keypair.to_seed(),
+                    node_did: state.node_did.to_string(),
+                    repo_name: record.name.clone(),
+                    irys_url: state.config.irys_url.clone(),
+                    http_client: std::sync::Arc::clone(&state.http_client),
+                };
+                tokio::spawn(run_post_push_replication(
+                    inflight_guard,
+                    ctx,
+                    object_list.clone(),
+                    rules_opt.clone(),
+                    record.is_public,
+                    record.owner_did.clone(),
+                    withheld_set,
+                ));
             }
         }
     }
@@ -4570,6 +4749,130 @@ mod tests {
         assert!(
             inflight.try_begin("owner/first").is_some(),
             "the first push on a cold in-flight set must admit (never falsely coalesce)"
+        );
+    }
+
+    // ---- U3 (#173 F3): dirty-flag requeue seam (the mechanics behind the end-to-end
+    // requeue tests in test_support.rs) ----
+
+    /// A coalesced push MARKS the repo dirty (not just "skip"), and the in-flight task's
+    /// tail check-and-clear then runs ONE more pass before releasing: `requeue_or_release`
+    /// returns `true` (loop) while dirty, clearing the flag, then `false` (release) when
+    /// clean. This is the mechanism that makes a coalesced push requeued, not dropped.
+    #[test]
+    fn u3_try_begin_marks_dirty_then_requeue_loops_once_then_releases() {
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkU3DirtyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/proj";
+
+        let mut guard = inflight.try_begin(repo).expect("first push admits");
+        assert_eq!(inflight.dirty(repo), Some(false), "fresh task starts clean");
+
+        // A push coalesces during the in-flight window: marked dirty, no new task.
+        assert!(
+            inflight.try_begin(repo).is_none(),
+            "coalesced push does not spawn"
+        );
+        assert_eq!(
+            inflight.dirty(repo),
+            Some(true),
+            "the coalesced push marked the repo dirty"
+        );
+
+        // Task tail, pass 1: dirty -> requeue (clear the flag, keep the key, loop).
+        assert!(
+            guard.requeue_or_release(),
+            "dirty repo requeues one more pass"
+        );
+        assert_eq!(
+            inflight.dirty(repo),
+            Some(false),
+            "the dirty flag is cleared for the next pass"
+        );
+        assert_eq!(
+            inflight.len(),
+            1,
+            "the key is still held while the task loops"
+        );
+
+        // Task tail, pass 2: clean -> release (remove the key, exit).
+        assert!(
+            !guard.requeue_or_release(),
+            "a clean repo releases and exits"
+        );
+        assert_eq!(inflight.len(), 0, "the key is removed on the clean release");
+        assert_eq!(
+            inflight.dirty(repo),
+            None,
+            "no in-flight entry after release"
+        );
+    }
+
+    /// The check-and-clear is ATOMIC with the release decision, so no push lands in a
+    /// "checked clean but still present" gap (scenario 6, race gap). A push that arrives
+    /// BEFORE the tail check sets dirty -> the same pass requeues it. A push that arrives
+    /// AFTER a clean release finds an empty set -> `try_begin` spawns a fresh task. Both
+    /// directions covered; neither drops the push.
+    #[test]
+    fn u3_requeue_or_release_leaves_no_uncovered_gap() {
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkU3GapBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB/proj";
+
+        // Case A: push arrives before the tail check -> requeue covers it.
+        let mut guard = inflight.try_begin(repo).expect("admit");
+        assert!(
+            inflight.try_begin(repo).is_none(),
+            "push arrives during the window"
+        );
+        assert!(
+            guard.requeue_or_release(),
+            "the pre-check push is covered by a requeue"
+        );
+        // Now clean: the task releases and exits.
+        assert!(!guard.requeue_or_release(), "clean -> release");
+        assert_eq!(inflight.len(), 0);
+
+        // Case B: a push arriving after release starts a brand-new task (not dropped).
+        let guard2 = inflight.try_begin(repo);
+        assert!(
+            guard2.is_some(),
+            "a post-release push spawns a fresh task, never dropped"
+        );
+    }
+
+    /// Drop is a PANIC BACKSTOP only. A task that panics before releasing still frees the
+    /// key (so a crashed walk never permanently locks the repo out); a task that releases
+    /// via `requeue_or_release` and then drops does not double-free.
+    #[test]
+    fn u3_drop_is_panic_backstop_for_unreleased_guard() {
+        let inflight = crate::state::EncryptInflight::new();
+        let repo = "did:key:z6MkU3PanicCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC/proj";
+
+        // Normal release then drop: key already gone, drop is a no-op.
+        let mut g = inflight.try_begin(repo).expect("admit");
+        assert!(!g.requeue_or_release(), "clean release");
+        assert_eq!(inflight.len(), 0);
+        drop(g);
+        assert_eq!(
+            inflight.len(),
+            0,
+            "dropping an already-released guard does not resurrect a key"
+        );
+
+        // Panic before releasing: Drop-on-unwind frees the key.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = inflight.try_begin(repo).expect("admit before panic");
+            assert_eq!(inflight.len(), 1);
+            panic!("task panics before reaching its tail check-and-clear");
+        }));
+        assert!(panicked.is_err(), "the simulated task panicked");
+        assert_eq!(
+            inflight.len(),
+            0,
+            "a panic before release still frees the key (backstop), so the repo is not locked out"
+        );
+        assert!(
+            inflight.try_begin(repo).is_some(),
+            "the repo can be admitted again after a panic"
         );
     }
 
