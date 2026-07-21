@@ -332,14 +332,16 @@ impl RepoStore {
         store::init_bare(&local_path).context("initializing bare repo")?;
 
         // Upload to the object store in the background, UNDER the per-repo lock
-        // so the PUT can't race a purge. Skips on contention; a skipped init
-        // upload self-heals — the first write's release re-uploads the state.
+        // so the PUT can't race a purge. Waits (bounded) for the lock:
+        // create_repo calls init while holding this repo's lock, so the upload
+        // waits out the creator's own insert-and-release rather than dying on it
+        // (a skipped init upload has no retry until the first write).
         if self.object_store.is_some() {
             let store = self.clone();
             let did = owner_did.to_string();
             let name = repo_name.to_string();
             tokio::spawn(async move {
-                store.upload_locked(&did, &name, false).await;
+                store.upload_locked(&did, &name, true).await;
             });
         }
 
@@ -372,10 +374,12 @@ impl RepoStore {
     /// the dir under its lock, so a post-purge uploader finds it gone and skips.
     /// Returns true iff a PUT was performed. A no-op when no store is configured.
     ///
-    /// `wait`: fork's foreground upload waits (bounded) for the lock; the
-    /// background migration/init uploads pass `false` and skip on contention —
-    /// they self-heal (lazy migration retries on the next `acquire`, init's
-    /// state is re-uploaded by the first write's release).
+    /// `wait`: fork's foreground upload and init's background upload wait
+    /// (bounded) for the lock; a skipped upload on those paths has no later
+    /// retry (init's next re-upload is the first write's release, which may
+    /// never come). The background lazy-migration upload passes `false` and
+    /// skips on contention; that skip genuinely self-heals, since the next
+    /// `acquire` retries the migration.
     async fn upload_locked(&self, owner_did: &str, repo_name: &str, wait: bool) -> bool {
         let Some(ref store) = self.object_store else {
             return false;
@@ -1291,10 +1295,77 @@ mod tests {
             .join(format!("{name}.git"))
     }
 
-    // R7/R8/AE6: init's background upload must SKIP while a live writer holds the
-    // repo lock. Pre-fix (unlocked upload) it PUTs regardless -> RED.
+    // R1/R7: init's background upload must WAIT (bounded) for the creator's own
+    // lock rather than dying on it. create_repo holds the per-repo lock across
+    // existence-check -> init -> row insert, so the spawned upload always finds
+    // it held at first. Create-shaped flow: hold the lock, init under it,
+    // release shortly after; no PUT while held, exactly one PUT after release.
+    // Pre-fix (wait=false) the task try-locks once, skips, and the PUT never
+    // arrives -> RED on the post-release assert. The "still empty at 500ms"
+    // assert alone would pass vacuously during the new wait window; the
+    // post-release upload assert is what makes this test load-bearing.
     #[sqlx::test]
-    async fn init_upload_skips_while_repo_locked(
+    async fn init_upload_waits_out_creators_lock_then_uploads(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        let pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ts = GatedStore::new(false);
+        let uploads = ts.uploads.clone();
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkInitWaitAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "initwait";
+        let slug = owner.replace([':', '/'], "_");
+
+        let held = store.try_lock_repo(owner, name).await.unwrap().unwrap();
+        store.init(owner, name).await.unwrap();
+        // While the creator still holds the lock the upload must not PUT.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "init's upload must not PUT while the creator still holds the lock"
+        );
+        held.release().await;
+
+        // The waiting task retries every 200ms; the PUT must land soon after.
+        let mut landed = false;
+        for _ in 0..50 {
+            if uploads.lock().unwrap().len() == 1 {
+                landed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            landed,
+            "init's upload must PUT after the creator releases the lock"
+        );
+        let ups = uploads.lock().unwrap();
+        assert_eq!(
+            ups.len(),
+            1,
+            "init's upload must PUT exactly once after the lock frees"
+        );
+        assert_eq!(ups[0], (slug, name.to_string()));
+    }
+
+    // R1/R7 negative: the bounded wait must not become an unbounded one. A lock
+    // held past the full 30 x 200ms window yields NO PUT: the task logs a skip
+    // and exits. The post-release grace assert is what proves boundedness; an
+    // unbounded waiter would still be parked at release time and would PUT once
+    // the lock frees. (Reworked from init_upload_skips_while_repo_locked, whose
+    // skip-immediately premise inverts under wait=true.)
+    #[sqlx::test]
+    async fn init_upload_gives_up_after_bounded_lock_wait(
         pool_opts: sqlx::postgres::PgPoolOptions,
         connect_opts: sqlx::postgres::PgConnectOptions,
     ) {
@@ -1316,13 +1387,19 @@ mod tests {
 
         let held = store.try_lock_repo(owner, name).await.unwrap().unwrap();
         store.init(owner, name).await.unwrap();
-        // Let the spawned upload attempt-and-skip.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Hold past the entire bounded window (29 sleeps x 200ms, ~5.8s).
+        tokio::time::sleep(std::time::Duration::from_millis(8_000)).await;
         assert!(
             uploads.lock().unwrap().is_empty(),
-            "init's background upload must skip while the repo is locked by a live writer"
+            "init's upload must give up, not PUT, when the lock outlives the bounded wait"
         );
         held.release().await;
+        // A still-parked (unbounded) waiter would PUT within ~200ms of release.
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        assert!(
+            uploads.lock().unwrap().is_empty(),
+            "no late PUT after release; the upload task must have exited at the bound"
+        );
     }
 
     // R8/AE6: fork's foreground upload (release_after_write) WAITS for the lock
