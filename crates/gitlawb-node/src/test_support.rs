@@ -3674,6 +3674,55 @@ mod tests {
         );
     }
 
+    /// T2b (R5, KTD5): the `GITLAWB_IPFS_MAX_REPOS_WALKED` knob drives the legacy-probe
+    /// budget end to end. With the knob at 1 (fed through the same production helper the
+    /// state seeding uses) and two candidate repos that miss, the first repo spends the
+    /// single probe and the second is skipped at the cap → truncated → 503. If the knob
+    /// budget were not honoured (unbounded), both would probe, both miss, and the request
+    /// would be a definitive 404. Proves the wired knob=1 → exactly one probe path.
+    #[sqlx::test]
+    async fn ipfs_cid_repos_walked_knob_caps_legacy_probes(pool: PgPool) {
+        use clap::Parser;
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        // Seed the legacy-probe budget the way production does: from the operator knob.
+        let cfg =
+            crate::config::Config::parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "1"]);
+        state.ipfs_max_legacy_probes = AppState::ipfs_legacy_probe_budget(&cfg);
+        assert_eq!(state.ipfs_max_legacy_probes, 1, "knob=1 → one-probe budget");
+        // The knob must not touch the history-walk ceiling (must stay MAX_PIN_SOURCES + 1).
+        assert_eq!(
+            state.ipfs_max_history_walks,
+            crate::api::ipfs::MAX_HISTORY_WALKS_PER_REQUEST,
+            "the repos-walked knob leaves the history-walk ceiling untouched"
+        );
+
+        let _fx = seed_cid_repos(&slug, &short, &["k0", "k1"]);
+        for n in ["k0", "k1"] {
+            let repo = seed_repo(&owner_did, n);
+            state.db.create_repo(&repo).await.expect("seed repo");
+        }
+        // A legacy pin whose oid is absent from every repo: the cap, not a hit, decides.
+        let bogus_oid = "0".repeat(64);
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(b"absent-marker-knob").to_string();
+        state
+            .db
+            .record_pinned_cid(&bogus_oid, &cid, None)
+            .await
+            .expect("record legacy pin");
+
+        let (st, _) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "knob=1 caps the scan at one probe → incomplete search → retryable 503"
+        );
+    }
+
     /// T3 (F2): a walk-cap truncation must not false-404. Walk ceiling shrunk to 1;
     /// two public repos each carry a path-scoped rule over the object and deny anon.
     /// The 1st spends the single walk (deny), the 2nd is skipped at the cap — the

@@ -242,6 +242,18 @@ impl AppState {
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
     }
+
+    /// Legacy-probe budget wired from the `GITLAWB_IPFS_MAX_REPOS_WALKED` operator
+    /// knob (R5, KTD5). The knob seeds `ipfs_max_legacy_probes` at construction so it
+    /// controls the per-request legacy (NULL-provenance) probe fan-out it advertises.
+    /// It deliberately does NOT feed `ipfs_max_history_walks`: that ceiling must stay
+    /// at `MAX_HISTORY_WALKS_PER_REQUEST` (`MAX_PIN_SOURCES + 1`) or a provenanced
+    /// request with a full source set is truncated into a false 503, and the knob's
+    /// range starts at 1. The knob is `usize`, the field `u32`; the range cap
+    /// (1_048_576) keeps the cast lossless.
+    pub(crate) fn ipfs_legacy_probe_budget(config: &crate::config::Config) -> u32 {
+        config.ipfs_max_repos_walked as u32
+    }
 }
 
 /// Bounds the OUTSTANDING post-push encryption-task set by per-repo coalescing
