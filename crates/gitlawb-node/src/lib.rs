@@ -1243,6 +1243,41 @@ fn list_publish_markers(final_path: &std::path::Path) -> Vec<std::path::PathBuf>
     markers
 }
 
+/// The publish markers AND recovery claims (`.{stem}.publishing.*` plus
+/// `.{stem}.recovering.*`) beside `final_path`, sorted: the full claimable
+/// set for crash recovery (#194, F3). Claims count because a recoverer's
+/// claim IS a renamed marker: a recoverer that crashes between its claim
+/// rename and the quarantine leaves a content-bad final with a claim and
+/// ZERO markers, and a signature keyed on markers alone would leave that
+/// state unrecoverable forever. Directory-read and non-UTF-8 policy match
+/// `list_publish_markers`.
+fn list_recovery_claimables(final_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.pem");
+    let publishing = format!(".{stem}.publishing.");
+    let recovering = format!(".{stem}.recovering.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut claimables: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&publishing) || n.starts_with(&recovering))
+        })
+        .map(|e| e.path())
+        .collect();
+    claimables.sort();
+    claimables
+}
+
 /// Load a key another concurrent start may still be publishing, polling until it
 /// parses or `KEY_RACE_DEADLINE` elapses. An already-provisioned key parses on
 /// the first attempt with no sleep.
@@ -1262,8 +1297,9 @@ enum BootLoad {
     /// Boxed to keep the variants' sizes comparable (clippy:
     /// large_enum_variant); the enum lives only across a boot-time match.
     Loaded(Box<Keypair>),
-    /// Content-class failure observed while a `.publishing.` marker was
-    /// present; returned immediately, without riding the deadline.
+    /// Content-class failure observed while a `.publishing.` marker or a
+    /// `.recovering.` claim was present, on two consecutive polls; returned
+    /// without riding the rest of the deadline.
     CrashSignature(anyhow::Error),
     /// Any other failure, after the full deadline.
     Failed(anyhow::Error),
@@ -1271,13 +1307,19 @@ enum BootLoad {
 
 /// `load_racing_key` for the boot loop (#194, U2). With `crash_exit` set, a
 /// content-class failure (`KeyContentError`) observed while a `.publishing.`
-/// marker is present returns `CrashSignature` IMMEDIATELY instead of riding
-/// the deadline: marker plus unreadable content is the crash signature
-/// recovery exists for, and the caller's atomic claim rename arbitrates the
-/// (rare) race against a live fallback publisher still inside its window.
-/// Every other failure keeps the full wall-clock deadline. `load_fault` is
-/// the injection hook (a no-op `Ok` in production); an injected `Err` is
-/// taken as that attempt's result and is NOT content-class.
+/// marker or a `.recovering.` claim is present, on TWO consecutive polls,
+/// returns `CrashSignature` instead of riding the deadline: claimable plus
+/// unreadable content is the crash signature recovery exists for, and the
+/// caller's atomic claim renames arbitrate the (rare) race against a live
+/// fallback publisher still inside its window. Claims count toward the
+/// signature for F3 (see `list_recovery_claimables`). The two-poll grace
+/// exists so a reader that catches a live publisher's mid-write window is
+/// not instantly classified as a crash: one ~2ms iteration is enough for
+/// most writes to complete, and a real crash state persists across every
+/// poll. Every other failure keeps the full wall-clock deadline.
+/// `load_fault` is the injection hook (a no-op `Ok` in production); an
+/// injected `Err` is taken as that attempt's result and is NOT
+/// content-class.
 fn boot_load_key(
     path: &std::path::Path,
     crash_exit: bool,
@@ -1285,6 +1327,7 @@ fn boot_load_key(
 ) -> BootLoad {
     let deadline = std::time::Instant::now() + KEY_RACE_DEADLINE;
     let mut last_err;
+    let mut signature_seen = false;
     loop {
         match load_fault()
             .map_err(anyhow::Error::new)
@@ -1293,9 +1336,13 @@ fn boot_load_key(
             Ok(kp) => return BootLoad::Loaded(Box::new(kp)),
             Err(e) => last_err = e,
         }
-        if crash_exit && is_key_content_error(&last_err) && !list_publish_markers(path).is_empty() {
+        let signature = crash_exit
+            && is_key_content_error(&last_err)
+            && !list_recovery_claimables(path).is_empty();
+        if signature && signature_seen {
             return BootLoad::CrashSignature(last_err);
         }
+        signature_seen = signature;
         if std::time::Instant::now() >= deadline {
             return BootLoad::Failed(last_err);
         }
@@ -1505,14 +1552,17 @@ impl PublishFaults {
 ///
 /// Against the boot-time crash RECOVERY race (#194, U3) the fallback's marker
 /// protocol restores (b)-style convergence: removing the publish marker is
-/// the winner's commit check, and recovery claims a round by renaming that
-/// same marker, so exactly one side takes the round. A winner that loses its
-/// marker demotes itself to Lost, waits out any `.recovering.` claim
-/// (bounded by `KEY_RACE_DEADLINE`), and re-loads the settled key. Honest
-/// residuals: a winner stalled past `KEY_RACE_DEADLINE` that loads in the
-/// sub-ms window before a recoverer's claim exists, and a crash-interrupted
-/// recovery whose stale claim just expires the bounded wait — both degrade
-/// to a loud error or a re-load, never silent two-sided divergence.
+/// the winner's commit check, and recovery claims a round by renaming EVERY
+/// marker and stale claim beside the final (a live winner's own marker is
+/// necessarily among them), so exactly one side takes the round. A winner
+/// that loses its marker demotes itself to Lost, waits out any
+/// `.recovering.` claim (bounded by `KEY_RACE_DEADLINE`), and re-loads the
+/// settled key; a recovery that finds the final completed after claiming
+/// re-loads it instead of quarantining. Honest residuals: a winner stalled
+/// past `KEY_RACE_DEADLINE` that loads in the sub-ms window before a
+/// recoverer's claim exists, and a crash-interrupted recovery whose stale
+/// claim just expires the bounded wait: both degrade to a loud error or a
+/// re-load, never silent two-sided divergence.
 ///
 /// `before_link` is a no-op in production; tests use it to widen the
 /// post-write / pre-link window deterministically. `before_commit` runs
@@ -1824,9 +1874,10 @@ fn publish_key_fallback(
         }
     }
     // Success: the final is complete and durable. Removing our OWN marker is
-    // the COMMIT CHECK (#194, U3): recovery claims a round by renaming this
-    // exact marker, so a successful removal proves no recovery can ever claim
-    // it and linearizes this winner ahead of any recoverer. Any failure
+    // the COMMIT CHECK (#194, U3): recovery claims a round by renaming EVERY
+    // marker beside the final, so our marker is necessarily among any
+    // claimed round and a successful removal proves no recovery can ever
+    // claim it, linearizing this winner ahead of any recoverer. Any failure
     // (NotFound after a peer's claim rename, or any other error) means
     // ownership of the round cannot be proven: a recovering peer may have
     // quarantined our final and republished, so returning Won could report
@@ -1872,6 +1923,10 @@ struct RecoverySeam<'a> {
     /// `Err` is taken as that sync's result, so a test can fail the sweep's
     /// durability gate deterministically (#194, U4).
     sweep_sync: fn() -> std::io::Result<()>,
+    /// Runs inside `recover_crashed_publish` between the claim renames and
+    /// the post-claim re-parse of the final, so a test can interleave a
+    /// concurrent publisher's resolution into exactly that window (#194, F2).
+    before_reparse: &'a dyn Fn(),
 }
 
 impl RecoverySeam<'_> {
@@ -1880,6 +1935,7 @@ impl RecoverySeam<'_> {
         load_fault: || Ok(()),
         before_publish: &|| {},
         sweep_sync: || Ok(()),
+        before_reparse: &|| {},
     };
 }
 
@@ -1895,10 +1951,10 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
 /// Outcome of `recover_crashed_publish` (#194, U2).
 enum Recovery {
-    /// A marker was claimed and the corrupt final quarantined (or removed);
-    /// the caller regenerates. Holds the claim file's path, removed only
-    /// after the follow-up publish resolves.
-    Claimed(std::path::PathBuf),
+    /// The round was claimed and the corrupt final quarantined (or removed);
+    /// the caller regenerates. Holds every claim file this recovery created,
+    /// removed once the follow-up publish resolves (or on any error exit).
+    Claimed(Vec<std::path::PathBuf>),
     /// The marker vanished before it could be claimed (the publisher — or a
     /// competing recoverer — resolved the window concurrently): the single
     /// follow-up load's result is final, success or error, no recovery.
@@ -1907,20 +1963,55 @@ enum Recovery {
     Reloaded(Box<Result<Keypair>>),
 }
 
+/// Best-effort removal of the claim files a recovery created, plus a
+/// best-effort dir fsync. Claims vouch for NO on-disk content (unlike
+/// publish markers, whose disposal order against the final is pinned): they
+/// only gate a demoted publisher's bounded wait and recovery arbitration.
+/// Release therefore needs no ordering against the final, the markers, or
+/// anything else: any exit may drop the claims at any point once their owner
+/// stops recovering, and the worst a lost claim can cause is a waiter
+/// re-loading early, which the load path copes with (#194, F1/F3).
+fn release_recovery_claims(final_path: &std::path::Path, claims: &[std::path::PathBuf]) {
+    for claim in claims {
+        let _ = std::fs::remove_file(claim);
+    }
+    #[cfg(unix)]
+    {
+        let _ = fsync_parent_dir(final_path);
+    }
+}
+
 /// Claim-and-quarantine for a boot whose load returned `CrashSignature`: a
-/// content-class failure beside a `.publishing.` marker — U1's signature of
-/// a fallback publish crashed inside its non-atomic window (#194, U2).
-/// Atomically claims ONE marker (rename to `.{stem}.recovering.{pid}`, so N
-/// racing recoverers admit exactly one), quarantines the corrupt final by
-/// rename (preserving bytes and mode for post-mortem; falls back to removal
-/// only if every quarantine name fails), consumes any remaining markers
-/// best-effort, and hands control back to regenerate. The caller observed a
-/// marker, so finding none here (or losing the claim rename) means the
-/// window was resolved concurrently: one immediate re-load decides, with no
-/// recovery.
+/// content-class failure beside a `.publishing.` marker or `.recovering.`
+/// claim, the signature of a fallback publish (or a recovery) crashed
+/// inside its window (#194, U2/F2/F3). Claims the WHOLE round: every marker
+/// and every pre-existing claim is renamed to a fresh claim of our own
+/// (`.{stem}.recovering.{pid}.{n}`, bounded fresh-name probing per item, the
+/// KEY_TEMP_ATTEMPTS discipline; a NotFound on an individual rename means
+/// that item resolved concurrently and is skipped). Claiming everything is
+/// what makes the publisher's commit check sound: a live fallback publisher
+/// still inside its window necessarily has its own marker among the
+/// claimables, so its marker removal fails and it demotes (F2); claiming
+/// only one marker would let a stale marker's claim steal a live round.
+///
+/// If NO rename lands, the round resolved concurrently: one immediate
+/// re-load decides, with no recovery. If at least one lands, this recovery
+/// owns the round, and it RE-PARSES the final once before touching it: a
+/// publisher that completed inside the claim window has already resolved the
+/// round, so a parseable final is returned as `Reloaded` and the claims are
+/// released, never quarantining a good key. Only if the final still
+/// content-fails does the recovery quarantine it by rename (preserving bytes
+/// and mode for post-mortem; falling back to removal only if every
+/// quarantine name fails), consume any remaining markers best-effort, and
+/// hand control back to regenerate. Every error exit after claiming releases
+/// the claims first (see `release_recovery_claims`; a leaked claim would
+/// stall later demoted publishers on the full deadline, F1). `before_reparse`
+/// is the test seam for the claim-to-re-parse window (a no-op in
+/// production).
 fn recover_crashed_publish(
     final_path: &std::path::Path,
     load_err: anyhow::Error,
+    before_reparse: &dyn Fn(),
 ) -> Result<Recovery> {
     let dir = final_path
         .parent()
@@ -1930,27 +2021,58 @@ fn recover_crashed_publish(
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("identity.pem");
-    let markers = list_publish_markers(final_path);
-    let Some(first_marker) = markers.first() else {
+    let claimables = list_recovery_claimables(final_path);
+    if claimables.is_empty() {
         return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
-    };
+    }
 
-    // CLAIM one marker atomically. rename admits exactly one winner: a
-    // competing recoverer (or the publisher finishing and removing its
-    // marker) leaves NotFound, which means the window resolved concurrently;
-    // one immediate re-load decides, with no recovery.
-    let claim = dir.join(format!(".{stem}.recovering.{}", std::process::id()));
-    match std::fs::rename(first_marker, &claim) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
+    // CLAIM every marker and foreign claim by rename. Each rename admits
+    // exactly one winner; NotFound means that item resolved concurrently (a
+    // publisher committed, or a competing recoverer claimed it) and is
+    // skipped. Names are never reused or clobbered: the monotonic counter
+    // plus the exists() probe keeps every destination fresh, bounded per
+    // item like the temp/marker/quarantine probes.
+    let mut claims: Vec<std::path::PathBuf> = Vec::new();
+    let mut next_name = 0u32;
+    for item in &claimables {
+        for _ in 0..KEY_TEMP_ATTEMPTS {
+            let dest = dir.join(format!(
+                ".{stem}.recovering.{}.{next_name}",
+                std::process::id()
+            ));
+            next_name = next_name.wrapping_add(1);
+            if dest.exists() {
+                continue;
+            }
+            match std::fs::rename(item, &dest) {
+                Ok(()) => {
+                    claims.push(dest);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                // Any other rename failure: probe the next fresh name, up to
+                // the per-item bound; an unclaimable item is left for the
+                // best-effort marker consumption below (or a later sweep).
+                Err(_) => continue,
+            }
         }
-        Err(e) => {
-            return Err(load_err.context(format!(
-                "could not claim publish marker {} for crash recovery: {e}",
-                first_marker.display()
-            )));
-        }
+    }
+    if claims.is_empty() {
+        // Every item vanished before it could be claimed: the round resolved
+        // concurrently; one immediate re-load decides, with no recovery.
+        return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
+    }
+
+    // POST-CLAIM RE-PARSE (#194, F2): between the crash-signature
+    // observation and the renames above, a live publisher may have completed
+    // its final. Now that the round is claimed no publisher can commit
+    // anymore, so one parse decides: a readable final means the round is
+    // already resolved, so release the claims and defer to it, never
+    // quarantining a good key.
+    (before_reparse)();
+    if let Ok(kp) = load_existing_key(final_path) {
+        release_recovery_claims(final_path, &claims);
+        return Ok(Recovery::Reloaded(Box::new(Ok(kp))));
     }
 
     // QUARANTINE the final under a bounded name probe (the KEY_TEMP_ATTEMPTS
@@ -1964,8 +2086,8 @@ fn recover_crashed_publish(
         .unwrap_or(0);
     warn!(
         path = %final_path.display(),
-        markers = ?markers,
-        claim = %claim.display(),
+        claimables = ?claimables,
+        claims = ?claims,
         quarantine = %dest_for(start).display(),
         "crash-interrupted identity key publish: quarantining the unreadable key and \
          regenerating the identity"
@@ -1992,20 +2114,24 @@ fn recover_crashed_publish(
     if !quarantined {
         // Every rename failed: removal still unblocks the regeneration
         // (mirroring the publish paths' removal policy); only if even that
-        // fails is the boot left to its loud error.
+        // fails is the boot left to its loud error, with the claims
+        // released first, so the dead round cannot stall later publishers
+        // (#194, F1).
         if let Err(e) = std::fs::remove_file(final_path) {
             if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(anyhow::Error::new(e).context(format!(
+                release_recovery_claims(final_path, &claims);
+                return Err(load_err.context(format!(
                     "could not quarantine or remove corrupt identity key {} during crash \
-                     recovery",
+                     recovery: {e}",
                     final_path.display()
                 )));
             }
         }
     }
 
-    // Consume any remaining markers (a multi-crash pile-up) best-effort, and
-    // best-effort fsync the directory so the transition tends to be durable.
+    // Consume any remaining markers (a multi-crash pile-up, or an item the
+    // claim probe could not rename) best-effort, and best-effort fsync the
+    // directory so the transition tends to be durable.
     for marker in list_publish_markers(final_path) {
         let _ = std::fs::remove_file(&marker);
     }
@@ -2013,7 +2139,7 @@ fn recover_crashed_publish(
     {
         let _ = fsync_parent_dir(final_path);
     }
-    Ok(Recovery::Claimed(claim))
+    Ok(Recovery::Claimed(claims))
 }
 
 /// Body of `load_or_create_keypair` with the test seams threaded in (#194,
@@ -2022,12 +2148,13 @@ fn recover_crashed_publish(
 /// load-side recovery seam (production: `RecoverySeam::NONE`).
 ///
 /// Load-or-generate with AT MOST ONE crash recovery per start: a load
-/// failure recovers — claim a marker, quarantine the final, regenerate —
+/// failure recovers (claim the round, quarantine the final, regenerate)
 /// only when it is content-class (`KeyContentError`), a `.publishing.`
-/// marker exists (U1's crash signature), and no recovery has run yet this
-/// start. Every other failure surfaces unchanged. The Lost arm participates
-/// in the same policy; a recovery fired there loops back for one retry
-/// publish, and any failure on that second pass surfaces unchanged.
+/// marker or `.recovering.` claim exists (the crash signature, observed on
+/// two consecutive polls), and no recovery has run yet this start. Every
+/// other failure surfaces unchanged. The Lost arm participates in the same
+/// policy; a recovery fired there loops back for one retry publish, and any
+/// failure on that second pass surfaces unchanged.
 fn load_or_create_keypair_with(
     key_path: &std::path::Path,
     before_link: &dyn Fn(),
@@ -2035,17 +2162,14 @@ fn load_or_create_keypair_with(
     faults: PublishFaults,
     seam: RecoverySeam<'_>,
 ) -> Result<Keypair> {
-    // The claim file of a fired recovery. Removed (best-effort) only at exits
-    // AFTER the follow-up publish resolves (Won or Lost), so a stalled winner
-    // our claim demoted can still observe it while waiting; U3 relies on
-    // this. The pre-publish error exits inside recover_crashed_publish
-    // deliberately leave it in place.
-    let mut claim: Option<std::path::PathBuf> = None;
-    let remove_claim = |claim: &Option<std::path::PathBuf>| {
-        if let Some(c) = claim {
-            let _ = std::fs::remove_file(c);
-        }
-    };
+    // The claim files of a fired recovery. Held while the follow-up
+    // generate+publish runs, so a stalled winner our claims demoted can still
+    // observe them while waiting (U3 relies on this), and released on EVERY
+    // exit after that, success, Lost, and error alike (#194, F1): a leaked claim
+    // stalls every later demoted publisher on the full KEY_RACE_DEADLINE.
+    // Release order against the final or the markers does not matter; see
+    // release_recovery_claims.
+    let mut claims: Vec<std::path::PathBuf> = Vec::new();
     let mut recovery_allowed = true;
 
     // At most two passes: the second exists only so a Lost-arm recovery can
@@ -2057,22 +2181,24 @@ fn load_or_create_keypair_with(
         if key_path.exists() {
             match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
                 BootLoad::Loaded(kp) => {
-                    remove_claim(&claim);
+                    release_recovery_claims(key_path, &claims);
                     sweep_stale_markers(key_path, seam.sweep_sync);
                     return Ok(*kp);
                 }
                 // Only emitted while recovery is still allowed (crash_exit is
                 // gated on it).
-                BootLoad::CrashSignature(e) => match recover_crashed_publish(key_path, e)? {
-                    Recovery::Claimed(c) => {
-                        claim = Some(c);
-                        recovery_allowed = false;
-                        // Fall through to regenerate and publish.
+                BootLoad::CrashSignature(e) => {
+                    match recover_crashed_publish(key_path, e, seam.before_reparse)? {
+                        Recovery::Claimed(c) => {
+                            claims = c;
+                            recovery_allowed = false;
+                            // Fall through to regenerate and publish.
+                        }
+                        Recovery::Reloaded(result) => return *result,
                     }
-                    Recovery::Reloaded(result) => return *result,
-                },
+                }
                 BootLoad::Failed(e) => {
-                    remove_claim(&claim);
+                    release_recovery_claims(key_path, &claims);
                     return Err(e);
                 }
             }
@@ -2080,20 +2206,42 @@ fn load_or_create_keypair_with(
 
         (seam.before_publish)();
         let kp = Keypair::generate();
-        let pem = kp
-            .to_pem()
-            .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+        // Every error exit below this point may hold a fired recovery's
+        // claims; release them before propagating (#194, F1). The bare `?`
+        // this replaces leaked the claim files on a failed retry publish.
+        let pem = match kp.to_pem() {
+            Ok(pem) => pem,
+            Err(e) => {
+                release_recovery_claims(key_path, &claims);
+                return Err(anyhow::anyhow!("failed to serialize key: {e}"));
+            }
+        };
 
         if let Some(parent) = key_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                release_recovery_claims(key_path, &claims);
+                return Err(e.into());
+            }
         }
 
         // Publish atomically: the final path only ever appears complete, and a
         // lost race loads the winner's key rather than overwriting it.
-        match publish_key_atomically(key_path, pem.as_bytes(), before_link, before_commit, faults)?
-        {
+        let published = match publish_key_atomically(
+            key_path,
+            pem.as_bytes(),
+            before_link,
+            before_commit,
+            faults,
+        ) {
+            Ok(published) => published,
+            Err(e) => {
+                release_recovery_claims(key_path, &claims);
+                return Err(e);
+            }
+        };
+        match published {
             KeyPublish::Won => {
-                remove_claim(&claim);
+                release_recovery_claims(key_path, &claims);
                 sweep_stale_markers(key_path, seam.sweep_sync);
                 info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
                 return Ok(kp);
@@ -2101,29 +2249,31 @@ fn load_or_create_keypair_with(
             KeyPublish::Lost => {
                 match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
                     BootLoad::Loaded(kp) => {
-                        remove_claim(&claim);
+                        release_recovery_claims(key_path, &claims);
                         sweep_stale_markers(key_path, seam.sweep_sync);
                         return Ok(*kp);
                     }
                     // Only emitted while recovery is still allowed (crash_exit
                     // is gated on it).
-                    BootLoad::CrashSignature(e) => match recover_crashed_publish(key_path, e) {
-                        Ok(Recovery::Claimed(c)) => {
-                            claim = Some(c);
-                            recovery_allowed = false;
-                            continue; // Second pass: regenerate and publish.
+                    BootLoad::CrashSignature(e) => {
+                        match recover_crashed_publish(key_path, e, seam.before_reparse) {
+                            Ok(Recovery::Claimed(c)) => {
+                                claims = c;
+                                recovery_allowed = false;
+                                continue; // Second pass: regenerate and publish.
+                            }
+                            Ok(Recovery::Reloaded(result)) => {
+                                release_recovery_claims(key_path, &claims);
+                                return *result;
+                            }
+                            Err(err) => {
+                                release_recovery_claims(key_path, &claims);
+                                return Err(err);
+                            }
                         }
-                        Ok(Recovery::Reloaded(result)) => {
-                            remove_claim(&claim);
-                            return *result;
-                        }
-                        Err(err) => {
-                            remove_claim(&claim);
-                            return Err(err);
-                        }
-                    },
+                    }
                     BootLoad::Failed(e) => {
-                        remove_claim(&claim);
+                        release_recovery_claims(key_path, &claims);
                         return Err(e);
                     }
                 }
@@ -3904,14 +4054,15 @@ mod identity_key_tests {
         let recovery = super::recover_crashed_publish(
             &key_path,
             anyhow::anyhow!("synthetic post-commit crash signature"),
+            &|| {},
         )
         .expect("a late recovery must not error");
         let loaded = match recovery {
             super::Recovery::Reloaded(result) => {
                 result.expect("the vanished-marker arm re-loads the winner's key")
             }
-            super::Recovery::Claimed(claim) => {
-                panic!("no marker exists to claim after commit, got claim {claim:?}")
+            super::Recovery::Claimed(claims) => {
+                panic!("no marker exists to claim after commit, got claims {claims:?}")
             }
         };
         assert_eq!(
@@ -4105,6 +4256,308 @@ mod identity_key_tests {
             names_containing(dir.path(), ".publishing."),
             vec![".identity.pem.publishing.99999.0".to_string()],
             "the unremovable marker survives, harmlessly"
+        );
+    }
+
+    // #194 (F1): a claimed recovery whose retry publish FAILS must release
+    // its `.recovering.` claim before surfacing the error. A leaked claim
+    // makes every later demoted fallback publisher ride the full
+    // KEY_RACE_DEADLINE in wait_for_recovery_claims until some healthy boot
+    // sweeps it. RED before F1: the bare `?` on the publish call returns
+    // with the claim still on disk.
+    #[test]
+    fn claim_released_when_post_recovery_publish_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            fallback_create: || Err(std::io::Error::other("injected fallback create failure")),
+            ..PublishFaults::NONE
+        };
+
+        let err = match load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &|| {},
+            faults,
+            RecoverySeam::NONE,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("the forced publish failure must surface, not resolve a key"),
+        };
+        assert!(
+            format!("{err:#}").contains("injected fallback create failure"),
+            "the publish failure must propagate: {err:#}"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "a failed retry publish must release the recovery claim, not leak it"
+        );
+    }
+
+    // #194 (F2): a stale marker must not let recovery steal a LIVE fallback
+    // publisher's round. Deterministic construction: publisher A parks at
+    // its commit check (final complete and durable, own marker M present,
+    // stale marker S beside it); the real recovery runs, and its
+    // before-reparse seam (inside the window between the claim step and the
+    // post-claim re-parse) unparks A and waits for A to finish, landing A's
+    // commit exactly in the claim window. Under F2 recovery claims EVERY
+    // claimable, so A's removal of M fails and A demotes; the re-parse then
+    // sees A's completed key and recovery aborts to Reloaded. Everyone
+    // converges on one on-disk identity. RED before F2: recovery claims only
+    // the lexicographically-first stale S, A's commit on M succeeds, and A
+    // returns Won with key A while recovery quarantines A's final and
+    // republishes key B: the two-sided divergence R4 forbids.
+    #[test]
+    fn stale_marker_cannot_steal_a_live_publishers_round() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        // Sorts before any real-pid marker (pids never start with '0').
+        std::fs::write(dir.path().join(".identity.pem.publishing.00000.0"), b"")
+            .expect("seed stale marker");
+
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
+        let (unpark_tx, unpark_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<String>();
+        let p_path = key_path.clone();
+        let publisher = std::thread::spawn(move || {
+            let before_commit = move || {
+                parked_tx.send(()).expect("signal parked");
+                unpark_rx
+                    .recv()
+                    .expect("wait inside the recovery's claim window");
+            };
+            let faults = PublishFaults {
+                link: || Err(std::io::ErrorKind::Unsupported.into()),
+                ..PublishFaults::NONE
+            };
+            let kp = load_or_create_keypair_with(
+                &p_path,
+                &|| {},
+                &before_commit,
+                faults,
+                RecoverySeam::NONE,
+            )
+            .expect("the publisher must resolve a key, demoted or not");
+            done_tx
+                .send(format!("{}", kp.did()))
+                .expect("report the publisher's identity");
+        });
+        parked_rx
+            .recv()
+            .expect("publisher reaches its commit check");
+
+        // The concurrent recovery, via the REAL recovery path. Its
+        // before-reparse hook interleaves the publisher's commit into the
+        // post-claim window and records the identity the publisher resolved.
+        let publisher_did: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let before_reparse = || {
+            unpark_tx.send(()).expect("unpark the publisher");
+            let did = done_rx
+                .recv()
+                .expect("publisher finishes inside the window");
+            *publisher_did.lock().expect("publisher_did lock") = Some(did);
+        };
+        let recovery = super::recover_crashed_publish(
+            &key_path,
+            anyhow::anyhow!("synthetic crash signature"),
+            &before_reparse,
+        )
+        .expect("recovery must not error");
+        let recovered_did = match recovery {
+            super::Recovery::Reloaded(result) => format!(
+                "{}",
+                result
+                    .expect("the post-claim re-parse resolves the completed key")
+                    .did()
+            ),
+            super::Recovery::Claimed(recovery_claims) => {
+                // The boot loop's follow-through: regenerate, publish, release.
+                let kp_b = Keypair::generate();
+                let pem_b = kp_b.to_pem().expect("pem b");
+                let out = publish_key_atomically(
+                    &key_path,
+                    pem_b.as_bytes(),
+                    &|| {},
+                    &|| {},
+                    PublishFaults::NONE,
+                )
+                .expect("recovery's republish");
+                assert!(matches!(out, KeyPublish::Won), "recovery's republish wins");
+                for c in &recovery_claims {
+                    let _ = std::fs::remove_file(c);
+                }
+                format!("{}", kp_b.did())
+            }
+        };
+        publisher.join().expect("publisher joins");
+
+        let p_did = publisher_did
+            .lock()
+            .expect("publisher_did lock")
+            .take()
+            .expect("the publisher reported its identity");
+        let disk_did = format!(
+            "{}",
+            super::load_existing_key(&key_path)
+                .expect("final parses")
+                .did()
+        );
+        assert_eq!(
+            p_did, disk_did,
+            "the publisher must never resolve an identity that diverges from disk"
+        );
+        assert_eq!(
+            recovered_did, disk_did,
+            "recovery must converge on the same on-disk identity"
+        );
+        assert!(
+            names_containing(dir.path(), ".quarantined.").is_empty(),
+            "a completed publisher's final must not be quarantined"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "no recovery claims may remain"
+        );
+    }
+
+    // #194 (F3): a recoverer crashed between its claim rename and the
+    // quarantine leaves a content-bad final beside a stale `.recovering.`
+    // claim and ZERO `.publishing.` markers: the claim IS the renamed
+    // marker. The claim must count toward the crash signature and be
+    // claimable itself, or no later boot can ever recover: the permanent
+    // wedge this protocol exists to eliminate. RED before F3: the signature
+    // counts only `.publishing.` names, so the boot rides the deadline and
+    // fails loudly forever.
+    #[test]
+    fn claim_crash_state_is_recoverable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        std::fs::write(&key_path, b"").expect("seed crashed final");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 crashed final");
+        std::fs::write(dir.path().join(".identity.pem.recovering.99999.0"), b"")
+            .expect("seed stale recovery claim");
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("a claim-crash state must recover, not wedge every later boot");
+
+        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the returned identity must match the regenerated on-disk key"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantine file must exist: {quarantined:?}"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "the stale claim must be consumed and the fresh claim released"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
+        );
+    }
+
+    // #194 (grace): the crash signature requires TWO consecutive
+    // observations. A reader that catches a live fallback publisher's
+    // mid-write window sees content-bad-plus-marker ONCE; if the state heals
+    // before the next poll, no CrashSignature may fire, since a single
+    // observation classifying a crash would let a crash-free boot hijack the
+    // publisher's round and churn a quarantine. The load-fault hook heals
+    // the state on the second attempt; the boot must LOAD the healed key.
+    // RED before the grace: the first observation returns CrashSignature
+    // immediately.
+    #[test]
+    fn mid_write_reader_does_not_hijack_before_grace() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::OnceLock;
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        static STATE: OnceLock<(std::path::PathBuf, std::path::PathBuf, String)> = OnceLock::new();
+        fn heal_on_second_attempt() -> std::io::Result<()> {
+            if CALLS.fetch_add(1, Ordering::SeqCst) == 1 {
+                let (marker, final_path, pem) = STATE.get().expect("state seeded");
+                std::fs::remove_file(marker)?;
+                std::fs::write(final_path, pem.as_bytes())?;
+            }
+            Ok(())
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        let marker = dir.path().join(".identity.pem.publishing.99999.0");
+        let pem = Keypair::generate().to_pem().expect("pem");
+        let expected = format!("{}", Keypair::from_pem(&pem).expect("fixture parses").did());
+        STATE
+            .set((marker, key_path.clone(), pem.to_string()))
+            .expect("state seeded once");
+
+        match super::boot_load_key(&key_path, true, heal_on_second_attempt) {
+            super::BootLoad::Loaded(kp) => {
+                assert_eq!(
+                    format!("{}", kp.did()),
+                    expected,
+                    "the healed key must be the one loaded"
+                );
+            }
+            super::BootLoad::CrashSignature(e) => {
+                panic!("a single mid-write observation must not classify a crash: {e:#}")
+            }
+            super::BootLoad::Failed(e) => panic!("the healed key must load: {e:#}"),
+        }
+    }
+
+    // #194 (F2, window-1): a publisher that completes between recovery's
+    // claim step and its re-parse must win the round retroactively. The
+    // post-claim re-parse sees the completed key, so recovery releases its
+    // claims and aborts to Reloaded: no quarantine of a good key, no claim
+    // left behind, the completed identity returned. RED before F2: no
+    // re-parse exists, so recovery quarantines the just-completed key and
+    // regenerates over it.
+    #[test]
+    fn post_claim_reparse_aborts_to_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        let completed = Keypair::generate();
+        let pem = completed.to_pem().expect("pem");
+        let heal_path = key_path.clone();
+        let before_reparse = move || {
+            std::fs::write(&heal_path, pem.as_bytes())
+                .expect("complete the final inside the claim window");
+        };
+        let seam = RecoverySeam {
+            before_reparse: &before_reparse,
+            ..RecoverySeam::NONE
+        };
+
+        let kp = load_or_create_keypair_with(&key_path, &|| {}, &|| {}, PublishFaults::NONE, seam)
+            .expect("recovery must abort to the completed key");
+
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", completed.did()),
+            "the identity completed inside the window must be the one returned"
+        );
+        assert!(
+            names_containing(dir.path(), ".quarantined.").is_empty(),
+            "a key completed before the re-parse must never be quarantined"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "the aborting recovery must release its claims"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "the claimed markers must not reappear"
         );
     }
 }
