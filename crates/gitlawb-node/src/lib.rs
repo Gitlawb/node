@@ -1153,7 +1153,8 @@ const KEY_RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5)
 /// by a crashed prior start with the same PID (a restarted container is
 /// commonly PID 1 again) is skipped rather than wedging the restart (#194).
 /// 64 names is far more than any plausible pile-up of stale temps plus live
-/// concurrent publishers.
+/// concurrent publishers. Also bounds the fallback publish-marker names,
+/// which follow the same stale-name discipline (#194, U1).
 const KEY_TEMP_ATTEMPTS: u32 = 64;
 
 /// Load an already-provisioned identity key. On Unix, defensively tighten looser
@@ -1216,6 +1217,16 @@ struct PublishFaults {
     /// is taken as the open result (a non-`AlreadyExists` open error), so the
     /// publish surfaces it chained with `link_err`.
     fallback_create: fn() -> std::io::Result<()>,
+    /// Runs before the fallback's publish-marker `create_new` (each name
+    /// attempt); an `Err` is taken as the create result (a non-`AlreadyExists`
+    /// open error), so the publish surfaces it chained with `link_err` (#194,
+    /// U1).
+    marker_create: fn() -> std::io::Result<()>,
+    /// Runs before the fsync of the marker's parent directory; an `Err` is
+    /// taken as that fsync's result. This fsync is warn-and-continue, so an
+    /// injected `Err` must NOT fail the publish (#194, U1).
+    #[cfg(unix)]
+    marker_fsync: fn() -> std::io::Result<()>,
     /// Runs before the fallback's `write_all`; an `Err` is taken as the write
     /// result.
     fallback_write: fn() -> std::io::Result<()>,
@@ -1238,6 +1249,9 @@ impl PublishFaults {
     const NONE: Self = Self {
         link: || Ok(()),
         fallback_create: || Ok(()),
+        marker_create: || Ok(()),
+        #[cfg(unix)]
+        marker_fsync: || Ok(()),
         fallback_write: || Ok(()),
         fallback_fsync: || Ok(()),
         #[cfg(unix)]
@@ -1379,6 +1393,26 @@ fn publish_key_atomically(
 /// parent-DIR fsync keeps the final (the content is complete and data-synced,
 /// and a lost directory entry just disappears -> clean regen, no wedge). Every
 /// error context chains `link_err` so a two-step failure is diagnosable.
+///
+/// The whole non-atomic window is bracketed by a durable publish marker
+/// (`.{stem}.publishing.{pid}.{attempt}`, empty, same dir as the final): the
+/// marker is created and its NAME fsynced BEFORE the final can exist, and it
+/// is removed only once the final is complete-and-durable (success) or
+/// disposed of (error / lost race). A crash inside the window therefore
+/// leaves marker+final together, so a later boot can tell "partial final from
+/// a crashed fallback publish" from a key an operator corrupted (#194, U1).
+/// Two constraints:
+///   - Disposal ORDER is pinned: wherever the error policy removes the final,
+///     that removal is ISSUED BEFORE the marker's. Cleanup is deliberately
+///     NOT a Drop guard: a drop guard can run ahead of the final's disposal
+///     on an early exit, and a crash between the reordered unlinks would
+///     recreate exactly the marker-less partial final this bracket exists to
+///     prevent.
+///   - The marker dir fsync is warn-and-continue, not a hard gate: on
+///     dir-fsync-hostile mounts a hard failure would turn "wedge once, then
+///     recover" into "never provisions". Without that durability the marker
+///     still survives SIGKILL-class crashes (the fs state persists); only the
+///     power-loss protection narrows.
 fn publish_key_fallback(
     final_path: &std::path::Path,
     pem: &[u8],
@@ -1391,6 +1425,79 @@ fn publish_key_fallback(
         err = %link_err,
         "hard_link failed; publishing identity key via direct create_new fallback"
     );
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.pem");
+
+    // Create the publish marker BEFORE the final name can exist, probing
+    // bounded per-call names exactly like the temp-name loop and for the same
+    // reasons: a stale marker left by a crashed same-PID start must not wedge
+    // the restart, and a stale marker is indistinguishable from a live
+    // concurrent publisher's, so never delete a name this call did not
+    // create; just skip to the next one (#194, U1).
+    let mut marker = None;
+    for attempt in 0..KEY_TEMP_ATTEMPTS {
+        let candidate = dir.join(format!(
+            ".{stem}.publishing.{}.{attempt}",
+            std::process::id()
+        ));
+        match (faults.marker_create)().and_then(|()| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+        }) {
+            Ok(f) => {
+                drop(f);
+                marker = Some(candidate);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "create publish marker {} in hard_link fallback (link failed: {link_err})",
+                        candidate.display()
+                    )
+                })
+            }
+        }
+    }
+    let Some(marker) = marker else {
+        anyhow::bail!(
+            "all {KEY_TEMP_ATTEMPTS} publish marker names .{stem}.publishing.{}.* in {} are \
+             taken; remove the stale marker files and restart (link failed: {link_err})",
+            std::process::id(),
+            dir.display()
+        );
+    };
+    // Marker disposal is explicit at every exit, never a Drop guard; see the
+    // order constraint in the doc comment.
+    let dispose_marker = || {
+        let _ = std::fs::remove_file(&marker);
+    };
+    // Make the marker NAME durable before the final can exist, so no crash
+    // can leave a partial final without its marker. Warn-and-continue on
+    // failure per the doc comment's degradation constraint.
+    #[cfg(unix)]
+    {
+        if let Err(e) = (faults.marker_fsync)()
+            .map_err(anyhow::Error::new)
+            .and_then(|()| fsync_parent_dir(final_path))
+        {
+            warn!(
+                marker = %marker.display(),
+                err = %e,
+                "publish marker dir fsync failed; continuing with reduced power-loss protection"
+            );
+        }
+    }
+
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1400,28 +1507,45 @@ fn publish_key_fallback(
     }
     let mut f = match (faults.fallback_create)().and_then(|()| opts.open(final_path)) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(KeyPublish::Lost),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost race: the existing final is the winner's complete key, not
+            // ours to bracket; drop our marker and defer to it.
+            dispose_marker();
+            return Ok(KeyPublish::Lost);
+        }
         Err(e) => {
+            // The final was never created here, so there is no final removal
+            // to order ahead of the marker's.
+            dispose_marker();
             return Err(e).with_context(|| {
                 format!(
                     "create identity key {} in hard_link fallback (link failed: {link_err})",
                     final_path.display()
                 )
-            })
+            });
         }
     };
     // Secure the empty final BEFORE the PEM bytes hit it (#194, U2). The
     // helper's fail-closed removal is what keeps a retry from wedging on
     // AlreadyExists, and is safe here for the same reason as everywhere: the
     // file is still empty, so the split-phase keep-the-final rule below does
-    // not apply yet.
+    // not apply yet. The helper removes the final before returning Err, so
+    // the pinned final-before-marker disposal order holds.
     #[cfg(unix)]
-    tighten_and_verify_created(final_path, faults.fallback_mode_verify).with_context(|| {
-        format!("secure identity key in hard_link fallback (link failed: {link_err})")
-    })?;
+    {
+        if let Err(e) = tighten_and_verify_created(final_path, faults.fallback_mode_verify)
+            .with_context(|| {
+                format!("secure identity key in hard_link fallback (link failed: {link_err})")
+            })
+        {
+            dispose_marker();
+            return Err(e);
+        }
+    }
     // A failed write removes the final (partial content cannot parse and would
-    // wedge every later start).
-    write_key_or_cleanup(
+    // wedge every later start). The helper removes the final before returning
+    // Err, so the pinned final-before-marker disposal order holds.
+    if let Err(e) = write_key_or_cleanup(
         final_path,
         (faults.fallback_write)().and_then(|()| f.write_all(pem)),
     )
@@ -1430,7 +1554,10 @@ fn publish_key_fallback(
             "hard_link fallback publish to {} (link failed: {link_err})",
             final_path.display()
         )
-    })?;
+    }) {
+        dispose_marker();
+        return Err(e);
+    }
     // Fsync the file, and REMOVE the final on failure too (#194 F1). Unlike the
     // hard-link path (which fsyncs a TEMP, so the final NAME only ever appears
     // over a durable inode), the fallback's `create_new` already made the final
@@ -1442,8 +1569,10 @@ fn publish_key_fallback(
     // ENOSPC/EIO can tell "durability failed" (bytes accepted, not synced) from
     // the write-rejected case above. Only the parent-DIR fsync below keeps the
     // final on failure (a lost directory entry just disappears -> clean regen).
+    // Final removal is issued first, marker disposal second (pinned order).
     if let Err(e) = (faults.fallback_fsync)().and_then(|()| f.sync_all()) {
         let _ = std::fs::remove_file(final_path);
+        dispose_marker();
         return Err(anyhow::Error::new(e).context(format!(
             "fsync identity key {} in hard_link fallback (durability failed, \
              removed; link failed: {link_err})",
@@ -1453,9 +1582,24 @@ fn publish_key_fallback(
     drop(f);
     // Fsync the parent directory so the new name is durable before success is
     // reported, as on the hard-link path. Same policy on failure: the final is
-    // complete and data-synced, so it is NOT removed.
+    // complete and data-synced, so it is NOT removed; the marker is still
+    // disposed of best-effort.
     #[cfg(unix)]
-    fsync_parent_dir(final_path)?;
+    {
+        if let Err(e) = fsync_parent_dir(final_path) {
+            dispose_marker();
+            return Err(e);
+        }
+    }
+    // Success: the final is complete and durable, so the bracket closes.
+    // Remove the marker, then best-effort fsync the removal so it tends to be
+    // durable too. (A later unit turns this removal into a commit check; U1
+    // keeps it best-effort.)
+    dispose_marker();
+    #[cfg(unix)]
+    {
+        let _ = fsync_parent_dir(final_path);
+    }
     Ok(KeyPublish::Won)
 }
 
@@ -2444,6 +2588,265 @@ mod identity_key_tests {
             format!("{}", loaded.did()),
             format!("{}", kp.did()),
             "the retry must publish the intended identity"
+        );
+    }
+
+    /// Lists leftover `.{stem}.publishing.*` marker files in `dir` (#194, U1).
+    fn publishing_markers(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().contains(".publishing."))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// #194 (U1): a successful fallback publish (link forced to fail) must win,
+    /// round-trip the key through the normal loader, and leave NO publish
+    /// marker behind: the marker exists only for the non-atomic window.
+    #[test]
+    fn fallback_publish_succeeds_and_leaves_no_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+            .expect("fallback publish");
+        assert!(matches!(out, KeyPublish::Won), "fallback publish wins");
+        let loaded = super::load_existing_key(&key_path).expect("published key loads");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "fallback publish must round-trip the same identity"
+        );
+        let markers = publishing_markers(dir.path());
+        assert!(
+            markers.is_empty(),
+            "a successful fallback publish must remove its marker, found {markers:?}"
+        );
+    }
+
+    /// #194 (U1): a fallback that loses the create race (final already present)
+    /// must still behave as today (existing key loaded, never clobbered) and
+    /// must remove its own marker on the lost-race exit.
+    #[test]
+    fn lost_fallback_race_leaves_no_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let winner = Keypair::generate();
+        let pem_winner = winner.to_pem().expect("pem winner");
+        let out = publish_key_atomically(
+            &key_path,
+            pem_winner.as_bytes(),
+            &|| {},
+            PublishFaults::NONE,
+        )
+        .expect("winner publishes");
+        assert!(matches!(out, KeyPublish::Won), "winner publish wins");
+
+        let pem_loser = Keypair::generate().to_pem().expect("pem loser");
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::PermissionDenied.into()),
+            ..PublishFaults::NONE
+        };
+        let out = publish_key_atomically(&key_path, pem_loser.as_bytes(), &|| {}, faults)
+            .expect("an existing final must read as a lost race, not an error");
+        assert!(matches!(out, KeyPublish::Lost), "fallback loses");
+        let loaded = load_racing_key(&key_path).expect("lost race loads the winner");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", winner.did()),
+            "the lost race must return the winner's identity"
+        );
+        let markers = publishing_markers(dir.path());
+        assert!(
+            markers.is_empty(),
+            "a lost fallback race must remove its own marker, found {markers:?}"
+        );
+    }
+
+    /// Shared body for the fallback error-arm marker tests (#194, U1): with the
+    /// link fault plus one injected fallback fault, the error must surface as
+    /// today, the final must be absent (today's removal policy for every one of
+    /// these arms), and no publish marker may remain.
+    fn assert_fallback_error_leaves_no_marker_or_final(faults: PublishFaults, injected: &str) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("the injected fallback fault must error the publish"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(injected),
+            "the error must surface the injected fault: {msg}"
+        );
+        assert!(
+            !key_path.exists(),
+            "the final must be absent per the existing removal policy"
+        );
+        let markers = publishing_markers(dir.path());
+        assert!(
+            markers.is_empty(),
+            "an errored fallback must dispose its marker, found {markers:?}"
+        );
+    }
+
+    #[test]
+    fn failed_fallback_create_leaves_no_marker() {
+        assert_fallback_error_leaves_no_marker_or_final(
+            PublishFaults {
+                link: || Err(std::io::ErrorKind::Unsupported.into()),
+                fallback_create: || Err(std::io::Error::other("injected fallback create failure")),
+                ..PublishFaults::NONE
+            },
+            "injected fallback create failure",
+        );
+    }
+
+    #[test]
+    fn failed_fallback_write_leaves_no_marker() {
+        assert_fallback_error_leaves_no_marker_or_final(
+            PublishFaults {
+                link: || Err(std::io::ErrorKind::Unsupported.into()),
+                fallback_write: || Err(std::io::Error::other("injected write failure")),
+                ..PublishFaults::NONE
+            },
+            "injected write failure",
+        );
+    }
+
+    #[test]
+    fn failed_fallback_fsync_leaves_no_marker() {
+        assert_fallback_error_leaves_no_marker_or_final(
+            PublishFaults {
+                link: || Err(std::io::ErrorKind::Unsupported.into()),
+                fallback_fsync: || Err(std::io::Error::other("injected fsync failure")),
+                ..PublishFaults::NONE
+            },
+            "injected fsync failure",
+        );
+    }
+
+    #[test]
+    fn failed_fallback_mode_verify_leaves_no_marker() {
+        assert_fallback_error_leaves_no_marker_or_final(
+            PublishFaults {
+                link: || Err(std::io::ErrorKind::Unsupported.into()),
+                fallback_mode_verify: || Err(std::io::Error::other("injected mode-ignoring mount")),
+                ..PublishFaults::NONE
+            },
+            "injected mode-ignoring mount",
+        );
+    }
+
+    /// #194 (U1): marker-name probing is bounded like the temp names. With
+    /// every candidate marker name taken the fallback must fail loudly, naming
+    /// the stale prefix and directory, and must never create the final.
+    #[test]
+    fn marker_name_exhaustion_errors_loudly_and_never_creates_the_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+
+        for attempt in 0..KEY_TEMP_ATTEMPTS {
+            let stale = dir.path().join(format!(
+                ".identity.pem.publishing.{}.{attempt}",
+                std::process::id()
+            ));
+            std::fs::write(&stale, b"").expect("seed stale marker");
+        }
+
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+        let err = match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("the fallback must fail when every marker name is taken"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!(".identity.pem.publishing.{}", std::process::id()))
+                && msg.contains(&dir.path().display().to_string()),
+            "the error must name the marker prefix and directory: {msg}"
+        );
+        assert!(
+            !key_path.exists(),
+            "an exhausted marker probe must not create the final key"
+        );
+    }
+
+    /// #194 (U1): a failed marker DIR fsync must NOT fail the publish
+    /// (warn-and-continue): on dir-fsync-hostile mounts a hard gate would turn
+    /// "wedge once then recover" into "never provisions". The publish must
+    /// still win, the key must load, and the marker must still be removed.
+    #[test]
+    fn marker_fsync_failure_does_not_fail_the_publish() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            marker_fsync: || Err(std::io::Error::other("injected marker dir fsync failure")),
+            ..PublishFaults::NONE
+        };
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+            .expect("a marker dir fsync failure must not fail the publish");
+        assert!(matches!(out, KeyPublish::Won), "publish still wins");
+        let loaded = super::load_existing_key(&key_path).expect("published key loads");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "publish must round-trip the same identity"
+        );
+        let markers = publishing_markers(dir.path());
+        assert!(
+            markers.is_empty(),
+            "the marker must still be removed, found {markers:?}"
+        );
+    }
+
+    /// #194 (U1): the primary hard-link path must never touch the marker
+    /// machinery. The `marker_create` hook is poisoned, so if the primary path
+    /// ever created a marker the publish would error; it must win untouched
+    /// and leave no `.publishing.` file.
+    #[test]
+    fn primary_hardlink_publish_never_creates_a_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let kp = Keypair::generate();
+        let pem = kp.to_pem().expect("pem");
+
+        let faults = PublishFaults {
+            marker_create: || Err(std::io::Error::other("marker created on the primary path")),
+            ..PublishFaults::NONE
+        };
+        let out = publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, faults)
+            .expect("the primary path must never reach the marker machinery");
+        assert!(matches!(out, KeyPublish::Won), "primary publish wins");
+        let loaded = super::load_existing_key(&key_path).expect("published key loads");
+        assert_eq!(
+            format!("{}", loaded.did()),
+            format!("{}", kp.did()),
+            "primary publish must round-trip the same identity"
+        );
+        let markers = publishing_markers(dir.path());
+        assert!(
+            markers.is_empty(),
+            "the primary path must never create a marker, found {markers:?}"
         );
     }
 }
