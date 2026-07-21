@@ -885,6 +885,8 @@ async fn run_post_push_replication(
             crate::ipfs_pin::pin_new_objects(
                 &ctx.ipfs_api,
                 &ctx.disk_path,
+                &ctx.git_bin,
+                ctx.timeout,
                 object_list.clone(),
                 &ctx.db,
                 &ctx.repo_id,

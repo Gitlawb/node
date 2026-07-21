@@ -2430,6 +2430,8 @@ mod tests {
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
             &pub_bare,
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
             &pub_repo.id,
@@ -2553,6 +2555,8 @@ mod tests {
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
             &pub_bare,
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
             &pub_repo.id,
@@ -3120,6 +3124,8 @@ mod tests {
         let pinned = crate::ipfs_pin::pin_new_objects(
             &server.url(),
             &bare,
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
             "repoZ",
@@ -3139,6 +3145,123 @@ mod tests {
                 .as_deref(),
             Some("repoZ"),
             "pin_new_objects records the repo_id it was given as the pin's provenance"
+        );
+    }
+
+    /// #173 (grok F2): the post-push pin read is BOUNDED, so a wedged/D-state
+    /// `git cat-file` (stuck NFS/Tigris backend) is reaped at `git_timeout` and
+    /// `pin_new_objects` RETURNS — reaching `requeue_or_release` in production —
+    /// instead of hanging forever and pinning the per-repo coalescing key until
+    /// process death. A fake `git` whose `cat-file` records its pid then sleeps far
+    /// past a SHORT 1s timeout stands in for the wedged backend; the `run_bounded_git`
+    /// watchdog (SIGTERM -> grace -> SIGKILL of the process group) must reap it well
+    /// before its 8s natural exit, and the call must return with nothing pinned.
+    ///
+    /// REVERT PROOF (RED): swap `read_object_bounded` back to the bare
+    /// `store::read_object` at the pin read and the wedged child is STILL RUNNING at
+    /// the mid-flight liveness poll below (unbounded `Command::output` cannot be
+    /// reaped at the deadline) — the reap assertion fails.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn pin_new_objects_reaps_wedged_read_at_deadline(pool: PgPool) {
+        use std::time::Duration;
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Fake `git`: `cat-file` records its own pid then sleeps 8s (>> the 1s
+        // deadline) so the read is genuinely wedged; the watchdog is what must end it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("catfile.pid");
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               cat-file) echo $$ > \"{}\"; sleep 8 ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            pidfile.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+        let repo = tmp.path().to_path_buf();
+        let git = git_path.to_str().unwrap().to_string();
+        // A never-pinned OID so the call reaches the object-read stage (not the
+        // already-pinned skip path).
+        let oid = "f".repeat(64);
+        // Non-empty ipfs_api so `pin_new_objects` does not early-return; the wedged
+        // read is reaped and the OID skipped before any `/add`, so this URL is unused.
+        let ipfs_api = "http://127.0.0.1:1".to_string();
+
+        // `pin_new_objects` must run on THIS runtime so its `is_pinned` DB call keeps
+        // the sqlx pool on its home runtime. The bounded read is a synchronous blocking
+        // call, so the reap poll runs on a separate OS thread (independent of tokio): it
+        // captures the wedged child's pid, waits past the deadline, records whether it
+        // was reaped, then SIGKILLs defensively so even a true infinite hang cannot leak
+        // an orphan or stall the awaited call.
+        let pidfile_poll = pidfile.clone();
+        let poll = std::thread::spawn(move || -> (Option<i32>, bool) {
+            let alive = |pid: i32| unsafe { libc::kill(pid, 0) == 0 };
+            let mut pid = None;
+            for _ in 0..500 {
+                if let Some(p) = std::fs::read_to_string(&pidfile_poll)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok())
+                {
+                    pid = Some(p);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let pid = match pid {
+                Some(p) => p,
+                None => return (None, false),
+            };
+            // Past the 1s deadline + SIGTERM grace but well before the 8s natural exit:
+            // the bounded read must already have reaped the wedged group. The unbounded
+            // `store::read_object` leaves it running here — the load-bearing RED.
+            std::thread::sleep(Duration::from_secs(3));
+            let reaped = !alive(pid);
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            (Some(pid), reaped)
+        });
+
+        // The call must RETURN — reaching `requeue_or_release` in production — rather
+        // than hang on the 8s sleep. The poll thread's defensive SIGKILL guarantees the
+        // read completes even in the unbounded RED case, so this observes a bounded
+        // return either way; the reap assertion below is what separates RED from GREEN.
+        let pinned = tokio::time::timeout(
+            Duration::from_secs(6),
+            crate::ipfs_pin::pin_new_objects(
+                &ipfs_api,
+                &repo,
+                &git,
+                Duration::from_secs(1),
+                vec![oid],
+                &db,
+                "repoWedge",
+            ),
+        )
+        .await
+        .expect("pin_new_objects must return within the bound, not hang on the wedged read");
+
+        let (pid, reaped) = poll.join().expect("poll thread joins");
+        pid.expect("the fake cat-file must have spawned and recorded its pid");
+        assert!(
+            reaped,
+            "the post-push pin read must reap the wedged cat-file child at the deadline, \
+             not leave it running (which would pin the coalescing key until process death)"
+        );
+        assert!(
+            pinned.is_empty(),
+            "a wedged read pins nothing this pass; a later pass/push retries"
         );
     }
 
@@ -3248,6 +3371,8 @@ mod tests {
         let pinned = crate::ipfs_pin::pin_new_objects(
             &server.url(),
             &bare,
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
             "repoBF",
@@ -3367,6 +3492,8 @@ mod tests {
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
             &bare,
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
             &repo.id,
@@ -3468,6 +3595,8 @@ mod tests {
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
             &bare,
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![fx.public_oid.clone()],
             &state.db,
             "repoCG",
@@ -3530,6 +3659,8 @@ mod tests {
         crate::ipfs_pin::pin_new_objects(
             &server.url(),
             &bare,
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
             vec![phantom_oid.clone()],
             &state.db,
             "repoUR",
