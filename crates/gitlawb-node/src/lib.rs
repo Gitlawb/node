@@ -1157,6 +1157,29 @@ const KEY_RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5)
 /// which follow the same stale-name discipline (#194, U1).
 const KEY_TEMP_ATTEMPTS: u32 = 64;
 
+/// A key-load failure caused by the file's CONTENT (an empty or unparseable
+/// PEM) rather than IO or permissions (#194, U2). Used as the anyhow error's
+/// root so the boot loop can classify a failure as crash-recoverable via
+/// `is_key_content_error` WITHOUT changing the message text operators and
+/// tests rely on ("invalid PEM key"). Every other load failure (stat,
+/// tighten, mode verification, read IO) stays a plain anyhow error and is
+/// never recovered from.
+#[derive(Debug)]
+struct KeyContentError(String);
+
+impl std::fmt::Display for KeyContentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeyContentError {}
+
+/// True when `err` is a content-class load failure (see `KeyContentError`).
+fn is_key_content_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<KeyContentError>().is_some()
+}
+
 /// Load an already-provisioned identity key. On Unix, defensively tighten looser
 /// permissions to 0600 (do NOT reject a loose key — that would break existing
 /// deployments; just narrow them), then verify the mode is actually 0600.
@@ -1180,24 +1203,101 @@ fn load_existing_key(path: &std::path::Path) -> Result<Keypair> {
     }
     let pem = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read key from {}", path.display()))?;
-    let kp = Keypair::from_pem(&pem).map_err(|e| anyhow::anyhow!("invalid PEM key: {e}"))?;
+    // Content-class failure (#194, U2): an empty file reads Ok("") and is
+    // rejected here too, so this one arm classifies both the zero-length and
+    // the unparseable case. The message text is unchanged.
+    let kp = Keypair::from_pem(&pem)
+        .map_err(|e| anyhow::Error::new(KeyContentError(format!("invalid PEM key: {e}"))))?;
     info!(path = %path.display(), "loaded existing identity");
     Ok(kp)
+}
+
+/// The publish markers (`.{stem}.publishing.*`) beside `final_path`, sorted:
+/// U1's crash signature for a fallback publish interrupted mid-window (#194,
+/// U2). An unreadable directory reads as no markers, so recovery stays off
+/// and the load error surfaces unchanged (the loud-fail default); entries
+/// with non-UTF-8 names cannot be our markers and are skipped.
+fn list_publish_markers(final_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.pem");
+    let prefix = format!(".{stem}.publishing.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut markers: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .map(|e| e.path())
+        .collect();
+    markers.sort();
+    markers
 }
 
 /// Load a key another concurrent start may still be publishing, polling until it
 /// parses or `KEY_RACE_DEADLINE` elapses. An already-provisioned key parses on
 /// the first attempt with no sleep.
 fn load_racing_key(path: &std::path::Path) -> Result<Keypair> {
+    match boot_load_key(path, false, || Ok(())) {
+        BootLoad::Loaded(kp) => Ok(*kp),
+        BootLoad::CrashSignature(e) | BootLoad::Failed(e) => Err(e),
+    }
+}
+
+/// Outcome of `boot_load_key` (#194, U2). The tri-state exists so the boot
+/// loop can tell "content failure WITH the crash signature observed" (a
+/// recovery candidate) from every other failure; folding both into one error
+/// would let a concurrent recoverer's marker sweep turn a recoverable boot
+/// into a loud failure.
+enum BootLoad {
+    /// Boxed to keep the variants' sizes comparable (clippy:
+    /// large_enum_variant); the enum lives only across a boot-time match.
+    Loaded(Box<Keypair>),
+    /// Content-class failure observed while a `.publishing.` marker was
+    /// present; returned immediately, without riding the deadline.
+    CrashSignature(anyhow::Error),
+    /// Any other failure, after the full deadline.
+    Failed(anyhow::Error),
+}
+
+/// `load_racing_key` for the boot loop (#194, U2). With `crash_exit` set, a
+/// content-class failure (`KeyContentError`) observed while a `.publishing.`
+/// marker is present returns `CrashSignature` IMMEDIATELY instead of riding
+/// the deadline: marker plus unreadable content is the crash signature
+/// recovery exists for, and the caller's atomic claim rename arbitrates the
+/// (rare) race against a live fallback publisher still inside its window.
+/// Every other failure keeps the full wall-clock deadline. `load_fault` is
+/// the injection hook (a no-op `Ok` in production); an injected `Err` is
+/// taken as that attempt's result and is NOT content-class.
+fn boot_load_key(
+    path: &std::path::Path,
+    crash_exit: bool,
+    load_fault: fn() -> std::io::Result<()>,
+) -> BootLoad {
     let deadline = std::time::Instant::now() + KEY_RACE_DEADLINE;
     let mut last_err;
     loop {
-        match load_existing_key(path) {
-            Ok(kp) => return Ok(kp),
+        match load_fault()
+            .map_err(anyhow::Error::new)
+            .and_then(|()| load_existing_key(path))
+        {
+            Ok(kp) => return BootLoad::Loaded(Box::new(kp)),
             Err(e) => last_err = e,
         }
+        if crash_exit && is_key_content_error(&last_err) && !list_publish_markers(path).is_empty() {
+            return BootLoad::CrashSignature(last_err);
+        }
         if std::time::Instant::now() >= deadline {
-            return Err(last_err);
+            return BootLoad::Failed(last_err);
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
@@ -1603,33 +1703,270 @@ fn publish_key_fallback(
     Ok(KeyPublish::Won)
 }
 
+/// Compile-time test seam for the load-side crash recovery in
+/// `load_or_create_keypair_with` (#194, U2), following the `PublishFaults`
+/// precedent: production passes `RecoverySeam::NONE` (every hook a no-op).
+#[derive(Clone, Copy)]
+struct RecoverySeam<'a> {
+    /// Runs before every load attempt of the boot loader; an `Err` is taken as
+    /// that attempt's result. The injected failure is NOT content-class, so it
+    /// deterministically exercises the transient-failure (never-recover) policy.
+    load_fault: fn() -> std::io::Result<()>,
+    /// Runs at the top of each generate+publish pass, so a test can mutate
+    /// on-disk state between a completed recovery and the retry publish.
+    before_publish: &'a dyn Fn(),
+}
+
+impl RecoverySeam<'_> {
+    /// The production value: no fault, no hook.
+    const NONE: RecoverySeam<'static> = RecoverySeam {
+        load_fault: || Ok(()),
+        before_publish: &|| {},
+    };
+}
+
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
-    let key_path = config.resolved_key_path();
+    load_or_create_keypair_with(
+        &config.resolved_key_path(),
+        &|| {},
+        PublishFaults::NONE,
+        RecoverySeam::NONE,
+    )
+}
 
-    // Fast path for the common already-provisioned case (still race-safe: a
-    // concurrently-publishing winner is handled by the retry in load_racing_key).
-    if key_path.exists() {
-        return load_racing_key(&key_path);
-    }
+/// Outcome of `recover_crashed_publish` (#194, U2).
+enum Recovery {
+    /// A marker was claimed and the corrupt final quarantined (or removed);
+    /// the caller regenerates. Holds the claim file's path, removed only
+    /// after the follow-up publish resolves.
+    Claimed(std::path::PathBuf),
+    /// The marker vanished before it could be claimed (the publisher — or a
+    /// competing recoverer — resolved the window concurrently): the single
+    /// follow-up load's result is final, success or error, no recovery.
+    /// Boxed to keep the variants' sizes comparable (clippy:
+    /// large_enum_variant); the enum lives only across a boot-time match.
+    Reloaded(Box<Result<Keypair>>),
+}
 
-    let kp = Keypair::generate();
-    let pem = kp
-        .to_pem()
-        .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+/// Claim-and-quarantine for a boot whose load returned `CrashSignature`: a
+/// content-class failure beside a `.publishing.` marker — U1's signature of
+/// a fallback publish crashed inside its non-atomic window (#194, U2).
+/// Atomically claims ONE marker (rename to `.{stem}.recovering.{pid}`, so N
+/// racing recoverers admit exactly one), quarantines the corrupt final by
+/// rename (preserving bytes and mode for post-mortem; falls back to removal
+/// only if every quarantine name fails), consumes any remaining markers
+/// best-effort, and hands control back to regenerate. The caller observed a
+/// marker, so finding none here (or losing the claim rename) means the
+/// window was resolved concurrently: one immediate re-load decides, with no
+/// recovery.
+fn recover_crashed_publish(
+    final_path: &std::path::Path,
+    load_err: anyhow::Error,
+) -> Result<Recovery> {
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let stem = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("identity.pem");
+    let markers = list_publish_markers(final_path);
+    let Some(first_marker) = markers.first() else {
+        return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
+    };
 
-    if let Some(parent) = key_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Publish atomically: the final path only ever appears complete, and a lost
-    // race loads the winner's key rather than overwriting it.
-    match publish_key_atomically(&key_path, pem.as_bytes(), &|| {}, PublishFaults::NONE)? {
-        KeyPublish::Won => {
-            info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
-            Ok(kp)
+    // CLAIM one marker atomically. rename admits exactly one winner: a
+    // competing recoverer (or the publisher finishing and removing its
+    // marker) leaves NotFound, which means the window resolved concurrently;
+    // one immediate re-load decides, with no recovery.
+    let claim = dir.join(format!(".{stem}.recovering.{}", std::process::id()));
+    match std::fs::rename(first_marker, &claim) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Recovery::Reloaded(Box::new(load_racing_key(final_path))));
         }
-        KeyPublish::Lost => load_racing_key(&key_path),
+        Err(e) => {
+            return Err(load_err.context(format!(
+                "could not claim publish marker {} for crash recovery: {e}",
+                first_marker.display()
+            )));
+        }
     }
+
+    // QUARANTINE the final under a bounded name probe (the KEY_TEMP_ATTEMPTS
+    // discipline: a stale quarantine from a crashed same-PID start must not
+    // wedge this one). The warn precedes the move and carries stable
+    // operator-greppable fields; the destination it names is the first free
+    // candidate, which the rename below tries first.
+    let dest_for = |n: u32| dir.join(format!(".{stem}.quarantined.{}.{n}", std::process::id()));
+    let start = (0..KEY_TEMP_ATTEMPTS)
+        .find(|&n| !dest_for(n).exists())
+        .unwrap_or(0);
+    warn!(
+        path = %final_path.display(),
+        markers = ?markers,
+        claim = %claim.display(),
+        quarantine = %dest_for(start).display(),
+        "crash-interrupted identity key publish: quarantining the unreadable key and \
+         regenerating the identity"
+    );
+    let mut quarantined = false;
+    for n in start..KEY_TEMP_ATTEMPTS {
+        let dest = dest_for(n);
+        if dest.exists() {
+            continue;
+        }
+        match std::fs::rename(final_path, &dest) {
+            Ok(()) => {
+                quarantined = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The final vanished concurrently; nothing left to quarantine.
+                quarantined = true;
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    if !quarantined {
+        // Every rename failed: removal still unblocks the regeneration
+        // (mirroring the publish paths' removal policy); only if even that
+        // fails is the boot left to its loud error.
+        if let Err(e) = std::fs::remove_file(final_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "could not quarantine or remove corrupt identity key {} during crash \
+                     recovery",
+                    final_path.display()
+                )));
+            }
+        }
+    }
+
+    // Consume any remaining markers (a multi-crash pile-up) best-effort, and
+    // best-effort fsync the directory so the transition tends to be durable.
+    for marker in list_publish_markers(final_path) {
+        let _ = std::fs::remove_file(&marker);
+    }
+    #[cfg(unix)]
+    {
+        let _ = fsync_parent_dir(final_path);
+    }
+    Ok(Recovery::Claimed(claim))
+}
+
+/// Body of `load_or_create_keypair` with the test seams threaded in (#194,
+/// U2): `before_link` and `faults` pass through to `publish_key_atomically`
+/// (production: no-op / `NONE`), `seam` is the load-side recovery seam
+/// (production: `RecoverySeam::NONE`).
+///
+/// Load-or-generate with AT MOST ONE crash recovery per start: a load
+/// failure recovers — claim a marker, quarantine the final, regenerate —
+/// only when it is content-class (`KeyContentError`), a `.publishing.`
+/// marker exists (U1's crash signature), and no recovery has run yet this
+/// start. Every other failure surfaces unchanged. The Lost arm participates
+/// in the same policy; a recovery fired there loops back for one retry
+/// publish, and any failure on that second pass surfaces unchanged.
+fn load_or_create_keypair_with(
+    key_path: &std::path::Path,
+    before_link: &dyn Fn(),
+    faults: PublishFaults,
+    seam: RecoverySeam<'_>,
+) -> Result<Keypair> {
+    // The claim file of a fired recovery. Removed (best-effort) only at exits
+    // AFTER the follow-up publish resolves (Won or Lost), so a stalled winner
+    // our claim demoted can still observe it while waiting; U3 relies on
+    // this. The pre-publish error exits inside recover_crashed_publish
+    // deliberately leave it in place.
+    let mut claim: Option<std::path::PathBuf> = None;
+    let remove_claim = |claim: &Option<std::path::PathBuf>| {
+        if let Some(c) = claim {
+            let _ = std::fs::remove_file(c);
+        }
+    };
+    let mut recovery_allowed = true;
+
+    // At most two passes: the second exists only so a Lost-arm recovery can
+    // retry the generate+publish once.
+    for _pass in 0..2 {
+        // Fast path for the common already-provisioned case (still race-safe: a
+        // concurrently-publishing winner is handled by the retry in
+        // boot_load_key).
+        if key_path.exists() {
+            match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
+                BootLoad::Loaded(kp) => {
+                    remove_claim(&claim);
+                    return Ok(*kp);
+                }
+                // Only emitted while recovery is still allowed (crash_exit is
+                // gated on it).
+                BootLoad::CrashSignature(e) => match recover_crashed_publish(key_path, e)? {
+                    Recovery::Claimed(c) => {
+                        claim = Some(c);
+                        recovery_allowed = false;
+                        // Fall through to regenerate and publish.
+                    }
+                    Recovery::Reloaded(result) => return *result,
+                },
+                BootLoad::Failed(e) => {
+                    remove_claim(&claim);
+                    return Err(e);
+                }
+            }
+        }
+
+        (seam.before_publish)();
+        let kp = Keypair::generate();
+        let pem = kp
+            .to_pem()
+            .map_err(|e| anyhow::anyhow!("failed to serialize key: {e}"))?;
+
+        if let Some(parent) = key_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Publish atomically: the final path only ever appears complete, and a
+        // lost race loads the winner's key rather than overwriting it.
+        match publish_key_atomically(key_path, pem.as_bytes(), before_link, faults)? {
+            KeyPublish::Won => {
+                remove_claim(&claim);
+                info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
+                return Ok(kp);
+            }
+            KeyPublish::Lost => {
+                match boot_load_key(key_path, recovery_allowed, seam.load_fault) {
+                    BootLoad::Loaded(kp) => {
+                        remove_claim(&claim);
+                        return Ok(*kp);
+                    }
+                    // Only emitted while recovery is still allowed (crash_exit
+                    // is gated on it).
+                    BootLoad::CrashSignature(e) => match recover_crashed_publish(key_path, e) {
+                        Ok(Recovery::Claimed(c)) => {
+                            claim = Some(c);
+                            recovery_allowed = false;
+                            continue; // Second pass: regenerate and publish.
+                        }
+                        Ok(Recovery::Reloaded(result)) => {
+                            remove_claim(&claim);
+                            return *result;
+                        }
+                        Err(err) => {
+                            remove_claim(&claim);
+                            return Err(err);
+                        }
+                    },
+                    BootLoad::Failed(e) => {
+                        remove_claim(&claim);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    unreachable!("the boot loop returns within two passes");
 }
 
 #[cfg(test)]
@@ -1696,8 +2033,9 @@ mod gossip_ssrf_tests {
 #[cfg(all(test, unix))]
 mod identity_key_tests {
     use super::{
-        load_or_create_keypair, load_racing_key, publish_key_atomically, Config, KeyPublish,
-        Keypair, PublishFaults, KEY_TEMP_ATTEMPTS,
+        load_or_create_keypair, load_or_create_keypair_with, load_racing_key,
+        publish_key_atomically, Config, KeyPublish, Keypair, PublishFaults, RecoverySeam,
+        KEY_TEMP_ATTEMPTS,
     };
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
@@ -2847,6 +3185,359 @@ mod identity_key_tests {
         assert!(
             markers.is_empty(),
             "the primary path must never create a marker, found {markers:?}"
+        );
+    }
+
+    /// Seed the on-disk signature of a fallback publish crashed mid-write
+    /// (#194, U2): a 0600 final holding `content` (empty or truncated) beside
+    /// a `.publishing.` marker carrying a foreign (crashed) process's pid.
+    /// Returns the final's path.
+    fn seed_crash_state(dir: &std::path::Path, content: &[u8]) -> std::path::PathBuf {
+        let key_path = dir.join("identity.pem");
+        std::fs::write(&key_path, content).expect("seed crashed final");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 crashed final");
+        std::fs::write(dir.join(".identity.pem.publishing.99999.0"), b"")
+            .expect("seed publish marker");
+        key_path
+    }
+
+    /// File names in `dir` containing `needle` (marker/claim/quarantine sweeps).
+    fn names_containing(dir: &std::path::Path, needle: &str) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(needle))
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn key_config(key_path: &std::path::Path) -> Config {
+        Config::parse_from([
+            "gitlawb-node",
+            "--key-path",
+            key_path.to_str().expect("utf8 path"),
+        ])
+    }
+
+    // #194 (U2): a `.publishing.` marker beside an EMPTY final is the crash
+    // signature of an interrupted fallback publish; boot must claim the
+    // marker, quarantine the empty final, and regenerate instead of wedging
+    // on `invalid PEM key` forever. RED before U2: load_or_create_keypair
+    // errors with `invalid PEM key`.
+    #[test]
+    fn recovery_regenerates_after_crash_leaves_empty_final() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("a crash-marked empty final must recover, not wedge the start");
+
+        let mode = std::fs::metadata(&key_path)
+            .expect("regenerated final exists")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "regenerated final must be 0600");
+        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the returned identity must match the regenerated on-disk key"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "recovery must consume the publish marker(s)"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "the recovery claim must be removed after the publish resolves"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantine file must exist: {quarantined:?}"
+        );
+        let bytes = std::fs::read(dir.path().join(&quarantined[0])).expect("read quarantine");
+        assert!(
+            bytes.is_empty(),
+            "the quarantine must preserve the crashed final's (empty) content"
+        );
+    }
+
+    // #194 (U2): same recovery for a final holding a truncated PEM, and the
+    // quarantine (a rename) must preserve the truncated bytes exactly for
+    // post-mortem inspection.
+    #[test]
+    fn recovery_quarantines_truncated_final_preserving_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pem = Keypair::generate().to_pem().expect("pem");
+        let truncated = &pem.as_bytes()[..pem.len() / 2];
+        let key_path = seed_crash_state(dir.path(), truncated);
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("a crash-marked truncated final must recover, not wedge the start");
+
+        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the returned identity must match the regenerated on-disk key"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantine file must exist: {quarantined:?}"
+        );
+        let bytes = std::fs::read(dir.path().join(&quarantined[0])).expect("read quarantine");
+        assert_eq!(
+            bytes, truncated,
+            "the quarantine must hold exactly the truncated input bytes"
+        );
+    }
+
+    // MUST-NOT (#194, U2): an unparseable final WITHOUT a marker is operator
+    // corruption, not a crash signature; it must keep today's loud fail
+    // bit-for-bit: same `invalid PEM key` message, final left on disk with
+    // identical bytes, no quarantine, no regeneration. Rides the full
+    // KEY_RACE_DEADLINE (~5s), as today. Pre-implementation this must PASS;
+    // after GREEN it is the mutation guard for the marker-presence check.
+    #[test]
+    fn bad_final_without_marker_still_fails_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let garbage: &[u8] = b"-----BEGIN nonsense truncated";
+        std::fs::write(&key_path, garbage).expect("seed garbage final");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 garbage final");
+
+        let err = match load_or_create_keypair(&key_config(&key_path)) {
+            Err(e) => e,
+            Ok(_) => panic!("a marker-less corrupt final must fail loudly, never regenerate"),
+        };
+        assert!(
+            err.to_string().contains("invalid PEM key"),
+            "the load failure must surface unchanged: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).expect("final still on disk"),
+            garbage,
+            "the corrupt final must be left untouched"
+        );
+        assert!(
+            names_containing(dir.path(), ".quarantined.").is_empty(),
+            "no quarantine may be created without a marker"
+        );
+    }
+
+    // MUST-NOT (#194, U2): a VALID final beside a stale marker loads
+    // unchanged: same identity, same bytes, no quarantine. (U4 adds marker
+    // hygiene; U2 may leave the stale marker in place.)
+    #[test]
+    fn valid_final_with_stale_marker_loads_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let existing = Keypair::generate();
+        let pem = existing.to_pem().expect("pem");
+        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("a valid final with a stale marker must load");
+
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", existing.did()),
+            "the pre-existing identity must be preserved, not regenerated"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).expect("final still on disk"),
+            pem.as_bytes(),
+            "the valid final's bytes must be untouched"
+        );
+        assert!(
+            names_containing(dir.path(), ".quarantined.").is_empty(),
+            "a valid final must never be quarantined"
+        );
+    }
+
+    // MUST-NOT (#194, U2): a TRANSIENT (non-content) load failure must never
+    // recover, even with a marker present: loud error, no quarantine, final
+    // and marker untouched. The seam's load fault injects the transient class
+    // deterministically. Rides the full KEY_RACE_DEADLINE (~5s). RED if
+    // recovery keys on any-error instead of content-class.
+    #[test]
+    fn transient_error_with_marker_never_recovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pem = Keypair::generate().to_pem().expect("pem");
+        let key_path = seed_crash_state(dir.path(), pem.as_bytes());
+        let seam = RecoverySeam {
+            load_fault: || Err(std::io::Error::other("injected transient load failure")),
+            ..RecoverySeam::NONE
+        };
+
+        let err = match load_or_create_keypair_with(&key_path, &|| {}, PublishFaults::NONE, seam) {
+            Err(e) => e,
+            Ok(_) => panic!("a transient-class load failure must stay loud, never recover"),
+        };
+        assert!(
+            format!("{err:#}").contains("injected transient load failure"),
+            "the transient failure must surface: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).expect("final still on disk"),
+            pem.as_bytes(),
+            "the final must be untouched by a transient failure"
+        );
+        assert_eq!(
+            names_containing(dir.path(), ".publishing."),
+            vec![".identity.pem.publishing.99999.0".to_string()],
+            "the marker must be untouched"
+        );
+        assert!(
+            names_containing(dir.path(), ".quarantined.").is_empty(),
+            "a transient failure must never quarantine"
+        );
+    }
+
+    // #194 (U2): recovery runs AT MOST ONCE per start. After the first
+    // recovery completes, the seam re-plants a crash state (marker + empty
+    // final) before the retry publish; the second load failure must surface
+    // as an error, not recover again. Exactly one quarantine, from the first
+    // pass. Rides the full KEY_RACE_DEADLINE (~5s) on the second load.
+    #[test]
+    fn recovery_runs_at_most_once_per_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        let replanted = std::sync::atomic::AtomicBool::new(false);
+        let replant_path = key_path.clone();
+        let replant_marker = dir.path().join(".identity.pem.publishing.88888.0");
+        let before_publish = move || {
+            if !replanted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::write(&replant_marker, b"").expect("re-plant marker");
+                std::fs::write(&replant_path, b"").expect("re-plant empty final");
+                std::fs::set_permissions(&replant_path, std::fs::Permissions::from_mode(0o600))
+                    .expect("0600 re-planted final");
+            }
+        };
+        let seam = RecoverySeam {
+            before_publish: &before_publish,
+            ..RecoverySeam::NONE
+        };
+
+        let err = match load_or_create_keypair_with(&key_path, &|| {}, PublishFaults::NONE, seam) {
+            Err(e) => e,
+            Ok(_) => panic!("a second crash state in the same start must error, not recover again"),
+        };
+        assert!(
+            err.to_string().contains("invalid PEM key"),
+            "the second load failure must surface unchanged: {err:#}"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantine, from the first recovery: {quarantined:?}"
+        );
+    }
+
+    // #194 (U2): two concurrent boots against the same crash state must admit
+    // exactly ONE recoverer (the atomic claim rename arbitrates); both end on
+    // the SAME identity, one quarantine, no markers or claims left behind.
+    // Modeled on concurrent_starts_converge_on_one_identity.
+    #[test]
+    fn claim_race_admits_exactly_one_recoverer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = seed_crash_state(dir.path(), b"");
+        let config = std::sync::Arc::new(key_config(&key_path));
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let c = config.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    format!(
+                        "{}",
+                        load_or_create_keypair(&c).expect("recovering start").did()
+                    )
+                })
+            })
+            .collect();
+        let dids: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread joins"))
+            .collect();
+
+        assert_eq!(
+            dids[0], dids[1],
+            "both concurrent recovering starts must converge on one identity"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one recoverer must quarantine: {quarantined:?}"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "no recovery claims may remain"
+        );
+    }
+
+    // #194 (U2): the Lost arm participates in recovery. The publisher's link
+    // is forced to fail (fallback path) and the crash state (foreign marker +
+    // empty final) appears between the temp write and the link, so the
+    // publish loses to the crashed final; the Lost-arm load must then take
+    // the recovery path and regenerate.
+    #[test]
+    fn lost_race_load_failure_takes_recovery_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let planted = std::sync::atomic::AtomicBool::new(false);
+        let plant_path = key_path.clone();
+        let plant_marker = dir.path().join(".identity.pem.publishing.77777.0");
+        let before_link = move || {
+            if !planted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                std::fs::write(&plant_marker, b"").expect("plant marker");
+                std::fs::write(&plant_path, b"").expect("plant empty final");
+                std::fs::set_permissions(&plant_path, std::fs::Permissions::from_mode(0o600))
+                    .expect("0600 planted final");
+            }
+        };
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+
+        let kp = load_or_create_keypair_with(&key_path, &before_link, faults, RecoverySeam::NONE)
+            .expect("a lost race onto a crash-state final must recover, not fail the start");
+
+        let on_disk = super::load_existing_key(&key_path).expect("regenerated final parses");
+        assert_eq!(
+            format!("{}", on_disk.did()),
+            format!("{}", kp.did()),
+            "the returned identity must match the regenerated on-disk key"
+        );
+        let quarantined = names_containing(dir.path(), ".quarantined.");
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantine file must exist: {quarantined:?}"
+        );
+        assert!(
+            names_containing(dir.path(), ".publishing.").is_empty(),
+            "no publish markers may remain"
+        );
+        assert!(
+            names_containing(dir.path(), ".recovering.").is_empty(),
+            "no recovery claims may remain"
         );
     }
 }
