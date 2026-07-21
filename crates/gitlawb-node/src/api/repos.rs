@@ -1658,6 +1658,20 @@ pub async fn fork_repo(
         ));
     }
 
+    // Materialize the SOURCE on local disk BEFORE taking the target lock
+    // (downloads from Tigris on cache miss). On a cold source (archive-only, no
+    // local dir) this download takes a nested advisory lock on the write
+    // lock_pool for the source's OWN namespace; doing it under the held target
+    // lock would need two lock-pool connections at once from a pool sized
+    // one-per-writer. The source is a read-only, different-namespace concern and
+    // needs no target-namespace protection, and nothing under the lock below
+    // depends on it beyond the clone reading source_path.
+    let source_path = state
+        .repo_store
+        .acquire(&source.owner_did, &source.name)
+        .await
+        .map_err(|e| AppError::Git(e.to_string()))?;
+
     // Serialize against a concurrent same-key purge or creation on the FORK
     // TARGET namespace, mirroring create_repo's lock above (same rationale,
     // same 503 mapping). Held across the conflict check, clone, durable upload,
@@ -1687,25 +1701,55 @@ pub async fn fork_repo(
     // Request is admissible — spend the proof now, immediately before the write.
     let verified_proof = proof.consume(&state.db).await?;
 
-    // Ensure source repo is on local disk (downloads from Tigris on cache miss)
-    let source_path = state
-        .repo_store
-        .acquire(&source.owner_did, &source.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
-
     let disk_path = store::repo_disk_path(&state.config.repos_dir, &forker_did, &fork_name);
 
-    // Clone the source repo as a mirror
-    let output = std::process::Command::new("git")
-        .args([
-            "clone",
-            "--mirror",
-            source_path.to_str().unwrap_or(""),
-            disk_path.to_str().unwrap_or(""),
-        ])
-        .output()
-        .map_err(|e| AppError::Git(format!("git clone --mirror failed: {e}")))?;
+    // Clone the source repo as a mirror, bounded so a pathological or huge source
+    // cannot pin the held target lock (and its lock-pool connection)
+    // indefinitely. Reuses the served-git ceiling (git_service_timeout_secs,
+    // generous for large clones); after the source reorder above source_path is a
+    // LOCAL path so a normal clone is fast and never approaches the bound, which
+    // is a safety ceiling only. tokio::process with kill_on_drop tears the child
+    // down when the timeout drops the future.
+    let clone_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+    let output = match tokio::time::timeout(
+        clone_timeout,
+        tokio::process::Command::new("git")
+            .args([
+                "clone",
+                "--mirror",
+                source_path.to_str().unwrap_or(""),
+                disk_path.to_str().unwrap_or(""),
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        // Spawn/IO failure, or the clone exceeded the bound (child killed on
+        // drop). Clear any partial mirror and fail the fork with the same
+        // retryable shape the durable-upload arm below returns, before any
+        // RepoRecord exists.
+        Ok(Err(e)) => {
+            if let Err(rm) = std::fs::remove_dir_all(&disk_path) {
+                tracing::warn!(fork = %fork_name, err = %rm,
+                    "failed to remove fork mirror after a failed clone spawn");
+            }
+            repo_lock.release().await;
+            return Err(AppError::Git(format!("git clone --mirror failed: {e}")));
+        }
+        Err(_elapsed) => {
+            if let Err(rm) = std::fs::remove_dir_all(&disk_path) {
+                tracing::warn!(fork = %fork_name, err = %rm,
+                    "failed to remove fork mirror after a clone timeout");
+            }
+            repo_lock.release().await;
+            return Err(AppError::Git(format!(
+                "git clone --mirror timed out after {}s for {fork_name}",
+                clone_timeout.as_secs()
+            )));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4259,6 +4303,124 @@ mod tests {
         let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
         assert!(!clone_dir.exists(), "no clone residue after a 503'd fork");
         held.release().await;
+    }
+
+    // Finding 1: forking a COLD source (archive-only, no local dir) must
+    // materialize the source out from under the target lock, so it works even
+    // when the write lock_pool is sized 1. On a cold source, acquire()'s
+    // download takes a nested advisory lock on that SAME lock_pool for the
+    // SOURCE's namespace; if the target lock (which pins the pool's one
+    // connection) were held first, that nested acquire would find the pool
+    // exhausted, PoolTimedOut -> the source publish degrades -> the source never
+    // lands on disk -> the clone of a missing source fails the fork. RED on the
+    // pre-reorder code (source acquire AFTER lock_repo_blocking): fork fails
+    // with a 5xx at a size-1 lock pool. GREEN after: acquire runs before the
+    // lock, so the two nested acquires never overlap.
+    #[sqlx::test]
+    async fn fork_cold_source_materializes_before_target_lock_at_pool_size_one(
+        pool_opts: sqlx::postgres::PgPoolOptions,
+        connect_opts: sqlx::postgres::PgConnectOptions,
+    ) {
+        use std::path::Path as StdPath;
+
+        // An object store standing in for a cold source: exists() is always
+        // true, and download() materializes a valid bare repo at the target path
+        // (mirroring the real store's extract-then-swap), so acquire() publishes
+        // the source on disk. upload() succeeds so the fork's own durable upload
+        // is a no-op success.
+        struct ColdMaterializeStore;
+        #[async_trait::async_trait]
+        impl crate::git::tigris::ObjectStore for ColdMaterializeStore {
+            async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            async fn upload(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn download(&self, _o: &str, _r: &str, p: &StdPath) -> anyhow::Result<()> {
+                if p.exists() {
+                    std::fs::remove_dir_all(p)?;
+                }
+                crate::git::store::init_bare(p)?;
+                Ok(())
+            }
+            async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        // App pool for state.db (get_repo / proof.consume / create_repo), sized
+        // generously so unrelated app work never contends. The hazard under test
+        // is on the SEPARATE lock pool below.
+        let app_pool = pool_opts
+            .max_connections(5)
+            .connect_with(connect_opts.clone())
+            .await
+            .unwrap();
+        // The write lock_pool sized to ONE connection: a target lock plus an
+        // overlapping source-namespace lock cannot both be satisfied from it, so
+        // this size is exactly what surfaces the double-hold hazard.
+        let lock_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .min_connections(0)
+            .connect_with(connect_opts)
+            .await
+            .unwrap();
+
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(std::sync::Arc::new(ColdMaterializeStore)),
+            lock_pool,
+        );
+
+        // Build state WITHOUT creating the source bare on disk: the source lives
+        // only in the object store, so acquire() must download it. (fork_test_state
+        // would materialize it locally, which is the warm path, not this one.)
+        let mut state = crate::test_support::test_state(app_pool).await;
+        state.repo_store = repo_store;
+        let mut cfg = (*state.config).clone();
+        cfg.repos_dir = repos_dir.path().to_path_buf();
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo(
+                FORK_SRC_OWNER,
+                FORK_SRC_NAME,
+                "unused-cold-path",
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        // The source must NOT be on local disk, or acquire takes the warm path
+        // and never exercises the cold download + nested lock.
+        let src_local =
+            store::repo_disk_path(&state.config.repos_dir, FORK_SRC_OWNER, FORK_SRC_NAME);
+        assert!(!src_local.exists(), "source must be cold (absent locally)");
+
+        let forker = "did:key:z6MkForkColdSrcAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let fork_name = "coldfork";
+
+        let resp = call_fork(&state, forker, fork_name)
+            .await
+            .expect("cold-source fork must succeed at a size-1 lock pool");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(
+            state
+                .db
+                .get_repo(forker, fork_name)
+                .await
+                .unwrap()
+                .is_some(),
+            "repos row present after the cold-source fork"
+        );
+        let clone_dir = store::repo_disk_path(&state.config.repos_dir, forker, fork_name);
+        assert!(
+            clone_dir.exists(),
+            "cloned mirror present after the cold-source fork"
+        );
     }
 
     // create_repo must NOT take its serialization lock from the APP pool. Doing so
