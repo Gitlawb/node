@@ -92,6 +92,11 @@ pub async fn run() -> Result<()> {
 
     // Load or generate the node's identity keypair
     let keypair = load_or_create_keypair(&config)?;
+    // The boot sweep spares young `.recovering.` claims (they may gate a
+    // live round); this one delayed re-sweep clears any spared orphan once
+    // it has aged past the liveness floor, ~12s into uptime, so aged claim
+    // residue cannot linger beside a healthy final (F2). Fire-and-forget.
+    spawn_delayed_claim_resweep(config.resolved_key_path());
     let node_did = keypair.did();
 
     // One-time metrics init. Must run before any handler that calls into
@@ -1271,14 +1276,22 @@ fn quarantined_prefix(stem: &str) -> String {
     format!(".{stem}.quarantined.")
 }
 
-/// The newest `.{stem}.quarantined.*` entry beside `final_path` whose bytes
-/// parse as a keypair, with those bytes: a COMPLETED key a crashed or failed
-/// recovery left stranded, adoptable by the generate arm of
-/// `load_or_create_keypair_with` (F1). Candidates are tried newest mtime
-/// first (the most recent quarantine is the most recently live identity;
-/// unreadable mtimes sort last); unreadable or unparseable entries are
-/// skipped, staying on disk as forensics. Directory-read and non-UTF-8
-/// policy match `list_publish_markers`.
+/// The newest `.{stem}.quarantined.*` entry beside `final_path` YOUNGER than
+/// `CLAIM_SWEEP_MIN_AGE` whose bytes parse as a keypair, with those bytes: a
+/// COMPLETED key the CURRENT round's crashed or failed recovery left
+/// stranded, adoptable by the generate arm of `load_or_create_keypair_with`
+/// (F1). The age bound is the point: a stranded current round's quarantine
+/// is seconds old, so continuity across a just-crashed restore is preserved,
+/// while a HISTORICAL parseable quarantine (forensics kept after a Lost
+/// restore, or any prior round) is never resurrected; without the bound, a
+/// final that goes missing later silently revives an old identity, and the
+/// operator procedure "delete identity.pem for a fresh DID" is defeated by
+/// whatever quarantine still sits beside it. Once the floor passes, that
+/// procedure mints a genuinely fresh identity. An unreadable mtime reads as
+/// too old (skip; fail safe against resurrection). Candidates are tried
+/// newest mtime first (the most recent quarantine is the most recently live
+/// identity); unparseable entries are skipped, staying on disk as forensics.
+/// Directory-read and non-UTF-8 policy match `list_publish_markers`.
 fn find_adoptable_quarantine(
     final_path: &std::path::Path,
 ) -> Option<(std::path::PathBuf, String, Keypair)> {
@@ -1292,20 +1305,24 @@ fn find_adoptable_quarantine(
         .unwrap_or("identity.pem");
     let prefix = quarantined_prefix(stem);
     let entries = std::fs::read_dir(dir).ok()?;
-    let mut quarantines: Vec<(std::path::PathBuf, Option<std::time::SystemTime>)> = entries
+    let now = std::time::SystemTime::now();
+    let mut quarantines: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
         .filter_map(|e| e.ok())
         .filter(|e| {
             e.file_name()
                 .to_str()
                 .is_some_and(|n| n.starts_with(&prefix))
         })
-        .map(|e| {
-            let mtime = e.metadata().and_then(|m| m.modified()).ok();
-            (e.path(), mtime)
+        .filter_map(|e| {
+            // The adoption age bound (see the doc comment): an unreadable
+            // mtime is skipped outright, and a future mtime (clock skew)
+            // reads as age zero, matching the sweep's young side.
+            let mtime = e.metadata().and_then(|m| m.modified()).ok()?;
+            let age = now.duration_since(mtime).unwrap_or_default();
+            (age < CLAIM_SWEEP_MIN_AGE).then_some((e.path(), mtime))
         })
         .collect();
-    // Newest first; None (unreadable mtime) orders before every Some under
-    // Option's Ord, so the descending sort puts it last.
+    // Newest first.
     quarantines.sort_by_key(|q| std::cmp::Reverse(q.1));
     for (path, _) in quarantines {
         let Ok(pem) = std::fs::read_to_string(&path) else {
@@ -1489,18 +1506,28 @@ fn boot_load_key(
     }
 }
 
-/// Wait until no `.{stem}.recovering.*` claim remains beside `final_path`,
-/// polling on `load_racing_key`'s cadence (~2ms), bounded by
-/// `KEY_RACE_DEADLINE` (#194, U3). Why the wait exists: a fallback winner
-/// that failed its commit check was demoted by a recovering peer, and that
-/// peer is mid-round — it quarantines the (old) final, republishes a fresh
-/// key, and only then clears its claim. A demoted winner that re-loaded
-/// before the claim cleared could observe the pre-quarantine key and diverge
-/// from what the peer ends up publishing; waiting for claim clearance makes
-/// the follow-up load observe the settled state. Deadline expiry is NOT an
-/// error: a claim left by a recovery that itself crashed never clears, and
-/// the caller's load path copes with whatever state remains (loudly, if the
-/// key is unreadable). An unreadable directory reads as no claims, matching
+/// Wait until no `.{stem}.recovering.*` claim YOUNGER than
+/// `CLAIM_SWEEP_MIN_AGE` remains beside `final_path`, polling on
+/// `load_racing_key`'s cadence (~2ms), bounded by `CLAIM_SWEEP_MIN_AGE` plus
+/// a one-second margin (#194, U3; F3). Why the wait exists: a fallback
+/// winner that failed its commit check was demoted by a recovering peer, and
+/// that peer is mid-round — it quarantines the (old) final, republishes a
+/// fresh key, and only then clears its claim. A demoted winner that
+/// re-loaded before the claim cleared could observe the pre-quarantine key
+/// and diverge from what the peer ends up publishing; waiting for claim
+/// clearance makes the follow-up load observe the settled state.
+///
+/// The waiter and the sweep share ONE liveness rule (F3): a claim is live
+/// only while younger than `CLAIM_SWEEP_MIN_AGE`, the protocol's
+/// claim-liveness floor. An AGED claim is orphaned residue by definition and
+/// does not hold the waiter, while a young claim holds it up to the floor
+/// (the old `KEY_RACE_DEADLINE` bound expired while a slow mount's live
+/// round could still be in flight). The margin lets a claim born at wait
+/// start age out naturally, so bound expiry means only unreadable-mtime
+/// residue remains. Bound expiry is NOT an error: the caller's load path
+/// copes with whatever state remains (loudly, if the key is unreadable). An
+/// unreadable claim mtime reads as young (hold; fail safe, matching the
+/// sweep), and an unreadable directory reads as no claims, matching
 /// `list_publish_markers`' policy.
 fn wait_for_recovery_claims(final_path: &std::path::Path) {
     let dir = final_path
@@ -1512,13 +1539,26 @@ fn wait_for_recovery_claims(final_path: &std::path::Path) {
         .and_then(|s| s.to_str())
         .unwrap_or("identity.pem");
     let prefix = recovering_prefix(stem);
-    let deadline = std::time::Instant::now() + KEY_RACE_DEADLINE;
+    let deadline =
+        std::time::Instant::now() + CLAIM_SWEEP_MIN_AGE + std::time::Duration::from_secs(1);
     loop {
         let claimed = std::fs::read_dir(dir).is_ok_and(|entries| {
             entries.filter_map(|e| e.ok()).any(|e| {
-                e.file_name()
+                if !e
+                    .file_name()
                     .to_str()
                     .is_some_and(|n| n.starts_with(&prefix))
+                {
+                    return false;
+                }
+                // The shared liveness rule (see the doc comment): only a
+                // young claim holds the waiter; unreadable mtime = young.
+                let age = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok());
+                age.is_none_or(|age| age < CLAIM_SWEEP_MIN_AGE)
             })
         });
         if !claimed || std::time::Instant::now() >= deadline {
@@ -1619,6 +1659,34 @@ fn sweep_stale_markers(final_path: &std::path::Path, sweep_sync: fn() -> std::io
     {
         let _ = fsync_parent_dir(final_path);
     }
+}
+
+/// Fire-and-forget companion to the boot sweep's young-claim sparing (F2):
+/// one delayed re-sweep of `key_path`, `CLAIM_SWEEP_MIN_AGE` plus a
+/// two-second margin into uptime. The boot-time sweep must SPARE a young
+/// `.recovering.` claim (it may gate a live round), but a spared orphan is
+/// never re-examined in-process, and once it ages on disk a LATER content
+/// failure of the good final would match the crash signature (content-bad
+/// beside an aged claimable) and silently regenerate where marker-less
+/// corruption must fail loudly. By the time this fires, any claim the boot
+/// sweep spared has aged past the liveness floor, so `sweep_stale_markers`
+/// clears it and aged residue cannot coexist with a long-healthy final. The
+/// node never waits on this task; failures stay at warn (the sweep itself
+/// warns internally when it skips).
+fn spawn_delayed_claim_resweep(key_path: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(CLAIM_SWEEP_MIN_AGE + std::time::Duration::from_secs(2)).await;
+        let sweep_path = key_path.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || sweep_stale_markers(&sweep_path, || Ok(()))).await
+        {
+            warn!(
+                path = %key_path.display(),
+                err = %e,
+                "delayed identity-claim re-sweep task failed"
+            );
+        }
+    })
 }
 
 /// Compile-time fault-injection seam for `publish_key_atomically`, extending
@@ -2637,12 +2705,13 @@ fn load_or_create_keypair_with(
         // stranded in a quarantine: the recoverer's restore republish
         // errored, or the recoverer crashed between its quarantine rename
         // and the restore. Generating here would mint a fresh DID over a
-        // still-live identity, so a parseable quarantine is republished and
-        // adopted instead: adoption preserves identity continuity across a
-        // crashed or failed restore. An unparseable quarantine is the
-        // expected crash state and stays on disk as forensics; only when no
-        // quarantine parses (or none exists) does the boot fall through to
-        // generate. The republish holds no-clobber on every tier, so Lost
+        // still-live identity, so a YOUNG parseable quarantine (the current
+        // round's; see find_adoptable_quarantine's age bound) is republished
+        // and adopted instead: adoption preserves identity continuity across
+        // a crashed or failed restore. An unparseable quarantine is the
+        // expected crash state and stays on disk as forensics, as does an
+        // AGED parseable one (history, never resurrected); only when no
+        // quarantine qualifies does the boot fall through to generate. The republish holds no-clobber on every tier, so Lost
         // means a concurrent starter durably published meanwhile: defer to
         // it and keep the quarantine, exactly like the G2b restore. A
         // republish error surfaces loudly with the quarantine kept: minting
@@ -4810,13 +4879,16 @@ mod identity_key_tests {
         );
     }
 
-    // #194 (U3): a demoted winner facing a STALE `.recovering.` claim (a
-    // recovery that crashed before clearing it) must wait the claim out on
-    // the bounded KEY_RACE_DEADLINE and then return Lost, not error. The
-    // marker is stolen WITHOUT a real recovery (final left in place), so the
-    // follow-up load resolves the winner's OWN key: the demotion-is-safe
-    // property. RED before U3: the publish returns Won immediately and the
-    // elapsed floor fails.
+    // #194 (U3, reshaped by F3): a demoted winner facing an AGED
+    // `.recovering.` claim (a recovery that crashed before clearing it) must
+    // SKIP it quickly and return Lost, not error: the waiter now shares the
+    // sweep's liveness rule, and a claim past CLAIM_SWEEP_MIN_AGE is
+    // orphaned residue by definition. The marker is stolen WITHOUT a real
+    // recovery (final left in place), so the follow-up load resolves the
+    // winner's OWN key: the demotion-is-safe property.
+    // waiter_holds_for_live_young_claims covers the young-claim hold side.
+    // RED before F3: the age-blind waiter rides the full KEY_RACE_DEADLINE
+    // (~5s) on the aged claim and the elapsed ceiling fails.
     #[test]
     fn demoted_winner_waits_out_a_stale_claim() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4835,8 +4907,12 @@ mod identity_key_tests {
                 "A's window must be bracketed: {markers:?}"
             );
             std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
-            std::fs::write(steal_dir.join(".identity.pem.recovering.44444"), b"")
-                .expect("plant stale claim");
+            let claim = steal_dir.join(".identity.pem.recovering.44444");
+            std::fs::write(&claim, b"").expect("plant stale claim");
+            // The planted claim models an orphan of a LONG-crashed recovery,
+            // so it must be aged; a fresh claim reads as live and holds the
+            // waiter (waiter_holds_for_live_young_claims).
+            age_beyond_claim_sweep(&claim);
         };
         let faults = PublishFaults {
             link: || Err(std::io::ErrorKind::Unsupported.into()),
@@ -4855,8 +4931,86 @@ mod identity_key_tests {
         let waited = started.elapsed();
 
         assert!(
-            waited >= std::time::Duration::from_secs(4),
-            "the demotion must wait out the stale claim on the deadline, waited {waited:?}"
+            waited < std::time::Duration::from_secs(4),
+            "an aged (orphaned) claim must not hold the demoted winner, waited {waited:?}"
+        );
+        let on_disk = super::load_existing_key(&key_path).expect("final parses");
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", on_disk.did()),
+            "with the final untouched the demoted winner must resolve its own key"
+        );
+    }
+
+    // F3: the waiter's hold must follow the claim-liveness floor
+    // (CLAIM_SWEEP_MIN_AGE), not KEY_RACE_DEADLINE: a live claim's round is
+    // allowed the full liveness floor to finish, so a demoted winner that
+    // gives up at the 5s deadline can re-load the pre-quarantine key while a
+    // slow-mount recovery is still mid-round. Plant a FRESH claim, hold it
+    // live for ~7s (past the old deadline), then remove it mid-wait: the
+    // waiter must still be holding past 5s and return shortly after the
+    // removal, well under the CLAIM_SWEEP_MIN_AGE-plus-margin bound. RED
+    // before F3: the waiter expires at KEY_RACE_DEADLINE and the elapsed
+    // floor fails.
+    #[test]
+    fn waiter_holds_for_live_young_claims() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let steal_dir = dir.path().to_path_buf();
+        let before_commit = move || {
+            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let markers = names_containing(&steal_dir, ".publishing.");
+            assert_eq!(
+                markers.len(),
+                1,
+                "A's window must be bracketed: {markers:?}"
+            );
+            std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
+            std::fs::write(steal_dir.join(".identity.pem.recovering.55555"), b"")
+                .expect("plant fresh (live) claim");
+        };
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+
+        // Model the live round resolving mid-wait: once the claim appears,
+        // keep it live for 7s (past the old 5s deadline, under the ~11s
+        // bound), then clear it as a finishing recoverer would.
+        let claim_path = dir.path().join(".identity.pem.recovering.55555");
+        let remover_path = claim_path.clone();
+        let remover = std::thread::spawn(move || {
+            while !remover_path.exists() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(7));
+            std::fs::remove_file(&remover_path).expect("clear the live claim mid-wait");
+        });
+
+        let started = std::time::Instant::now();
+        let kp = load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &before_commit,
+            faults,
+            RecoverySeam::NONE,
+        )
+        .expect("a demoted winner behind a live claim must still resolve a key");
+        let waited = started.elapsed();
+        remover.join().expect("remover joins");
+
+        assert!(
+            waited > super::KEY_RACE_DEADLINE + std::time::Duration::from_millis(1500),
+            "a young claim must hold the waiter past the old deadline, waited {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(10),
+            "the waiter must release on the claim's removal, not ride the full \
+             bound: waited {waited:?}"
         );
         let on_disk = super::load_existing_key(&key_path).expect("final parses");
         assert_eq!(
@@ -4944,6 +5098,72 @@ mod identity_key_tests {
         assert!(
             names_containing(dir.path(), ".publishing.").is_empty(),
             "publish markers keep the unconditional sweep"
+        );
+    }
+
+    // F2 (function level): the boot sweep SPARES a young claim (it may gate
+    // a live round), so orphaned residue can outlive a healthy boot; once
+    // the claim ages past CLAIM_SWEEP_MIN_AGE a SECOND sweep over the same
+    // final must clear it, or the residue later pairs with a real content
+    // failure of the good final and misclassifies marker-less corruption as
+    // a crash. GREEN at introduction (the sweep is already age-correct);
+    // load-bearing by mutation check: inverting the sweep's age gate turns
+    // it RED. spawn_delayed_claim_resweep is the boot wiring that provides
+    // the second sweep in-process.
+    #[test]
+    fn second_sweep_clears_aged_orphan_claims() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+        std::fs::write(&key_path, pem.as_bytes()).expect("seed valid final");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 final");
+        let claim = dir.path().join(".identity.pem.recovering.33333");
+        std::fs::write(&claim, b"").expect("seed young claim");
+
+        super::sweep_stale_markers(&key_path, || Ok(()));
+        assert!(
+            claim.exists(),
+            "the first sweep must spare the young (possibly live) claim"
+        );
+
+        age_beyond_claim_sweep(&claim);
+        super::sweep_stale_markers(&key_path, || Ok(()));
+        assert!(
+            !claim.exists(),
+            "a second sweep must clear the claim once it ages into an orphan"
+        );
+    }
+
+    // F2 (wiring): the delayed boot re-sweep must actually fire and sweep.
+    // Paused tokio time drives the real CLAIM_SWEEP_MIN_AGE-plus-margin
+    // sleep instantly; the claim is pre-aged on disk because paused time
+    // advances the tokio clock, not SystemTime mtimes. This covers "the
+    // spawned task runs the sweep after the delay";
+    // second_sweep_clears_aged_orphan_claims covers the age semantics.
+    #[tokio::test(start_paused = true)]
+    async fn delayed_resweep_clears_aged_orphan_claims() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+        std::fs::write(&key_path, pem.as_bytes()).expect("seed valid final");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 final");
+        let claim = dir.path().join(".identity.pem.recovering.66666");
+        std::fs::write(&claim, b"").expect("seed claim");
+        age_beyond_claim_sweep(&claim);
+
+        super::spawn_delayed_claim_resweep(key_path.clone())
+            .await
+            .expect("the re-sweep task must complete");
+
+        assert!(
+            !claim.exists(),
+            "the delayed re-sweep must clear the aged orphan claim"
+        );
+        assert!(
+            super::load_existing_key(&key_path).is_ok(),
+            "the final must survive the re-sweep intact"
         );
     }
 
@@ -5516,6 +5736,74 @@ mod identity_key_tests {
         assert!(
             names_containing(dir.path(), ".quarantined.").is_empty(),
             "the quarantine must be consumed once its bytes are durably republished"
+        );
+    }
+
+    // F1 MUST-NOT (age bound): adoption exists for the CURRENT round only (a
+    // recoverer that crashed or failed seconds ago), so a parseable
+    // quarantine AGED past CLAIM_SWEEP_MIN_AGE is history, not a stranded
+    // round: kept forensics after a Lost restore, or an old identity the
+    // operator already moved past. Adopting it would resurrect a dead DID
+    // whenever the final later goes missing. The aged quarantine must
+    // survive untouched as forensics while boot generates fresh. RED before
+    // the age bound: the aged quarantine is adopted.
+    #[test]
+    fn aged_quarantine_is_never_adopted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let stranded = Keypair::generate();
+        let pem = stranded.to_pem().expect("pem");
+        let quarantine = dir.path().join(".identity.pem.quarantined.99999.0");
+        std::fs::write(&quarantine, pem.as_bytes()).expect("seed aged quarantine");
+        age_beyond_claim_sweep(&quarantine);
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("an aged quarantine must not block a fresh generation");
+
+        assert_ne!(
+            format!("{}", kp.did()),
+            format!("{}", stranded.did()),
+            "an aged quarantine is history and must never be resurrected"
+        );
+        assert_eq!(
+            std::fs::read(&quarantine).expect("quarantine still on disk"),
+            pem.as_bytes(),
+            "the aged quarantine must survive byte-for-byte as forensics"
+        );
+    }
+
+    // F1 (operator procedure): deleting identity.pem is the documented way
+    // to mint a fresh DID. With an old parseable quarantine sitting beside
+    // the final as forensics, the post-delete boot must GENERATE a new
+    // identity, not adopt the quarantined one; unbounded adoption silently
+    // defeats the procedure. RED before the age bound: the old quarantine's
+    // DID comes back.
+    #[test]
+    fn operator_fresh_identity_procedure_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let first = load_or_create_keypair(&key_config(&key_path)).expect("provision identity");
+        let old = Keypair::generate();
+        let old_pem = old.to_pem().expect("pem");
+        let quarantine = dir.path().join(".identity.pem.quarantined.88888.0");
+        std::fs::write(&quarantine, old_pem.as_bytes()).expect("seed forensic quarantine");
+        age_beyond_claim_sweep(&quarantine);
+
+        // The operator action: delete the final to get a fresh DID.
+        std::fs::remove_file(&key_path).expect("operator deletes the final");
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("the post-delete boot must provision a fresh identity");
+
+        assert_ne!(
+            format!("{}", kp.did()),
+            format!("{}", old.did()),
+            "the old quarantined identity must not be resurrected"
+        );
+        assert_ne!(
+            format!("{}", kp.did()),
+            format!("{}", first.did()),
+            "the operator must get a genuinely fresh DID"
         );
     }
 

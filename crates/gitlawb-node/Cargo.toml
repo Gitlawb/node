@@ -95,6 +95,9 @@ libp2p-dns = { version = "0.44.0", features = ["tokio"] }
 [dev-dependencies]
 mockito = "1"
 tempfile = "3"
+# test-util enables tokio::test(start_paused): the delayed claim re-sweep
+# test drives the real CLAIM_SWEEP_MIN_AGE-plus-margin sleep on paused time.
+tokio = { workspace = true, features = ["test-util"] }
 # Used by the deny-harness integration crate (tests/deny_harness.rs): the
 # #[sqlx::test] macro for an ephemeral per-test pool, and reqwest as the real
 # HTTP client that drives deny paths over the socket.
