@@ -23,3 +23,16 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+# Job Object bindings for the real_git_fetch harness: the Windows analog of the
+# unix process-group teardown, so the whole `git fetch` tree can be killed
+# together on both the timeout and clean-exit paths (INV-22). Win32_Security is
+# required by CreateJobObjectW, and Win32_System_Threading by
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION (it embeds IO_COUNTERS).
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
