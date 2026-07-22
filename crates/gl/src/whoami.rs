@@ -238,7 +238,10 @@ mod tests {
         let err = run(args).await.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("403"), "expected 403 error, got: {msg}");
-        assert!(msg.contains("forbidden"), "expected 'forbidden' in error, got: {msg}");
+        assert!(
+            msg.contains("forbidden"),
+            "expected 'forbidden' in error, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -266,7 +269,10 @@ mod tests {
         let err = run(args).await.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("500"), "expected 500 error, got: {msg}");
-        assert!(msg.contains("internal error"), "expected 'internal error' in error, got: {msg}");
+        assert!(
+            msg.contains("internal error"),
+            "expected 'internal error' in error, got: {msg}"
+        );
     }
 
     #[tokio::test]
