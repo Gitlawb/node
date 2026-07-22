@@ -1159,7 +1159,9 @@ const KEY_RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5)
 /// each mtime every quarter of this floor until release, so a live round's
 /// claims NEVER age out, however long the round runs on a slow shared
 /// volume. An AGED claim therefore means its recoverer stopped heartbeating
-/// (crashed or killed): orphaned residue, claimable and sweepable. A YOUNG
+/// (crashed or killed): orphaned residue, claimable and sweepable (the
+/// demotion waiter, by contrast, keys on claim-file ABSENCE, not age; see
+/// `wait_for_recovery_claims`). A YOUNG
 /// claim means live or recently dead, an ambiguity bounded by one floor
 /// (the price of never stealing a live round). The 2x margin over
 /// `KEY_RACE_DEADLINE` absorbs clock skew between writers on network
@@ -1177,14 +1179,20 @@ const KEY_RACE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5)
 /// price of never stealing a live recovery round.
 const CLAIM_SWEEP_MIN_AGE: std::time::Duration = KEY_RACE_DEADLINE.saturating_mul(2);
 
-/// Retention window for `.{stem}.superseded.` forensic files. A superseded
-/// quarantine is kept for operator inspection after a lost round, but with
-/// no expiry the residue accumulates forever (every lost round adds one
-/// file beside the final). 24 hours is a generous post-mortem window while
-/// keeping growth bounded: once a superseded file is older than this, the
-/// healthy-boot sweep removes it (behind the same durability gate as every
-/// other removal in `sweep_stale_markers`). An unreadable mtime reads as
-/// young (kept; fail safe).
+/// Retention window for forensic residue beside a healthy final: both
+/// `.{stem}.superseded.` files and plain `.{stem}.quarantined.` files. A
+/// superseded quarantine is kept for operator inspection after a lost
+/// round, and a plain quarantine lingers as crash forensics (unparseable
+/// bytes) or as aged history (a parseable key already past the adoption
+/// floor, never resurrected); with no expiry either class accumulates
+/// forever (every lost round or crash adds one file beside the final). 24
+/// hours is a generous post-mortem window while keeping growth bounded:
+/// once a file in either class is older than this, the healthy-boot sweep
+/// removes it (behind the same durability gate as every other removal in
+/// `sweep_stale_markers`). The window is orders of magnitude above the
+/// adoption floor (`CLAIM_SWEEP_MIN_AGE`), so no quarantine this sweep can
+/// touch was still adoptable. An unreadable mtime reads as young (kept;
+/// fail safe).
 const SUPERSEDED_RETENTION: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// How long the crash signature (a content-bad final beside a claimable)
@@ -1622,34 +1630,38 @@ fn boot_load_key(
     }
 }
 
-/// Wait until no `.{stem}.recovering.*` claim YOUNGER than
-/// `CLAIM_SWEEP_MIN_AGE` remains beside `final_path`, polling on
-/// `load_racing_key`'s cadence (~2ms), bounded by `CLAIM_SWEEP_MIN_AGE` plus
-/// a one-second margin (#194, U3; F3). Why the wait exists: a fallback
-/// winner that failed its commit check was demoted by a recovering peer, and
-/// that peer is mid-round — it quarantines the (old) final, republishes a
-/// fresh key, and only then clears its claim. A demoted winner that
-/// re-loaded before the claim cleared could observe the pre-quarantine key
-/// and diverge from what the peer ends up publishing; waiting for claim
-/// clearance makes the follow-up load observe the settled state.
+/// Wait until NO `.{stem}.recovering.*` claim FILE remains beside
+/// `final_path`, polling on `load_racing_key`'s cadence (~2ms), bounded by
+/// `CLAIM_SWEEP_MIN_AGE` plus a one-second margin (#194, U3; F3; N3). Why
+/// the wait exists: a fallback winner that failed its commit check was
+/// demoted by a recovering peer, and that peer is mid-round — it
+/// quarantines the (old) final, republishes a fresh key, and only then
+/// clears its claim. A demoted winner that re-loaded before the claim
+/// cleared could observe the pre-quarantine key and diverge from what the
+/// peer ends up publishing; waiting for claim clearance makes the follow-up
+/// load observe the settled state.
 ///
-/// The waiter and the sweep share ONE liveness rule (F3): a claim is live
-/// only while younger than `CLAIM_SWEEP_MIN_AGE`, the protocol's
-/// claim-liveness floor. An AGED claim is orphaned residue by definition and
-/// does not hold the waiter, while a young claim holds it up to the floor
-/// (the old `KEY_RACE_DEADLINE` bound expired while a slow mount's live
-/// round could still be in flight). The margin lets a claim born at wait
-/// start age out naturally.
+/// The waiter keys purely on ABSENCE, never on age. Age stays the liveness
+/// rule for the SWEEP (`sweep_stale_markers`) and CLAIMABILITY
+/// (`list_recovery_claimables`), but an aged claim is not proof its
+/// recoverer is gone: with the heartbeat spawn failed AND both mtime stamp
+/// rungs failing on a hostile volume, a LIVE recoverer's claim can sit
+/// mtime-frozen while the round is still settling disk, and a waiter that
+/// read it as orphaned residue would let the demoted publisher load a
+/// pre-settlement key while that recoverer settles disk differently:
+/// two-sided divergence under compounded failure. A file that is GONE is
+/// unambiguous: the round settled (release) or a sweep decided the claim
+/// was orphaned; either way the follow-up load observes a settled state.
 ///
-/// A wait that CLEARS (claims removed, or only aged orphans remain) returns
-/// `Ok`. Bound expiry with a YOUNG claim still present returns an `Err`
-/// naming the claim file(s) (N3): the recovery round did not settle within
-/// the bound, and a demoted publisher that loaded the final there could
-/// return a pre-settlement identity into `run()` while the still-live
-/// recoverer settles disk on a different one, the exact divergence the
-/// protocol forbids, so the caller must fail closed instead of loading. An
-/// unreadable claim mtime reads as young (hold; fail safe, matching the
-/// sweep), and an unreadable directory reads as no claims, matching
+/// So: `Ok` only when the claim files are gone. Bound expiry with ANY claim
+/// file still present (young or aged) returns an `Err` naming the file(s):
+/// the round cannot be proven settled, and the caller must fail closed
+/// instead of loading. Consequence: an aged ORPHAN claim (its recoverer
+/// long dead) now fails a concurrently-demoted publisher loudly until a
+/// healthy boot's sweep or the delayed re-sweep
+/// (`spawn_delayed_claim_resweep`) clears it — a bounded,
+/// operator-visible degradation, priced against the silent divergence the
+/// age rule risked. An unreadable directory reads as no claims, matching
 /// `list_publish_markers`' policy.
 fn wait_for_recovery_claims(final_path: &std::path::Path) -> Result<()> {
     let dir = final_path
@@ -1664,41 +1676,26 @@ fn wait_for_recovery_claims(final_path: &std::path::Path) -> Result<()> {
     let bound = CLAIM_SWEEP_MIN_AGE + std::time::Duration::from_secs(1);
     let deadline = std::time::Instant::now() + bound;
     loop {
-        let live: Vec<String> = std::fs::read_dir(dir)
+        let present: Vec<String> = std::fs::read_dir(dir)
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
                     .filter(|e| {
-                        if !e
-                            .file_name()
+                        e.file_name()
                             .to_str()
                             .is_some_and(|n| n.starts_with(&prefix))
-                        {
-                            return false;
-                        }
-                        // The shared liveness rule (see the doc comment): only
-                        // a young claim holds the waiter; unreadable mtime =
-                        // young.
-                        let age = e
-                            .metadata()
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .and_then(|mtime| {
-                                std::time::SystemTime::now().duration_since(mtime).ok()
-                            });
-                        age.is_none_or(|age| age < CLAIM_SWEEP_MIN_AGE)
                     })
                     .map(|e| e.file_name().to_string_lossy().into_owned())
                     .collect()
             })
             .unwrap_or_default();
-        if live.is_empty() {
+        if present.is_empty() {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "recovery round did not settle within the {bound:?} wait bound: live \
-                 recovery claim(s) {live:?} still present beside {}",
+                "recovery round did not settle within the {bound:?} wait bound: \
+                 recovery claim(s) {present:?} still present beside {}",
                 final_path.display()
             );
         }
@@ -1707,8 +1704,8 @@ fn wait_for_recovery_claims(final_path: &std::path::Path) -> Result<()> {
 }
 
 /// Best-effort sweep of stale `.{stem}.publishing.*` markers,
-/// `.{stem}.recovering.*` claims, and expired `.{stem}.superseded.*`
-/// forensics beside a healthy final, run on both
+/// `.{stem}.recovering.*` claims, and expired `.{stem}.superseded.*` /
+/// `.{stem}.quarantined.*` forensics beside a healthy final, run on both
 /// healthy-boot arms of `load_or_create_keypair_with` (#194, U4). Without it
 /// a marker orphaned by a crash between its durability fsync and the final's
 /// `create_new`, or a claim left by a crashed recovery, outlives every
@@ -1773,6 +1770,7 @@ fn sweep_stale_markers(final_path: &std::path::Path, sweep_sync: fn() -> std::io
     let publishing = publishing_prefix(stem);
     let recovering = recovering_prefix(stem);
     let superseded = superseded_prefix(stem);
+    let quarantined = quarantined_prefix(stem);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1793,11 +1791,14 @@ fn sweep_stale_markers(final_path: &std::path::Path, sweep_sync: fn() -> std::io
             if orphaned {
                 let _ = std::fs::remove_file(entry.path());
             }
-        } else if name.starts_with(&superseded) {
-            // Superseded forensics expire after SUPERSEDED_RETENTION (the
+        } else if name.starts_with(&superseded) || name.starts_with(&quarantined) {
+            // Forensic residue expires after SUPERSEDED_RETENTION (the
             // operator's inspection window); without an expiry every lost
-            // round's residue accumulates forever. Unreadable mtime reads
-            // as young (kept; fail safe), matching the claim gate above.
+            // round's superseded file, and every crash's plain quarantine
+            // (unparseable forensics, or parseable history already far past
+            // the adoption floor), accumulates forever. Unreadable mtime
+            // reads as young (kept; fail safe), matching the claim gate
+            // above.
             let expired = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -1944,14 +1945,17 @@ impl PublishFaults {
 /// the winner's commit check, and recovery claims a round by renaming EVERY
 /// marker and stale claim beside the final (a live winner's own marker is
 /// necessarily among them), so exactly one side takes the round. A winner
-/// that loses its marker demotes itself to Lost, waits out any
-/// `.recovering.` claim (bounded by `KEY_RACE_DEADLINE`), and re-loads the
-/// settled key; a recovery that finds the final completed after claiming
-/// re-loads it instead of quarantining. Honest residuals: a winner stalled
-/// past `KEY_RACE_DEADLINE` that loads in the sub-ms window before a
-/// recoverer's claim exists, and a crash-interrupted recovery whose stale
-/// claim just expires the bounded wait: both degrade to a loud error or a
-/// re-load, never silent two-sided divergence.
+/// that loses its marker demotes itself, waits for every `.recovering.`
+/// claim FILE to clear (bounded by `CLAIM_SWEEP_MIN_AGE` plus a margin; see
+/// `wait_for_recovery_claims`), and re-loads the settled key as Lost; if
+/// any claim file survives the bound the publish fails closed with a loud
+/// error instead of loading. A recovery that finds the final completed
+/// after claiming re-loads it instead of quarantining. Honest residuals: a
+/// winner stalled past `KEY_RACE_DEADLINE` that loads in the sub-ms window
+/// before a recoverer's claim exists degrades to a re-load, and a
+/// crash-interrupted recovery whose orphaned claim outlives the bounded
+/// wait fails the demoted publish loudly until a sweep clears the claim:
+/// loud error or re-load, never silent two-sided divergence.
 ///
 /// `before_link` is a no-op in production; tests use it to widen the
 /// post-write / pre-link window deterministically. `before_commit` runs
@@ -2294,10 +2298,10 @@ fn publish_key_fallback(
     // ONLY for a SETTLED round (N3): the caller's Lost arm re-loads the
     // final, and that load observes the recoverer's outcome only once the
     // recoverer's claims have cleared, so the demoted publish first waits
-    // them out. An UNSETTLED round past the wait bound (a young claim still
-    // live) fails the publish closed with a loud error instead: loading
-    // there could return a pre-settlement key while the still-live recoverer
-    // settles disk on a different identity.
+    // them out. An UNSETTLED round past the wait bound (any claim file
+    // still present) fails the publish closed with a loud error instead:
+    // loading there could return a pre-settlement key while the still-live
+    // recoverer settles disk on a different identity.
     before_commit();
     match std::fs::remove_file(&marker) {
         Ok(()) => {
@@ -2513,9 +2517,13 @@ impl Drop for ClaimHeartbeat {
 /// the joining release is prompt. This is what makes the G1 age-as-orphan
 /// rule sound (see `CLAIM_SWEEP_MIN_AGE`'s liveness contract): without it a
 /// recoverer stalled longer than the floor between claim and settlement
-/// reads as an orphan, the demotion waiter returns Ok (aged out), a demoted
-/// publisher loads the pre-settlement final, and a sweep removes the
-/// still-live claim: divergence returns on slow shared volumes. Best-effort:
+/// reads as an orphan to the sweep and to claimability, so a healthy boot
+/// can remove the still-live claim (early-releasing the demoted waiter to
+/// a pre-settlement load) or a competing recoverer can steal the round:
+/// divergence returns on slow shared volumes. The demotion waiter itself is
+/// age-blind (it keys on claim-file absence; see
+/// `wait_for_recovery_claims`), so a frozen mtime alone fails a demoted
+/// publisher closed rather than releasing it early. Best-effort:
 /// a failed spawn warns and degrades to the single claim-time stamp (the
 /// pre-heartbeat exposure, churn not divergence); a failed refresh warns and
 /// retries at the next beat.
@@ -2649,7 +2657,8 @@ fn release_recovery_claims(final_path: &std::path::Path, claims: &mut ClaimSet) 
 /// remaining markers best-effort and hands control back to regenerate.
 /// Every error exit after claiming releases
 /// the claims first (see `release_recovery_claims`; a leaked claim would
-/// stall later demoted publishers on the full deadline, F1). `seam` carries
+/// ride later demoted publishers through the full wait bound and fail
+/// their publish closed until a sweep cleared it, F1). `seam` carries
 /// the test hooks for the claim-to-re-parse and re-parse-to-quarantine
 /// windows (`before_reparse`, `reparse_fault`, `before_quarantine`; all
 /// no-ops in production).
@@ -2897,13 +2906,17 @@ fn recover_crashed_publish(
                 seam.restore_faults,
             ) {
                 Ok(KeyPublish::Won) => {
-                    let _ = std::fs::remove_file(quarantine);
                     // Mirror-arm invariant (N4): the restore decided this
                     // round in favor of the restored key, so any OTHER
                     // young parseable quarantine sibling provably lost it;
                     // supersede each, exactly like adoption-Won, or a later
                     // missing final resurrects a different historical DID.
+                    // ORDER: siblings first, THEN consume the chosen
+                    // quarantine, so a crash in the gap leaves the siblings
+                    // already superseded, never adoptable beside a final
+                    // that already holds the winner.
                     supersede_sibling_quarantines(final_path, quarantine);
+                    let _ = std::fs::remove_file(quarantine);
                     #[cfg(unix)]
                     {
                         let _ = fsync_parent_dir(final_path);
@@ -2966,8 +2979,9 @@ fn load_or_create_keypair_with(
     // the follow-up
     // generate+publish runs, so a stalled winner our claims demoted can still
     // observe them while waiting (U3 relies on this), and released on EVERY
-    // exit after that, success, Lost, and error alike (#194, F1): a leaked claim
-    // stalls every later demoted publisher on the full KEY_RACE_DEADLINE.
+    // exit after that, success, Lost, and error alike (#194, F1): a leaked
+    // claim rides every later demoted publisher through the full wait bound
+    // and fails its publish closed until a sweep clears the orphan.
     // Release order against the final or the markers does not matter; see
     // release_recovery_claims.
     let mut claims = ClaimSet::empty();
@@ -3040,16 +3054,20 @@ fn load_or_create_keypair_with(
         if let Some((quarantine, pem, kp)) = find_adoptable_quarantine(key_path) {
             match publish_key_atomically(key_path, pem.as_bytes(), &|| {}, &|| {}, faults) {
                 Ok(KeyPublish::Won) => {
-                    // The quarantine's bytes are an exact copy of what now
-                    // durably lives at the final, so keeping it buys no
-                    // forensics (the G2b restore's removal rationale).
-                    let _ = std::fs::remove_file(&quarantine);
                     // N4: any OTHER young parseable quarantine sibling lost
                     // this round to the adopted key; move each into the
                     // superseded class so a later missing final cannot
                     // resurrect a different historical DID. Unparseable
                     // siblings stay plain quarantines as crash forensics.
+                    // ORDER: siblings first, THEN consume the chosen
+                    // quarantine, so a crash in the gap leaves the siblings
+                    // already superseded, never adoptable beside a final
+                    // that already holds the winner.
                     supersede_sibling_quarantines(key_path, &quarantine);
+                    // The quarantine's bytes are an exact copy of what now
+                    // durably lives at the final, so keeping it buys no
+                    // forensics (the G2b restore's removal rationale).
+                    let _ = std::fs::remove_file(&quarantine);
                     #[cfg(unix)]
                     {
                         let _ = fsync_parent_dir(key_path);
@@ -5215,18 +5233,18 @@ mod identity_key_tests {
         );
     }
 
-    // #194 (U3, reshaped by F3): a demoted winner facing an AGED
-    // `.recovering.` claim (a recovery that crashed before clearing it) must
-    // SKIP it quickly and return Lost, not error: the waiter now shares the
-    // sweep's liveness rule, and a claim past CLAIM_SWEEP_MIN_AGE is
-    // orphaned residue by definition. The marker is stolen WITHOUT a real
-    // recovery (final left in place), so the follow-up load resolves the
-    // winner's OWN key: the demotion-is-safe property.
-    // waiter_holds_for_live_young_claims covers the young-claim hold side.
-    // RED before F3: the age-blind waiter rides the full KEY_RACE_DEADLINE
-    // (~5s) on the aged claim and the elapsed ceiling fails.
+    // #194 (U3, reshaped by F3 and the absence-keyed waiter): a demoted
+    // winner whose round is SETTLED (no `.recovering.` claim file remains,
+    // the recoverer released before the demoted publish reached its wait)
+    // must resolve Lost immediately: the waiter keys purely on claim-file
+    // absence, so an empty directory clears it on the first poll. The
+    // marker is stolen WITHOUT a real recovery (final left in place), so
+    // the follow-up load resolves the winner's OWN key: the
+    // demotion-is-safe property. waiter_holds_for_live_young_claims covers
+    // the hold side; frozen_claim_fails_the_waiter_closed covers a claim
+    // that never clears.
     #[test]
-    fn demoted_winner_waits_out_a_stale_claim() {
+    fn demoted_winner_resolves_fast_when_claims_are_gone() {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = dir.path().join("identity.pem");
 
@@ -5242,13 +5260,9 @@ mod identity_key_tests {
                 1,
                 "A's window must be bracketed: {markers:?}"
             );
+            // The demoting peer already resolved AND released its claims:
+            // only the stolen marker remains as evidence of the demotion.
             std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
-            let claim = steal_dir.join(".identity.pem.recovering.44444");
-            std::fs::write(&claim, b"").expect("plant stale claim");
-            // The planted claim models an orphan of a LONG-crashed recovery,
-            // so it must be aged; a fresh claim reads as live and holds the
-            // waiter (waiter_holds_for_live_young_claims).
-            age_beyond_claim_sweep(&claim);
         };
         let faults = PublishFaults {
             link: || Err(std::io::ErrorKind::Unsupported.into()),
@@ -5263,12 +5277,12 @@ mod identity_key_tests {
             faults,
             RecoverySeam::NONE,
         )
-        .expect("a demoted winner behind a stale claim must still resolve a key");
+        .expect("a demoted winner with no claims left must still resolve a key");
         let waited = started.elapsed();
 
         assert!(
             waited < std::time::Duration::from_secs(4),
-            "an aged (orphaned) claim must not hold the demoted winner, waited {waited:?}"
+            "an absent claim must not hold the demoted winner, waited {waited:?}"
         );
         let on_disk = super::load_existing_key(&key_path).expect("final parses");
         assert_eq!(
@@ -5278,14 +5292,89 @@ mod identity_key_tests {
         );
     }
 
-    // F3: the waiter's hold must follow the claim-liveness floor
-    // (CLAIM_SWEEP_MIN_AGE), not KEY_RACE_DEADLINE: a live claim's round is
-    // allowed the full liveness floor to finish, so a demoted winner that
-    // gives up at the 5s deadline can re-load the pre-quarantine key while a
-    // slow-mount recovery is still mid-round. Plant a FRESH claim, hold it
-    // live for ~7s (past the old deadline), then remove it mid-wait: the
-    // waiter must still be holding past 5s and return shortly after the
-    // removal, well under the CLAIM_SWEEP_MIN_AGE-plus-margin bound. RED
+    // Q3: a demoted winner facing a claim whose mtime is FROZEN (its
+    // recoverer's heartbeat never span up and both stamp rungs failed on a
+    // hostile volume, or it is a long-crashed recovery's orphan) must fail
+    // the publish CLOSED, never resolve a key: the waiter keys purely on
+    // claim-file PRESENCE, so a claim that never leaves the directory rides
+    // the full bound and errors, whatever its age. Before this fix the
+    // waiter read an aged claim as orphaned residue and returned Ok, and
+    // the demoted publisher loaded a possibly pre-settlement key while an
+    // mtime-frozen LIVE recoverer could still settle disk differently. RED
+    // before the fix: the aged claim clears the wait as Ok and the demoted
+    // winner resolves its own key.
+    #[test]
+    fn frozen_claim_fails_the_waiter_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let steal_dir = dir.path().to_path_buf();
+        let final_bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let final_at_demotion = final_bytes.clone();
+        let observe_path = key_path.clone();
+        let before_commit = move || {
+            if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let markers = names_containing(&steal_dir, ".publishing.");
+            assert_eq!(
+                markers.len(),
+                1,
+                "A's window must be bracketed: {markers:?}"
+            );
+            std::fs::remove_file(steal_dir.join(&markers[0])).expect("steal A's marker");
+            let claim = steal_dir.join(".identity.pem.recovering.44444");
+            std::fs::write(&claim, b"").expect("plant frozen claim");
+            // Freeze the claim's mtime far in the past: no heartbeat, no
+            // stamp, only the file itself, which never leaves the directory.
+            age_beyond_claim_sweep(&claim);
+            *final_at_demotion.lock().expect("final bytes lock") =
+                std::fs::read(&observe_path).expect("final is complete at the commit check");
+        };
+        let faults = PublishFaults {
+            link: || Err(std::io::ErrorKind::Unsupported.into()),
+            ..PublishFaults::NONE
+        };
+
+        let result = load_or_create_keypair_with(
+            &key_path,
+            &|| {},
+            &before_commit,
+            faults,
+            RecoverySeam::NONE,
+        );
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => {
+                panic!("a claim still present at the wait bound must fail closed, not resolve")
+            }
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(".identity.pem.recovering.44444"),
+            "the error must name the surviving claim file: {msg}"
+        );
+        assert!(
+            msg.contains("settle"),
+            "the error must name the unsettled round: {msg}"
+        );
+        assert_eq!(
+            std::fs::read(&key_path).expect("final still on disk"),
+            *final_bytes.lock().expect("final bytes lock"),
+            "the failed-closed publish must leave the final untouched"
+        );
+    }
+
+    // F3: the waiter's hold must follow the CLAIM_SWEEP_MIN_AGE-plus-margin
+    // bound, not KEY_RACE_DEADLINE: a live claim's round is allowed the
+    // full bound to finish, so a demoted winner that gives up at the 5s
+    // deadline can re-load the pre-quarantine key while a slow-mount
+    // recovery is still mid-round. Plant a claim, hold it in place for ~7s
+    // (past the old deadline), then remove it mid-wait: the waiter must
+    // still be holding past 5s (the file is present) and return shortly
+    // after the removal (absence is the release), well under the bound. RED
     // before F3: the waiter expires at KEY_RACE_DEADLINE and the elapsed
     // floor fails.
     #[test]
@@ -5356,14 +5445,16 @@ mod identity_key_tests {
         );
     }
 
-    // N3: a demoted fallback winner whose wait bound expires while a LIVE
-    // young claim still persists has NOT observed a settled round: loading
-    // the final there can return a pre-settlement key into run() while the
+    // N3: a demoted fallback winner whose wait bound expires while a claim
+    // still persists has NOT observed a settled round: loading the final
+    // there can return a pre-settlement key into run() while the
     // still-live recoverer settles disk on a different identity, the exact
     // divergence the protocol forbids. The publish must fail closed (a loud
     // Err naming the unsettled round), never resolve Lost and load. A
     // refresher thread keeps the claim young past the full wait bound,
-    // modeling a recovery round still live (or stuck) beyond it. RED before
+    // modeling a recovery round still heartbeating (live but stuck) beyond
+    // it; frozen_claim_fails_the_waiter_closed covers the mtime-frozen
+    // side, which the absence-keyed waiter treats identically. RED before
     // N3: the waiter expires silently and the demoted winner returns its
     // own key.
     #[test]
@@ -5397,10 +5488,12 @@ mod identity_key_tests {
             ..PublishFaults::NONE
         };
 
-        // Keep the claim YOUNG for the waiter's whole bound: a recovery
-        // round that never settles. Without the refresher the claim would
-        // age past CLAIM_SWEEP_MIN_AGE before the bound expires and the
-        // wait would clear as aged-orphan residue (the Ok side).
+        // Keep the claim YOUNG for the waiter's whole bound, modeling a
+        // recovery round that heartbeats but never settles. The
+        // absence-keyed waiter fails closed on presence regardless of age
+        // (frozen_claim_fails_the_waiter_closed pins the frozen-mtime
+        // side); the refresher keeps this test honest about the LIVE-round
+        // shape it models.
         let claim_path = dir.path().join(".identity.pem.recovering.55555");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_refresher = stop.clone();
@@ -5600,6 +5693,54 @@ mod identity_key_tests {
         );
     }
 
+    // Q2: plain `.quarantined.` residue also never expired: an unparseable
+    // quarantine (crash forensics) and an aged parseable one (past the
+    // adoption floor, so pure history) sat beside a healthy final forever.
+    // The healthy sweep must remove a `.quarantined.` entry older than
+    // SUPERSEDED_RETENTION, while a YOUNG unparseable one (fresh crash
+    // forensics) and a parseable one past the adoption floor but inside
+    // retention (recent history, an operator may still want it) survive.
+    // RED before Q2: the aged unparseable quarantine survives every
+    // healthy boot.
+    #[test]
+    fn old_quarantine_forensics_are_retention_swept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let pem = Keypair::generate().to_pem().expect("pem");
+        std::fs::write(&key_path, pem.as_bytes()).expect("seed valid final");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 final");
+        let aged_garbage = dir.path().join(".identity.pem.quarantined.99999.0");
+        std::fs::write(&aged_garbage, b"-----BEGIN nonsense").expect("seed aged forensics");
+        set_mtime_past(&aged_garbage, "2 days ago");
+        let young_garbage = dir.path().join(".identity.pem.quarantined.99999.1");
+        std::fs::write(&young_garbage, b"-----BEGIN nonsense").expect("seed young forensics");
+        let recent_parseable = dir.path().join(".identity.pem.quarantined.99999.2");
+        std::fs::write(
+            &recent_parseable,
+            Keypair::generate().to_pem().expect("pem").as_bytes(),
+        )
+        .expect("seed recent parseable quarantine");
+        // Past the adoption floor (CLAIM_SWEEP_MIN_AGE) but well inside the
+        // 24h retention window.
+        set_mtime_past(&recent_parseable, "1 hour ago");
+
+        load_or_create_keypair(&key_config(&key_path)).expect("healthy load");
+
+        assert!(
+            !aged_garbage.exists(),
+            "a quarantine past the retention window must be swept"
+        );
+        assert!(
+            young_garbage.exists(),
+            "young crash forensics must survive the healthy sweep"
+        );
+        assert!(
+            recent_parseable.exists(),
+            "a quarantine past the adoption floor but inside retention must survive"
+        );
+    }
+
     // F2 (wiring): the delayed boot re-sweep must actually fire and sweep.
     // Paused tokio time drives the real CLAIM_SWEEP_MIN_AGE-plus-margin
     // sleep instantly; the claim is pre-aged on disk because paused time
@@ -5712,10 +5853,12 @@ mod identity_key_tests {
 
     // M3: claim liveness is age < CLAIM_SWEEP_MIN_AGE, but a single
     // claim-time stamp lets a recoverer stalled longer than the floor
-    // between claim and settlement read as an orphan: the demotion waiter
-    // returns Ok (aged out), a demoted publisher loads the pre-settlement
-    // final, and the delayed re-sweep or a healthy boot sweeps the
-    // still-live claim: divergence returns on slow shared volumes. A live
+    // between claim and settlement read as an orphan to the sweep and to
+    // claimability: the delayed re-sweep or a healthy boot removes the
+    // still-live claim (early-releasing any demoted publisher's
+    // absence-keyed wait to a pre-settlement load), or a competing
+    // recoverer steals the round: divergence returns on slow shared
+    // volumes. A live
     // recovery must HEARTBEAT its claims so they never age out while it
     // runs. The park holds recovery inside the claim-to-settlement window
     // (before_quarantine) just past the floor while the test samples the
@@ -5982,10 +6125,10 @@ mod identity_key_tests {
 
     // #194 (F1): a claimed recovery whose retry publish FAILS must release
     // its `.recovering.` claim before surfacing the error. A leaked claim
-    // makes every later demoted fallback publisher ride the full
-    // KEY_RACE_DEADLINE in wait_for_recovery_claims until some healthy boot
-    // sweeps it. RED before F1: the bare `?` on the publish call returns
-    // with the claim still on disk.
+    // makes every later demoted fallback publisher ride the full wait
+    // bound in wait_for_recovery_claims and fail its publish closed until
+    // some healthy boot sweeps it. RED before F1: the bare `?` on the
+    // publish call returns with the claim still on disk.
     #[test]
     fn claim_released_when_post_recovery_publish_fails() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6073,11 +6216,11 @@ mod identity_key_tests {
         // step and the post-claim re-parse: A's marker is already claimed,
         // so A's commit check fails and A demotes, then waits out the LIVE
         // claims until this recovery releases them. (The hook must not park
-        // recovery until A finishes: A's waiter holds while the claims are
-        // young, and the M3 heartbeat keeps a live round's claims young
-        // until release, so that cycle would correctly fail A closed; the
-        // pre-heartbeat version only unblocked because the live claims aged
-        // out mid-round, the exact divergence window M3 closes.)
+        // recovery until A finishes: A's waiter holds while the claim
+        // files are present, until release, so that cycle would correctly
+        // fail A closed; the pre-heartbeat, age-keyed version only
+        // unblocked because the live claims aged out mid-round, the exact
+        // divergence window M3 and the absence-keyed waiter close.)
         let before_reparse = || {
             unpark_tx.send(()).expect("unpark the publisher");
         };
@@ -6493,6 +6636,84 @@ mod identity_key_tests {
             format!("{}", fresh.did()),
             format!("{}", newer.did()),
             "the operator must get a genuinely fresh DID"
+        );
+    }
+
+    // Q1: both Won arms now supersede the sibling quarantines BEFORE
+    // consuming the chosen one, so a crash in the gap leaves the
+    // POST-SUPERSEDE image: final present, siblings already superseded,
+    // only the chosen quarantine (the winner's own bytes) still adoptable.
+    // No seam reaches the reordered gap, so this test pins the two crash
+    // images directly rather than interposing. First the post-fix image: a
+    // later missing final may re-adopt only the winner's own key, never a
+    // different historical DID. Then the PRE-fix image (chosen consumed
+    // first, sibling still plain): a concrete demonstration that the old
+    // ordering's crash gap left the sibling adoptable, resurrecting a
+    // different DID after delete-final. The ordering itself is not
+    // runtime-observable without a production seam; see the fix report.
+    #[test]
+    fn crash_between_won_and_sibling_supersede_leaves_no_adoptable() {
+        // POST-fix crash image: crash fell between the sibling supersede
+        // and the chosen quarantine's removal.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let winner = Keypair::generate();
+        let winner_pem = winner.to_pem().expect("pem");
+        let sibling = Keypair::generate();
+        let sibling_pem = sibling.to_pem().expect("pem");
+        std::fs::write(&key_path, winner_pem.as_bytes()).expect("seed final");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 final");
+        std::fs::write(
+            dir.path().join(".identity.pem.superseded.99999.0"),
+            sibling_pem.as_bytes(),
+        )
+        .expect("seed superseded sibling");
+        let chosen = dir.path().join(".identity.pem.quarantined.99999.1");
+        std::fs::write(&chosen, winner_pem.as_bytes()).expect("seed un-consumed chosen");
+
+        let kp = load_or_create_keypair(&key_config(&key_path))
+            .expect("the post-supersede crash image must boot healthy");
+        assert_eq!(
+            format!("{}", kp.did()),
+            format!("{}", winner.did()),
+            "the final's key wins the crash-image boot"
+        );
+
+        std::fs::remove_file(&key_path).expect("final goes missing");
+        let readopted = load_or_create_keypair(&key_config(&key_path))
+            .expect("the post-delete boot must provision an identity");
+        assert_ne!(
+            format!("{}", readopted.did()),
+            format!("{}", sibling.did()),
+            "a crash in the supersede-then-consume gap must leave no sibling adoptable"
+        );
+        assert_eq!(
+            format!("{}", readopted.did()),
+            format!("{}", winner.did()),
+            "only the winner's own quarantined bytes may be re-adopted"
+        );
+
+        // PRE-fix crash image (the old ordering's gap): chosen already
+        // consumed, sibling still in the plain adoptable class. This is the
+        // hazard: the sibling IS adopted once the final goes missing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        std::fs::write(&key_path, winner_pem.as_bytes()).expect("seed final");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("0600 final");
+        std::fs::write(
+            dir.path().join(".identity.pem.quarantined.99999.0"),
+            sibling_pem.as_bytes(),
+        )
+        .expect("seed still-plain sibling");
+        std::fs::remove_file(&key_path).expect("final goes missing");
+        let resurrected = load_or_create_keypair(&key_config(&key_path))
+            .expect("the post-delete boot must provision an identity");
+        assert_eq!(
+            format!("{}", resurrected.did()),
+            format!("{}", sibling.did()),
+            "the pre-fix image demonstrably resurrects the sibling's DID"
         );
     }
 
