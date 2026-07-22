@@ -316,7 +316,7 @@ async fn seed_authored_issue(
 ) -> String {
     use super::signing::signed_request;
 
-    let client = reqwest::Client::new();
+    let client = super::bounded_client();
     let path = format!("/api/v1/repos/{owner_did}/{repo}/issues");
     let body = br#"{"title":"prober close issue"}"#.to_vec();
     let resp = signed_request(
@@ -350,7 +350,7 @@ async fn seed_authored_issue(
 async fn seed_pending_task(node: &TestNode, delegator: &Keypair) -> String {
     use super::signing::signed_request;
 
-    let client = reqwest::Client::new();
+    let client = super::bounded_client();
     let delegator_did = delegator.did().to_string();
     let body =
         format!(r#"{{"kind":"review","capability":"read","delegator_did":"{delegator_did}"}}"#)
@@ -387,7 +387,7 @@ async fn seed_claimed_task(node: &TestNode, owner: &Keypair, assignee: &Keypair)
 
     let id = seed_pending_task(node, owner).await;
 
-    let client = reqwest::Client::new();
+    let client = super::bounded_client();
     let assignee_did = assignee.did().to_string();
     let claim_path = format!("/api/v1/tasks/{id}/claim");
     let body = format!(r#"{{"assignee_did":"{assignee_did}"}}"#).into_bytes();
@@ -446,7 +446,7 @@ async fn seed_bounty_at_stage(
 ) -> String {
     use super::signing::signed_request;
 
-    let client = reqwest::Client::new();
+    let client = super::bounded_client();
 
     // create_bounty (creator) -> 201 with the minted BountyRecord (carries the id).
     let create_path = format!("/api/v1/repos/{owner_did}/{repo}/bounties");
@@ -543,7 +543,7 @@ async fn seed_private_issue(
 ) -> String {
     use super::signing::signed_request;
 
-    let client = reqwest::Client::new();
+    let client = super::bounded_client();
     let path = format!("/api/v1/repos/{owner_did}/{repo}/issues");
     let body = format!(r#"{{"title":"{marker}"}}"#).into_bytes();
     let resp = signed_request(
@@ -583,7 +583,7 @@ async fn seed_private_pr(
 ) {
     use super::signing::signed_request;
 
-    let client = reqwest::Client::new();
+    let client = super::bounded_client();
     let path = format!("/api/v1/repos/{owner_did}/{repo}/pulls");
     let body =
         format!(r#"{{"title":"{marker}","source_branch":"feature","target_branch":"main"}}"#)
@@ -626,7 +626,7 @@ async fn seed_private_bounty(
 ) -> String {
     use super::signing::signed_request;
 
-    let client = reqwest::Client::new();
+    let client = super::bounded_client();
     let path = format!("/api/v1/repos/{owner_did}/{repo}/bounties");
     let body = format!(r#"{{"title":"{marker}","amount":1}}"#).into_bytes();
     let resp = signed_request(
@@ -761,7 +761,7 @@ async fn seed_private_push_and_cert(
     body.extend_from_slice(b"0000");
     body.extend_from_slice(&pack);
 
-    let client = reqwest::Client::new();
+    let client = super::bounded_client();
     let push_path = format!("/{owner_did}/{repo}/git-receive-pack");
     let resp = signed_request(
         &client,

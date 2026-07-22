@@ -204,6 +204,8 @@ async fn signed_stranger_protected_branch_push_is_forbidden(pool: sqlx::PgPool) 
         403,
         "the owner must not be blocked by their own branch protection (control)"
     );
+
+    node.shutdown().await;
 }
 
 // ── U5(b): INV-8/INV-2 — anonymous /ipfs/{cid} of a withheld blob is denied ──
@@ -598,6 +600,8 @@ async fn get_pr_diff_withheld_path_is_denied(pool: sqlx::PgPool) {
         resp.text().await.unwrap().contains("TOPSECRET-PRDIFF-PATH"),
         "the owner's diff returns the touched file content"
     );
+
+    node.shutdown().await;
 }
 
 // ── U8: INV-2 — an anonymous clone/fetch excludes withheld subtree blobs ──────
@@ -906,6 +910,8 @@ async fn deny_bearing_registry_denies_hostile_and_admits_authorized(pool: sqlx::
         twins_driven >= 1,
         "no positive twins were driven — the reachability proof is missing"
     );
+
+    node.shutdown().await;
 }
 
 // ── Additional INV-1 owner-gates over the real stack (fan-out of U6) ──────────
@@ -2125,5 +2131,140 @@ mod completeness {
             !has_signer_self_did_matches(owner_form),
             "the owner form must NOT be treated as a caller-self gate (no double-count)"
         );
+    }
+
+    // ── Shutdown-completeness guard: every spawn_node test must shutdown() ────────
+
+    /// `(name, body)` for every real `#[sqlx::test]` in `src`. The attribute is only
+    /// counted when nothing but whitespace precedes it on its line, so a backtick
+    /// mention inside a doc comment (the module header names the attribute in prose)
+    /// is not mistaken for a test. The needle is spelled in two pieces so this
+    /// scanner does not match its own source when it scrapes this file. The body is
+    /// brace-matched from the signature's opening `{` to its close, so a marker cannot
+    /// leak across into the next item.
+    fn sqlx_test_bodies(src: &str) -> Vec<(String, String)> {
+        // Split so the literal attribute never appears contiguously in this fn's own
+        // source (belt-and-suspenders with the whitespace-before-on-line check below).
+        let attr = concat!("#[sqlx", "::test]");
+        let bytes = src.as_bytes();
+        let mut out = Vec::new();
+        let mut search = 0;
+        while let Some(rel) = src[search..].find(attr) {
+            let at = search + rel;
+            search = at + attr.len();
+            // Real attribute only: the text between the line start and the attribute
+            // must be blank (rejects `//! … #[sqlx::test] …` and any string mention).
+            let line_start = src[..at].rfind('\n').map(|n| n + 1).unwrap_or(0);
+            if !src[line_start..at].trim().is_empty() {
+                continue;
+            }
+            let Some(fnrel) = src[search..].find("fn ") else {
+                break;
+            };
+            let name_start = search + fnrel + "fn ".len();
+            let name: String = src[name_start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let Some(brel) = src[name_start..].find('{') else {
+                break;
+            };
+            let open = name_start + brel;
+            let mut depth = 0i32;
+            let mut j = open;
+            while j < src.len() {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            out.push((name, src[open..j].to_string()));
+            search = j;
+        }
+        out
+    }
+
+    /// Every `#[sqlx::test]` that spawns a node must end it with
+    /// `node.shutdown().await`, so the serve task's pool clones are released before
+    /// `#[sqlx::test]`'s synchronous `DROP DATABASE` cleanup fires. A test that returns
+    /// via `TestNode`'s async `Drop` instead only *signals* teardown (it drains on a
+    /// later scheduler tick — the Drop-regression tests poll up to 5s for it), so it
+    /// races the cleanup and can leak the per-test database / flake under parallelism.
+    /// The module header states this contract in prose; this makes it load-bearing —
+    /// removing any one `shutdown()` turns this RED.
+    ///
+    /// The two Drop-regression tests are the CLOSED allowlist: they deliberately
+    /// return WITHOUT `shutdown()` to exercise the Drop teardown, so they must NOT call
+    /// it. The allowlist is checked both ways — an allowlisted name that no longer
+    /// exists (rename/removal) or that grows a `shutdown()` call fails here — so it
+    /// cannot silently rot into covering a test it no longer describes.
+    #[test]
+    fn every_spawn_node_test_shuts_the_node_down() {
+        // The ONLY tests allowed to return without shutdown(): they test Drop itself.
+        const DROP_REGRESSION_ALLOW: &[&str] = &[
+            "drop_without_shutdown_unblocks_database",
+            "drop_with_broken_graceful_chain_still_unblocks_via_abort",
+        ];
+
+        let src = include_str!("deny_harness.rs");
+        let tests = sqlx_test_bodies(src);
+
+        // Non-vacuous floor: if the scraper silently found nothing, every loop below
+        // would pass by checking zero tests. The file has 14 sqlx::test fns today.
+        assert!(
+            tests.len() >= 12,
+            "sqlx::test scrape found only {} tests — the parser likely broke (floor 12)",
+            tests.len()
+        );
+
+        // Each allowlisted name must resolve to a real spawn_node test that (correctly)
+        // does NOT call shutdown — so the allowlist cannot cover a renamed/deleted test
+        // or one that later grew a shutdown() call and no longer exercises Drop.
+        for allowed in DROP_REGRESSION_ALLOW {
+            let (_, body) = tests
+                .iter()
+                .find(|(name, _)| name == allowed)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "allowlisted Drop-regression test `{allowed}` not found — renamed or \
+                         removed? update DROP_REGRESSION_ALLOW"
+                    )
+                });
+            assert!(
+                body.contains("spawn_node"),
+                "allowlisted test `{allowed}` no longer spawns a node — it does not belong \
+                 on the shutdown allowlist"
+            );
+            assert!(
+                !body.contains("node.shutdown("),
+                "allowlisted Drop-regression test `{allowed}` now calls shutdown() — it no \
+                 longer exercises Drop-only teardown; remove it from DROP_REGRESSION_ALLOW"
+            );
+        }
+
+        // Every other spawn_node test must shut its node down.
+        for (name, body) in &tests {
+            if !body.contains("spawn_node") || DROP_REGRESSION_ALLOW.contains(&name.as_str()) {
+                continue;
+            }
+            assert!(
+                body.contains("node.shutdown("),
+                "test `{name}` spawns a node but never calls node.shutdown().await — it \
+                 returns via TestNode::Drop, racing sqlx's DROP DATABASE cleanup (add the \
+                 awaited shutdown, or add it to DROP_REGRESSION_ALLOW if it deliberately \
+                 tests Drop)"
+            );
+        }
     }
 }
