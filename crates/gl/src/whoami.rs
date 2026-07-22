@@ -53,10 +53,7 @@ pub async fn run(args: WhoamiArgs) -> Result<()> {
                 }
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
-                bail!(
-                    "agent not found, or this node does not yet support the agents API (v0.3+)\n\
-                     upgrade the node or check GITLAWB_NODE is pointing to the right server"
-                );
+                registered = Some(false);
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -213,12 +210,7 @@ mod tests {
             node: Some(server.url()),
             json: false,
         };
-        let err = run(args).await.unwrap_err();
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("agents API"),
-            "expected ambiguous 404 error, got: {msg}"
-        );
+        run(args).await.unwrap();
     }
 
     #[tokio::test]
@@ -246,6 +238,7 @@ mod tests {
         let err = run(args).await.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("403"), "expected 403 error, got: {msg}");
+        assert!(msg.contains("forbidden"), "expected 'forbidden' in error, got: {msg}");
     }
 
     #[tokio::test]
@@ -273,6 +266,7 @@ mod tests {
         let err = run(args).await.unwrap_err();
         let msg = format!("{err:?}");
         assert!(msg.contains("500"), "expected 500 error, got: {msg}");
+        assert!(msg.contains("internal error"), "expected 'internal error' in error, got: {msg}");
     }
 
     #[tokio::test]
