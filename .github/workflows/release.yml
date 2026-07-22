@@ -591,6 +591,15 @@ jobs:
               bin.install "git-remote-gitlawb"
             end
 
+            def caveats
+              <<~CAVEATS
+                oh-my-zsh's git plugin aliases gl='git pull', which shadows this
+                binary in interactive shells. If \`gl\` prints "fatal: not a git
+                repository", run:
+                  echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc
+              CAVEATS
+            end
+
             test do
               assert_match version.to_s, shell_output("#{bin}/gl --version")
             end
