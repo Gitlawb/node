@@ -2734,9 +2734,9 @@ mod tests {
     // spawn_blocking extraction resurrect the abandoned temp dir after cleanup.
     // The store's extraction lands well past the download timeout; the timeout
     // fires, acquire bails, and the extraction then creates ("renames into place")
-    // temp.path(). The fix ties cleanup to the extraction's completion — a
-    // detached janitor awaits the download future to settle, then removes the temp
-    // dir — so no `.tmp-download.*` dir survives. Pre-fix the timeout arm drops the
+    // temp.path(). The fix ties cleanup to the extraction's completion: a spawned
+    // task owns the download and the temp guard, so the temp dir is removed only
+    // once the download settles, and no `.tmp-download.*` dir survives. Pre-fix the timeout arm drops the
     // download future, the detached extraction recreates temp.path() AFTER the RAII
     // guard's Drop, and it survives forever — the second poll never sees a clean
     // parent -> RED.
@@ -2785,6 +2785,68 @@ mod tests {
         assert!(
             poll_until_true(|| !has_leftover_temp(&parent)).await,
             "a timed-out cold read must not leave a resurrected .tmp-download.* dir"
+        );
+    }
+
+    // Cancellation twin of the resurrection test above: the handler future is
+    // DROPPED mid-download (axum cancels it on client disconnect) instead of
+    // timing out. Pre-fix, dropping the handler dropped the download future
+    // while its spawn_blocking extraction kept running; TempDownloadDir::Drop
+    // removed the (not yet created) temp dir, and the extraction's later
+    // "rename into place" resurrected it as an orphan that only a later
+    // same-repo download would sweep -> the cleanup poll never succeeds -> RED.
+    // Post-fix the spawned task owns the download and the temp guard, keeps
+    // running across the caller's cancellation, and removes the temp dir once
+    // the download settles -> GREEN.
+    #[sqlx::test]
+    async fn cancelled_cold_read_does_not_resurrect_temp_dir(pool: sqlx::PgPool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let extracted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ts = DetachExtractStore {
+            // Long enough that the abort below lands while the extraction is
+            // still running, so the cancellation drops the download mid-flight.
+            extract_delay: std::time::Duration::from_millis(600),
+            downloads: downloads.clone(),
+            extracted: extracted.clone(),
+        };
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        );
+        let owner = "did:key:z6MkCancelResurrectTempDirAAAAAAAAAAAAAAAA";
+        let name = "cancelresurrect";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        let parent = dir.parent().unwrap().to_path_buf();
+
+        // Cold cache miss: the handler enters the download path and its store
+        // download (the slow extraction) is in flight.
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+        assert!(
+            poll_until_true(|| downloads.load(SeqCst) >= 1).await,
+            "the reader's download must be in flight"
+        );
+
+        // Drop the handler future mid-download (the client-disconnect hazard).
+        h.abort();
+
+        // Wait for the underlying extraction to settle (the resurrection moment
+        // pre-fix; the cleanup moment post-fix).
+        assert!(
+            poll_until_true(|| extracted.load(SeqCst) >= 1).await,
+            "the detached extraction must run to completion"
+        );
+
+        // Once the download has settled, no temp dir may survive under the
+        // parent. Pre-fix the resurrected dir survives and this poll never
+        // sees a clean parent -> RED.
+        assert!(
+            poll_until_true(|| !has_leftover_temp(&parent)).await,
+            "a cancelled cold read must not leave a resurrected .tmp-download.* dir"
         );
     }
 }

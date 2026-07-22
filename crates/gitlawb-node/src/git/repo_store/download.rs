@@ -194,8 +194,8 @@ impl RepoStore {
             .to_string_lossy();
 
         // Best-effort sweep of leftover temp siblings from a prior download whose
-        // RAII guard dropped, or whose extract spawn_blocking completed
-        // uninterruptibly AFTER that guard's Drop ran (finding 1). Serialized per
+        // cleanup never ran (a process crash or kill mid-download, where no Drop
+        // and no owning task survive to remove the temp). Serialized per
         // repo by the download mutex, so no concurrent same-repo download owns a
         // live temp here; scoped to THIS repo's prefix, so other repos are
         // untouched.
@@ -228,56 +228,55 @@ impl RepoStore {
             uuid::Uuid::new_v4()
         )));
 
-        // Bound the network download: a stalled GET would park this reader (and,
-        // via the per-repo download mutex, every coalesced reader) indefinitely.
-        // A timeout takes the SAME cleanup arm as a download error (return Err,
-        // the temp guard's Drop removes the dir), so `download_published` frees
-        // the map entry and wakes waiters rather than leaving them parked forever.
-        //
-        // The download future is OWNED (Box::pin) rather than borrowed so the
-        // timeout arm can hand the still-running extraction to a detached janitor
-        // instead of dropping it (finding F3). `store.download` runs its tar
-        // extraction in `spawn_blocking`, and a tokio timeout does NOT cancel a
-        // spawn_blocking task: dropping the download future on timeout detaches
-        // that task, which then renames its extraction into `temp.path()` AFTER
-        // this function's `temp` guard Drop has already removed the dir —
-        // resurrecting an abandoned, fully-populated temp dir that the per-repo
-        // sweep above only reclaims on a later download of the SAME repo, so an
-        // abandoned extraction for a repo never re-downloaded accumulates on disk.
+        // Ownership of the download AND the temp-dir guard moves into a spawned
+        // task, so timeout and handler cancellation share ONE cleanup path
+        // (finding F3 and its cancellation twin). `store.download` runs its tar
+        // extraction in `spawn_blocking`, and neither a tokio timeout nor a
+        // dropped handler future cancels a spawn_blocking task: pre-fix,
+        // dropping the download future (a timed-out await, or axum dropping the
+        // whole handler on client disconnect) detached the extraction, whose
+        // later rename resurrected `temp.path()` AFTER the guard's Drop had
+        // removed it, leaving an orphan only a later same-repo download sweeps.
+        // The spawned task is never dropped mid-flight, so the download future
+        // always runs to settle. On success it returns the still-armed guard
+        // through the JoinHandle: the caller consumes it and publishes below.
+        // If the caller timed out or was cancelled, the JoinHandle is gone, so
+        // the runtime drops the returned guard when the task settles and its
+        // Drop removes the temp dir; cleanup is tied to the extraction's
+        // completion, never racing it (this subsumes the previous detached
+        // janitor). A download error drops the guard inside the task with the
+        // same at-settle timing.
         let store_dl = Arc::clone(store);
         let (dl_owner, dl_repo, dl_target) = (
             owner_slug.to_string(),
             repo_name.to_string(),
             temp.path().to_path_buf(),
         );
-        let mut download_fut =
-            Box::pin(async move { store_dl.download(&dl_owner, &dl_repo, &dl_target).await });
-        match tokio::time::timeout(self.release_upload_timeout, &mut download_fut).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
+        let dl_task = tokio::spawn(async move {
+            match store_dl.download(&dl_owner, &dl_repo, &dl_target).await {
+                Ok(()) => Ok(temp),
+                // `temp` drops here: the download settled, so removal is safe.
+                Err(e) => Err(e),
+            }
+        });
+        // Bound the wait, not the work: a stalled GET would park this reader
+        // (and, via the per-repo download mutex, every coalesced reader)
+        // indefinitely. On timeout the caller gets the same error as before and
+        // `download_published` frees the map entry and wakes waiters; the task
+        // keeps running and cleans up when the download settles (see above).
+        let temp = match tokio::time::timeout(self.release_upload_timeout, dl_task).await {
+            Ok(Ok(Ok(temp))) => temp,
+            Ok(Ok(Err(e))) => return Err(e),
+            // The task panicked; its unwind dropped the guard, removing the dir.
+            Ok(Err(join_err)) => {
+                return Err(anyhow::Error::from(join_err).context("read download task failed"))
+            }
             Err(_) => {
                 warn!(repo = %repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
                     "read download timed out — discarding");
-                // Do NOT drop the download future here: its spawn_blocking
-                // extraction may still be running, and dropping detaches it,
-                // letting its rename resurrect `temp.path()` after cleanup. Tie
-                // cleanup to the extraction's completion instead — disarm the RAII
-                // guard and hand the future to a detached janitor that awaits it
-                // to settle (the spawn_blocking join resolves, so any rename has
-                // landed) and only THEN removes the temp dir. Waiters are freed
-                // immediately by the return below; the janitor runs off the
-                // critical path, bounded by the extraction itself.
-                let temp_path = temp.path().to_path_buf();
-                temp.disarm();
-                tokio::spawn(async move {
-                    let _ = download_fut.await;
-                    let _ =
-                        tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&temp_path))
-                            .await;
-                });
                 return Err(anyhow::anyhow!("read download timed out"));
             }
-        }
+        };
 
         let guard = match self.try_lock_repo(owner_did, repo_name).await {
             Ok(Some(g)) => g,
