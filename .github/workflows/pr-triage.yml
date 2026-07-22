@@ -75,10 +75,11 @@ jobs:
             // #[test]. Anchor to a leading #[ (horizontal whitespace only, so the attribute
             // itself must be on the added line) so ::test in ordinary code (indexing,
             // comments, strings) doesn't count, require cfg(test) to close before accepting
-            // it as a test gate, allow the whitespace Rust permits around :: and cfg(, and
-            // allow an optional leading :: for absolute-path attributes (::tokio::test).
+            // it as a test gate, allow the whitespace Rust permits around :: and cfg(,
+            // allow an optional leading :: for absolute-path attributes (::tokio::test),
+            // and allow the raw-identifier spelling (#[r#test], #[tokio::r#test]).
             const testAttrRe =
-              /#[ \s]*\[[ \s]*(?:cfg[ \s]*\([ \s]*test[ \s]*\)|(?:[ \s]*::[ \s]*)?(?:[\w-]+(?:[ \s]*::[ \s]*[\w-]+)*[ \s]*::[ \s]*)?test\b[ \s]*[\]\()])/g;
+              /#[ \s]*\[[ \s]*(?:cfg[ \s]*\([ \s]*test[ \s]*\)|(?:[ \s]*::[ \s]*)?(?:[\w-]+(?:[ \s]*::[ \s]*[\w-]+)*[ \s]*::[ \s]*)?(?:r#)?test\b[ \s]*[\]\()])/g;
 
             // Strip comments and string contents from a file of Rust, carrying lexical
             // state (open block comment / raw string / normal string) and tracking
@@ -180,6 +181,7 @@ jobs:
                   continue;
                 }
                 if (newLine === null) continue;
+                if (line.startsWith("\\ No newline at end of file")) continue;
                 if (line.startsWith("+") && !line.startsWith("+++")) {
                   added.add(newLine);
                   newLine += 1;
@@ -194,8 +196,13 @@ jobs:
             // patch text alone can misclassify an added line that sits inside a comment or
             // raw string opened earlier in the file. Lex the complete head-version file
             // instead, in file order, and only test the lines the diff actually added.
+            const MAX_BLOB_SIZE = 5 * 1024 * 1024; // 5 MB; bounds decode/lex cost per candidate file
             let addsInlineTest = false;
             let contentFetchCount = 0;
+            // Set whenever a candidate couldn't actually be checked (fetch cap hit, blob too
+            // large, unsupported encoding). In that case we don't know whether a test was
+            // added, so we must not assert the negative and add needs-tests below.
+            let scanIncomplete = false;
             for (const f of files) {
               if (addsInlineTest) break;
               if (!f.filename.endsWith(".rs") || !f.patch) continue;
@@ -210,12 +217,13 @@ jobs:
 
               // Bound the API work, but don't abort the whole job when a large PR exceeds it:
               // that would skip label reconciliation and the guidance comment for every
-              // managed label, not just needs-tests. Stop scanning further candidates and
-              // fall through with whatever inline-test evidence we've already found.
+              // managed label, not just needs-tests. Stop scanning further candidates; the
+              // scan is now inconclusive rather than a clean "no test found".
               if (contentFetchCount >= 15) {
                 core.warning(
                   "More than 15 candidate Rust files touch tests/cfg; stopping inline-test analysis early."
                 );
+                scanIncomplete = true;
                 break;
               }
               contentFetchCount++;
@@ -227,7 +235,13 @@ jobs:
               try {
                 const res = await github.rest.git.getBlob({ owner, repo, file_sha: f.sha });
                 if (res.data.encoding !== "base64") {
-                  core.warning(`Unsupported content encoding for ${f.filename}; skipping inline-test analysis for this file.`);
+                  core.warning(`Unsupported content encoding for ${f.filename}; inline-test scan is inconclusive for this file.`);
+                  scanIncomplete = true;
+                  continue;
+                }
+                if (res.data.size > MAX_BLOB_SIZE) {
+                  core.warning(`${f.filename} is ${res.data.size} bytes, over the ${MAX_BLOB_SIZE}-byte scan limit; inline-test scan is inconclusive for this file.`);
+                  scanIncomplete = true;
                   continue;
                 }
                 fileContent = Buffer.from(res.data.content, "base64").toString("utf8");
@@ -259,8 +273,12 @@ jobs:
                 if (addsInlineTest) break;
               }
             }
+            // scanIncomplete means some candidate couldn't be checked, so we can't prove a
+            // negative; don't apply needs-tests off an unverified scan.
             const touchedTests =
-              names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
+              names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) ||
+              addsInlineTest ||
+              scanIncomplete;
             if (changedRust && !touchedTests) want.add("needs-tests");
 
             // Reconcile labels: add wanted managed labels, remove managed labels no longer wanted.
