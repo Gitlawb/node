@@ -70,6 +70,16 @@ async fn main() -> Result<()> {
 
     let mut config = Config::parse();
 
+    // Fallback to legacy GITLAWB_IRYS_URL for backward compatibility during rename
+    if config.bundler_url.is_empty() {
+        if let Ok(legacy) = std::env::var("GITLAWB_IRYS_URL") {
+            if !legacy.is_empty() {
+                config.bundler_url = legacy;
+                tracing::warn!("GITLAWB_IRYS_URL is deprecated, use GITLAWB_BUNDLER_URL instead");
+            }
+        }
+    }
+
     // Merge the embedded seed list of public network nodes into the runtime
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
     bootstrap::merge_seeds(&mut config);

@@ -52,6 +52,9 @@ pub async fn list_certs(
                 "node_did":   c.node_did,
                 "signature":  c.signature,
                 "issued_at":  c.issued_at,
+                "seq":        c.seq,
+                "prev":       c.prev,
+                "pusher_sig": c.pusher_sig,
             })
         })
         .collect();
@@ -92,5 +95,8 @@ pub async fn get_cert(
         "node_did":   cert.node_did,
         "signature":  cert.signature,
         "issued_at":  cert.issued_at,
+        "seq":        cert.seq,
+        "prev":       cert.prev,
+        "pusher_sig": cert.pusher_sig,
     })))
 }
