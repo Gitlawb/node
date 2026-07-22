@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::http::NodeClient;
 use crate::identity::load_keypair_from_dir;
+use crate::sync::{read_body_capped, sanitize_node_msg};
 
 #[derive(Args)]
 pub struct WhoamiArgs {
@@ -52,17 +53,27 @@ pub async fn run(args: WhoamiArgs) -> Result<()> {
                 }
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
-                registered = Some(false);
+                bail!(
+                    "agent not found, or this node does not yet support the agents API (v0.3+)\n\
+                     upgrade the node or check GITLAWB_NODE is pointing to the right server"
+                );
             }
             Ok(resp) => {
                 let status = resp.status();
-                let msg = resp
-                    .json::<Value>()
-                    .await
+                let raw = read_body_capped(resp, 8 * 1024).await;
+                let msg = serde_json::from_str::<Value>(&raw)
                     .ok()
-                    .and_then(|v| v["message"].as_str().map(String::from))
-                    .unwrap_or_else(|| "request failed".to_string());
-                bail!("agent lookup failed ({status}): {msg}");
+                    .and_then(|v| {
+                        v.get("message")
+                            .or_else(|| v.get("error"))
+                            .and_then(|m| m.as_str())
+                            .map(String::from)
+                    })
+                    .unwrap_or(raw);
+                bail!(
+                    "agent lookup failed ({status}): {}",
+                    sanitize_node_msg(&msg)
+                );
             }
             Err(e) => {
                 bail!("agent lookup failed: {e}");
@@ -202,7 +213,12 @@ mod tests {
             node: Some(server.url()),
             json: false,
         };
-        run(args).await.unwrap();
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("agents API"),
+            "expected ambiguous 404 error, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -277,6 +293,69 @@ mod tests {
             msg.contains("agent lookup failed"),
             "expected transport error, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_whoami_server_error_caps_body_size() {
+        let dir = TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+        let did = kp.did().to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _agent = server
+            .mock("GET", format!("/api/v1/agents/{did}").as_str())
+            .with_status(502)
+            .with_header("content-type", "application/json")
+            .with_body("x".repeat(100_000))
+            .create_async()
+            .await;
+
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(server.url()),
+            json: false,
+        };
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("502"),
+            "expected 502 error with bounded body, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_whoami_server_error_sanitizes_controls() {
+        let dir = TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+        let did = kp.did().to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _agent = server
+            .mock("GET", format!("/api/v1/agents/{did}").as_str())
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body("{\"message\":\"\\u{1b}[31mowned\\u{07}\\u{202e}evil\"}")
+            .create_async()
+            .await;
+
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(server.url()),
+            json: false,
+        };
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("owned"),
+            "expected sanitized error body, got: {msg}"
+        );
+        assert!(!msg.contains('\u{1b}'), "ESC control char leaked: {msg}");
+        assert!(!msg.contains('\u{07}'), "BEL control char leaked: {msg}");
+        assert!(!msg.contains('\u{202e}'), "RTL override leaked: {msg}");
     }
 
     #[tokio::test]
