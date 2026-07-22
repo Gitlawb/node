@@ -46,7 +46,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.toolchain }})
@@ -94,7 +94,7 @@ jobs:
       - name: cargo test
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/gitlawb_test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   build-release:
     name: build --release
@@ -117,7 +117,7 @@ jobs:
           key: release
 
       - name: cargo build --release
-        run: cargo build --release --workspace
+        run: cargo build --locked --release --workspace
 
   audit:
     name: cargo audit
@@ -199,7 +199,7 @@ jobs:
           key: msrv
 
       - name: cargo check on MSRV
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
   docker-build:
     name: Docker build smoke test
@@ -246,4 +246,4 @@ jobs:
           key: windows
 
       - name: cargo test (shipped Windows crates)
-        run: cargo test -p gl -p git-remote-gitlawb
+        run: cargo test --locked -p gl -p git-remote-gitlawb
