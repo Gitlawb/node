@@ -47,6 +47,7 @@ crypto-common
 crypto_box
 crypto_secretbox
 curve25519-dalek
+curve25519-dalek-derive
 data-encoding
 data-encoding-macro
 data-encoding-macro-internal
