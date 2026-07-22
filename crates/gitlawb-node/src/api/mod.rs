@@ -290,37 +290,20 @@ mod authz_guard {
             ("fail_task", "failTask", "did_matches("),
         ];
 
-        // Completeness source is the SDL (#219): it includes visible=false mutations,
-        // which introspection omits. Cross-check against introspection first so a hidden
-        // mutation fails with a specific, actionable message rather than a generic
-        // "unclassified".
-        let fields = graphql_mutation_fields_from_sdl();
-        let introspected = graphql_mutation_fields_from_schema();
-        for f in &fields {
-            assert!(
-                introspected.iter().any(|i| i == f),
-                "GraphQL mutation `{f}` is in the schema but hidden from introspection \
-                 (a `#[graphql(visible = false)]` field): hidden mutations are forbidden \
-                 by this fence — make it visible so its classification is enforceable, or \
-                 remove it"
-            );
-        }
-
-        // Completeness both directions against the authoritative (SDL) field set.
-        for f in &fields {
-            assert!(
-                registered.iter().any(|(_, camel, _)| camel == f),
-                "unclassified GraphQL mutation `{f}`: add it to \
-                 every_graphql_mutation_has_its_gate with a deliberate gate \
-                 (`require_repo_owner(` for a repo-write, `did_matches(` for a task op)"
-            );
-        }
-        for (_, camel, _) in registered {
-            assert!(
-                fields.iter().any(|f| f == camel),
-                "registered GraphQL mutation `{camel}` is not in the schema \
-                 (renamed or removed); update the table"
-            );
+        // Completeness + hidden-mutation cross-check against the REAL schema (#219),
+        // delegated to the generic `assert_mutation_fence` so the SDL sourcing and the
+        // cross-check are ALSO exercised by a synthetic hidden schema in
+        // `fence_rejects_a_hidden_mutation` (INV-21). Because the real MutationRoot has no
+        // hidden field today, that synthetic test — not a hypothetical production canary —
+        // is what turns reverting the SDL source or deleting the cross-check RED.
+        {
+            use crate::graphql::mutation::MutationRoot;
+            use crate::graphql::query::QueryRoot;
+            use crate::graphql::subscription::SubscriptionRoot;
+            let schema =
+                async_graphql::Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+            let registered_camel: Vec<&str> = registered.iter().map(|(_, c, _)| *c).collect();
+            assert_mutation_fence(&schema, &registered_camel);
         }
 
         // Marker present (source scrape; the vacuity limit, backstopped by the
@@ -344,7 +327,7 @@ mod authz_guard {
     /// RED — the assumption is load-bearing, not trusted.
     #[test]
     fn sdl_source_sees_hidden_mutations_that_introspection_omits() {
-        use async_graphql::{EmptySubscription, Object, Schema, Value};
+        use async_graphql::{EmptySubscription, Object, Schema};
         struct Q;
         #[Object]
         impl Q {
@@ -374,27 +357,9 @@ mod authz_guard {
              completeness guarantee is broken: {sdl_fields:?}"
         );
 
-        // Introspection (the OLD source): omits the hidden field. This is the exact gap
-        // the fix closes — an introspection-sourced fence never sees `hiddenMut`.
-        let resp = tokio::runtime::Runtime::new()
-            .expect("tokio runtime")
-            .block_on(schema.execute("{ __schema { mutationType { fields { name } } } }"));
-        let mut introspected = Vec::new();
-        if let Value::Object(root) = &resp.data {
-            if let Some(Value::Object(sc)) = root.get("__schema") {
-                if let Some(Value::Object(mt)) = sc.get("mutationType") {
-                    if let Some(Value::List(fl)) = mt.get("fields") {
-                        for fo in fl {
-                            if let Value::Object(o) = fo {
-                                if let Some(Value::String(n)) = o.get("name") {
-                                    introspected.push(n.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Introspection (the fence's own helper): OMITS the hidden field. This is the
+        // exact gap the fix closes — an introspection-sourced fence never sees `hiddenMut`.
+        let introspected = introspection_mutation_fields(&schema);
         assert!(
             !introspected.iter().any(|f| f == "hiddenMut"),
             "introspection is expected to OMIT the visible=false mutation (that is the \
@@ -413,23 +378,141 @@ mod authz_guard {
         );
     }
 
-    /// The mutation field names (camelCase, as async-graphql exposes them) via the
-    /// engine's own introspection. STRUCTURED: the names arrive as data, so nothing in
-    /// the resolver source or the serialized SDL (a brace in a doc description, a
-    /// comment, a string) can hide a field. The schema builds with no data and
-    /// introspection runs no resolver, so this stays a plain DB-free unit test. A
-    /// navigation miss yields an empty list, which fails loud via the set-equality
-    /// above (a registered name reads as "not in the schema"), never vacuously.
-    fn graphql_mutation_fields_from_schema() -> Vec<String> {
-        use crate::graphql::mutation::MutationRoot;
-        use crate::graphql::query::QueryRoot;
-        use crate::graphql::subscription::SubscriptionRoot;
+    /// INV-21 wiring guard (#219): drives the generic `assert_mutation_fence` — the SAME
+    /// helper the real fence calls — against a synthetic schema whose mutation is
+    /// `visible = false` and IS registered, so completeness passes and ONLY the
+    /// hidden-from-introspection cross-check can fail. This is what makes the fence's SDL
+    /// sourcing load-bearing without a production canary: reverting the source to
+    /// introspection (the hidden field then absent from the SDL set) or deleting the
+    /// cross-check removes this panic (or changes its message), turning the
+    /// `should_panic` test RED. The real MutationRoot has no hidden field, so nothing on
+    /// the real schema could catch that regression.
+    #[test]
+    #[should_panic(expected = "hidden from introspection")]
+    fn fence_rejects_a_hidden_mutation() {
+        use async_graphql::{EmptySubscription, Object, Schema};
+        struct Q;
+        #[Object]
+        impl Q {
+            async fn ping(&self) -> i32 {
+                0
+            }
+        }
+        struct M;
+        #[Object]
+        impl M {
+            async fn visible_mut(&self) -> i32 {
+                1
+            }
+            #[graphql(visible = false)]
+            async fn hidden_mut(&self) -> i32 {
+                2
+            }
+        }
+        let schema = Schema::build(Q, M, EmptySubscription).finish();
+        // Both fields registered, so completeness passes and only the cross-check fires.
+        assert_mutation_fence(&schema, &["visibleMut", "hiddenMut"]);
+    }
+
+    /// Deprecated-mutation guard (#219): a `#[graphql(deprecation = "...")]` mutation is
+    /// executable and present in SDL, but GraphQL introspection omits it by default. The
+    /// fence's introspection helper uses `includeDeprecated: true`, so a deprecated (but
+    /// visible) mutation is NOT mistaken for a hidden one. With it registered, the fence
+    /// must NOT panic. Remove `includeDeprecated: true` and this goes RED — the deprecated
+    /// field would look hidden and false-red as a forbidden visible=false mutation.
+    #[test]
+    fn fence_admits_a_deprecated_mutation() {
+        use async_graphql::{EmptySubscription, Object, Schema};
+        struct Q;
+        #[Object]
+        impl Q {
+            async fn ping(&self) -> i32 {
+                0
+            }
+        }
+        struct M;
+        #[Object]
+        impl M {
+            async fn visible_mut(&self) -> i32 {
+                1
+            }
+            #[graphql(deprecation = "use visibleMut")]
+            async fn deprecated_mut(&self) -> i32 {
+                2
+            }
+        }
+        let schema = Schema::build(Q, M, EmptySubscription).finish();
+        // Must not panic: the deprecated field is visible (present in introspection with
+        // includeDeprecated) and registered, so it is neither hidden nor unclassified.
+        assert_mutation_fence(&schema, &["visibleMut", "deprecatedMut"]);
+    }
+
+    /// Completeness + hidden-mutation cross-check for a BUILT schema (#219). Generic over
+    /// the schema type so the real fence AND the synthetic `fence_rejects_a_hidden_mutation`
+    /// / `fence_admits_a_deprecated_mutation` tests drive the SAME sourcing and cross-check.
+    /// Completeness is sourced from SDL (which includes `visible = false` fields); the
+    /// cross-check fails any SDL field hidden from introspection. This genericity is the
+    /// INV-21 fix: because the real MutationRoot has no hidden field, only a synthetic
+    /// hidden schema through THIS helper makes reverting the SDL source or removing the
+    /// cross-check RED, rather than leaving the class latent behind a production canary.
+    fn assert_mutation_fence<Q, M, S>(
+        schema: &async_graphql::Schema<Q, M, S>,
+        registered_camel: &[&str],
+    ) where
+        Q: async_graphql::ObjectType + 'static,
+        M: async_graphql::ObjectType + 'static,
+        S: async_graphql::SubscriptionType + 'static,
+    {
+        let sdl_fields = mutation_field_names_from_sdl(&schema.sdl());
+        let introspected = introspection_mutation_fields(schema);
+        // No SDL field may be hidden from introspection (a visible=false mutation).
+        for f in &sdl_fields {
+            assert!(
+                introspected.iter().any(|i| i == f),
+                "GraphQL mutation `{f}` is in the schema but hidden from introspection \
+                 (a `#[graphql(visible = false)]` field): hidden mutations are forbidden \
+                 by this fence — make it visible so its classification is enforceable, or \
+                 remove it"
+            );
+        }
+        // Completeness both directions against the registered (camelCase) set.
+        for f in &sdl_fields {
+            assert!(
+                registered_camel.contains(&f.as_str()),
+                "unclassified GraphQL mutation `{f}`: add it to \
+                 every_graphql_mutation_has_its_gate with a deliberate gate \
+                 (`require_repo_owner(` for a repo-write, `did_matches(` for a task op)"
+            );
+        }
+        for c in registered_camel {
+            assert!(
+                sdl_fields.iter().any(|f| f == c),
+                "registered GraphQL mutation `{c}` is not in the schema \
+                 (renamed or removed); update the table"
+            );
+        }
+    }
+
+    /// The mutation field names via the engine's introspection, run against a passed
+    /// schema. STRUCTURED (names arrive as data). Uses `fields(includeDeprecated: true)`:
+    /// GraphQL's default omits `@deprecated` fields, but a `#[graphql(deprecation = "...")]`
+    /// mutation is still executable and present in SDL, so without this the cross-check
+    /// above would false-red a deprecated mutation as a hidden (visible=false) one. Only a
+    /// real visibility filter should trip that arm; deprecation is a lifecycle marker.
+    fn introspection_mutation_fields<Q, M, S>(
+        schema: &async_graphql::Schema<Q, M, S>,
+    ) -> Vec<String>
+    where
+        Q: async_graphql::ObjectType + 'static,
+        M: async_graphql::ObjectType + 'static,
+        S: async_graphql::SubscriptionType + 'static,
+    {
         use async_graphql::Value;
-        let schema =
-            async_graphql::Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
         let resp = tokio::runtime::Runtime::new()
             .expect("tokio runtime")
-            .block_on(schema.execute("{ __schema { mutationType { fields { name } } } }"));
+            .block_on(schema.execute(
+                "{ __schema { mutationType { fields(includeDeprecated: true) { name } } } }",
+            ));
         assert!(
             resp.errors.is_empty(),
             "schema introspection failed: {:?}",
@@ -661,17 +744,19 @@ mod authz_guard {
         out
     }
 
-    /// The introspection field set (the completeness source of truth) is exactly the
+    /// The SDL field set (the completeness source of truth, #219) is exactly the
     /// registered mutations. If async-graphql adds or renames a field, this reddens
-    /// and forces the `every_graphql_mutation_has_its_gate` table to be updated.
+    /// and forces the `every_graphql_mutation_has_its_gate` table to be updated. Uses
+    /// SDL, not introspection: introspection omits `visible = false` fields, so an
+    /// introspection-based pin here would go green while a hidden mutation existed.
     #[test]
     fn schema_lists_exactly_the_registered_mutations() {
-        let mut fields = graphql_mutation_fields_from_schema();
+        let mut fields = graphql_mutation_fields_from_sdl();
         fields.sort();
         assert_eq!(
             fields,
             vec!["claimTask", "completeTask", "createTask", "failTask"],
-            "the introspected mutation field set is the authoritative discovered set"
+            "the SDL mutation field set is the authoritative discovered set"
         );
     }
 
