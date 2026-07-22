@@ -333,21 +333,16 @@ fn reap_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Fallback tree teardown for the non-unix timeout path (INV-22): the leader-only
-/// counterpart used only when the Job Object could not be established at spawn.
-///
-/// The Job Object below is the correct primitive on Windows (it owns the tree
-/// regardless of leader liveness), so this is now a best-effort fallback rather
-/// than the main path. `taskkill /T /F` walks the parent-pid tree from the leader
-/// and force-kills every member reachable through it, closing the inherited pipe
-/// write-ends so the reader joins in `run_bounded` return instead of waiting out
-/// the helper's ~300s HTTP timeout. taskkill ships in System32 on every supported
-/// Windows and needs no `unsafe`. Its known limit is exactly why the job exists:
-/// /T resolves the parent-pid tree at invocation time and cannot reach a
-/// descendant once its leader has already exited. The `child.kill()` below is a
-/// further leader-only fallback for the taskkill-unavailable case; finally reap
-/// the leader so it does not linger, mirroring `reap_group`'s contract.
-#[cfg(not(unix))]
+/// Best-effort tree teardown for the fallback non-unix, non-windows timeout path
+/// (INV-22): the leader-only counterpart to the unix `reap_group`, for exotic targets
+/// that are neither unix (which uses `process_group(0)` + `reap_group`) nor windows
+/// (which uses the mandatory Job Object below). It attempts `taskkill /T /F` to walk a
+/// parent-pid tree if that tool is present, then force-kills and reaps the leader so it
+/// does not linger. With no group primitive on these targets it cannot guarantee a
+/// descendant is reached; it is the honest best effort where neither real primitive
+/// applies. Windows no longer routes here: the Job Object is mandatory there, so this
+/// is not compiled on windows and cannot warn as dead code.
+#[cfg(all(not(unix), not(windows)))]
 fn reap_tree(child: &mut std::process::Child) {
     let _ = Command::new("taskkill")
         .args(["/T", "/F", "/PID", &child.id().to_string()])
@@ -389,8 +384,14 @@ impl Drop for JobHandle {
 
 /// Create a Job Object, configure `KILL_ON_JOB_CLOSE`, and assign the freshly
 /// spawned `child` to it, mirroring the unix `cmd.process_group(0)` at spawn.
-/// Returns `None` if any step fails, in which case the caller falls back to the
-/// leader-only `reap_tree` tree walk.
+///
+/// The job is MANDATORY: it is the only reliable Windows teardown for this harness,
+/// so any failure to establish it PANICS rather than returning, which would leave
+/// `run_bounded` with no way to bound its clean-exit path (taskkill `/T` cannot reach
+/// a helper descendant once the `git fetch` leader has exited and no longer roots it
+/// in the parent-PID tree). Nested unnamed jobs with `KILL_ON_JOB_CLOSE` are standard
+/// on the shipped `x86_64-pc-windows-msvc` / CI runners, so failing loudly here beats
+/// silently entering the unbounded ~300s-hang path (jatmn's #192 P2).
 ///
 /// Honest caveat: this assigns the child right after `spawn` rather than via
 /// `CREATE_SUSPENDED` + resume (which std cannot do without exposing the main
@@ -401,7 +402,7 @@ impl Drop for JobHandle {
 /// the helper is created inside the job. `KILL_ON_JOB_CLOSE` covers any stray that
 /// somehow raced ahead.
 #[cfg(windows)]
-fn assign_job(child: &std::process::Child) -> Option<JobHandle> {
+fn assign_job(child: &std::process::Child) -> JobHandle {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::System::JobObjects::{
@@ -416,7 +417,10 @@ fn assign_job(child: &std::process::Child) -> Option<JobHandle> {
     // borrowed.
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
-        return None;
+        panic!(
+            "real_git_fetch harness: CreateJobObjectW failed; the deadlock-bounding \
+             harness requires a Windows Job Object to tear down the fetch tree"
+        );
     }
     // Own the handle now so an early return below still closes it via Drop.
     let owner = JobHandle(job);
@@ -437,7 +441,11 @@ fn assign_job(child: &std::process::Child) -> Option<JobHandle> {
         )
     };
     if ok == 0 {
-        return None; // `owner` drops here -> CloseHandle.
+        // `owner` drops on unwind -> CloseHandle.
+        panic!(
+            "real_git_fetch harness: SetInformationJobObject(KILL_ON_JOB_CLOSE) failed; \
+             the deadlock-bounding harness requires a Windows Job Object"
+        );
     }
 
     // SAFETY: assigns the child's OS process handle to the job. Both arguments are
@@ -445,9 +453,13 @@ fn assign_job(child: &std::process::Child) -> Option<JobHandle> {
     // process handle and outlives this call, so `as_raw_handle` is valid here.
     let ok = unsafe { AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) };
     if ok == 0 {
-        return None;
+        // `owner` drops on unwind -> CloseHandle.
+        panic!(
+            "real_git_fetch harness: AssignProcessToJobObject failed; the deadlock-bounding \
+             harness requires the git fetch leader inside a Windows Job Object"
+        );
     }
-    Some(owner)
+    owner
 }
 
 /// Terminate every member of the job (INV-22): the Windows analog of `reap_group`
@@ -489,8 +501,10 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
     // Windows analog of the unix `process_group(0)` above: Windows has no way to
     // set a group before spawn, so assign the freshly spawned leader to a Job
     // Object now. The job owns the whole fetch tree and is terminated on both
-    // teardown paths below (INV-22). `None` if the job could not be established, in
-    // which case teardown falls back to the taskkill tree walk.
+    // teardown paths below (INV-22). It is mandatory: `assign_job` panics rather
+    // than returning if the job cannot be established, because without it the
+    // clean-exit path below cannot be bounded (taskkill `/T` cannot reach an
+    // orphaned helper once the leader has exited).
     #[cfg(windows)]
     let job = assign_job(&child);
 
@@ -522,15 +536,12 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
             // (INV-22, mirrors gitlawb-node/src/git/smart_http.rs).
             #[cfg(unix)]
             reap_group(&mut child);
-            // Windows: terminate the whole job (every assigned member); the taskkill
-            // tree walk stays only as the fallback when the job was not established.
+            // Windows: terminate the whole job (every assigned member). The job is
+            // mandatory (`assign_job` panics otherwise), so there is no None fallback.
             #[cfg(windows)]
-            match &job {
-                Some(job) => {
-                    terminate_job(job);
-                    let _ = child.wait();
-                }
-                None => reap_tree(&mut child),
+            {
+                terminate_job(&job);
+                let _ = child.wait();
             }
             // Any other non-unix target keeps the leader-only tree walk.
             #[cfg(all(not(unix), not(windows)))]
@@ -578,9 +589,7 @@ fn run_bounded(mut cmd: Command, timeout: Duration) -> (bool, std::process::Outp
     // already-empty job is a harmless no-op (INV-22).
     #[cfg(windows)]
     if completed {
-        if let Some(job) = &job {
-            terminate_job(job);
-        }
+        terminate_job(&job);
     }
 
     let stdout = out_reader.join().expect("stdout reader");
