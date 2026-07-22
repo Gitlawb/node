@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use sqlx::pool::PoolConnection;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -152,18 +153,67 @@ impl RepoStore {
     }
 
     /// Take a write lock (Postgres advisory lock), ensure repo is local, return guard.
-    /// The lock prevents concurrent writes to the same repo across machines.
+    ///
+    /// # Cross-machine guarantee
+    ///
+    /// When multiple nodes share a single Postgres database (the shared-Postgres
+    /// deployment model), this lock prevents concurrent writes to the same repo
+    /// across machines. The lock has no effect across separate Postgres instances
+    /// (federated per-node-DB topology).
+    ///
+    /// # Session affinity
+    ///
+    /// PostgreSQL advisory locks are session-scoped: the lock is released by the
+    /// *same* backend connection that acquired it. If the acquiring connection
+    /// were returned to the pool, a later writer could be handed it and
+    /// reentrantly acquire the same lock, while `pg_advisory_unlock` issued on
+    /// a different session would silently no-op. We therefore hold the
+    /// `PoolConnection<Postgres>` returned by the acquiring query inside
+    /// `RepoWriteGuard` and release the lock through that exact connection before
+    /// returning it to the pool on drop.
+    ///
+    /// # Rolling upgrade caveat (SHA-256 re-keying)
+    ///
+    /// This function hashes `(owner_slug, repo_name)` with SHA-256 to produce a
+    /// stable `i64` key. Earlier builds used `std::collections::DefaultHasher`,
+    /// whose algorithm is not frozen by the Rust standard and has already
+    /// shifted across toolchain versions. The SHA-256 swap re-keys *every*
+    /// repo: an old-binary node holding the legacy `DefaultHasher` key and a
+    /// new-binary node holding the SHA-256 key for the same repo compute
+    /// *different* i64 keys, so PostgreSQL treats them as independent locks and
+    /// the cross-machine write-exclusion this lock provides is lost for the
+    /// duration of a rolling upgrade.
+    ///
+    /// The accepted remediation (see issue #210) is operational: during a
+    /// shared-Postgres rolling upgrade, **drain in-flight writes or cut over
+    /// through a single node** (e.g. stop receive-pack / issue / pull / archive
+    /// writers on the old version) before bringing new-binary nodes online. The
+    /// window is bounded by the operator's rollout cadence. A future
+    /// transition release could acquire both legacy and new keys for one cycle
+    /// and drop the legacy one a release later; that's optional given the
+    /// accepted-window path.
     pub async fn acquire_write(&self, owner_did: &str, repo_name: &str) -> Result<RepoWriteGuard> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
         // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
         // to avoid blocking indefinitely on stale locks from crashed connections.
+        //
+        // We hold onto the connection that won the lock for the lifetime of the
+        // guard — see the method docstring on session affinity. A subsequent
+        // writer cannot be handed this connection and reentrantly grab the
+        // same lock, and the unlock on release() is guaranteed to run on the
+        // owning session.
+        let mut conn: PoolConnection<sqlx::Postgres> = self
+            .pool
+            .acquire()
+            .await
+            .context("acquiring connection for advisory lock")?;
         let mut acquired = false;
         for attempt in 0..60 {
             let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_key)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *conn)
                 .await
                 .context("trying advisory lock")?;
             if row.0 {
@@ -178,33 +228,55 @@ impl RepoStore {
             anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
         }
 
+        // Construct the guard immediately so its Drop implementation protects
+        // subsequent cancellation points (tigris download below).
+        let mut guard = RepoWriteGuard {
+            owner_slug,
+            repo_name: repo_name.to_string(),
+            local_path,
+            lock_key,
+            conn: Some(conn),
+            tigris: self.tigris.clone(),
+        };
+
         // Always download the latest from Tigris before writing.
         // Local disk may be stale if another machine pushed since our last access.
         if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
+            if tigris
+                .exists(&guard.owner_slug, repo_name)
+                .await
+                .unwrap_or(false)
+            {
                 debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
+                if let Err(e) = tigris
+                    .download(&guard.owner_slug, repo_name, &guard.local_path)
+                    .await
+                {
                     // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
                     // Tigris archive must not block a write when a valid local copy
                     // exists — release(success) will re-upload a good archive.
-                    if local_path.exists() {
+                    if guard.local_path.exists() {
                         warn!(repo = %repo_name, err = %e,
                             "write acquire: tigris download failed — falling back to local copy");
                     } else {
+                        // Drop the lock on the error path before returning.
+                        // Unlock through the guard's connection, then clear conn
+                        // so Drop returns it to the pool (lock-free) instead of
+                        // closing it.
+                        if let Some(ref mut gconn) = guard.conn {
+                            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                                .bind(guard.lock_key)
+                                .execute(&mut **gconn)
+                                .await;
+                        }
+                        guard.conn = None;
                         return Err(e).context("downloading repo from tigris for write");
                     }
                 }
             }
         }
 
-        Ok(RepoWriteGuard {
-            owner_slug,
-            repo_name: repo_name.to_string(),
-            local_path,
-            lock_key,
-            pool: self.pool.clone(),
-            tigris: self.tigris.clone(),
-        })
+        Ok(guard)
     }
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
@@ -349,12 +421,20 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 
 /// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
 /// uploads to Tigris + releases the lock on `release()`.
+///
+/// Holds the owning `PoolConnection<Postgres>` so the lock is released on
+/// the same session that acquired it — see `acquire_write` for the session
+/// affinity rationale.
+///
+/// On cancellation (drop without `release()`), the connection is closed instead
+/// of returned to the pool, so the advisory lock is released by Postgres when
+/// the backend session ends.
 pub struct RepoWriteGuard {
     owner_slug: String,
     repo_name: String,
     pub local_path: PathBuf,
     lock_key: i64,
-    pool: PgPool,
+    conn: Option<PoolConnection<sqlx::Postgres>>,
     tigris: Option<TigrisClient>,
 }
 
@@ -369,7 +449,7 @@ impl RepoWriteGuard {
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(self, success: bool) {
+    pub async fn release(mut self, success: bool) {
         // Upload to Tigris only on success.
         if success {
             if let Some(ref tigris) = self.tigris {
@@ -384,21 +464,43 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
-        // Release advisory lock
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(self.lock_key)
-            .execute(&self.pool)
-            .await;
+        // Release advisory lock on the owning session, then return connection
+        // to the pool. Take the connection so Drop sees None and does nothing.
+        if let Some(mut conn) = self.conn.take() {
+            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(self.lock_key)
+                .execute(&mut *conn)
+                .await;
+            // conn drops here, returned to the pool
+        }
+    }
+}
+
+impl Drop for RepoWriteGuard {
+    fn drop(&mut self) {
+        // If conn is still Some, release() was never called (e.g. cancellation).
+        // Close the connection instead of returning it to the pool, so the
+        // Postgres backend session ends and the advisory lock is released.
+        if let Some(ref mut conn) = self.conn {
+            conn.close_on_drop();
+        }
     }
 }
 
 /// Compute a stable i64 hash for a Postgres advisory lock key.
+///
+/// Uses SHA-256 (not `DefaultHasher`) so the same `(owner_slug, repo_name)`
+/// produces the same `i64` key across every Rust toolchain version, operating
+/// system, and machine — the algorithm is frozen by the SHA-2 standard rather
+/// than by a std-internal implementation detail.
 fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    owner_slug.hash(&mut hasher);
-    repo_name.hash(&mut hasher);
-    hasher.finish() as i64
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(owner_slug.as_bytes());
+    hasher.update(b":");
+    hasher.update(repo_name.as_bytes());
+    let digest = hasher.finalize();
+    i64::from_le_bytes(digest[..8].try_into().expect("sha256 output is >= 8 bytes"))
 }
 
 #[cfg(test)]
@@ -561,5 +663,47 @@ mod tests {
                 "owner_did={bad:?} must be rejected"
             );
         }
+    }
+
+    // ── advisory_lock_key stability ─────────────────────────────────────────
+
+    #[test]
+    fn advisory_lock_key_is_stable() {
+        // Golden value: SHA-256("did_key_...:<repo_name>")[..8] as i64 little-endian.
+        // If this test fails, the hashing algorithm has changed — the new key
+        // must be backward-compatible or the rollout planned accordingly.
+        let key = advisory_lock_key(
+            "did_key_z6MkqDnb7Siv3Cwj7pGJq4T5EsUisECqR8KpnDLwcaZq5TPr",
+            "hello",
+        );
+        assert_eq!(key, -6680856138670956537_i64);
+    }
+
+    #[test]
+    fn advisory_lock_key_differs_for_different_inputs() {
+        // Vary one axis at a time so a regression that drops either parameter
+        // from the hash is caught, not just one that drops both. The golden
+        // test above backstops a total algorithm swap.
+        let base = advisory_lock_key("owner_a", "repo_a");
+
+        // Same owner, different repo: a regression that hashes only owner_slug
+        // would make these collide.
+        let same_owner_diff_repo = advisory_lock_key("owner_a", "repo_b");
+        assert_ne!(
+            base, same_owner_diff_repo,
+            "key must depend on repo_name, not just owner_slug"
+        );
+
+        // Same repo, different owner: a regression that hashes only repo_name
+        // would make these collide.
+        let diff_owner_same_repo = advisory_lock_key("owner_b", "repo_a");
+        assert_ne!(
+            base, diff_owner_same_repo,
+            "key must depend on owner_slug, not just repo_name"
+        );
+
+        // Sanity: both axes varying at once still differs (the original shape).
+        let both_differ = advisory_lock_key("owner_b", "repo_b");
+        assert_ne!(base, both_differ);
     }
 }

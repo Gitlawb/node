@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Known caveats
+
+* **repo_store:** the advisory-lock key for cross-machine write exclusion is now derived via SHA-256 of `(owner_slug, repo_name)` instead of `std::collections::DefaultHasher` (the previous algorithm was not frozen by the Rust standard). During a shared-Postgres rolling upgrade, old-binary nodes holding the legacy `DefaultHasher` key and new-binary nodes holding the SHA-256 key for the same repo compute *different* i64 keys, so PostgreSQL treats them as independent locks and cross-machine write-exclusion is lost for the deploy window. Operators should drain in-flight writes or cut over through a single node before bringing new-binary nodes online. A future transition release may acquire both keys for one cycle. See `RepoStore::acquire_write` and issue #210.
+
 ## [0.5.1](https://github.com/Gitlawb/node/compare/v0.5.0...v0.5.1) (2026-07-10)
 
 
