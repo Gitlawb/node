@@ -251,12 +251,17 @@ mod authz_guard {
     /// a guard over a heterogeneous set must classify per member, and these
     /// same-named task rows belong to the GraphQL surface, not `api/tasks.rs`.
     ///
-    /// COMPLETENESS comes from async-graphql's own introspection (structured field
-    /// names from the engine), NOT any text parse of source or SDL, so no source-text
-    /// shape and no serialized-SDL quirk can hide a live mutation from the fence. The
-    /// schema field set must equal the registered set: a new field with no row fails
-    /// (a repo-write cannot slip in unlisted); a registered name absent from the
-    /// schema fails (renamed or removed).
+    /// COMPLETENESS comes from the engine's own SDL (`schema.sdl()`), parsed as a
+    /// structured AST (#219), NOT introspection and NOT a text parse of source.
+    /// This matters: async-graphql OMITS `#[graphql(visible = false)]` fields from
+    /// introspection while leaving them executable, so an introspection-sourced fence
+    /// could be defeated by a hidden mutation. SDL includes those fields, so no
+    /// visibility flag (and, via the AST parse, no brace-in-description quirk) can hide
+    /// a live mutation. The SDL field set must equal the registered set: a new field with
+    /// no row fails (a repo-write cannot slip in unlisted); a registered name absent from
+    /// the schema fails (renamed or removed). The set is also cross-checked against
+    /// introspection, so any field present in SDL but hidden from introspection fails
+    /// named as a forbidden hidden mutation.
     ///
     /// The MARKER check is the only source-scraped part, and it is not the
     /// completeness guarantee. Three honest limits, so a green check is not misread
@@ -271,7 +276,7 @@ mod authz_guard {
     ///      a `{`/`}` or a `did_matches(` inside a STRING literal is not masked, so it
     ///      could mis-slice that body or satisfy the marker vacuously (the same
     ///      vacuous-marker class as limit 1). Completeness is unaffected: it comes
-    ///      from introspection, not from this scrape.
+    ///      from the SDL AST, not from this scrape.
     #[test]
     fn every_graphql_mutation_has_its_gate() {
         // (Rust snake name, schema field in camelCase, expected gate marker). The
@@ -285,8 +290,23 @@ mod authz_guard {
             ("fail_task", "failTask", "did_matches("),
         ];
 
-        // Completeness both directions against the authoritative schema field set.
-        let fields = graphql_mutation_fields_from_schema();
+        // Completeness source is the SDL (#219): it includes visible=false mutations,
+        // which introspection omits. Cross-check against introspection first so a hidden
+        // mutation fails with a specific, actionable message rather than a generic
+        // "unclassified".
+        let fields = graphql_mutation_fields_from_sdl();
+        let introspected = graphql_mutation_fields_from_schema();
+        for f in &fields {
+            assert!(
+                introspected.iter().any(|i| i == f),
+                "GraphQL mutation `{f}` is in the schema but hidden from introspection \
+                 (a `#[graphql(visible = false)]` field): hidden mutations are forbidden \
+                 by this fence — make it visible so its classification is enforceable, or \
+                 remove it"
+            );
+        }
+
+        // Completeness both directions against the authoritative (SDL) field set.
         for f in &fields {
             assert!(
                 registered.iter().any(|(_, camel, _)| camel == f),
@@ -313,6 +333,84 @@ mod authz_guard {
                 "GraphQL mutation `{snake}` is missing its gate marker `{marker}`: gate removed"
             );
         }
+    }
+
+    /// Version-safety self-check (#219, INV-21): the fence's completeness guarantee rests
+    /// on `schema.sdl()` INCLUDING `visible = false` fields while introspection omits
+    /// them. That is observed async-graphql behavior, not a documented contract, so pin
+    /// it here: a synthetic schema with a hidden mutation must have that field in its
+    /// SDL-derived set and NOT in its introspection-derived set. If a future
+    /// async-graphql upgrade ever filters SDL by visibility, the first assertion flips
+    /// RED — the assumption is load-bearing, not trusted.
+    #[test]
+    fn sdl_source_sees_hidden_mutations_that_introspection_omits() {
+        use async_graphql::{EmptySubscription, Object, Schema, Value};
+        struct Q;
+        #[Object]
+        impl Q {
+            async fn ping(&self) -> i32 {
+                0
+            }
+        }
+        struct M;
+        #[Object]
+        impl M {
+            async fn visible_mut(&self) -> i32 {
+                1
+            }
+            #[graphql(visible = false)]
+            async fn hidden_mut(&self) -> i32 {
+                2
+            }
+        }
+        let schema = Schema::build(Q, M, EmptySubscription).finish();
+
+        // SDL source (the fix): includes the hidden field.
+        let sdl_fields = mutation_field_names_from_sdl(&schema.sdl());
+        assert!(
+            sdl_fields.iter().any(|f| f == "hiddenMut"),
+            "SDL-sourced set MUST include the visible=false mutation; if this is RED, \
+             async-graphql started filtering SDL by visibility and the fence's \
+             completeness guarantee is broken: {sdl_fields:?}"
+        );
+
+        // Introspection (the OLD source): omits the hidden field. This is the exact gap
+        // the fix closes — an introspection-sourced fence never sees `hiddenMut`.
+        let resp = tokio::runtime::Runtime::new()
+            .expect("tokio runtime")
+            .block_on(schema.execute("{ __schema { mutationType { fields { name } } } }"));
+        let mut introspected = Vec::new();
+        if let Value::Object(root) = &resp.data {
+            if let Some(Value::Object(sc)) = root.get("__schema") {
+                if let Some(Value::Object(mt)) = sc.get("mutationType") {
+                    if let Some(Value::List(fl)) = mt.get("fields") {
+                        for fo in fl {
+                            if let Value::Object(o) = fo {
+                                if let Some(Value::String(n)) = o.get("name") {
+                                    introspected.push(n.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            !introspected.iter().any(|f| f == "hiddenMut"),
+            "introspection is expected to OMIT the visible=false mutation (that is the \
+             gap the SDL source closes); got {introspected:?}"
+        );
+
+        // The exact diff the fence computes: hidden ∈ (sdl \ introspection).
+        let hidden: Vec<&String> = sdl_fields
+            .iter()
+            .filter(|f| !introspected.iter().any(|i| i == *f))
+            .collect();
+        assert_eq!(
+            hidden,
+            vec!["hiddenMut"],
+            "the SDL-vs-introspection diff must surface exactly the hidden mutation"
+        );
     }
 
     /// The mutation field names (camelCase, as async-graphql exposes them) via the
@@ -354,6 +452,115 @@ mod authz_guard {
             }
         }
         names
+    }
+
+    /// The mutation field names sourced from the built schema's SDL — the completeness
+    /// source (#219). Builds the same DB-free schema as the introspection helper and runs
+    /// its `.sdl()` (sync, no runtime needed) through [`mutation_field_names_from_sdl`].
+    /// SDL includes `#[graphql(visible = false)]` fields, so this source cannot be
+    /// defeated by hiding a mutation from introspection.
+    fn graphql_mutation_fields_from_sdl() -> Vec<String> {
+        use crate::graphql::mutation::MutationRoot;
+        use crate::graphql::query::QueryRoot;
+        use crate::graphql::subscription::SubscriptionRoot;
+        let schema =
+            async_graphql::Schema::build(QueryRoot, MutationRoot, SubscriptionRoot).finish();
+        mutation_field_names_from_sdl(&schema.sdl())
+    }
+
+    /// The mutation type's field names extracted from an async-graphql SDL string via
+    /// the engine's OWN parser AST (`async_graphql::parser::parse_schema`), NOT
+    /// introspection. This is the completeness source (#219): unlike introspection,
+    /// which async-graphql filters by `visible` (a `#[graphql(visible = false)]`
+    /// mutation is executable but ABSENT from introspection), `schema.sdl()` includes
+    /// every registered field, so a hidden mutation still appears here and must carry a
+    /// classified row. Parsing the AST (not a brace/line text scan) means a `}` inside a
+    /// field description cannot mis-slice the type block. camelCase, as async-graphql
+    /// emits. An empty result on a navigation miss is safe: the set-equality in
+    /// `every_graphql_mutation_has_its_gate` turns "no fields" into a loud failure for
+    /// every registered name, never a vacuous pass.
+    fn mutation_field_names_from_sdl(sdl: &str) -> Vec<String> {
+        use async_graphql::parser::parse_schema;
+        use async_graphql::parser::types::{TypeKind, TypeSystemDefinition};
+
+        let doc = parse_schema(sdl).expect("async-graphql SDL must parse");
+        // The mutation root type name: from the `schema { mutation: X }` block if
+        // present, else the GraphQL default "Mutation".
+        let mutation_type = doc
+            .definitions
+            .iter()
+            .find_map(|def| match def {
+                TypeSystemDefinition::Schema(s) => s
+                    .node
+                    .mutation
+                    .as_ref()
+                    .map(|m| m.node.as_str().to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "Mutation".to_string());
+        // The fields of that object type.
+        doc.definitions
+            .iter()
+            .find_map(|def| match def {
+                TypeSystemDefinition::Type(t) if t.node.name.node.as_str() == mutation_type => {
+                    match &t.node.kind {
+                        TypeKind::Object(obj) => Some(
+                            obj.fields
+                                .iter()
+                                .map(|f| f.node.name.node.as_str().to_string())
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn sdl_extractor_includes_a_hidden_visible_false_field() {
+        // A field that would be hidden from introspection must still be listed from SDL.
+        let sdl = "schema { query: QueryRoot mutation: MutationRoot }\n\
+                   type QueryRoot { ping: Int! }\n\
+                   type MutationRoot { createTask: Int! hiddenMut: Int! }\n";
+        let fields = mutation_field_names_from_sdl(sdl);
+        assert!(
+            fields.iter().any(|f| f == "createTask"),
+            "visible field must be listed: {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|f| f == "hiddenMut"),
+            "a visible=false field (present in SDL, hidden from introspection) MUST be \
+             listed by the completeness source: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn sdl_extractor_is_not_fooled_by_a_brace_in_a_field_description() {
+        // A `}` inside a field description must not truncate the type block (the AST
+        // parse is immune to the text-parse quirk the old design feared).
+        let sdl = "schema { query: QueryRoot mutation: MutationRoot }\n\
+                   type QueryRoot { ping: Int! }\n\
+                   type MutationRoot {\n\
+                     \"\"\"a description with a } brace and { another\"\"\"\n\
+                     createTask: Int!\n\
+                     claimTask: Int!\n\
+                   }\n";
+        let fields = mutation_field_names_from_sdl(sdl);
+        assert!(
+            fields.iter().any(|f| f == "createTask") && fields.iter().any(|f| f == "claimTask"),
+            "both fields must be extracted despite a brace in a description: {fields:?}"
+        );
+    }
+
+    #[test]
+    fn sdl_extractor_returns_empty_for_a_query_only_schema() {
+        let sdl = "schema { query: QueryRoot }\ntype QueryRoot { ping: Int! }\n";
+        assert!(
+            mutation_field_names_from_sdl(sdl).is_empty(),
+            "a schema with no mutation root yields no mutation fields (no panic)"
+        );
     }
 
     /// The comment-masked body of `async fn <snake>` in `graphql/mutation.rs`, bounded
