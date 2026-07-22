@@ -4,6 +4,20 @@ on:
   push:
     branches:
       - main
+  # Manual backfill: republish an already-cut release to a channel that
+  # missed it. Fill in only the channel(s) you want — an empty input leaves
+  # that channel's jobs skipped. npm reuses the existing release's binary
+  # assets; docker rebuilds the image from the tag and re-tags the manifest.
+  workflow_dispatch:
+    inputs:
+      npm_backfill_tag:
+        description: "Existing release tag to publish to npm (e.g. v0.6.0)"
+        required: false
+        type: string
+      docker_backfill_tag:
+        description: "Existing release tag to publish to ghcr (e.g. v0.6.0)"
+        required: false
+        type: string
 
 concurrency:
   group: release-${{ github.ref }}
@@ -14,7 +28,10 @@ permissions: {}
 
 jobs:
   release-please:
-    if: ${{ github.repository == 'Gitlawb/node' }}
+    # Skipped on manual dispatch: a backfill must never create or advance a
+    # release PR as a side effect (npm-publish tolerates the skipped need via
+    # !cancelled(), and every other job gates on release_created == 'true').
+    if: ${{ github.repository == 'Gitlawb/node' && github.event_name != 'workflow_dispatch' }}
     name: Release Please
     runs-on: ubuntu-latest
     permissions:
@@ -31,23 +48,60 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # Each architecture builds NATIVELY (amd64 on ubuntu-latest, arm64 on
+  # ubuntu-24.04-arm) and pushes by digest; docker-manifest below stitches the
+  # digests into the tagged multi-arch image. No QEMU: emulating the arm64
+  # Rust release build wedged the v0.6.0 run for 3+ hours and, via the
+  # workflow concurrency group, blocked every queued release run behind it.
   docker:
-    name: Build & Push Docker Image
+    name: Build & Push Docker Image (${{ matrix.arch }})
     needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
-    runs-on: ubuntu-latest
+    # Runs on a fresh release, or on manual dispatch for an existing tag
+    # (release-please is skipped on dispatch, hence !cancelled()).
+    if: >-
+      ${{ !cancelled() && (
+        needs.release-please.outputs.release_created == 'true' ||
+        (github.event_name == 'workflow_dispatch' && inputs.docker_backfill_tag != '')
+      ) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            os: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            os: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
       packages: write
     steps:
+      - name: Resolve release tag
+        id: rel
+        env:
+          DISPATCH_TAG: ${{ inputs.docker_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          # ghcr requires a lowercase repository path, and unlike metadata-action,
+          # buildx's `--output name=` does no lowercasing — a mixed-case owner
+          # makes the digest push fail with "invalid reference format".
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ steps.rel.outputs.tag }}
           persist-credentials: false
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
@@ -59,45 +113,130 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=semver,pattern={{version}},value=${{ needs.release-please.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.release-please.outputs.version }}
-            type=raw,value=latest
-
       - name: Build and load locally (smoke)
         uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
         with:
           context: .
+          platforms: ${{ matrix.platform }}
           load: true
           tags: gitlawb-node:smoke
-          cache-from: type=gha
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
 
+      # Native runner on both arches, so the built image can always execute.
+      # Assert the released version so a stale artifact fails here, not in prod.
       - name: Smoke test
-        run: docker run --rm gitlawb-node:smoke --version
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm gitlawb-node:smoke --version)"
+          echo "$out"
+          grep -qF "$VERSION" <<<"$out" || {
+            echo "::error::image --version did not report expected version $VERSION (got: $out)"
+            exit 1
+          }
 
-      - name: Build and push (multi-arch)
+      # Push by digest only — tags are applied once by docker-manifest so a
+      # half-finished matrix can never publish a partially-tagged image.
+      # provenance:false keeps each push a plain single-arch manifest, which is
+      # what imagetools create expects to merge.
+      - name: Build and push by digest
+        id: push
         uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ steps.rel.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: Publish Docker manifest
+    needs: [release-please, docker]
+    if: ${{ !cancelled() && needs.docker.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - name: Resolve release tag
+        id: rel
+        env:
+          DISPATCH_TAG: ${{ inputs.docker_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download digests
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: docker-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -euo pipefail
+          # ghcr requires a lowercase repository path.
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
+          MAJOR_MINOR="${VERSION%.*}"
+          digests=""
+          for f in /tmp/digests/*; do
+            digests="$digests $IMAGE@sha256:$(basename "$f")"
+          done
+          # shellcheck disable=SC2086
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:$MAJOR_MINOR" \
+            -t "$IMAGE:latest" \
+            $digests
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
 
       - name: Release summary
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           {
-            echo "## Released ${{ needs.release-please.outputs.tag_name }}"
+            echo "## Released $TAG"
             echo
-            echo "- Image: \`ghcr.io/${{ github.repository }}:${{ needs.release-please.outputs.version }}\`"
-            echo "- GitHub: https://github.com/${{ github.repository }}/releases/tag/${{ needs.release-please.outputs.tag_name }}"
+            echo "- Image: \`ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION\` (linux/amd64 + linux/arm64)"
+            echo "- GitHub: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
           } >> "$GITHUB_STEP_SUMMARY"
 
   release-binaries:
@@ -248,37 +387,62 @@ jobs:
   npm-publish:
     name: Publish to npm
     needs: [release-please, release-binaries]
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    # Runs on a fresh release, or on manual dispatch for an existing tag
+    # (release-binaries is skipped on dispatch, hence !cancelled()). Publishing
+    # auth is npm Trusted Publishing (GitHub OIDC) — no NPM_TOKEN. Each
+    # @gitlawb package must have this repo + workflow (release.yml) configured
+    # as its trusted publisher on npmjs.com, or publish fails loudly here —
+    # deliberately loud: the silent secret-guard skip is how 0.4.x–0.6.0
+    # never reached npm.
+    if: >-
+      ${{ !cancelled() && (
+        (needs.release-please.outputs.release_created == 'true' && needs.release-binaries.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.npm_backfill_tag != '')
+      ) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # npm provenance
+      id-token: write # npm trusted publishing (OIDC) + provenance
     steps:
-      - name: Guard on secret
-        id: guard
+      - name: Resolve release tag
+        id: rel
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DISPATCH_TAG: ${{ inputs.npm_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
-          if [ -z "${NPM_TOKEN:-}" ]; then
-            echo "::warning::NPM_TOKEN is not set — skipping npm publish."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout release tag
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ steps.rel.outputs.tag }}
           persist-credentials: false
 
+      # npm >= 11.5.1 performs the OIDC token exchange automatically when the
+      # package has a trusted publisher configured; older npm silently falls
+      # back to (absent) token auth and fails confusingly.
+      - name: Set up Node 24 + OIDC-capable npm
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24"
+      - name: Ensure npm supports trusted publishing
+        run: |
+          set -euo pipefail
+          npm install -g npm@^11.5.1
+          npm --version
+
       - name: Lay in release binaries
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -euo pipefail
           # npm platform package -> Rust target triple (unix only; Windows is not
@@ -305,9 +469,8 @@ jobs:
           done
 
       - name: Set versions
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
-          VERSION: ${{ needs.release-please.outputs.version }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
           node -e '
@@ -327,13 +490,12 @@ jobs:
           '
 
       - name: Publish
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          # No token: npm exchanges this job's GitHub OIDC identity with the
+          # registry (trusted publishing); provenance is attested automatically.
           # Platform packages first, then the wrapper (so its optionalDependencies resolve).
           # Skip versions already on the registry so a rerun after a partial publish
           # is idempotent instead of erroring on the first existing package.
@@ -427,6 +589,15 @@ jobs:
             def install
               bin.install "gl"
               bin.install "git-remote-gitlawb"
+            end
+
+            def caveats
+              <<~CAVEATS
+                oh-my-zsh's git plugin aliases gl='git pull', which shadows this
+                binary in interactive shells. If \`gl\` prints "fatal: not a git
+                repository", run:
+                  echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc
+              CAVEATS
             end
 
             test do

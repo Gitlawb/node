@@ -1,8 +1,8 @@
 //! Webhook CRUD API.
 //!
-//! POST   /api/v1/repos/:owner/:repo/hooks        — create (auth required)
-//! GET    /api/v1/repos/:owner/:repo/hooks        — list
-//! DELETE /api/v1/repos/:owner/:repo/hooks/:id   — delete (auth required)
+//! POST   /api/v1/repos/:owner/:repo/hooks        — create (owner only)
+//! GET    /api/v1/repos/:owner/:repo/hooks        — list (owner only; auth required)
+//! DELETE /api/v1/repos/:owner/:repo/hooks/:id   — delete (owner only)
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -73,12 +73,26 @@ pub async fn create_webhook(
 pub async fn list_webhooks(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &name)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{name}")))?;
+    // This route sits on `optional_signature`, so the DID is optional. Webhook
+    // callback URLs are owner-secret config and there is no anonymous form, so a
+    // headerless caller is rejected before any lookup (401, which fires for an
+    // existing-private and an absent repo alike, so it leaks no existence).
+    let Some(Extension(AuthenticatedDid(caller))) = auth else {
+        return Err(AppError::Unauthorized(
+            "listing webhooks requires authentication".into(),
+        ));
+    };
+
+    // Read-visibility first, then owner. authorize_repo_read returns 404 on a
+    // visibility deny, so a non-reader of a private repo cannot tell it exists
+    // (uniform with the sibling read surfaces); require_repo_owner then yields
+    // 403 only for a non-owner of a public/readable repo, where existence is not
+    // secret.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, Some(&caller), "/").await?;
+    crate::api::require_repo_owner(&record, &caller)?;
 
     let hooks = state.db.list_webhooks(&record.id).await?;
     // Redact secrets in list response
