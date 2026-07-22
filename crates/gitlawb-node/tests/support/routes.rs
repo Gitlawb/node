@@ -24,7 +24,7 @@
 //! (R9).
 
 /// The gate class of a deny-bearing route and the exact status its deny emits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GateClass {
     /// `require_repo_owner` / `require_owner` / inline `did_matches(caller, owner)`
     /// -> `AppError::Forbidden` == 403. Probed with a validly-signed non-owner.
@@ -186,6 +186,30 @@ pub struct Row {
     pub principals: &'static [Principal],
     /// How the `{id}` placeholder is filled for this row (see [`IdSource`]).
     pub id_source: IdSource,
+    /// For `ReadGate` rows, the status an ANONYMOUS (headerless) caller gets on
+    /// the withheld target. Most read GETs take `Option` auth and existence-hide
+    /// with a 404 (`Deny404`), but a read GET that *requires* auth rejects a
+    /// headerless caller with 401 BEFORE any lookup (`Deny401`) — e.g.
+    /// `list_webhooks`, whose callback URLs are owner-secret config with no anon
+    /// form. The signed-non-reader 404 (existence-hiding) is unchanged either way;
+    /// only the anon leg differs. Meaningless on non-`ReadGate` rows, which set
+    /// `Deny404` as the not-applicable sentinel (mirrors `reach: Reach::None`).
+    /// A new auth-required read added as a `ReadGate` row that forgets `Deny401`
+    /// fails loudly (its anon probe gets 401, not the expected 404), so the field
+    /// is self-correcting rather than a silent default.
+    pub anon_read: AnonRead,
+}
+
+/// The status class an anonymous caller gets from a `ReadGate` row's withheld
+/// target — 404 existence-hiding (the default) or a 401 auth-required rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonRead {
+    /// `Option`-auth read: anon gets the existence-hiding 404, same as a signed
+    /// non-reader. The default for every read GET that has an anonymous form.
+    Deny404,
+    /// Auth-required read: a headerless caller is rejected 401 before any lookup
+    /// (no anonymous form). The signed-non-reader still gets the 404.
+    Deny401,
 }
 
 const NO_ENTITY: &[&str] = &[];
@@ -208,6 +232,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // #195 (F1): close_pr / close_issue are owner-OR-author gates (pulls.rs:276,
         // issues.rs:255). A plain OwnerGate tests only the owner arm, so reverting
@@ -222,6 +247,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Owner, Principal::Author],
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -233,6 +259,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Owner, Principal::Author],
             id_source: IdSource::IssueId,
+            anon_read: AnonRead::Deny404,
         },
         // #195 (F1): dispute_bounty is creator-OR-claimant (bounties.rs:425). Not
         // repo-scoped: it gates on the bounty's creator/claimant, so the row is
@@ -247,6 +274,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Creator, Principal::Claimant],
             id_source: IdSource::BountyId,
+            anon_read: AnonRead::Deny404,
         },
         // #195 (N2): submit/approve/cancel each 403 a non-claimant/non-creator, but
         // their STATUS check fires before the auth check, so each row gets its own
@@ -268,6 +296,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Claimant],
             id_source: IdSource::ClaimedBountyId,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -282,6 +311,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Creator],
             id_source: IdSource::SubmittedBountyId,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -293,6 +323,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Creator],
             id_source: IdSource::OpenBountyId,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -304,6 +335,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "DELETE",
@@ -315,6 +347,25 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #113: the OWNER layer of list_webhooks (GET /hooks). On the PUBLIC repo a
+        // signed stranger passes authorize_repo_read (public) and is then denied 403
+        // by require_repo_owner — this row drives that 403. The READ layer (404 on
+        // the private repo, anon 401) is the sibling ReadGate row; the two share the
+        // path, admitted by the (method, path, gate) dedup key. A GET owner-gate
+        // like list_visibility below.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/hooks",
+            gate: GateClass::OwnerGate,
+            handler: "webhooks::list_webhooks",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -326,6 +377,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "DELETE",
@@ -337,6 +389,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -348,6 +401,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "DELETE",
@@ -359,6 +413,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "PUT",
@@ -370,6 +425,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "DELETE",
@@ -381,6 +437,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // list_visibility is a 403 owner-gate despite being a GET (calls
         // require_owner); the /visibility mount chains put+delete+get, all gated.
@@ -394,6 +451,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // ── Signature-required (401) — verified: git write route wrapped by the
         //    require_signature layer (add_auth_layers in server.rs). ─────────────
@@ -407,6 +465,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // ── Read-gate (404) — verified: each handler calls
         //    authorize_repo_read / visibility_check on "/" which returns
@@ -428,6 +487,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // #195 (F2): repo-root reads that gate on "/" — driven as real ReadGate rows
         // rather than source-only exemptions, so a runtime bypass that keeps the
@@ -442,6 +502,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -453,6 +514,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -464,6 +526,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -475,6 +538,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -486,6 +550,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // Path-scoped read: get_blob gates on "/{path}" (repos.rs:390). The
         // fully-private fixture repo denies any path to anon (404); the owner
@@ -502,6 +567,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -513,6 +579,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -524,6 +591,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -535,6 +603,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -546,6 +615,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -557,6 +627,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -568,6 +639,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -579,6 +651,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -590,6 +663,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -601,6 +675,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -612,6 +687,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // #195 (F2, U3): sub-entity reads that gate on "/" (the private repo) but
         // require the entity to EXIST at the request path for the owner-2xx twin.
@@ -631,6 +707,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::PrivIssueId,
+            anon_read: AnonRead::Deny404,
         },
         // list_issue_comments: parent issue must exist (private); child list may be
         // empty — an empty `{"comments":[]}` is a non-empty 2xx body.
@@ -644,6 +721,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::PrivIssueId,
+            anon_read: AnonRead::Deny404,
         },
         // get_pr: the seeded PRIVATE PR #1 (marker in its title).
         Row {
@@ -656,6 +734,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // get_pr_diff: the PRIVATE PR #1 has a real `feature` source branch with a
         // marker file, so branch_diff_names(main, feature) is NON-EMPTY and the
@@ -672,6 +751,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // list_reviews / list_comments: parent PR #1 must exist (private); child
         // lists may be empty.
@@ -685,6 +765,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "GET",
@@ -696,6 +777,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         // get_cert: id-keyed by a real ref-certificate issued by an owner push to
         // the private repo. No cert-content marker is seeded: get_cert read-gates
@@ -712,6 +794,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::CertId,
+            anon_read: AnonRead::Deny404,
         },
         // get_bounty: NOT repo-scoped in its path, read-gates on the bounty's repo.
         // Seeded against the PRIVATE repo (marker in its title), id-keyed.
@@ -725,6 +808,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::PrivBountyId,
+            anon_read: AnonRead::Deny404,
         },
         // get_tree (path-scoped): genuinely ADDITIONAL to get_tree_root (Q1). Root
         // gates on "/"; get_tree gates on the REQUESTED subtree (N3,
@@ -741,6 +825,61 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::ReaderReads,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #113: /replicas and /branches/protected gained an `authorize_repo_read`
+        // gate on "/" — a private repo's replica URLs / protected-branch list are
+        // now hidden (404) from a non-reader. Both take `Option` auth (anon and a
+        // signed non-reader alike get the existence-hiding 404), gate on the whole
+        // repo, and return an empty-or-seeded 2xx list to the owner, so `ReaderReads`
+        // (owner re-read) is the twin and no per-row sub-entity seeding is needed.
+        // Driven as real ReadGate rows rather than left in PUBLIC_REPO_GETS, which
+        // is why the completeness fence flagged them after the #113 merge.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/replicas",
+            gate: GateClass::ReadGate,
+            handler: "replicas::list_replicas",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/branches/protected",
+            gate: GateClass::ReadGate,
+            handler: "protect::list_protected_branches",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #113: list_webhooks is DOUBLY gated — authorize_repo_read (404) THEN
+        // require_repo_owner (403) — and it rejects a headerless caller with 401
+        // BEFORE the lookup (callback URLs are owner-secret config with no anon
+        // form). This is the READ layer: a signed non-reader of the private repo
+        // gets the existence-hiding 404, while an anon caller gets 401 (AnonRead::
+        // Deny401). The OWNER layer (403 for a signed reader-non-owner) is the
+        // sibling OwnerGate row above, run against the public repo where the read
+        // gate passes and the owner gate is what fires. Two rows share this path
+        // (one ReadGate, one OwnerGate); the consistency dedup keys on
+        // (method, path, gate) to admit exactly this dual-gate case.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/hooks",
+            gate: GateClass::ReadGate,
+            handler: "webhooks::list_webhooks",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny401,
         },
         // ── Caller-self / actor (403), #195 (F3). The task/register handlers carry
         //    genuine caller-self 403 gates a bypass would expose (impersonate a
@@ -764,6 +903,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -778,6 +918,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::ClaimableTaskId,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -792,6 +933,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: NO_PRINCIPAL,
             id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -805,6 +947,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Assignee],
             id_source: IdSource::CompletableTaskId,
+            anon_read: AnonRead::Deny404,
         },
         Row {
             method: "POST",
@@ -819,6 +962,7 @@ pub fn deny_bearing_routes() -> &'static [Row] {
             reach: Reach::None,
             principals: &[Principal::Assignee],
             id_source: IdSource::FailableTaskId,
+            anon_read: AnonRead::Deny404,
         },
         // The read-gate handlers NOT driven here (deferred GET reads, read-gating
         // mutations, git smart-HTTP reads, the content-addressed read, and the
@@ -839,14 +983,21 @@ mod tests {
     fn registry_internal_consistency() {
         let rows = deny_bearing_routes();
 
-        // No duplicate method+path.
+        // No duplicate method+path+gate. The key is (method, path, gate), not
+        // (method, path): one endpoint can carry two distinct gate LAYERS that each
+        // need their own probe substrate — list_webhooks (GET /hooks) read-gates
+        // (404 on the private repo) THEN owner-gates (403 on the public repo), so it
+        // is one ReadGate row and one OwnerGate row on the same path. An accidental
+        // copy-paste of a row keeps the same gate, so this still catches the real
+        // double-registration bug; it only admits the deliberate dual-gate case.
         let mut seen = std::collections::HashSet::new();
         for r in rows {
             assert!(
-                seen.insert((r.method, r.path)),
-                "duplicate deny-bearing row: {} {}",
+                seen.insert((r.method, r.path, r.gate)),
+                "duplicate deny-bearing row: {} {} {:?}",
                 r.method,
-                r.path
+                r.path,
+                r.gate
             );
         }
 
