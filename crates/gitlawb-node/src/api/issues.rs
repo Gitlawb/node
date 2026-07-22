@@ -293,13 +293,36 @@ pub async fn close_issue(
         ));
     }
 
+    // Snapshot the issue ref's pre-close OID so a failed durable upload can roll
+    // the close back on local disk, mirroring create_issue. Best-effort: if the
+    // snapshot read fails we proceed without a rollback closure (the close still
+    // applies and a failed upload still surfaces as a 5xx below).
+    let prior_ref = git_issues::issue_ref_oid(&disk_path, &issue_id)
+        .ok()
+        .flatten();
+
     let close_result = git_issues::close_issue(&disk_path, &issue_id);
 
     // Always release the advisory lock, even on error; upload to Tigris only on
     // success. A false return means the durable upload failed: the close applied
     // to local disk but never reached object storage, so a later acquire_write
     // reverts it. Report 5xx so the client retries. (P1 data-loss guard.)
-    let upload_ok = guard.release(close_result.is_ok()).await;
+    // On that failure, roll the local close BACK to the captured open ref BEFORE
+    // the lock releases — otherwise the local fast path in RepoStore::acquire
+    // serves the "closed" state until a later write refreshes the archive, even
+    // though the client got a 5xx. The cleanup runs only when an upload was
+    // attempted and failed, while the advisory lock is still held.
+    let upload_ok = guard
+        .release_with_failure_cleanup(close_result.is_ok(), |path| {
+            if let Some((full_id, oid)) = &prior_ref {
+                if let Err(e) = git_issues::restore_issue_ref(path, full_id, oid) {
+                    tracing::warn!(issue = %issue_id, err = %e,
+                        "failed to roll back local issue close after failed durable upload; \
+                         a local-fast-path read may serve a stale closed state");
+                }
+            }
+        })
+        .await;
 
     let updated = close_result
         .map_err(|e| AppError::Git(e.to_string()))?
@@ -431,6 +454,129 @@ mod tests {
             Ok((code, _)) => code,
             Err(e) => e.into_response().status(),
         }
+    }
+
+    async fn close_issue_status(
+        state: &crate::state::AppState,
+        owner: &str,
+        name: &str,
+        issue_id: &str,
+    ) -> axum::http::StatusCode {
+        use axum::response::IntoResponse;
+        let resp = super::close_issue(
+            State(state.clone()),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            AxPath((owner.to_string(), name.to_string(), issue_id.to_string())),
+        )
+        .await;
+        match resp {
+            Ok(_) => axum::http::StatusCode::OK,
+            Err(e) => e.into_response().status(),
+        }
+    }
+
+    // Seed an OPEN issue directly on local disk, bypassing the (stalling) upload
+    // path so the close test starts from a durably-consistent open issue.
+    fn seed_open_issue(bare: &StdPath, owner: &str, issue_id: &str) {
+        let issue = IssueRecord {
+            id: issue_id.to_string(),
+            title: "t".into(),
+            body: None,
+            author: Some(owner.to_string()),
+            created_at: Utc::now().to_rfc3339(),
+            status: "open".to_string(),
+            signed_payload: None,
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        git_issues::create_issue(bare, issue_id, &json).unwrap();
+    }
+
+    fn issue_status(bare: &StdPath, issue_id: &str) -> String {
+        let raw = git_issues::get_issue(bare, issue_id).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        v["status"].as_str().unwrap().to_string()
+    }
+
+    // U2 [F2, P1] — the failed-upload rollback on the close path. close_issue
+    // applies the "closed" ref to LOCAL disk, then release() uploads to durable
+    // storage. When that upload times out the local close is NOT persisted, so a
+    // later acquire_write reverts it from the stale archive — but until then, a
+    // local-fast-path read via RepoStore::acquire serves the stale "closed"
+    // state even though the client got a 5xx. The fix rolls the close back to the
+    // captured open ref while the advisory lock is held. RED with the cleanup
+    // closure reverted to `|_| {}`: the read sees "closed".
+    #[sqlx::test]
+    async fn issue_close_failed_upload_rolls_back_to_open(pool: sqlx::PgPool) {
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let owner = "z6issuecloserollbackowner";
+        let name = "issuecloserollback";
+        let (state, bare) = stall_state_with_repo(pool, &repos_dir, owner, name).await;
+
+        let issue_id = "aaaa1111-0000-0000-0000-000000000000";
+        seed_open_issue(&bare, owner, issue_id);
+        assert_eq!(issue_status(&bare, issue_id), "open", "seed must be open");
+
+        // Close via the handler — the durable upload stalls and times out (5xx).
+        let status = close_issue_status(&state, owner, name, issue_id).await;
+        assert!(
+            status.is_server_error(),
+            "a stalled durable upload on issue-close must 500, got {status}"
+        );
+
+        // The local fast path must still see the issue OPEN: the failed upload
+        // rolled the close back while the lock was held.
+        assert_eq!(
+            issue_status(&bare, issue_id),
+            "open",
+            "a failed durable upload must roll the local close back to open; a \
+             local-fast-path read served the stale closed state"
+        );
+    }
+
+    // Success path: a working store closes the issue (2xx) and the read reflects
+    // the close. Confirms the rollback wiring does not fire on success.
+    #[sqlx::test]
+    async fn issue_close_success_persists_close(pool: sqlx::PgPool) {
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let owner = "z6issueclosesuccessowner";
+        let name = "issueclosesuccess";
+        let (mut state, bare) = stall_state_with_repo(pool.clone(), &repos_dir, owner, name).await;
+        // Swap the stalling store for one whose upload succeeds immediately.
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(std::sync::Arc::new(OkStore)),
+            pool.clone(),
+        )
+        .with_release_upload_timeout(Duration::from_millis(200));
+
+        let issue_id = "bbbb2222-0000-0000-0000-000000000000";
+        seed_open_issue(&bare, owner, issue_id);
+
+        let status = close_issue_status(&state, owner, name, issue_id).await;
+        assert_eq!(status, StatusCode::OK, "working store must close (200)");
+        assert_eq!(
+            issue_status(&bare, issue_id),
+            "closed",
+            "a successful close must persist as closed"
+        );
+    }
+
+    // Pre-write error path: closing a nonexistent issue returns 404 and never
+    // attempts an upload (release(false)), so the stalling store cannot hang it.
+    #[sqlx::test]
+    async fn issue_close_not_found_releases_without_upload(pool: sqlx::PgPool) {
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        let owner = "z6issueclosemissingowner";
+        let name = "issueclosemissing";
+        let (state, _bare) = stall_state_with_repo(pool, &repos_dir, owner, name).await;
+
+        let status =
+            close_issue_status(&state, owner, name, "cccc3333-0000-0000-0000-000000000000").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "closing a missing issue must 404 without attempting an upload"
+        );
     }
 
     fn issue_refs(bare: &StdPath) -> Vec<String> {

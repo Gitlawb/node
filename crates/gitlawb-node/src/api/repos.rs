@@ -999,13 +999,30 @@ pub async fn git_receive_pack(
             }
         };
         let disk_path = guard.path().to_path_buf();
+
+        // Snapshot the pre-push refs so a failed durable upload can roll the
+        // applied pack back on local disk (mirrors create_issue). Without this
+        // the local fast path in RepoStore::acquire serves the pushed refs until
+        // a later write refreshes the archive, even though the client got a 5xx.
+        let pre_push_refs = store::list_refs(&disk_path).unwrap_or_default();
+
         tracing::debug!(repo = %record.name, path = %disk_path.display(), "running git receive-pack");
         let result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
         // Always release the advisory lock — even on error, and BEFORE the tail —
         // to prevent stale locks and to avoid holding the write lock across the
         // fan-out. Only upload to Tigris when the push succeeded; uploading a
-        // half-applied repo would propagate corruption.
-        let upload_ok = guard.release(result.is_ok()).await;
+        // half-applied repo would propagate corruption. On a failed durable
+        // upload, restore the pre-push refs BEFORE the lock releases so a
+        // local-fast-path read does not serve refs that never landed durably.
+        let upload_ok = guard
+            .release_with_failure_cleanup(result.is_ok(), |path| {
+                if let Err(e) = store::restore_refs(path, &pre_push_refs) {
+                    tracing::warn!(repo = %record.name, err = %e,
+                        "failed to roll back receive-pack refs after failed durable upload; \
+                         a local-fast-path read may serve un-uploaded refs");
+                }
+            })
+            .await;
 
         // On receive-pack error, deliver the classified error to the client and run
         // NO tail. On success, hand report-status to the client now, then continue
