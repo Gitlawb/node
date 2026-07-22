@@ -52,7 +52,15 @@ pub fn check_denied(
 /// full body once.
 pub async fn assert_denied(resp: reqwest::Response, expected: u16, withheld: &[&str]) {
     let status = resp.status().as_u16();
-    let body = resp.text().await.unwrap_or_default();
+    // A body-read failure must NOT fold to "" — an empty body passes the withheld
+    // scan vacuously, so an unreadable denial (a mid-body reset/truncation) would be
+    // certified leak-free without ever inspecting the bytes. Fail loud instead. A
+    // legitimately empty body is `Ok("")`, not `Err`, so the honest empty-401 denials
+    // still pass.
+    let body = resp
+        .text()
+        .await
+        .expect("read denial body: an unreadable denial cannot be certified leak-free");
     if let Err(reason) = check_denied(status, &body, expected, withheld) {
         panic!("{reason}");
     }
