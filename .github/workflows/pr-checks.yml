@@ -2,6 +2,10 @@ name: PR Checks
 
 on:
   pull_request:
+  # Run in the merge queue so a PR is re-validated against the true merged
+  # result before it lands. Guards against semantic merge races where two
+  # individually-green PRs break main in combination (#113 + #145 → #229).
+  merge_group:
   push:
     branches:
       - main

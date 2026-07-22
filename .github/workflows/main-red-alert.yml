@@ -1,0 +1,70 @@
+# Opens an issue the moment a push-to-main run of PR Checks goes red.
+#
+# Two individually-green PRs can still break main in combination when the
+# second one merges on checks that ran against a stale base (semantic merge
+# race — #113 + #145 broke test compilation, found only via #229). A red main
+# is otherwise silent, and release-please PRs inherit the breakage, so this
+# turns it into an open, labeled issue instead.
+name: Main red alert
+
+on:
+  workflow_run:
+    workflows: ["PR Checks"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  issues: write
+
+jobs:
+  alert:
+    name: Open issue on red main
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Create or update the broken-main issue
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const label = 'ci-main-red';
+            const headline = run.head_commit?.message?.split('\n')[0] ?? '';
+            const body = [
+              `[PR Checks run](${run.html_url}) failed on main at \`${run.head_sha}\`.`,
+              '',
+              `> ${headline}`,
+              '',
+              'Likely a semantic merge race: each merged PR was green on a stale base.',
+              'Fix main before merging anything else — release-please PRs inherit this breakage.',
+            ].join('\n');
+
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: label });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              await github.rest.issues.createLabel({
+                ...context.repo,
+                name: label,
+                color: 'b60205',
+                description: 'CI is failing on main',
+              });
+            }
+
+            const open = await github.rest.issues.listForRepo({
+              ...context.repo, state: 'open', labels: label, per_page: 1,
+            });
+            if (open.data.length > 0) {
+              await github.rest.issues.createComment({
+                ...context.repo, issue_number: open.data[0].number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                ...context.repo,
+                title: 'CI is red on main',
+                body,
+                labels: [label],
+              });
+            }
