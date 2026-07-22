@@ -37,17 +37,9 @@ pub async fn run(args: StatusArgs) -> Result<()> {
     let client = NodeClient::new(&args.node, None);
     if let Some(ref did) = maybe_did {
         let short_key = did.split(':').next_back().unwrap_or(did);
-        match client.get(&format!("/api/v1/agents/{short_key}")).await {
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = resp.json::<Value>().await {
-                    let score = body["trust_score"].as_f64().unwrap_or(0.0);
-                    let bar = trust_bar(score);
-                    println!("  trust     {score:.2}  {bar}");
-                }
-            }
-            _ => {
-                println!("  trust     — not registered (run `gl register`)");
-            }
+        let resp = client.get(&format!("/api/v1/agents/{short_key}")).await;
+        if let Some(line) = trust_line(resp).await {
+            println!("{line}");
         }
     }
 
@@ -81,7 +73,9 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         let pr_resp = client
             .get(&format!("/api/v1/repos/{short_owner}/{repo_name}/pulls"))
             .await;
-        if let Ok(r) = pr_resp {
+        if let Some(line) = section_unavailable_line("PRs", &pr_resp) {
+            println!("{line}");
+        } else if let Ok(r) = pr_resp {
             if let Ok(body) = r.json::<Value>().await {
                 let prs = body["pulls"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = prs
@@ -108,7 +102,9 @@ pub async fn run(args: StatusArgs) -> Result<()> {
         let issue_resp = client
             .get(&format!("/api/v1/repos/{short_owner}/{repo_name}/issues"))
             .await;
-        if let Ok(r) = issue_resp {
+        if let Some(line) = section_unavailable_line("issues", &issue_resp) {
+            println!("{line}");
+        } else if let Ok(r) = issue_resp {
             if let Ok(body) = r.json::<Value>().await {
                 let issues = body["issues"].as_array().cloned().unwrap_or_default();
                 let open: Vec<_> = issues
@@ -134,6 +130,40 @@ pub async fn run(args: StatusArgs) -> Result<()> {
 
     println!();
     Ok(())
+}
+
+/// The status line for a repo section (PRs / issues) whose gated read returned a
+/// non-2xx: the denial must surface, never render as "no open ..." (INV-8).
+/// Returns `None` for a success (the caller renders the body) or a transport error
+/// (the section degrades silently — R5 — so the multi-section `gl status` never
+/// hard-fails on one denied read).
+fn section_unavailable_line(label: &str, resp: &Result<reqwest::Response>) -> Option<String> {
+    match resp {
+        Ok(r) if !r.status().is_success() => {
+            Some(format!("  {label:<10}unavailable ({})", r.status()))
+        }
+        _ => None,
+    }
+}
+
+/// The `trust` status line for the caller's own identity. A genuine 404 means the
+/// identity is not registered; any OTHER non-2xx (403/429/5xx) is a failed lookup
+/// and must surface as unavailable rather than fabricating an unregistered state
+/// (INV-8). A transport error degrades silently — the node-unreachable line below
+/// already surfaces it — matching `section_unavailable_line`.
+async fn trust_line(resp: Result<reqwest::Response>) -> Option<String> {
+    match resp {
+        Ok(r) if r.status().is_success() => {
+            let body = r.json::<Value>().await.ok()?;
+            let score = body["trust_score"].as_f64().unwrap_or(0.0);
+            Some(format!("  trust     {score:.2}  {}", trust_bar(score)))
+        }
+        Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => {
+            Some("  trust     — not registered (run `gl register`)".to_string())
+        }
+        Ok(r) => Some(format!("  trust     unavailable ({})", r.status())),
+        Err(_) => None,
+    }
 }
 
 /// Render a simple ASCII trust bar: 0.75 → "███░"
@@ -336,5 +366,126 @@ mod tests {
     #[test]
     fn trust_bar_quarter() {
         assert_eq!(trust_bar(0.25), "█░░░");
+    }
+
+    // ── gl status section denial surfacing (#123 / INV-8, R5) ────────────
+
+    async fn get_response(
+        server: &mut mockito::Server,
+        status: usize,
+    ) -> Result<reqwest::Response> {
+        let _m = server
+            .mock("GET", "/x")
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"pulls":[]}"#)
+            .create_async()
+            .await;
+        NodeClient::new(server.url(), None).get("/x").await
+    }
+
+    #[tokio::test]
+    async fn gated_section_surfaces_unavailable_not_empty() {
+        // A gated 404 on a status section must surface "unavailable", never be
+        // treated as "no open PRs" (INV-8).
+        let mut server = mockito::Server::new_async().await;
+        let resp = get_response(&mut server, 404).await;
+        assert_eq!(
+            section_unavailable_line("PRs", &resp),
+            Some(format!("  {:<10}unavailable (404 Not Found)", "PRs"))
+        );
+    }
+
+    #[tokio::test]
+    async fn success_section_returns_none_for_body_render() {
+        // A 2xx returns None so the caller renders the body as before.
+        let mut server = mockito::Server::new_async().await;
+        let resp = get_response(&mut server, 200).await;
+        assert!(section_unavailable_line("issues", &resp).is_none());
+    }
+
+    #[test]
+    fn transport_error_degrades_silently() {
+        // A transport error (not a status) must NOT surface — the section
+        // degrades silently so gl status never hard-fails on one bad read (R5).
+        let err: Result<reqwest::Response> = Err(anyhow::anyhow!("connection refused"));
+        assert!(section_unavailable_line("PRs", &err).is_none());
+    }
+
+    // ── trust_line: a 404 means unregistered; any OTHER failure must surface as
+    //    unavailable, never fabricate an unregistered verdict (INV-8). ──────────
+    async fn agents_resp(
+        server: &mut mockito::Server,
+        status: usize,
+        body: &str,
+    ) -> Result<reqwest::Response> {
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/agents/".to_string()),
+            )
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+        NodeClient::new(server.url(), None)
+            .get("/api/v1/agents/zTest")
+            .await
+    }
+
+    #[tokio::test]
+    async fn trust_line_registered_shows_score_only() {
+        let mut s = mockito::Server::new_async().await;
+        let line = trust_line(agents_resp(&mut s, 200, r#"{"trust_score":0.5}"#).await)
+            .await
+            .unwrap();
+        assert!(line.contains("0.50"), "line={line}");
+        assert!(!line.contains("not registered"), "line={line}");
+        assert!(!line.contains("unavailable"), "line={line}");
+    }
+
+    #[tokio::test]
+    async fn trust_line_404_is_not_registered() {
+        let mut s = mockito::Server::new_async().await;
+        let line = trust_line(agents_resp(&mut s, 404, r#"{"message":"agent not found"}"#).await)
+            .await
+            .unwrap();
+        assert!(line.contains("not registered"), "line={line}");
+        assert!(!line.contains("unavailable"), "line={line}");
+    }
+
+    // Load-bearing: a 403 for an existing identity is a denied lookup, not proof it is unregistered.
+    #[tokio::test]
+    async fn trust_line_403_is_unavailable_not_registered() {
+        let mut s = mockito::Server::new_async().await;
+        let line = trust_line(agents_resp(&mut s, 403, r#"{"message":"forbidden"}"#).await)
+            .await
+            .unwrap();
+        assert!(
+            line.contains("unavailable") && line.contains("403"),
+            "line={line}"
+        );
+        assert!(!line.contains("not registered"), "line={line}");
+    }
+
+    // Load-bearing: a 5xx is a failed lookup, not an unregistered verdict.
+    #[tokio::test]
+    async fn trust_line_500_is_unavailable_not_registered() {
+        let mut s = mockito::Server::new_async().await;
+        let line = trust_line(agents_resp(&mut s, 500, r#"{"message":"boom"}"#).await)
+            .await
+            .unwrap();
+        assert!(line.contains("unavailable"), "line={line}");
+        assert!(!line.contains("not registered"), "line={line}");
+    }
+
+    // Load-bearing: a transport error degrades silently, never fabricates unregistered.
+    #[tokio::test]
+    async fn trust_line_transport_error_is_silent() {
+        let resp = NodeClient::new("http://127.0.0.1:1", None)
+            .get("/api/v1/agents/zTest")
+            .await;
+        assert!(trust_line(resp).await.is_none());
     }
 }
