@@ -2135,10 +2135,138 @@ mod completeness {
 
     // ── Shutdown-completeness guard: every spawn_node test must shutdown() ────────
 
-    /// `(name, body)` for every real `#[sqlx::test]` in `src`. The attribute is only
-    /// counted when nothing but whitespace precedes it on its line, so a backtick
-    /// mention inside a doc comment (the module header names the attribute in prose)
-    /// is not mistaken for a test. The needle is spelled in two pieces so this
+    /// Blank the CONTENT of comments and double-quoted / raw string literals in `src`
+    /// (length-preserving, newlines kept) so the brace slicer and the marker scans see
+    /// CODE only. Without it this guard carries two vacuity holes of exactly the class
+    /// it exists to close (INV-21 on the guard itself): a `{` inside a format string
+    /// unbalances the body slice and can swallow a later test's `shutdown()`, and a
+    /// `// node.shutdown()` comment satisfies the presence check while the test still
+    /// returns through `Drop`. Handles `//` and nested `/* */` comments, `"..."` (with
+    /// `\` escapes), and hash-delimited raw strings (`r#"..."#`, `br#"..."#`). Char
+    /// literals and lifetimes are left as code: they carry neither braces-of-interest
+    /// nor the shutdown marker, and telling a `'a` lifetime from a `'a'` char would add
+    /// hazard for no coverage.
+    fn code_only(src: &str) -> String {
+        fn blank(out: &mut [u8], from: usize, to: usize) {
+            for c in &mut out[from..to] {
+                if *c != b'\n' {
+                    *c = b' ';
+                }
+            }
+        }
+        let b = src.as_bytes();
+        let n = b.len();
+        let mut out = b.to_vec();
+        let mut i = 0;
+        while i < n {
+            // Line comment: `//` … EOL.
+            if b[i] == b'/' && i + 1 < n && b[i + 1] == b'/' {
+                let start = i;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+                blank(&mut out, start, i);
+                continue;
+            }
+            // Block comment `/* … */`, nesting allowed (Rust nests them).
+            if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                let start = i;
+                let mut depth = 1i32;
+                i += 2;
+                while i < n && depth > 0 {
+                    if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                blank(&mut out, start, i.min(n));
+                continue;
+            }
+            // Raw string `r"…"` / `r#"…"#` (also the b-prefixed byte form, entered at
+            // the `r`). A raw ident `r#foo` has no `"` after the hashes and falls through.
+            if b[i] == b'r' && i + 1 < n && (b[i + 1] == b'"' || b[i + 1] == b'#') {
+                let mut h = i + 1;
+                let mut hashes = 0usize;
+                while h < n && b[h] == b'#' {
+                    hashes += 1;
+                    h += 1;
+                }
+                if h < n && b[h] == b'"' {
+                    let content = h + 1;
+                    let mut k = content;
+                    let mut close = None;
+                    while k < n {
+                        if b[k] == b'"' {
+                            let mut extra = 0;
+                            while k + 1 + extra < n && extra < hashes && b[k + 1 + extra] == b'#' {
+                                extra += 1;
+                            }
+                            if extra == hashes {
+                                close = Some(k);
+                                break;
+                            }
+                        }
+                        k += 1;
+                    }
+                    blank(&mut out, content, close.unwrap_or(n));
+                    i = close.map(|c| c + 1 + hashes).unwrap_or(n);
+                    continue;
+                }
+            }
+            // Normal string `"…"`, honoring `\` escapes (so `\"` does not close it).
+            if b[i] == b'"' {
+                let content = i + 1;
+                let mut k = content;
+                while k < n {
+                    if b[k] == b'\\' {
+                        k += 2;
+                        continue;
+                    }
+                    if b[k] == b'"' {
+                        break;
+                    }
+                    k += 1;
+                }
+                blank(&mut out, content, k.min(n));
+                i = if k >= n { n } else { k + 1 };
+                continue;
+            }
+            i += 1;
+        }
+        String::from_utf8(out).expect("code_only blanks whole literal spans, so utf-8 survives")
+    }
+
+    /// The spawn_node tests that fail the shutdown contract: they spawn a node, are not
+    /// allowlisted, and their (code-only) body carries no `node.shutdown(` call. Pure so
+    /// the adversarial unit tests below can drive synthetic sources; the `#[test]` guard
+    /// runs it over this file's real, sanitized source.
+    fn spawn_node_tests_missing_shutdown(
+        tests: &[(String, String)],
+        allow: &[&str],
+    ) -> Vec<String> {
+        tests
+            .iter()
+            .filter(|(name, body)| {
+                body.contains("spawn_node")
+                    && !allow.contains(&name.as_str())
+                    && !body.contains("node.shutdown(")
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// `(name, body)` for every real `#[sqlx::test]` in `src`. `src` is expected to be
+    /// [`code_only`]-sanitized so string/comment content cannot unbalance the body
+    /// slice. The attribute is only counted when nothing but whitespace precedes it on
+    /// its line (belt-and-suspenders with sanitization, which already blanks any
+    /// backtick mention inside a doc comment, e.g. the module header naming the
+    /// attribute in prose, so it is not mistaken for a test). The needle is spelled in
+    /// two pieces so this
     /// scanner does not match its own source when it scrapes this file. The body is
     /// brace-matched from the signature's opening `{` to its close, so a marker cannot
     /// leak across into the next item.
@@ -2217,8 +2345,8 @@ mod completeness {
             "drop_with_broken_graceful_chain_still_unblocks_via_abort",
         ];
 
-        let src = include_str!("deny_harness.rs");
-        let tests = sqlx_test_bodies(src);
+        let src = code_only(include_str!("deny_harness.rs"));
+        let tests = sqlx_test_bodies(&src);
 
         // Non-vacuous floor: if the scraper silently found nothing, every loop below
         // would pass by checking zero tests. The file has 14 sqlx::test fns today.
@@ -2254,17 +2382,103 @@ mod completeness {
         }
 
         // Every other spawn_node test must shut its node down.
-        for (name, body) in &tests {
-            if !body.contains("spawn_node") || DROP_REGRESSION_ALLOW.contains(&name.as_str()) {
-                continue;
-            }
-            assert!(
-                body.contains("node.shutdown("),
-                "test `{name}` spawns a node but never calls node.shutdown().await — it \
-                 returns via TestNode::Drop, racing sqlx's DROP DATABASE cleanup (add the \
-                 awaited shutdown, or add it to DROP_REGRESSION_ALLOW if it deliberately \
-                 tests Drop)"
-            );
-        }
+        let missing = spawn_node_tests_missing_shutdown(&tests, DROP_REGRESSION_ALLOW);
+        assert!(
+            missing.is_empty(),
+            "these tests spawn a node but never call node.shutdown().await — they return \
+             via TestNode::Drop, racing sqlx's DROP DATABASE cleanup (add the awaited \
+             shutdown, or add to DROP_REGRESSION_ALLOW if they deliberately test Drop): \
+             {missing:?}"
+        );
+    }
+
+    // ── Adversarial unit tests for the guard itself (INV-21 on the guard) ────────
+    // These drive synthetic sources so the two vacuity holes an external review
+    // flagged are proven CLOSED by execution: a commented-out shutdown, and an
+    // unbalanced brace inside a string that would otherwise swallow a sibling's
+    // shutdown. Each passes (false green) against a raw substring/brace scan;
+    // sanitizing via `code_only` first is what makes them fail as they must.
+
+    #[test]
+    fn shutdown_guard_flags_a_commented_out_shutdown() {
+        // The ONLY node.shutdown( occurrence is a comment: the node is never torn
+        // down, so the test must be flagged despite the textual match.
+        let synth = concat!(
+            "#[sqlx",
+            "::test]\n",
+            "async fn foo(pool: PgPool) {\n",
+            "    let node = spawn_node(pool).await;\n",
+            "    // node.shutdown().await;  (deleted, left as a comment)\n",
+            "}\n"
+        );
+        let tests = sqlx_test_bodies(&code_only(synth));
+        assert_eq!(
+            spawn_node_tests_missing_shutdown(&tests, &[]),
+            vec!["foo".to_string()],
+            "a commented-out shutdown must NOT satisfy the guard"
+        );
+    }
+
+    #[test]
+    fn shutdown_guard_is_not_fooled_by_a_brace_inside_a_string() {
+        // `a` has no shutdown and an unbalanced `{` inside a string; `b` follows and
+        // does shut down. A brace-blind slicer would extend `a` into `b`, borrow b's
+        // shutdown, and clear `a` — sanitization keeps the two bodies separate.
+        let synth = concat!(
+            "#[sqlx",
+            "::test]\n",
+            "async fn a(pool: PgPool) {\n",
+            "    let node = spawn_node(pool).await;\n",
+            "    let _ = \"oops {\";\n",
+            "}\n",
+            "#[sqlx",
+            "::test]\n",
+            "async fn b(pool: PgPool) {\n",
+            "    let node = spawn_node(pool).await;\n",
+            "    node.shutdown().await;\n",
+            "}\n"
+        );
+        let tests = sqlx_test_bodies(&code_only(synth));
+        let missing = spawn_node_tests_missing_shutdown(&tests, &[]);
+        assert!(
+            missing.contains(&"a".to_string()),
+            "test `a` (no shutdown; unbalanced brace in a string) must be flagged, not \
+             masked by test `b`'s shutdown: got {missing:?}"
+        );
+        assert!(
+            !missing.contains(&"b".to_string()),
+            "test `b` shuts down and must not be flagged: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn shutdown_guard_passes_clean_and_exempts_only_via_allowlist() {
+        let synth = concat!(
+            "#[sqlx",
+            "::test]\n",
+            "async fn good(pool: PgPool) {\n",
+            "    let node = spawn_node(pool).await;\n",
+            "    node.shutdown().await;\n",
+            "}\n",
+            "#[sqlx",
+            "::test]\n",
+            "async fn drop_probe(pool: PgPool) {\n",
+            "    let node = spawn_node(pool).await;\n",
+            "    // deliberately no shutdown: exercises Drop\n",
+            "}\n"
+        );
+        let tests = sqlx_test_bodies(&code_only(synth));
+        // Clean test + allowlisted Drop test -> no offenders.
+        assert!(
+            spawn_node_tests_missing_shutdown(&tests, &["drop_probe"]).is_empty(),
+            "a clean test plus an allowlisted Drop test must produce no offenders"
+        );
+        // Without the allowlist the Drop test IS an offender, proving the exemption
+        // comes from the allowlist, not from an accident of the scan.
+        assert_eq!(
+            spawn_node_tests_missing_shutdown(&tests, &[]),
+            vec!["drop_probe".to_string()],
+            "un-allowlisted, the no-shutdown test must be flagged"
+        );
     }
 }
