@@ -6,6 +6,13 @@ on:
   # result before it lands. Guards against semantic merge races where two
   # individually-green PRs break main in combination (#113 + #145 → #229).
   merge_group:
+  # Release-branch heads are created and pushed by GITHUB_TOKEN (release-please
+  # and the lock-sync job), and GitHub's recursion guard means those pushes
+  # trigger no workflow runs. workflow_dispatch is the documented carve-out that
+  # GITHUB_TOKEN CAN trigger, so the release flow dispatches this workflow at
+  # the release branch to attach check runs to its head. Read-only workflow
+  # (contents: read), so the dispatch surface adds no privilege.
+  workflow_dispatch:
   push:
     branches:
       - main
