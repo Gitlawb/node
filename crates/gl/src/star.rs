@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -75,13 +74,7 @@ async fn cmd_add(repo: String, node: String, dir: Option<PathBuf>) -> Result<()>
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("star failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "star").await?;
 
     let count = body["star_count"].as_i64().unwrap_or(0);
     println!("Starred {owner}/{name}  ({count} stars total)");
@@ -99,13 +92,7 @@ async fn cmd_remove(repo: String, node: String, dir: Option<PathBuf>) -> Result<
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("unstar failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "unstar").await?;
 
     let count = body["star_count"].as_i64().unwrap_or(0);
     println!("Unstarred {owner}/{name}  ({count} stars remaining)");
@@ -124,13 +111,7 @@ async fn cmd_count(repo: String, node: String, dir: Option<PathBuf>) -> Result<(
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("star count failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "star count").await?;
 
     let count = body["star_count"].as_i64().unwrap_or(0);
     println!("{owner}/{name}: {count} stars");
@@ -230,6 +211,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repo not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -241,6 +223,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("star failed"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -287,6 +271,7 @@ mod tests {
             .with_status(404)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"repo not found"}"#)
+            .expect(1)
             .create_async()
             .await;
 
@@ -298,6 +283,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("unstar failed"));
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -334,5 +321,52 @@ mod tests {
         let (owner, name) = resolve_owner_repo("alice/myrepo", None).unwrap();
         assert_eq!(owner, "alice");
         assert_eq!(name, "myrepo");
+    }
+
+    // U15 (#186): a converted handler must inherit read_json's capped + sanitized
+    // error path end-to-end. A hostile 500 whose `message` carries terminal-control
+    // + bidi bytes and is long must reach the terminal neither verbatim nor unbounded.
+    #[tokio::test]
+    async fn cmd_add_hostile_error_is_sanitized_and_bounded() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        // ESC + a long run + a right-to-left override, all inside the node message
+        // (JSON \u escapes so the source has no raw control bytes).
+        let hostile = format!(r#"{{"message":"a\u001b[31m{}b\u202ec"}}"#, "Z".repeat(500));
+        let _m = server
+            .mock("PUT", mockito::Matcher::Regex(r"/star$".to_string()))
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(hostile)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = cmd_add(
+            "myrepo".to_string(),
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            !err.contains('\u{1b}'),
+            "ESC leaked to the terminal: {err:?}"
+        );
+        assert!(!err.contains('\u{202e}'), "bidi override leaked: {err:?}");
+        // Bounded: sanitize_node_msg caps the surfaced message, so the 500-char run
+        // cannot flood the error string.
+        assert!(err.len() < 300, "error not bounded ({} bytes)", err.len());
+        assert!(err.contains("star failed"), "handler label lost: {err}");
+        _m.assert_async().await;
     }
 }
