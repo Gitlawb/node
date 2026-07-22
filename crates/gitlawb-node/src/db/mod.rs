@@ -928,6 +928,23 @@ fn owner_key_case_sql(col: &str) -> String {
     )
 }
 
+/// Take a transaction-scoped Postgres advisory lock keyed on the normalized repo
+/// slug (`normalize_owner_key(owner)/name`). `delete_repo_by_id`'s purge cascade and
+/// `upsert_mirror_repo`'s ingest both take this lock on the identical slug string, so
+/// a peer-sync mirror insert cannot interleave between the purge's point-in-time
+/// sibling check and its slug-scoped deletes (which would half-wipe a live mirror's
+/// child rows / bounty). `hashtextextended($1, 0)` folds the slug to the `bigint` the
+/// lock API needs; both call sites hash the identical string, so their keys agree.
+/// XACT-scoped, so it auto-releases on commit/rollback with no unlock bookkeeping
+/// (mirrors the session-scoped `pg_advisory_lock` migration guard, but self-releasing).
+async fn lock_repo_slug(conn: &mut sqlx::PgConnection, slug: &str) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(slug)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod normalize_owner_key_tests {
     use super::normalize_owner_key;
@@ -1030,6 +1047,14 @@ impl Db {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
+        // Slug the purge cascade keys on. Take the shared advisory lock on it inside a
+        // tx so a concurrent `delete_repo_by_id` purge of a colliding row cannot
+        // interleave its sibling-check-then-cascade around this insert and wipe the
+        // mirror we are ingesting. Normalize the owner the same way the cascade does so
+        // both call sites hash the identical slug string.
+        let slug = format!("{}/{}", normalize_owner_key(owner_short), name);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut *tx, &slug).await?;
         // `quarantined` is set only on first insert (the admission decision).
         // A re-sync (ON CONFLICT) preserves the existing flag — admission runs
         // once, and an operator's later release must not be silently reverted.
@@ -1050,8 +1075,9 @@ impl Db {
         .bind(disk_path)
         .bind(machine_id)
         .bind(quarantined)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1342,6 +1368,13 @@ impl Db {
         };
         let slug = format!("{}/{}", normalize_owner_key(&owner_did), name);
 
+        // Serialize this purge against a concurrent `upsert_mirror_repo` ingest that
+        // resolves to the same slug: both take this xact-scoped advisory lock on the
+        // identical slug string BEFORE the sibling check below, so a peer-sync insert
+        // cannot land between that point-in-time check and the slug-scoped cascade
+        // deletes (which would half-wipe the live mirror). Auto-released on commit.
+        lock_repo_slug(&mut *tx, &slug).await?;
+
         // Grandchildren first: PR reviews/comments key on pr_id, so delete them
         // before the parent PRs vanish.
         for table in ["pr_reviews", "pr_comments"] {
@@ -1381,10 +1414,12 @@ impl Db {
         // a surviving sibling's records. Gate the slug-scoped deletes on the absence
         // of any OTHER repos row resolving to the same slug, using the same
         // OWNER_KEY_CASE_SQL the slug was built from so the check is byte-identical to
-        // the cascade key. (Residual: this is a point-in-time check inside one READ
-        // COMMITTED tx, not full serialization against a concurrent colliding create;
-        // see the plan's KTD4. Purge is the sole caller, so the window is
-        // operator-scoped.)
+        // the cascade key. The xact advisory lock taken at the top of this tx (and
+        // matched in `upsert_mirror_repo` on the identical slug) serializes this
+        // sibling-check-then-cascade against a concurrent peer-sync insert for the same
+        // slug, so this is no longer a bare point-in-time read a mirror upsert can slip
+        // past (closing the old KTD4 residual: the concurrent inserter is peer sync,
+        // not an operator, so the window was never operator-scoped).
         let sibling_exists: bool = sqlx::query_scalar(&format!(
             "SELECT EXISTS(SELECT 1 FROM repos WHERE id <> $1 AND {key} || '/' || name = $2)",
             key = OWNER_KEY_CASE_SQL
@@ -3948,6 +3983,148 @@ mod dedup_db_tests {
                 .status,
             "open",
             "a bounty on a repo whose mirror survives the purge must stay open, not be tombstoned"
+        );
+    }
+
+    /// U1 (F1): the purge cascade must be serialized with mirror ingestion on the
+    /// shared slug. `delete_repo_by_id` runs a point-in-time sibling check and then,
+    /// only if no sibling was seen, wipes the slug-scoped child rows / tombstones the
+    /// bounty. A concurrent `upsert_mirror_repo` that inserts a colliding mirror row
+    /// AFTER that check but before/around the cascade would leave a half-wipe: the
+    /// mirror's `repos` row survives while its live child rows / bounty are gone.
+    ///
+    /// Deterministic race: hold a session advisory lock on the same `hashtextextended`
+    /// slug key the cascade locks on, so the spawned purge BLOCKS at the top of its tx
+    /// (before the sibling check). While it is parked, land the mirror's `repos` row
+    /// (what ingestion writes), then release the lock. With the lock in place the purge
+    /// resumes, its sibling check now SEES the mirror row, and it skips the cascade —
+    /// both the mirror row and its child rows survive (GREEN). Remove the
+    /// `lock_repo_slug` call from `delete_repo_by_id` and the purge no longer blocks: it
+    /// runs its sibling check before the mirror row exists, cascades, and half-wipes the
+    /// child rows / bounty while the mirror row (inserted afterwards) survives (RED).
+    #[sqlx::test]
+    async fn purge_serializes_with_mirror_ingest_via_advisory_lock(pool: PgPool) {
+        let db = db(pool).await;
+        // Purge target: an empty canonical `did:key:` row.
+        let owner = "did:key:z6MkPurgeRaceMirrorFixtureForLock";
+        let target = rec(
+            "rid-purge-race-target",
+            owner,
+            "victim",
+            "empty canonical",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&target).await.unwrap();
+
+        // The mirror's slug-scoped live state, keyed on the shared slug. The mirror's
+        // `repos` row is deliberately NOT present yet — ingestion lands it mid-race.
+        let slug = format!(
+            "{}/victim",
+            crate::db::normalize_owner_key(owner)
+        );
+        sqlx::query(
+            "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
+             VALUES ($1, 'refs/heads/main', '1', 'cid', 'n', '2026-02-01T00:00:00Z')",
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.create_bounty(&BountyRecord {
+            id: "bnt-purge-race".to_string(),
+            repo_owner: "z6MkPurgeRaceMirrorFixtureForLock".to_string(),
+            repo_name: "victim".to_string(),
+            issue_id: None,
+            title: "mirror bounty".to_string(),
+            amount: 5_000,
+            creator_did: "did:key:z6MkCreator".to_string(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".to_string(),
+            created_at: "2026-02-01T00:00:00Z".to_string(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 604_800,
+            tx_hash: None,
+        })
+        .await
+        .unwrap();
+
+        // Hold a session-scoped advisory lock on the exact slug key the cascade takes.
+        // A session lock and the cascade's xact lock share Postgres' advisory lock
+        // space, so the purge's `pg_advisory_xact_lock` blocks on this until we unlock.
+        let mut lock_conn = db.pool().acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(&slug)
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        // Spawn the purge; with the lock present it parks at the top of its tx.
+        let pool_for_task = db.pool().clone();
+        let purge = tokio::spawn(async move {
+            Db::for_testing(pool_for_task)
+                .delete_repo_by_id("rid-purge-race-target")
+                .await
+        });
+
+        // Give the purge time to reach the lock wait (GREEN) or, without the lock, to
+        // run its whole sibling-check-then-cascade (RED) before the mirror row lands.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Mirror ingestion lands the colliding `repos` row (slug-form id, bare owner) —
+        // exactly what upsert_mirror_repo writes. Raw insert here so it does not contend
+        // on the advisory lock the test connection is holding.
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
+                                created_at, updated_at, disk_path, machine_id, quarantined)
+             VALUES ($1, 'victim', 'z6MkPurgeRaceMirrorFixtureForLock', 'mirrored from peer',
+                     true, 'main', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z',
+                     '/srv/mirror', NULL, false)",
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // Release the lock so the purge can proceed (and observe the mirror row).
+        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&slug)
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        let removed = purge.await.unwrap().unwrap();
+        assert_eq!(removed, 1, "the empty canonical target row is purged");
+
+        async fn count(db: &Db, sql: &str, arg: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(arg)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        }
+        // No half-wipe: the mirror row AND its slug-scoped state are all present.
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM repos WHERE id=$1", &slug).await,
+            1,
+            "the mirror repos row survives the purge"
+        );
+        assert!(
+            count(&db, "SELECT COUNT(*) FROM branch_cids WHERE repo=$1", &slug).await > 0,
+            "mirror branch_cids must survive: the purge serialized behind the ingest and saw the sibling"
+        );
+        assert_eq!(
+            db.get_bounty("bnt-purge-race")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "open",
+            "the mirror's bounty must stay open, not be tombstoned by the racing purge"
         );
     }
 
