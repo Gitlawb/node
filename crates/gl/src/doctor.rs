@@ -145,13 +145,15 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         Ok(v) if !v.is_empty() && !v.contains("127.0.0.1") && !v.contains("localhost") => {
             checks.push(Check::pass("GITLAWB_NODE", v.to_string()));
         }
+        // A local address is a legitimate setup (self-hosted node, dev
+        // harness) — the connectivity check below fails loudly if it is not
+        // actually reachable, so don't red-flag the configuration itself.
         Ok(v) if v.contains("127.0.0.1") || v.contains("localhost") => {
-            checks.push(Check::fail(
+            checks.push(Check::pass(
                 "GITLAWB_NODE",
                 format!(
-                    "set to local address ({v}) — git push/clone will fail against remote nodes"
+                    "{v} (local node — intentional for self-hosting/dev; unset to target the public network)"
                 ),
-                "export GITLAWB_NODE=https://node.gitlawb.com",
             ));
         }
         _ => {
