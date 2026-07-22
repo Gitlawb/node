@@ -1036,8 +1036,22 @@ pub async fn git_receive_pack(
         // a later write refreshes the archive, even though the client got a 5xx.
         // `.ok()`, not `.unwrap_or_default()`: a listing error must read as
         // "snapshot unavailable", never as an empty snapshot, or the rollback
-        // below would delete every ref in the repo.
-        let pre_push_refs = store::list_refs(&disk_path).ok();
+        // below would delete every ref in the repo. Fail closed on a snapshot
+        // failure: without a restore plan, a failed durable upload would leave
+        // the pushed refs on the local fast path with no way back (the class
+        // this rollback exists to close), so refuse the push before mutating.
+        let pre_push_refs = match store::list_refs(&disk_path) {
+            Ok(refs) => Some(refs),
+            Err(e) => {
+                tracing::error!(repo = %record.name, err = %e, "pre-push ref snapshot failed");
+                // release(false): no upload attempted, so the bool is always true.
+                let _ = guard.release(false).await;
+                let _ = report_tx.send(Err(AppError::Internal(anyhow::anyhow!(
+                    "cannot snapshot pre-push refs; refusing push: {e}"
+                ))));
+                return;
+            }
+        };
 
         tracing::debug!(repo = %record.name, path = %disk_path.display(), "running git receive-pack");
         let result = smart_http::receive_pack(&disk_path, body, git_timeout).await;

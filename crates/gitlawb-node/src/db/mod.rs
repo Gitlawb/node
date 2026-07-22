@@ -2953,6 +2953,13 @@ impl Db {
     pub async fn record_arweave_anchor(&self, input: &RecordAnchorInput<'_>) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
+        // `arweave_anchors` is slug-scoped and cascaded by `delete_repo_by_id`;
+        // take the shared advisory lock on the same normalized slug so a post-push
+        // anchor cannot land inside the purge's sibling-check-then-cascade window
+        // (same shape as `upsert_branch_cid`; single lock, no deadlock exposure).
+        let slug = normalize_repo_slug(input.repo);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         sqlx::query(
             "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
@@ -2968,8 +2975,9 @@ impl Db {
         .bind(input.arweave_url)
         .bind(input.node_did)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
