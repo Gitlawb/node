@@ -4031,7 +4031,7 @@ mod agent_discovery_tests {
 
 #[cfg(test)]
 mod dedup_db_tests {
-    use super::{normalize_owner_key, BountyRecord, Db, RepoRecord};
+    use super::{normalize_owner_key, BountyRecord, Db, RecordAnchorInput, RepoRecord};
     use chrono::{DateTime, Utc};
     use sqlx::PgPool;
 
@@ -4443,6 +4443,96 @@ mod dedup_db_tests {
             "open",
             "the mirror's bounty must stay open, not be tombstoned by the racing purge"
         );
+    }
+
+    /// Sibling of the mirror-ingest race above, for the arweave-anchor writer.
+    /// `record_arweave_anchor` inserts a slug-scoped child row (`arweave_anchors`)
+    /// that `delete_repo_by_id`'s cascade wipes, so it must serialize on the same
+    /// `lock_repo_slug` key or a post-push anchor can land inside the purge's
+    /// sibling-check-then-cascade window. Deterministic choreography, same as the
+    /// mirror test: hold a session advisory lock on the exact `hashtextextended`
+    /// slug key, spawn the REAL `record_arweave_anchor` (its own `lock_repo_slug`
+    /// parks it), assert mid-park that the anchor row has NOT landed (this is the
+    /// load-bearing check: remove `lock_repo_slug` from `record_arweave_anchor`
+    /// and the insert lands during the sleep, RED), then release and assert the
+    /// row lands. The writer is handed the full-DID `owner/name` form so the test
+    /// also pins the `normalize_repo_slug` folding to the purge's key.
+    #[sqlx::test]
+    async fn purge_serializes_with_arweave_anchor_via_advisory_lock(pool: PgPool) {
+        let db = db(pool).await;
+        let owner = "did:key:z6MkAnchorRaceFixtureForSlugLock";
+        let target = rec(
+            "rid-anchor-race-target",
+            owner,
+            "victim",
+            "canonical",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&target).await.unwrap();
+        let slug = format!("{}/victim", crate::db::normalize_owner_key(owner));
+
+        // Hold a session-scoped advisory lock on the exact slug key the anchor
+        // writer's xact lock hashes; they share Postgres' advisory lock space.
+        let mut lock_conn = db.pool().acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(&slug)
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        // Spawn the REAL anchor writer with the full-DID slug form; its
+        // `normalize_repo_slug` folds it to the identical key the session lock
+        // holds, so `lock_repo_slug` parks it here.
+        let pool_for_anchor = db.pool().clone();
+        let repo_arg = format!("{owner}/victim");
+        let repo_arg_for_task = repo_arg.clone();
+        let anchor = tokio::spawn(async move {
+            Db::for_testing(pool_for_anchor)
+                .record_arweave_anchor(&RecordAnchorInput {
+                    repo: &repo_arg_for_task,
+                    owner_did: "did:key:z6MkAnchorRaceFixtureForSlugLock",
+                    ref_name: "refs/heads/main",
+                    old_sha: "0",
+                    new_sha: "1",
+                    cid: Some("cid"),
+                    irys_tx_id: "irys-tx-race",
+                    arweave_url: "https://ar/anchor-race",
+                    node_did: "did:key:z6MkNodeFixture",
+                })
+                .await
+        });
+
+        // Give the writer time to reach the lock wait, then assert it is actually
+        // parked: no anchor row while the session lock is held. Without
+        // `lock_repo_slug` in `record_arweave_anchor` the insert commits during
+        // this sleep and the assert fails (RED).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let landed_early: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM arweave_anchors WHERE repo=$1")
+                .bind(&repo_arg)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            landed_early, 0,
+            "record_arweave_anchor must block on the slug advisory lock, not insert past it"
+        );
+
+        // Release; the parked writer acquires the lock and commits.
+        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&slug)
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+        anchor.await.unwrap().unwrap();
+
+        let landed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM arweave_anchors WHERE repo=$1")
+            .bind(&repo_arg)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(landed, 1, "the anchor lands once the lock is released");
     }
 
     /// U8 (F): bounties key on (repo_owner, repo_name), not an immutable repo id,

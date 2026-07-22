@@ -59,11 +59,14 @@ impl Drop for TempDownloadDir {
 /// RAII removal of a download-coordination map entry (finding 4). Its `Drop`
 /// removes the entry from `download_locks` whenever the map still holds THIS
 /// Arc (ptr_eq-guarded so a newer entry inserted after an earlier removal is
-/// never clobbered). Removing on every exit — normal return, `?`, or a handler
-/// future cancelled mid cold-read (axum drops it on client disconnect) — is
-/// what keeps the map from growing per arbitrary requested name: the pre-fix
-/// explicit removals ran only at the labelled return points, which a cancelled
-/// future skipped, leaking the entry. The outer map is a std::sync::Mutex so
+/// never clobbered). Removal is guaranteed on every path (a normal return or
+/// `?` drops it in the holder; once a download is in flight it travels with
+/// the spawned task and drops at settle, covering holder timeout and a
+/// handler future cancelled mid cold-read, which axum triggers on client
+/// disconnect), which is what keeps the map from growing per arbitrary
+/// requested name: the pre-fix explicit removals ran only at the labelled
+/// return points, which a cancelled future skipped, leaking the entry. The
+/// outer map is a std::sync::Mutex so
 /// this Drop can prune it synchronously (Drop cannot be async); it is only ever
 /// held briefly for a get/insert/remove, never across an await.
 struct DownloadEntryGuard {
@@ -111,24 +114,35 @@ impl RepoStore {
                     .or_insert_with(|| Arc::new(Mutex::new(()))),
             )
         };
-        // RAII: remove the map entry on EVERY exit of this function — normal
-        // return, `?`, or handler cancellation (finding 4). Its Drop is ptr_eq-
-        // guarded, so it never clobbers a newer entry, and it subsumes the
-        // pre-fix explicit removals (which a cancelled future skipped, leaking
-        // the entry). Declared here so it outlives `held` below and prunes the
-        // map only after the inner per-repo lock has been released.
-        let _entry_guard = DownloadEntryGuard {
-            locks: Arc::clone(&self.download_locks),
-            key: map_key.clone(),
-            entry: Arc::clone(&entry),
-        };
-        let held = match entry.try_lock() {
+        let held = match Arc::clone(&entry).try_lock_owned() {
             Ok(g) => g,
             Err(_) => {
-                let g = entry.lock().await;
+                // Bounded coalescing wait: once a holder's download is in
+                // flight, the spawned task owns this lock (and the map entry)
+                // until it settles, whatever happens to the holder (timeout or
+                // cancellation), so an unbounded lock().await here would park
+                // this reader for as long as a stall lasts. On elapse, report
+                // the same timeout error the holder would. Do NOT touch the
+                // map entry on this path: pruning it while the download is in
+                // flight would let the next arrival start a duplicate download.
+                let waited = tokio::time::timeout(
+                    self.release_upload_timeout,
+                    Arc::clone(&entry).lock_owned(),
+                )
+                .await;
+                let g = match waited {
+                    Ok(g) => g,
+                    Err(_) => {
+                        if local_path.exists() {
+                            // A concurrent reader published while we waited.
+                            return Ok(DownloadOutcome::Published);
+                        }
+                        return Err(anyhow::anyhow!("read download timed out"));
+                    }
+                };
                 if local_path.exists() {
                     // A concurrent reader published while we waited — serve it.
-                    // `_entry_guard`'s Drop removes the map entry on return.
+                    // The holder's own guard prunes the map entry on its exit.
                     return Ok(DownloadOutcome::Published);
                 }
                 // The holder degraded without publishing; this reader takes over.
@@ -145,20 +159,33 @@ impl RepoStore {
                 g
             }
         };
-        let outcome = self
-            .download_and_publish(
-                owner_did,
-                repo_name,
-                owner_slug,
-                local_path,
-                store,
-                local_existed_at_entry,
-            )
-            .await;
-        drop(held);
-        outcome
-        // `_entry_guard`'s Drop removes the map entry here (after `held` and on
-        // every early return above), including when this future is cancelled.
+        // RAII: remove the map entry when this holder's work is done (finding
+        // 4). Created only once THIS reader holds the per-repo lock, so a
+        // parked or timed-out waiter never prunes the entry out from under a
+        // live holder; its Drop is ptr_eq-guarded, so it never clobbers a
+        // newer entry. Ownership moves into download_and_publish and from
+        // there into the spawned download task itself, so on EVERY settle path
+        // (success, download error, holder timeout, holder cancellation) the
+        // entry stays registered and the lock stays held until the in-flight
+        // download settles: waiters queue on the ONE download instead of each
+        // timeout or cancel wave starting a fresh full download of the same
+        // object.
+        let entry_guard = DownloadEntryGuard {
+            locks: Arc::clone(&self.download_locks),
+            key: map_key,
+            entry: Arc::clone(&entry),
+        };
+        self.download_and_publish(
+            owner_did,
+            repo_name,
+            owner_slug,
+            local_path,
+            store,
+            local_existed_at_entry,
+            entry_guard,
+            held,
+        )
+        .await
     }
 
     /// The holder's half of the coordinated download: fetch and extract the
@@ -177,6 +204,15 @@ impl RepoStore {
     /// the lock, before the swap, we detect a writer that published a fresher
     /// copy during our unlocked download window and serve theirs instead of
     /// clobbering it with our now-stale temp.
+    ///
+    /// `entry_guard` and `held` are this holder's per-repo coordination (the
+    /// download_locks map entry and the locked per-repo mutex). Both move into
+    /// the spawned download task, which returns them through its JoinHandle on
+    /// success; on any other settle path (download error, task panic, holder
+    /// timeout, holder cancellation) they drop when the task settles, so
+    /// waiters keep queueing on the SAME in-flight download until it settles
+    /// rather than each starting a duplicate one.
+    #[allow(clippy::too_many_arguments)]
     async fn download_and_publish(
         &self,
         owner_did: &str,
@@ -185,6 +221,8 @@ impl RepoStore {
         local_path: &Path,
         store: &Arc<dyn ObjectStore>,
         local_existed_at_entry: bool,
+        entry_guard: DownloadEntryGuard,
+        held: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<DownloadOutcome> {
         let parent = local_path.parent().context("repo path has no parent")?;
         std::fs::create_dir_all(parent).context("creating repo parent dir")?;
@@ -252,31 +290,67 @@ impl RepoStore {
             repo_name.to_string(),
             temp.path().to_path_buf(),
         );
+        // The per-repo coordination (`held`, `entry_guard`) moves into the task
+        // alongside the temp guard: whatever happens to THIS caller (timeout
+        // below, or a handler future cancelled by axum on client disconnect),
+        // the lock stays held and the map entry stays registered until the
+        // in-flight download settles, so waiters and new arrivals queue on the
+        // ONE download instead of starting duplicates. On success the tuple
+        // returns through the JoinHandle: the caller publishes under `held` as
+        // before. If the caller timed out or was cancelled, the runtime drops
+        // the returned tuple when the task settles, in field order: `temp`
+        // (dir removed), then `held` (lock released), then `entry_guard` (map
+        // entry pruned), the same unlock-before-prune order as a normal
+        // return.
         let dl_task = tokio::spawn(async move {
+            // The guards travel as one `(held, entry_guard)` tuple so that
+            // wherever it drops (here on error, in the runtime at settle after
+            // a caller timeout or cancellation, or in the caller after a
+            // normal publish), its field order gives unlock-before-prune.
             match store_dl.download(&dl_owner, &dl_repo, &dl_target).await {
-                Ok(()) => Ok(temp),
-                // `temp` drops here: the download settled, so removal is safe.
-                Err(e) => Err(e),
+                Ok(()) => Ok((temp, (held, entry_guard))),
+                // The download settled, so cleanup is safe. Explicit drops pin
+                // the order (async-block captures have no guaranteed one):
+                // temp removed, lock released, map entry pruned last.
+                Err(e) => {
+                    drop(temp);
+                    drop(held);
+                    drop(entry_guard);
+                    Err(e)
+                }
             }
         });
         // Bound the wait, not the work: a stalled GET would park this reader
-        // (and, via the per-repo download mutex, every coalesced reader)
-        // indefinitely. On timeout the caller gets the same error as before and
-        // `download_published` frees the map entry and wakes waiters; the task
-        // keeps running and cleans up when the download settles (see above).
-        let temp = match tokio::time::timeout(self.release_upload_timeout, dl_task).await {
-            Ok(Ok(Ok(temp))) => temp,
-            Ok(Ok(Err(e))) => return Err(e),
-            // The task panicked; its unwind dropped the guard, removing the dir.
-            Ok(Err(join_err)) => {
-                return Err(anyhow::Error::from(join_err).context("read download task failed"))
-            }
-            Err(_) => {
-                warn!(repo = %repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
-                    "read download timed out — discarding");
-                return Err(anyhow::anyhow!("read download timed out"));
-            }
-        };
+        // indefinitely. On timeout the caller gets the same error as before,
+        // but the coordination does NOT unwind: it lives in the task (see
+        // above) and is released only at settle. Waiters therefore stay queued
+        // on the SAME in-flight download (each bounded by its own timeout in
+        // download_published) instead of each timeout wave starting a fresh
+        // full download of the same object; the task keeps running and cleans
+        // up its temp when the download settles.
+        // `_coordination` is `(held, entry_guard)`, kept alive to the end of
+        // this function exactly as the separate guards were before: the
+        // publish below still runs with the per-repo lock held, and the map
+        // entry is pruned only on exit (unlock first, prune second, per the
+        // tuple's field order).
+        let (temp, _coordination) =
+            match tokio::time::timeout(self.release_upload_timeout, dl_task).await {
+                Ok(Ok(Ok(returned))) => returned,
+                Ok(Ok(Err(e))) => return Err(e),
+                // The task panicked; its unwind dropped the guards, removing
+                // the dir, releasing the lock, and pruning the map entry.
+                Ok(Err(join_err)) => {
+                    return Err(anyhow::Error::from(join_err).context("read download task failed"))
+                }
+                Err(_) => {
+                    warn!(repo = %repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
+                        "read download timed out — discarding");
+                    // Dropping the JoinHandle detaches the task; the runtime
+                    // frees temp dir, lock, and map entry at settle (see the
+                    // spawn comment above).
+                    return Err(anyhow::anyhow!("read download timed out"));
+                }
+            };
 
         let guard = match self.try_lock_repo(owner_did, repo_name).await {
             Ok(Some(g)) => g,

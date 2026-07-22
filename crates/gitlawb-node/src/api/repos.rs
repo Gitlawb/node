@@ -3702,6 +3702,175 @@ mod tests {
         );
     }
 
+    // Fail-closed fence on the pre-push ref snapshot, driven through the real
+    // handler: when `store::list_refs` on the acquired disk path fails, the
+    // handler must refuse the push (Internal, 5xx) BEFORE running receive-pack,
+    // because without a snapshot a failed durable upload has no restore plan.
+    // The repo on disk is a real bare repo whose config declares
+    // repositoryformatversion=999, so every git invocation in it fails
+    // deterministically at repo-setup time (`for-each-ref` included) while the
+    // directory itself is untouched valid state. No object store is configured,
+    // so acquire_write's local fast path uses the existing directory as-is and
+    // never repairs or re-downloads it.
+    //
+    // Load-bearing (RED) checks: remove the fence at the `store::list_refs`
+    // match in `git_receive_pack` (e.g. fall back to `.ok()` and proceed) and
+    // the failure comes from receive-pack instead, so the "cannot snapshot
+    // pre-push refs" assertion on the error text fails. The directory-listing
+    // comparison pins that nothing mutated the repo before the refusal.
+    #[sqlx::test]
+    async fn push_fails_closed_when_ref_snapshot_unavailable(pool: sqlx::PgPool) {
+        use axum::extract::{Path as AxPath, State};
+        use axum::response::IntoResponse;
+        use std::process::{Command, Stdio};
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        // No object store: acquire_write takes the local fast path and hands the
+        // on-disk directory to the handler exactly as seeded below.
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            None,
+            pool.clone(),
+        );
+
+        let owner = "z6snapshotfenceowner";
+        let name = "snapfence";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let bare = repos_dir
+            .path()
+            .join(&owner_slug)
+            .join(format!("{name}.git"));
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
+            .await
+            .unwrap();
+
+        fn git(args: &[&str], dir: &std::path::Path) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        // A scratch repo provides a real oid and a well-formed (empty) pack so
+        // the request body is a genuine push, not garbage the parser rejects.
+        let work = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q", "-b", "main", "."], work.path());
+        git(&["config", "user.email", "t@t"], work.path());
+        git(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "hi").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c"], work.path());
+        let oid = git(&["rev-parse", "HEAD"], work.path());
+
+        // Seed the target: a REAL bare repo, then declare an unsupported
+        // repository format version. Discovery still finds the repo (HEAD,
+        // objects/, refs/ all present) but every git command in it dies with
+        // "expected git repo version <= 1": the deterministic corruption that
+        // makes `list_refs` fail without any racy filesystem state.
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let out = Command::new("git")
+            .args(["init", "--bare", "-q", &bare.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init --bare failed");
+        std::fs::write(
+            bare.join("config"),
+            "[core]\n\trepositoryformatversion = 999\n\tbare = true\n",
+        )
+        .unwrap();
+        assert!(
+            store::list_refs(&bare).is_err(),
+            "precondition: list_refs must fail on the corrupted repo"
+        );
+
+        // Recursive sorted listing of the repo dir, to pin "nothing modified".
+        fn listing(root: &std::path::Path) -> Vec<String> {
+            fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<String>) {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let p = entry.unwrap().path();
+                    out.push(p.strip_prefix(root).unwrap().to_string_lossy().into_owned());
+                    if p.is_dir() {
+                        walk(root, &p, out);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(root, root, &mut out);
+            out.sort();
+            out
+        }
+        let before = listing(&bare);
+
+        // Minimal push body: create refs/heads/main at the scratch oid plus an
+        // empty pack (same shape as the rollback test above).
+        let zero = "0".repeat(40);
+        let cmd = format!("{zero} {oid} refs/heads/main\0report-status\n");
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("{:04x}", cmd.len() + 4).as_bytes());
+        body.extend_from_slice(cmd.as_bytes());
+        body.extend_from_slice(b"0000");
+        let pack = Command::new("git")
+            .args([
+                "-C",
+                &work.path().to_string_lossy(),
+                "pack-objects",
+                "--stdout",
+                "-q",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(pack.status.success(), "pack-objects failed");
+        body.extend_from_slice(&pack.stdout);
+        let body = Bytes::from(body);
+
+        let resp = super::git_receive_pack(
+            State(state.clone()),
+            AxPath((owner.to_string(), format!("{name}.git"))),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            body,
+        )
+        .await;
+        let err = match resp {
+            Ok(r) => panic!(
+                "push must fail closed when the ref snapshot is unavailable, got {}",
+                r.status()
+            ),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        let status = err.into_response().status();
+        assert!(
+            status.is_server_error(),
+            "snapshot failure must surface as a 5xx, got {status}"
+        );
+        // This is the fence-specific assert: without the fail-closed branch the
+        // failure comes from receive-pack ("git error: ...") instead.
+        assert!(
+            msg.contains("cannot snapshot pre-push refs"),
+            "the refusal must come from the snapshot fence, before receive-pack; got: {msg}"
+        );
+
+        // Nothing ran against the repo: the directory contents are unchanged
+        // (no new refs, no objects, no receive-pack side effects).
+        let after = listing(&bare);
+        assert_eq!(
+            after, before,
+            "the corrupted repo must not be modified by a refused push"
+        );
+    }
+
     // A bare repo at HEAD with one commit on main, for the rollback-decision
     // unit tests below. Returns the tempdirs (kept alive by the caller), the
     // bare path, and main's oid.

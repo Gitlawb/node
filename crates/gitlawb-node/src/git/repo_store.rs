@@ -807,6 +807,12 @@ impl RepoWriteGuard {
         // caller surfaces as a FAILED push so the client re-pushes rather than
         // trusting a commit that never reached durable storage. (P1 data-loss.)
         let mut upload_ok = true;
+        // Whether the failed upload TIMED OUT (as opposed to erroring). On the
+        // error arm the PUT definitively failed; on the timeout arm the dropped
+        // upload future may have already transmitted the full body, so the store
+        // can still commit the POST-state archive; that arm alone needs the
+        // compensating upload after cleanup below.
+        let mut upload_timed_out = false;
 
         // Upload to Tigris only on success. Bound the upload so a stalled PUT
         // cannot pin the guard's advisory-lock connection indefinitely — on
@@ -829,6 +835,7 @@ impl RepoWriteGuard {
                     }
                     Err(_) => {
                         upload_ok = false;
+                        upload_timed_out = true;
                         warn!(repo = %self.repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
                             "tigris upload timed out after write — releasing the advisory lock without a completed upload");
                     }
@@ -844,6 +851,41 @@ impl RepoWriteGuard {
         // back, which a later download would resurrect.
         if !upload_ok {
             cleanup(&self.local_path);
+
+            // TIMEOUT arm only: the dropped upload future may have fully
+            // transmitted the PUT body with only the response in flight, so the
+            // store can commit the POST-state archive even though `cleanup`
+            // just rolled the local refs back, and a later cold download would
+            // resurrect the rolled-back write. Attempt ONE bounded compensating
+            // upload of the now-rolled-back tree: it starts strictly after the
+            // rollback, so if it lands it commits after the orphan PUT's
+            // near-immediate commit and the store converges to the rolled-back
+            // state either way. This at most doubles the bounded lock hold on
+            // this rare arm; the advisory lock must still be held during the
+            // compensation, and it is, since this runs before the unlock below.
+            // `upload_ok` stays false regardless: the client was already told
+            // the write failed; the compensation only converges durable state.
+            // The error arm needs none of this: its PUT definitively failed.
+            if upload_timed_out {
+                if let Some(ref tigris) = self.object_store {
+                    match tokio::time::timeout(
+                        self.release_upload_timeout,
+                        tigris.upload(&self.owner_slug, &self.repo_name, &self.local_path),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            warn!(repo = %self.repo_name, err = %e,
+                                "compensating upload after timed-out release upload failed: store may hold a write that was reported failed until the next successful upload");
+                        }
+                        Err(_) => {
+                            warn!(repo = %self.repo_name, timeout_secs = self.release_upload_timeout.as_secs(),
+                                "compensating upload after timed-out release upload timed out: store may hold a write that was reported failed until the next successful upload");
+                        }
+                    }
+                }
+            }
         }
 
         // Unlock on the SAME connection that took the lock, then TAKE the
@@ -1929,6 +1971,146 @@ mod tests {
         );
     }
 
+    // ObjectStore double for the timed-out-release compensation tests: `upload()`
+    // records its call count and, at entry, whether the caller's rollback marker
+    // file exists in the repo dir (so a test can prove WHICH state each upload
+    // observed). When `err_first` is set the first call fails immediately (the
+    // Err arm); otherwise the first call parks forever past the release timeout
+    // (the timeout arm) and every later call succeeds instantly.
+    struct CompensationProbeStore {
+        err_first: bool,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        marker_at_upload: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::git::tigris::ObjectStore for CompensationProbeStore {
+        async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn upload(&self, _o: &str, _r: &str, p: &std::path::Path) -> anyhow::Result<()> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.marker_at_upload
+                .lock()
+                .unwrap()
+                .push(p.join("rollback-marker").exists());
+            if n == 0 {
+                if self.err_first {
+                    anyhow::bail!("simulated PUT failure");
+                }
+                // Park forever; the release timeout is what must unblock it.
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+        async fn download(&self, _o: &str, _r: &str, _p: &std::path::Path) -> anyhow::Result<()> {
+            unreachable!("exists() is always false, so no download should run");
+        }
+        async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A release upload that TIMES OUT may have fully transmitted its PUT body
+    // (only the response in flight), so the store can commit the POST-state
+    // archive while cleanup rolls the local tree back, and a later cold download
+    // would resurrect the rolled-back write. release_with_failure_cleanup must
+    // therefore attempt ONE bounded compensating upload of the rolled-back tree
+    // after cleanup, on the timeout arm only. Pre-fix (no compensation) upload
+    // runs exactly once -> the call-count == 2 assert is RED.
+    #[sqlx::test]
+    async fn timed_out_release_upload_compensates_with_rolled_back_tree(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let marker_at_upload = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ts = CompensationProbeStore {
+            err_first: false,
+            calls: calls.clone(),
+            marker_at_upload: marker_at_upload.clone(),
+        };
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        )
+        .with_release_upload_timeout(std::time::Duration::from_millis(300));
+        let owner = "did:key:z6MkTimeoutCompensateAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "compensate";
+
+        // A real write under the guard, so the first upload has a tree to PUT.
+        let guard = store.acquire_write(owner, name).await.unwrap();
+        crate::git::store::init_bare(guard.path()).unwrap();
+
+        let cleanup_ran = std::sync::atomic::AtomicBool::new(false);
+        let ok = guard
+            .release_with_failure_cleanup(true, |p| {
+                // Models the rollback: mutate a marker the double snapshots at
+                // upload entry, so the compensating upload's observed state is
+                // provably POST-cleanup.
+                std::fs::write(p.join("rollback-marker"), b"rolled back").unwrap();
+                cleanup_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await;
+
+        assert!(!ok, "a timed-out upload must still be reported as failed");
+        assert!(
+            cleanup_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "cleanup must run on the timeout arm"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the timeout arm must attempt exactly one compensating upload after cleanup"
+        );
+        assert_eq!(
+            *marker_at_upload.lock().unwrap(),
+            vec![false, true],
+            "the compensating upload must observe the POST-cleanup (rolled-back) tree"
+        );
+    }
+
+    // The Err arm must NOT compensate: an erroring PUT definitively failed, so
+    // there is no orphan archive to converge over. Exactly one upload call.
+    #[sqlx::test]
+    async fn errored_release_upload_does_not_compensate(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ts = CompensationProbeStore {
+            err_first: true,
+            calls: calls.clone(),
+            marker_at_upload: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        )
+        .with_release_upload_timeout(std::time::Duration::from_millis(300));
+        let owner = "did:key:z6MkErrNoCompensateAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "nocompensate";
+
+        let guard = store.acquire_write(owner, name).await.unwrap();
+        crate::git::store::init_bare(guard.path()).unwrap();
+
+        let cleanup_ran = std::sync::atomic::AtomicBool::new(false);
+        let ok = guard
+            .release_with_failure_cleanup(true, |_| {
+                cleanup_ran.store(true, std::sync::atomic::Ordering::SeqCst)
+            })
+            .await;
+
+        assert!(!ok, "an erroring upload must be reported as failed");
+        assert!(
+            cleanup_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "cleanup must run on the error arm"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the error arm must not attempt a compensating upload"
+        );
+    }
+
     // FINDING 3 / R2 / INV-22: acquire_write's under-lock freshness DOWNLOAD must
     // be bounded, not just release()'s upload. acquire_write holds the write
     // advisory lock on a pinned lock-pool connection, then does store.exists() +
@@ -2633,12 +2815,16 @@ mod tests {
 
     // A cold-read holder parks mid-download, then its handler future is dropped
     // (axum cancels it on client disconnect). The per-repo map entry must be
-    // removed anyway — the pre-fix code removed it only at explicit return points,
-    // which a cancelled future skips, so a permissionless caller could fan cold
-    // GETs across many public repos and disconnect to grow the map. The RAII
-    // DownloadEntryGuard's Drop closes that gap. This reads the private
-    // download_locks map directly (the test module is a child of RepoStore's
-    // module). Pre-fix: after abort the entry LEAKS -> still present -> RED.
+    // removed once the in-flight download settles. The original pre-fix code
+    // removed it only at explicit return points, which a cancelled future
+    // skips, so a permissionless caller could fan cold GETs across many public
+    // repos and disconnect to grow the map. The RAII DownloadEntryGuard's Drop
+    // closes that gap; the guard now travels with the spawned download task,
+    // so the entry deliberately STAYS registered while the download is in
+    // flight (that is what keeps cancel-then-retry from duplicating the
+    // download) and is pruned at settle. This reads the private download_locks
+    // map directly (the test module is a child of RepoStore's module).
+    // Original bug: after abort the entry leaked forever -> never freed -> RED.
     #[sqlx::test]
     async fn cancelled_cold_read_frees_the_map_entry(pool: sqlx::PgPool) {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2672,12 +2858,26 @@ mod tests {
 
         // Cancel the handler future mid-download (the client-disconnect hazard).
         h.abort();
+        assert!(
+            h.await.unwrap_err().is_cancelled(),
+            "the holder future must be cancelled, not settled"
+        );
 
-        // The RAII guard's Drop must remove the entry despite the cancellation.
+        // The spawned download task owns the coordination, so the entry stays
+        // registered while the download is still in flight; a reader arriving
+        // now queues on it instead of starting a duplicate download.
+        assert!(
+            store.download_locks.lock().unwrap().contains_key(&map_key),
+            "the entry must stay registered while the cancelled holder's download is in flight"
+        );
+
+        // Let the parked download settle; the task's returned guards then drop
+        // in the runtime and prune the entry.
+        gate.notify_one();
         let freed = poll_until_true(|| store.download_locks.lock().unwrap().is_empty()).await;
         assert!(
             freed,
-            "a cold-read future cancelled mid-download must still free its map entry"
+            "the map entry must be freed once the cancelled holder's download settles"
         );
     }
 
@@ -2847,6 +3047,179 @@ mod tests {
         assert!(
             poll_until_true(|| !has_leftover_temp(&parent)).await,
             "a cancelled cold read must not leave a resurrected .tmp-download.* dir"
+        );
+    }
+
+    // Timeout waves must coalesce on the ONE in-flight download. Pre-fix, a
+    // holder whose download timed out released the per-repo mutex and pruned
+    // the map entry while its spawned download task was still running; the
+    // next reader of the same repo then became a fresh holder and started a
+    // second full store.download, so N timeout waves meant N concurrent
+    // downloads of the same object. Post-fix the spawned download task itself
+    // owns `held` and the entry guard until it settles, so the second reader
+    // queues on the same entry, its bounded wait elapses, and it reports the
+    // same timeout error WITHOUT invoking store.download again. RED recipe: in
+    // download.rs, revert the ownership move (make the spawned task return
+    // only `temp` and keep `held`/`entry_guard` in the caller frame, the
+    // pre-fix unwind): the holder's timeout then frees the lock and entry
+    // while the download still runs, the second reader acquires them and
+    // starts download #2, and the downloads == 1 assert fails.
+    #[sqlx::test]
+    async fn timed_out_cold_reads_coalesce_on_the_inflight_download(pool: sqlx::PgPool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let extracted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ts = DetachExtractStore {
+            // The download settles well after BOTH callers' 150ms timeouts.
+            extract_delay: std::time::Duration::from_millis(600),
+            downloads: downloads.clone(),
+            extracted: extracted.clone(),
+        };
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        )
+        .with_release_upload_timeout(std::time::Duration::from_millis(150));
+        let owner = "did:key:z6MkTimeoutCoalesceAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "timeoutcoalesce";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        let parent = dir.parent().unwrap().to_path_buf();
+
+        // First cold reader: its download stalls and its 150ms timeout fires.
+        let store1 = store.clone();
+        let (o1, n1) = (owner.to_string(), name.to_string());
+        let h1 = tokio::spawn(async move { store1.acquire(&o1, &n1).await });
+        assert!(
+            poll_until_true(|| downloads.load(SeqCst) == 1).await,
+            "the first reader's download must be in flight"
+        );
+        // Start the second reader measurably after the first, so that pre-fix
+        // (RED) the lock the first holder frees at ~150ms is available well
+        // before the second reader's own 150ms wait elapses.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let h2 = tokio::spawn(async move { store2.acquire(&o2, &n2).await });
+
+        let res1 = h1.await.unwrap();
+        let res2 = h2.await.unwrap();
+        assert!(
+            res1.is_err(),
+            "the stalled holder must report its timeout error"
+        );
+        let err2 = res2.expect_err("the coalesced reader must also time out, not succeed");
+        assert!(
+            format!("{err2:#}").contains("read download timed out"),
+            "the coalesced reader reports the same timeout error, got: {err2:#}"
+        );
+        assert_eq!(
+            downloads.load(SeqCst),
+            1,
+            "both timed-out cold reads must share the ONE in-flight download"
+        );
+
+        // Once the in-flight download settles, the task-owned coordination must
+        // be released (map entry pruned) and the temp dir must be cleaned.
+        assert!(
+            poll_until_true(|| extracted.load(SeqCst) >= 1).await,
+            "the detached extraction must run to completion"
+        );
+        assert!(
+            poll_until_true(|| store.download_locks.lock().unwrap().is_empty()).await,
+            "the map entry must be pruned once the download settles"
+        );
+        assert!(
+            poll_until_true(|| !has_leftover_temp(&parent)).await,
+            "the settled download's temp dir must be cleaned up"
+        );
+    }
+
+    // Cancellation twin of the coalescing test above: the first cold reader is
+    // ABORTED mid-download (axum drops the handler on client disconnect)
+    // instead of timing out. Pre-fix (guards in the caller frame), the abort
+    // dropped `held` and the entry guard immediately while the spawned
+    // download task kept running, so a retry arriving right after the
+    // disconnect became a fresh holder and started a second full
+    // store.download. Post-fix the task owns the coordination, so the retry
+    // queues on the in-flight download, its bounded wait elapses, and it
+    // reports the timeout error WITHOUT a second download; the entry is
+    // pruned once the task settles. RED recipe: same revert as above (task
+    // returns only `temp`, guards stay caller-side): the abort then frees
+    // lock and entry at once, the retry starts download #2, and the
+    // downloads == 1 assert fails.
+    #[sqlx::test]
+    async fn cancelled_cold_read_coalesces_next_reader_on_the_inflight_download(
+        pool: sqlx::PgPool,
+    ) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let extracted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ts = DetachExtractStore {
+            // The download settles well after the retry's 150ms bounded wait.
+            extract_delay: std::time::Duration::from_millis(600),
+            downloads: downloads.clone(),
+            extracted: extracted.clone(),
+        };
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        )
+        .with_release_upload_timeout(std::time::Duration::from_millis(150));
+        let owner = "did:key:z6MkCancelCoalesceAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let name = "cancelcoalesce";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        let parent = dir.parent().unwrap().to_path_buf();
+
+        // First cold reader: download in flight, then the handler is dropped.
+        let store1 = store.clone();
+        let (o1, n1) = (owner.to_string(), name.to_string());
+        let h1 = tokio::spawn(async move { store1.acquire(&o1, &n1).await });
+        assert!(
+            poll_until_true(|| downloads.load(SeqCst) == 1).await,
+            "the first reader's download must be in flight"
+        );
+        h1.abort();
+        assert!(
+            h1.await.unwrap_err().is_cancelled(),
+            "the first reader must be cancelled, not settled"
+        );
+
+        // Retry after the disconnect, well before the download settles at
+        // ~600ms: it must queue on the in-flight download, not start its own.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let store2 = store.clone();
+        let (o2, n2) = (owner.to_string(), name.to_string());
+        let res2 = tokio::spawn(async move { store2.acquire(&o2, &n2).await })
+            .await
+            .unwrap();
+        let err2 = res2.expect_err("the retry must hit its bounded wait, not succeed");
+        assert!(
+            format!("{err2:#}").contains("read download timed out"),
+            "the retry reports the bounded-wait timeout error, got: {err2:#}"
+        );
+        assert_eq!(
+            downloads.load(SeqCst),
+            1,
+            "a retry after a cancelled cold read must share the ONE in-flight download"
+        );
+
+        // At settle, the task-owned coordination unwinds: entry pruned, temp
+        // dir cleaned.
+        assert!(
+            poll_until_true(|| extracted.load(SeqCst) >= 1).await,
+            "the detached extraction must run to completion"
+        );
+        assert!(
+            poll_until_true(|| store.download_locks.lock().unwrap().is_empty()).await,
+            "the map entry must be pruned once the cancelled holder's download settles"
+        );
+        assert!(
+            poll_until_true(|| !has_leftover_temp(&parent)).await,
+            "the settled download's temp dir must be cleaned up"
         );
     }
 }
