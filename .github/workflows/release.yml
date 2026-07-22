@@ -53,26 +53,64 @@ jobs:
   # release-please cannot update Cargo.lock, so without this job every release
   # merge ships a tag whose lockfile disagrees with its manifests (a --locked
   # build from the tag fails, and pr-checks builds --locked). Sync the lock on
-  # the release branch so the tagged tree is internally consistent. Runs only
-  # while a release PR is open (the pr output is unset on the merge push that
-  # creates the release).
+  # the release branch so the tagged tree is internally consistent.
+  #
+  # Runs on every push-triggered release run, not only when release-please
+  # reports the PR: the `pr` output is set only on runs that CREATE or UPDATE
+  # the release PR, so gating on it would leave an already-open release PR
+  # (opened before this job existed, or untouched by a non-releasable push)
+  # permanently without the sync and without check runs. The resolve step
+  # discovers any open release-please PR itself and no-ops when there is none.
   sync-release-lock:
     name: Sync Cargo.lock on the release PR
     needs: release-please
-    if: ${{ needs.release-please.outputs.pr }}
+    if: ${{ !cancelled() && github.repository == 'Gitlawb/node' && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
+      # actions: write lets the final step dispatch pr-checks on the release
+      # branch. Note this grant is repo-wide dispatch rights (GitHub cannot
+      # scope it to one workflow); acceptable here because reaching this job's
+      # steps already requires write to main. Needed because every push to the
+      # release branch (release-please's and the lock sync below) is made with
+      # GITHUB_TOKEN, which triggers no workflow runs, so without an explicit
+      # dispatch the release PR's head carries no check runs and the --locked
+      # gate never validates it.
+      actions: write
     steps:
+      # Prefer the fresh `pr` output when this run just created/updated the
+      # release PR; otherwise fall back to querying for an open release-please
+      # branch (prefix match: the branch carries `--components--` suffixes).
+      - name: Resolve the open release PR branch
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_FROM_OUTPUT: ${{ needs.release-please.outputs.pr && fromJSON(needs.release-please.outputs.pr).headBranchName || '' }}
+        run: |
+          branch="$BRANCH_FROM_OUTPUT"
+          if [ -z "$branch" ]; then
+            branch=$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+              --json headRefName \
+              --jq '[.[].headRefName | select(startswith("release-please--"))][0] // empty')
+          fi
+          if [ -z "$branch" ]; then
+            echo "no open release PR; nothing to sync"
+          fi
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
       - name: Checkout release branch
+        if: ${{ steps.resolve.outputs.branch != '' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+          ref: ${{ steps.resolve.outputs.branch }}
 
       - name: Sync workspace crate versions into Cargo.lock
+        if: ${{ steps.resolve.outputs.branch != '' }}
         run: cargo update --workspace
 
       - name: Commit and push when the lock changed
+        if: ${{ steps.resolve.outputs.branch != '' }}
         run: |
           if git diff --quiet Cargo.lock; then
             echo "Cargo.lock already in sync"
@@ -83,6 +121,40 @@ jobs:
           git add Cargo.lock
           git commit -m "chore: sync Cargo.lock with the release version bump"
           git push
+
+      # Every push to the release branch is made with GITHUB_TOKEN (release-
+      # please's own pushes and the lock sync above), and events created by
+      # GITHUB_TOKEN start no workflow runs. workflow_dispatch is the documented
+      # exception GITHUB_TOKEN may trigger, so dispatch pr-checks at the release
+      # branch to attach check runs to its current head. Unconditional (also on
+      # the already-in-sync path) because the branch's ORIGINAL head has the
+      # same no-runs problem. Loud on failure by design: a silent fallback
+      # would recreate the checkless-head problem, and a job rerun is safe
+      # (sync no-ops, dispatch retries). Loop-safe: pr-checks is read-only and
+      # dispatches nothing. Runs after the push ack, so the dispatched ref tip
+      # is the sync commit. Merge-queue note: this validates the branch tip;
+      # the enforced merge queue's merge_group run still re-validates the true
+      # merged result before landing.
+      - name: Dispatch PR checks on the release branch
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.resolve.outputs.branch }}
+        run: |
+          # A release branch cut before pr-checks gained its workflow_dispatch
+          # trigger 422s ("does not have a workflow_dispatch trigger" reported
+          # against the dispatched ref's copy of the file). That is the one
+          # tolerated failure: it self-heals when release-please next rewrites
+          # the branch from current main. Anything else fails the job loudly.
+          out=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/pr-checks.yml/dispatches" \
+            -f "ref=$BRANCH" 2>&1) && exit 0
+          if echo "$out" | grep -qi "does not have a workflow_dispatch trigger"; then
+            echo "release branch predates the dispatch trigger; checks attach after release-please next rebases it"
+            echo "$out"
+            exit 0
+          fi
+          echo "$out"
+          exit 1
 
   # Each architecture builds NATIVELY (amd64 on ubuntu-latest, arm64 on
   # ubuntu-24.04-arm) and pushes by digest; docker-manifest below stitches the
