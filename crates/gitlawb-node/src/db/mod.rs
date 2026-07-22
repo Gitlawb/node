@@ -160,6 +160,8 @@ pub struct PinnedCidRecord {
     pub cid: String,
     pub pinned_at: String,
     pub pinata_cid: Option<String>,
+    pub repo: String,
+    pub owner_did: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -678,6 +680,15 @@ const MIGRATIONS: &[Migration] = &[
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_repo_replicas_repo ON repo_replicas(repo_id)",
             "CREATE INDEX IF NOT EXISTS idx_repo_replicas_did  ON repo_replicas(replica_did)",
+            // ── Pinned CID repos (junction table for shared-object associations) ──
+            r#"CREATE TABLE IF NOT EXISTS pinned_cid_repos (
+                sha256_hex TEXT NOT NULL,
+                repo       TEXT NOT NULL,
+                owner_did  TEXT NOT NULL,
+                pinned_at  TEXT NOT NULL,
+                PRIMARY KEY (sha256_hex, repo)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cid_repos_repo ON pinned_cid_repos(repo, owner_did)",
             // ── PR comments ─────────────────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS pr_comments (
                 id         TEXT NOT NULL PRIMARY KEY,
@@ -856,6 +867,7 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE",
         ],
     },
+
     Migration {
         version: 10,
         name: "ref_cert_unique_per_ref",
@@ -883,14 +895,86 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
-    // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
-    // The runner keys the applied set on the integer alone, so a version another
-    // in-flight branch also claims is skipped in full on whichever side merges
-    // second — no error, no warning, and schema_migrations still reads healthy
-    // while the column is simply absent. Two open branches already claim into
-    // this range: #135/#173 holds through 14 (15 once it rebases past v11), and
-    // #253 took 16. 17 clears both. Gaps are harmless: the runner iterates the
-    // array and never requires contiguity.
+    Migration {
+        version: 12,
+        name: "pinned_cids_repo_owner",
+        stmts: &[
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS repo TEXT",
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS owner_did TEXT",
+            // Backfill repo/owner only when both the CID AND the Git SHA match
+            // between pinned_cids and branch_cids.  The CID alone does not encode
+            // the Git object type, so a private blob and a public commit with the
+            // same raw bytes would share a CID, and the plain CID-join would
+            // wrongly assign the private pin to the public repo (P1).  Requiring
+            // p.sha256_hex = bc.sha ensures only the ref-target objects
+            // (commits) are matched — blobs/trees fall through to the empty-
+            // string fallback below, which is safer than a wrong assignment.
+            r#"UPDATE pinned_cids p
+               SET repo = m.repo,
+                   owner_did = m.owner_did
+               FROM (
+                   SELECT DISTINCT
+                       bc.cid,
+                       bc.sha,
+                       bc.repo,
+                       r.owner_did
+                   FROM branch_cids bc
+                   JOIN repos r
+                     ON r.name = split_part(bc.repo, '/', 2)
+                    AND (CASE WHEN r.owner_did LIKE 'did:key:%' AND position(':' in substr(r.owner_did, 9)) = 0 THEN substr(r.owner_did, 9) ELSE r.owner_did END)
+                        = split_part(bc.repo, '/', 1)
+               ) m
+               WHERE p.cid = m.cid
+                 AND p.sha256_hex = m.sha"#,
+            // Fallback for remaining rows
+            "UPDATE pinned_cids SET repo = '' WHERE repo IS NULL",
+            "UPDATE pinned_cids SET owner_did = '' WHERE owner_did IS NULL",
+            // Default the new columns so a pre-v11 binary still running during
+            // a rolling deploy can INSERT (sha256_hex, cid, pinned_at) without
+            // hitting a NOT NULL violation (P2).
+            "ALTER TABLE pinned_cids ALTER COLUMN repo SET DEFAULT ''",
+            "ALTER TABLE pinned_cids ALTER COLUMN owner_did SET DEFAULT ''",
+            "ALTER TABLE pinned_cids ALTER COLUMN repo SET NOT NULL",
+            "ALTER TABLE pinned_cids ALTER COLUMN owner_did SET NOT NULL",
+            // New unique constraint for post-v11 ON CONFLICT(repo, sha256_hex)
+            "CREATE UNIQUE INDEX IF NOT EXISTS pinned_cids_repo_sha_hex_key ON pinned_cids (repo, sha256_hex)",
+            // Old PK on sha256_hex kept intact for pre-v11 ON CONFLICT(sha256_hex)
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_repo_owner ON pinned_cids (repo, owner_did)",
+        ],
+    },
+    Migration {
+        version: 13,
+        name: "arweave_anchors_repo_owner_index",
+        stmts: &[
+            "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo_owner_anchored ON arweave_anchors (repo, owner_did, anchored_at DESC)",
+        ],
+    },
+    Migration {
+        version: 14,
+        name: "pinned_cid_repos_junction",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS pinned_cid_repos (
+                sha256_hex TEXT NOT NULL,
+                repo       TEXT NOT NULL,
+                owner_did  TEXT NOT NULL,
+                pinned_at  TEXT NOT NULL,
+                PRIMARY KEY (sha256_hex, repo)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cid_repos_repo ON pinned_cid_repos(repo, owner_did)",
+            // Backfill from existing pinned_cids rows that have non-empty repo/owner
+            r#"INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+               SELECT sha256_hex, repo, owner_did, pinned_at
+               FROM pinned_cids
+               WHERE repo IS NOT NULL AND repo != ''
+                 AND owner_did IS NOT NULL AND owner_did != ''
+               ON CONFLICT (sha256_hex, repo) DO NOTHING"#,
+            // Note: legacy (unassociated) pinned_cids rows with empty repo
+            // or owner_did are intentionally not migrated to the junction
+            // table: the scoped listing requires a known (repo, owner_did)
+            // pair, and silently showing orphaned objects to every caller
+            // would leak SHA/CID pairs from before the migration.,
+        ],
+    },
     Migration {
         version: 17,
         name: "sync_queue_attempted_at",
@@ -916,10 +1000,6 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
 /// filter or group by owner key use this const so the Rust and SQL sides cannot
 /// drift apart. If you change `normalize_owner_key`, update this const too.
 const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
-
-/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
-/// named `did` (like in agent_profiles) instead of `owner_did`.
-const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
 
 #[cfg(test)]
 mod normalize_owner_key_tests {
@@ -1659,46 +1739,13 @@ impl Db {
         Ok(())
     }
 
-    /// Take up to `limit` pending syncs — the least recently attempted ones —
-    /// and stamp each with the time it was handed out.
-    ///
-    /// Selecting and stamping in one statement is deliberate. A row the worker
-    /// cannot make progress on stays `pending` so it is retried, and if its
-    /// ordering key never moved it would remain among the oldest rows forever,
-    /// holding a fixed-size window against every healthy repo behind it.
-    /// Stamping on the way out makes the key "least recently handed out", so a
-    /// stuck row rotates to the back instead. Doing it here rather than at each
-    /// deferral branch in the worker is what makes that hold by construction:
-    /// no call site can forget it, and a batch that dies mid-loop still leaves
-    /// its rows stamped. `enqueued_at` is left alone so backlog age stays
-    /// measurable.
-    ///
-    /// Two things this deliberately does not promise. The returned rows are the
-    /// right *set*, in no particular order — `RETURNING` does not sort, and
-    /// nothing in `process_batch` depends on the order within a batch. And this
-    /// is not a claim: the rows stay `pending` with no row lock held past the
-    /// statement, so two workers against one database can still be handed the
-    /// same batch. Single-worker deployment is the existing assumption;
-    /// `FOR UPDATE SKIP LOCKED` is what would change that, and it is not here.
-    ///
-    /// Errors surface to the caller, which logs and skips the poll. That is
-    /// worth knowing now that this writes: it can fail for reasons a plain
-    /// SELECT could not, such as a read-only transaction or a lock timeout.
     pub async fn dequeue_pending_syncs(&self, limit: i64) -> Result<Vec<SyncQueueItem>> {
         let rows = sqlx::query(
-            // The outer `status = 'pending'` is not redundant with the
-            // subquery's: between the two, a concurrent worker can settle a row,
-            // and without it the UPDATE would still stamp and return a row that
-            // had already left the pending set.
-            "UPDATE sync_queue SET attempted_at = $2
-             WHERE status = 'pending' AND id IN (
-                 SELECT id FROM sync_queue WHERE status = 'pending'
-                 ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
-             )
-             RETURNING id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at",
+            "SELECT id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at
+             FROM sync_queue WHERE status = 'pending'
+             ORDER BY enqueued_at ASC LIMIT $1",
         )
         .bind(limit)
-        .bind(Utc::now().to_rfc3339())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -2144,46 +2191,10 @@ impl Db {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
         }
         let now = Utc::now().to_rfc3339();
-        // A changed URL drops the reachability gate, so a repointed peer does
-        // not inherit a probe the previous host earned. In the DO UPDATE branch
-        // `peers.http_url` is the existing pre-update row (the proposed value is
-        // $2), and the comparison runs under the conflict row lock, so
-        // concurrent announces for one DID serialize instead of racing a
-        // read-then-write. That orders announces against each other and nothing
-        // more: mark_peer_ping writes by DID with no http_url predicate, so a
-        // probe of the previous URL that lands after a reset can still re-grant
-        // the flag until the next round.
-        //
-        // Comparison is exact. http_url is stored as announced, so a cosmetic
-        // difference such as a trailing slash also clears the flag; the peer
-        // re-earns it on a later gossip round, provided no further announce
-        // lands first. Normalizing instead would mean canonicalizing the stored
-        // value, this comparison, and the existing trim_end_matches call sites.
-        //
-        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
-        // clear it by announcing a different URL, and until #248 lands can also
-        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
-        // writes mark_peer_ping from the stored URL's own probe response. Do not
-        // build a new consumer on this flag as if it were attacker-resistant.
-        //
-        // Only the federated repo fan-out in api/repos.rs gates on this flag.
-        // Four consumers act on a repointed http_url regardless of it (sync.rs's
-        // origin resolve, the post-receive notify fan-out, trigger_sync, and the
-        // public resolve route), and two read surfaces republish it as
-        // `reachable` (api/resolve.rs, api/peers.rs), which is where a reset
-        // becomes externally visible. So this bounds the automatic inheritance
-        // rather than closing the rewrite. Binding a DID to its first-seen
-        // announcing key is what closes it: #273.
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
              VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET
-               http_url = $2,
-               last_seen = $3,
-               last_ping_ok = CASE
-                 WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
-                 ELSE peers.last_ping_ok
-               END",
+             ON CONFLICT(did) DO UPDATE SET http_url = $2, last_seen = $3",
         )
         .bind(did)
         .bind(http_url)
@@ -2268,15 +2279,80 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
-    pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
+    #[allow(dead_code)]
+    pub async fn get_pinned_cid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM pinned_cids WHERE sha256_hex = $1 LIMIT 1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("cid")))
+    }
+
+    /// Record a pinned CID with explicit repo/owner_did association.
+    /// Phase 1 (expand): targets the kept sha256_hex PK so pre-v10 and
+    /// post-v10 writers share the same conflict target.  Phase 2 (contract)
+    /// will switch to ON CONFLICT(repo, sha256_hex) after the old PK is
+    /// dropped and (repo, sha256_hex) becomes the new primary key.
+    pub async fn record_pinned_cid_full(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo: &str,
+        owner_did: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT(sha256_hex) DO NOTHING",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                repo = COALESCE(NULLIF(EXCLUDED.repo, ''), pinned_cids.repo),
+                owner_did = COALESCE(NULLIF(EXCLUDED.owner_did, ''), pinned_cids.owner_did)",
         )
         .bind(sha256_hex)
         .bind(cid)
-        .bind(Utc::now().to_rfc3339())
+        .bind(&now)
+        .bind(repo)
+        .bind(owner_did)
+        .execute(&self.pool)
+        .await?;
+
+        // Also record the (repo, owner_did) association in the junction table
+        // so shared Git objects are visible to every repo's readers (P2).
+        if !repo.is_empty() && !owner_did.is_empty() {
+            sqlx::query(
+                "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (sha256_hex, repo) DO NOTHING",
+            )
+            .bind(sha256_hex)
+            .bind(repo)
+            .bind(owner_did)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn update_pinned_cid_repo(
+        &self,
+        sha256_hex: &str,
+        repo: &str,
+        owner_did: &str,
+    ) -> Result<()> {
+        if repo.is_empty() || owner_did.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (sha256_hex, repo) DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo)
+        .bind(owner_did)
+        .bind(&now)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2352,9 +2428,10 @@ impl Db {
         Ok(row.map(|r| r.get("recipients_tag")))
     }
 
+    #[allow(dead_code)]
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
         let rows = sqlx::query(
-            "SELECT sha256_hex, cid, pinned_at, pinata_cid FROM pinned_cids ORDER BY pinned_at DESC",
+            "SELECT sha256_hex, cid, pinned_at, pinata_cid, repo, owner_did FROM pinned_cids ORDER BY pinned_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2365,6 +2442,123 @@ impl Db {
                 cid: r.get("cid"),
                 pinned_at: r.get("pinned_at"),
                 pinata_cid: r.get("pinata_cid"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
+            })
+            .collect())
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_pinata_cid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT pinata_cid FROM pinned_cids WHERE sha256_hex = $1 AND pinata_cid IS NOT NULL LIMIT 1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("pinata_cid")))
+    }
+
+    /// Bounded global pin query: returns pins for any of the given (repo, owner_did)
+    /// pairs, ordered by pinned_at DESC, capped at `limit`.
+    /// Fetch pinned CIDs matching the readable (repo, owner_did) pairs,
+    /// ordered by (pinned_at DESC, repo DESC, sha256_hex DESC) for stable
+    /// keyset pagination.  When `cursor` is `Some((pinned_at, repo,
+    /// sha256_hex))`, only rows strictly before that cursor are returned (no
+    /// duplicates across batches).
+    pub async fn list_pinned_cids_for_repos(
+        &self,
+        repos: &[String],
+        owner_dids: &[String],
+        no_rules: &[bool],
+        limit: i64,
+        cursor: Option<(&str, &str, &str)>,
+    ) -> Result<Vec<PinnedCidRecord>> {
+        // LEFT JOIN with pinned_cid_repos so legacy rows inserted directly
+        // into pinned_cids (before the junction-table migration, or by tests
+        // that use raw SQL) are still returned.  When the junction table has
+        // no entry we fall back to pinned_cids.repo / pinned_cids.owner_did.
+        //
+        // Deduplicate by sha256_hex at the SQL level so page boundaries do
+        // not re-expose an object that appeared on a prior page via a
+        // different (repo, owner_did) association (P2).  The ROW_NUMBER
+        // ordering prefers associations from repos without path-scoped
+        // rules (no_rules = true) so that a hidden association that sorts
+        // alphabetically first does not suppress a visible one (P2).
+        let rows = if let Some((pa, r, sha)) = cursor {
+            sqlx::query(
+                "SELECT sub.sha256_hex, sub.cid, sub.pinned_at, sub.pinata_cid,
+                        sub.repo, sub.owner_did
+                 FROM (
+                     SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
+                            COALESCE(pr.repo, p.repo) AS repo,
+                            COALESCE(pr.owner_did, p.owner_did) AS owner_did,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY p.sha256_hex
+                                ORDER BY pairs.no_rules DESC,
+                                         COALESCE(pr.repo, p.repo) ASC
+                            ) AS rn
+                     FROM pinned_cids p
+                     LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                     JOIN UNNEST($1::text[], $2::text[], $3::bool[])
+                          AS pairs(repo, owner_did, no_rules)
+                       ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                          = (pairs.repo, pairs.owner_did)
+                     WHERE (p.pinned_at, COALESCE(pr.repo, p.repo), p.sha256_hex)
+                           < ($4::text, $5::text, $6::text)
+                 ) sub
+                 WHERE sub.rn = 1
+                 ORDER BY sub.pinned_at DESC, sub.repo DESC, sub.sha256_hex DESC
+                 LIMIT $7",
+            )
+            .bind(repos)
+            .bind(owner_dids)
+            .bind(no_rules)
+            .bind(pa)
+            .bind(r)
+            .bind(sha)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT sub.sha256_hex, sub.cid, sub.pinned_at, sub.pinata_cid,
+                        sub.repo, sub.owner_did
+                 FROM (
+                     SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
+                            COALESCE(pr.repo, p.repo) AS repo,
+                            COALESCE(pr.owner_did, p.owner_did) AS owner_did,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY p.sha256_hex
+                                ORDER BY pairs.no_rules DESC,
+                                         COALESCE(pr.repo, p.repo) ASC
+                            ) AS rn
+                     FROM pinned_cids p
+                     LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                     JOIN UNNEST($1::text[], $2::text[], $3::bool[])
+                          AS pairs(repo, owner_did, no_rules)
+                       ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                          = (pairs.repo, pairs.owner_did)
+                 ) sub
+                 WHERE sub.rn = 1
+                 ORDER BY sub.pinned_at DESC, sub.repo DESC, sub.sha256_hex DESC
+                 LIMIT $4",
+            )
+            .bind(repos)
+            .bind(owner_dids)
+            .bind(no_rules)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|r| PinnedCidRecord {
+                sha256_hex: r.get("sha256_hex"),
+                cid: r.get("cid"),
+                pinned_at: r.get("pinned_at"),
+                pinata_cid: r.get("pinata_cid"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
             })
             .collect())
     }
@@ -2381,20 +2575,44 @@ impl Db {
     }
 
     /// Record the Pinata CID for a git object.
-    /// Inserts the row if it doesn't exist (objects pinned directly to Pinata
-    /// without a prior local IPFS pin get cid = pinata_cid).
-    pub async fn record_pinata_cid(&self, sha256_hex: &str, pinata_cid: &str) -> Result<()> {
+    /// Record the Pinata CID with explicit repo/owner_did association.
+    pub async fn record_pinata_cid_full(
+        &self,
+        sha256_hex: &str,
+        pinata_cid: &str,
+        repo: &str,
+        owner_did: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid,
+                repo = COALESCE(NULLIF(EXCLUDED.repo, ''), pinned_cids.repo),
+                owner_did = COALESCE(NULLIF(EXCLUDED.owner_did, ''), pinned_cids.owner_did)",
         )
         .bind(sha256_hex)
         .bind(pinata_cid) // fallback local cid if row is new
-        .bind(Utc::now().to_rfc3339())
+        .bind(&now)
         .bind(pinata_cid)
+        .bind(repo)
+        .bind(owner_did)
         .execute(&self.pool)
         .await?;
+
+        if !repo.is_empty() && !owner_did.is_empty() {
+            sqlx::query(
+                "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (sha256_hex, repo) DO NOTHING",
+            )
+            .bind(sha256_hex)
+            .bind(repo)
+            .bind(owner_did)
+            .bind(&now)
+            .execute(&self.pool)
+            .await?;
+        }
         Ok(())
     }
 }
@@ -2810,6 +3028,50 @@ impl Db {
             .fetch_all(&self.pool)
             .await?
         };
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ArweaveAnchor {
+                id: r.get("id"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
+                ref_name: r.get("ref_name"),
+                old_sha: r.get("old_sha"),
+                new_sha: r.get("new_sha"),
+                cid: r.get("cid"),
+                irys_tx_id: r.get("irys_tx_id"),
+                arweave_url: r.get("arweave_url"),
+                node_did: r.get("node_did"),
+                anchored_at: r.get("anchored_at"),
+            })
+            .collect())
+    }
+
+    /// List arweave anchors scoped to repos the caller can read.
+    /// Filtered by (repo, owner_did) pairs from the caller's readable set.
+    pub async fn list_arweave_anchors_for_repos(
+        &self,
+        repos: &[String],
+        owner_dids: &[String],
+        limit: i64,
+    ) -> Result<Vec<ArweaveAnchor>> {
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
+             FROM arweave_anchors
+             WHERE (repo, owner_did) IN (
+                 SELECT * FROM UNNEST($1::text[], $2::text[])
+             )
+             ORDER BY anchored_at DESC
+             LIMIT $3",
+        )
+        .bind(repos)
+        .bind(owner_dids)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows
             .into_iter()
@@ -3458,9 +3720,6 @@ impl Db {
             let new_website = website.or(existing.website.as_deref());
             let new_socials = socials.or(existing.socials.as_deref());
 
-            // get_profile equates bare short ids with did:key:<id>. UPDATE must target
-            // the stored row identity (existing.did), not the caller's raw input form,
-            // or a did:key: alias against a bare-stored profile updates zero rows.
             sqlx::query(
                 "UPDATE agent_profiles
                  SET display_name=$1, bio=$2, avatar_url=$3, website=$4, socials=$5, updated_at=$6
@@ -3472,12 +3731,12 @@ impl Db {
             .bind(new_website)
             .bind(new_socials)
             .bind(&now)
-            .bind(&existing.did)
+            .bind(did)
             .execute(&self.pool)
             .await?;
 
             Ok(ProfileRecord {
-                did: existing.did,
+                did: did.to_string(),
                 display_name: new_name.map(String::from),
                 bio: new_bio.map(String::from),
                 avatar_url: new_avatar.map(String::from),
@@ -3518,20 +3777,14 @@ impl Db {
     }
 
     pub async fn get_profile(&self, did: &str) -> Result<Option<ProfileRecord>> {
-        // Same owner-key contract as get_repo: strip `did:key:` only when the
-        // remainder is a bare key id. The old `LIKE '%:' || $1` matched any DID
-        // method that shared a suffix and could resolve the wrong profile.
-        let did_key = normalize_owner_key(did);
-        let sql = format!(
+        let row = sqlx::query(
             "SELECT did, display_name, bio, avatar_url, website, socials, profile_cid, created_at, updated_at
              FROM agent_profiles
-             WHERE ({key}) = $1",
-            key = PROFILE_DID_CASE_SQL
-        );
-        let row = sqlx::query(&sql)
-            .bind(did_key)
-            .fetch_optional(&self.pool)
-            .await?;
+             WHERE did = $1 OR did LIKE '%:' || $1",
+        )
+        .bind(did)
+        .fetch_optional(&self.pool)
+        .await?;
 
         Ok(row.map(|r| ProfileRecord {
             did: r.get("did"),
@@ -3547,17 +3800,10 @@ impl Db {
     }
 
     pub async fn set_profile_cid(&self, did: &str, cid: &str) -> Result<()> {
-        // Same did:key / bare equivalence as get_profile so a full did:key: form
-        // updates a profile stored under the bare short id.
-        let did_key = normalize_owner_key(did);
-        let sql = format!(
-            "UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE ({key}) = $3",
-            key = PROFILE_DID_CASE_SQL
-        );
-        sqlx::query(&sql)
+        sqlx::query("UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE did = $3")
             .bind(cid)
             .bind(Utc::now().to_rfc3339())
-            .bind(did_key)
+            .bind(did)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -3574,7 +3820,8 @@ impl Db {
 
 #[cfg(test)]
 mod migration_tests {
-    use super::{MIGRATIONS, MIGRATION_V1_NAME};
+    use super::{Db, MIGRATIONS, MIGRATION_V1_NAME};
+    use sqlx::{PgPool, Row};
 
     #[test]
     fn migrations_are_non_empty() {
@@ -3652,6 +3899,7 @@ mod migration_tests {
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
     }
+
 
     /// Simulate an existing node at v9 with populated received_ref_updates,
     /// then apply the v11 migration and verify (a) owner_did IS NULL on
@@ -3762,184 +4010,280 @@ mod migration_tests {
         db.migrate().await.unwrap();
     }
 
-    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
+    #[sqlx::test]
+    async fn test_migration_v11_upgrade_path(pool: PgPool) {
+        let db = Db::for_testing(pool);
 
-    async fn enqueue_one(db: &super::Db, repo: &str) {
-        db.enqueue_sync(
-            repo,
-            "did:key:zPEER",
-            "refs/heads/main",
-            &"0".repeat(40),
-            None,
+        // Run migrations up to version 9
+        async fn run_migrations_up_to(db: &Db, version: i64) {
+            sqlx::query(
+                r#"CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version    BIGINT  NOT NULL PRIMARY KEY,
+                    name       TEXT    NOT NULL,
+                    applied_at TEXT    NOT NULL
+                )"#,
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+            for m in super::MIGRATIONS {
+                if m.version > version {
+                    break;
+                }
+                let already: bool = sqlx::query(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
+                )
+                .bind(m.version)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+                .get::<bool, _>("applied");
+
+                if already {
+                    continue;
+                }
+
+                let mut tx = db.pool.begin().await.unwrap();
+                for stmt in m.stmts {
+                    sqlx::query(stmt).execute(&mut *tx).await.unwrap();
+                }
+                sqlx::query(
+                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                )
+                .bind(m.version)
+                .bind(m.name)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+        }
+
+        run_migrations_up_to(&db, 9).await;
+
+        // Seed a repo, branch_cids, and pinned_cids under v9 schema
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch, created_at, updated_at, disk_path)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
         )
+        .bind("repo-123")
+        .bind("myrepo")
+        .bind("did:key:z6Mkwowner")
+        .bind("desc")
+        .bind(true)
+        .bind("main")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("/srv/repo-123")
+        .execute(&db.pool)
         .await
         .unwrap();
-    }
 
-    async fn attempted_at_of(db: &super::Db, repo: &str) -> Option<String> {
-        sqlx::query_scalar("SELECT attempted_at FROM sync_queue WHERE repo = $1")
-            .bind(repo)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap()
-    }
+        sqlx::query(
+            "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("z6Mkwowner/myrepo")
+        .bind("refs/heads/main")
+        .bind("old-sha")
+        .bind("old-cid")
+        .bind("node-did")
+        .bind("2026-07-03T00:00:00Z")
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
-    /// Upgrade-path test: simulate a node already at v11 and let the real
-    /// migration entry point apply v17, rather than hand-copying its SQL.
-    ///
-    /// This is the test that catches the column being added to the v1
-    /// statement array instead of a new migration. v1 never re-runs on an
-    /// existing install, so that mistake breaks every deployed node's dequeue
-    /// while staying invisible to every other test here, since `#[sqlx::test]`
-    /// hands out a fresh database that runs the whole chain.
-    #[sqlx::test]
-    async fn migration_v17_adds_sync_queue_attempted_at(pool: sqlx::PgPool) {
-        let db = super::Db::for_testing(pool);
-        db.migrate().await.unwrap();
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
+             VALUES ($1, $2, $3)",
+        )
+        .bind("old-sha")
+        .bind("old-cid")
+        .bind("2026-07-03T00:00:00Z")
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
-        // Roll back to v11: drop the column and forget the version.
-        sqlx::query("ALTER TABLE sync_queue DROP COLUMN attempted_at")
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 17")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        // Run remaining migrations (v10 = ref_cert_dedup, v11 = pinned_cids)
+        db.run_migrations().await.unwrap();
 
-        // A row written by the old node, before the column existed.
-        enqueue_one(&db, "z6Mkfoo/legacy").await;
-
-        db.migrate().await.unwrap();
-
-        let col: (String, String) = sqlx::query_as(
-            "SELECT data_type, is_nullable
-             FROM information_schema.columns
-             WHERE table_name = 'sync_queue' AND column_name = 'attempted_at'",
+        // Verify backfilling of repo and owner_did columns
+        let row = sqlx::query(
+            "SELECT sha256_hex, cid, repo, owner_did FROM pinned_cids WHERE sha256_hex = 'old-sha'",
         )
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(col.0, "text");
-        assert_eq!(col.1, "YES", "attempted_at must be nullable");
 
-        let recorded: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 17")
-                .fetch_one(&db.pool)
-                .await
-                .unwrap();
-        assert_eq!(recorded.0, 1, "v17 must be recorded as applied");
+        assert_eq!(row.get::<String, _>("repo"), "z6Mkwowner/myrepo");
+        assert_eq!(row.get::<String, _>("owner_did"), "did:key:z6Mkwowner");
 
-        // The pre-existing row survives with a null key and is still dequeued.
-        assert_eq!(attempted_at_of(&db, "z6Mkfoo/legacy").await, None);
-        let items = db.dequeue_pending_syncs(10).await.unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].repo, "z6Mkfoo/legacy");
+        // Phase 1 (expand): the old PK on sha256_hex still rejects duplicate
+        // SHA across repos — pre-v10 ON CONFLICT(sha256_hex) keeps working.
+        let res = sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("old-sha")
+        .bind("old-cid")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("other-repo")
+        .bind("other-owner")
+        .execute(&db.pool)
+        .await;
 
-        // Idempotent re-run.
-        db.migrate().await.unwrap();
-    }
-
-    #[sqlx::test]
-    async fn dequeue_stamps_attempted_at_on_every_row_it_hands_out(pool: sqlx::PgPool) {
-        // The stamp is what stops a deferred row from holding the window, and
-        // it happens here rather than at the deferral branches so no call site
-        // can forget it.
-        let db = super::Db::for_testing(pool);
-        db.migrate().await.unwrap();
-        enqueue_one(&db, "z6Mkfoo/a").await;
-        assert_eq!(
-            attempted_at_of(&db, "z6Mkfoo/a").await,
-            None,
-            "a freshly enqueued row has no attempt yet"
-        );
-
-        let items = db.dequeue_pending_syncs(10).await.unwrap();
-        assert_eq!(items.len(), 1);
         assert!(
-            attempted_at_of(&db, "z6Mkfoo/a").await.is_some(),
-            "dequeue must stamp the row it returns, whatever the worker does next"
+            res.is_err(),
+            "Phase 1: old PK on sha256_hex must reject duplicate SHA across repos"
         );
-    }
 
-    #[sqlx::test]
-    async fn dequeue_orders_by_last_attempt_then_enqueue_time(pool: sqlx::PgPool) {
-        let db = super::Db::for_testing(pool);
-        db.migrate().await.unwrap();
-        enqueue_one(&db, "z6Mkfoo/older").await;
-        enqueue_one(&db, "z6Mkfoo/newer").await;
-        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
-            .bind("2026-07-29T00:00:00Z")
-            .bind("z6Mkfoo/older")
+        // Phase 2 (contract): drop the old PK and UNIQUE, promote to compound PK.
+        // Once all pre-v10 writers are drained this step makes the migration
+        // complete — same SHA can appear in different repos.
+        sqlx::query("ALTER TABLE pinned_cids DROP CONSTRAINT pinned_cids_pkey")
             .execute(&db.pool)
             .await
             .unwrap();
-        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
-            .bind("2026-07-29T00:00:01Z")
-            .bind("z6Mkfoo/newer")
+        sqlx::query("DROP INDEX IF EXISTS pinned_cids_repo_sha_hex_key")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE pinned_cids ADD PRIMARY KEY (repo, sha256_hex)")
             .execute(&db.pool)
             .await
             .unwrap();
 
-        // Never-attempted rows fall back to enqueue order.
-        let first = db.dequeue_pending_syncs(1).await.unwrap();
-        assert_eq!(first[0].repo, "z6Mkfoo/older");
+        // Now the same SHA works in a different repo (compound PK allows it).
+        let res = sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("old-sha")
+        .bind("old-cid")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("other-repo")
+        .bind("other-owner")
+        .execute(&db.pool)
+        .await;
 
-        // Having been attempted, it now sorts behind the untried row.
-        let second = db.dequeue_pending_syncs(1).await.unwrap();
-        assert_eq!(
-            second[0].repo, "z6Mkfoo/newer",
-            "an attempted row must yield to one that has never been tried"
+        assert!(
+            res.is_ok(),
+            "Phase 2: compound PK must allow same SHA in different repos"
         );
     }
 
+    /// A pinned CID whose SHA is not a current branch_cids ref tip falls back to
+    /// repo = '' after migration v11. This tests that the backfill does not
+    /// silently orphan such pins by leaving repo NULL/unqueryable; the empty
+    /// string is at least queryable by list_pinned_cids_for_repos callers.
     #[sqlx::test]
-    async fn dequeue_leaves_enqueued_at_untouched(pool: sqlx::PgPool) {
-        // enqueued_at keeps meaning enqueue time, so backlog age stays
-        // measurable; that is the reason attempted_at is a separate column.
-        let db = super::Db::for_testing(pool);
-        db.migrate().await.unwrap();
-        enqueue_one(&db, "z6Mkfoo/a").await;
-        let before: String =
-            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+    async fn test_migration_v11_orphan_non_tip_pin(pool: PgPool) {
+        let db = Db::for_testing(pool);
+
+        // Run migrations up to version 9
+        async fn run_migrations_up_to(db: &Db, version: i64) {
+            sqlx::query(
+                r#"CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version    BIGINT  NOT NULL PRIMARY KEY,
+                    name       TEXT    NOT NULL,
+                    applied_at TEXT    NOT NULL
+                )"#,
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+            for m in super::MIGRATIONS {
+                if m.version > version {
+                    break;
+                }
+                let already: bool = sqlx::query(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
+                )
+                .bind(m.version)
                 .fetch_one(&db.pool)
                 .await
-                .unwrap();
+                .unwrap()
+                .get::<bool, _>("applied");
 
-        db.dequeue_pending_syncs(10).await.unwrap();
+                if already {
+                    continue;
+                }
 
-        let after: String =
-            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
-                .fetch_one(&db.pool)
+                let mut tx = db.pool.begin().await.unwrap();
+                for stmt in m.stmts {
+                    sqlx::query(stmt).execute(&mut *tx).await.unwrap();
+                }
+                sqlx::query(
+                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                )
+                .bind(m.version)
+                .bind(m.name)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&mut *tx)
                 .await
                 .unwrap();
-        assert_eq!(before, after);
-    }
-
-    #[sqlx::test]
-    async fn dequeue_does_not_touch_settled_rows(pool: sqlx::PgPool) {
-        // The stamping UPDATE must not reach a row that already left the
-        // pending set, or a terminal row could be dragged back into rotation.
-        let db = super::Db::for_testing(pool);
-        db.migrate().await.unwrap();
-        enqueue_one(&db, "z6Mkfoo/failed").await;
-        enqueue_one(&db, "z6Mkfoo/done").await;
-        let ids: Vec<(String, String)> =
-            sqlx::query_as("SELECT repo, id FROM sync_queue ORDER BY repo")
-                .fetch_all(&db.pool)
-                .await
-                .unwrap();
-        for (repo, id) in &ids {
-            if repo.ends_with("failed") {
-                db.mark_sync_failed(id).await.unwrap();
-            } else {
-                db.mark_sync_done(id).await.unwrap();
+                tx.commit().await.unwrap();
             }
         }
 
-        assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
-        assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
-        assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
+        run_migrations_up_to(&db, 9).await;
+
+        // Seed a repo and a pinned_cid, but no matching branch_cids entry.
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch, created_at, updated_at, disk_path)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        )
+        .bind("repo-orphan")
+        .bind("orphan-repo")
+        .bind("did:key:z6Mkworphan")
+        .bind("desc")
+        .bind(true)
+        .bind("main")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("/srv/orphan")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // This CID is a pinned object that is NOT a current ref tip —
+        // no matching row in branch_cids exists.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
+             VALUES ($1, $2, $3)",
+        )
+        .bind("orphan-sha")
+        .bind("orphan-cid")
+        .bind("2026-07-03T00:00:00Z")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Run remaining migrations (v10 = ref_cert_dedup, v11 = pinned_cids)
+        db.run_migrations().await.unwrap();
+
+        // The orphan pin should have fallen back to repo = '' because
+        // branch_cids had no matching cid to backfill from.
+        let row = sqlx::query(
+            "SELECT sha256_hex, repo, owner_did FROM pinned_cids WHERE sha256_hex = 'orphan-sha'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            row.get::<String, _>("repo"),
+            "",
+            "non-tip pin must fall back to empty repo"
+        );
+        assert_eq!(
+            row.get::<String, _>("owner_did"),
+            "",
+            "non-tip pin must fall back to empty owner_did"
+        );
     }
 }
 
@@ -4691,103 +5035,6 @@ mod dedup_db_tests {
         assert!(!got.is_public, "non-key row's is_public must be preserved");
     }
 
-    /// get_profile must not resolve a non-key DID (e.g. did:gitlawb:) when
-    /// queried with the bare short id. The old `LIKE '%:' || $1` clause was too
-    /// broad and could return the wrong profile row.
-    #[sqlx::test]
-    async fn get_profile_does_not_match_non_key_did(pool: PgPool) {
-        let db = db(pool).await;
-        let short = "z6Mkprof1";
-
-        // Seed only a non-key DID row first. When queried with the bare short ID,
-        // get_profile must return None (lone non-key fixture test).
-        db.upsert_profile(
-            &format!("did:gitlawb:{short}"),
-            Some("other-method"),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let got = db.get_profile(short).await.unwrap();
-        assert!(
-            got.is_none(),
-            "bare short id must not resolve a lone non-key DID profile"
-        );
-
-        // Now seed the canonical bare key profile row as well.
-        db.upsert_profile(short, Some("canonical"), None, None, None, None)
-            .await
-            .unwrap();
-
-        let got = db
-            .get_profile(short)
-            .await
-            .unwrap()
-            .expect("bare short id should resolve the key-form profile");
-        assert_eq!(got.did, short);
-        assert_eq!(got.display_name.as_deref(), Some("canonical"));
-
-        let got = db
-            .get_profile(&format!("did:key:{short}"))
-            .await
-            .unwrap()
-            .expect("did:key form should also resolve the key-form profile");
-        assert_eq!(got.did, short);
-
-        let got = db
-            .get_profile(&format!("did:gitlawb:{short}"))
-            .await
-            .unwrap()
-            .expect("full non-key DID should resolve its own profile");
-        assert_eq!(got.did, format!("did:gitlawb:{short}"));
-        assert_eq!(got.display_name.as_deref(), Some("other-method"));
-    }
-
-    /// upsert_profile must update a bare-stored profile when called with the
-    /// full did:key: form. get_profile equates the two, so the UPDATE has to
-    /// target existing.did rather than the raw input.
-    #[sqlx::test]
-    async fn upsert_profile_updates_via_did_key_alias(pool: PgPool) {
-        let db = db(pool).await;
-        let short = "z6Mkprof2";
-
-        db.upsert_profile(short, Some("before"), None, None, None, None)
-            .await
-            .unwrap();
-
-        let updated = db
-            .upsert_profile(
-                &format!("did:key:{short}"),
-                Some("after"),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(updated.did, short, "preserve the stored did form on update");
-        assert_eq!(updated.display_name.as_deref(), Some("after"));
-
-        let got = db
-            .get_profile(short)
-            .await
-            .unwrap()
-            .expect("profile should still resolve by bare short id");
-        assert_eq!(got.did, short);
-        assert_eq!(got.display_name.as_deref(), Some("after"));
-
-        db.set_profile_cid(&format!("did:key:{short}"), "bafytestcid")
-            .await
-            .unwrap();
-        let got = db.get_profile(short).await.unwrap().unwrap();
-        assert_eq!(got.profile_cid.as_deref(), Some("bafytestcid"));
-    }
-
     /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
     /// expression agree on every boundary value in the owner-key normalization
     /// set. A mismatch would let the Rust code bind a different key than the SQL
@@ -4834,49 +5081,6 @@ mod dedup_db_tests {
             assert_eq!(
                 sql_result, rust_result,
                 "normalize_owner_key(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
-            );
-        }
-    }
-
-    /// Verify that `PROFILE_DID_CASE_SQL` (which aliases the column `did`) also
-    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
-    #[sqlx::test]
-    async fn profile_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
-        let boundary_values = [
-            "did:key:z6Mkfoo",
-            "z6Mkfoo",
-            "did:gitlawb:z6Mkfoo",
-            "did:web:example.com:alice",
-            "did:key:did:gitlawb:z6Mkfoo",
-            "",
-            "did:key:",
-            "DID:KEY:z6Mkfoo",
-        ];
-
-        let values_sql: String = boundary_values
-            .iter()
-            .map(|v| format!("('{}'::text)", v))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "WITH data(did) AS (VALUES {values_sql})
-             SELECT did, ({key}) AS normalized FROM data ORDER BY did",
-            key = super::PROFILE_DID_CASE_SQL
-        );
-
-        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
-
-        assert_eq!(
-            rows.len(),
-            boundary_values.len(),
-            "every boundary value must produce a row"
-        );
-
-        for (val, sql_result) in &rows {
-            let rust_result = super::normalize_owner_key(val);
-            assert_eq!(
-                sql_result, rust_result,
-                "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
             );
         }
     }
@@ -6106,172 +6310,5 @@ mod ref_update_db_tests {
         let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].new_sha, "gggg");
-    }
-}
-
-#[cfg(test)]
-mod peer_reachability_tests {
-    use super::Db;
-    use sqlx::PgPool;
-
-    const VICTIM_DID: &str = "did:key:z6MkvictimPeerFixture";
-    const HONEST_URL: &str = "https://honest-peer.example.com";
-    const ATTACKER_URL: &str = "https://attacker.example.com";
-
-    async fn db(pool: PgPool) -> Db {
-        let db = Db::for_testing(pool);
-        db.run_migrations().await.unwrap();
-        db
-    }
-
-    /// Read the row back through `list_peers`, the same surface the federated
-    /// fan-out filters on, rather than issuing raw SQL from the test.
-    async fn peer(db: &Db, did: &str) -> (String, bool) {
-        let row = db
-            .list_peers()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|p| p.did == did)
-            .expect("seeded peer row is missing");
-        (row.http_url, row.last_ping_ok)
-    }
-
-    /// Parsed rather than string-compared, so the ordering assertion does not
-    /// depend on the stored timestamp's textual precision.
-    async fn last_seen(db: &Db, did: &str) -> chrono::DateTime<chrono::Utc> {
-        let row = db
-            .list_peers()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|p| p.did == did)
-            .expect("seeded peer row is missing");
-        chrono::DateTime::parse_from_rfc3339(&row.last_seen.expect("last_seen is set by upsert"))
-            .expect("last_seen is rfc3339")
-            .with_timezone(&chrono::Utc)
-    }
-
-    /// Seed a peer that has earned reachability, asserting the seed took so a
-    /// later case cannot pass vacuously on a row that was never written.
-    async fn seed_reachable(db: &Db) {
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
-        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
-        assert_eq!(
-            peer(db, VICTIM_DID).await,
-            (HONEST_URL.to_string(), true),
-            "seed did not take"
-        );
-    }
-
-    /// Repointing an existing peer's URL must drop the reachability gate: the
-    /// new host has not been probed, so it cannot inherit the old host's
-    /// earned `last_ping_ok`.
-    #[sqlx::test]
-    async fn url_change_clears_reachability(pool: PgPool) {
-        let db = db(pool).await;
-        seed_reachable(&db).await;
-
-        db.upsert_peer(VICTIM_DID, ATTACKER_URL).await.unwrap();
-
-        let (url, reachable) = peer(&db, VICTIM_DID).await;
-        assert_eq!(url, ATTACKER_URL, "the URL should still be rewritten");
-        assert!(
-            !reachable,
-            "a repointed peer must re-earn reachability, not inherit it"
-        );
-    }
-
-    /// A plain liveness re-announce carries the same URL and must not cost an
-    /// honest peer its place in the federated fan-out. Guards against a fix
-    /// that clears the flag on every conflict instead of only on a change.
-    #[sqlx::test]
-    async fn same_url_reannounce_keeps_reachability(pool: PgPool) {
-        let db = db(pool).await;
-        seed_reachable(&db).await;
-
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
-
-        let (url, reachable) = peer(&db, VICTIM_DID).await;
-        assert_eq!(url, HONEST_URL);
-        assert!(
-            reachable,
-            "an unchanged-URL re-announce must not drop the gate"
-        );
-    }
-
-    /// The must-not-grant direction. An unchanged URL preserves the flag as it
-    /// stands, which means FALSE stays FALSE: reachability is earned by a probe,
-    /// never by announcing. This is the only case that fails if the conditional
-    /// is flattened to `last_ping_ok = (peers.http_url IS NOT DISTINCT FROM $2)`,
-    /// which would let any unsigned same-URL re-announce set the flag TRUE.
-    #[sqlx::test]
-    async fn same_url_reannounce_does_not_grant_reachability(pool: PgPool) {
-        let db = db(pool).await;
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
-        assert_eq!(peer(&db, VICTIM_DID).await, (HONEST_URL.to_string(), false));
-
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
-
-        let (_, reachable) = peer(&db, VICTIM_DID).await;
-        assert!(
-            !reachable,
-            "announcing must never grant reachability without a probe"
-        );
-    }
-
-    /// A first insert stays out of the fan-out until a probe confirms it. Guards
-    /// against the conditional leaking into the INSERT branch.
-    #[sqlx::test]
-    async fn fresh_peer_inserts_unreachable(pool: PgPool) {
-        let db = db(pool).await;
-
-        db.upsert_peer("did:key:z6MkfreshPeerFixture", HONEST_URL)
-            .await
-            .unwrap();
-
-        let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
-        assert!(!reachable, "a never-probed peer must insert unreachable");
-    }
-
-    /// Comparison is exact, by decision: http_url is stored as announced and
-    /// nothing normalizes it, so a trailing slash is a different remote as far
-    /// as this row is concerned and clears the gate. Pins that decision against
-    /// a future normalizing comparison, which every other case here would pass
-    /// because they only ever compare identical or wholly different hosts.
-    #[sqlx::test]
-    async fn cosmetic_url_difference_counts_as_a_change(pool: PgPool) {
-        let db = db(pool).await;
-        seed_reachable(&db).await;
-
-        let with_slash = format!("{HONEST_URL}/");
-        db.upsert_peer(VICTIM_DID, &with_slash).await.unwrap();
-
-        let (url, reachable) = peer(&db, VICTIM_DID).await;
-        assert_eq!(url, with_slash);
-        assert!(
-            !reachable,
-            "comparison is exact, so a cosmetic difference clears the gate too"
-        );
-    }
-
-    /// The reset must ride the existing UPDATE, not gate it. Hoisting the
-    /// condition to a statement-level WHERE would leave every case above green
-    /// while silently skipping the whole update on a same-URL re-announce, so
-    /// liveness would stop advancing and the peer would age out on last_seen.
-    #[sqlx::test]
-    async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
-        let db = db(pool).await;
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
-        let first = last_seen(&db, VICTIM_DID).await;
-
-        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
-
-        let second = last_seen(&db, VICTIM_DID).await;
-        assert!(
-            second > first,
-            "a same-URL re-announce is a liveness signal and must still \
-             advance last_seen: {first} then {second}"
-        );
     }
 }

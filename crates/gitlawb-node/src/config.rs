@@ -234,6 +234,29 @@ pub struct Config {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub db_retry_max_secs: u64,
+
+    /// Maximum number of concurrent visibility walks (git rev-list / ls-tree)
+    /// across all IPFS pin listing requests.  Prevents a flood of signed
+    /// requests from exhausting the blocking-pool worker or leaving git
+    /// children running past their timeout (P1).
+    #[arg(long, env = "GITLAWB_WALK_CONCURRENCY_LIMIT", default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
+    pub walk_concurrency_limit: u32,
+
+    /// Per-DID rate limit for IPFS pin listing — requests per hour per DID.
+    /// The listing performs expensive git walks and cat-file probes, so a
+    /// throwaway DID with a valid signature can otherwise exhaust resources.
+    #[arg(long, env = "GITLAWB_IPFS_LIST_RATE_LIMIT", default_value_t = 60)]
+    pub ipfs_list_rate_limit: usize,
+
+    /// Global (non-sybil) rate limit for IPFS pin listing — total requests
+    /// per hour regardless of signed DID.  Prevents DID-rotation attacks
+    /// from bypassing the per-DID limiter (P1).
+    #[arg(
+        long,
+        env = "GITLAWB_IPFS_LIST_GLOBAL_RATE_LIMIT",
+        default_value_t = 1200
+    )]
+    pub ipfs_list_global_rate_limit: usize,
 }
 
 impl Config {

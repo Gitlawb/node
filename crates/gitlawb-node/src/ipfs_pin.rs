@@ -93,12 +93,18 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
 /// object's bytes. The twin in `pinata.rs` mirrors this shape — change both in
 /// lockstep.
 ///
+/// `repo_slug` and `owner_did` are recorded alongside each pin so the scoped
+/// listing query (`list_pinned_cids_for_repos`) can find them.  Pass empty
+/// strings if not available (the scoped listing will omit such pins).
+///
 /// Returns a list of `(sha256_hex, cid)` pairs for objects pinned this call.
 pub async fn pin_new_objects(
     ipfs_api: &str,
     repo_path: &std::path::Path,
     object_list: Vec<String>,
     db: &crate::db::Db,
+    repo_slug: &str,
+    owner_did: &str,
 ) -> Vec<(String, String)> {
     if ipfs_api.is_empty() {
         return vec![];
@@ -107,9 +113,16 @@ pub async fn pin_new_objects(
     let mut pinned = Vec::new();
 
     for sha in object_list {
-        // Skip if already pinned
+        // Check if already pinned.  Even when pinned, update the
+        // repo/owner_did association so the scoped listing query can
+        // find this object under the current repo (P2).
         match db.is_pinned(&sha).await {
-            Ok(true) => continue,
+            Ok(true) => {
+                if !repo_slug.is_empty() {
+                    let _ = db.update_pinned_cid_repo(&sha, repo_slug, owner_did).await;
+                }
+                continue;
+            }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(sha = %sha, err = %e, "DB error checking pinned status");
@@ -130,7 +143,10 @@ pub async fn pin_new_objects(
         // Pin to IPFS
         match pin_git_object(ipfs_api, &sha, &data).await {
             Ok(cid) if !cid.is_empty() => {
-                if let Err(e) = db.record_pinned_cid(&sha, &cid).await {
+                if let Err(e) = db
+                    .record_pinned_cid_full(&sha, &cid, repo_slug, owner_did)
+                    .await
+                {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinned CID in DB");
                 }
                 pinned.push((sha, cid));
