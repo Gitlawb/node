@@ -945,6 +945,20 @@ async fn lock_repo_slug(conn: &mut sqlx::PgConnection, slug: &str) -> Result<()>
     Ok(())
 }
 
+/// Normalize an `owner/name` slug to the exact string `delete_repo_by_id` builds its
+/// advisory-lock key from: `normalize_owner_key(owner)/name`, splitting at the first
+/// `/` (owners never contain `/`; DID owners use `:`). Writers that receive the slug
+/// as one string (`branch_cids.repo`, `sync_queue.repo`, `received_ref_updates.repo`)
+/// must lock this normalized form, not the verbatim input, or a full-DID caller would
+/// hash a different key than the purge and slip past the serialization. A string with
+/// no `/` is returned as-is; the purge never locks such a key, so it is inert.
+fn normalize_repo_slug(repo: &str) -> String {
+    match repo.split_once('/') {
+        Some((owner, name)) => format!("{}/{}", normalize_owner_key(owner), name),
+        None => repo.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod normalize_owner_key_tests {
     use super::normalize_owner_key;
@@ -1782,6 +1796,15 @@ impl Db {
         cid: &str,
         node_did: &str,
     ) -> Result<()> {
+        // `branch_cids` is one of the slug-scoped tables `delete_repo_by_id` cascades
+        // over. Take the shared advisory lock (same normalized slug the purge hashes)
+        // inside a tx so this row cannot land between the purge's point-in-time
+        // sibling check and its cascade deletes (which would strand an orphan row or
+        // half-wipe a live mirror's state). Single lock, nothing else held, so the
+        // ordering matches every other slug-lock site and cannot deadlock.
+        let slug = normalize_repo_slug(repo);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         sqlx::query(
             "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -1795,8 +1818,9 @@ impl Db {
         .bind(cid)
         .bind(node_did)
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1845,6 +1869,13 @@ impl Db {
         new_sha: &str,
         cid: Option<&str>,
     ) -> Result<()> {
+        // `sync_queue` is slug-scoped and cascaded by `delete_repo_by_id`; take the
+        // shared advisory lock on the same normalized slug so an enqueue cannot
+        // interleave with the purge's sibling-check-then-cascade (same shape and
+        // rationale as `upsert_branch_cid`; single lock, no deadlock exposure).
+        let slug = normalize_repo_slug(repo);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         sqlx::query(
             "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at)
              VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
@@ -1857,8 +1888,9 @@ impl Db {
         .bind(new_sha)
         .bind(cid)
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2537,6 +2569,14 @@ impl Db {
 
 impl Db {
     pub async fn insert_ref_update(&self, update: &ReceivedRefUpdate) -> Result<()> {
+        // `received_ref_updates` is slug-scoped and cascaded by `delete_repo_by_id`;
+        // take the shared advisory lock on the same normalized slug so a peer-fed
+        // insert cannot land inside the purge's sibling-check-then-cascade window
+        // (same shape and rationale as `upsert_branch_cid`; single lock, no deadlock
+        // exposure).
+        let slug = normalize_repo_slug(&update.repo);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         sqlx::query(
             "INSERT INTO received_ref_updates
              (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
@@ -2555,8 +2595,9 @@ impl Db {
         .bind(&update.cert_id)
         .bind(&update.received_at)
         .bind(&update.from_peer)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3993,15 +4034,18 @@ mod dedup_db_tests {
     /// AFTER that check but before/around the cascade would leave a half-wipe: the
     /// mirror's `repos` row survives while its live child rows / bounty are gone.
     ///
-    /// Deterministic race: hold a session advisory lock on the same `hashtextextended`
-    /// slug key the cascade locks on, so the spawned purge BLOCKS at the top of its tx
-    /// (before the sibling check). While it is parked, land the mirror's `repos` row
-    /// (what ingestion writes), then release the lock. With the lock in place the purge
-    /// resumes, its sibling check now SEES the mirror row, and it skips the cascade —
-    /// both the mirror row and its child rows survive (GREEN). Remove the
-    /// `lock_repo_slug` call from `delete_repo_by_id` and the purge no longer blocks: it
-    /// runs its sibling check before the mirror row exists, cascades, and half-wipes the
-    /// child rows / bounty while the mirror row (inserted afterwards) survives (RED).
+    /// Deterministic race, with BOTH sides going through the real code: hold a session
+    /// advisory lock on the same `hashtextextended` slug key both sides hash, spawn the
+    /// REAL `upsert_mirror_repo` (parks on its own `lock_repo_slug`, first in the wait
+    /// queue), assert the mirror row has NOT landed while parked, then spawn the purge
+    /// (parks second) and release. Advisory-lock waiters are granted FIFO, so the
+    /// ingest commits the mirror row first and the purge's sibling check then SEES it
+    /// and skips the cascade: mirror row, child rows, and bounty all survive (GREEN).
+    /// Remove `lock_repo_slug` from `upsert_mirror_repo` and the ingest no longer
+    /// parks: the mirror row appears while the session lock is still held and the
+    /// mid-park absence assert fails (RED). Remove it from `delete_repo_by_id` and the
+    /// purge no longer blocks: it runs its sibling check before the parked ingest has
+    /// committed, cascades, and half-wipes the child rows / bounty (RED).
     #[sqlx::test]
     async fn purge_serializes_with_mirror_ingest_via_advisory_lock(pool: PgPool) {
         let db = db(pool).await;
@@ -4060,40 +4104,60 @@ mod dedup_db_tests {
             .await
             .unwrap();
 
-        // Spawn the purge; with the lock present it parks at the top of its tx.
-        let pool_for_task = db.pool().clone();
-        let purge = tokio::spawn(async move {
-            Db::for_testing(pool_for_task)
-                .delete_repo_by_id("rid-purge-race-target")
+        // Spawn the REAL mirror ingest; its own `lock_repo_slug` inside
+        // `upsert_mirror_repo` parks it on the held session lock, first in the wait
+        // queue. Bare owner short form, so it normalizes to the identical slug the
+        // purge locks.
+        let pool_for_ingest = db.pool().clone();
+        let ingest = tokio::spawn(async move {
+            Db::for_testing(pool_for_ingest)
+                .upsert_mirror_repo(
+                    "z6MkPurgeRaceMirrorFixtureForLock",
+                    "victim",
+                    "/srv/mirror",
+                    None,
+                    false,
+                )
                 .await
         });
 
-        // Give the purge time to reach the lock wait (GREEN) or, without the lock, to
-        // run its whole sibling-check-then-cascade (RED) before the mirror row lands.
+        // Give the ingest time to reach the lock wait, then assert it is actually
+        // parked: the mirror row must NOT exist while the session lock is held. This
+        // is the load-bearing check for the ingest side; without `lock_repo_slug` in
+        // `upsert_mirror_repo` the insert lands during this sleep (RED).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let landed_early: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repos WHERE id=$1")
+            .bind(&slug)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            landed_early, 0,
+            "the real upsert_mirror_repo must block on the slug advisory lock, not insert past it"
+        );
+
+        // Spawn the purge; it parks on the same lock, second in the queue. Without
+        // `lock_repo_slug` in `delete_repo_by_id` it runs immediately instead: its
+        // sibling check sees no mirror row (the ingest is still parked), so it
+        // cascades the child rows and tombstones the bounty (RED below).
+        let pool_for_purge = db.pool().clone();
+        let purge = tokio::spawn(async move {
+            Db::for_testing(pool_for_purge)
+                .delete_repo_by_id("rid-purge-race-target")
+                .await
+        });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Mirror ingestion lands the colliding `repos` row (slug-form id, bare owner) —
-        // exactly what upsert_mirror_repo writes. Raw insert here so it does not contend
-        // on the advisory lock the test connection is holding.
-        sqlx::query(
-            "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch,
-                                created_at, updated_at, disk_path, machine_id, quarantined)
-             VALUES ($1, 'victim', 'z6MkPurgeRaceMirrorFixtureForLock', 'mirrored from peer',
-                     true, 'main', '2026-02-01T00:00:00Z', '2026-02-01T00:00:00Z',
-                     '/srv/mirror', NULL, false)",
-        )
-        .bind(&slug)
-        .execute(db.pool())
-        .await
-        .unwrap();
-
-        // Release the lock so the purge can proceed (and observe the mirror row).
+        // Release the lock. Advisory-lock waiters are woken FIFO: the ingest (queued
+        // first) commits the mirror row, then the purge acquires the lock and its
+        // sibling check observes the committed row.
         sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
             .bind(&slug)
             .execute(&mut *lock_conn)
             .await
             .unwrap();
 
+        ingest.await.unwrap().unwrap();
         let removed = purge.await.unwrap().unwrap();
         assert_eq!(removed, 1, "the empty canonical target row is purged");
 
