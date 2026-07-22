@@ -2752,8 +2752,12 @@ mod tests {
             downloads: downloads.clone(),
             extracted: extracted.clone(),
         };
-        let store = RepoStore::new(tmp.path().to_path_buf(), Some(std::sync::Arc::new(ts)), pool)
-            .with_release_upload_timeout(std::time::Duration::from_millis(150));
+        let store = RepoStore::new(
+            tmp.path().to_path_buf(),
+            Some(std::sync::Arc::new(ts)),
+            pool,
+        )
+        .with_release_upload_timeout(std::time::Duration::from_millis(150));
         let owner = "did:key:z6MkF3ResurrectTempDirAAAAAAAAAAAAAAAAAAAA";
         let name = "f3resurrect";
         let dir = repo_dir_of(tmp.path(), owner, name);
