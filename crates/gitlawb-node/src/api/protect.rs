@@ -79,12 +79,14 @@ pub async fn unprotect_branch(
 pub async fn list_protected_branches(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    // Read-visibility-gated (INV-2 root listing): a public repo's protected
+    // branches stay anonymously listable; a private repo's branch names are
+    // hidden (404) from anyone who cannot read it at the root.
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let branches = state.db.list_protected_branches(&record.id).await?;
 

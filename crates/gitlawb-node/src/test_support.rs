@@ -626,6 +626,1093 @@ mod tests {
         );
     }
 
+    /// #94: list_webhooks is gated read-visibility THEN owner. Webhook callback
+    /// URLs are owner-secret, so the listing must hide a private repo's existence
+    /// (404, uniform with the read-visibility siblings) and 403 a non-owner of a
+    /// public repo, while a headerless caller gets 401 (no anonymous form). Mounts
+    /// the handler directly (it sits on `optional_signature`, so the handler does
+    /// its own check) and seeds a real webhook so a leak would surface in the body.
+    #[sqlx::test]
+    async fn list_webhooks_is_owner_gated(pool: PgPool) {
+        let owner = "did:key:zHOOKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zHOOKSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "hook-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "hook-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let secret_url = "https://hooks.example.com/sekret-endpoint";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .create_webhook(&crate::db::Webhook {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    repo_id: repo.id.clone(),
+                    url: secret_url.to_string(),
+                    secret: Some("topsecret".to_string()),
+                    events: vec!["*".to_string()],
+                    created_by_did: owner.to_string(),
+                    created_at: Utc::now().to_rfc3339(),
+                    active: true,
+                })
+                .await
+                .expect("seed webhook");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/hooks",
+                    axum::routing::get(crate::api::webhooks::list_webhooks),
+                )
+                .with_state(state.clone())
+        };
+        let body_text = |resp_body: &[u8]| String::from_utf8_lossy(resp_body).to_string();
+
+        // Owner on the public repo → 200, hook listed, secret redacted, url present.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-pub/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner must read its own hooks"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let txt = body_text(&bytes);
+        assert!(
+            txt.contains(secret_url),
+            "owner response must include the url"
+        );
+        assert!(txt.contains("***"), "secret must stay redacted");
+        assert!(
+            !txt.contains("topsecret"),
+            "the real secret must never appear"
+        );
+
+        // Non-owner of a PUBLIC repo → 403 (repo is public, existence not secret).
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-pub/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner of a public repo must be forbidden, not served"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body_text(&bytes).contains(secret_url),
+            "403 must not leak the url"
+        );
+
+        // Non-owner of a PRIVATE repo → 404 (existence hidden, uniform with siblings).
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-priv/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader of a private repo must get 404, not 403/200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body_text(&bytes).contains(secret_url),
+            "404 must not leak the url"
+        );
+
+        // Owner of a PRIVATE repo → 200 (both guards pass: read-visibility admits
+        // the owner, then require_repo_owner admits the owner). Exercises the
+        // both-pass branch the public/owner case does not, and confirms redaction.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-priv/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the owner must read its own private repo's hooks"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let txt = body_text(&bytes);
+        assert!(
+            txt.contains(secret_url),
+            "owner of private repo sees the url"
+        );
+        assert!(
+            txt.contains("***"),
+            "secret stays redacted on the private repo"
+        );
+
+        // Headerless (no AuthenticatedDid) → 401: a webhook listing has no anon form.
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/hook-pub/hooks"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a headerless caller must get 401"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/does-not-exist/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #94: a visibility READER who is not the owner passes the read gate but is
+    /// still refused the webhook list (the require_repo_owner half), and the
+    /// headerless 401 fires before any lookup so it cannot be an existence oracle
+    /// (headerless on an existing private repo and on an absent repo both 401).
+    #[sqlx::test]
+    async fn list_webhooks_reader_403_and_no_existence_oracle(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zHKRDROWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zHKRDRREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "hook-reader");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // Root allow-list rule: `reader` may read the repo at "/", but is not the owner.
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        let secret_url = "https://hooks.example.com/reader-case";
+        state
+            .db
+            .create_webhook(&crate::db::Webhook {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                url: secret_url.to_string(),
+                secret: None,
+                events: vec!["*".to_string()],
+                created_by_did: owner.to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                active: true,
+            })
+            .await
+            .expect("seed webhook");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/hooks",
+                    axum::routing::get(crate::api::webhooks::list_webhooks),
+                )
+                .with_state(state.clone())
+        };
+
+        // A listed reader passes authorize_repo_read but is not the owner → 403,
+        // and the webhook url does not leak.
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-reader/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner reader passes the read gate but is refused the webhook list"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(secret_url),
+            "403 must not leak the url to a reader"
+        );
+
+        // Existence-oracle check: headerless on the existing private repo → 401,
+        // headerless on an absent repo → 401. Indistinguishable ⇒ no oracle.
+        let headerless = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router()
+            .oneshot(headerless(format!(
+                "/api/v1/repos/{owner}/hook-reader/hooks"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "headerless on an existing private repo → 401 (before any lookup)"
+        );
+        let resp = router()
+            .oneshot(headerless(format!(
+                "/api/v1/repos/{owner}/no-such-repo/hooks"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "headerless on an absent repo → 401 too, so existence does not leak"
+        );
+    }
+
+    /// #94: the read-visibility surfaces admit a listed reader who is NOT the
+    /// owner (the allow-list branch of visibility_check). Pins that a private
+    /// repo's reader — not just its owner — can read replicas and protected
+    /// branches, while a non-reader stranger still 404s.
+    #[sqlx::test]
+    async fn read_visibility_admits_listed_reader(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zRDRDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zRDRDREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zRDRDSTRGRCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "rdr-repo");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .register_replica(&repo.id, stranger, "https://replica.example.com/x")
+            .await
+            .expect("seed replica");
+        state
+            .db
+            .protect_branch(&repo.id, "main", owner)
+            .await
+            .expect("seed protected branch");
+
+        let call = |handler_router: Router, did: Option<&str>, uri: String| {
+            let req = match did {
+                Some(d) => signed_request_as(d, Method::GET, &uri, Body::empty()),
+                None => Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            };
+            handler_router.oneshot(req)
+        };
+
+        let replicas_router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::get(crate::api::replicas::list_replicas),
+                )
+                .with_state(state.clone())
+        };
+        let protect_router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/branches/protected",
+                    axum::routing::get(crate::api::protect::list_protected_branches),
+                )
+                .with_state(state.clone())
+        };
+
+        // Listed reader (non-owner) → 200 on both surfaces.
+        for (router, path) in [
+            (replicas_router(), "replicas"),
+            (protect_router(), "branches/protected"),
+        ] {
+            let resp = call(
+                router,
+                Some(reader),
+                format!("/api/v1/repos/{owner}/rdr-repo/{path}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a listed reader must read {path}"
+            );
+        }
+
+        // A non-reader stranger → 404 on both (deny path).
+        for (router, path) in [
+            (replicas_router(), "replicas"),
+            (protect_router(), "branches/protected"),
+        ] {
+            let resp = call(
+                router,
+                Some(stranger),
+                format!("/api/v1/repos/{owner}/rdr-repo/{path}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "a non-reader stranger must be denied {path}"
+            );
+        }
+    }
+
+    /// #94 sibling: list_replicas is read-visibility-gated. Replica lists are a
+    /// documented public mirror-discovery surface, so a PUBLIC repo stays
+    /// anonymously listable, but a PRIVATE repo must not leak its replica URLs.
+    /// register_replica registers NON-owner DIDs (it rejects the owner), and a
+    /// replica operator is not a visibility reader, so a non-owner replica
+    /// operator of a private repo gets 404 — the intended contract, pinned here.
+    #[sqlx::test]
+    async fn list_replicas_is_read_visibility_gated(pool: PgPool) {
+        let owner = "did:key:zREPLOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let replica_op = "did:key:zREPLOPERATORBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "repl-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "repl-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let replica_url = "https://replica.example.com/mirror-endpoint";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .register_replica(&repo.id, replica_op, replica_url)
+                .await
+                .expect("seed replica");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::get(crate::api::replicas::list_replicas),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains(replica_url);
+        let anon = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Public repo, anonymous → 200, replicas listed (mirror-discovery preserved).
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/repl-pub/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public replica list stays anonymous"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "public response must include the replica url"
+        );
+
+        // Private repo, anonymous → 404, no replica URL leaked.
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/repl-priv/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "private replica list is hidden from anon"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the replica url");
+
+        // Private repo, owner → 200.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/repl-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private replica list"
+        );
+
+        // Private repo, the non-owner replica operator → 404 (intended contract:
+        // a replica operator is not a visibility reader).
+        let resp = router()
+            .oneshot(signed_request_as(
+                replica_op,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/repl-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-owner replica operator of a private repo is not a reader"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/no-such-repo/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #94 sibling: list_labels is read-visibility-gated. A public repo's labels
+    /// stay anonymously listable; a private repo's label names must not leak to a
+    /// non-reader (404). A listed reader of the private repo reads the label; the
+    /// owner reads it; a non-reader stranger 404s.
+    #[sqlx::test]
+    async fn list_labels_is_read_visibility_gated(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zLBLOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zLBLREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zLBLSTRGRCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "lbl-priv");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .add_label(&repo.id, "bug")
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels",
+                    axum::routing::get(crate::api::labels::list_labels),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains("bug");
+        let uri = format!("/api/v1/repos/{owner}/lbl-priv/labels");
+
+        // Owner (signed) → 200, sees the label.
+        let resp = router()
+            .oneshot(signed_request_as(owner, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(leaks(&bytes), "owner response must include the label");
+
+        // Listed reader (signed, non-owner) → 200, sees the label.
+        let resp = router()
+            .oneshot(signed_request_as(reader, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader reads the labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "listed reader response must include the label"
+        );
+
+        // Non-reader stranger (signed) → 404, no label leaked.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader stranger is denied the private labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the label name");
+
+        // Anonymous on the private repo → 404.
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "anon is denied the private labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "anon 404 must not leak the label name");
+
+        // Public repo, anonymous → 200, label visible. The gate must not break
+        // the existing anonymous read path for public repos.
+        let pub_repo = seed_repo(owner, "lbl-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        state
+            .db
+            .add_label(&pub_repo.id, "pubtag")
+            .await
+            .expect("seed public label");
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/lbl-pub/labels"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a public repo's labels stay anonymously listable"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("pubtag"),
+            "public anon response must include the label"
+        );
+
+        // Absent repo → 404 (uniform with the non-reader denial; no 500).
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/no-such-repo/labels"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #94 sibling: list_protected_branches is read-visibility-gated. A public
+    /// repo's protected-branch listing stays anonymous; a private repo must not
+    /// leak its branch names to a non-reader (404, uniform no-existence-oracle).
+    #[sqlx::test]
+    async fn list_protected_branches_is_read_visibility_gated(pool: PgPool) {
+        let owner = "did:key:zPROTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "prot-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "prot-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let secret_branch = "release-embargoed";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .protect_branch(&repo.id, secret_branch, owner)
+                .await
+                .expect("seed protected branch");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/branches/protected",
+                    axum::routing::get(crate::api::protect::list_protected_branches),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains(secret_branch);
+        let anon = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Public repo, anonymous → 200, branch listed.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/prot-pub/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public protected-branch list stays anonymous"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "public response must include the branch name"
+        );
+
+        // Private repo, anonymous → 404, no branch name leaked.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/prot-priv/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "private branch list hidden from anon"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the branch name");
+
+        // Private repo, owner → 200, branch listed.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/prot-priv/branches/protected"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private protected branches"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/no-such-repo/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #113: the events read-gate admits a listed reader (the allow-list branch
+    /// of visibility_check), not just the owner — parity with the replica and
+    /// protected-branch surfaces covered by `read_visibility_admits_listed_reader`.
+    /// A non-reader stranger still 404s with no leak.
+    #[sqlx::test]
+    async fn list_repo_events_admits_listed_reader(pool: PgPool) {
+        use crate::db::{RefCertificate, VisibilityMode};
+        let owner = "did:key:zEVTRDROWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zEVTRDRREADERBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zEVTRDRSTRGRCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "evt-rdr");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .insert_ref_certificate(&RefCertificate {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                ref_name: "refs/heads/embargo-rdr".to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: "rdrsha00".to_string(),
+                pusher_did: owner.to_string(),
+                node_did: owner.to_string(),
+                signature: "sig".to_string(),
+                issued_at: Utc::now().to_rfc3339(),
+            })
+            .await
+            .expect("seed private cert");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/events",
+                    axum::routing::get(crate::api::events::list_repo_events),
+                )
+                .with_state(state.clone())
+        };
+        let uri = format!("/api/v1/repos/{owner}/evt-rdr/events");
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).to_string();
+
+        // Listed reader (non-owner) → 200, the private cert is served.
+        let resp = router()
+            .oneshot(signed_request_as(reader, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader (non-owner) must read events"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            text(&bytes).contains("embargo-rdr"),
+            "listed reader sees the private cert"
+        );
+
+        // A non-reader stranger → 404, and the cert ref does not leak.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader stranger must 404"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !text(&bytes).contains("embargo-rdr"),
+            "404 must not leak the cert ref"
+        );
+        assert!(
+            !text(&bytes).contains("rdrsha00"),
+            "404 must not leak the cert sha"
+        );
+    }
+
+    /// #113 fail-closed: when the repo lookup ERRORS (not a clean Ok(None)), the
+    /// visibility gate must not be skipped. The buggy `.ok().flatten()` collapsed an
+    /// Err into None, so a transient DB failure during the lookup dropped the gate
+    /// and the handler served the private repo's gossip ref-updates via the
+    /// ungated None branch (slug taken from the URL owner segment). We force a
+    /// deterministic get_repo error by dropping the column its SELECT reads, then
+    /// require the handler to fail closed (500, no secret) instead of 200-with-secret.
+    #[sqlx::test]
+    async fn list_repo_events_fails_closed_when_repo_lookup_errors(pool: PgPool) {
+        use crate::db::ReceivedRefUpdate;
+        let owner = "did:key:zEVTERRAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // Caller addresses the repo by the full key part (the slug gossip rows use),
+        // so the buggy None-branch fallback slug matches the seeded private update.
+        let keypart = owner.split(':').next_back().unwrap();
+        let state = test_state(pool.clone()).await;
+
+        let mut priv_repo = seed_repo(owner, "evt-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        state
+            .db
+            .insert_ref_update(&ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: owner.to_string(),
+                pusher_did: owner.to_string(),
+                repo: format!("{keypart}/evt-priv"),
+                ref_name: "refs/heads/embargo-gossip".to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: "gossipSEKRET".to_string(),
+                timestamp: Utc::now().to_rfc3339(),
+                cert_id: None,
+                received_at: Utc::now().to_rfc3339(),
+                from_peer: "peer".to_string(),
+                owner_did: None,
+            })
+            .await
+            .expect("seed private gossip update");
+
+        // Force get_repo's SELECT (which reads machine_id, db/mod.rs) to error,
+        // simulating a transient DB failure during the visibility lookup. The repo
+        // row and the gossip update both remain present.
+        // Precondition: the lookup must succeed before we break it, otherwise the
+        // injection proves nothing.
+        state
+            .db
+            .get_repo(keypart, "evt-priv")
+            .await
+            .expect("pre-drop lookup must succeed")
+            .expect("private repo row must be present pre-drop");
+        sqlx::query("ALTER TABLE repos DROP COLUMN machine_id")
+            .execute(&pool)
+            .await
+            .expect("drop column to force a get_repo error");
+        // Guard the injection: if a future refactor drops machine_id from get_repo's
+        // SELECT, this assertion fails loudly instead of letting the test pass
+        // vacuously (get_repo would return Ok and the gate, not the error path,
+        // would drive the response).
+        assert!(
+            state.db.get_repo(keypart, "evt-priv").await.is_err(),
+            "dropping machine_id must make get_repo error, else this test no longer exercises the Err path"
+        );
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/events",
+                axum::routing::get(crate::api::events::list_repo_events),
+            )
+            .with_state(state.clone());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{keypart}/evt-priv/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Fail closed: a lookup error must surface as 500, never a 200 that serves
+        // the private repo's ref metadata through the ungated branch.
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a repo-lookup error must fail closed, not skip the gate"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(
+            !body.contains("gossipSEKRET"),
+            "fail-closed response must not leak the gossip secret"
+        );
+    }
+
+    /// #94 end-to-end seam: a REAL RFC-9421 signature produced exactly as the gl
+    /// client's get_signed does (gitlawb_core::http_sig::sign_request over GET +
+    /// empty body) is accepted by the node's actual optional_signature middleware,
+    /// which verifies it and injects AuthenticatedDid, so the owner's signed
+    /// `gl webhook list` resolves to 200. This stitches the gl signing side and
+    /// the node verifying side in one test (not mockito on one end and a unit
+    /// verify on the other).
+    #[sqlx::test]
+    async fn list_webhooks_accepts_a_real_gl_signature_e2e(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        // Short owner form in the URL path: no colons (so the signed @path and the
+        // node's path_and_query() match byte-for-byte), and get_repo's owner LIKE
+        // match + did_matches still authorize the full-DID signer as the owner.
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+        let repo = seed_repo(&owner_did, "real-sig-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let url = "https://hooks.example.com/e2e";
+        state
+            .db
+            .create_webhook(&crate::db::Webhook {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                url: url.to_string(),
+                secret: None,
+                events: vec!["*".to_string()],
+                created_by_did: owner_did.clone(),
+                created_at: Utc::now().to_rfc3339(),
+                active: true,
+            })
+            .await
+            .expect("seed webhook");
+
+        let path = format!("/api/v1/repos/{short}/real-sig-repo/hooks");
+        let signed = sign_request(&kp, "GET", &path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        // Mount the handler UNDER the production optional_signature middleware so
+        // the node actually verifies the signature (not the injected-DID shortcut).
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/hooks",
+                axum::routing::get(crate::api::webhooks::list_webhooks),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state);
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the node must verify a real gl-style signature and authorize the owner"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(url),
+            "the verified owner sees the webhook list"
+        );
+    }
+
     /// Issue #6 / jatmn finding 2: `/api/v1/stats` counts logical repos, not raw
     /// rows. With a mirror+canonical pair and a standalone repo present, the
     /// `repos` count is 2.
@@ -3379,6 +4466,172 @@ mod tests {
         );
     }
 
+    // ── Ref-update events (issue #144: owner_did wire format) ─────────────────
+
+    fn events_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/events/ref-updates",
+                axum::routing::get(crate::api::events::list_ref_updates),
+            )
+            .with_state(state)
+    }
+
+    #[sqlx::test]
+    async fn events_returns_inserted_ref_updates(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zEVENTSOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Seed a local repo the wire owner_did is bound to. The stored wire
+        // owner_did is untrusted; it is only surfaced when it matches the
+        // canonical owner of the local repo the slug names.
+        state
+            .db
+            .create_repo(&seed_repo(owner, "myrepo"))
+            .await
+            .unwrap();
+
+        // Insert a gossip event with owner_did set
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/myrepo", owner.split(':').next_back().unwrap()),
+                owner_did: Some(owner.into()),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["repo"],
+            format!("{}/myrepo", owner.split(':').next_back().unwrap())
+        );
+        assert_eq!(events[0]["owner_did"], owner);
+    }
+
+    // P1: a peer-supplied owner_did that does NOT match the canonical owner of
+    // the local repo the slug names must NOT be surfaced. Here zVictim asserts
+    // ownership of alice's widget repo; the projection must drop it to null
+    // rather than poisoning persisted event ownership.
+    #[sqlx::test]
+    async fn events_drop_forged_peer_owner_did(pool: PgPool) {
+        let state = test_state(pool).await;
+        let alice = "did:key:zALICEOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let victim = "did:key:zVICTIMOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        state
+            .db
+            .create_repo(&seed_repo(alice, "widget"))
+            .await
+            .unwrap();
+
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/widget", alice.split(':').next_back().unwrap()),
+                owner_did: Some(victim.into()),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        // Forged value dropped: owner_did is null, NOT zVictim.
+        assert_eq!(events[0]["owner_did"], serde_json::Value::Null);
+    }
+
+    // P3: a legacy row stored with owner_did = None must be attributed only via
+    // an exact, unique local match — never a loose prefix-tolerant collision.
+    // alice/widget is owned by alice; a stray None row on a different repo whose
+    // owner key shares a segment must not inherit alice's full DID.
+    #[sqlx::test]
+    async fn events_legacy_none_owner_uses_exact_local_match(pool: PgPool) {
+        let state = test_state(pool).await;
+        let alice = "did:key:zALICEOWNER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let bob = "did:key:zBOBOWNER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Alice owns "widget".
+        state
+            .db
+            .create_repo(&seed_repo(alice, "widget"))
+            .await
+            .unwrap();
+        // Bob owns a distinct "gadget" repo.
+        state
+            .db
+            .create_repo(&seed_repo(bob, "gadget"))
+            .await
+            .unwrap();
+
+        // Legacy None row claiming slug "bob/gadget" (matches bob exactly).
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/gadget", bob.split(':').next_back().unwrap()),
+                owner_did: None,
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        // Attributed to the exact local owner (bob), not alice via collision.
+        assert_eq!(
+            events[0]["owner_did"],
+            serde_json::Value::String(bob.to_string())
+        );
+    }
+
     #[sqlx::test]
     async fn list_all_bounties_past_private_window_finds_public(pool: PgPool) {
         let state = test_state(pool).await;
@@ -3547,6 +4800,42 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn events_limit_respects_limit_param(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zEVENTLIMITAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        for i in 0..5 {
+            state
+                .db
+                .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    node_did: "did:key:zNode".into(),
+                    pusher_did: "did:key:zPusher".into(),
+                    repo: format!("{}/r{i}", owner.split(':').next_back().unwrap()),
+                    owner_did: Some(owner.into()),
+                    ref_name: "refs/heads/main".into(),
+                    old_sha: "0000000000000000000000000000000000000000".into(),
+                    new_sha: format!("{i:040x}"),
+                    timestamp: format!("2026-07-02T12:00:{i:02}Z"),
+                    cert_id: None,
+                    received_at: format!("2026-07-02T12:00:{i:02}Z"),
+                    from_peer: "12D3KooWTest".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates?limit=2"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"].as_i64(), Some(2));
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
     }
 
     #[sqlx::test]

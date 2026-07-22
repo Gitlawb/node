@@ -57,6 +57,7 @@ pub struct RefUpdateType {
     pub pusher_did: String,
     pub node_did: String,
     pub timestamp: String,
+    pub owner_did: Option<String>,
 }
 
 #[derive(SimpleObject, Clone)]

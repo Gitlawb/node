@@ -64,6 +64,12 @@ fn sanitize_excerpt(s: &str) -> String {
             }
             continue;
         }
+        if gitlawb_core::sanitize::is_bidi_format(ch) {
+            // Drop Cf bidi/format controls (INV-6, #183) without setting
+            // pending_space: they are not whitespace, so stripping leaves no
+            // phantom gap.
+            continue;
+        }
         if ch.is_whitespace() {
             pending_space = true;
             continue;
@@ -422,11 +428,51 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_bidi_format_controls() {
+        // The Cc-only test above is vacuous for Cf: it passes whether or not bidi
+        // controls survive, which is why this gap shipped (#183). Here every Cf
+        // bidi class is stripped — override (RLO), embedding + pop (LRE/PDF),
+        // isolate (LRI/PDI), marks (LRM/ALM) — asserted per code point, and the
+        // visible words JOIN with no phantom space (a bidi char is dropped like a
+        // control byte, but unlike a newline/tab it is not whitespace). The leading
+        // bidi char (index 0) also exercises the empty-out path.
+        let out = sanitize_excerpt("\u{202e}err\u{202a}\u{202c}\u{2066}\u{2069}\u{200e}\u{061c}ok");
+        for c in [
+            '\u{202e}', '\u{202a}', '\u{202c}', '\u{2066}', '\u{2069}', '\u{200e}', '\u{061c}',
+        ] {
+            assert!(!out.contains(c), "bidi U+{:04X} leaked: {out:?}", c as u32);
+        }
+        assert_eq!(out, "errok");
+    }
+
+    #[test]
+    fn sanitize_preserves_legitimate_and_rtl_text() {
+        // Must not over-strip: plain text, a genuine RTL SCRIPT letter (Arabic
+        // U+0627, category Lo), and ZWJ (U+200D, a legitimate Cf char) survive.
+        assert_eq!(
+            sanitize_excerpt("ok \u{0627}\u{200D}b"),
+            "ok \u{0627}\u{200D}b"
+        );
+    }
+
+    #[test]
     fn sanitize_collapses_whitespace_and_caps_length() {
         let collapsed = sanitize_excerpt("a\n\n\t  b");
         assert_eq!(collapsed, "a b");
         let long = "x".repeat(MAX_ERR_CHARS + 500);
         assert_eq!(sanitize_excerpt(&long).chars().count(), MAX_ERR_CHARS);
+    }
+
+    #[test]
+    fn sanitize_bidi_chars_do_not_consume_the_length_cap() {
+        // A dropped bidi char must not count toward MAX_ERR_CHARS: it is dropped
+        // before `kept` increments, so interleaving bidi controls cannot truncate
+        // the visible output early. MAX_ERR_CHARS + 100 visible 'x', each trailed by
+        // a bidi override, must still yield exactly MAX_ERR_CHARS visible 'x' with
+        // no phantom spaces. (Would regress to fewer 'x' if bidi consumed budget, or
+        // to spaces if the drop branch wrongly set pending_space.)
+        let body = "x\u{202e}".repeat(MAX_ERR_CHARS + 100);
+        assert_eq!(sanitize_excerpt(&body), "x".repeat(MAX_ERR_CHARS));
     }
 
     // ── P2: never talk to (or hand a key to) an untrusted node-chosen URL ──
