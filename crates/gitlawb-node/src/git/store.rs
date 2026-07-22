@@ -138,7 +138,11 @@ pub fn restore_refs(repo_path: &Path, snapshot: &[(String, String)]) -> Result<(
     }
 
     if !errors.is_empty() {
-        bail!("failed to restore {} ref(s): {}", errors.len(), errors.join("; "));
+        bail!(
+            "failed to restore {} ref(s): {}",
+            errors.len(),
+            errors.join("; ")
+        );
     }
     Ok(())
 }

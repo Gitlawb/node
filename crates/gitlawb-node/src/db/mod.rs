@@ -1054,7 +1054,7 @@ impl Db {
         // both call sites hash the identical slug string.
         let slug = format!("{}/{}", normalize_owner_key(owner_short), name);
         let mut tx = self.pool.begin().await?;
-        lock_repo_slug(&mut *tx, &slug).await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         // `quarantined` is set only on first insert (the admission decision).
         // A re-sync (ON CONFLICT) preserves the existing flag — admission runs
         // once, and an operator's later release must not be silently reverted.
@@ -1373,7 +1373,7 @@ impl Db {
         // identical slug string BEFORE the sibling check below, so a peer-sync insert
         // cannot land between that point-in-time check and the slug-scoped cascade
         // deletes (which would half-wipe the live mirror). Auto-released on commit.
-        lock_repo_slug(&mut *tx, &slug).await?;
+        lock_repo_slug(&mut tx, &slug).await?;
 
         // Grandchildren first: PR reviews/comments key on pr_id, so delete them
         // before the parent PRs vanish.
@@ -4019,10 +4019,7 @@ mod dedup_db_tests {
 
         // The mirror's slug-scoped live state, keyed on the shared slug. The mirror's
         // `repos` row is deliberately NOT present yet — ingestion lands it mid-race.
-        let slug = format!(
-            "{}/victim",
-            crate::db::normalize_owner_key(owner)
-        );
+        let slug = format!("{}/victim", crate::db::normalize_owner_key(owner));
         sqlx::query(
             "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
              VALUES ($1, 'refs/heads/main', '1', 'cid', 'n', '2026-02-01T00:00:00Z')",
