@@ -71,6 +71,10 @@ pub async fn remove_label(
 }
 
 /// GET /api/v1/repos/:owner/:repo/labels
+///
+/// Read-visibility-gated (INV-2 root listing): a public repo's labels stay
+/// anonymously listable; a private repo's label names are hidden (404) from
+/// anyone who cannot read it at the root.
 pub async fn list_labels(
     State(state): State<AppState>,
     Path((owner, name)): Path<(String, String)>,

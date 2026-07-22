@@ -172,6 +172,7 @@ mod authz_guard {
         let issues = include_str!("issues.rs");
         let bounties = include_str!("bounties.rs");
         let replicas = include_str!("replicas.rs");
+        let events = include_str!("events.rs");
         let tasks = include_str!("tasks.rs");
         let stars = include_str!("stars.rs");
         let protect = include_str!("protect.rs");
@@ -187,6 +188,13 @@ mod authz_guard {
             (pulls, "merge_pr", "require_repo_owner("),
             (webhooks, "create_webhook", "require_repo_owner("),
             (webhooks, "delete_webhook", "require_repo_owner("),
+            // Bucket A/B hybrid — list_webhooks is read-visibility THEN owner:
+            // authorize_repo_read 404s a non-reader of a private repo, then
+            // require_repo_owner 403s a non-owner of a public one. Both halves
+            // are pinned: the authorize_repo_read marker guards the read half
+            // (existence hiding) and require_repo_owner guards the owner half.
+            (webhooks, "list_webhooks", "authorize_repo_read("),
+            (webhooks, "list_webhooks", "require_repo_owner("),
             (labels, "add_label", "require_repo_owner("),
             (labels, "remove_label", "require_repo_owner("),
             // Bucket A' — owner OR author (did_matches against the author)
@@ -203,6 +211,12 @@ mod authz_guard {
             // get_by_cid gates each iterated repo row directly via visibility_check
             // (KTD2a: it must NOT route through authorize_repo_read's fuzzy re-resolve).
             (ipfs, "get_by_cid", "visibility_check("),
+            // #94 sibling read surfaces: gate private-repo metadata on read
+            // visibility (public repos stay anonymous; private repos 404).
+            (replicas, "list_replicas", "authorize_repo_read("),
+            (protect, "list_protected_branches", "authorize_repo_read("),
+            (labels, "list_labels", "authorize_repo_read("),
+            (events, "list_repo_events", "authorize_repo_read("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),
@@ -509,11 +523,7 @@ mod authz_guard {
 
         // Repo-scoped reads known to be ungated today, each tracked by an issue.
         // Remove an entry the moment its gate lands (the staleness assert enforces it).
-        let known_ungated: &[(&str, &str)] = &[
-            ("list_webhooks", "#94 (PR #113)"),
-            ("list_replicas", "PR #113"),
-            ("list_protected_branches", "PR #113"),
-        ];
+        let known_ungated: &[(&str, &str)] = &[];
         let is_known = |n: &str| known_ungated.iter().any(|(k, _)| *k == n);
         // Any one of these = the handler binds the caller to an authz decision: the
         // first two are read gates, the rest are the write/owner/self-binding forms.
