@@ -59,7 +59,7 @@ pub async fn run(args: StatusArgs) -> Result<()> {
             println!("  repo      {short_did}/{repo}");
         }
         None => {
-            println!("  repo      (not in a gitlawb repo — no gitlawb:// origin)");
+            println!("  repo      (not in a gitlawb repo — no gitlawb:// remote)");
         }
     }
 
@@ -143,29 +143,61 @@ fn trust_bar(score: f64) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(empty))
 }
 
-/// Parse `gitlawb://<did>/<repo>` from the git origin remote.
+/// Find a `gitlawb://<did>/<repo>` remote in the current repo.
+///
+/// Checks `origin` first (clones), then `gitlawb` (the name `gl init` adds),
+/// then any other remote with a gitlawb:// URL.
 fn detect_gitlawb_remote() -> Option<(String, String)> {
     let out = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
+        .args(["remote"])
         .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     if !out.status.success() {
         return None;
     }
-    let url = String::from_utf8(out.stdout).ok()?;
-    let rest = url.trim().strip_prefix("gitlawb://")?;
-    let slash = rest.rfind('/')?;
-    let did = rest[..slash].to_string();
-    let repo = rest[slash + 1..].to_string();
-    if did.is_empty() || repo.is_empty() {
-        return None;
+    let names: Vec<String> = String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let preferred = ["origin", "gitlawb"];
+    let ordered = preferred
+        .iter()
+        .filter(|p| names.iter().any(|n| n == *p))
+        .map(|p| p.to_string())
+        .chain(
+            names
+                .iter()
+                .filter(|n| !preferred.contains(&n.as_str()))
+                .cloned(),
+        );
+
+    for name in ordered {
+        let Ok(out) = std::process::Command::new("git")
+            .args(["remote", "get-url", &name])
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if !out.status.success() {
+            continue;
+        }
+        let Ok(url) = String::from_utf8(out.stdout) else {
+            continue;
+        };
+        if let Some(parsed) = parse_gitlawb_url(&url) {
+            return Some(parsed);
+        }
     }
-    Some((did, repo))
+    None
 }
 
-/// Parse a gitlawb:// URL string into (did, repo) — extracted for testing.
-#[cfg(test)]
+/// Parse a gitlawb:// URL string into (did, repo).
 fn parse_gitlawb_url(url: &str) -> Option<(String, String)> {
     let rest = url.trim().strip_prefix("gitlawb://")?;
     let slash = rest.rfind('/')?;
