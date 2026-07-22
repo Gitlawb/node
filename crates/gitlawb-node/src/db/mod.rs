@@ -3900,7 +3900,6 @@ mod migration_tests {
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
     }
 
-
     /// Simulate an existing node at v9 with populated received_ref_updates,
     /// then apply the v11 migration and verify (a) owner_did IS NULL on
     /// existing rows, (b) the column exists and is nullable TEXT, and
