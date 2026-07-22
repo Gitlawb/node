@@ -2680,4 +2680,107 @@ mod tests {
             "a cold-read future cancelled mid-download must still free its map entry"
         );
     }
+
+    // ── F3: a timed-out cold read must not resurrect its abandoned temp dir ──
+
+    // An ObjectStore double that reproduces the detached-spawn_blocking
+    // resurrection. Its download() runs the extraction in spawn_blocking (as the
+    // real TigrisClient::download does) and awaits the join handle. A tokio
+    // timeout that fires while the blocking task runs does NOT cancel it:
+    // dropping the download future detaches the task, which then creates ("renames
+    // into place") the target path LATE — after the caller's temp-dir cleanup has
+    // already run. `extracted` is bumped once the blocking task has created the
+    // dir, so a test can wait for the extraction to actually land.
+    struct DetachExtractStore {
+        extract_delay: std::time::Duration,
+        downloads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        extracted: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::git::tigris::ObjectStore for DetachExtractStore {
+        async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        async fn upload(&self, _o: &str, _r: &str, _p: &std::path::Path) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn download(&self, _o: &str, _r: &str, p: &std::path::Path) -> anyhow::Result<()> {
+            self.downloads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let target = p.to_path_buf();
+            let delay = self.extract_delay;
+            let extracted = self.extracted.clone();
+            // Mirror TigrisClient::download: the extraction runs in spawn_blocking
+            // and we await the join. A timeout that drops THIS future detaches the
+            // blocking task, which finishes its "rename into place" after cleanup.
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(delay);
+                std::fs::create_dir_all(&target).unwrap();
+                // A marker so the resurrected dir looks like a real extraction.
+                std::fs::write(target.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+                extracted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+            Ok(())
+        }
+        async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // F3: a cold read whose download times out must not let the detached
+    // spawn_blocking extraction resurrect the abandoned temp dir after cleanup.
+    // The store's extraction lands well past the download timeout; the timeout
+    // fires, acquire bails, and the extraction then creates ("renames into place")
+    // temp.path(). The fix ties cleanup to the extraction's completion — a
+    // detached janitor awaits the download future to settle, then removes the temp
+    // dir — so no `.tmp-download.*` dir survives. Pre-fix the timeout arm drops the
+    // download future, the detached extraction recreates temp.path() AFTER the RAII
+    // guard's Drop, and it survives forever — the second poll never sees a clean
+    // parent -> RED.
+    #[sqlx::test]
+    async fn timed_out_cold_read_does_not_resurrect_temp_dir(pool: sqlx::PgPool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let extracted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let downloads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ts = DetachExtractStore {
+            // The extraction lands well after the 150ms download timeout below.
+            extract_delay: std::time::Duration::from_millis(600),
+            downloads: downloads.clone(),
+            extracted: extracted.clone(),
+        };
+        let store = RepoStore::new(tmp.path().to_path_buf(), Some(std::sync::Arc::new(ts)), pool)
+            .with_release_upload_timeout(std::time::Duration::from_millis(150));
+        let owner = "did:key:z6MkF3ResurrectTempDirAAAAAAAAAAAAAAAAAAAA";
+        let name = "f3resurrect";
+        let dir = repo_dir_of(tmp.path(), owner, name);
+        let parent = dir.parent().unwrap().to_path_buf();
+
+        // Cold cache miss: acquire enters the download path, the download times out
+        // at 150ms, and the read path bails (no local copy to serve).
+        let res = store.acquire(owner, name).await;
+        assert!(
+            res.is_err(),
+            "a timed-out cold read with no local copy must bail"
+        );
+        assert_eq!(downloads.load(SeqCst), 1, "exactly one download attempt");
+
+        // Wait for the detached extraction to actually finish its "rename into
+        // place" (the resurrection moment).
+        assert!(
+            poll_until_true(|| extracted.load(SeqCst) >= 1).await,
+            "the detached extraction must run to completion"
+        );
+
+        // Once the extraction has landed, no temp dir may survive under the parent.
+        // The fix's janitor removes temp.path() after the extraction settles;
+        // pre-fix the resurrected dir survives and this poll never sees it cleaned.
+        assert!(
+            poll_until_true(|| !has_leftover_temp(&parent)).await,
+            "a timed-out cold read must not leave a resurrected .tmp-download.* dir"
+        );
+    }
 }
