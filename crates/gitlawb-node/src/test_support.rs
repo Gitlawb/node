@@ -1577,6 +1577,7 @@ mod tests {
                 cert_id: None,
                 received_at: Utc::now().to_rfc3339(),
                 from_peer: "peer".to_string(),
+                owner_did: None,
             })
             .await
             .expect("seed private gossip update");
