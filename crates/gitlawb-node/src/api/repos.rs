@@ -887,6 +887,32 @@ async fn notify_peer_of_refs(
     }
 }
 
+/// Roll a push whose durable upload failed back to the pre-push ref snapshot.
+/// `None` means the pre-push listing itself failed: rolling back to an empty
+/// snapshot would delete EVERY ref in the repo, so the rollback is skipped
+/// instead. A genuinely empty repo snapshots as `Some(vec![])` and still rolls
+/// back (deleting the refs the failed push created).
+fn rollback_push_refs(
+    path: &std::path::Path,
+    repo_name: &str,
+    pre_push_refs: &Option<Vec<(String, String)>>,
+) {
+    match pre_push_refs {
+        Some(refs) => {
+            if let Err(e) = store::restore_refs(path, refs) {
+                tracing::warn!(repo = %repo_name, err = %e,
+                    "failed to roll back receive-pack refs after failed durable upload; \
+                     a local-fast-path read may serve un-uploaded refs");
+            }
+        }
+        None => {
+            tracing::warn!(repo = %repo_name,
+                "skipping ref rollback after failed durable upload: pre-push snapshot \
+                 unavailable; a local-fast-path read may serve un-uploaded refs");
+        }
+    }
+}
+
 /// POST /:owner/:repo.git/git-receive-pack  (AUTH REQUIRED — enforced by middleware)
 pub async fn git_receive_pack(
     State(state): State<AppState>,
@@ -1004,7 +1030,10 @@ pub async fn git_receive_pack(
         // applied pack back on local disk (mirrors create_issue). Without this
         // the local fast path in RepoStore::acquire serves the pushed refs until
         // a later write refreshes the archive, even though the client got a 5xx.
-        let pre_push_refs = store::list_refs(&disk_path).unwrap_or_default();
+        // `.ok()`, not `.unwrap_or_default()`: a listing error must read as
+        // "snapshot unavailable", never as an empty snapshot, or the rollback
+        // below would delete every ref in the repo.
+        let pre_push_refs = store::list_refs(&disk_path).ok();
 
         tracing::debug!(repo = %record.name, path = %disk_path.display(), "running git receive-pack");
         let result = smart_http::receive_pack(&disk_path, body, git_timeout).await;
@@ -1016,11 +1045,7 @@ pub async fn git_receive_pack(
         // local-fast-path read does not serve refs that never landed durably.
         let upload_ok = guard
             .release_with_failure_cleanup(result.is_ok(), |path| {
-                if let Err(e) = store::restore_refs(path, &pre_push_refs) {
-                    tracing::warn!(repo = %record.name, err = %e,
-                        "failed to roll back receive-pack refs after failed durable upload; \
-                         a local-fast-path read may serve un-uploaded refs");
-                }
+                rollback_push_refs(path, &record.name, &pre_push_refs)
             })
             .await;
 
@@ -3473,6 +3498,257 @@ mod tests {
             pushes, 0,
             "the success tail (record_push) must NOT run when the durable upload \
              failed — the push was not durably accepted"
+        );
+    }
+
+    // Rollback completeness on the receive-pack path: a failed durable upload
+    // must restore the EXACT pre-push snapshot (a ref the push updated is
+    // rewound AND a ref the push created is deleted) while the advisory lock
+    // is held, so the local fast path never serves refs that never landed
+    // durably. RED with the cleanup closure reverted to `|_| {}` (or with
+    // restore_refs not deleting created refs): main stays at the pushed tip
+    // and/or the created ref survives.
+    #[sqlx::test]
+    async fn push_failed_upload_rolls_back_created_and_updated_refs(pool: sqlx::PgPool) {
+        use axum::extract::{Path as AxPath, State};
+        use axum::response::IntoResponse;
+        use axum::Extension;
+        use std::path::Path as StdPath;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        struct StallStore;
+        #[async_trait::async_trait]
+        impl crate::git::tigris::ObjectStore for StallStore {
+            async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
+                Ok(false)
+            }
+            async fn upload(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+            async fn download(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(std::sync::Arc::new(StallStore)),
+            pool.clone(),
+        )
+        .with_release_upload_timeout(Duration::from_millis(200));
+
+        let owner = "z6refrollbackowner";
+        let name = "refrollback";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let bare = repos_dir
+            .path()
+            .join(&owner_slug)
+            .join(format!("{name}.git"));
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
+            .await
+            .unwrap();
+
+        fn git(args: &[&str], dir: &std::path::Path) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        // Two commits in a scratch repo: the bare repo starts at c1 and the
+        // push advances main to c2 AND creates a second ref at c2.
+        let work = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q", "-b", "main", "."], work.path());
+        git(&["config", "user.email", "t@t"], work.path());
+        git(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "one").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c1"], work.path());
+        let old_oid = git(&["rev-parse", "HEAD"], work.path());
+        std::fs::write(work.path().join("f.txt"), "two").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c2"], work.path());
+        let new_oid = git(&["rev-parse", "HEAD"], work.path());
+
+        // Bare clone (has both commits' objects), then rewind main to c1 so the
+        // push is a genuine update satisfiable with an empty pack.
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &work.path().to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone --bare failed");
+        git(
+            &[
+                "-C",
+                &bare.to_string_lossy(),
+                "update-ref",
+                "refs/heads/main",
+                &old_oid,
+            ],
+            work.path(),
+        );
+
+        let snapshot = store::list_refs(&bare).unwrap();
+        assert_eq!(
+            snapshot,
+            vec![("refs/heads/main".to_string(), old_oid.clone())],
+            "pre-push snapshot must be exactly main at c1"
+        );
+
+        // Two commands: update main c1 -> c2, create refs/heads/feature at c2.
+        let zero = "0".repeat(40);
+        let mut body = Vec::new();
+        let cmd1 = format!("{old_oid} {new_oid} refs/heads/main\0report-status\n");
+        body.extend_from_slice(format!("{:04x}", cmd1.len() + 4).as_bytes());
+        body.extend_from_slice(cmd1.as_bytes());
+        let cmd2 = format!("{zero} {new_oid} refs/heads/feature\n");
+        body.extend_from_slice(format!("{:04x}", cmd2.len() + 4).as_bytes());
+        body.extend_from_slice(cmd2.as_bytes());
+        body.extend_from_slice(b"0000");
+        let pack = Command::new("git")
+            .args([
+                "-C",
+                &bare.to_string_lossy(),
+                "pack-objects",
+                "--stdout",
+                "-q",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(pack.status.success(), "pack-objects failed");
+        body.extend_from_slice(&pack.stdout);
+        let body = Bytes::from(body);
+
+        let resp = super::git_receive_pack(
+            State(state.clone()),
+            AxPath((owner.to_string(), format!("{name}.git"))),
+            Extension(crate::auth::AuthenticatedDid(owner.to_string())),
+            body,
+        )
+        .await;
+        let status = match resp {
+            Ok(r) => r.status(),
+            Err(e) => e.into_response().status(),
+        };
+        assert!(
+            status.is_server_error(),
+            "a timed-out durable upload must fail the push (5xx), got {status}"
+        );
+
+        // The refs must equal the pre-push snapshot EXACTLY: the created ref is
+        // gone and the updated ref is rewound.
+        let after = store::list_refs(&bare).unwrap();
+        assert_eq!(
+            after, snapshot,
+            "a failed durable upload must restore the exact pre-push snapshot \
+             (created ref deleted, updated ref rewound)"
+        );
+    }
+
+    // A bare repo at HEAD with one commit on main, for the rollback-decision
+    // unit tests below. Returns the tempdirs (kept alive by the caller), the
+    // bare path, and main's oid.
+    fn seeded_bare_repo() -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf, String) {
+        use std::process::Command;
+
+        fn git(args: &[&str], dir: &std::path::Path) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        let work = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q", "-b", "main", "."], work.path());
+        git(&["config", "user.email", "t@t"], work.path());
+        git(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "hi").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c"], work.path());
+        let oid = git(&["rev-parse", "HEAD"], work.path());
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("repo.git");
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &work.path().to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone --bare failed");
+        (work, dir, bare, oid)
+    }
+
+    // The None arm of the rollback decision: a failed pre-push listing means
+    // "snapshot unavailable", and the rollback must be SKIPPED: the repo's
+    // existing refs survive. RED on the pre-fix shape (unwrap_or_default + an
+    // unconditional restore_refs), which reads the error as an empty snapshot
+    // and deletes every ref.
+    #[test]
+    fn ref_rollback_skips_when_snapshot_unavailable() {
+        let (_work, _dir, bare, oid) = seeded_bare_repo();
+
+        super::rollback_push_refs(&bare, "r", &None);
+
+        assert_eq!(
+            store::list_refs(&bare).unwrap(),
+            vec![("refs/heads/main".to_string(), oid)],
+            "a None snapshot (listing failed) must skip the rollback, not \
+             mass-delete the repo's refs"
+        );
+    }
+
+    // The must-keep negative of the fix: a genuinely EMPTY repo snapshots as
+    // Some(vec![]) and still rolls back, deleting the refs the failed push
+    // created. Guards against the `.ok()` change accidentally widening the
+    // skip to empty snapshots.
+    #[test]
+    fn ref_rollback_empty_snapshot_still_deletes_created_refs() {
+        let (_work, _dir, bare, _oid) = seeded_bare_repo();
+
+        super::rollback_push_refs(&bare, "r", &Some(vec![]));
+
+        assert_eq!(
+            store::list_refs(&bare).unwrap(),
+            Vec::<(String, String)>::new(),
+            "an empty (but present) snapshot must still roll back: the ref the \
+             push created has to be deleted"
         );
     }
 
