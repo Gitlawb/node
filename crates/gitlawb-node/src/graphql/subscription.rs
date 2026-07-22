@@ -39,6 +39,7 @@ impl SubscriptionRoot {
                     pusher_did: ev.pusher_did,
                     node_did: ev.node_did,
                     timestamp: ev.timestamp,
+                    owner_did: Some(ev.owner_did),
                 }),
                 _ => None,
             }

@@ -113,16 +113,17 @@ pub async fn unregister_replica(
 }
 
 /// GET /api/v1/repos/:owner/:repo/replicas
-/// Public — returns the list of replicas (DID + URL + registration timestamp).
+/// Read-visibility-gated: a PUBLIC repo's replica list stays anonymously
+/// listable (mirror-discovery), but a PRIVATE repo's replica URLs are hidden
+/// (404) from anyone who cannot read the repo at its root.
 pub async fn list_replicas(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
 ) -> Result<Json<serde_json::Value>> {
-    let record = state
-        .db
-        .get_repo(&owner, &repo)
-        .await?
-        .ok_or_else(|| AppError::RepoNotFound(format!("{owner}/{repo}")))?;
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo, caller, "/").await?;
 
     let replicas = state.db.list_replicas(&record.id).await?;
 

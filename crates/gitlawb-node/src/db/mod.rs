@@ -175,6 +175,9 @@ pub struct ReceivedRefUpdate {
     pub cert_id: Option<String>,
     pub received_at: String,
     pub from_peer: String,
+    /// Full owner DID — populated by new peers; None for events from older
+    /// peers that predate the wire-format change (#144).
+    pub owner_did: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -870,6 +873,14 @@ const MIGRATIONS: &[Migration] = &[
                    ) dups WHERE dups.rn > 1
                )"#,
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_ref ON ref_certificates(repo_id, ref_name)",
+        ],
+    },
+    Migration {
+        version: 11,
+        name: "ref_update_owner_did",
+        stmts: &[
+            // Index deferred — the feed gate (#144) does not read owner_did yet.
+            "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
 ];
@@ -2304,8 +2315,8 @@ impl Db {
         sqlx::query(
             "INSERT INTO received_ref_updates
              (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-              cert_id, received_at, from_peer)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+              cert_id, received_at, from_peer, owner_did)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&update.id)
@@ -2319,9 +2330,136 @@ impl Db {
         .bind(&update.cert_id)
         .bind(&update.received_at)
         .bind(&update.from_peer)
+        .bind(&update.owner_did)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Resolve the trusted display `owner_did` for every ref-update row in a page,
+    /// issuing at most one query per *unique* local repo so the cost scales with
+    /// the number of distinct repos in the page rather than the page size.
+    ///
+    /// The stored `owner_did` (and the `repo` slug) arrive over gossipsub or the
+    /// unsigned peer-notify HTTP path, so neither is trusted. This method binds
+    /// the wire `owner_did` to the local repo the slug names before it is ever
+    /// surfaced:
+    ///
+    /// * **P1 (untrusted wire value):** a peer-supplied `owner_did` is only
+    ///   echoed when it normalizes equal to the canonical owner of the *actual
+    ///   local repo* at that slug. A caller asserting `did:key:zVictim` on a
+    ///   `zAlice/widget` row is dropped, because `zVictim` does not own the
+    ///   local `zAlice/widget` repo. The canonical DID is returned (not the raw
+    ///   wire bytes), so the projection is always the local source of truth.
+    /// * **P3 (legacy fallback):** a row stored with `owner_did = None` is
+    ///   attributed only via an *exact, normalized, unique* local match —
+    ///   `get_repo` matches the slug's owner key and name exactly (`LIMIT 1`,
+    ///   preferring canonical rows). The loose prefix-tolerant drop gate
+    ///   (`ref_update_row_names_repo`) is never used for attribution, so a
+    ///   cross-method slug collision cannot synthesize the wrong owner. When no
+    ///   unique local repo proves the owner, `None` is returned.
+    ///
+    /// # P2 mirror-only fallback
+    ///
+    /// Mirror-only repos store their owner as the bare normalized key (no DID
+    /// method prefix).  When a validated wire DID carries a full prefix (e.g.
+    /// `did:key:z…`) and the matching repo is a mirror, the full wire value is
+    /// returned so the API contract preserves the DID method for these rows.
+    ///
+    /// The slug must be `"{owner}/{name}"`; a slug without a `/` cannot be
+    /// attributed and yields `None`.
+    pub async fn resolve_ref_update_owner_dids(
+        &self,
+        rows: &[(&str, Option<&str>)],
+    ) -> Result<Vec<Option<String>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ── 1.  Collect unique lookup keys ────────────────────────────────
+        let mut slug_parts: Vec<Option<String>> = Vec::with_capacity(rows.len());
+        // Keys are stored as `format!("{normalized_key}\0{name}")` for cheap
+        // HashMap lookup.
+        let mut unique_keys: Vec<String> = Vec::new();
+
+        for (slug, _wire) in rows {
+            if let Some((owner_part, name)) = slug.rsplit_once('/') {
+                let normalized = normalize_owner_key(owner_part);
+                let key = format!("{normalized}\0{name}");
+                if !unique_keys.contains(&key) {
+                    unique_keys.push(key.clone());
+                }
+                slug_parts.push(Some(key));
+            } else {
+                slug_parts.push(None);
+            }
+        }
+
+        // ── 2.  Fetch all matching repos in one set-based query ──────────
+        // Build a single SQL with one OR condition per unique key so every
+        // distinct slug is resolved in one round-trip regardless of how many
+        // unique repos the page names.
+        let mut repo_map: std::collections::HashMap<String, RepoRecord> =
+            std::collections::HashMap::new();
+
+        if !unique_keys.is_empty() {
+            let mut sql = String::from(
+                "SELECT id, name, owner_did, description, is_public, default_branch,
+                        created_at, updated_at, disk_path, forked_from, machine_id
+                 FROM repos WHERE (",
+            );
+            let mut conds: Vec<String> = Vec::with_capacity(unique_keys.len());
+            for i in 0..unique_keys.len() {
+                let p = (2 * i + 1) as i64;
+                let q = (2 * i + 2) as i64;
+                conds.push(format!("({}) = ${p} AND name = ${q}", OWNER_KEY_CASE_SQL));
+            }
+            sql.push_str(&conds.join(" OR "));
+            sql.push_str(
+                ") ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END, \
+                 created_at ASC, id ASC",
+            );
+
+            let mut q = sqlx::query(&sql);
+            for key in &unique_keys {
+                if let Some((owner_part, name)) = key.split_once('\0') {
+                    q = q.bind(owner_part).bind(name);
+                }
+            }
+
+            for row in q.fetch_all(&self.pool).await? {
+                let repo = row_to_repo(row);
+                let key = format!("{}\0{}", normalize_owner_key(&repo.owner_did), repo.name);
+                repo_map.entry(key).or_insert(repo);
+            }
+        }
+
+        // ── 3.  Resolve every input row ──────────────────────────────────
+        let mut results = Vec::with_capacity(rows.len());
+        for (i, (_slug, wire_owner_did)) in rows.iter().enumerate() {
+            let Some(repo) = slug_parts[i].as_ref().and_then(|k| repo_map.get(k)) else {
+                results.push(None);
+                continue;
+            };
+
+            match (wire_owner_did, repo) {
+                (Some(wire), repo)
+                    if normalize_owner_key(wire) == normalize_owner_key(&repo.owner_did) =>
+                {
+                    if repo.id.contains('/') && *wire != repo.owner_did {
+                        results.push(Some((*wire).to_string()));
+                    } else {
+                        results.push(Some(repo.owner_did.clone()));
+                    }
+                }
+                (None, _) => {
+                    results.push(Some(repo.owner_did.clone()));
+                }
+                _ => results.push(None),
+            }
+        }
+
+        Ok(results)
     }
 
     /// One page of ref updates (newest first), optionally scoped to one repo.
@@ -2348,7 +2486,7 @@ impl Db {
         after: Option<(&str, &str)>,
     ) -> Result<Vec<ReceivedRefUpdate>> {
         const COLS: &str = "id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, \
-                            timestamp, cert_id, received_at, from_peer";
+                            timestamp, cert_id, received_at, from_peer, owner_did";
 
         // Positional params in bind order: repo?, after_ts?, after_id?, limit.
         let mut conds: Vec<String> = Vec::new();
@@ -2686,6 +2824,7 @@ fn row_to_ref_update(r: sqlx::postgres::PgRow) -> ReceivedRefUpdate {
         cert_id: r.get("cert_id"),
         received_at: r.get("received_at"),
         from_peer: r.get("from_peer"),
+        owner_did: r.get("owner_did"),
     }
 }
 
@@ -3405,6 +3544,115 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+
+    /// Simulate an existing node at v9 with populated received_ref_updates,
+    /// then apply the v11 migration and verify (a) owner_did IS NULL on
+    /// existing rows, (b) the column exists and is nullable TEXT, and
+    /// (c) idempotent re-run does not error.
+    #[sqlx::test]
+    async fn migration_v11_creates_owner_did_column(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+
+        // Create all tables by running the full migration chain from scratch,
+        // then drop the owner_did column to simulate a pre-v10 schema.
+        db.migrate().await.unwrap();
+        sqlx::query("ALTER TABLE received_ref_updates DROP COLUMN owner_did")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Truncate schema_migrations and re-seed at v9 — simulate an existing
+        // node that has run v1..v9 but not yet v10.
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 10) {
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(m.version)
+            .bind(m.name)
+            .bind("2026-07-01T00:00:00Z")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // ── Simulate an existing node with rows recorded before v11 ────────
+        // The owner_did column does not exist yet, so we INSERT without it.
+        let row_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO received_ref_updates
+             (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha,
+              timestamp, cert_id, received_at, from_peer)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(&row_id)
+        .bind("did:key:zNode")
+        .bind("did:key:zPusher")
+        .bind("z6MkOwner/myrepo")
+        .bind("refs/heads/main")
+        .bind("0000000000000000000000000000000000000000")
+        .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("2026-07-01T12:00:00Z")
+        .bind::<Option<String>>(None)
+        .bind("2026-07-01T12:00:01Z")
+        .bind("12D3KooWPeer")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM received_ref_updates")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            1,
+            "pre-migration row must exist"
+        );
+
+        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did) ──
+        db.migrate().await.unwrap();
+
+        // ── Assertions ────────────────────────────────────────────────────
+
+        // (a) Existing row has owner_did IS NULL (not overwritten).
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_did FROM received_ref_updates WHERE id = $1")
+                .bind(&row_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, None, "existing row's owner_did must be NULL");
+
+        // (b) Column exists and is nullable TEXT.
+        let col: (String, String, String) = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'received_ref_updates' AND column_name = 'owner_did'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "owner_did");
+        assert_eq!(col.1, "text");
+        assert_eq!(col.2, "YES", "owner_did must be nullable");
+
+        // (c) Version 11 is recorded as applied.
+        let v11_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 11")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            v11_count.0, 1,
+            "migration v11 must be recorded in schema_migrations"
+        );
+
+        // (d) Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
+        db.migrate().await.unwrap();
     }
 }
 
@@ -4454,6 +4702,7 @@ mod ref_update_keyset_paging_tests {
             cert_id: None,
             received_at: ts.into(),
             from_peer: "peer".into(),
+            owner_did: None,
         }
     }
 
@@ -4562,6 +4811,7 @@ mod ref_update_keyset_repo_filtered_tests {
             cert_id: None,
             received_at: ts.into(),
             from_peer: "peer".into(),
+            owner_did: None,
         }
     }
 
@@ -4668,6 +4918,7 @@ mod ref_update_keyset_same_timestamp_tests {
             cert_id: None,
             received_at: ts.into(),
             from_peer: "peer".into(),
+            owner_did: None,
         }
     }
 
@@ -5261,5 +5512,172 @@ mod ref_certificate_tests {
             err.is_err(),
             "raw duplicate INSERT must be rejected by the unique index"
         );
+    }
+}
+#[cfg(test)]
+mod ref_update_db_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn update(
+        id: &str,
+        repo: &str,
+        owner_did: Option<&str>,
+        ref_name: &str,
+        sha: &str,
+    ) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.to_string(),
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: repo.to_string(),
+            owner_did: owner_did.map(|s| s.to_string()),
+            ref_name: ref_name.to_string(),
+            old_sha: "0000000000000000000000000000000000000000".into(),
+            new_sha: sha.to_string(),
+            timestamp: "2026-07-02T12:00:00Z".into(),
+            cert_id: None,
+            received_at: "2026-07-02T12:00:01Z".into(),
+            from_peer: "12D3KooWTest".into(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_with_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u1",
+            "zOwner/myrepo",
+            Some("did:key:zOwner"),
+            "refs/heads/main",
+            "aaaa",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did.as_deref(), Some("did:key:zOwner"));
+        assert_eq!(all[0].repo, "zOwner/myrepo");
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_without_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u2",
+            "zOwner/myrepo",
+            None,
+            "refs/heads/main",
+            "bbbb",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did, None);
+    }
+
+    #[sqlx::test]
+    async fn list_repo_ref_updates_filters_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u3",
+            "alice/repo1",
+            Some("did:key:zAlice"),
+            "refs/heads/main",
+            "cccc",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u4",
+            "bob/repo2",
+            Some("did:key:zBob"),
+            "refs/heads/feat",
+            "dddd",
+        ))
+        .await
+        .unwrap();
+
+        let alice_events = db
+            .list_ref_updates_keyset(Some("alice/repo1"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(alice_events.len(), 1);
+        assert_eq!(alice_events[0].id, "u3");
+        assert_eq!(alice_events[0].owner_did.as_deref(), Some("did:key:zAlice"));
+
+        let bob_events = db
+            .list_ref_updates_keyset(Some("bob/repo2"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(bob_events.len(), 1);
+        assert_eq!(bob_events[0].id, "u4");
+        assert_eq!(bob_events[0].owner_did.as_deref(), Some("did:key:zBob"));
+
+        let empty = db
+            .list_ref_updates_keyset(Some("other/repo"), 100, None)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn list_ref_updates_filtered_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u5",
+            "ownerA/proj",
+            Some("did:key:zA"),
+            "refs/heads/main",
+            "eeee",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u6",
+            "ownerB/proj",
+            Some("did:web:host:zB"),
+            "refs/heads/main",
+            "ffff",
+        ))
+        .await
+        .unwrap();
+
+        let filtered = db
+            .list_ref_updates_keyset(Some("ownerA/proj"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "u5");
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn insert_update_idempotent_on_conflict(pool: PgPool) {
+        let db = db(pool).await;
+        let u = update(
+            "u7",
+            "repo/x",
+            Some("did:key:zX"),
+            "refs/heads/main",
+            "gggg",
+        );
+        db.insert_ref_update(&u).await.unwrap();
+        db.insert_ref_update(&u).await.unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].new_sha, "gggg");
     }
 }

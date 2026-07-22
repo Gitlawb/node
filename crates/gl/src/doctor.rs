@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use crate::http::NodeClient;
 
 const PUBLIC_NODE: &str = "https://node.gitlawb.com";
+const GITHUB_API_BASE: &str = "https://api.github.com";
 
 #[derive(Args)]
 pub struct DoctorArgs {
@@ -263,7 +264,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 
     // ── 7. Version up to date ─────────────────────────────────────────────
     let current = env!("CARGO_PKG_VERSION");
-    checks.push(check_version(current).await);
+    checks.push(check_version(current, GITHUB_API_BASE).await);
 
     // ── Render ────────────────────────────────────────────────────────────
     for check in &checks {
@@ -319,8 +320,9 @@ fn which_in_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Fetch the latest release tag from gitlawb/releases and compare to current version.
-async fn check_version(current: &'static str) -> Check {
+/// Fetch the latest release tag from Gitlawb/node (the actual release repo — see install.sh's
+/// `GITLAWB_RELEASE_REPO` default) and compare to current version.
+async fn check_version(current: &'static str, github_api_base: &str) -> Check {
     let client = match reqwest::Client::builder()
         .user_agent(format!("gl/{current}"))
         .timeout(std::time::Duration::from_secs(5))
@@ -331,13 +333,22 @@ async fn check_version(current: &'static str) -> Check {
     };
 
     let resp = match client
-        .get("https://api.github.com/repos/gitlawb/releases/releases/latest")
+        .get(format!(
+            "{github_api_base}/repos/Gitlawb/node/releases/latest"
+        ))
         .send()
         .await
     {
         Ok(r) => r,
         Err(_) => return Check::pass("version", format!("v{current} (offline — could not check)")),
     };
+
+    if !resp.status().is_success() {
+        return Check::pass(
+            "version",
+            format!("v{current} (GitHub API returned HTTP {})", resp.status()),
+        );
+    }
 
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
@@ -416,5 +427,51 @@ mod tests {
     #[test]
     fn test_which_in_path_missing_binary() {
         assert!(!which_in_path("this-binary-does-not-exist-gl-test-12345"));
+    }
+
+    #[tokio::test]
+    async fn test_check_version_queries_gitlawb_node_releases() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tag_name":"v9.9.9"}"#)
+            .create_async()
+            .await;
+
+        let check = check_version("0.1.0", &server.url()).await;
+        assert!(matches!(check.state, CheckState::Warn));
+        assert!(check.detail.contains("v9.9.9"));
+    }
+
+    #[tokio::test]
+    async fn test_check_version_up_to_date() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tag_name":"v0.1.0"}"#)
+            .create_async()
+            .await;
+
+        let check = check_version("0.1.0", &server.url()).await;
+        assert!(matches!(check.state, CheckState::Ok));
+        assert!(check.detail.contains("up to date"));
+    }
+
+    #[tokio::test]
+    async fn test_check_version_http_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .with_status(403)
+            .create_async()
+            .await;
+
+        let check = check_version("0.1.0", &server.url()).await;
+        assert!(matches!(check.state, CheckState::Ok));
+        assert!(check.detail.contains("GitHub API returned HTTP 403"));
     }
 }

@@ -17,6 +17,7 @@ pub struct RefUpdateBroadcast {
     pub pusher_did: String,
     pub node_did: String,
     pub timestamp: String,
+    pub owner_did: String,
 }
 
 #[derive(Clone, Debug)]
