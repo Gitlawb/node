@@ -4,6 +4,16 @@ on:
   push:
     branches:
       - main
+  # Manual backfill: publish an already-cut release to npm (e.g. after the
+  # npm side of trusted publishing is configured, or a publish was missed).
+  # Only the npm-publish job runs; binaries are downloaded from the existing
+  # GitHub release for the given tag.
+  workflow_dispatch:
+    inputs:
+      npm_backfill_tag:
+        description: "Existing release tag to publish to npm (e.g. v0.6.0)"
+        required: true
+        type: string
 
 concurrency:
   group: release-${{ github.ref }}
@@ -14,7 +24,10 @@ permissions: {}
 
 jobs:
   release-please:
-    if: ${{ github.repository == 'Gitlawb/node' }}
+    # Skipped on manual dispatch: a backfill must never create or advance a
+    # release PR as a side effect (npm-publish tolerates the skipped need via
+    # !cancelled(), and every other job gates on release_created == 'true').
+    if: ${{ github.repository == 'Gitlawb/node' && github.event_name != 'workflow_dispatch' }}
     name: Release Please
     runs-on: ubuntu-latest
     permissions:
@@ -248,37 +261,62 @@ jobs:
   npm-publish:
     name: Publish to npm
     needs: [release-please, release-binaries]
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    # Runs on a fresh release, or on manual dispatch for an existing tag
+    # (release-binaries is skipped on dispatch, hence !cancelled()). Publishing
+    # auth is npm Trusted Publishing (GitHub OIDC) — no NPM_TOKEN. Each
+    # @gitlawb package must have this repo + workflow (release.yml) configured
+    # as its trusted publisher on npmjs.com, or publish fails loudly here —
+    # deliberately loud: the silent secret-guard skip is how 0.4.x–0.6.0
+    # never reached npm.
+    if: >-
+      ${{ !cancelled() && (
+        (needs.release-please.outputs.release_created == 'true' && needs.release-binaries.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.npm_backfill_tag != '')
+      ) }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # npm provenance
+      id-token: write # npm trusted publishing (OIDC) + provenance
     steps:
-      - name: Guard on secret
-        id: guard
+      - name: Resolve release tag
+        id: rel
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DISPATCH_TAG: ${{ inputs.npm_backfill_tag }}
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
-          if [ -z "${NPM_TOKEN:-}" ]; then
-            echo "::warning::NPM_TOKEN is not set — skipping npm publish."
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
+          case "$TAG" in
+            v[0-9]*) ;;
+            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout release tag
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ steps.rel.outputs.tag }}
           persist-credentials: false
 
+      # npm >= 11.5.1 performs the OIDC token exchange automatically when the
+      # package has a trusted publisher configured; older npm silently falls
+      # back to (absent) token auth and fails confusingly.
+      - name: Set up Node 24 + OIDC-capable npm
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: "24"
+      - name: Ensure npm supports trusted publishing
+        run: |
+          set -euo pipefail
+          npm install -g npm@^11.5.1
+          npm --version
+
       - name: Lay in release binaries
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
+          VERSION: ${{ steps.rel.outputs.version }}
+          TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -euo pipefail
           # npm platform package -> Rust target triple (unix only; Windows is not
@@ -305,9 +343,8 @@ jobs:
           done
 
       - name: Set versions
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
-          VERSION: ${{ needs.release-please.outputs.version }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
           node -e '
@@ -327,13 +364,12 @@ jobs:
           '
 
       - name: Publish
-        if: ${{ steps.guard.outputs.enabled == 'true' }}
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          VERSION: ${{ needs.release-please.outputs.version }}
+          VERSION: ${{ steps.rel.outputs.version }}
         run: |
           set -euo pipefail
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          # No token: npm exchanges this job's GitHub OIDC identity with the
+          # registry (trusted publishing); provenance is attested automatically.
           # Platform packages first, then the wrapper (so its optionalDependencies resolve).
           # Skip versions already on the registry so a rerun after a partial publish
           # is idempotent instead of erroring on the first existing package.
