@@ -216,6 +216,14 @@ pub async fn merge_pr(
         .map_err(|e| AppError::Git(e.to_string()))?;
     let disk_path = guard.path().to_path_buf();
     let merger_did = auth.0;
+
+    // Snapshot the target branch's pre-merge tip so a failed durable upload can
+    // roll the merge commit back on local disk (mirrors create_issue). Without
+    // this the local fast path in RepoStore::acquire serves the merged tree until
+    // a later write refreshes the archive, even though the client got a 5xx.
+    let target_ref = format!("refs/heads/{}", pr.target_branch);
+    let prior_target = store::ref_oid(&disk_path, &target_ref).ok().flatten();
+
     let merge_result = store::merge_branch(
         &disk_path,
         &pr.target_branch,
@@ -230,8 +238,19 @@ pub async fn merge_pr(
     // acquire_write reverts it from the stale archive. Report 5xx so the client
     // retries rather than marking the PR merged in the DB while the merged tree
     // was silently lost. Fail BEFORE merge_pr / touch_repo / webhooks. (P1
-    // data-loss guard, same as receive-pack.)
-    let upload_ok = guard.release(merge_result.is_ok()).await;
+    // data-loss guard, same as receive-pack.) On that failure, roll the local
+    // merge back to the captured tip BEFORE the lock releases.
+    let upload_ok = guard
+        .release_with_failure_cleanup(merge_result.is_ok(), |path| {
+            if let Some(oid) = &prior_target {
+                if let Err(e) = store::set_ref(path, &target_ref, oid) {
+                    tracing::warn!(repo = %record.name, err = %e,
+                        "failed to roll back local merge commit after failed durable upload; \
+                         a local-fast-path read may serve the un-uploaded merged tree");
+                }
+            }
+        })
+        .await;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
 

@@ -80,6 +80,49 @@ pub fn delete_issue_ref(repo_path: &Path, issue_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read the object id an issue ref currently points to (resolving an 8-char
+/// prefix), returning `(full_id, oid)`. Returns None if no such issue exists.
+/// Used to snapshot an issue ref's pre-mutation state so a failed durable
+/// upload can restore it, mirroring `create_issue`'s rollback.
+pub fn issue_ref_oid(repo_path: &Path, issue_id: &str) -> Result<Option<(String, String)>> {
+    let full_id = match resolve_issue_id(repo_path, issue_id)? {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    let ref_name = format!("refs/gitlawb/issues/{full_id}");
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", &ref_name])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git rev-parse")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if oid.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((full_id, oid)))
+}
+
+/// Reset an issue ref back to a captured object id — rolls back a local
+/// mutation (e.g. a close) whose durable upload failed, so a local-fast-path
+/// read does not serve the un-uploaded state. `full_id` must be the resolved
+/// UUID (from [`issue_ref_oid`]). The now-dangling object is harmless.
+pub fn restore_issue_ref(repo_path: &Path, full_id: &str, oid: &str) -> Result<()> {
+    let ref_name = format!("refs/gitlawb/issues/{full_id}");
+    let output = Command::new("git")
+        .args(["update-ref", &ref_name, oid])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git update-ref")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git update-ref failed: {stderr}");
+    }
+    Ok(())
+}
+
 /// List all issue refs and return their JSON content.
 pub fn list_issues(repo_path: &Path) -> Result<Vec<String>> {
     // List all refs under refs/gitlawb/issues/

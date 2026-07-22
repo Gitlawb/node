@@ -63,6 +63,86 @@ pub fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
+/// Read the object id a single ref currently points to. Returns None if the
+/// ref does not exist. Used to snapshot a ref's pre-write state so a failed
+/// durable upload can roll the local write back.
+pub fn ref_oid(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", ref_name])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git rev-parse")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if oid.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(oid))
+}
+
+/// Force a single ref back to a captured object id — rolls back a local write
+/// (e.g. a merge commit) whose durable upload failed, so a local-fast-path
+/// read does not serve the un-uploaded state. The now-dangling objects are
+/// harmless.
+pub fn set_ref(repo_path: &Path, ref_name: &str, oid: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["update-ref", ref_name, oid])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git update-ref")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git update-ref failed: {stderr}");
+    }
+    Ok(())
+}
+
+/// Restore a repo's refs to a previously captured snapshot: reset every
+/// snapshot ref to its captured object id, and delete any ref that exists now
+/// but was absent from the snapshot (created by the intervening write). Used
+/// to roll back a receive-pack whose durable upload failed, so the next
+/// local-fast-path read does not serve refs that never reached object storage.
+/// Best-effort per ref: an individual failure is collected and reported, but
+/// the remaining refs are still attempted.
+pub fn restore_refs(repo_path: &Path, snapshot: &[(String, String)]) -> Result<()> {
+    use std::collections::HashSet;
+
+    let mut errors: Vec<String> = Vec::new();
+
+    // Reset every snapshot ref to its captured oid (recreates refs the write
+    // deleted, and rewinds refs the write advanced).
+    for (ref_name, oid) in snapshot {
+        if let Err(e) = set_ref(repo_path, ref_name, oid) {
+            errors.push(format!("{ref_name}: {e}"));
+        }
+    }
+
+    // Delete refs that exist now but were not in the snapshot (created by the
+    // write being rolled back).
+    let snapshot_names: HashSet<&str> = snapshot.iter().map(|(r, _)| r.as_str()).collect();
+    let current = list_refs(repo_path)?;
+    for (ref_name, _) in &current {
+        if !snapshot_names.contains(ref_name.as_str()) {
+            let output = Command::new("git")
+                .args(["update-ref", "-d", ref_name])
+                .current_dir(repo_path)
+                .output()
+                .context("failed to run git update-ref -d")?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                errors.push(format!("{ref_name} (delete): {stderr}"));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        bail!("failed to restore {} ref(s): {}", errors.len(), errors.join("; "));
+    }
+    Ok(())
+}
+
 /// Read the current HEAD commit hash of a repository.
 /// Returns None if the repo is empty (no commits yet).
 pub fn head_commit(repo_path: &Path) -> Result<Option<String>> {
