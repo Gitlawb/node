@@ -458,3 +458,169 @@ pub async fn list_comments(
     let comments = state.db.list_pr_comments(&pr.id).await?;
     Ok(Json(serde_json::json!({ "comments": comments })))
 }
+
+#[cfg(test)]
+mod tests {
+    // super::* brings in the handler plus the axum Extension/Path/State
+    // extractors and the Utc/Uuid/PullRequest types the seed uses.
+    use super::*;
+    use std::path::Path as StdPath;
+    use std::time::Duration;
+
+    // Object store whose upload() parks forever, so release()'s bounded timeout
+    // is the only thing that completes it, modeling a stalled durable PUT.
+    // exists() is false so acquire_write never downloads over the local bare repo.
+    struct StallStore;
+    #[async_trait::async_trait]
+    impl crate::git::tigris::ObjectStore for StallStore {
+        async fn exists(&self, _o: &str, _r: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+        async fn upload(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+        async fn download(&self, _o: &str, _r: &str, _p: &StdPath) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete(&self, _o: &str, _r: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The failed-upload rollback on the merge path. merge_pr writes the merge
+    // commit to LOCAL disk, then release() uploads to durable storage. When
+    // that upload times out the handler must 5xx (before merge_pr/webhooks)
+    // AND roll the target branch back to its pre-merge tip while the advisory
+    // lock is held, so a local-fast-path read never serves the un-uploaded
+    // merged tree. RED with the cleanup closure at ~pulls.rs:244 reverted to
+    // `|_| {}`: main stays at the merge commit.
+    #[sqlx::test]
+    async fn merge_failed_upload_rolls_back_target_ref(pool: sqlx::PgPool) {
+        use axum::response::IntoResponse;
+        use std::process::Command;
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::new(
+            repos_dir.path().to_path_buf(),
+            Some(std::sync::Arc::new(StallStore)),
+            pool.clone(),
+        )
+        .with_release_upload_timeout(Duration::from_millis(200));
+
+        let owner = "z6mergerollbackowner";
+        let name = "mergerollback";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let bare = repos_dir
+            .path()
+            .join(&owner_slug)
+            .join(format!("{name}.git"));
+
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &bare.to_string_lossy(), None, false)
+            .await
+            .unwrap();
+
+        fn git(args: &[&str], dir: &StdPath) -> String {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+
+        // Scratch repo: c1 on main, c2 on feature; the bare clone carries both
+        // branches, so the merge of feature into main has real work to do.
+        let work = tempfile::TempDir::new().unwrap();
+        git(&["init", "-q", "-b", "main", "."], work.path());
+        git(&["config", "user.email", "t@t"], work.path());
+        git(&["config", "user.name", "t"], work.path());
+        std::fs::write(work.path().join("f.txt"), "one").unwrap();
+        git(&["add", "f.txt"], work.path());
+        git(&["commit", "-q", "-m", "c1"], work.path());
+        git(&["checkout", "-q", "-b", "feature"], work.path());
+        std::fs::write(work.path().join("g.txt"), "two").unwrap();
+        git(&["add", "g.txt"], work.path());
+        git(&["commit", "-q", "-m", "c2"], work.path());
+
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &work.path().to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "clone --bare failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let pre_merge_tip = store::ref_oid(&bare, "refs/heads/main")
+            .unwrap()
+            .expect("main exists before the merge");
+
+        // Seed the open PR row the handler looks up.
+        let record = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        let now = Utc::now().to_rfc3339();
+        state
+            .db
+            .create_pr(&PullRequest {
+                id: Uuid::new_v4().to_string(),
+                repo_id: record.id.clone(),
+                number: 1,
+                title: "t".into(),
+                body: None,
+                author_did: owner.to_string(),
+                source_branch: "feature".into(),
+                target_branch: "main".into(),
+                status: "open".to_string(),
+                merged_by_did: None,
+                merged_at: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        // Merge as the owner: the merge commit applies locally, the durable
+        // upload stalls and times out, and the handler must report 5xx.
+        let resp = super::merge_pr(
+            State(state.clone()),
+            Extension(AuthenticatedDid(owner.to_string())),
+            Path((owner.to_string(), name.to_string(), 1)),
+        )
+        .await;
+        let status = match resp {
+            Ok(_) => StatusCode::OK,
+            Err(e) => e.into_response().status(),
+        };
+        assert!(
+            status.is_server_error(),
+            "a stalled durable upload on merge must 5xx, got {status}"
+        );
+
+        // The target branch must still point at the pre-merge tip: the failed
+        // upload rolled the merge commit back while the lock was held.
+        let tip = store::ref_oid(&bare, "refs/heads/main")
+            .unwrap()
+            .expect("main still exists after the rollback");
+        assert_eq!(
+            tip, pre_merge_tip,
+            "a failed durable upload must roll the target branch back to its \
+             pre-merge tip; a local-fast-path read served the un-uploaded merge"
+        );
+    }
+}
