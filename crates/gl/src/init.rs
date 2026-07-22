@@ -186,6 +186,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
+    // symbolic-ref succeeds on a branch (including an unborn one) and fails
+    // on a detached HEAD — where guessing "main" could push the wrong ref.
     let branch = std::process::Command::new("git")
         .args(["symbolic-ref", "--short", "HEAD"])
         .current_dir(&cwd)
@@ -195,17 +197,24 @@ pub async fn run(args: InitArgs) -> Result<()> {
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "main".to_string());
+        .filter(|s| !s.is_empty());
 
     println!();
-    if has_commits {
-        println!("Ready! Push with:");
-        println!("  git push gitlawb {branch}");
-    } else {
-        println!("Ready! Nothing is committed yet — commit, then push:");
-        println!("  git add -A && git commit -m \"initial commit\"");
-        println!("  git push gitlawb {branch}");
+    match (branch, has_commits) {
+        (Some(branch), true) => {
+            println!("Ready! Push with:");
+            println!("  git push gitlawb {branch}");
+        }
+        (Some(branch), false) => {
+            println!("Ready! Nothing is committed yet — commit, then push:");
+            println!("  git add -A && git commit -m \"initial commit\"");
+            println!("  git push gitlawb {branch}");
+        }
+        (None, _) => {
+            println!("Ready! HEAD is detached — create or switch to a branch, then push:");
+            println!("  git switch -c main");
+            println!("  git push gitlawb main");
+        }
     }
 
     Ok(())

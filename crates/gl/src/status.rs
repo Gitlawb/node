@@ -177,21 +177,28 @@ fn detect_gitlawb_remote() -> Option<(String, String)> {
         );
 
     for name in ordered {
-        let Ok(out) = std::process::Command::new("git")
-            .args(["remote", "get-url", &name])
-            .stderr(std::process::Stdio::null())
-            .output()
-        else {
-            continue;
-        };
-        if !out.status.success() {
-            continue;
-        }
-        let Ok(url) = String::from_utf8(out.stdout) else {
-            continue;
-        };
-        if let Some(parsed) = parse_gitlawb_url(&url) {
-            return Some(parsed);
+        // A remote can carry several URLs, and the gitlawb:// one may be a
+        // push URL behind an https fetch URL — check every fetch and push URL.
+        for extra in [&["--all"][..], &["--push", "--all"][..]] {
+            let mut args = vec!["remote", "get-url"];
+            args.extend_from_slice(extra);
+            args.push(&name);
+            let Ok(out) = std::process::Command::new("git")
+                .args(&args)
+                .stderr(std::process::Stdio::null())
+                .output()
+            else {
+                continue;
+            };
+            if !out.status.success() {
+                continue;
+            }
+            let Ok(urls) = String::from_utf8(out.stdout) else {
+                continue;
+            };
+            if let Some(parsed) = urls.lines().find_map(parse_gitlawb_url) {
+                return Some(parsed);
+            }
         }
     }
     None

@@ -199,7 +199,7 @@ fi
 # print git's baffling "fatal: not a git repository".
 if [ -f "$HOME/.zshrc" ] && [ -d "$HOME/.oh-my-zsh/plugins/git" ] \
   && grep -Eq '^[[:space:]]*plugins=\(([^)]*[[:space:]])?git([[:space:]][^)]*)?\)' "$HOME/.zshrc" \
-  && ! grep -q 'unalias gl' "$HOME/.zshrc"; then
+  && ! grep -Eq '^([^#]*[[:space:];&|])?unalias[[:space:]]+([^;&|#]*[[:space:]])?gl([[:space:]]|$)' "$HOME/.zshrc"; then
   echo ""
   echo "NOTE: oh-my-zsh's git plugin aliases gl='git pull', which will shadow"
   echo "the gl command in interactive shells. To use gl by name, run:"

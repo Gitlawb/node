@@ -178,19 +178,29 @@ async fn cmd_show(
         }
     }
 
-    let info: Value = client
-        .get("/")
-        .await?
-        .json()
-        .await
-        .context("failed to fetch node info")?;
-    let current_node_did = info["did"].as_str().unwrap_or("");
-    if current_node_did == node_did {
-        println!("  Issuing node DID matches the node being queried.");
-    } else {
-        println!("  WARNING: Certificate node DID ({node_did}) does not match");
-        println!("           current node DID ({current_node_did}).");
-        println!("           This certificate was issued by a different node.");
+    // Contextual only — the verdict above stands on its own, so a node-info
+    // hiccup here must not turn a successfully displayed certificate into an
+    // error exit.
+    let current_node_did = match client.get("/").await {
+        Ok(resp) => resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|info| info["did"].as_str().map(str::to_string)),
+        Err(_) => None,
+    };
+    match current_node_did.as_deref() {
+        Some(current) if current == node_did => {
+            println!("  Issuing node DID matches the node being queried.");
+        }
+        Some(current) => {
+            println!("  WARNING: Certificate node DID ({node_did}) does not match");
+            println!("           current node DID ({current}).");
+            println!("           This certificate was issued by a different node.");
+        }
+        None => {
+            println!("  NOTE: could not fetch current node info — skipping node-DID comparison.");
+        }
     }
 
     if require_valid {
