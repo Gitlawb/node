@@ -90,18 +90,10 @@ pub fn issue_ref_oid(repo_path: &Path, issue_id: &str) -> Result<Option<(String,
         None => return Ok(None),
     };
     let ref_name = format!("refs/gitlawb/issues/{full_id}");
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", &ref_name])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git rev-parse")?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if oid.is_empty() {
-        return Ok(None);
-    }
+    let oid = match crate::git::store::ref_oid(repo_path, &ref_name)? {
+        Some(oid) => oid,
+        None => return Ok(None),
+    };
     Ok(Some((full_id, oid)))
 }
 
@@ -111,16 +103,7 @@ pub fn issue_ref_oid(repo_path: &Path, issue_id: &str) -> Result<Option<(String,
 /// UUID (from [`issue_ref_oid`]). The now-dangling object is harmless.
 pub fn restore_issue_ref(repo_path: &Path, full_id: &str, oid: &str) -> Result<()> {
     let ref_name = format!("refs/gitlawb/issues/{full_id}");
-    let output = Command::new("git")
-        .args(["update-ref", &ref_name, oid])
-        .current_dir(repo_path)
-        .output()
-        .context("failed to run git update-ref")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("git update-ref failed: {stderr}");
-    }
-    Ok(())
+    crate::git::store::set_ref(repo_path, &ref_name, oid)
 }
 
 /// List all issue refs and return their JSON content.
