@@ -16,3 +16,6 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+
+[dev-dependencies]
+mockito = "1"
