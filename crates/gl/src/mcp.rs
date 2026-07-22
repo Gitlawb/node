@@ -654,12 +654,13 @@ async fn call_tool(
         }
 
         "node_info" => {
-            let info: Value = client.get("/").await?.json().await?;
+            let info = crate::http::read_json(client.get("/").await?, "node info").await?;
             Ok(serde_json::to_string_pretty(&info)?)
         }
 
         "node_health" => {
-            let health: Value = client.get("/health").await?.json().await?;
+            let health =
+                crate::http::read_json(client.get("/health").await?, "node health").await?;
             Ok(serde_json::to_string_pretty(&health)?)
         }
 
@@ -670,39 +671,48 @@ async fn call_tool(
                 "description": args["description"],
                 "is_public": args["is_public"].as_bool().unwrap_or(true),
             }))?;
-            let resp: Value = client.post("/api/v1/repos", &body).await?.json().await?;
+            let resp =
+                crate::http::read_json(client.post("/api/v1/repos", &body).await?, "create repo")
+                    .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "repo_list" => {
-            let repos: Value = client.get("/api/v1/repos").await?.json().await?;
+            let repos =
+                crate::http::read_json(client.get("/api/v1/repos").await?, "list repos").await?;
             Ok(serde_json::to_string_pretty(&repos)?)
         }
 
         "repo_list_federated" => {
-            let result: Value = client.get("/api/v1/repos/federated").await?.json().await?;
+            let result = crate::http::read_json(
+                client.get("/api/v1/repos/federated").await?,
+                "list federated repos",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&result)?)
         }
 
         "repo_get" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let repo: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}"))
-                .await?
-                .json()
-                .await?;
+            let repo = crate::http::read_json(
+                client.get(&format!("/api/v1/repos/{owner}/{name}")).await?,
+                "repo",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&repo)?)
         }
 
         "repo_commits" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let commits: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
-                .await?
-                .json()
-                .await?;
+            let commits = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
+                    .await?,
+                "commits",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&commits)?)
         }
 
@@ -710,17 +720,19 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let path = args["path"].as_str().unwrap_or("");
             let owner = resolve_owner(&args, &client).await?;
-            let tree: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
-                .await?
-                .json()
-                .await?;
+            let tree = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
+                    .await?,
+                "tree",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&tree)?)
         }
 
         "repo_clone_url" => {
             let name = args["name"].as_str().context("missing 'name'")?;
-            let info: Value = client.get("/").await?.json().await?;
+            let info = crate::http::read_json(client.get("/").await?, "node info").await?;
             let did = info["did"].as_str().context("node info missing DID")?;
             Ok(format!("gitlawb://{}/{}", did, name))
         }
@@ -736,7 +748,11 @@ async fn call_tool(
                 "capabilities": caps,
                 "model": args["model"],
             }))?;
-            let resp: Value = client.post("/api/register", &body).await?.json().await?;
+            let resp = crate::http::read_json(
+                client.post("/api/register", &body).await?,
+                "register agent",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -793,6 +809,10 @@ async fn call_tool(
                     "/{owner}/{name}/info/refs?service=git-upload-pack"
                 ))
                 .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                anyhow::bail!("git refs failed ({status})");
+            }
             let bytes = resp.bytes().await?;
             // Parse pkt-line refs
             let refs = parse_info_refs(&bytes);
@@ -814,22 +834,26 @@ async fn call_tool(
                 "source_branch": head,
                 "target_branch": base,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body)
+                    .await?,
+                "create pull request",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "pr_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+                    .await?,
+                "pull requests",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -837,18 +861,22 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let pr: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
-                .await?
-                .json()
-                .await?;
-            let reviews: Value = client
-                .get(&format!(
-                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
-                ))
-                .await?
-                .json()
-                .await?;
+            let pr = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+                    .await?,
+                "pull request",
+            )
+            .await?;
+            let reviews = crate::http::read_json(
+                client
+                    .get(&format!(
+                        "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
+                    ))
+                    .await?,
+                "reviews",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(
                 &json!({ "pr": pr, "reviews": reviews["reviews"] }),
             )?)
@@ -858,11 +886,13 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+                    .await?,
+                "diff",
+            )
+            .await?;
             let diff = resp["diff"].as_str().unwrap_or("(empty diff)");
             Ok(diff.to_string())
         }
@@ -879,14 +909,16 @@ async fn call_tool(
                 "status": status,
                 "body": args["body"],
             }))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
+                        &body,
+                    )
+                    .await?,
+                "submit review",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -895,14 +927,16 @@ async fn call_tool(
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
+                        &body,
+                    )
+                    .await?,
+                "merge pull request",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -922,20 +956,22 @@ async fn call_tool(
                 "secret": args["secret"],
                 "events": events,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &body)
+                    .await?,
+                "create webhook",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "webhook_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             // Owner-gated route: an explicit `owner` arg wins, otherwise default to
-            // the signing keypair's short DID (NOT the node DID). The request is
-            // signed by this keypair, so the path owner must match it or the node
-            // returns 403/404.
+            // the signing keypair's short DID (NOT the node DID that resolve_owner
+            // returns). The request is signed by this keypair, so the path owner
+            // must match it or the node returns 403/404.
             let owner = if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
                 o.to_string()
             } else {
@@ -945,20 +981,22 @@ async fn call_tool(
                 let did = kp.did().to_string();
                 did.split(':').next_back().unwrap_or(&did).to_string()
             };
-            // Owner-gated route: must be signed (get_signed), not a plain get().
-            let resp = client
-                .get_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-                .await?;
-            // Check the HTTP status before deserializing: a 401/403/404 JSON error
-            // body (missing identity, wrong owner, private/deleted repo) must fail
-            // the tool call, not be returned as a successful result.
-            let status = resp.status();
-            let body: Value = resp.json().await?;
-            if !status.is_success() {
-                let msg = body["message"].as_str().unwrap_or("unknown error");
-                anyhow::bail!("webhook_list failed ({status}): {msg}");
-            }
-            Ok(serde_json::to_string_pretty(&body)?)
+            // Owner-gated AND auth-required route (list_webhooks 401s a headerless
+            // caller, then 403s a non-owner). get_maybe_signed signs when an
+            // identity is present (so the owner is authorized) and otherwise sends
+            // unsigned — the node then returns the 401/403/404 denial, which
+            // read_json (#186) surfaces as an error instead of a fake result, with
+            // a bounded error read. Unlike get_signed, this still ISSUES the request
+            // without a local identity (surfacing the node's denial) rather than
+            // failing client-side before the node is contacted.
+            let resp = crate::http::read_json(
+                client
+                    .get_maybe_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+                    .await?,
+                "webhook_list",
+            )
+            .await?;
+            Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "webhook_delete" => {
@@ -966,11 +1004,13 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let owner = resolve_owner(&args, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
-            let resp: Value = client
-                .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &body)
+                    .await?,
+                "delete webhook",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -990,17 +1030,17 @@ async fn call_tool(
                 }
                 u
             };
-            let resp: Value = client.get_authed(&url).await?.json().await?;
+            let resp = crate::http::read_json(client.get_authed(&url).await?, "bounties").await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_show" => {
             let id = args["id"].as_str().context("missing 'id'")?;
-            let resp: Value = client
-                .get_authed(&format!("/api/v1/bounties/{id}"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client.get_authed(&format!("/api/v1/bounties/{id}")).await?,
+                "bounty",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1013,28 +1053,32 @@ async fn call_tool(
                 "issue_id": args.get("issue_id").and_then(|v| v.as_str()),
                 "tx_hash": args.get("tx_hash").and_then(|v| v.as_str()),
             });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{name}/bounties"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{name}/bounties"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+                "create bounty",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_claim" => {
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = json!({ "wallet": args.get("wallet").and_then(|v| v.as_str()) });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/bounties/{id}/claim"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/bounties/{id}/claim"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+                "claim bounty",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1042,19 +1086,23 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let pr_id = args["pr_id"].as_str().context("missing 'pr_id'")?;
             let body = json!({ "pr_id": pr_id });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/bounties/{id}/submit"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/bounties/{id}/submit"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+                "submit bounty",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_stats" => {
-            let resp: Value = client.get("/api/v1/bounties/stats").await?.json().await?;
+            let resp =
+                crate::http::read_json(client.get("/api/v1/bounties/stats").await?, "bounty stats")
+                    .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1068,7 +1116,7 @@ async fn call_tool(
             if let Some(a) = args.get("assignee_did").and_then(|v| v.as_str()) {
                 path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
             }
-            let resp: Value = client.get(&path).await?.json().await?;
+            let resp = crate::http::read_json(client.get(&path).await?, "list tasks").await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1085,7 +1133,9 @@ async fn call_tool(
                 "deadline": args.get("deadline").and_then(|v| v.as_str()),
                 "delegator_did": delegator_did,
             }))?;
-            let resp: Value = client.post("/api/v1/tasks", &body).await?.json().await?;
+            let resp =
+                crate::http::read_json(client.post("/api/v1/tasks", &body).await?, "create task")
+                    .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1094,11 +1144,13 @@ async fn call_tool(
             let assignee_did = kp.did().to_string();
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = serde_json::to_vec(&json!({ "assignee_did": assignee_did }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/tasks/{id}/claim"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/tasks/{id}/claim"), &body)
+                    .await?,
+                "claim task",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1110,11 +1162,13 @@ async fn call_tool(
                 "result": args.get("result").and_then(|v| v.as_str()),
                 "by_did": by_did,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/tasks/{id}/complete"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/tasks/{id}/complete"), &body)
+                    .await?,
+                "complete task",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1184,11 +1238,13 @@ async fn call_tool(
                 let owner = resolve_owner(&args, &client).await?;
                 (owner, repo.to_string())
             };
-            let resp: Value = client
-                .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
+                    .await?,
+                "issues",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1208,11 +1264,13 @@ async fn call_tool(
                 "title": title,
                 "body": args.get("body").and_then(|v| v.as_str()),
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body)
+                    .await?,
+                "create issue",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1230,14 +1288,16 @@ async fn call_tool(
                 (owner, repo.to_string())
             };
             let body = serde_json::to_vec(&json!({ "body": comment_body }))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = crate::http::read_json(
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"),
+                        &body,
+                    )
+                    .await?,
+                "comment on issue",
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1252,7 +1312,7 @@ async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
     if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
         return Ok(o.to_string());
     }
-    let info: Value = client.get("/").await?.json().await?;
+    let info = crate::http::read_json(client.get("/").await?, "node info").await?;
     let did = info["did"].as_str().context("node info missing DID")?;
     Ok(did.split(':').next_back().unwrap_or(did).to_string())
 }
@@ -2031,5 +2091,581 @@ mod tests {
         let tools = tool_definitions();
         let count = tools.as_array().unwrap().len();
         assert_eq!(count, 40, "expected 40 tools, got {count}");
+    }
+
+    // ── Gated read arms surface node denials, not fabricated results (#123 / INV-8) ──
+
+    #[tokio::test]
+    async fn repo_get_surfaces_denial_not_fabricated_repo() {
+        // The node returns the opaque 404 for a private repo the caller cannot read.
+        // The tool must Err surfacing it, NOT Ok with the error body serialized as the repo.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+
+        let err = result
+            .expect_err("repo_get must Err on a 404, not fabricate a repo")
+            .to_string();
+        assert!(err.contains("404"), "err={err}");
+        assert!(err.contains("not found"), "err={err}");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repo_get_returns_repo_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/myrepo")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"name":"myrepo","owner_did":"did:gitlawb:alice"}"#)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "myrepo"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["name"], "myrepo");
+    }
+
+    #[tokio::test]
+    async fn repo_commits_surfaces_denial_not_empty_list() {
+        // Before the fix a 404 rendered as "no commits" (empty). Now it must Err.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/commits")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_commits",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "repo_commits must Err on 404");
+        assert!(result.unwrap_err().to_string().contains("not found"));
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn repo_tree_surfaces_denial_not_fabricated_tree() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/tree/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "repo_tree",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "repo_tree must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pr_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_list",
+            json!({"owner": "alice", "repo": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn webhook_list_surfaces_denial_not_hook_targets() {
+        // Client half of #94: a non-owner hooks read must surface the denial,
+        // never render the webhook target URLs as a result.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/hooks")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "webhook_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn issue_list_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/issues")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "issue_list",
+            json!({"repo": "alice/secret"}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "issue_list must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pr_view_surfaces_denial_not_stub() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls/1")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_view",
+            json!({"owner": "alice", "repo": "secret", "number": 1}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_view must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn pr_diff_surfaces_denial_not_empty() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/secret/pulls/1/diff")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = call_tool(
+            "pr_diff",
+            json!({"owner": "alice", "repo": "secret", "number": 1}),
+            &server.url(),
+            None,
+        )
+        .await;
+        assert!(result.is_err(), "pr_diff must Err on 404");
+        // Prove the gated route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy is_err() vacuously.
+        _m.assert_async().await;
+    }
+
+    // ── INV-8 across the MCP twin: every tool that renders a node response must
+    //    surface a denial as an Err, not print the 4xx/5xx body as a success. ──
+
+    /// Drive one MCP tool against a node returning a 404 and assert it Errs
+    /// (surfacing the denial) rather than returning the error body as a result.
+    /// `.expect(1)` proves the tool hit the intended endpoint, so a wrong-path
+    /// request (mockito's 501) can't satisfy the Err assertion vacuously.
+    async fn assert_tool_surfaces_denial(
+        tool: &str,
+        method: &str,
+        path: mockito::Matcher,
+        args: Value,
+        with_identity: bool,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        if with_identity {
+            let kp = gitlawb_core::identity::Keypair::generate();
+            std::fs::write(
+                dir.path().join("identity.pem"),
+                kp.to_pem().unwrap().as_bytes(),
+            )
+            .unwrap();
+        }
+        let _m = server
+            .mock(method, path)
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let dir_opt = with_identity.then(|| dir.path());
+        let err = call_tool(tool, args, &server.url(), dir_opt)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("404"),
+            "{tool} must surface the 404 denial as an Err, got: {err}"
+        );
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn node_info_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "node_info",
+            "GET",
+            mockito::Matcher::Regex(r"^/$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn node_health_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "node_health",
+            "GET",
+            mockito::Matcher::Regex(r"^/health$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repo_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "repo_create",
+            "POST",
+            mockito::Matcher::Regex(r"^/api/v1/repos$".to_string()),
+            json!({"name": "r"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repo_list_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "repo_list",
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v1/repos$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repo_list_federated_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "repo_list_federated",
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v1/repos/federated$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn agent_register_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "agent_register",
+            "POST",
+            mockito::Matcher::Regex(r"^/api/register$".to_string()),
+            json!({}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "pr_create",
+            "POST",
+            mockito::Matcher::Regex(r"/pulls$".to_string()),
+            json!({"owner": "alice", "repo": "r", "head": "h", "title": "t"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr_review_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "pr_review",
+            "POST",
+            mockito::Matcher::Regex(r"/pulls/1/reviews$".to_string()),
+            json!({"owner": "alice", "repo": "r", "number": 1, "status": "approve"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pr_merge_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "pr_merge",
+            "POST",
+            mockito::Matcher::Regex(r"/pulls/1/merge$".to_string()),
+            json!({"owner": "alice", "repo": "r", "number": 1}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn webhook_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "webhook_create",
+            "POST",
+            mockito::Matcher::Regex(r"/hooks$".to_string()),
+            json!({"owner": "alice", "repo": "r", "url": "http://example.com"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn webhook_delete_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "webhook_delete",
+            "DELETE",
+            mockito::Matcher::Regex(r"/hooks/h1$".to_string()),
+            json!({"owner": "alice", "repo": "r", "id": "h1"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_show_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_show",
+            "GET",
+            mockito::Matcher::Regex(r"/api/v1/bounties/b1$".to_string()),
+            json!({"id": "b1"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_create",
+            "POST",
+            mockito::Matcher::Regex(r"/bounties$".to_string()),
+            json!({"repo": "a/b", "title": "t", "amount": 100}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_claim_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_claim",
+            "POST",
+            mockito::Matcher::Regex(r"/api/v1/bounties/b1/claim$".to_string()),
+            json!({"id": "b1"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_submit_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_submit",
+            "POST",
+            mockito::Matcher::Regex(r"/api/v1/bounties/b1/submit$".to_string()),
+            json!({"id": "b1", "pr_id": "p1"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bounty_stats_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "bounty_stats",
+            "GET",
+            mockito::Matcher::Regex(r"^/api/v1/bounties/stats$".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_list_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "task_list",
+            "GET",
+            mockito::Matcher::Regex(r"/api/v1/tasks\?".to_string()),
+            json!({}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "task_create",
+            "POST",
+            mockito::Matcher::Regex(r"^/api/v1/tasks$".to_string()),
+            json!({"kind": "code-review"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_claim_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "task_claim",
+            "POST",
+            mockito::Matcher::Regex(r"/api/v1/tasks/t1/claim$".to_string()),
+            json!({"id": "t1"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn task_complete_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "task_complete",
+            "POST",
+            mockito::Matcher::Regex(r"/api/v1/tasks/t1/complete$".to_string()),
+            json!({"id": "t1"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_create_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "issue_create",
+            "POST",
+            mockito::Matcher::Regex(r"/issues$".to_string()),
+            json!({"owner": "alice", "repo": "r", "title": "t"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn issue_comment_via_mcp_surfaces_denial() {
+        assert_tool_surfaces_denial(
+            "issue_comment",
+            "POST",
+            mockito::Matcher::Regex(r"/issues/i1/comments$".to_string()),
+            json!({"owner": "alice", "repo": "r", "issue_id": "i1", "body": "b"}),
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn git_refs_via_mcp_surfaces_denial() {
+        // git_refs reads pkt-line bytes, not JSON, so a 404 body would otherwise
+        // parse to an empty ref list and render as a successful (empty) result.
+        assert_tool_surfaces_denial(
+            "git_refs",
+            "GET",
+            mockito::Matcher::Regex(r"/info/refs".to_string()),
+            json!({"owner": "alice", "name": "r"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn repo_clone_url_via_mcp_surfaces_denial() {
+        // repo_clone_url resolves the node DID via GET / (read_json). A gated 404
+        // there must Err (surfacing the status), not fabricate a clone URL.
+        assert_tool_surfaces_denial(
+            "repo_clone_url",
+            "GET",
+            mockito::Matcher::Regex(r"^/$".to_string()),
+            json!({"name": "r"}),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn mcp_resolve_owner_surfaces_denial() {
+        // With no "owner" arg, resolve_owner GETs / for the node DID via read_json.
+        // A gated 404 there must Err (surfacing the status), proving the conversion
+        // is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_owner(&json!({}), &NodeClient::new(server.url(), None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
     }
 }

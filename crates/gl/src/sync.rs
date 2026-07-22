@@ -71,8 +71,9 @@ pub async fn run(args: SyncArgs) -> Result<()> {
         SyncCmd::Status => {
             let client = NodeClient::new(&args.node, None);
             // Just show peer list and node stats for now
-            let stats: serde_json::Value = client.get("/api/v1/stats").await?.json().await?;
-            let peers: serde_json::Value = client.get("/api/v1/peers").await?.json().await?;
+            let stats =
+                crate::http::read_json(client.get("/api/v1/stats").await?, "node stats").await?;
+            let peers = crate::http::read_json(client.get("/api/v1/peers").await?, "peers").await?;
             println!("Node stats:");
             println!("  repos:  {}", stats["repos"].as_i64().unwrap_or(0));
             println!("  agents: {}", stats["agents"].as_i64().unwrap_or(0));
@@ -107,7 +108,7 @@ fn trigger_counts(resp: &serde_json::Value) -> (u64, u64) {
 /// Read at most `cap` bytes of a response body. Bounds the allocation from a
 /// hostile or broken node returning a huge error body — the display is capped
 /// separately, but the read itself must not be unbounded (INV-6, read half).
-async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < cap {
         match resp.chunk().await {
@@ -130,7 +131,7 @@ async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
 /// reach the terminal verbatim (INV-6). We drop the C0/C1 control bytes (which
 /// defangs ANSI/OSC escapes) AND the Unicode bidi/format controls (which
 /// `char::is_control` does not cover — they can reorder the displayed line).
-fn sanitize_node_msg(s: &str) -> String {
+pub(crate) fn sanitize_node_msg(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() && !gitlawb_core::sanitize::is_bidi_format(*c))
         .take(200)
@@ -191,6 +192,7 @@ mod tests {
             // Valid JSON: the parse-without-status-check bug deserializes this
             // into a zero-count success struct and prints "✓ sync triggered".
             .with_body(r#"{"message":"unauthorized"}"#)
+            .expect(1)
             .create_async()
             .await;
         let (args, _dir) = trigger_args(server.url());
@@ -199,6 +201,8 @@ mod tests {
             err.to_string().contains("401"),
             "expected 401 surfaced, got: {err}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -209,6 +213,7 @@ mod tests {
             .with_status(429)
             .with_header("content-type", "application/json")
             .with_body(r#"{"message":"slow down"}"#)
+            .expect(1)
             .create_async()
             .await;
         let (args, _dir) = trigger_args(server.url());
@@ -217,6 +222,8 @@ mod tests {
             err.to_string().contains("429"),
             "expected 429 surfaced, got: {err}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -233,6 +240,7 @@ mod tests {
             // BEL (\u0007); serde decodes them to real control bytes a naive
             // client would print. (The status-check bug fake-successes here.)
             .with_body("{\"message\":\"pwned\\u001b[31m\\u0007bad\"}")
+            .expect(1)
             .create_async()
             .await;
         let (args, _dir) = trigger_args(server.url());
@@ -244,6 +252,8 @@ mod tests {
             s.contains("pwned") && s.contains("bad"),
             "message text dropped: {s:?}"
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -300,6 +310,7 @@ mod tests {
             .mock("POST", "/api/v1/sync/trigger")
             .with_status(401)
             .with_body("A".repeat(2_000_000))
+            .expect(1)
             .create_async()
             .await;
         let (args, _dir) = trigger_args(server.url());
@@ -311,6 +322,8 @@ mod tests {
             "error message not bounded: {} chars",
             s.len()
         );
+        // Prove the mocked route was actually requested; a non-matching request (mockito's 501, also non-2xx) would otherwise satisfy the error assertion vacuously.
+        _m.assert_async().await;
     }
 
     #[tokio::test]
@@ -340,5 +353,72 @@ mod tests {
             trigger_counts(&serde_json::json!({"peers_reached": "x"})),
             (0, 0)
         );
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_stats_denial_not_fake_zeros() {
+        // A node error on /stats must Err, not print "0 repos / 0 agents / 0 pushes".
+        let mut server = mockito::Server::new_async().await;
+        let stats = server
+            .mock("GET", "/api/v1/stats")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // A peers mock so the pre-fix path reaches a clean success rather than a
+        // 501 on an unmocked route; after the fix the /stats denial bails first.
+        let _peers = server
+            .mock("GET", "/api/v1/peers")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"count":0,"peers":[]}"#)
+            .create_async()
+            .await;
+        let args = SyncArgs {
+            cmd: SyncCmd::Status,
+            node: server.url(),
+            dir: None,
+        };
+        let err = run(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "expected 500 surfaced, got: {err}"
+        );
+        stats.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn status_surfaces_peers_denial() {
+        // /stats succeeds but /peers denies — the peers read must Err too, not
+        // print "Known peers: 0".
+        let mut server = mockito::Server::new_async().await;
+        let _stats = server
+            .mock("GET", "/api/v1/stats")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"repos":1,"agents":2,"pushes":3}"#)
+            .create_async()
+            .await;
+        let peers = server
+            .mock("GET", "/api/v1/peers")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"boom"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let args = SyncArgs {
+            cmd: SyncCmd::Status,
+            node: server.url(),
+            dir: None,
+        };
+        let err = run(args).await.unwrap_err();
+        assert!(
+            err.to_string().contains("500"),
+            "expected 500 surfaced, got: {err}"
+        );
+        peers.assert_async().await;
     }
 }

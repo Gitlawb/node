@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
 use icaptcha_client::IcaptchaCfg;
+use serde_json::Value;
 
 /// Max times we'll fetch a fresh proof and retry a 403-iCaptcha response
 /// (absorbs proof expiry / first-seen replay).
@@ -201,6 +202,51 @@ async fn obtain_proof(cfg: IcaptchaCfg) -> Result<String> {
     tokio::task::spawn_blocking(move || icaptcha_client::obtain_proof(&cfg, None))
         .await
         .context("iCaptcha solver task panicked")?
+}
+
+/// Read a JSON response, surfacing a node denial/error instead of parsing it as
+/// the requested resource. On a non-2xx status it returns an `Err` carrying the
+/// node's sanitized `message` (INV-6) plus the status; on success it parses the
+/// body and propagates a parse error, so a truncated/garbage 2xx body is an error
+/// rather than a silently-empty success (the denial-as-success bug #123 fixes).
+/// `what` names the resource for the error text (e.g. "repo", "commits").
+///
+/// Callers must route gated reads through this rather than `resp.json().await?`:
+/// the bare parse renders a gated 404/5xx body back as the resource (INV-8).
+/// Cap on the error body `read_json` reads before parsing a node's `message`.
+/// Matches the capped-read bound used on the sync error path; large enough for any
+/// legitimate error, small enough that a hostile node cannot exhaust memory.
+const ERROR_BODY_CAP: usize = 8 * 1024;
+
+pub(crate) async fn read_json(resp: reqwest::Response, what: &str) -> Result<Value> {
+    let status = resp.status();
+    if !status.is_success() {
+        // Bound the error read: `resp.json()` would buffer and parse the WHOLE
+        // body, so a hostile node could stream an arbitrarily large valid JSON
+        // error and exhaust this process's memory (#186). Read a small capped body
+        // first, then best-effort extract `message`. The error body may also be
+        // non-JSON (503 degraded, 413 body-limit from middleware), so a parse miss
+        // falls back to the capped raw text; an empty body to the status alone.
+        let raw = crate::sync::read_body_capped(resp, ERROR_BODY_CAP).await;
+        // Preserve the prior contract: surface the JSON `message` when present in
+        // the capped body, else the status alone ("request failed") — a non-JSON
+        // or message-less body (503 degraded, 413 body-limit) never surfaces raw
+        // node bytes. A body whose `message` sits past the cap parses as truncated
+        // garbage here and correctly falls back rather than being buffered whole.
+        let msg = serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|b| b.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "request failed".to_owned());
+        anyhow::bail!(
+            "{what} failed ({status}): {}",
+            crate::sync::sanitize_node_msg(&msg)
+        );
+    }
+    // Success: a truncated/garbage 2xx body must be an `Err`, not `Ok(Null)` that
+    // a caller then renders as an empty success.
+    resp.json()
+        .await
+        .with_context(|| format!("invalid JSON in {what} response"))
 }
 
 #[cfg(test)]
@@ -586,5 +632,152 @@ mod tests {
         n.assert();
         ic.challenge.assert();
         ic.answer.assert();
+    }
+
+    // ── read_json (status-checked read; #123 / INV-8 / INV-6) ────────────
+
+    /// Drive a real `reqwest::Response` off a mockito mock so `read_json` sees an
+    /// actual HTTP status + body, the same shape the gated read arms produce.
+    async fn response_for(
+        server: &mut Server,
+        status: usize,
+        body: &str,
+        json: bool,
+    ) -> reqwest::Response {
+        let mut m = server.mock("GET", "/x").with_status(status).with_body(body);
+        if json {
+            m = m.with_header("content-type", "application/json");
+        }
+        let _m = m.create_async().await;
+        NodeClient::new(server.url(), None).get("/x").await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_json_returns_body_on_2xx() {
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            200,
+            r#"{"name":"r","owner_did":"did:gitlawb:z"}"#,
+            true,
+        )
+        .await;
+        let v = read_json(resp, "repo").await.unwrap();
+        assert_eq!(v["name"], "r");
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_404_surfacing_message_and_status() {
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            404,
+            r#"{"message":"repository 'o/r' not found"}"#,
+            true,
+        )
+        .await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("404"), "err={err}");
+        assert!(err.contains("not found"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_500_surfacing_message() {
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 500, r#"{"message":"internal boom"}"#, true).await;
+        let err = read_json(resp, "commits").await.unwrap_err().to_string();
+        assert!(err.contains("500"), "err={err}");
+        assert!(err.contains("internal boom"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_non_json_error_body_with_fallback() {
+        // 503 with a plain-text (middleware) body: no `message` field to surface.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 503, "service unavailable", false).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("503"), "err={err}");
+        assert!(err.contains("request failed"), "err={err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_sanitizes_control_and_bidi_in_message() {
+        // INV-6: a hostile node embeds ESC, BEL, and a right-to-left override in
+        // the error message; none may reach the terminal verbatim.
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            404,
+            r#"{"message":"a\u001b[31mb\u0007c\u202ed"}"#,
+            true,
+        )
+        .await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(!err.contains('\u{1b}'), "ESC leaked: {err:?}");
+        assert!(!err.contains('\u{7}'), "BEL leaked: {err:?}");
+        assert!(!err.contains('\u{202e}'), "bidi override leaked: {err:?}");
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_garbage_2xx_body() {
+        // The #123 correctness point: a 200 with a non-JSON/truncated body must be
+        // an `Err`, NOT `Ok(Null)` that a caller renders as an empty success.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 200, "this is not json", false).await;
+        assert!(read_json(resp, "repo").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_empty_2xx_body() {
+        // A zero-byte 200 body must be an `Err`, not a silent `Ok(Null)`.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 200, "", false).await;
+        assert!(read_json(resp, "repo").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_json_errs_on_non_2xx_json_without_message() {
+        // A non-2xx JSON body that lacks a `message` key falls back to "request failed".
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 403, r#"{"error":"forbidden"}"#, true).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("403"), "err={err}");
+        assert!(err.contains("request failed"), "err={err}");
+    }
+
+    /// #186 (F2): the non-2xx error path must read a CAPPED body, not buffer and
+    /// parse the whole thing — a hostile node can stream an arbitrarily large valid
+    /// JSON error. Place the `message` field AFTER more than the cap of padding: the
+    /// bounded read stops before it, so it must be ABSENT from the surfaced error.
+    /// RED before the fix (`resp.json()` parses the full body → the far message
+    /// appears), GREEN after (capped read truncates → fallback → far message gone).
+    /// The status is still surfaced, so a legitimate small error is unaffected.
+    #[tokio::test]
+    async fn read_json_bounds_the_error_body_read() {
+        let mut server = Server::new_async().await;
+        // >8 KiB of padding, then the marker message at the very end of the body.
+        let big = format!(
+            r#"{{"padding":"{}","message":"FARMARKER_BEYOND_CAP"}}"#,
+            "A".repeat(16 * 1024)
+        );
+        let resp = response_for(&mut server, 500, &big, true).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("500"), "bounded read still errors: {err}");
+        assert!(
+            !err.contains("FARMARKER_BEYOND_CAP"),
+            "the error body read must be capped: a message beyond the cap must not be surfaced, err={err}"
+        );
+    }
+
+    /// #186 (F2): an EMPTY non-2xx body is its own input class — the capped read
+    /// yields "", the JSON parse fails, and it falls back to the status alone
+    /// ("request failed"), never a panic or a spurious success.
+    #[tokio::test]
+    async fn read_json_errs_on_empty_non_2xx_body() {
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 502, "", false).await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("502"), "err={err}");
+        assert!(err.contains("request failed"), "err={err}");
     }
 }

@@ -82,12 +82,7 @@ async fn resolve_repo(
             did.split(':').next_back().unwrap_or(&did).to_string()
         } else {
             let client = signed_client(node, dir);
-            let info: Value = client
-                .get_authed("/")
-                .await?
-                .json()
-                .await
-                .context("failed to fetch node info")?;
+            let info = crate::http::read_json(client.get_authed("/").await?, "node info").await?;
             let did = info["did"].as_str().context("node info missing 'did'")?;
             did.split(':').next_back().unwrap_or(did).to_string()
         };
@@ -100,12 +95,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
 
     let client = signed_client(&node, dir.as_deref());
     let path = format!("/api/v1/repos/{owner}/{name}/certs");
-    let resp: Value = client
-        .get_authed(&path)
-        .await?
-        .json()
-        .await
-        .context("failed to list certificates")?;
+    let resp = crate::http::read_json(client.get_authed(&path).await?, "certificates").await?;
 
     let certs = resp["certificates"].as_array().cloned().unwrap_or_default();
 
@@ -139,14 +129,10 @@ async fn cmd_show(
     let client = signed_client(&node, dir.as_deref());
     let id = resolve_cert_id(&client, &owner, &name, &id).await?;
 
-    // Fetch the certificate
+    // Fetch the certificate. read_json checks status first and surfaces the node's
+    // capped+sanitized message on a non-2xx (a bounded error read, not the whole body).
     let path = format!("/api/v1/repos/{owner}/{name}/certs/{id}");
-    let resp = client
-        .get_authed(&path)
-        .await?
-        .error_for_status()
-        .context("certificate not found")?;
-    let cert: Value = resp.json().await.context("certificate not found")?;
+    let cert = crate::http::read_json(client.get_authed(&path).await?, "certificate").await?;
 
     let cert_id = cert["id"].as_str().unwrap_or("?");
     let ref_name = cert["ref_name"].as_str().unwrap_or("?");
@@ -291,14 +277,7 @@ async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str)
     }
 
     let path = format!("/api/v1/repos/{owner}/{name}/certs?prefix={id}");
-    let resp: Value = client
-        .get_authed(&path)
-        .await?
-        .error_for_status()
-        .context("failed to list certificates")?
-        .json()
-        .await
-        .context("failed to list certificates")?;
+    let resp = crate::http::read_json(client.get_authed(&path).await?, "certificates").await?;
 
     let certs = resp["certificates"].as_array().cloned().unwrap_or_default();
     let matches: Vec<String> = certs
@@ -396,5 +375,306 @@ mod tests {
             "not-base64url!!!",
         );
         assert!(garbage.is_err(), "malformed signature must not verify");
+    }
+
+    #[tokio::test]
+    async fn cmd_list_surfaces_denial_not_empty() {
+        // A gated 404 on the repo-scoped certs read must Err, not print "No certificates".
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/repos/alice/secret/certs$".to_string()),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository 'alice/secret' not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let result = cmd_list("alice/secret".to_string(), server.url(), None).await;
+        assert!(result.is_err(), "cert list must Err on a gated 404");
+        // Prove the gated certs path was actually requested: without this, an
+        // unmatched route (mockito's 501, also non-2xx) would satisfy is_err().
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn resolve_repo_surfaces_denial() {
+        // A slash-free repo with an empty identity dir forces the GET / node-info
+        // fetch. A gated 404 there must Err (surfacing the status), proving the
+        // read_json conversion is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap(); // empty, no identity.pem, forces the GET / branch
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_repo("noslash", &server.url(), Some(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
+    }
+
+    // The `GET /` node-info lookup after the cert loads is a fail-soft diagnostic:
+    // a response-level failure degrades to a could-not-compare hint and the command
+    // completes Ok, never a fabricated mismatch warning and never a fatal Err. The
+    // cert fetch itself stays fail-closed. A >=36-char id skips resolve_cert_id so
+    // only two mocks are needed.
+    #[tokio::test]
+    async fn cmd_show_completes_with_degraded_hint_when_node_info_denied() {
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cert show must complete despite a denied node-info lookup: {result:?}"
+        );
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_show_degrades_on_malformed_node_info() {
+        // A 2xx node-info body that fails to parse degrades the same way a denial
+        // does: hint printed, command completes Ok.
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body("not json")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cert show must complete despite malformed node info: {result:?}"
+        );
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_show_degrades_when_node_info_lacks_did() {
+        // A 2xx node-info body with no `did` routes to the degraded hint, not a
+        // fabricated empty-DID mismatch warning; the command completes Ok.
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "cert show must complete when node info lacks a DID: {result:?}"
+        );
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    // Must-not case: the certificate fetch itself stays fail-closed. A gated 404
+    // aborts the command with the status surfaced, and the node-info lookup is
+    // never reached (the expect(0) assert proves it never ran).
+    #[tokio::test]
+    async fn cmd_show_surfaces_denied_certificate() {
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"repository not found"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"n"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let err = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_show_reports_matching_node_did() {
+        // Pins the unchanged success path: node info fetched, DIDs compared, Ok.
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"n"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "got: {result:?}");
+        _cert.assert_async().await;
+        _root.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn cmd_show_warns_on_mismatching_node_did() {
+        // A real, differing node DID drives the WARNING branch end to end; the
+        // command still completes Ok.
+        let mut server = mockito::Server::new_async().await;
+        let long_id = "a".repeat(36);
+        let _cert = server
+            .mock(
+                "GET",
+                format!("/api/v1/repos/alice/secret/certs/{long_id}").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"id":"c1","ref_name":"refs/heads/main","old_sha":"0","new_sha":"1","pusher_did":"p","node_did":"n","signature":"s","issued_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .create_async()
+            .await;
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:other"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = cmd_show(
+            "alice/secret".to_string(),
+            long_id,
+            server.url(),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "got: {result:?}");
+        _cert.assert_async().await;
+        _root.assert_async().await;
     }
 }
