@@ -440,6 +440,9 @@ mod ref_updates_feed_tests {
             seq: 1,
             prev: "0".repeat(64),
             pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         }
     }
 

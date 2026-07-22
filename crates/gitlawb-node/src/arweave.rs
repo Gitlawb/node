@@ -22,6 +22,7 @@ use base64::Engine as _;
 use serde::Serialize;
 use serde_json::json;
 use sha2::Digest;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 /// Data describing a ref-update event to be anchored.
@@ -261,22 +262,32 @@ pub async fn verify_anchor(
     tx_id: &str,
     db: &crate::db::Db,
 ) -> Result<VerifyResult> {
-    // Fetch the data item from the bundler gateway.
-    let url = format!("{}/v1/tx/{}", gateway_url.trim_end_matches('/'), tx_id);
+    // Fetch the data item from the Arweave gateway's data path.
+    // Gateways serve data at /{tx_id}, not /v1/tx/{id} (which is the bundler API).
+    let url = format!("{}/{}", gateway_url.trim_end_matches('/'), tx_id);
     let resp = client
         .get(&url)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("failed to fetch data from bundler gateway: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to fetch data from Arweave gateway: {e}"))?;
     if !resp.status().is_success() {
         return Ok(VerifyResult {
             valid: false,
             anchor: serde_json::Value::Null,
             certificate: None,
-            errors: vec![format!("bundler gateway returned {}", resp.status())],
+            errors: vec![format!("Arweave gateway returned {}", resp.status())],
         });
     }
+    // Bound the untrusted response to 1 MiB to prevent memory exhaustion.
     let body_bytes = resp.bytes().await?;
+    if body_bytes.len() > 1_048_576 {
+        return Ok(VerifyResult {
+            valid: false,
+            anchor: serde_json::Value::Null,
+            certificate: None,
+            errors: vec!["response body exceeds 1 MiB limit".to_string()],
+        });
+    }
 
     // Parse the payload — could be JSON or raw bytes depending on gateway
     let anchor: serde_json::Value = serde_json::from_slice(&body_bytes)?;
@@ -341,25 +352,131 @@ pub async fn verify_anchor(
             errors.push(format!("certificate signature verification failed: {e}"));
         }
 
-        // 2. Verify prev hash linkage against the predecessor at seq - 1
+        // 2. Verify prev hash linkage against the predecessor at seq - 1.
+        //    Fail closed: a missing declared predecessor is treated as invalid.
         if c.seq > 1 {
-            if let Ok(Some(pred)) = db.get_cert_by_seq(&c.repo_id, c.seq - 1).await {
-                let prev_payload = serde_json::json!({
-                    "repo_id":    pred.repo_id,
-                    "ref":        pred.ref_name,
-                    "old":        pred.old_sha,
-                    "new":        pred.new_sha,
-                    "pusher":     pred.pusher_did,
-                    "node":       pred.node_did,
-                    "ts":         pred.issued_at,
-                });
-                let prev_bytes = serde_json::to_vec(&prev_payload)?;
-                let expected_prev = hex::encode(sha2::Sha256::digest(&prev_bytes));
-                if c.prev != expected_prev {
+            match db.get_cert_by_seq(&c.repo_id, c.seq - 1).await {
+                Ok(Some(pred)) => {
+                    let prev_payload = serde_json::json!({
+                        "repo_id":    pred.repo_id,
+                        "ref":        pred.ref_name,
+                        "old":        pred.old_sha,
+                        "new":        pred.new_sha,
+                        "pusher":     pred.pusher_did,
+                        "node":       pred.node_did,
+                        "ts":         pred.issued_at,
+                    });
+                    let prev_bytes = serde_json::to_vec(&prev_payload)?;
+                    let expected_prev = hex::encode(sha2::Sha256::digest(&prev_bytes));
+                    if c.prev != expected_prev {
+                        errors.push(format!(
+                            "prev hash mismatch: claimed {} expected {}",
+                            c.prev, expected_prev
+                        ));
+                    }
+                }
+                Ok(None) => {
                     errors.push(format!(
-                        "prev hash mismatch: claimed {} expected {}",
-                        c.prev, expected_prev
+                        "predecessor cert seq {} not found for repo {}",
+                        c.seq - 1,
+                        c.repo_id
                     ));
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "error looking up predecessor seq {}: {e}",
+                        c.seq - 1
+                    ));
+                }
+            }
+        }
+
+        // 3. Verify the pusher authorization proof (RFC 9421 HTTP Signature)
+        //    when all required context is available.
+        if let (Some(pusher_sig), Some(sig_input), Some(content_digest), Some(request_path)) = (
+            &c.pusher_sig,
+            &c.signature_input,
+            &c.content_digest,
+            &c.request_path,
+        ) {
+            match gitlawb_core::http_sig::HttpSignature::parse(
+                sig_input,
+                &format!("sig1=:{pusher_sig}:"),
+            ) {
+                Ok(http_sig) => {
+                    let mut request_values: HashMap<String, String> = HashMap::new();
+                    request_values.insert("@method".to_string(), "POST".to_string());
+                    request_values.insert("@path".to_string(), request_path.clone());
+                    request_values.insert("content-digest".to_string(), content_digest.clone());
+
+                    let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
+                    let components_ref: Vec<&str> =
+                        http_sig.components.iter().map(String::as_str).collect();
+
+                    match gitlawb_core::http_sig::build_signing_string(
+                        &components_ref,
+                        sig_params_value,
+                        &request_values,
+                    ) {
+                        Ok(signing_string) => {
+                            let pusher_did = gitlawb_core::did::Did::from_str(&c.pusher_did);
+                            let pusher_vk = pusher_did.and_then(|d| d.to_verifying_key());
+                            match pusher_vk {
+                                Ok(vk) => {
+                                    let sig_bytes: [u8; 64] =
+                                        match base64::engine::general_purpose::STANDARD
+                                            .decode(pusher_sig)
+                                        {
+                                            Ok(bytes) => match bytes.as_slice().try_into() {
+                                                Ok(a) => a,
+                                                Err(_) => {
+                                                    errors.push(
+                                                        "pusher signature is not 64 bytes"
+                                                            .to_string(),
+                                                    );
+                                                    return Ok(VerifyResult {
+                                                        valid: false,
+                                                        anchor,
+                                                        certificate: cert,
+                                                        errors,
+                                                    });
+                                                }
+                                            },
+                                            Err(_) => {
+                                                errors.push(
+                                                    "pusher signature is not valid base64"
+                                                        .to_string(),
+                                                );
+                                                return Ok(VerifyResult {
+                                                    valid: false,
+                                                    anchor,
+                                                    certificate: cert,
+                                                    errors,
+                                                });
+                                            }
+                                        };
+                                    if let Err(e) = gitlawb_core::identity::verify(
+                                        &vk,
+                                        signing_string.as_bytes(),
+                                        &sig_bytes,
+                                    ) {
+                                        errors.push(format!(
+                                            "pusher signature verification failed: {e}"
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    errors.push(format!("unresolvable pusher DID: {e}"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            errors.push(format!("failed to build signing string: {e}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("failed to parse pusher Signature-Input: {e}"));
                 }
             }
         }
@@ -564,16 +681,14 @@ mod tests {
     #[tokio::test]
     async fn test_verify_anchor_uses_correct_gateway_url() {
         let mut server = mockito::Server::new_async().await;
+        // Gateways serve data at /{tx_id}, not /v1/tx/{id}.
         let _mock = server
-            .mock("GET", "/v1/tx/does-not-exist")
+            .mock("GET", "/does-not-exist")
             .with_status(404)
             .create_async()
             .await;
 
         let client = reqwest::Client::new();
-        // verify_anchor needs a real PgPool; this test only exercises that
-        // the function correctly formats the gateway URL and handles a 404.
-        // It will error on the pool access which is expected without a test DB.
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
@@ -582,13 +697,9 @@ mod tests {
 
         match result {
             Ok(r) => {
-                // With a lazy unconnected pool, get_most_recent_cert will fail,
-                // but the function still returns Ok(VerifyResult) with errors.
                 assert!(!r.valid);
             }
             Err(e) => {
-                // On some systems the POSTGRES connection attempt may abort
-                // rather than fail gracefully.
                 let msg = e.to_string();
                 assert!(
                     msg.contains("pool") || msg.contains("error"),

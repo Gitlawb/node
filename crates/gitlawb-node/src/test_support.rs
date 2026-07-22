@@ -1751,6 +1751,12 @@ mod tests {
                 node_did: owner.to_string(),
                 signature: "sig".to_string(),
                 issued_at: Utc::now().to_rfc3339(),
+                seq: 1,
+                prev: "0".repeat(64),
+                pusher_sig: None,
+                signature_input: None,
+                content_digest: None,
+                request_path: None,
             })
             .await
             .expect("seed private cert");
@@ -13946,6 +13952,9 @@ mod tests {
             seq: 1,
             prev: "0".repeat(64),
             pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -13984,6 +13993,9 @@ mod tests {
             seq: 1,
             prev: "0".repeat(64),
             pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -14496,6 +14508,9 @@ mod tests {
             seq: 1,
             prev: "0".repeat(64),
             pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -15355,6 +15370,9 @@ mod tests {
             seq: 1,
             prev: "0".repeat(64),
             pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         }
     }
 
