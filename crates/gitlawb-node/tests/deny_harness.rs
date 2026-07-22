@@ -1845,11 +1845,15 @@ mod completeness {
     /// below must not demand they be driven or structurally excused. Keyed by path
     /// (the unit `scrape_mounts` yields) so a new gate added to one of these later
     /// still surfaces via the marker scan; this list only says "no gate today".
-    const PUBLIC_REPO_GETS: &[&str] = &[
-        "/api/v1/repos/{owner}/{repo}/hooks", // list_webhooks
-        "/api/v1/repos/{owner}/{repo}/branches/protected", // list_protected_branches
-        "/api/v1/repos/{owner}/{repo}/replicas", // list_replicas
-    ];
+    ///
+    /// Currently EMPTY: `/hooks`, `/branches/protected`, and `/replicas` were listed
+    /// here as ungated public GETs, but #113 added an `authorize_repo_read` gate to
+    /// all three. They are now DRIVEN as real `ReadGate` rows in
+    /// `deny_bearing_routes()` (list_webhooks also as an OwnerGate row for its owner
+    /// layer), so they are classified via the driven-path set, not this list. The
+    /// mechanism is kept (not deleted) so the next genuinely-public repo-GET has a
+    /// home — the marker scan is the source of truth that keeps it honest.
+    const PUBLIC_REPO_GETS: &[&str] = &[];
 
     /// True for a mounted path that is scoped to a single repo — the API form
     /// `/api/v1/repos/{owner}/{repo}/…` and the bare git form `/{owner}/{repo}/…`.

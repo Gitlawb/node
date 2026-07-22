@@ -14,7 +14,7 @@
 use gitlawb_core::identity::Keypair;
 use gitlawb_node::test_harness::TestNode;
 
-use super::routes::{GateClass, IdSource, Principal, Reach, Row};
+use super::routes::{AnonRead, GateClass, IdSource, Principal, Reach, Row};
 
 /// A seeded two-repo state matrix plus the owner and stranger identities.
 pub struct Fixture {
@@ -992,15 +992,23 @@ pub fn probes_for(row: &Row, fixture: &Fixture) -> Vec<Probe> {
                 fixture.private_repo_id.clone(),
             ];
             withheld.extend(fixture.priv_markers.iter().cloned());
+            // The anon leg: an `Option`-auth read existence-hides with a 404, but an
+            // auth-required read (`AnonRead::Deny401`, e.g. list_webhooks) rejects a
+            // headerless caller 401 BEFORE any lookup. The signed-non-reader 404
+            // below is the existence-hiding gate either way; only this leg differs.
+            let anon_status = match row.anon_read {
+                AnonRead::Deny404 => 404,
+                AnonRead::Deny401 => 401,
+            };
             let mut v = vec![
                 Probe {
-                    label: format!("{} read-gate hostile (anon)", row.handler),
+                    label: format!("{} read-gate hostile (anon -> {anon_status})", row.handler),
                     method: method.clone(),
                     path: path.clone(),
                     body: body.clone(),
                     signer: Signer::Anon,
                     json,
-                    expect: Expect::Deny(404),
+                    expect: Expect::Deny(anon_status),
                     withheld: withheld.clone(),
                 },
                 // #195 (F1): a signed NON-READER must also get the existence-hiding
@@ -1181,6 +1189,7 @@ mod tests {
             reach: Reach::None,
             principals: &[],
             id_source: crate::support::routes::IdSource::Fixed,
+            anon_read: crate::support::routes::AnonRead::Deny404,
         };
         let ps = probes_for(&row, &fx());
         assert_eq!(ps.len(), 2);
@@ -1213,6 +1222,7 @@ mod tests {
             reach: Reach::ReaderReads,
             principals: &[],
             id_source: crate::support::routes::IdSource::Fixed,
+            anon_read: crate::support::routes::AnonRead::Deny404,
         };
         let f = fx();
         let ps = probes_for(&row, &f);
@@ -1272,6 +1282,7 @@ mod tests {
             reach: Reach::None,
             principals: &[],
             id_source: crate::support::routes::IdSource::Fixed,
+            anon_read: crate::support::routes::AnonRead::Deny404,
         };
         let ps = probes_for(&row, &fx());
         assert_eq!(ps.len(), 1);
@@ -1296,6 +1307,7 @@ mod tests {
             reach: Reach::SiblingPublic("/api/v1/repos/{owner}/{repo}/blob/{*path}"),
             principals: &[],
             id_source: crate::support::routes::IdSource::Fixed,
+            anon_read: crate::support::routes::AnonRead::Deny404,
         };
         let ps = probes_for(&row, &fx());
         // anon hostile, signed-stranger hostile (#195 F1), sibling-public twin.
@@ -1337,6 +1349,7 @@ mod tests {
             reach: Reach::ReaderReads,
             principals: &[],
             id_source: crate::support::routes::IdSource::Fixed,
+            anon_read: crate::support::routes::AnonRead::Deny404,
         };
         let f = fx();
         let ps = probes_for(&row, &f);
@@ -1400,6 +1413,7 @@ mod tests {
             reach: Reach::None,
             principals: &[],
             id_source: crate::support::routes::IdSource::Fixed,
+            anon_read: crate::support::routes::AnonRead::Deny404,
         };
         let _ = probes_for(&row, &fx());
     }
