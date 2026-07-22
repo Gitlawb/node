@@ -38,13 +38,23 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let git_dir = cwd.join(".git");
     if !git_dir.exists() {
         println!("Initializing git repository...");
+        // -b main: the push flow targets `main`; without it a fresh repo uses
+        // the user's init.defaultBranch (often `master`). Older git (<2.28)
+        // lacks the flag, so fall back to a plain init.
         let status = std::process::Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(&cwd)
             .status()
             .context("failed to run git init")?;
         if !status.success() {
-            anyhow::bail!("git init failed");
+            let status = std::process::Command::new("git")
+                .args(["init"])
+                .current_dir(&cwd)
+                .status()
+                .context("failed to run git init")?;
+            if !status.success() {
+                anyhow::bail!("git init failed");
+            }
         }
     } else {
         println!("Git repository detected.");
@@ -165,9 +175,47 @@ pub async fn run(args: InitArgs) -> Result<()> {
         }
     }
 
+    // The hint must match the repo's actual state: with no commits yet, a bare
+    // `git push` fails with "src refspec ... does not match any" — exactly the
+    // trap a zero-to-push command must not set.
+    let has_commits = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(&cwd)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    // symbolic-ref succeeds on a branch (including an unborn one) and fails
+    // on a detached HEAD — where guessing "main" could push the wrong ref.
+    let branch = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(&cwd)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     println!();
-    println!("Ready! Push with:");
-    println!("  git push gitlawb main");
+    match (branch, has_commits) {
+        (Some(branch), true) => {
+            println!("Ready! Push with:");
+            println!("  git push gitlawb {branch}");
+        }
+        (Some(branch), false) => {
+            println!("Ready! Nothing is committed yet — commit, then push:");
+            println!("  git add -A && git commit -m \"initial commit\"");
+            println!("  git push gitlawb {branch}");
+        }
+        (None, _) => {
+            println!("Ready! HEAD is detached — create or switch to a branch, then push:");
+            println!("  git switch -c main");
+            println!("  git push gitlawb main");
+        }
+    }
 
     Ok(())
 }
