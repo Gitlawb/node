@@ -1,10 +1,16 @@
-# Opens an issue the moment a push-to-main run of PR Checks goes red.
+# Tracks main's CI state as a labeled issue: opens (or updates) a ci-main-red
+# issue when a push-to-main run of PR Checks ends red, and closes it when a
+# subsequent run on main's tip goes green.
 #
-# Two individually-green PRs can still break main in combination when the
-# second one merges on checks that ran against a stale base (semantic merge
+# Why: two individually-green PRs can break main in combination when the
+# second merges on checks that ran against a stale base (semantic merge
 # race — #113 + #145 broke test compilation, found only via #229). A red main
-# is otherwise silent, and release-please PRs inherit the breakage, so this
-# turns it into an open, labeled issue instead.
+# is otherwise silent, and release-please PRs inherit the breakage.
+#
+# The alert reflects main's CURRENT STATE, not raw CI events: runs whose
+# commit is no longer main's tip are ignored (a re-run of an old red run
+# after a fix has landed must not cry wolf), and a green run on the tip
+# closes any open alert.
 name: Main red alert
 
 on:
@@ -15,38 +21,78 @@ on:
 
 permissions:
   issues: write
+  contents: read # getBranch tip check
 
-# Serialize alert runs: two near-simultaneous red-main events would otherwise
-# race the label/issue lookups and open duplicate ci-main-red issues (or 422
-# on createLabel). Never cancel a running alert; a superseded pending run is
-# fine — the newest event still lands its comment.
+# Serialize runs: concurrent completions would race the label/issue lookups
+# into duplicates (or 422 on createLabel). queue: max keeps every pending
+# completion instead of letting a later (possibly green-skipped) arrival
+# displace a pending red alert under burst merges; it is only incompatible
+# with cancel-in-progress: true, which we don't use.
 concurrency:
   group: main-red-alert
   cancel-in-progress: false
+  queue: max
 
 jobs:
-  alert:
-    name: Open issue on red main
+  track:
+    name: Track main CI state
+    # timed_out (the test job runs 45 min against Postgres) and
+    # startup_failure (malformed workflow) are red too — only cancelled is
+    # excluded as a deliberate human abort. success runs are needed to close
+    # the alert once main recovers.
     if: >-
-      github.event.workflow_run.conclusion == 'failure' &&
-      github.event.workflow_run.event == 'push'
+      github.event.workflow_run.event == 'push' &&
+      contains(fromJSON('["failure", "timed_out", "startup_failure", "success"]'), github.event.workflow_run.conclusion)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Create or update the broken-main issue
+      - name: Reconcile the broken-main issue with main's current state
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
             const run = context.payload.workflow_run;
             const label = 'ci-main-red';
+
+            // Freshness gate: only the run for main's current tip may open or
+            // close anything. Re-runs of superseded commits are events about
+            // the past, not statements about main's state.
+            const { data: branch } = await github.rest.repos.getBranch({
+              ...context.repo, branch: 'main',
+            });
+            if (branch.commit.sha !== run.head_sha) {
+              core.info(`run ${run.id} is for ${run.head_sha}, main is at ${branch.commit.sha} — ignoring stale run`);
+              return;
+            }
+
+            // listForRepo returns PRs carrying the label too — those must
+            // never be mistaken for the tracking issue.
+            const open = (await github.rest.issues.listForRepo({
+              ...context.repo, state: 'open', labels: label, per_page: 100,
+            })).data.filter(item => !item.pull_request);
+
+            if (run.conclusion === 'success') {
+              const body = `Recovered: [PR Checks](${run.html_url}) is green on main at \`${run.head_sha}\`.`;
+              for (const issue of open) {
+                await github.rest.issues.createComment({
+                  ...context.repo, issue_number: issue.number, body,
+                });
+                await github.rest.issues.update({
+                  ...context.repo, issue_number: issue.number, state: 'closed', state_reason: 'completed',
+                });
+              }
+              return;
+            }
+
             const headline = run.head_commit?.message?.split('\n')[0] ?? '';
             const body = [
-              `[PR Checks run](${run.html_url}) failed on main at \`${run.head_sha}\`.`,
+              `[PR Checks run](${run.html_url}) concluded \`${run.conclusion}\` on main at \`${run.head_sha}\`.`,
               '',
               `> ${headline}`,
               '',
               'Likely a semantic merge race: each merged PR was green on a stale base.',
               'Fix main before merging anything else — release-please PRs inherit this breakage.',
+              '',
+              "This issue closes automatically when a run on main's tip goes green.",
             ].join('\n');
 
             try {
@@ -61,12 +107,9 @@ jobs:
               });
             }
 
-            const open = await github.rest.issues.listForRepo({
-              ...context.repo, state: 'open', labels: label, per_page: 1,
-            });
-            if (open.data.length > 0) {
+            if (open.length > 0) {
               await github.rest.issues.createComment({
-                ...context.repo, issue_number: open.data[0].number, body,
+                ...context.repo, issue_number: open[0].number, body,
               });
             } else {
               await github.rest.issues.create({
