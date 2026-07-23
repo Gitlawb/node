@@ -1,0 +1,65 @@
+# fly.toml app configuration file generated for gitlawb-node-2 on 2026-07-22T09:47:18+08:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'gitlawb-node-2'
+primary_region = 'sjc'
+
+[build]
+  dockerfile = '../../Dockerfile'
+
+[env]
+  GITLAWB_AUTO_SYNC = 'true'
+  GITLAWB_BOOTSTRAP_PEERS = 'https://node.gitlawb.com,https://node3.gitlawb.com'
+  GITLAWB_HOST = '0.0.0.0'
+  GITLAWB_KEY = '/data/keys/identity.pem'
+  GITLAWB_MAX_PACK_BYTES = '524288000'
+  GITLAWB_P2P_PORT = '7546'
+  GITLAWB_PORT = '7545'
+  GITLAWB_PUBLIC_URL = 'https://node2.gitlawb.com'
+  GITLAWB_REPOS_DIR = '/data/repos'
+  ICAPTCHA_MODE = 'enforce'
+  ICAPTCHA_PUBKEY = 'xjyPNqIbvc9U-kwXW6u9mDqRJ7E2UUMOaJdUWhpEXq8'
+  ICAPTCHA_REQUIRED_LEVEL = '3'
+
+[[mounts]]
+  source = 'gitlawb_data'
+  destination = '/data'
+
+[http_service]
+  internal_port = 7545
+  force_https = true
+  auto_stop_machines = 'off'
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = 'connections'
+    hard_limit = 500
+    soft_limit = 400
+
+  [http_service.http_options]
+    idle_timeout = 120
+
+  [[http_service.checks]]
+    interval = '15s'
+    timeout = '5s'
+    grace_period = '30s'
+    method = 'GET'
+    path = '/ready'
+
+[[services]]
+  protocol = 'udp'
+  internal_port = 7546
+
+  [[services.ports]]
+    port = 7546
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '1024'
+
+[[metrics]]
+  port = 9091
+  path = '/metrics'
