@@ -52,19 +52,72 @@ pub async fn info_refs(repo_path: &Path, service: &str) -> Result<Response> {
 ///
 /// Serves pack data for a clone or fetch. This is stateless — the entire
 /// negotiation happens in a single request/response.
+///
+/// Returns `(response, served_pack)` where `served_pack` is whether the
+/// git-upload-pack-result actually delivered a packfile (vs a negotiation-only
+/// ACK/NAK round). The handler counts a completed fetch from this outcome rather
+/// than from the request's `done` flag (#192 F1).
 pub async fn upload_pack(
     repo_path: &Path,
     request_body: Bytes,
     timeout: Duration,
-) -> Result<Response> {
+) -> Result<(Response, bool)> {
     let output =
         run_git_service("git", "git-upload-pack", repo_path, request_body, timeout).await?;
 
-    Ok(Response::builder()
+    let served_pack = response_served_pack(&output);
+    let resp = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/x-git-upload-pack-result")
         .header("Cache-Control", "no-cache")
-        .body(Body::from(output))?)
+        .body(Body::from(output))?;
+    Ok((resp, served_pack))
+}
+
+/// True when a `git-upload-pack-result` stream actually delivered a packfile,
+/// as opposed to a negotiation-only response (ACK/NAK with no pack).
+///
+/// Lets the fetch-completion metric key off the response outcome instead of the
+/// request's `done` flag (#192 F1): a `no-done` fetch that the server answers
+/// with `ACK <oid> ready` + pack is a completion; a flush-terminated negotiation
+/// round (the server replies only ACK/NAK, or nothing) is not.
+///
+/// Handles both framings the serve paths emit:
+/// - side-band-64k: the pack rides in band-1 (`0x01`) pkt-lines; the first such
+///   chunk begins with the `PACK` magic (band-2 progress lines can precede it).
+/// - non-sideband: the raw packfile follows the ACK/NAK pkt-lines and begins with
+///   the `PACK` magic (which is not valid pkt-line hex, so parsing falls through
+///   to the raw-stream check).
+///
+/// Fails closed (returns false) on a truncated or malformed stream.
+pub fn response_served_pack(output: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 <= output.len() {
+        let Ok(hdr) = std::str::from_utf8(&output[i..i + 4]) else {
+            // Not a pkt-line header: the raw (non-sideband) pack stream has begun.
+            return output[i..].starts_with(b"PACK");
+        };
+        let Ok(len) = usize::from_str_radix(hdr, 16) else {
+            // `PACK` (and any other non-hex 4 bytes) lands here: the raw pack
+            // follows the NAK pkt-line in the non-sideband framing.
+            return output[i..].starts_with(b"PACK");
+        };
+        // 0000/0001/0002 are flush/delim/response-end markers, no payload.
+        if len < 4 {
+            i += 4;
+            continue;
+        }
+        if i + len > output.len() {
+            return false; // truncated
+        }
+        let payload = &output[i + 4..i + len];
+        // side-band-64k: band 1 carries pack data; its first chunk is the PACK magic.
+        if payload.first() == Some(&0x01) && payload[1..].starts_with(b"PACK") {
+            return true;
+        }
+        i += len;
+    }
+    false
 }
 
 /// Handle `POST /:owner/:repo/git-receive-pack`
@@ -409,7 +462,7 @@ pub async fn upload_pack_excluding(
     repo_path: &Path,
     request_body: Bytes,
     withheld: &HashSet<String>,
-) -> Result<Response> {
+) -> Result<(Response, bool)> {
     // build_filtered_pack shells out to git (rev-list, pack-objects) with
     // blocking std::process I/O; run it off the async worker so a large repo's
     // pack build does not stall the tokio runtime.
@@ -443,11 +496,19 @@ pub async fn upload_pack_excluding(
         body.extend_from_slice(&pack);
     }
 
-    Ok(Response::builder()
+    // The filtered path always builds and serves a self-contained pack, so this
+    // is always true; computing it (rather than hardcoding) keeps the signal
+    // honest if the framing ever changes. The handler does NOT count off this
+    // flag alone — a filtered response can't distinguish an accepted fresh clone
+    // from a rejected mid-negotiation one, so the count is gated on `done` too
+    // (#192 F2, see `should_count_fetch`).
+    let served_pack = response_served_pack(&body);
+    let resp = Response::builder()
         .status(StatusCode::OK)
         .header("Content-Type", "application/x-git-upload-pack-result")
         .header("Cache-Control", "no-cache")
-        .body(Body::from(body))?)
+        .body(Body::from(body))?;
+    Ok((resp, served_pack))
 }
 
 /// True if `needle` occurs anywhere in `haystack`. Small substring scan used to
@@ -459,6 +520,87 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+/// Build real `git upload-pack --stateless-rpc` result fixtures for tests:
+/// `(pack_bearing, negotiation_only)`. The first is a completing clone request
+/// (`want` + flush + `done`) which git answers with `NAK` + a packfile; the
+/// second is a negotiation round (`want` + flush + an unknown `have` + flush, no
+/// `done`) which git answers with `NAK` and no pack. Used to exercise
+/// [`response_served_pack`] and the completion-count rule against real protocol
+/// output rather than a hand-rolled approximation.
+#[cfg(test)]
+pub(crate) fn upload_pack_result_fixtures() -> (Vec<u8>, Vec<u8>) {
+    use std::io::Write as _;
+    let dir = tempfile::TempDir::new().unwrap();
+    let work = dir.path().join("work");
+    let bare = dir.path().join("bare.git");
+    std::fs::create_dir_all(work.join("sub")).unwrap();
+    std::fs::write(work.join("a.txt"), b"hello\n").unwrap();
+    std::fs::write(work.join("sub/b.txt"), b"world\n").unwrap();
+    let g = |args: &[&str], d: &Path| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(d)
+            .status()
+            .unwrap()
+            .success());
+    };
+    g(&["init", "-q"], &work);
+    g(&["config", "user.email", "t@t"], &work);
+    g(&["config", "user.name", "t"], &work);
+    g(&["add", "."], &work);
+    g(&["commit", "-qm", "init"], &work);
+    g(
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            work.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+        dir.path(),
+    );
+    let sha = {
+        let o = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    let caps = "multi_ack_detailed side-band-64k thin-pack ofs-delta agent=git/test";
+    let run = |req: &[u8]| -> Vec<u8> {
+        let mut child = std::process::Command::new("git")
+            .args(["upload-pack", "--stateless-rpc"])
+            .arg(&bare)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(req).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "upload-pack failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    // Completing: want + flush + done -> NAK + pack.
+    let mut completing = pkt_line(&format!("want {sha} {caps}\n"));
+    completing.extend_from_slice(b"0000");
+    completing.extend_from_slice(&pkt_line("done\n"));
+    let pack_bearing = run(&completing);
+    // Negotiation-only: want + flush + an unknown have + flush, no done -> NAK,
+    // no pack.
+    let mut nego = pkt_line(&format!("want {sha} {caps}\n"));
+    nego.extend_from_slice(b"0000");
+    nego.extend_from_slice(&pkt_line("have 0000000000000000000000000000000000000000\n"));
+    nego.extend_from_slice(b"0000");
+    let negotiation_only = run(&nego);
+    (pack_bearing, negotiation_only)
 }
 
 #[cfg(test)]
@@ -600,7 +742,11 @@ mod tests {
             b"0098want 0000000000000000000000000000000000000000 \
               side-band-64k ofs-delta agent=git/2\n00000009done\n",
         );
-        let resp = upload_pack_excluding(&bare, req, &withheld).await.unwrap();
+        let (resp, served_pack) = upload_pack_excluding(&bare, req, &withheld).await.unwrap();
+        assert!(
+            served_pack,
+            "the filtered serve path always delivers a pack"
+        );
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let ids = pack_object_ids(&extract_pack(&body));
         assert!(
@@ -660,6 +806,7 @@ mod tests {
         upload_pack_excluding(&st.repo, body, &st.withheld)
             .await
             .unwrap()
+            .0
     }
 
     /// Spawn the server for `bare`, withholding `withheld`. Returns the clone URL
@@ -1512,5 +1659,59 @@ mod tests {
             "run_git_service must surface git's stderr (a classifiable 400), not the \
              stdin-write EPIPE (a generic 500); got: {msg}"
         );
+    }
+
+    // ── #192 F1: response_served_pack detector (real git output) ────────────
+
+    // A completing request (want+flush+done) yields NAK + a real packfile;
+    // response_served_pack must detect the delivered pack. A negotiation-only
+    // round (want+flush+have+flush, no done) yields NAK with no pack and must
+    // detect false. Fixtures are captured from real `git upload-pack
+    // --stateless-rpc`, so the detector is validated against protocol output, not
+    // a hand-rolled approximation.
+    #[test]
+    fn response_served_pack_detects_real_pack_vs_negotiation_only() {
+        let (pack_bearing, negotiation_only) = upload_pack_result_fixtures();
+
+        // Sanity-check the fixtures are the shapes we think (a served pack carries
+        // the PACK magic; a NAK-only round does not).
+        assert!(
+            pack_bearing.windows(4).any(|w| w == b"PACK"),
+            "the completing fixture must carry a packfile"
+        );
+        assert!(
+            !negotiation_only.windows(4).any(|w| w == b"PACK"),
+            "the negotiation-only fixture must carry no packfile"
+        );
+
+        assert!(
+            response_served_pack(&pack_bearing),
+            "a real NAK + pack response must be detected as a served pack"
+        );
+        assert!(
+            !response_served_pack(&negotiation_only),
+            "a real ACK/NAK-only negotiation round must be detected as no pack"
+        );
+        // An empty response (git produced nothing for a want+flush with no done)
+        // is a negotiation round, not a completion.
+        assert!(!response_served_pack(b""));
+    }
+
+    // The non-sideband framing (raw pack after the NAK pkt-line) must also detect
+    // true: the raw PACK magic is not valid pkt-line hex, so parsing falls through
+    // to the raw-stream check. Built by hand to pin that branch independent of the
+    // client's advertised capabilities.
+    #[test]
+    fn response_served_pack_detects_non_sideband_raw_pack() {
+        let mut raw = pkt_line("NAK\n");
+        raw.extend_from_slice(b"PACK\x00\x00\x00\x02\x00\x00\x00\x00");
+        assert!(
+            response_served_pack(&raw),
+            "a raw (non-sideband) pack after NAK must be detected"
+        );
+
+        // NAK with no following pack is a negotiation round.
+        let nak_only = pkt_line("NAK\n");
+        assert!(!response_served_pack(&nak_only));
     }
 }
