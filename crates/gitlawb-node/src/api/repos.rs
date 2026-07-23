@@ -1233,7 +1233,6 @@ pub async fn git_receive_pack(
         let pusher_did_clone = did.to_string();
         let db_for_peers = state.db.clone();
         let ref_update_tx = state.ref_update_tx.clone();
-        let arweave_gateway = state.config.arweave_gateway.clone();
         let bundler_url = state.config.bundler_url.clone();
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
@@ -1324,6 +1323,7 @@ pub async fn git_receive_pack(
                     // repo-wide latest, so each anchor embeds the exact
                     // certificate for its own ref transition.
                     let cert = ref_certs_clone.get(ref_name).cloned();
+                    let cert_id = cert.as_ref().map(|c| c.id.clone());
                     let anchor = crate::arweave::RefAnchor {
                         repo: repo_slug.clone(),
                         owner_did: owner_did_for_arweave.clone(),
@@ -1349,7 +1349,7 @@ pub async fn git_receive_pack(
                                     cid: cid.as_deref(),
                                     arweave_tx_id: &tx_id,
                                     node_did: &node_did_str,
-                                    gateway_url: &arweave_gateway,
+                                    cert_id,
                                 })
                                 .await;
                         }

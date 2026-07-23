@@ -300,8 +300,19 @@ pub async fn verify_anchor(
         });
     }
 
-    // Parse the payload — could be JSON or raw bytes depending on gateway
-    let anchor: serde_json::Value = serde_json::from_slice(&body_bytes)?;
+    // Parse the payload — could be JSON or raw bytes depending on gateway.
+    // Non-JSON responses are handled as an invalid result rather than an error.
+    let anchor: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(VerifyResult {
+                valid: false,
+                anchor: serde_json::Value::Null,
+                certificate: None,
+                errors: vec![format!("anchor payload is not valid JSON: {e}")],
+            });
+        }
+    };
     let cert_value = anchor.get("certificate");
 
     let cert: Option<crate::db::RefCertificate> = match cert_value {

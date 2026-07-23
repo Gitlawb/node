@@ -220,12 +220,20 @@ pub fn build_router(state: AppState) -> Router {
         .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
+    // Rate-limited per-IP to prevent the verify endpoint from being used as an
+    // open arweave gateway proxy or abused in a resource-exhaustion attack.
+    let arweave_limiter = rate_limit::IpRateLimiter {
+        limiter: state.rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
     let arweave_routes = Router::new()
         .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
         .route(
             "/api/v1/arweave/verify/{tx_id}",
             get(arweave::verify_anchor_endpoint),
-        );
+        )
+        .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(arweave_limiter));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
