@@ -2101,6 +2101,7 @@ impl Db {
     /// Insert a ref certificate (append-only). The unique constraint on
     /// `(repo_id, seq)` prevents duplicate sequence numbers; callers must
     /// handle retry on collision.
+    #[allow(dead_code)]
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates
@@ -2229,6 +2230,7 @@ impl Db {
         Ok(row.map(row_to_cert))
     }
 
+    #[allow(dead_code)]
     pub async fn get_most_recent_cert(&self, repo_id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
             "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
@@ -2261,6 +2263,7 @@ impl Db {
     /// the sequence number allocation.
     /// Uses a transaction-scoped lock (`pg_advisory_xact_lock`) so it MUST
     /// be called within an active transaction to be effective.
+    #[allow(dead_code)]
     pub async fn lock_repo_cert_issuance(&self, repo_id: &str) -> Result<()> {
         let hash = repo_lock_hash(repo_id);
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
