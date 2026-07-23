@@ -276,10 +276,16 @@ async fn main() -> Result<()> {
     // connection for its whole lifetime (lock held across receive-pack +
     // upload), so giving locks their own budget keeps a burst of concurrent or
     // slow pushes from draining the main pool and stalling every other DB
-    // handler node-wide. Sized independently of the handler pool.
-    const ADVISORY_LOCK_POOL_SIZE: u32 = 16;
+    // handler node-wide. Sized independently of the handler pool
+    // (GITLAWB_ADVISORY_LOCK_POOL_SIZE). acquire_timeout matches the advisory
+    // lock's own wait budget: with the default 30s, a burst that pins every
+    // connection would fail waiters at 30s even though the lock path is
+    // prepared to outwait a full 300s storage upload.
     let lock_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(ADVISORY_LOCK_POOL_SIZE)
+        .max_connections(config.advisory_lock_pool_size)
+        .acquire_timeout(std::time::Duration::from_secs(
+            git::repo_store::LOCK_ACQUIRE_TIMEOUT_SECS,
+        ))
         .connect(&config.database_url)
         .await
         .context("creating advisory-lock connection pool")?;

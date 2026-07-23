@@ -163,12 +163,20 @@ pub struct Config {
 
     /// Acknowledge a push to the client before the durable upload to object
     /// storage finishes (write-back). Lowers push latency, but opens a
-    /// durability window: if the node stops between the ack and the upload, on
-    /// restart a stale remote archive can overwrite the newer local copy. Off
-    /// by default (strict upload-before-ack); opt in only where the latency win
-    /// is worth that risk.
+    /// durability window: if the upload fails or the node stops first, storage
+    /// stays stale until the next successful upload. A persisted pending-upload
+    /// marker keeps the local copy authoritative on this node in that window
+    /// (no rollback of the acked push), but other nodes serve the stale archive
+    /// until the re-upload lands. Off by default (strict upload-before-ack).
     #[arg(long, env = "GITLAWB_ASYNC_UPLOAD", default_value_t = false)]
     pub async_upload: bool,
+
+    /// Max connections in the dedicated advisory-lock pool. A push pins one
+    /// connection for its whole lifetime (lock held across receive-pack and
+    /// the storage upload), so this bounds per-node push concurrency. Counts
+    /// against Postgres `max_connections` on top of the handler pool.
+    #[arg(long, env = "GITLAWB_ADVISORY_LOCK_POOL_SIZE", default_value_t = 16)]
+    pub advisory_lock_pool_size: u32,
 
     /// Maximum pack body size for git-receive-pack and git-upload-pack, in bytes.
     /// Applies only to git smart-HTTP routes — all other API routes keep the 2 MB default.

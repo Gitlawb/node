@@ -143,34 +143,4 @@ impl BlobStore for S3BlobStore {
             .context(format!("S3 DELETE {key}"))?;
         Ok(())
     }
-
-    async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let mut keys = Vec::new();
-        let mut continuation: Option<String> = None;
-        loop {
-            let mut req = self
-                .s3
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(prefix);
-            if let Some(token) = continuation.take() {
-                req = req.continuation_token(token);
-            }
-            let resp = req.send().await.context(format!("S3 LIST {prefix}"))?;
-            for obj in resp.contents() {
-                if let Some(k) = obj.key() {
-                    keys.push(k.to_string());
-                }
-            }
-            if resp.is_truncated().unwrap_or(false) {
-                continuation = resp.next_continuation_token().map(|s| s.to_string());
-                if continuation.is_none() {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-        Ok(keys)
-    }
 }

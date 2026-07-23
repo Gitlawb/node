@@ -101,7 +101,6 @@ impl RepoArchive {
     }
 
     /// Delete a repo archive.
-    #[allow(dead_code)]
     pub async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
         self.store.delete(&Self::key(owner_slug, repo_name)).await
     }

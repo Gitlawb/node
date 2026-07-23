@@ -92,6 +92,28 @@ impl RepoStore {
         let Some(ref archive) = self.archive else {
             return Ok(());
         };
+
+        let marker = pending_upload_marker(local_path);
+        if marker.exists() {
+            if local_path.exists() {
+                // The local copy has a write that storage never received (its
+                // upload failed, or the node stopped first). Storage is BEHIND
+                // local, so the etag-mismatch-means-remote-newer rule below is
+                // inverted here — downloading would roll the acked write back.
+                // Serve the local copy; the next successful post-write upload
+                // clears the marker and re-syncs storage. Cross-node caveat:
+                // until that upload lands, other nodes still see the stale
+                // archive — the marker protects this node's copy, it does not
+                // replicate it.
+                warn!(repo = %repo_name,
+                    "local copy ahead of storage (pending upload) — skipping download");
+                return Ok(());
+            }
+            // Marker without a local copy: the repo dir was removed out from
+            // under us, so the storage copy is the best remaining state. Drop
+            // the stale marker and fall through to the normal download.
+            let _ = std::fs::remove_file(&marker);
+        }
         let key = format!("{owner_slug}/{repo_name}");
 
         let remote_etag = match archive.head_etag(owner_slug, repo_name).await {
@@ -188,6 +210,10 @@ impl RepoStore {
                     .download(&owner_slug, repo_name, &local_path)
                     .await
                     .context("downloading repo from storage")?;
+                // The local copy didn't exist, so any pending-upload marker
+                // here is stale litter — clear it or it would wrongly pin the
+                // just-downloaded copy as "ahead of storage".
+                clear_pending_upload(&local_path);
                 let key = format!("{owner_slug}/{repo_name}");
                 self.migrated.lock().await.insert(key.clone());
                 self.versions.lock().await.insert(key, remote_etag);
@@ -251,10 +277,19 @@ impl RepoStore {
         // Upload the new repo synchronously under the advisory lock: a background
         // upload could land the empty repo *after* a racing first push and clobber
         // it, and a silent failure would leave the repo absent from storage. Fail
-        // closed instead — surface upload errors to the caller.
-        self.upload_under_lock(&owner_slug, repo_name, &local_path, false)
+        // closed instead — surface upload errors to the caller, and remove the
+        // just-created local dir so a retry of the same name doesn't hit an
+        // existing destination.
+        if let Err(e) = self
+            .upload_under_lock(&owner_slug, repo_name, &local_path, false)
             .await
-            .context("uploading new repo to storage")?;
+        {
+            if let Err(cleanup_err) = std::fs::remove_dir_all(&local_path) {
+                warn!(repo = %repo_name, err = %cleanup_err,
+                    "failed to remove local repo dir after init upload failure");
+            }
+            return Err(e).context("uploading new repo to storage");
+        }
 
         Ok(local_path)
     }
@@ -271,19 +306,43 @@ impl RepoStore {
             .local_path(owner_did, repo_name)
             .context("rejected unsafe path in release_after_write")?;
         let key = format!("{owner_slug}/{repo_name}");
+        mark_pending_upload(&local_path, repo_name);
         match archive.upload(&owner_slug, repo_name, &local_path).await {
             Ok(Some(etag)) => {
                 self.versions.lock().await.insert(key, etag);
+                clear_pending_upload(&local_path);
                 Ok(())
             }
-            Ok(None) => Ok(()),
+            Ok(None) => {
+                clear_pending_upload(&local_path);
+                Ok(())
+            }
             Err(e) => {
-                // Invalidate so the next access re-downloads rather than trusting
-                // a local copy we failed to persist.
+                // Storage is now behind local. Drop the cached etag, and leave
+                // the pending-upload marker in place so sync_down_if_stale
+                // serves the local copy instead of rolling it back to the
+                // stale archive.
                 self.versions.lock().await.remove(&key);
                 Err(e).context("uploading repo to storage after write")
             }
         }
+    }
+
+    /// Remove a repo's archive object from storage. Cleanup for creation flows
+    /// that uploaded successfully but then failed before the DB row existed —
+    /// without this, the archive is orphaned with no owning record.
+    pub async fn delete_archive(&self, owner_did: &str, repo_name: &str) -> Result<()> {
+        let Some(ref archive) = self.archive else {
+            return Ok(());
+        };
+        let (owner_slug, _) = self
+            .local_path(owner_did, repo_name)
+            .context("rejected unsafe path in delete_archive")?;
+        self.versions
+            .lock()
+            .await
+            .remove(&format!("{owner_slug}/{repo_name}"));
+        archive.delete(&owner_slug, repo_name).await
     }
 
     /// Upload `local_path` to storage while holding the per-repo advisory lock,
@@ -433,7 +492,7 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 /// `ipfs.rs`): the writer holding the lock may legitimately be mid-upload of a
 /// large archive, so a concurrent push must be willing to outwait the longest
 /// possible upload rather than failing while the lock holder is still healthy.
-const LOCK_ACQUIRE_TIMEOUT_SECS: u64 = 300;
+pub(crate) const LOCK_ACQUIRE_TIMEOUT_SECS: u64 = 300;
 
 /// A pool connection pinned for the lifetime of a session-scoped advisory lock.
 ///
@@ -521,7 +580,13 @@ impl LockedConn {
                 .execute(&mut *conn)
                 .await
             {
-                warn!(repo = %self.repo_label, err = %e, "failed to release advisory lock");
+                // The unlock failed, so the session may still hold the lock —
+                // close the connection (like `Drop`) instead of repooling it,
+                // or the lock would wedge this repo's writes until the pool
+                // happened to recycle that connection.
+                warn!(repo = %self.repo_label, err = %e,
+                    "failed to release advisory lock — closing its connection");
+                drop(conn.detach());
             }
         }
     }
@@ -585,19 +650,27 @@ impl RepoWriteGuard {
         // error; a write-back caller logs it).
         let upload_result: Result<()> = if success {
             if let Some(ref archive) = self.archive {
+                mark_pending_upload(&self.local_path, &self.repo_name);
                 match archive
                     .upload(&self.owner_slug, &self.repo_name, &self.local_path)
                     .await
                 {
                     Ok(Some(etag)) => {
                         self.versions.lock().await.insert(key.clone(), etag);
+                        clear_pending_upload(&self.local_path);
                         Ok(())
                     }
-                    Ok(None) => Ok(()),
+                    Ok(None) => {
+                        clear_pending_upload(&self.local_path);
+                        Ok(())
+                    }
                     Err(e) => {
-                        // The durable copy is now stale. Drop the cached etag so
-                        // the next write re-downloads and reconciles rather than
-                        // trusting a local copy we failed to persist.
+                        // Storage is now behind local (this holds even for an
+                        // already-acked write-back push). Drop the cached etag,
+                        // and leave the pending-upload marker so the next
+                        // access serves the local copy instead of rolling it
+                        // back to the stale archive; the next successful
+                        // upload re-syncs storage and clears the marker.
                         self.versions.lock().await.remove(&key);
                         Err(e).context("uploading repo to storage after write")
                     }
@@ -621,6 +694,34 @@ impl RepoWriteGuard {
 
         upload_result
     }
+}
+
+/// Sibling marker file recording that `local_path` holds writes storage has
+/// not received yet ("local is ahead"). Written before every post-write upload
+/// and removed only when the upload succeeds, so it survives process death and
+/// lets `sync_down_if_stale` distinguish "storage is ahead of local" (download)
+/// from "local is ahead of storage" (never download — that would roll back an
+/// acked write). Lives next to the repo dir, not inside it, so it is never
+/// packed into the archive.
+fn pending_upload_marker(local_path: &Path) -> PathBuf {
+    let name = local_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    local_path.with_file_name(format!(".{name}.pending-upload"))
+}
+
+fn mark_pending_upload(local_path: &Path, repo_name: &str) {
+    if let Err(e) = std::fs::write(pending_upload_marker(local_path), b"") {
+        // Best-effort: without the marker we fall back to the pre-marker
+        // behavior (a failed upload risks rollback), but the upload itself
+        // must still proceed.
+        warn!(repo = %repo_name, err = %e, "failed to write pending-upload marker");
+    }
+}
+
+fn clear_pending_upload(local_path: &Path) {
+    let _ = std::fs::remove_file(pending_upload_marker(local_path));
 }
 
 /// Compute a stable i64 hash for a Postgres advisory lock key.
@@ -844,6 +945,98 @@ mod tests {
             b"LOCAL-EDIT\n",
             "etag match must skip the download (local copy preserved)"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_marker_prevents_rollback_and_clears_on_next_upload() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        // Storage holds v1; local downloads it.
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+        let local = repos_dir.path().join("owner").join("repo.git");
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+
+        // Simulate an acked write whose upload failed: local advances, the
+        // pending marker persists, and storage still holds the older v1 with a
+        // *different* etag than the local cache (cache invalidated on failure).
+        std::fs::write(local.join("HEAD"), b"ACKED-WRITE\n").unwrap();
+        mark_pending_upload(&local, "repo");
+        store.versions.lock().await.clear();
+
+        // Both the read and the write path must serve local, not roll it back.
+        for require_fresh in [false, true] {
+            store
+                .sync_down_if_stale("owner", "repo", &local, require_fresh)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(local.join("HEAD")).unwrap(),
+                b"ACKED-WRITE\n",
+                "pending marker must prevent rollback (require_fresh={require_fresh})"
+            );
+        }
+
+        // The next successful upload re-syncs storage and clears the marker.
+        store.release_after_write("owner", "repo").await.unwrap();
+        assert!(
+            !pending_upload_marker(&local).exists(),
+            "marker must be cleared by a successful upload"
+        );
+        let out = tempfile::tempdir().unwrap();
+        let restored = out.path().join("restored.git");
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .download("owner", "repo", &restored)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(restored.join("HEAD")).unwrap(),
+            b"ACKED-WRITE\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_pending_marker_without_local_copy_is_dropped() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        store
+            .archive
+            .as_ref()
+            .unwrap()
+            .upload("owner", "repo", seed.path())
+            .await
+            .unwrap();
+
+        // Marker exists but the repo dir does not (removed out from under us):
+        // the marker is stale — drop it and download normally.
+        let local = repos_dir.path().join("owner").join("repo.git");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        mark_pending_upload(&local, "repo");
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"v1\n");
+        assert!(!pending_upload_marker(&local).exists());
     }
 
     #[tokio::test]

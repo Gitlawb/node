@@ -54,12 +54,6 @@ pub trait BlobStore: Send + Sync {
 
     /// Delete an object. Succeeds (no-op) if the key does not exist.
     async fn delete(&self, key: &str) -> Result<()>;
-
-    /// List object keys under a prefix. Part of the backend interface (and
-    /// implemented by every backend) for future admin/GC/migration use; not yet
-    /// wired to a caller, hence the allow.
-    #[allow(dead_code)]
-    async fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
 /// Build the configured blob store.

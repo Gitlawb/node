@@ -116,7 +116,13 @@ impl BlobStore for FsBlobStore {
             Err(e) => Err(e).context(format!("deleting {}", path.display())),
         }
     }
+}
 
+/// Test-only helper: enumerate stored keys. `list` was dropped from the
+/// `BlobStore` trait until a production consumer (GC/admin/migration) exists;
+/// the tests here still need it to assert on stored state.
+#[cfg(test)]
+impl FsBlobStore {
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let root = self.root.clone();
         let prefix = prefix.to_string();

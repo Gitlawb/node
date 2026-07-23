@@ -953,10 +953,12 @@ pub async fn git_receive_pack(
         // can't observe a stale archive. If this detached task is cancelled by
         // runtime shutdown mid-upload, the guard's lock connection is closed
         // rather than repooled, so Postgres frees the advisory lock (see
-        // `LockedConn`). Durability tradeoff: if the node stops after this ack
-        // but before the upload, the local copy survives but STORAGE stays
-        // stale until this repo's next successful push re-uploads — it is not
-        // automatically reconciled. Hence async_upload is opt-in.
+        // `LockedConn`). Durability tradeoff: if the upload fails (or the node
+        // stops first), storage stays stale until this repo's next successful
+        // upload. The persisted pending-upload marker keeps the local copy
+        // authoritative on THIS node in that window — no access rolls it back
+        // to the stale archive — but other nodes still serve the stale archive
+        // until the re-upload lands. Hence async_upload is opt-in.
         let repo_label = name.to_string();
         tokio::spawn(async move {
             if let Err(e) = guard.release(true).await {
@@ -965,15 +967,19 @@ pub async fn git_receive_pack(
             }
         });
     } else {
-        // Strict path (or failed push): upload-before-ack. On a successful push
-        // whose durable upload then fails, surface an error so the client knows
-        // the push is not durably stored (a failed push returns Ok from release
-        // and the push error is reported below).
+        // Strict path (or failed push): upload-before-ack.
         if let Err(e) = guard.release(push_ok).await {
-            tracing::error!(repo = %name, err = %e, "durable upload failed after push");
-            return Err(AppError::Git(format!(
-                "push applied locally but durable upload to storage failed: {e}"
-            )));
+            if push_ok {
+                // A successful push whose durable upload then failed — the
+                // client must know the push is not durably stored.
+                tracing::error!(repo = %name, err = %e, "durable upload failed after push");
+                return Err(AppError::Git(format!(
+                    "push applied locally but durable upload to storage failed: {e}"
+                )));
+            }
+            // The push itself failed; log the release error but fall through
+            // so the real git failure (below) is what the client sees.
+            tracing::error!(repo = %name, err = %e, "lock release failed after failed push");
         }
     }
 
@@ -1660,6 +1666,16 @@ pub async fn fork_repo(
 
     if let Err(e) = state.db.create_repo(&record).await {
         cleanup_local_fork(disk_path).await;
+        // The archive was already uploaded; without a DB row it would be
+        // orphaned in storage, so remove it too.
+        if let Err(cleanup_err) = state
+            .repo_store
+            .delete_archive(&forker_did, &fork_name)
+            .await
+        {
+            tracing::warn!(fork = %fork_name, err = %cleanup_err,
+                "failed to remove orphaned storage archive after fork error");
+        }
         return Err(e.into());
     }
 
@@ -2606,7 +2622,7 @@ mod tests {
 
     /// The receive-pack *advertisement* (`GET info/refs?service=git-receive-pack`)
     /// must be throttled by the per-IP push limiter BEFORE it does the fresh
-    /// Tigris acquire — otherwise the flood brake on the POST is bypassable via
+    /// storage acquire — otherwise the flood brake on the POST is bypassable via
     /// the cheaper unauthenticated GET (PR #152 review P1). Pre-filling the
     /// bucket makes the assertion deterministic and keeps the test off the
     /// acquire path entirely.
@@ -2645,7 +2661,7 @@ mod tests {
         assert_eq!(
             status,
             StatusCode::TOO_MANY_REQUESTS,
-            "receive-pack advertisement must be throttled before the Tigris acquire"
+            "receive-pack advertisement must be throttled before the storage acquire"
         );
     }
 
