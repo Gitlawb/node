@@ -27,7 +27,8 @@ pub mod ipfs;
 pub mod s3;
 
 /// Metadata about a stored object. `etag` is an opaque change-detection token
-/// (S3 ETag, IPFS CID, or a size/mtime fingerprint for the filesystem backend).
+/// (S3 ETag, IPFS CID, or a persisted per-write UUID for the filesystem
+/// backend).
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
     pub size: u64,
