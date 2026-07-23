@@ -70,11 +70,215 @@ jobs:
             const changedRust = names.some(n => n.startsWith("crates/") && n.endsWith(".rs"));
             // A test can live in a tests/ dir, a *_test.rs file, or (the common Rust
             // pattern) an inline #[test] / #[cfg(test)] block added inside the source file.
-            const addsInlineTest = files.some(f =>
-              f.filename.endsWith(".rs") && f.patch &&
-              /^\+.*#\[(test\]|cfg\(test\))/m.test(f.patch));
+            // Async tests use a namespaced attribute (#[tokio::test], #[async_std::test],
+            // possibly with args like #[tokio::test(flavor = ...)]) rather than the bare
+            // #[test]. Anchor to a leading #[ (horizontal whitespace only, so the attribute
+            // itself must be on the added line) so ::test in ordinary code (indexing,
+            // comments, strings) doesn't count, require cfg(test) to close before accepting
+            // it as a test gate, allow the whitespace Rust permits around :: and cfg(,
+            // allow an optional leading :: for absolute-path attributes (::tokio::test),
+            // and allow the raw-identifier spelling (#[r#test], #[tokio::r#test]).
+            const testAttrRe =
+              /#[ \s]*\[[ \s]*(?:cfg[ \s]*\([ \s]*test[ \s]*\)|(?:[ \s]*::[ \s]*)?(?:[\w-]+(?:[ \s]*::[ \s]*[\w-]+)*[ \s]*::[ \s]*)?(?:r#)?test\b[ \s]*[\]\()])/g;
+
+            // Strip comments and string contents from a file of Rust, carrying lexical
+            // state (open block comment / raw string / normal string) and tracking
+            // original line mapping. Each skipped comment/string/char-literal leaves a single
+            // non-whitespace placeholder behind so tokens on either side of it can't glue
+            // together into a false attribute match (e.g. a macro arg list containing a
+            // stray "#" and a string literal must not read as "#[test]" once stripped).
+            function stripRustFile(fileContent) {
+              let stripped = "";
+              const lineMap = [];
+              const state = { blockCommentDepth: 0, rawStringDelim: null, inNormalString: false };
+              const lines = fileContent.split("\n");
+
+              for (let lineNo = 1; lineNo <= lines.length; lineNo++) {
+                const content = lines[lineNo - 1];
+                let i = 0;
+                while (i < content.length) {
+                  if (state.blockCommentDepth > 0) {
+                    if (content.slice(i, i + 2) === "*/") {
+                      state.blockCommentDepth--;
+                      i += 2;
+                    } else if (content.slice(i, i + 2) === "/*") {
+                      state.blockCommentDepth++;
+                      i += 2;
+                    } else {
+                      i += 1;
+                    }
+                  } else if (state.rawStringDelim) {
+                    const len = state.rawStringDelim.length;
+                    if (content.slice(i, i + len) === state.rawStringDelim) {
+                      state.rawStringDelim = null;
+                      i += len;
+                    } else {
+                      i += 1;
+                    }
+                  } else if (state.inNormalString) {
+                    if (content[i] === "\\") {
+                      i += 2;
+                    } else if (content[i] === '"') {
+                      state.inNormalString = false;
+                      i += 1;
+                    } else {
+                      i += 1;
+                    }
+                  } else {
+                    if (content.slice(i, i + 2) === "//") {
+                      break; // skip rest of line
+                    }
+                    if (content.slice(i, i + 2) === "/*") {
+                      state.blockCommentDepth = 1;
+                      stripped += "\0";
+                      lineMap.push(lineNo);
+                      i += 2;
+                      continue;
+                    }
+                    const charMatch = content.slice(i).match(/^'(?:[^'\\]|\\.)'/);
+                    if (charMatch) {
+                      stripped += "\0";
+                      lineMap.push(lineNo);
+                      i += charMatch[0].length;
+                      continue;
+                    }
+                    const rawMatch = content.slice(i).match(/^r(#*)"/);
+                    if (rawMatch) {
+                      state.rawStringDelim = '"' + rawMatch[1];
+                      stripped += "\0";
+                      lineMap.push(lineNo);
+                      i += rawMatch[0].length;
+                      continue;
+                    }
+                    if (content[i] === '"') {
+                      state.inNormalString = true;
+                      stripped += "\0";
+                      lineMap.push(lineNo);
+                      i += 1;
+                      continue;
+                    }
+                    stripped += content[i];
+                    lineMap.push(lineNo);
+                    i += 1;
+                  }
+                }
+                if (lineNo < lines.length) {
+                  stripped += "\n";
+                  lineMap.push(lineNo);
+                }
+              }
+              return { stripped, lineMap };
+            }
+
+            // New-file line numbers touched by "+" lines in a unified diff patch.
+            function addedLineNumbers(patch) {
+              const added = new Set();
+              let newLine = null;
+              for (const line of patch.split("\n")) {
+                const hunk = line.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                if (hunk) {
+                  newLine = parseInt(hunk[1], 10);
+                  continue;
+                }
+                if (newLine === null) continue;
+                if (line.startsWith("\\ No newline at end of file")) continue;
+                if (line.startsWith("+") && !line.startsWith("+++")) {
+                  added.add(newLine);
+                  newLine += 1;
+                } else if (!line.startsWith("-") || line.startsWith("---")) {
+                  newLine += 1; // context line
+                }
+              }
+              return added;
+            }
+
+            // A diff hunk carries no lexical context from lines outside it, so scanning
+            // patch text alone can misclassify an added line that sits inside a comment or
+            // raw string opened earlier in the file. Lex the complete head-version file
+            // instead, in file order, and only test the lines the diff actually added.
+            const MAX_BLOB_SIZE = 5 * 1024 * 1024; // 5 MB; bounds decode/lex cost per candidate file
+            let addsInlineTest = false;
+            let contentFetchCount = 0;
+            // Set whenever a candidate couldn't actually be checked (fetch cap hit, blob too
+            // large, unsupported encoding). In that case we don't know whether a test was
+            // added, so we must not assert the negative and add needs-tests below.
+            let scanIncomplete = false;
+            for (const f of files) {
+              if (addsInlineTest) break;
+              if (!f.filename.endsWith(".rs") || !f.patch) continue;
+
+              // Pre-filter: only fetch and parse file contents if the patch actually adds
+              // something that looks like a potential test attribute or cfg gate.
+              const patchHasPotentialTest = f.patch.split("\n").some(line =>
+                line.startsWith("+") && !line.startsWith("+++") &&
+                (line.toLowerCase().includes("test") || line.toLowerCase().includes("cfg"))
+              );
+              if (!patchHasPotentialTest) continue;
+
+              // Bound the API work, but don't abort the whole job when a large PR exceeds it:
+              // that would skip label reconciliation and the guidance comment for every
+              // managed label, not just needs-tests. Stop scanning further candidates; the
+              // scan is now inconclusive rather than a clean "no test found".
+              if (contentFetchCount >= 15) {
+                core.warning(
+                  "More than 15 candidate Rust files touch tests/cfg; stopping inline-test analysis early."
+                );
+                scanIncomplete = true;
+                break;
+              }
+              contentFetchCount++;
+
+              // Use the Git Data API (blob sha from the diff) rather than the Contents API:
+              // the Contents API returns encoding "none" (no content) for files between 1-100MB,
+              // which the Git Data API supports directly.
+              let fileContent;
+              try {
+                const res = await github.rest.git.getBlob({ owner, repo, file_sha: f.sha });
+                if (res.data.encoding !== "base64") {
+                  core.warning(`Unsupported content encoding for ${f.filename}; inline-test scan is inconclusive for this file.`);
+                  scanIncomplete = true;
+                  continue;
+                }
+                if (res.data.size > MAX_BLOB_SIZE) {
+                  core.warning(`${f.filename} is ${res.data.size} bytes, over the ${MAX_BLOB_SIZE}-byte scan limit; inline-test scan is inconclusive for this file.`);
+                  scanIncomplete = true;
+                  continue;
+                }
+                fileContent = Buffer.from(res.data.content, "base64").toString("utf8");
+              } catch (e) {
+                if (e.status === 404) {
+                  continue; // file since deleted; nothing to lex
+                }
+                throw new Error(`Failed to fetch content for ${f.filename}: ${e.message || e}`);
+              }
+
+              const added = addedLineNumbers(f.patch);
+              if (added.size === 0) continue;
+
+              const { stripped, lineMap } = stripRustFile(fileContent);
+              let match;
+              testAttrRe.lastIndex = 0;
+              while ((match = testAttrRe.exec(stripped)) !== null) {
+                const start = match.index;
+                const end = testAttrRe.lastIndex;
+                for (let k = start; k < end; k++) {
+                  // Require an actual attribute token (not just whitespace the match
+                  // spans, e.g. a blank line inserted inside an otherwise unchanged
+                  // multiline attribute) to be on an added line.
+                  if (added.has(lineMap[k]) && !/\s/.test(stripped[k])) {
+                    addsInlineTest = true;
+                    break;
+                  }
+                }
+                if (addsInlineTest) break;
+              }
+            }
+            // scanIncomplete means some candidate couldn't be checked, so we can't prove a
+            // negative; don't apply needs-tests off an unverified scan.
             const touchedTests =
-              names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
+              names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) ||
+              addsInlineTest ||
+              scanIncomplete;
             if (changedRust && !touchedTests) want.add("needs-tests");
 
             // Reconcile labels: add wanted managed labels, remove managed labels no longer wanted.
