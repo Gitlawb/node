@@ -41,7 +41,7 @@ Owner focus: protocol/auth.
 - Implement repo write authorization: repo owner checks, protected branches, UCAN capability checks, and clear delegation semantics.
 - Implement private-read enforcement or remove private-repo affordances until it exists.
 - Add UCAN revocation or blocklisting, with an emergency compromised-key runbook.
-- Add mutation-aware GraphQL auth before GraphQL becomes a public write API surface.
+- GraphQL mutations require a verified signer (shipped, #87). Keep the surface limited to the agent-task queue; do not expose an owner-gated repo-write mutation over GraphQL without its owner-gate and REST parity. The `every_graphql_mutation_has_its_gate` fence forces any new mutation to be classified in its table (discovered from the schema, so none can slip in unlisted); the owner-gate and REST parity themselves stay the INV-1 review check, not something the fence proves.
 - Harden peer registration and outbound peer calls against SSRF and peer-list poisoning.
 - After all live peers upgrade, enable signed peer writes by default.
 

@@ -87,7 +87,7 @@ Fixed or staged in this pass:
 
 Live-network blockers to prioritize:
 
-- GraphQL POST is still open for compatibility; GraphQL mutations should get mutation-aware auth before it becomes a public write API surface.
+- GraphQL mutations now require a verified signer bound to the acting DID (#87), and the surface stays limited to the agent-task queue, so there is no public repo-write GraphQL API to gate. Queries remain open by design. (Resolved; kept here as posture, not a live blocker.)
 - Push authorization is still not capability-complete. A valid DID signature is authentication, not authorization; unprotected repo branches do not yet enforce owner/UCAN capability checks.
 - UCAN chain validation is incomplete and UCAN revocation/blocklisting is not implemented as an operator feature.
 - Private repository reads are not enforced. `is_public` and `GITLAWB_PUBLIC_READ` exist, but per-repository private-read behavior is not wired.
