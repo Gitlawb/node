@@ -96,6 +96,16 @@ jobs:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/gitlawb_test
         run: cargo test --workspace
 
+      # The real-node deny harness is behind the `test-harness` feature (so its
+      # spawn surface never compiles into the production binary), which means
+      # `--workspace` above skips it. Run it explicitly so the trust-boundary
+      # regression cases (INV-1/INV-2/INV-8) execute on every PR. Uses the same
+      # Postgres service; `#[sqlx::test]` provisions an isolated DB per test.
+      - name: cargo test (real-node deny harness)
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/gitlawb_test
+        run: cargo test -p gitlawb-node --features test-harness --test deny_harness
+
   build-release:
     name: build --release
     runs-on: ubuntu-latest

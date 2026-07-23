@@ -33,7 +33,7 @@ pub struct RepoStore {
 }
 
 impl RepoStore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn for_testing(repos_dir: PathBuf, pool: PgPool) -> Self {
         Self {
             repos_dir,

@@ -6,9 +6,27 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "gitlawb_node"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gitlawb-node"
 path = "src/main.rs"
+
+# Exposes the `test_harness` spawn surface (src/test_harness.rs) to the
+# real-node deny-harness integration crate. Off by default so the production
+# binary never compiles test-only boot code. Enable with
+# `cargo test -p gitlawb-node --features test-harness`.
+[features]
+test-harness = []
+
+# Only builds when `test-harness` is enabled; otherwise skipped (not an error),
+# so `cargo test --workspace` without the feature stays green.
+[[test]]
+name = "deny_harness"
+path = "tests/deny_harness.rs"
+required-features = ["test-harness"]
 
 [dependencies]
 gitlawb-core = { path = "../gitlawb-core" }
@@ -77,3 +95,12 @@ libp2p-dns = { version = "0.44.0", features = ["tokio"] }
 [dev-dependencies]
 mockito = "1"
 tempfile = "3"
+# test-util enables tokio::test(start_paused): the delayed claim re-sweep
+# test drives the real CLAIM_SWEEP_MIN_AGE-plus-margin sleep on paused time.
+tokio = { workspace = true, features = ["test-util"] }
+# Used by the deny-harness integration crate (tests/deny_harness.rs): the
+# #[sqlx::test] macro for an ephemeral per-test pool, and reqwest as the real
+# HTTP client that drives deny paths over the socket.
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "macros", "migrate"] }
+reqwest = { workspace = true }
+hex = "0.4"

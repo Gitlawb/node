@@ -162,8 +162,10 @@ pub struct Config {
     pub metrics_addr: String,
 
     /// Maximum time to wait for in-flight requests to drain on shutdown, in
-    /// seconds. After this elapses, the server returns 503 to anything still
-    /// in flight and exits. Default: 30s.
+    /// seconds. On the shutdown signal the server stops accepting new
+    /// connections and gives in-flight requests this long to complete; at
+    /// expiry it abandons whatever remains (clients observe a closed
+    /// connection, not an error response) and exits. Default: 30s.
     #[arg(long, env = "GITLAWB_SHUTDOWN_GRACE_SECS", default_value_t = 30)]
     pub shutdown_grace_secs: u64,
 

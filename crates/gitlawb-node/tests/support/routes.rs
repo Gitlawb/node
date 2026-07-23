@@ -1,0 +1,1210 @@
+//! U1: the deny-bearing route set for the invariant deny-prober.
+//!
+//! Every route that carries a runtime deny to assert lives here: owner-gate
+//! (403), multi-principal (403), read-gate (404), signature-required (401), and
+//! caller-self / actor (403): `SignerSelfGate` for the request-body field
+//! bindings (create_task delegator, claim_task assignee, register did) and
+//! `MultiPrincipalGate` with the assignee arm for the complete/fail actor gates.
+//! The completeness cross-check in `deny_harness.rs` derives the caller-self set
+//! from `src/api` and requires each `did_matches(caller, X)` handler to be a
+//! driven row, so a new one cannot silently escape the sweep.
+//!
+//! Scope: this doc claims the REST/api surface only. The parallel GraphQL
+//! mutation caller-self gates (`src/graphql/mutation.rs`) are out of this
+//! harness and fenced separately (#219).
+//!
+//! Each row is classified by READING its handler, never inferred from the route
+//! name, and records the handler fn name so a reviewer can spot-check. Guessing
+//! is how a false test enters the sweep (the register_replica lesson: it looks
+//! like an owner-gate, it is signer-self; and list_visibility is a 403
+//! owner-gate despite being a GET).
+//!
+//! Rows are declarative (gate class + entities + reachability), not prebuilt
+//! requests, so Flavor B (the cross-surface differential prober) can reuse them
+//! (R9).
+
+/// The gate class of a deny-bearing route and the exact status its deny emits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GateClass {
+    /// `require_repo_owner` / `require_owner` / inline `did_matches(caller, owner)`
+    /// -> `AppError::Forbidden` == 403. Probed with a validly-signed non-owner.
+    OwnerGate,
+    /// A 403 gate with ONE OR MORE NAMED authorizing principals (owner-OR-author,
+    /// creator-OR-claimant, claimant-only, …). Probed with a validly-signed
+    /// stranger (403) plus one Not403 twin per declared arm (`Row.principals`),
+    /// so reverting ANY single arm turns that arm's twin RED (#195, F1).
+    /// `OwnerGate` is the owner-arm special case; a single-arm gate whose
+    /// principal is NOT the repo owner (submit_bounty's claimant-only check,
+    /// approve/cancel's creator-only check) belongs here, because the point is
+    /// that the arms are DECLARED and each one gets its own twin (#195, N2).
+    MultiPrincipalGate,
+    /// `authorize_repo_read` / `visibility_check` -> `RepoNotFound` == 404
+    /// (existence-hiding). Probed with a non-reader against a private/withheld
+    /// target. A 404 alone is ambiguous (a missing entity also 404s), so every
+    /// read-gate row carries a `Reach` positive twin.
+    ReadGate,
+    /// `require_signature` layer -> 401 on the git write routes. Probed unsigned.
+    SignatureRequired,
+    /// A caller-self 403 gate that binds a DID field in the request BODY to the
+    /// authenticated signer (`did_matches(caller, &body.<field>_did)`): create_task
+    /// (delegator_did), claim_task (assignee_did), register (did). Probed with a
+    /// validly-signed stranger whose body names the OWNER (mismatch -> 403) plus an
+    /// owner control whose body names the owner (match -> Not403). Distinct from
+    /// `OwnerGate`: the bound identity is a body field, not the stored repo owner,
+    /// and the completeness classifier keys on exactly that (#195, F3, KTD-1). The
+    /// actor-vs-stored caller-self gates (complete_task/fail_task) are the
+    /// `MultiPrincipalGate` assignee-arm shape instead, not this class.
+    SignerSelfGate,
+}
+
+impl GateClass {
+    pub fn expected_status(self) -> u16 {
+        match self {
+            GateClass::OwnerGate | GateClass::MultiPrincipalGate | GateClass::SignerSelfGate => 403,
+            GateClass::ReadGate => 404,
+            GateClass::SignatureRequired => 401,
+        }
+    }
+}
+
+/// An authorizing principal (arm) of a multi-principal 403 gate. Each maps to a
+/// distinct fixture identity in `probe.rs` so reverting one arm cannot silently
+/// re-collapse onto another (the original bug seeded `author == owner`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Principal {
+    /// The repo owner (`require_repo_owner` / `did_matches(caller, owner)`).
+    Owner,
+    /// The PR/issue author (`did_matches(caller, author_did)`).
+    Author,
+    /// The bounty creator (`did_matches(caller, creator_did)`).
+    Creator,
+    /// The bounty claimant (`did_matches(caller, claimant_did)`).
+    Claimant,
+    /// The task assignee (`did_matches(caller, stored assignee_did)`): the actor
+    /// arm of complete_task / fail_task (#195, F3). Unlike the field-binding
+    /// `SignerSelfGate`, the identity is the task's STORED assignee, so the arm is
+    /// driven against a seeded claimed task, not a body field.
+    Assignee,
+}
+
+/// How a read-gate row's positive twin proves the 404 is the gate and not a
+/// merely-absent entity/repo. Owner-gate and signature rows use `None`
+/// (the owner-gate twin is the same request re-signed as the owner, handled by
+/// the probe generator from the class, not a path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// Not a read-gate row; no read-twin.
+    None,
+    /// The authorized reader/owner issues the same request and gets 2xx.
+    ReaderReads,
+    /// A sibling PUBLIC path on the same repo returns 2xx-with-content, proving
+    /// the 404 is path-scoped withholding, not a blanket/absent 404. Mirrors the
+    /// existing U7/U8/anon_ipfs cases in `tests/deny_harness.rs`.
+    SiblingPublic(&'static str),
+}
+
+/// How a row's `{id}` placeholder is filled. Most id-keyed paths use a fixed
+/// seed id (`"1"`), but some entities are keyed by a UUID minted at seed time
+/// (a bounty, a cert), so the fixture must inject the captured id per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdSource {
+    /// `{id}` -> the fixed seed id `"1"` (static-template entities seeded at #1).
+    Fixed,
+    /// `{id}` -> the fixture's seeded disputable bounty id (UUID).
+    BountyId,
+    /// `{id}` -> the fixture's seeded issue id (UUID). The issue is stored as a
+    /// full git-JSON `IssueRecord` (authored by the fixture author), which a
+    /// bare `{"author":..}` seed cannot satisfy — close_issue deserializes the
+    /// whole record before reading its author, so the author arm needs the
+    /// complete record.
+    IssueId,
+    /// `{id}` -> the fixture's seeded PRIVATE-repo issue id (UUID). Distinct from
+    /// `IssueId` (the public-repo close-gate issue): the get_issue /
+    /// list_issue_comments read-gate rows run against the PRIVATE repo, so their
+    /// `{id}` must be an issue that actually exists there (#195, F2/U3).
+    PrivIssueId,
+    /// `{id}` -> the fixture's seeded PRIVATE-repo bounty id (UUID). get_bounty is
+    /// NOT repo-scoped in its path (`/api/v1/bounties/{id}`) but read-gates on the
+    /// bounty's own repo; the bounty is seeded against the private repo so anon /
+    /// stranger get the existence-hiding 404 and the owner gets 2xx (#195, U3).
+    PrivBountyId,
+    /// `{id}` -> the fixture's seeded ref-certificate id (UUID), issued by a real
+    /// owner push to the private repo. get_cert read-gates the private repo on "/"
+    /// then fetches the cert by id, so the owner-2xx twin needs a real cert whose
+    /// repo_id is the private repo's (#195, U3).
+    CertId,
+    /// `{id}` -> the fixture's bounty seeded in status "claimed" (#195, N2).
+    /// submit_bounty checks status BEFORE auth (bounties.rs:294), so the stranger
+    /// only reaches the claimant 403 gate on a bounty that is already "claimed";
+    /// the claimant twin then consumes that status (claimed -> submitted), so the
+    /// row needs its own bounty.
+    ClaimedBountyId,
+    /// `{id}` -> the fixture's bounty driven to status "submitted" (#195, N2).
+    /// approve_bounty's status check fires before its creator gate
+    /// (bounties.rs:334), so only a "submitted" bounty reaches the 403; the
+    /// creator twin consumes it (submitted -> completed).
+    SubmittedBountyId,
+    /// `{id}` -> the fixture's bounty left in status "open" (#195, N2).
+    /// cancel_bounty's status check fires before its creator gate
+    /// (bounties.rs:381), so only an "open" bounty reaches the 403; the creator
+    /// twin consumes it (open -> cancelled).
+    OpenBountyId,
+    /// `{id}` -> the fixture's task seeded "pending" (#195, F3). The claim_task
+    /// caller-self gate fires before the DB claim, so the stranger 403 does not
+    /// consume it; the owner control then claims it (pending -> claimed).
+    ClaimableTaskId,
+    /// `{id}` -> the fixture's task seeded "claimed" by the assignee (#195, F3).
+    /// complete_task's assignee actor gate reaches it; the assignee twin then
+    /// finishes it (claimed -> completed).
+    CompletableTaskId,
+    /// `{id}` -> a second assignee-claimed task (#195, F3), so fail_task's twin
+    /// (claimed -> failed) does not race complete_task for one entity.
+    FailableTaskId,
+}
+
+/// One deny-bearing route. `path` is a template with `{owner}`/`{repo}`/`{id}`
+/// /`{number}`/`{*path}` placeholders the probe generator (U2) fills from the
+/// fixture. `needs` names the seeded sub-entities the path requires (empty for
+/// owner-gate rows: the gate fires before the entity lookup).
+#[derive(Debug, Clone, Copy)]
+pub struct Row {
+    pub method: &'static str,
+    pub path: &'static str,
+    pub gate: GateClass,
+    /// Handler fn name, recorded for review spot-check (per-row verification).
+    pub handler: &'static str,
+    /// Sample request body (JSON) or `None`. JSON bodies drive the
+    /// `Content-Type: application/json` the probe attaches to clear the extractor.
+    pub body: Option<&'static str>,
+    /// Seeded sub-entities the path template consumes.
+    pub needs: &'static [&'static str],
+    /// Positive-twin strategy for read-gate rows.
+    pub reach: Reach,
+    /// For `MultiPrincipalGate` rows, the authorizing arms this gate must drive
+    /// (one Not403 twin each). Empty for every other class — only meaningful for
+    /// `MultiPrincipalGate`, and the consistency test enforces that pairing.
+    pub principals: &'static [Principal],
+    /// How the `{id}` placeholder is filled for this row (see [`IdSource`]).
+    pub id_source: IdSource,
+    /// For `ReadGate` rows, the status an ANONYMOUS (headerless) caller gets on
+    /// the withheld target. Most read GETs take `Option` auth and existence-hide
+    /// with a 404 (`Deny404`), but a read GET that *requires* auth rejects a
+    /// headerless caller with 401 BEFORE any lookup (`Deny401`) — e.g.
+    /// `list_webhooks`, whose callback URLs are owner-secret config with no anon
+    /// form. The signed-non-reader 404 (existence-hiding) is unchanged either way;
+    /// only the anon leg differs. Meaningless on non-`ReadGate` rows, which set
+    /// `Deny404` as the not-applicable sentinel (mirrors `reach: Reach::None`).
+    /// A new auth-required read added as a `ReadGate` row that forgets `Deny401`
+    /// fails loudly (its anon probe gets 401, not the expected 404), so the field
+    /// is self-correcting rather than a silent default.
+    pub anon_read: AnonRead,
+}
+
+/// The status class an anonymous caller gets from a `ReadGate` row's withheld
+/// target — 404 existence-hiding (the default) or a 401 auth-required rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnonRead {
+    /// `Option`-auth read: anon gets the existence-hiding 404, same as a signed
+    /// non-reader. The default for every read GET that has an anonymous form.
+    Deny404,
+    /// Auth-required read: a headerless caller is rejected 401 before any lookup
+    /// (no anonymous form). The signed-non-reader still gets the 404.
+    Deny401,
+}
+
+const NO_ENTITY: &[&str] = &[];
+const NO_PRINCIPAL: &[Principal] = &[];
+
+/// The deny-bearing route set. Owner-gate and signature-required tranches are
+/// fully verified against their handlers this session; the read-gate tranche is
+/// populated as each handler's deny path (404-deny vs list-filter) is verified.
+pub fn deny_bearing_routes() -> &'static [Row] {
+    &[
+        // ── Owner-gate (403) — verified: each calls require_repo_owner /
+        //    require_owner / inline did_matches against the repo owner. ──────────
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/merge",
+            gate: GateClass::OwnerGate,
+            handler: "pulls::merge_pr",
+            body: None,
+            needs: &["pr_number"],
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #195 (F1): close_pr / close_issue are owner-OR-author gates (pulls.rs:276,
+        // issues.rs:255). A plain OwnerGate tests only the owner arm, so reverting
+        // the author arm is invisible. MultiPrincipalGate drives BOTH arms.
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/close",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "pulls::close_pr",
+            body: None,
+            needs: &["pr_number"],
+            reach: Reach::None,
+            principals: &[Principal::Owner, Principal::Author],
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/issues/{id}/close",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "issues::close_issue",
+            body: None,
+            needs: &["issue_id"],
+            reach: Reach::None,
+            principals: &[Principal::Owner, Principal::Author],
+            id_source: IdSource::IssueId,
+            anon_read: AnonRead::Deny404,
+        },
+        // #195 (F1): dispute_bounty is creator-OR-claimant (bounties.rs:425). Not
+        // repo-scoped: it gates on the bounty's creator/claimant, so the row is
+        // id-keyed by the seeded disputable bounty's UUID (IdSource::BountyId).
+        Row {
+            method: "POST",
+            path: "/api/v1/bounties/{id}/dispute",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "bounties::dispute_bounty",
+            body: None,
+            needs: &["bounty_id"],
+            reach: Reach::None,
+            principals: &[Principal::Creator, Principal::Claimant],
+            id_source: IdSource::BountyId,
+            anon_read: AnonRead::Deny404,
+        },
+        // #195 (N2): submit/approve/cancel each 403 a non-claimant/non-creator, but
+        // their STATUS check fires before the auth check, so each row gets its own
+        // bounty seeded in the gate-reaching status (claimed / submitted / open).
+        // The sweep drives probes in emission order (hostile first, probes_for),
+        // so the stranger 403 fires while the bounty still holds that status; the
+        // arm twin then consumes it (submit: claimed -> submitted, approve:
+        // submitted -> completed, cancel: open -> cancelled), which is why the
+        // rows cannot share a bounty with each other or with dispute_bounty.
+        Row {
+            method: "POST",
+            path: "/api/v1/bounties/{id}/submit",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "bounties::submit_bounty",
+            // pr_id is a free-text column (no FK); any string clears serde and
+            // the UPDATE. The gate fires before the value is used.
+            body: Some(r#"{"pr_id":"1"}"#),
+            needs: &["claimed_bounty_id"],
+            reach: Reach::None,
+            principals: &[Principal::Claimant],
+            id_source: IdSource::ClaimedBountyId,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/bounties/{id}/approve",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "bounties::approve_bounty",
+            // ApproveBountyRequest's only field (tx_hash) is Option, so an empty
+            // JSON object clears the Json extractor; a missing body would 4xx at
+            // the extractor, before the gate under test.
+            body: Some(r#"{}"#),
+            needs: &["submitted_bounty_id"],
+            reach: Reach::None,
+            principals: &[Principal::Creator],
+            id_source: IdSource::SubmittedBountyId,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/bounties/{id}/cancel",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "bounties::cancel_bounty",
+            body: None,
+            needs: &["open_bounty_id"],
+            reach: Reach::None,
+            principals: &[Principal::Creator],
+            id_source: IdSource::OpenBountyId,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/hooks",
+            gate: GateClass::OwnerGate,
+            handler: "webhooks::create_webhook",
+            body: Some(r#"{"url":"https://e.example/h","events":["*"]}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "DELETE",
+            path: "/api/v1/repos/{owner}/{repo}/hooks/{id}",
+            gate: GateClass::OwnerGate,
+            handler: "webhooks::delete_webhook",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #113: the OWNER layer of list_webhooks (GET /hooks). On the PUBLIC repo a
+        // signed stranger passes authorize_repo_read (public) and is then denied 403
+        // by require_repo_owner — this row drives that 403. The READ layer (404 on
+        // the private repo, anon 401) is the sibling ReadGate row; the two share the
+        // path, admitted by the (method, path, gate) dedup key. A GET owner-gate
+        // like list_visibility below.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/hooks",
+            gate: GateClass::OwnerGate,
+            handler: "webhooks::list_webhooks",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/labels",
+            gate: GateClass::OwnerGate,
+            handler: "labels::add_label",
+            body: Some(r#"{"label":"bug"}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "DELETE",
+            path: "/api/v1/repos/{owner}/{repo}/labels/{label}",
+            gate: GateClass::OwnerGate,
+            handler: "labels::remove_label",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/repos/{owner}/{repo}/branches/{branch}/protect",
+            gate: GateClass::OwnerGate,
+            handler: "protect::protect_branch",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "DELETE",
+            path: "/api/v1/repos/{owner}/{repo}/branches/{branch}/protect",
+            gate: GateClass::OwnerGate,
+            handler: "protect::unprotect_branch",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "PUT",
+            path: "/api/v1/repos/{owner}/{repo}/visibility",
+            gate: GateClass::OwnerGate,
+            handler: "visibility::set_visibility",
+            body: Some(r#"{"path_glob":"/","reader_dids":[]}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "DELETE",
+            path: "/api/v1/repos/{owner}/{repo}/visibility",
+            gate: GateClass::OwnerGate,
+            handler: "visibility::remove_visibility",
+            body: Some(r#"{"path_glob":"/"}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // list_visibility is a 403 owner-gate despite being a GET (calls
+        // require_owner); the /visibility mount chains put+delete+get, all gated.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/visibility",
+            gate: GateClass::OwnerGate,
+            handler: "visibility::list_visibility",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // ── Signature-required (401) — verified: git write route wrapped by the
+        //    require_signature layer (add_auth_layers in server.rs). ─────────────
+        Row {
+            method: "POST",
+            path: "/{owner}/{repo}/git-receive-pack",
+            gate: GateClass::SignatureRequired,
+            handler: "repos::git_receive_pack",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // ── Read-gate (404) — verified: each handler calls
+        //    authorize_repo_read / visibility_check on "/" which returns
+        //    AppError::RepoNotFound (404) when a non-reader hits a private repo
+        //    (api/mod.rs:44-62). The Reach twin is the owner issuing the same
+        //    request against the private repo and getting 2xx, proving the 404 is
+        //    the gate and not a merely-absent entity/repo. Every row here gates on
+        //    the whole repo ("/"), so ReaderReads (owner re-read) is the twin;
+        //    the fully-private fixture repo needs no per-row sub-entity seeding
+        //    because these reads either return the seeded repo/blob or an empty
+        //    2xx list.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_repo",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #195 (F2): repo-root reads that gate on "/" — driven as real ReadGate rows
+        // rather than source-only exemptions, so a runtime bypass that keeps the
+        // authorize_repo_read/visibility_check marker but leaks is caught.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/star",
+            gate: GateClass::ReadGate,
+            handler: "stars::get_star_status",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/icaptcha-proof",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_icaptcha_proof",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/encrypted-blobs/replicate",
+            gate: GateClass::ReadGate,
+            handler: "encrypted::replicate_encrypted_blobs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/commits",
+            gate: GateClass::ReadGate,
+            handler: "repos::list_commits",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/tree",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_tree_root",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // Path-scoped read: get_blob gates on "/{path}" (repos.rs:390). The
+        // fully-private fixture repo denies any path to anon (404); the owner
+        // reads the seeded blob at content_path and gets 2xx bytes. (Path-scoped
+        // subtree WITHHOLDING on a *public* repo — the SiblingPublic twin — is
+        // already covered by the U7/U8 cases in deny_harness.rs.)
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/blob/{*path}",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_blob",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/refs",
+            gate: GateClass::ReadGate,
+            handler: "repos::list_refs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/issues",
+            gate: GateClass::ReadGate,
+            handler: "issues::list_issues",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/labels",
+            gate: GateClass::ReadGate,
+            handler: "labels::list_labels",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/certs",
+            gate: GateClass::ReadGate,
+            handler: "certs::list_certs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/events",
+            gate: GateClass::ReadGate,
+            handler: "events::list_repo_events",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls",
+            gate: GateClass::ReadGate,
+            handler: "pulls::list_prs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/changelog",
+            gate: GateClass::ReadGate,
+            handler: "changelog::get_changelog",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/bounties",
+            gate: GateClass::ReadGate,
+            handler: "bounties::list_repo_bounties",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/withheld-paths",
+            gate: GateClass::ReadGate,
+            handler: "visibility::withheld_paths",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/encrypted-blobs",
+            gate: GateClass::ReadGate,
+            handler: "encrypted::list_encrypted_blobs",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #195 (F2, U3): sub-entity reads that gate on "/" (the private repo) but
+        // require the entity to EXIST at the request path for the owner-2xx twin.
+        // Each carries its own distinctive marker (seeded in probe.rs) added to the
+        // per-read withheld set, so a 404 that echoes THAT read's private content
+        // (issue title, PR title, PR diff, bounty title) fails — a status-
+        // only 404 check would be vacuous. These were source-only exemptions in
+        // READ_GATE_NOT_DRIVEN before; they are now driven as real ReadGate rows.
+        // get_issue: id-keyed by the seeded PRIVATE issue (marker in its title).
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/issues/{id}",
+            gate: GateClass::ReadGate,
+            handler: "issues::get_issue",
+            body: None,
+            needs: &["priv_issue_id"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::PrivIssueId,
+            anon_read: AnonRead::Deny404,
+        },
+        // list_issue_comments: parent issue must exist (private); child list may be
+        // empty — an empty `{"comments":[]}` is a non-empty 2xx body.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/issues/{id}/comments",
+            gate: GateClass::ReadGate,
+            handler: "issues::list_issue_comments",
+            body: None,
+            needs: &["priv_issue_id"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::PrivIssueId,
+            anon_read: AnonRead::Deny404,
+        },
+        // get_pr: the seeded PRIVATE PR #1 (marker in its title).
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}",
+            gate: GateClass::ReadGate,
+            handler: "pulls::get_pr",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // get_pr_diff: the PRIVATE PR #1 has a real `feature` source branch with a
+        // marker file, so branch_diff_names(main, feature) is NON-EMPTY and the
+        // owner twin returns a real diff (a bail!/500 if the source ref were
+        // missing). The per-path visibility_check Deny-return is additionally
+        // driven by the hand-written get_pr_diff_withheld_path_is_denied test.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/diff",
+            gate: GateClass::ReadGate,
+            handler: "pulls::get_pr_diff",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // list_reviews / list_comments: parent PR #1 must exist (private); child
+        // lists may be empty.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews",
+            gate: GateClass::ReadGate,
+            handler: "pulls::list_reviews",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/pulls/{number}/comments",
+            gate: GateClass::ReadGate,
+            handler: "pulls::list_comments",
+            body: None,
+            needs: &["priv_pr"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // get_cert: id-keyed by a real ref-certificate issued by an owner push to
+        // the private repo. No cert-content marker is seeded: get_cert read-gates
+        // the repo on "/" and 404s a non-reader BEFORE fetching the cert, so cert
+        // fields cannot reach the deny body — the repo-scoped tokens (private_repo_id,
+        // private_secret) plus the status check carry the no-leak assertion here.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/certs/{id}",
+            gate: GateClass::ReadGate,
+            handler: "certs::get_cert",
+            body: None,
+            needs: &["cert_id"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::CertId,
+            anon_read: AnonRead::Deny404,
+        },
+        // get_bounty: NOT repo-scoped in its path, read-gates on the bounty's repo.
+        // Seeded against the PRIVATE repo (marker in its title), id-keyed.
+        Row {
+            method: "GET",
+            path: "/api/v1/bounties/{id}",
+            gate: GateClass::ReadGate,
+            handler: "bounties::get_bounty",
+            body: None,
+            needs: &["priv_bounty_id"],
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::PrivBountyId,
+            anon_read: AnonRead::Deny404,
+        },
+        // get_tree (path-scoped): genuinely ADDITIONAL to get_tree_root (Q1). Root
+        // gates on "/"; get_tree gates on the REQUESTED subtree (N3,
+        // authorize_repo_read(&gate_path)), a distinct path-scoped Deny surface. The
+        // {*path} fills to the private content path, so a non-reader is denied the
+        // subtree listing and the owner gets a non-empty 2xx.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/tree/{*path}",
+            gate: GateClass::ReadGate,
+            handler: "repos::get_tree",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #113: /replicas and /branches/protected gained an `authorize_repo_read`
+        // gate on "/" — a private repo's replica URLs / protected-branch list are
+        // now hidden (404) from a non-reader. Both take `Option` auth (anon and a
+        // signed non-reader alike get the existence-hiding 404), gate on the whole
+        // repo, and return an empty-or-seeded 2xx list to the owner, so `ReaderReads`
+        // (owner re-read) is the twin and no per-row sub-entity seeding is needed.
+        // Driven as real ReadGate rows rather than left in PUBLIC_REPO_GETS, which
+        // is why the completeness fence flagged them after the #113 merge.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/replicas",
+            gate: GateClass::ReadGate,
+            handler: "replicas::list_replicas",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/branches/protected",
+            gate: GateClass::ReadGate,
+            handler: "protect::list_protected_branches",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        // #113: list_webhooks is DOUBLY gated — authorize_repo_read (404) THEN
+        // require_repo_owner (403) — and it rejects a headerless caller with 401
+        // BEFORE the lookup (callback URLs are owner-secret config with no anon
+        // form). This is the READ layer: a signed non-reader of the private repo
+        // gets the existence-hiding 404, while an anon caller gets 401 (AnonRead::
+        // Deny401). The OWNER layer (403 for a signed reader-non-owner) is the
+        // sibling OwnerGate row above, run against the public repo where the read
+        // gate passes and the owner gate is what fires. Two rows share this path
+        // (one ReadGate, one OwnerGate); the consistency dedup keys on
+        // (method, path, gate) to admit exactly this dual-gate case.
+        Row {
+            method: "GET",
+            path: "/api/v1/repos/{owner}/{repo}/hooks",
+            gate: GateClass::ReadGate,
+            handler: "webhooks::list_webhooks",
+            body: None,
+            needs: NO_ENTITY,
+            reach: Reach::ReaderReads,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny401,
+        },
+        // ── Caller-self / actor (403), #195 (F3). The task/register handlers carry
+        //    genuine caller-self 403 gates a bypass would expose (impersonate a
+        //    delegator/assignee, or forge a trust row for a DID you don't control).
+        //    Before this change they were marker-only (INV-21 vacuous); now each is
+        //    driven hostile-then-authorized. The field-binding shape (a body DID
+        //    field must equal the caller) is `SignerSelfGate`; the actor-vs-stored
+        //    shape (caller must equal the task's stored assignee) is
+        //    `MultiPrincipalGate` with the Assignee arm. Register is DRIVEN, not
+        //    excused: the harness runs icaptcha inert (spawn_node never inits the
+        //    verifier), so a stranger-signed POST /api/register reaches the 403.
+        Row {
+            method: "POST",
+            path: "/api/v1/tasks",
+            gate: GateClass::SignerSelfGate,
+            handler: "tasks::create_task",
+            // delegator_did must equal the signer (tasks.rs:101). Stranger names the
+            // owner -> mismatch -> 403; owner names the owner -> match -> 201.
+            body: Some(r#"{"kind":"review","capability":"read","delegator_did":"{owner}"}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/tasks/{id}/claim",
+            gate: GateClass::SignerSelfGate,
+            handler: "tasks::claim_task",
+            // assignee_did must equal the signer (tasks.rs:174); the gate fires
+            // before the DB claim, so the stranger 403 leaves the pending task for
+            // the owner control to claim.
+            body: Some(r#"{"assignee_did":"{owner}"}"#),
+            needs: &["claimable_task_id"],
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::ClaimableTaskId,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/register",
+            gate: GateClass::SignerSelfGate,
+            handler: "register::register",
+            // did must equal the signer (register.rs:55). The did must parse
+            // (register.rs:50) so the 403 is reached, so `{owner}` is a real DID.
+            // `message` is an unknown field serde ignores.
+            body: Some(r#"{"did":"{owner}","capabilities":[],"message":"probe"}"#),
+            needs: NO_ENTITY,
+            reach: Reach::None,
+            principals: NO_PRINCIPAL,
+            id_source: IdSource::Fixed,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/tasks/{id}/complete",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "tasks::complete_task",
+            // Caller must equal the task's STORED assignee (tasks.rs:220). Driven
+            // against a claimed task: stranger -> 403, the assignee arm -> 200.
+            body: Some(r#"{"result":"ok"}"#),
+            needs: &["completable_task_id"],
+            reach: Reach::None,
+            principals: &[Principal::Assignee],
+            id_source: IdSource::CompletableTaskId,
+            anon_read: AnonRead::Deny404,
+        },
+        Row {
+            method: "POST",
+            path: "/api/v1/tasks/{id}/fail",
+            gate: GateClass::MultiPrincipalGate,
+            handler: "tasks::fail_task",
+            // Caller must equal the task's STORED assignee (tasks.rs:273). Its own
+            // claimed task so the assignee twin (claimed -> failed) does not race
+            // complete_task's.
+            body: Some(r#"{"reason":"x"}"#),
+            needs: &["failable_task_id"],
+            reach: Reach::None,
+            principals: &[Principal::Assignee],
+            id_source: IdSource::FailableTaskId,
+            anon_read: AnonRead::Deny404,
+        },
+        // The read-gate handlers NOT driven here (deferred GET reads, read-gating
+        // mutations, git smart-HTTP reads, the content-addressed read, and the
+        // global list-filters) are no longer tracked by free-text prose: they are
+        // ENFORCED in deny_harness.rs's `READ_GATE_NOT_DRIVEN` allowlist, which the
+        // `every_read_gate_handler_is_driven_or_explicitly_allowlisted` guard checks
+        // against a live scan of every read-gate marker in src/api. That is the
+        // single source of truth — adding/removing a driven read row here without
+        // updating the allowlist trips the guard.
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_internal_consistency() {
+        let rows = deny_bearing_routes();
+
+        // No duplicate method+path+gate. The key is (method, path, gate), not
+        // (method, path): one endpoint can carry two distinct gate LAYERS that each
+        // need their own probe substrate — list_webhooks (GET /hooks) read-gates
+        // (404 on the private repo) THEN owner-gates (403 on the public repo), so it
+        // is one ReadGate row and one OwnerGate row on the same path. An accidental
+        // copy-paste of a row keeps the same gate, so this still catches the real
+        // double-registration bug; it only admits the deliberate dual-gate case.
+        let mut seen = std::collections::HashSet::new();
+        for r in rows {
+            assert!(
+                seen.insert((r.method, r.path, r.gate)),
+                "duplicate deny-bearing row: {} {} {:?}",
+                r.method,
+                r.path,
+                r.gate
+            );
+        }
+
+        for r in rows {
+            // Every row records its handler fn (review spot-check anchor).
+            assert!(
+                !r.handler.is_empty(),
+                "row {} {} has no handler",
+                r.method,
+                r.path
+            );
+
+            match r.gate {
+                // Every read-gate row must carry a positive twin, or a 404 from a
+                // merely-absent entity is indistinguishable from the gate's 404.
+                GateClass::ReadGate => assert_ne!(
+                    r.reach,
+                    Reach::None,
+                    "read-gate row {} {} needs a Reach positive twin",
+                    r.method,
+                    r.path
+                ),
+                // Owner-gate/signature rows use the class's own twin (owner re-sign)
+                // or none, never a read-path twin.
+                _ => assert_eq!(
+                    r.reach,
+                    Reach::None,
+                    "non-read-gate row {} {} must not carry a read twin",
+                    r.method,
+                    r.path
+                ),
+            }
+
+            // `principals` is meaningful ONLY on MultiPrincipalGate rows: it must
+            // be non-empty there (a gate with no declared arm drives nothing) and
+            // empty everywhere else (a stray arm set on a non-multi row is a bug).
+            match r.gate {
+                GateClass::MultiPrincipalGate => assert!(
+                    !r.principals.is_empty(),
+                    "multi-principal row {} {} declares no authorizing arms",
+                    r.method,
+                    r.path
+                ),
+                _ => assert!(
+                    r.principals.is_empty(),
+                    "non-multi-principal row {} {} must not declare arms",
+                    r.method,
+                    r.path
+                ),
+            }
+        }
+    }
+
+    /// STRUCTURAL enforcement (#195, F1): every `MultiPrincipalGate` row's
+    /// generator output must carry exactly one Not403 twin PER declared arm plus
+    /// the single stranger hostile, so a row that registered an arm but never
+    /// emits its twin (the vacuous-guard failure) fails HERE rather than in a
+    /// runtime sweep nobody re-runs. Invokes `probes_for` directly — the same
+    /// generator the real sweep drives — so the two cannot drift.
+    #[test]
+    fn multi_principal_rows_emit_one_twin_per_arm() {
+        use crate::support::probe::{probes_for, tests_support::fx, Expect, Signer};
+
+        let fixture = fx();
+        let mut checked = 0usize;
+        for r in deny_bearing_routes() {
+            if r.gate != GateClass::MultiPrincipalGate {
+                continue;
+            }
+            checked += 1;
+            let ps = probes_for(r, &fixture);
+
+            let hostile = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Stranger && matches!(p.expect, Expect::Deny(403)))
+                .count();
+            assert_eq!(
+                hostile, 1,
+                "multi-principal row {} {} must drive exactly one stranger-403 hostile, drove {hostile}",
+                r.method, r.path
+            );
+
+            let twins = ps
+                .iter()
+                .filter(|p| matches!(p.expect, Expect::Not403))
+                .count();
+            assert_eq!(
+                twins,
+                r.principals.len(),
+                "multi-principal row {} {} declares {} arms but emits {twins} Not403 twins",
+                r.method,
+                r.path,
+                r.principals.len(),
+            );
+
+            // Each declared arm maps to a distinct signer, and every twin's signer
+            // is one of the declared arms (no phantom / wrong-arm twin).
+            for arm in r.principals {
+                let want = crate::support::probe::signer_for_principal(*arm);
+                let present = ps
+                    .iter()
+                    .any(|p| p.signer == want && matches!(p.expect, Expect::Not403));
+                assert!(
+                    present,
+                    "multi-principal row {} {} declares arm {:?} but emits no Not403 twin for it",
+                    r.method, r.path, arm
+                );
+            }
+
+            // The twins' signers must be DISTINCT and number the declared arms. The
+            // per-arm any() check above is satisfied by a single twin when two arms
+            // map to the same Signer (a signer_for_principal collision), so without
+            // this a wrong mapping would pass with one arm silently untested.
+            let mut twin_signers: Vec<Signer> = ps
+                .iter()
+                .filter(|p| matches!(p.expect, Expect::Not403))
+                .map(|p| p.signer)
+                .collect();
+            twin_signers.sort_by_key(|s| format!("{s:?}"));
+            twin_signers.dedup();
+            assert_eq!(
+                twin_signers.len(),
+                r.principals.len(),
+                "multi-principal row {} {} emits twins with {} DISTINCT signers but declares {} arms \
+                 (Principal->Signer collision?)",
+                r.method,
+                r.path,
+                twin_signers.len(),
+                r.principals.len(),
+            );
+        }
+        assert!(
+            checked >= 8,
+            "expected at least the eight known multi-principal rows (close_pr, \
+             close_issue, dispute/submit/approve/cancel bounty, complete_task, \
+             fail_task), checked {checked}"
+        );
+    }
+
+    /// STRUCTURAL enforcement for `SignerSelfGate` rows (#195, F3): each caller-self
+    /// field-binding row's generator output must be exactly one Stranger/Deny(403)
+    /// hostile plus one Owner/Not403 control, and both bodies must bind the self
+    /// field to the owner DID (so the hostile is a real signer-vs-body mismatch and
+    /// the control a real match). Mirrors `multi_principal_rows_emit_one_twin_per_arm`
+    /// so a SignerSelfGate row that stopped emitting its twin (the vacuous-guard
+    /// failure) fails HERE, not only in a DB sweep nobody re-runs. Invokes
+    /// `probes_for` directly, the same generator the real sweep drives.
+    #[test]
+    fn signer_self_rows_emit_one_hostile_and_one_control() {
+        use crate::support::probe::{probes_for, tests_support::fx, Expect, Signer};
+
+        let fixture = fx();
+        let mut checked = 0usize;
+        for r in deny_bearing_routes() {
+            if r.gate != GateClass::SignerSelfGate {
+                continue;
+            }
+            checked += 1;
+            let ps = probes_for(r, &fixture);
+            assert_eq!(
+                ps.len(),
+                2,
+                "signer-self row {} {} must emit exactly two probes, emitted {}",
+                r.method,
+                r.path,
+                ps.len()
+            );
+
+            let hostile = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Stranger && matches!(p.expect, Expect::Deny(403)))
+                .count();
+            assert_eq!(
+                hostile, 1,
+                "signer-self row {} {} must drive exactly one stranger-403 hostile, drove {hostile}",
+                r.method, r.path
+            );
+
+            let control = ps
+                .iter()
+                .filter(|p| p.signer == Signer::Owner && matches!(p.expect, Expect::Not403))
+                .count();
+            assert_eq!(
+                control, 1,
+                "signer-self row {} {} must drive exactly one owner Not403 control, drove {control}",
+                r.method, r.path
+            );
+
+            // The bound self field (delegator_did / assignee_did / did) must resolve
+            // to the owner DID in BOTH bodies: the hostile is a stranger signing a
+            // body that names the owner (mismatch), the control an owner signing the
+            // same (match). A row whose body did not run through `fill()` would carry
+            // a literal `{owner}` and fail here.
+            for p in &ps {
+                let body = String::from_utf8(p.body.clone()).expect("probe body is UTF-8 JSON");
+                assert!(
+                    body.contains(&fixture.owner_did),
+                    "signer-self row {} {} body must bind the self field to the owner DID, got {body}",
+                    r.method,
+                    r.path
+                );
+            }
+        }
+        assert!(
+            checked >= 3,
+            "expected at least the three SignerSelfGate rows (create_task, claim_task, \
+             register), checked {checked}"
+        );
+    }
+}
