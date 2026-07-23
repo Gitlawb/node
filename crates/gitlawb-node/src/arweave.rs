@@ -279,6 +279,17 @@ pub async fn verify_anchor(
         });
     }
     // Bound the untrusted response to 1 MiB to prevent memory exhaustion.
+    // Check Content-Length first so we never buffer a giant body.
+    if let Some(cl) = resp.content_length() {
+        if cl > 1_048_576 {
+            return Ok(VerifyResult {
+                valid: false,
+                anchor: serde_json::Value::Null,
+                certificate: None,
+                errors: vec!["response body exceeds 1 MiB limit".to_string()],
+            });
+        }
+    }
     let body_bytes = resp.bytes().await?;
     if body_bytes.len() > 1_048_576 {
         return Ok(VerifyResult {
@@ -301,6 +312,53 @@ pub async fn verify_anchor(
     let mut errors = Vec::new();
 
     if let Some(ref c) = cert {
+        // 0. Cross-check the outer anchor fields against the embedded certificate.
+        //    A valid anchor must commit to the same identities and ref state.
+        let outer_repo = anchor.get("repo").and_then(|v| v.as_str());
+        let outer_ref = anchor.get("ref_name").and_then(|v| v.as_str());
+        let outer_old = anchor.get("old_sha").and_then(|v| v.as_str());
+        let outer_new = anchor.get("new_sha").and_then(|v| v.as_str());
+        let outer_node = anchor.get("node_did").and_then(|v| v.as_str());
+        if outer_repo.is_none() {
+            errors.push("anchor payload is missing top-level 'repo'".to_string());
+        } else if outer_repo != Some(&c.repo_id) {
+            errors.push(format!(
+                "anchor outer repo ({}) does not match certificate repo_id ({})",
+                outer_repo.unwrap_or(""),
+                c.repo_id
+            ));
+        }
+        if outer_ref.is_none() {
+            errors.push("anchor payload is missing top-level 'ref_name'".to_string());
+        } else if outer_ref != Some(&c.ref_name) {
+            errors.push(format!(
+                "anchor outer ref_name ({}) does not match certificate ref_name ({})",
+                outer_ref.unwrap_or(""),
+                c.ref_name
+            ));
+        }
+        if outer_old.is_some() && outer_old != Some(&c.old_sha) {
+            errors.push(format!(
+                "anchor outer old_sha ({}) does not match certificate old_sha ({})",
+                outer_old.unwrap_or(""),
+                c.old_sha
+            ));
+        }
+        if outer_new.is_some() && outer_new != Some(&c.new_sha) {
+            errors.push(format!(
+                "anchor outer new_sha ({}) does not match certificate new_sha ({})",
+                outer_new.unwrap_or(""),
+                c.new_sha
+            ));
+        }
+        if outer_node.is_some() && outer_node != Some(&c.node_did) {
+            errors.push(format!(
+                "anchor outer node_did ({}) does not match certificate node_did ({})",
+                outer_node.unwrap_or(""),
+                c.node_did
+            ));
+        }
+
         // 1. Verify node signature on the certificate payload
         let payload = serde_json::json!({
             "repo_id":    c.repo_id,

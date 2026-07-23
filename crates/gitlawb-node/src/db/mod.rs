@@ -2345,9 +2345,9 @@ impl Db {
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates
-             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path",
+              (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+              RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -2365,6 +2365,40 @@ impl Db {
         .bind(&cert.content_digest)
         .bind(&cert.request_path)
         .fetch_one(&self.pool)
+        .await?;
+        Ok(row_to_cert(row))
+    }
+
+    /// Transaction-scoped variant of [`insert_ref_certificate`].
+    /// Uses the same advisory-lock hash for the repo_id so the lock key
+    /// stays consistent with [`lock_repo_cert_issuance`].
+    pub async fn insert_ref_certificate_tx(
+        &self,
+        cert: &RefCertificate,
+        conn: &mut sqlx::postgres::PgConnection,
+    ) -> Result<RefCertificate> {
+        let row = sqlx::query(
+            "INSERT INTO ref_certificates
+              (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+              RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path",
+        )
+        .bind(&cert.id)
+        .bind(&cert.repo_id)
+        .bind(&cert.ref_name)
+        .bind(&cert.old_sha)
+        .bind(&cert.new_sha)
+        .bind(&cert.pusher_did)
+        .bind(&cert.node_did)
+        .bind(&cert.signature)
+        .bind(&cert.issued_at)
+        .bind(cert.seq)
+        .bind(&cert.prev)
+        .bind(&cert.pusher_sig)
+        .bind(&cert.signature_input)
+        .bind(&cert.content_digest)
+        .bind(&cert.request_path)
+        .fetch_one(&mut *conn)
         .await?;
         Ok(row_to_cert(row))
     }
@@ -2463,27 +2497,58 @@ impl Db {
         Ok(row.map(row_to_cert))
     }
 
+    /// Transaction-scoped variant of [`get_most_recent_cert`].
+    pub async fn get_most_recent_cert_tx(
+        &self,
+        repo_id: &str,
+        conn: &mut sqlx::postgres::PgConnection,
+    ) -> Result<Option<RefCertificate>> {
+        let row = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
+             FROM ref_certificates WHERE repo_id = $1 ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row.map(row_to_cert))
+    }
+
     /// Acquire a per-repo advisory lock to serialize certificate issuance.
     /// This prevents two concurrent pushes to the same repo from racing on
     /// the sequence number allocation.
+    /// Uses a transaction-scoped lock (`pg_advisory_xact_lock`) so it MUST
+    /// be called within an active transaction to be effective.
     pub async fn lock_repo_cert_issuance(&self, repo_id: &str) -> Result<()> {
-        // Use a hash of repo_id as the advisory lock key so we get a stable
-        // i64 value. FNV-1a 64-bit is sufficient — collision risk is negligible
-        // and a false collision would only serialize unrelated repos.
-        // Use the std DefaultHasher (SipHash-2-4) for a stable hash.
-        // Collision risk is negligible and would only serialize unrelated repos.
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            repo_id.hash(&mut h);
-            h.finish() as i64
-        };
+        let hash = repo_lock_hash(repo_id);
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(hash)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
+
+    /// Transaction-scoped variant of [`lock_repo_cert_issuance`].
+    /// The lock is held until the enclosing transaction commits or rolls back.
+    pub async fn lock_repo_cert_issuance_tx(
+        &self,
+        repo_id: &str,
+        conn: &mut sqlx::postgres::PgConnection,
+    ) -> Result<()> {
+        let hash = repo_lock_hash(repo_id);
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(hash)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Deterministic 64-bit hash of a repo_id for advisory lock keys.
+fn repo_lock_hash(repo_id: &str) -> i64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    repo_id.hash(&mut h);
+    h.finish() as i64
 }
 
 // ── Peers ─────────────────────────────────────────────────────────────────────
@@ -6669,6 +6734,13 @@ mod ref_certificate_tests {
     use chrono::Utc;
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static NEXT_SEQ: AtomicI64 = AtomicI64::new(1);
+
+    fn next_seq() -> i64 {
+        NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
+    }
 
     async fn db(pool: PgPool) -> Db {
         let db = Db::for_testing(pool);
@@ -6694,7 +6766,7 @@ mod ref_certificate_tests {
             node_did: "did:key:zNODE".to_string(),
             signature: "sig".to_string(),
             issued_at: issued_at.to_string(),
-            seq: 1,
+            seq: next_seq(),
             prev: "0".repeat(64),
             pusher_sig: None,
             signature_input: None,
@@ -7015,8 +7087,14 @@ mod ref_certificate_tests {
     async fn v10_dedup_removes_old_duplicates(pool: PgPool) {
         let db = db(pool.clone()).await;
 
-        // Drop the unique index so we can simulate pre-v10 duplicate rows.
+        // Drop the unique indexes so we can simulate pre-v10 duplicate rows.
+        // v13's (repo_id, seq) index must also be removed because raw INSERTS
+        // without an explicit seq all get DEFAULT 1.
         sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_seq")
             .execute(&pool)
             .await
             .unwrap();
@@ -7345,9 +7423,14 @@ mod ref_certificate_tests {
         let db = Db::for_testing(pool.clone());
         db.run_migrations().await.unwrap();
 
-        // 2. Roll back to v9: remove the v10-unique index and the
+        // 2. Roll back to v9: remove unique indexes and the
         //    schema_migrations record so that run_migrations() re-applies v10.
+        //    Also drop v13's (repo_id, seq) index so raw INSERTS below work.
         sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_seq")
             .execute(&pool)
             .await
             .unwrap();
@@ -7510,33 +7593,26 @@ mod ref_certificate_tests {
             "non-duplicate singleton untouched"
         );
 
-        // 6. Verify the unique index exists: the upsert helper must succeed
-        //    (exercises ON CONFLICT) and a direct duplicate INSERT must fail.
+        // 6. Verify the unique indexes exist: an append-only INSERT for
+        //    a new (repo_id, ref_name) succeeds, and a raw INSERT for an
+        //    existing (repo_id, ref_name) must fail (catches regressions).
         db.insert_ref_certificate(&make_cert(
-            "post-migration-upsert",
+            "post-migration-insert",
             &r1,
-            "refs/heads/main",
+            "refs/heads/new-ref",
             "1111",
             "2222",
             "2026-07-03T10:00:00Z",
         ))
         .await
         .unwrap();
-        let after_upsert = db.list_ref_certificates(&r1, 10).await.unwrap();
-        let r1_main_after: Vec<_> = after_upsert
-            .iter()
-            .filter(|c| c.ref_name == "refs/heads/main")
-            .collect();
-        assert_eq!(
-            r1_main_after.len(),
-            1,
-            "upsert keeps exactly one row for main"
+        let after_migration = db.list_ref_certificates(&r1, 10).await.unwrap();
+        assert!(
+            after_migration
+                .iter()
+                .any(|c| c.id == "post-migration-insert"),
+            "append-only insert for new ref succeeds"
         );
-        assert_eq!(
-            r1_main_after[0].id, "dup-a-new",
-            "upsert preserves original id"
-        );
-        assert_eq!(r1_main_after[0].old_sha, "1111", "upsert updated old_sha");
 
         // A raw INSERT for the same (repo_id, ref_name) must now fail.
         let err = sqlx::query(
