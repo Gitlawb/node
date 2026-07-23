@@ -477,11 +477,25 @@ impl LockedConn {
         };
         for attempt in 0..LOCK_ACQUIRE_TIMEOUT_SECS {
             let conn = this.conn.as_mut().expect("connection present until unlock");
-            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            let row: (bool,) = match sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_key)
                 .fetch_one(&mut **conn)
                 .await
-                .context("trying advisory lock")?;
+            {
+                Ok(row) => row,
+                Err(e) => {
+                    // The poll itself failed, so the lock's server-side state
+                    // is unknown: if the query executed but the response was
+                    // lost, this session HOLDS the lock, and repooling the
+                    // connection would strand it. Close the connection
+                    // deliberately (freeing any lock it may hold) instead of
+                    // going through Drop's generic dropped-holder warning.
+                    if let Some(conn) = this.conn.take() {
+                        drop(conn.detach());
+                    }
+                    return Err(e).context("trying advisory lock");
+                }
+            };
             if row.0 {
                 return Ok(this);
             }

@@ -137,8 +137,9 @@ pub struct Config {
 
     /// Object-storage backend: `s3` (any S3-compatible service), `fs` (local
     /// directory), or `ipfs` (Kubo MFS). Empty = auto-detect: `s3` when a bucket
-    /// is set, else `fs` when a storage dir is set, else `ipfs` when an IPFS API
-    /// is set, else local-only.
+    /// is set, else `fs` when a storage dir is set, else local-only. `ipfs` is
+    /// never auto-selected (`GITLAWB_IPFS_API` alone keeps its pinning-only
+    /// meaning) — set this explicitly to `ipfs` to opt in.
     #[arg(long, env = "GITLAWB_STORAGE_BACKEND", default_value = "")]
     pub storage_backend: String,
 

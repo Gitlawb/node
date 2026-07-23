@@ -151,8 +151,11 @@ pub(crate) fn validate_key(key: &str) -> Result<()> {
     if key.split('/').any(|seg| seg == ".." || seg == ".") {
         anyhow::bail!("blob key contains traversal segment: {key}");
     }
-    if key.starts_with('/') || key.contains('\0') {
-        anyhow::bail!("blob key is absolute or contains null byte: {key}");
+    // Backslash is rejected outright: keys are forward-slash-delimited, and on
+    // Windows `PathBuf::join` treats `\` as a separator, which would let a key
+    // smuggle path components past the segment checks above.
+    if key.starts_with('/') || key.contains('\\') || key.contains('\0') {
+        anyhow::bail!("blob key is absolute, contains '\\', or contains null byte: {key}");
     }
     Ok(())
 }

@@ -200,6 +200,9 @@ mod tests {
         let store = FsBlobStore::new(dir.path()).unwrap();
         assert!(store.get("../escape").await.is_err());
         assert!(store.put("a/../../etc/passwd", Bytes::new()).await.is_err());
+        // Backslashes are separators on Windows — must be rejected as keys.
+        assert!(store.get("a\\..\\escape").await.is_err());
+        assert!(store.put("repos\\v1\\x", Bytes::new()).await.is_err());
     }
 
     #[tokio::test]
