@@ -53,7 +53,10 @@ pub async fn run(args: WhoamiArgs) -> Result<()> {
                 }
             }
             Ok(resp) if resp.status().as_u16() == 404 => {
-                registered = Some(false);
+                bail!(
+                    "agent not found, or this node does not yet support the agents API (v0.3+)\n\
+                     upgrade the node or check GITLAWB_NODE is pointing to the right server"
+                );
             }
             Ok(resp) => {
                 let status = resp.status();
@@ -210,7 +213,12 @@ mod tests {
             node: Some(server.url()),
             json: false,
         };
-        run(args).await.unwrap();
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("agents API"),
+            "expected ambiguous 404 error, got: {msg}"
+        );
     }
 
     #[tokio::test]
