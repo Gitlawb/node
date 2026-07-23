@@ -550,4 +550,45 @@ mod tests {
         );
         assert!(key_trusted, "key stays trusted with operator origin");
     }
+
+    #[test]
+    fn new_normalizes_empty_api_key_to_none_on_trusted_origin() {
+        let guard = ICAPTCHA_ENV_LOCK.lock().unwrap();
+        let prev_key = std::env::var_os("GITLAWB_ICAPTCHA_API_KEY");
+        let prev_op = std::env::var_os("GITLAWB_ICAPTCHA_URL");
+
+        // Operator origin configured and resolved as trusted (no advert), so
+        // api_key reaches the env read and the emptiness filter is the only
+        // thing standing between a blank var and an empty bearer token.
+        std::env::set_var("GITLAWB_ICAPTCHA_URL", "https://icap.mynode.example");
+
+        // "Operator set the var but left it blank" must stay keyless: a
+        // Some("") would attach `Authorization: Bearer ` (empty token) to the
+        // challenge and answer requests instead of omitting the header.
+        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "");
+        let empty = IcaptchaCfg::new("did:key:zTEST", None, None);
+
+        // Contrast arm: a real key on the same trusted path must survive the
+        // filter, so the filter can't regress to dropping every key.
+        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "secret-bearer");
+        let non_empty = IcaptchaCfg::new("did:key:zTEST", None, None);
+
+        // Restore env and release the lock BEFORE asserting, so a failing
+        // assertion can't poison the shared lock or cascade into a sibling.
+        match prev_key {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_API_KEY"),
+        }
+        match prev_op {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+        }
+        drop(guard);
+
+        assert_eq!(
+            empty.api_key, None,
+            "empty GITLAWB_ICAPTCHA_API_KEY must normalize to None"
+        );
+        assert_eq!(non_empty.api_key.as_deref(), Some("secret-bearer"));
+    }
 }
