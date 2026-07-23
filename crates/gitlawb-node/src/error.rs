@@ -85,6 +85,10 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+/// Generic client-facing message for `AppError::Internal`. The real error is
+/// logged server-side; never put sqlx/anyhow detail in the HTTP body (#226).
+pub const INTERNAL_ERROR_MESSAGE: &str = "an internal error occurred";
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // iCaptcha challenges carry structured discovery so clients don't have to
@@ -148,11 +152,16 @@ impl IntoResponse for AppError {
                 DB_UNAVAILABLE_MESSAGE.into(),
             ),
             AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
-            AppError::Internal(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                e.to_string(),
-            ),
+            // Opaque body: raw sqlx/anyhow text must not reach unauthenticated
+            // callers (GET /ipfs/{cid} and siblings map DB failures here) (#226).
+            AppError::Internal(e) => {
+                tracing::error!(error = %e, "internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    INTERNAL_ERROR_MESSAGE.into(),
+                )
+            }
         };
 
         let body = Json(json!({
@@ -169,6 +178,7 @@ pub type Result<T> = std::result::Result<T, AppError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn timeout_maps_to_504_distinct_from_git_500() {
@@ -180,6 +190,30 @@ mod tests {
         assert_eq!(
             AppError::Git("x".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// #226: raw sqlx/DB detail must never appear in the Internal 500 body.
+    #[tokio::test]
+    async fn internal_error_body_is_opaque() {
+        let leak = "error returned from database: relation \"repos\" does not exist";
+        let resp = AppError::Internal(anyhow::anyhow!("{leak}")).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(v["error"], "internal_error");
+        assert_eq!(v["message"], INTERNAL_ERROR_MESSAGE);
+        let rendered = String::from_utf8_lossy(&bytes);
+        assert!(
+            !rendered.contains("relation"),
+            "DB schema detail leaked into body: {rendered}"
+        );
+        assert!(
+            !rendered.contains(leak),
+            "raw internal error leaked into body: {rendered}"
         );
     }
 }
