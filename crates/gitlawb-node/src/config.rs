@@ -88,7 +88,13 @@ pub struct Config {
 
     /// Bundler URL for Arweave permanent anchoring (Turbo/upload.ardrive.io).
     /// Leave empty to disable anchoring.
-    #[arg(long, env = "GITLAWB_BUNDLER_URL", default_value = "")]
+    /// Deprecated alias: --irys-url (renamed after the Irys→Bundler rebrand).
+    #[arg(
+        long,
+        env = "GITLAWB_BUNDLER_URL",
+        default_value = "",
+        alias = "irys-url"
+    )]
     pub bundler_url: String,
 
     /// Arweave gateway URL for resolving arweave_tx_id to data items.

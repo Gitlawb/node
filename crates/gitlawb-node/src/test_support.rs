@@ -1478,7 +1478,7 @@ mod tests {
                 node_did: owner.to_string(),
                 signature: "sig".to_string(),
                 issued_at: Utc::now().to_rfc3339(),
-                seq: 1,
+                seq: next_cert_seq(),
                 prev: "0".repeat(64),
                 pusher_sig: None,
                 signature_input: None,
@@ -4964,6 +4964,13 @@ mod tests {
 
     // ── #147: list_certs respects ?limit ──────────────────────────────────────
 
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static NEXT_CERT_SEQ: AtomicI64 = AtomicI64::new(1);
+
+    fn next_cert_seq() -> i64 {
+        NEXT_CERT_SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn seed_cert(
         id: &str,
         repo_id: &str,
@@ -4980,7 +4987,7 @@ mod tests {
             node_did: "did:key:zNODE".into(),
             signature: "sig".into(),
             issued_at: issued_at.to_string(),
-            seq: 1,
+            seq: next_cert_seq(),
             prev: "0".repeat(64),
             pusher_sig: None,
             signature_input: None,

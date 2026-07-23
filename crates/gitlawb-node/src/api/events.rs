@@ -426,6 +426,13 @@ mod ref_updates_feed_tests {
             .with_state(state)
     }
 
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static NEXT_FCERT_SEQ: AtomicI64 = AtomicI64::new(1);
+
+    fn ref_cert_seq() -> i64 {
+        NEXT_FCERT_SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn ref_cert(id: &str, repo_id: &str) -> RefCertificate {
         RefCertificate {
             id: id.into(),
@@ -437,7 +444,7 @@ mod ref_updates_feed_tests {
             node_did: "did:key:z6MkNode".into(),
             signature: "sig".into(),
             issued_at: Utc::now().to_rfc3339(),
-            seq: 1,
+            seq: ref_cert_seq(),
             prev: "0".repeat(64),
             pusher_sig: None,
             signature_input: None,
