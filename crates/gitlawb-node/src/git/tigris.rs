@@ -11,6 +11,21 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::Client as S3Client;
 use tracing::{debug, info};
 
+/// Object storage for git bare-repo archives. The seam that lets `RepoStore`
+/// (and tests) depend on storage behavior without a live bucket. `TigrisClient`
+/// is the production implementation.
+#[async_trait::async_trait]
+pub trait ObjectStore: Send + Sync {
+    /// Whether an archive exists for this repo.
+    async fn exists(&self, owner_slug: &str, repo_name: &str) -> Result<bool>;
+    /// Upload a local bare repo directory as an archive.
+    async fn upload(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()>;
+    /// Download and extract a repo archive to local disk.
+    async fn download(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()>;
+    /// Delete a repo archive.
+    async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()>;
+}
+
 /// Wrapper around the S3 client with the configured bucket.
 #[derive(Clone)]
 pub struct TigrisClient {
@@ -35,9 +50,12 @@ impl TigrisClient {
     fn repo_key(owner_slug: &str, repo_name: &str) -> String {
         format!("repos/v1/{owner_slug}/{repo_name}.tar.zst")
     }
+}
 
+#[async_trait::async_trait]
+impl ObjectStore for TigrisClient {
     /// Check if a repo archive exists in Tigris.
-    pub async fn exists(&self, owner_slug: &str, repo_name: &str) -> Result<bool> {
+    async fn exists(&self, owner_slug: &str, repo_name: &str) -> Result<bool> {
         let key = Self::repo_key(owner_slug, repo_name);
         match self
             .s3
@@ -59,7 +77,7 @@ impl TigrisClient {
     }
 
     /// Upload a local bare repo directory to Tigris as a tar.zst archive.
-    pub async fn upload(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()> {
+    async fn upload(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()> {
         let key = Self::repo_key(owner_slug, repo_name);
         debug!(key = %key, path = %local_path.display(), "uploading repo to tigris");
 
@@ -89,12 +107,7 @@ impl TigrisClient {
     }
 
     /// Download a repo archive from Tigris and extract to local disk.
-    pub async fn download(
-        &self,
-        owner_slug: &str,
-        repo_name: &str,
-        local_path: &Path,
-    ) -> Result<()> {
+    async fn download(&self, owner_slug: &str, repo_name: &str, local_path: &Path) -> Result<()> {
         let key = Self::repo_key(owner_slug, repo_name);
         debug!(key = %key, path = %local_path.display(), "downloading repo from tigris");
 
@@ -128,8 +141,7 @@ impl TigrisClient {
     }
 
     /// Delete a repo archive from Tigris.
-    #[allow(dead_code)]
-    pub async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
+    async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
         let key = Self::repo_key(owner_slug, repo_name);
         self.s3
             .delete_object()

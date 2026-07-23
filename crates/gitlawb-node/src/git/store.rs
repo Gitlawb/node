@@ -63,6 +63,105 @@ pub fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
     Ok(refs)
 }
 
+/// Read the object id a single ref currently points to. Returns None if the
+/// ref does not exist. Used to snapshot a ref's pre-write state so a failed
+/// durable upload can roll the local write back.
+pub fn ref_oid(repo_path: &Path, ref_name: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", ref_name])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git rev-parse")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let oid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if oid.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(oid))
+}
+
+/// Force a single ref back to a captured object id — rolls back a local write
+/// (e.g. a merge commit) whose durable upload failed, so a local-fast-path
+/// read does not serve the un-uploaded state. The now-dangling objects are
+/// harmless.
+pub fn set_ref(repo_path: &Path, ref_name: &str, oid: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["update-ref", ref_name, oid])
+        .current_dir(repo_path)
+        .output()
+        .context("failed to run git update-ref")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git update-ref failed: {stderr}");
+    }
+    Ok(())
+}
+
+/// Restore a repo's refs to a previously captured snapshot: reset every
+/// snapshot ref to its captured object id, and delete any ref that exists now
+/// but was absent from the snapshot (created by the intervening write). Used
+/// to roll back a receive-pack whose durable upload failed, so the next
+/// local-fast-path read does not serve refs that never reached object storage.
+/// Best-effort per ref: an individual failure is collected and reported, but
+/// the remaining refs are still attempted.
+pub fn restore_refs(repo_path: &Path, snapshot: &[(String, String)]) -> Result<()> {
+    use std::collections::HashSet;
+
+    let mut errors: Vec<String> = Vec::new();
+
+    // Reset every snapshot ref to its captured oid (recreates refs the write
+    // deleted, and rewinds refs the write advanced).
+    for (ref_name, oid) in snapshot {
+        if let Err(e) = set_ref(repo_path, ref_name, oid) {
+            errors.push(format!("{ref_name}: {e}"));
+        }
+    }
+
+    // Delete refs that exist now but were not in the snapshot (created by the
+    // write being rolled back). A failure to LIST the current refs is collected
+    // like any per-ref failure, never returned early: the snapshot-reset half
+    // above already ran, and bailing here would discard its collected errors.
+    let snapshot_names: HashSet<&str> = snapshot.iter().map(|(r, _)| r.as_str()).collect();
+    match list_refs(repo_path) {
+        Ok(current) => {
+            for (ref_name, _) in &current {
+                if !snapshot_names.contains(ref_name.as_str()) {
+                    match Command::new("git")
+                        .args(["update-ref", "-d", ref_name])
+                        .current_dir(repo_path)
+                        .output()
+                    {
+                        Ok(output) if output.status.success() => {}
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            errors.push(format!("{ref_name} (delete): {stderr}"));
+                        }
+                        Err(e) => {
+                            errors.push(format!(
+                                "{ref_name} (delete): failed to run git update-ref -d: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            errors.push(format!("(extra-ref sweep) listing current refs: {e}"));
+        }
+    }
+
+    if !errors.is_empty() {
+        bail!(
+            "failed to restore {} ref(s): {}",
+            errors.len(),
+            errors.join("; ")
+        );
+    }
+    Ok(())
+}
+
 /// Read the current HEAD commit hash of a repository.
 /// Returns None if the repo is empty (no commits yet).
 pub fn head_commit(repo_path: &Path) -> Result<Option<String>> {
@@ -455,9 +554,175 @@ pub fn repo_disk_path(repos_dir: &Path, owner_did: &str, repo_name: &str) -> Pat
 
 #[cfg(test)]
 mod tests {
-    use super::branch_diff_names;
+    use super::{branch_diff_names, list_refs, restore_refs};
     use std::path::Path;
     use std::process::Command;
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Bare repo with main at c2 and keeper at c2, whose "pre-push" state was
+    /// main and keeper both at c1. Returns (workdir, baredir, bare_path, c1, c2).
+    fn advanced_bare_repo() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        String,
+        String,
+    ) {
+        let work = tempfile::TempDir::new().unwrap();
+        run_git(work.path(), &["init", "-q", "-b", "main", "."]);
+        run_git(work.path(), &["config", "user.email", "t@t"]);
+        run_git(work.path(), &["config", "user.name", "t"]);
+        std::fs::write(work.path().join("f.txt"), "one").unwrap();
+        run_git(work.path(), &["add", "f.txt"]);
+        run_git(work.path(), &["commit", "-qm", "c1"]);
+        let c1 = run_git(work.path(), &["rev-parse", "HEAD"]);
+        std::fs::write(work.path().join("f.txt"), "two").unwrap();
+        run_git(work.path(), &["add", "f.txt"]);
+        run_git(work.path(), &["commit", "-qm", "c2"]);
+        let c2 = run_git(work.path(), &["rev-parse", "HEAD"]);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("repo.git");
+        let out = Command::new("git")
+            .args([
+                "clone",
+                "--bare",
+                "-q",
+                &work.path().to_string_lossy(),
+                &bare.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "clone --bare failed");
+        // "The push" advanced main to c2 (already there from the clone), moved
+        // keeper c1 -> c2, and created feature at c2.
+        run_git(&bare, &["update-ref", "refs/heads/keeper", &c2]);
+        run_git(&bare, &["update-ref", "refs/heads/feature", &c2]);
+        (work, dir, bare, c1, c2)
+    }
+
+    fn sorted_refs(bare: &Path) -> Vec<(String, String)> {
+        let mut refs = list_refs(bare).unwrap();
+        refs.sort();
+        refs
+    }
+
+    /// A single unrestorable snapshot entry (invalid oid, `set_ref` fails) must
+    /// not abort the restore: every OTHER snapshot ref is still reset and the
+    /// push-created extra ref is still deleted, and the fn returns Err carrying
+    /// the failure. RED with the reset loop reverted to `set_ref(..)?`: the
+    /// broken entry is first in the snapshot, so an early return leaves keeper
+    /// at c2 and feature alive.
+    #[test]
+    fn restore_refs_partial_failure_still_resets_rest_and_deletes_extras() {
+        let (_work, _dir, bare, c1, c2) = advanced_bare_repo();
+
+        let snapshot = vec![
+            (
+                "refs/heads/broken".to_string(),
+                "not-a-valid-oid".to_string(),
+            ),
+            ("refs/heads/main".to_string(), c1.clone()),
+            ("refs/heads/keeper".to_string(), c1.clone()),
+        ];
+        let err = restore_refs(&bare, &snapshot).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refs/heads/broken"),
+            "the aggregated error names the failed ref: {msg}"
+        );
+
+        let refs = sorted_refs(&bare);
+        assert_eq!(
+            refs,
+            vec![
+                ("refs/heads/keeper".to_string(), c1.clone()),
+                ("refs/heads/main".to_string(), c1.clone()),
+            ],
+            "keeper and main are reset to c1 and feature is deleted despite the \
+             broken entry (c2 was {c2})"
+        );
+    }
+
+    /// Happy path unchanged by the hardening: a fully valid snapshot restores
+    /// exactly (refs rewound, created ref deleted) and returns Ok.
+    #[test]
+    fn restore_refs_happy_path_restores_snapshot_exactly() {
+        let (_work, _dir, bare, c1, _c2) = advanced_bare_repo();
+
+        let snapshot = vec![
+            ("refs/heads/main".to_string(), c1.clone()),
+            ("refs/heads/keeper".to_string(), c1.clone()),
+        ];
+        restore_refs(&bare, &snapshot).unwrap();
+
+        let refs = sorted_refs(&bare);
+        assert_eq!(
+            refs,
+            vec![
+                ("refs/heads/keeper".to_string(), c1.clone()),
+                ("refs/heads/main".to_string(), c1),
+            ],
+            "restore must reproduce the snapshot exactly"
+        );
+    }
+
+    /// When the internal `list_refs` (extra-ref sweep) fails, the snapshot-reset
+    /// half must still have run and its collected failures must surface in the
+    /// aggregated error, not be discarded by an early `?` return. The repo is a
+    /// real bare repo declaring repositoryformatversion=999, so both `set_ref`
+    /// and `list_refs` fail deterministically. RED with the sweep reverted to
+    /// `let current = list_refs(repo_path)?;`: the raw for-each-ref error
+    /// propagates without the "failed to restore" aggregate or the ref name.
+    #[test]
+    fn restore_refs_aggregates_when_internal_list_refs_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bare = dir.path().join("repo.git");
+        let out = Command::new("git")
+            .args(["init", "--bare", "-q", &bare.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git init --bare failed");
+        std::fs::write(
+            bare.join("config"),
+            "[core]\n\trepositoryformatversion = 999\n\tbare = true\n",
+        )
+        .unwrap();
+        assert!(
+            list_refs(&bare).is_err(),
+            "precondition: list_refs must fail on the corrupted repo"
+        );
+
+        let snapshot = vec![("refs/heads/main".to_string(), "a".repeat(40))];
+        let err = restore_refs(&bare, &snapshot).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to restore"),
+            "must return the aggregated error, not the raw list_refs error: {msg}"
+        );
+        assert!(
+            msg.contains("refs/heads/main"),
+            "the set_ref failure from the reset half must survive the sweep \
+             failure: {msg}"
+        );
+        assert!(
+            msg.contains("listing current refs"),
+            "the sweep failure itself is also collected: {msg}"
+        );
+    }
 
     #[test]
     fn branch_diff_names_lists_changed_paths() {

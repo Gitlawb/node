@@ -70,10 +70,23 @@ impl RateLimiter {
         self.window.min(Duration::from_secs(1))
     }
 
+    /// Returns `true` if the request is allowed. Thin wrapper over
+    /// [`check_retry`](Self::check_retry) for callers that only need the
+    /// allow/deny decision, not the rejection's Retry-After delay. Test-only now:
+    /// production 429 sites use `check_retry` so they can advertise Retry-After.
+    #[cfg(test)]
     pub(crate) async fn check(&self, key: &str) -> bool {
+        self.check_retry(key).await.is_none()
+    }
+
+    /// Record a request against `key`. Returns `None` when it is allowed, or
+    /// `Some(retry_after)` when it is rejected — the delay a client should wait
+    /// before retrying, so a 429 can advertise a value consistent with the
+    /// actual window instead of a constant.
+    pub(crate) async fn check_retry(&self, key: &str) -> Option<Duration> {
         // max_requests == 0 means the limiter is disabled, not "block all".
         if self.max_requests == 0 {
-            return true;
+            return None;
         }
         let now = Instant::now();
         let mut state = self.state.lock().await;
@@ -85,10 +98,25 @@ impl RateLimiter {
                 .timestamps
                 .retain(|t| now.duration_since(*t) < self.window);
             if window.timestamps.len() >= self.max_requests {
-                return false;
+                // Insertion order is preserved, so after the retain the first
+                // element is the oldest live request. It ages out (freeing a
+                // slot) one window after it landed, so that remaining time is
+                // the delay to advertise. Clamp to >= 1 so a 429 never tells a
+                // client to retry immediately.
+                let retry = window
+                    .timestamps
+                    .first()
+                    .map(|oldest| {
+                        self.window
+                            .as_secs()
+                            .saturating_sub(now.duration_since(*oldest).as_secs())
+                    })
+                    .unwrap_or(0)
+                    .max(1);
+                return Some(Duration::from_secs(retry));
             }
             window.timestamps.push(now);
-            return true;
+            return None;
         }
 
         // New key. Enforce the cap BEFORE inserting so a flood of distinct keys
@@ -109,7 +137,11 @@ impl RateLimiter {
             }
             drop(last_sweep);
             if state.len() >= self.max_keys {
-                return false;
+                // The key is untracked (never inserted), so there is no oldest
+                // entry to derive a delay from. Advertise the full window as a
+                // conservative bound: capacity frees as other keys expire, at
+                // the latest one window from now.
+                return Some(self.window.max(Duration::from_secs(1)));
             }
         }
         state.insert(
@@ -118,7 +150,7 @@ impl RateLimiter {
                 timestamps: vec![now],
             },
         );
-        true
+        None
     }
 
     pub async fn cleanup(&self) {
@@ -129,6 +161,41 @@ impl RateLimiter {
                 .retain(|t| now.duration_since(*t) < self.window);
             !w.timestamps.is_empty()
         });
+    }
+
+    /// Test-only: insert a fully-expired entry (no live timestamps) that the next
+    /// `cleanup()` must reclaim. Models a key whose window has aged out, without
+    /// depending on wall-clock sleeps or a short window. Used cross-module by the
+    /// AppState cleanup guard test (H2).
+    #[cfg(test)]
+    pub(crate) async fn insert_reclaimable_for_test(&self, key: &str) {
+        self.state
+            .lock()
+            .await
+            .insert(key.to_string(), Window { timestamps: vec![] });
+    }
+
+    /// Test-only: number of distinct keys currently tracked.
+    #[cfg(test)]
+    pub(crate) async fn tracked_keys(&self) -> usize {
+        self.state.lock().await.len()
+    }
+
+    /// Test-only: seed a key's bucket with entries of the given ages (how long
+    /// ago each request landed), so a test can drive the Retry-After computation
+    /// off a controlled oldest-entry age without wall-clock sleeps. Ages that
+    /// would underflow the monotonic clock collapse to `now`.
+    #[cfg(test)]
+    pub(crate) async fn seed_aged_entry_for_test(&self, key: &str, ages: &[Duration]) {
+        let now = Instant::now();
+        let timestamps = ages
+            .iter()
+            .map(|a| now.checked_sub(*a).unwrap_or(now))
+            .collect();
+        self.state
+            .lock()
+            .await
+            .insert(key.to_string(), Window { timestamps });
     }
 }
 
@@ -141,13 +208,8 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
         .map(|a| a.0.clone());
 
     if let (Some(limiter), Some(did)) = (limiter, did) {
-        if !limiter.check(&did).await {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "60")],
-                "rate limit exceeded — try again later",
-            )
-                .into_response();
+        if let Some(retry_after) = limiter.check_retry(&did).await {
+            return too_many_requests(retry_after);
         }
     }
 
@@ -250,13 +312,13 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
-/// The shared 429 response for the per-IP flood brakes. Route-agnostic: this
-/// middleware now serves the push path AND the peer-sync routes, so the message
-/// stays generic (the offending path is recorded in the warn log below).
-pub fn too_many_requests() -> Response {
+/// The shared 429 response for the rate-limit middlewares (per-DID and per-IP
+/// alike). Route-agnostic: the message stays generic (the offending path, when
+/// logged, is recorded at the call site).
+pub fn too_many_requests(retry_after: Duration) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [("retry-after", "60")],
+        [("retry-after", retry_after.as_secs().to_string())],
         "rate limit exceeded — try again later",
     )
         .into_response()
@@ -274,9 +336,9 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
 
     if let Some(limiter) = limiter {
         if let Some(key) = client_key(request.headers(), peer, limiter.trust) {
-            if !limiter.limiter.check(&key).await {
+            if let Some(retry_after) = limiter.limiter.check_retry(&key).await {
                 tracing::warn!(key = %key, path = %request.uri().path(), "per-IP rate limit exceeded");
-                return too_many_requests();
+                return too_many_requests(retry_after);
             }
         }
     }
@@ -603,6 +665,198 @@ mod tests {
             post_repos_from(&router, peer).await,
             StatusCode::TOO_MANY_REQUESTS,
             "an exhausted IP must be braked with 429 before auth runs, not leak to 401"
+        );
+    }
+
+    // ── Adversarial TrustedProxy verification through the middleware (U5) ──
+    // These complement the client_key unit tests above by driving hostile
+    // headers through rate_limit_by_ip on a real router: the property under test
+    // is that the *bucket key* cannot be rotated by a spoofer.
+
+    async fn post_with(
+        router: &axum::Router,
+        peer: SocketAddr,
+        hdrs: &[(&str, &str)],
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let mut b = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/repos");
+        for (k, v) in hdrs {
+            b = b.header(*k, *v);
+        }
+        let mut req = b.body(axum::body::Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        router.clone().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn xff_spoofed_leftmost_hop_cannot_rotate_bucket() {
+        // XForwardedFor mode, budget 1. A spoofer varies the client-controlled
+        // leftmost hop every request but the trusted proxy always appends the
+        // same rightmost hop. All requests must key to the rightmost hop, so the
+        // second is braked despite a fresh leftmost value.
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::XForwardedFor,
+        });
+        let p1: SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let p2: SocketAddr = "10.0.0.2:1".parse().unwrap();
+        // First request passes the brake, reaches (failing) auth.
+        assert_eq!(
+            post_with(&router, p1, &[("x-forwarded-for", "9.9.9.1, 203.0.113.5")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // Different leftmost + different socket peer, SAME rightmost trusted hop:
+        // braked, because the key is the rightmost hop, not the spoofed value.
+        assert_eq!(
+            post_with(&router, p2, &[("x-forwarded-for", "9.9.9.2, 203.0.113.5")]).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a spoofer varying the leftmost XFF hop must not rotate its bucket key"
+        );
+    }
+
+    #[tokio::test]
+    async fn xff_distinct_real_clients_get_distinct_buckets() {
+        // Distinct trusted (rightmost) hops are distinct clients: neither throttles
+        // the other, so a busy legitimate client cannot starve a different one.
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::XForwardedFor,
+        });
+        let peer: SocketAddr = "10.0.0.9:1".parse().unwrap();
+        assert_eq!(
+            post_with(
+                &router,
+                peer,
+                &[("x-forwarded-for", "1.1.1.1, 203.0.113.5")]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_with(
+                &router,
+                peer,
+                &[("x-forwarded-for", "1.1.1.1, 203.0.113.6")]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED,
+            "a different trusted client hop must get its own bucket"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_trusted_header_collapses_to_socket_peer() {
+        // The documented fallback: in a trusted-proxy mode, a request with no
+        // forwarded header keys on the socket peer. Behind a real edge every
+        // request shares the proxy's socket, so they collapse onto one bucket —
+        // asserted here by name so any change to this behavior is deliberate.
+        let router = ip_limited_over_auth_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(60)),
+            trust: TrustedProxy::XForwardedFor,
+        });
+        let proxy: SocketAddr = "172.16.0.1:1".parse().unwrap();
+        assert_eq!(
+            post_with(&router, proxy, &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post_with(&router, proxy, &[]).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "with no trusted header, requests fall back to the socket peer key (collapse)"
+        );
+    }
+
+    // ── Retry-After derived from the window, not a constant 60 (U5) ───────
+    // A 429 must advertise the delay until the oldest live request ages out of
+    // the limiter's window, so the value tracks the real window instead of the
+    // hardcoded 60 that contradicted every limiter's 3600s window.
+
+    async fn resp_from(router: &axum::Router, peer: SocketAddr) -> Response {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/o/r/git-receive-pack")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        router.clone().oneshot(req).await.unwrap()
+    }
+
+    fn retry_after_secs(resp: &Response) -> u64 {
+        resp.headers()
+            .get("retry-after")
+            .expect("429 must carry a retry-after header")
+            .to_str()
+            .unwrap()
+            .parse()
+            .expect("retry-after must be an integer number of seconds")
+    }
+
+    #[tokio::test]
+    async fn retry_after_reflects_full_window_for_freshly_filled_bucket() {
+        // A just-filled bucket's oldest entry is ~now, so the advertised delay
+        // must be close to the whole window (100s), NOT the old constant 60.
+        let router = ip_limited_router(IpRateLimiter {
+            limiter: RateLimiter::new(1, Duration::from_secs(100)),
+            trust: TrustedProxy::None,
+        });
+        let peer: SocketAddr = "203.0.113.50:6000".parse().unwrap();
+        assert_eq!(resp_from(&router, peer).await.status(), StatusCode::OK);
+        let resp = resp_from(&router, peer).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = retry_after_secs(&resp);
+        assert!(
+            (95..=100).contains(&retry),
+            "freshly-filled bucket must advertise ~window (95..=100s), got {retry} (constant-60 bug if 60)"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_shrinks_as_oldest_entry_ages() {
+        // Seed the sole slot with an entry already 95s into a 100s window: the
+        // next request is rejected and must advertise only the ~5s remaining,
+        // not 60.
+        let limiter = RateLimiter::new(1, Duration::from_secs(100));
+        let peer: SocketAddr = "203.0.113.51:6000".parse().unwrap();
+        limiter
+            .seed_aged_entry_for_test(&peer.ip().to_string(), &[Duration::from_secs(95)])
+            .await;
+        let router = ip_limited_router(IpRateLimiter {
+            limiter,
+            trust: TrustedProxy::None,
+        });
+        let resp = resp_from(&router, peer).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = retry_after_secs(&resp);
+        assert!(
+            (1..=10).contains(&retry),
+            "an aged bucket must advertise the small remaining delay (1..=10s), got {retry}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_clamps_to_at_least_one_second() {
+        // Oldest entry is 99s into a 100s window: the raw remainder rounds toward
+        // 1s and must never be advertised as 0 (a 0/blank retry lets a rejected
+        // client hammer immediately).
+        let limiter = RateLimiter::new(1, Duration::from_secs(100));
+        let peer: SocketAddr = "203.0.113.52:6000".parse().unwrap();
+        limiter
+            .seed_aged_entry_for_test(&peer.ip().to_string(), &[Duration::from_secs(99)])
+            .await;
+        let router = ip_limited_router(IpRateLimiter {
+            limiter,
+            trust: TrustedProxy::None,
+        });
+        let resp = resp_from(&router, peer).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry = retry_after_secs(&resp);
+        assert!(retry >= 1, "retry-after must clamp to >= 1, got {retry}");
+        assert!(
+            retry <= 2,
+            "with 99s of a 100s window elapsed, the remaining delay is ~1s, got {retry}"
         );
     }
 }

@@ -250,7 +250,11 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
+    /// Access the underlying Postgres connection pool. Test-only: all production DB
+    /// access goes through `Db`'s methods, and the write advisory-lock subsystem uses
+    /// its own pool (`connect_lock_pool`). Tests reach for the raw pool to seed and
+    /// assert directly.
+    #[cfg(test)]
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -293,6 +297,30 @@ impl Db {
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Build a standalone Postgres pool for the advisory-lock subsystem,
+    /// separate from the app pool. No migrations run here (the app pool owns
+    /// the schema); this pool only serves the session-scoped advisory-lock
+    /// connections that `RepoStore`'s write guards pin for a write's whole
+    /// lifetime, so a concurrent-push burst pins connections from here rather
+    /// than starving the app pool. Sized by GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS.
+    pub async fn connect_lock_pool(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<PgPool> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "connecting advisory-lock pool"
+        );
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect(database_url)
+            .await
+            .context("connecting advisory-lock pool")
     }
 
     /// Cheap liveness probe against the pool, for readiness checks: one
@@ -899,6 +927,49 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
 /// drift apart. If you change `normalize_owner_key`, update this const too.
 const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
 
+/// `OWNER_KEY_CASE_SQL` over an arbitrary owner column. The const above hardcodes
+/// `owner_did` (the `repos` column the `idx_repos_owner_key_name` index is built
+/// on); the bounty tombstone needs the same normalizer over `bounties.repo_owner`,
+/// which is not index-backed. Byte-identical to `normalize_owner_key`; update this
+/// alongside the const and the fn if the rule changes.
+fn owner_key_case_sql(col: &str) -> String {
+    format!(
+        "CASE WHEN {col} LIKE 'did:key:%' AND position(':' in substr({col}, 9)) = 0 \
+         THEN substr({col}, 9) ELSE {col} END"
+    )
+}
+
+/// Take a transaction-scoped Postgres advisory lock keyed on the normalized repo
+/// slug (`normalize_owner_key(owner)/name`). `delete_repo_by_id`'s purge cascade and
+/// `upsert_mirror_repo`'s ingest both take this lock on the identical slug string, so
+/// a peer-sync mirror insert cannot interleave between the purge's point-in-time
+/// sibling check and its slug-scoped deletes (which would half-wipe a live mirror's
+/// child rows / bounty). `hashtextextended($1, 0)` folds the slug to the `bigint` the
+/// lock API needs; both call sites hash the identical string, so their keys agree.
+/// XACT-scoped, so it auto-releases on commit/rollback with no unlock bookkeeping
+/// (mirrors the session-scoped `pg_advisory_lock` migration guard, but self-releasing).
+async fn lock_repo_slug(conn: &mut sqlx::PgConnection, slug: &str) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(slug)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// Normalize an `owner/name` slug to the exact string `delete_repo_by_id` builds its
+/// advisory-lock key from: `normalize_owner_key(owner)/name`, splitting at the first
+/// `/` (owners never contain `/`; DID owners use `:`). Writers that receive the slug
+/// as one string (`branch_cids.repo`, `sync_queue.repo`, `received_ref_updates.repo`)
+/// must lock this normalized form, not the verbatim input, or a full-DID caller would
+/// hash a different key than the purge and slip past the serialization. A string with
+/// no `/` is returned as-is; the purge never locks such a key, so it is inert.
+fn normalize_repo_slug(repo: &str) -> String {
+    match repo.split_once('/') {
+        Some((owner, name)) => format!("{}/{}", normalize_owner_key(owner), name),
+        None => repo.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod normalize_owner_key_tests {
     use super::normalize_owner_key;
@@ -1001,6 +1072,14 @@ impl Db {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let id = format!("{owner_short}/{name}");
+        // Slug the purge cascade keys on. Take the shared advisory lock on it inside a
+        // tx so a concurrent `delete_repo_by_id` purge of a colliding row cannot
+        // interleave its sibling-check-then-cascade around this insert and wipe the
+        // mirror we are ingesting. Normalize the owner the same way the cascade does so
+        // both call sites hash the identical slug string.
+        let slug = format!("{}/{}", normalize_owner_key(owner_short), name);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         // `quarantined` is set only on first insert (the admission decision).
         // A re-sync (ON CONFLICT) preserves the existing flag — admission runs
         // once, and an operator's later release must not be silently reverted.
@@ -1021,8 +1100,9 @@ impl Db {
         .bind(disk_path)
         .bind(machine_id)
         .bind(quarantined)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1269,6 +1349,176 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Every repo row whose owner resolves to `owner_did` under did:key
+    /// normalization, so `did:key:z6…` and bare `z6…` rows of the same identity
+    /// both match (mirroring how ownership is resolved everywhere else via
+    /// `OWNER_KEY_CASE_SQL` / the `idx_repos_owner_key_name` index). No dedup, so a
+    /// caller enumerating one DID's repos sees every physical row. Backs the
+    /// `purge-spam` admin tool, whose selection then applies its own per-repo empty
+    /// check and exclusion gate (both normalization-consistent). Ordered by `id`.
+    pub async fn list_repos_by_owner_did(&self, owner_did: &str) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE {key} = $1 ORDER BY id",
+            key = OWNER_KEY_CASE_SQL
+        );
+        let rows = sqlx::query(&sql)
+            .bind(normalize_owner_key(owner_did))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Delete a single repo row by its primary key `id`. Returns the number of
+    /// rows removed (0 if no such repo). Operates on one repo at a time by design:
+    /// the `purge-spam` tool deletes a vetted candidate list per-repo, never a
+    /// blanket "delete all repos of owner X".
+    pub async fn delete_repo_by_id(&self, id: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+
+        // Resolve the row's identity so the `repo`-slug-keyed children (keyed on
+        // `normalize_owner_key(owner)/name`, not `repos.id`) can be matched. Absent
+        // row → nothing to delete; commit the empty tx and report 0.
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT owner_did, name FROM repos WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((owner_did, name)) = row else {
+            tx.commit().await?;
+            return Ok(0);
+        };
+        let slug = format!("{}/{}", normalize_owner_key(&owner_did), name);
+
+        // Serialize this purge against a concurrent `upsert_mirror_repo` ingest that
+        // resolves to the same slug: both take this xact-scoped advisory lock on the
+        // identical slug string BEFORE the sibling check below, so a peer-sync insert
+        // cannot land between that point-in-time check and the slug-scoped cascade
+        // deletes (which would half-wipe the live mirror). Auto-released on commit.
+        lock_repo_slug(&mut tx, &slug).await?;
+
+        // Grandchildren first: PR reviews/comments key on pr_id, so delete them
+        // before the parent PRs vanish.
+        for table in ["pr_reviews", "pr_comments"] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE pr_id IN (SELECT id FROM pull_requests WHERE repo_id = $1)"
+            ))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Direct children keyed on repos.id.
+        for table in [
+            "push_events",
+            "ref_certificates",
+            "pull_requests",
+            "webhooks",
+            "agent_tasks",
+            "protected_branches",
+            "repo_stars",
+            "repo_replicas",
+            "repo_labels",
+            "visibility_rules",
+            "encrypted_blobs",
+            "repo_icaptcha_proofs",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE repo_id = $1"))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // Children keyed on the derived `owner_short/name` slug rather than the id.
+        // INV-9 same-method slug collision: a canonical `did:key:zX` row and a bare
+        // `zX` mirror both normalize (via OWNER_KEY_CASE_SQL) to slug `zX/name`, so
+        // these tables cannot tell whose rows they are. Purging one row must not wipe
+        // a surviving sibling's records. Gate the slug-scoped deletes on the absence
+        // of any OTHER repos row resolving to the same slug, using the same
+        // OWNER_KEY_CASE_SQL the slug was built from so the check is byte-identical to
+        // the cascade key. The xact advisory lock taken at the top of this tx (and
+        // matched in `upsert_mirror_repo` on the identical slug) serializes this
+        // sibling-check-then-cascade against a concurrent peer-sync insert for the same
+        // slug, so this is no longer a bare point-in-time read a mirror upsert can slip
+        // past (closing the old KTD4 residual: the concurrent inserter is peer sync,
+        // not an operator, so the window was never operator-scoped).
+        let sibling_exists: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS(SELECT 1 FROM repos WHERE id <> $1 AND {key} || '/' || name = $2)",
+            key = OWNER_KEY_CASE_SQL
+        ))
+        .bind(id)
+        .bind(&slug)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !sibling_exists {
+            for table in [
+                "branch_cids",
+                "sync_queue",
+                "received_ref_updates",
+                "arweave_anchors",
+            ] {
+                sqlx::query(&format!("DELETE FROM {table} WHERE repo = $1"))
+                    .bind(&slug)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        // NOTE: `bounties` (financial: amount/wallet/tx_hash) and `issue_comments`
+        // (no issues table to map issue_id → repo) are deliberately NOT cascaded
+        // here — dropping money records or unmappable rows on a repo delete would
+        // be wrong. They are left intact by design.
+        //
+        // But bounties key on (repo_owner, repo_name), not an immutable repo id, so
+        // an untouched OPEN bounty would silently re-attach to a same-name repo the
+        // owner recreates and become claimable again (finding F). Tombstone the
+        // repo's non-terminal bounties to a dead `purged` status instead of deleting
+        // them: this preserves the financial record while making them unclaimable
+        // (claim/submit/approve/cancel/dispute all gate on specific non-`purged`
+        // source statuses, so `purged` is inert and no transition reopens it).
+        // Scope by (repo_owner, repo_name) as the surviving purge does; the already
+        // terminal `completed`/`cancelled` bounties are left as-is. (Residual: a
+        // tombstoned bounty stays readable/listable under the same owner/name after
+        // recreation — a view, not a claim/payout re-attach; see the plan's KTD8.)
+        //
+        // Gate the tombstone on the SAME sibling check as the cascade: only when no
+        // other repos row resolves to this slug. If a mirror row survives, the logical
+        // repo still exists (and still serves via the mirror), so its bounty is still
+        // valid — tombstoning it would kill a live repo's bounty. Only when the last
+        // row for the slug is gone can a recreate re-attach an open bounty.
+        //
+        // When it does fire, match EVERY owner representation by normalizing BOTH sides.
+        // `create_bounty` stores `repo_owner` verbatim from the URL Path param, commonly
+        // the bare SHORT form (`z6Mk...`), but a full-DID URL that resolves to a bare
+        // mirror row yields the FULL `did:key:z6Mk...` form. The repo row here is likewise
+        // either form (`delete_repo_by_id` is reachable on bare mirror rows). Comparing the
+        // SQL-normalized stored `repo_owner` against the normalized target covers all four
+        // combinations (did:key-row + short-bounty AND bare-row + full-bounty); binding
+        // only one side left the mirror form `open`, so it re-attached to the recreated
+        // repo. It's a rare purge, so a seq scan on `bounties` (the normalizer is not
+        // index-backed) is fine.
+        if !sibling_exists {
+            sqlx::query(&format!(
+                "UPDATE bounties SET status = 'purged'
+                 WHERE {key} = $1 AND repo_name = $2
+                   AND status IN ('open', 'claimed', 'submitted')",
+                key = owner_key_case_sql("repo_owner")
+            ))
+            .bind(normalize_owner_key(&owner_did))
+            .bind(&name)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        let result = sqlx::query("DELETE FROM repos WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 }
 
@@ -1557,6 +1807,15 @@ impl Db {
         cid: &str,
         node_did: &str,
     ) -> Result<()> {
+        // `branch_cids` is one of the slug-scoped tables `delete_repo_by_id` cascades
+        // over. Take the shared advisory lock (same normalized slug the purge hashes)
+        // inside a tx so this row cannot land between the purge's point-in-time
+        // sibling check and its cascade deletes (which would strand an orphan row or
+        // half-wipe a live mirror's state). Single lock, nothing else held, so the
+        // ordering matches every other slug-lock site and cannot deadlock.
+        let slug = normalize_repo_slug(repo);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         sqlx::query(
             "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -1570,8 +1829,9 @@ impl Db {
         .bind(cid)
         .bind(node_did)
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1620,6 +1880,13 @@ impl Db {
         new_sha: &str,
         cid: Option<&str>,
     ) -> Result<()> {
+        // `sync_queue` is slug-scoped and cascaded by `delete_repo_by_id`; take the
+        // shared advisory lock on the same normalized slug so an enqueue cannot
+        // interleave with the purge's sibling-check-then-cascade (same shape and
+        // rationale as `upsert_branch_cid`; single lock, no deadlock exposure).
+        let slug = normalize_repo_slug(repo);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         sqlx::query(
             "INSERT INTO sync_queue (id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at)
              VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
@@ -1632,8 +1899,9 @@ impl Db {
         .bind(new_sha)
         .bind(cid)
         .bind(Utc::now().to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2312,6 +2580,14 @@ impl Db {
 
 impl Db {
     pub async fn insert_ref_update(&self, update: &ReceivedRefUpdate) -> Result<()> {
+        // `received_ref_updates` is slug-scoped and cascaded by `delete_repo_by_id`;
+        // take the shared advisory lock on the same normalized slug so a peer-fed
+        // insert cannot land inside the purge's sibling-check-then-cascade window
+        // (same shape and rationale as `upsert_branch_cid`; single lock, no deadlock
+        // exposure).
+        let slug = normalize_repo_slug(&update.repo);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         sqlx::query(
             "INSERT INTO received_ref_updates
              (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
@@ -2331,8 +2607,9 @@ impl Db {
         .bind(&update.received_at)
         .bind(&update.from_peer)
         .bind(&update.owner_did)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2676,6 +2953,13 @@ impl Db {
     pub async fn record_arweave_anchor(&self, input: &RecordAnchorInput<'_>) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
+        // `arweave_anchors` is slug-scoped and cascaded by `delete_repo_by_id`;
+        // take the shared advisory lock on the same normalized slug so a post-push
+        // anchor cannot land inside the purge's sibling-check-then-cascade window
+        // (same shape as `upsert_branch_cid`; single lock, no deadlock exposure).
+        let slug = normalize_repo_slug(input.repo);
+        let mut tx = self.pool.begin().await?;
+        lock_repo_slug(&mut tx, &slug).await?;
         sqlx::query(
             "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
@@ -2691,8 +2975,9 @@ impl Db {
         .bind(input.arweave_url)
         .bind(input.node_did)
         .bind(&now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3746,7 +4031,7 @@ mod agent_discovery_tests {
 
 #[cfg(test)]
 mod dedup_db_tests {
-    use super::{Db, RepoRecord};
+    use super::{normalize_owner_key, BountyRecord, Db, RecordAnchorInput, RepoRecord};
     use chrono::{DateTime, Utc};
     use sqlx::PgPool;
 
@@ -3783,6 +4068,709 @@ mod dedup_db_tests {
             forked_from: None,
             machine_id: None,
         }
+    }
+
+    /// U2 (M7): deleting a repo must not orphan its child rows. Seeds one child in
+    /// a `repo_id`-keyed table (ref_certificates), one in a `repo`-slug-keyed table
+    /// (branch_cids), and a PR with a grandchild review (`pr_id`-keyed). Before the
+    /// transactional cascade these all survive `delete_repo_by_id` (RED); after, the
+    /// row and every child are gone (GREEN).
+    #[sqlx::test]
+    async fn delete_repo_by_id_removes_child_rows(pool: PgPool) {
+        let db = db(pool).await;
+        let owner = "did:key:z6MkChildOwnerFixtureForCascadeDelete";
+        let repo = rec(
+            "rid-cascade",
+            owner,
+            "victim",
+            "d",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&repo).await.unwrap();
+        let slug = format!("{}/victim", crate::db::normalize_owner_key(owner));
+
+        sqlx::query(
+            "INSERT INTO ref_certificates (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ('rc1', 'rid-cascade', 'refs/heads/main', '0', '1', 'p', 'n', 'sig', '2026-01-01T00:00:00Z')",
+        ).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
+             VALUES ($1, 'refs/heads/main', '1', 'cid', 'n', '2026-01-01T00:00:00Z')",
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pull_requests (id, repo_id, number, title, author_did, source_branch, target_branch, created_at, updated_at)
+             VALUES ('pr1', 'rid-cascade', 1, 't', 'a', 'b', 'main', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        ).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO pr_reviews (id, pr_id, reviewer_did, status, created_at)
+             VALUES ('rev1', 'pr1', 'r', 'approved', '2026-01-01T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        let removed = db.delete_repo_by_id("rid-cascade").await.unwrap();
+        assert_eq!(removed, 1, "parent repo row deleted");
+
+        async fn count(db: &Db, sql: &str, arg: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(arg)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        }
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM ref_certificates WHERE repo_id=$1",
+                "rid-cascade"
+            )
+            .await,
+            0,
+            "repo_id-keyed child (ref_certificates) must be deleted"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM branch_cids WHERE repo=$1", &slug).await,
+            0,
+            "slug-keyed child (branch_cids) must be deleted"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM pull_requests WHERE repo_id=$1",
+                "rid-cascade"
+            )
+            .await,
+            0,
+            "pull_requests must be deleted"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM pr_reviews WHERE pr_id=$1", "pr1").await,
+            0,
+            "PR grandchild (pr_reviews) must be deleted with its parent PR"
+        );
+    }
+
+    /// U4 gate-raise (INV-9 same-method slug collision): a canonical `did:key:zX`
+    /// row and a bare `zX` mirror of the same name both normalize to slug `zX/name`,
+    /// which is the key the slug-scoped child tables use. Purging the EMPTY canonical
+    /// row must NOT run the slug-scoped cascade, because that would wipe the surviving
+    /// non-empty mirror's branch_cids/arweave_anchors (keyed on the shared slug). The
+    /// physical `did:key:` row still goes; the sibling's slug-scoped records stay.
+    /// RED on base: the cascade fires and both survivor rows are deleted.
+    #[sqlx::test]
+    async fn delete_repo_keeps_sibling_slug_records_on_collision(pool: PgPool) {
+        let db = db(pool).await;
+        // Two rows collapsing to slug `z6MkSiblingCollisionFixture/victim`: an empty
+        // canonical `did:key:` row (deletion target) and a non-empty bare mirror.
+        let canonical = rec(
+            "rid-canonical-empty",
+            "did:key:z6MkSiblingCollisionFixture",
+            "victim",
+            "empty canonical",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        let mirror = rec(
+            "z6MkSiblingCollisionFixture/victim",
+            "z6MkSiblingCollisionFixture",
+            "victim",
+            "non-empty mirror",
+            "2026-02-01T00:00:00Z",
+            "2026-02-01T00:00:00Z",
+        );
+        db.create_repo(&canonical).await.unwrap();
+        db.create_repo(&mirror).await.unwrap();
+
+        // Both rows resolve to this slug; the child rows belong to the mirror.
+        let slug = format!(
+            "{}/victim",
+            crate::db::normalize_owner_key("did:key:z6MkSiblingCollisionFixture")
+        );
+        sqlx::query(
+            "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
+             VALUES ($1, 'refs/heads/main', '1', 'cid', 'n', '2026-02-01T00:00:00Z')",
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at)
+             VALUES ('anch1', $1, 'z6MkSiblingCollisionFixture', 'refs/heads/main', '0', '1', 'cid', 'irys', 'https://ar/1', 'n', '2026-02-01T00:00:00Z')",
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        // An OPEN bounty on the shared owner/name — it belongs to the logical repo the
+        // surviving mirror still serves, so purging the empty sibling must NOT tombstone it.
+        db.create_bounty(&BountyRecord {
+            id: "bnt-collision".to_string(),
+            repo_owner: "z6MkSiblingCollisionFixture".to_string(),
+            repo_name: "victim".to_string(),
+            issue_id: None,
+            title: "sibling bounty".to_string(),
+            amount: 5_000,
+            creator_did: "did:key:z6MkCreator".to_string(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".to_string(),
+            created_at: "2026-02-01T00:00:00Z".to_string(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 604_800,
+            tx_hash: None,
+        })
+        .await
+        .unwrap();
+
+        // Purge the empty canonical row.
+        let removed = db.delete_repo_by_id("rid-canonical-empty").await.unwrap();
+        assert_eq!(removed, 1, "the empty canonical row is deleted");
+
+        async fn count(db: &Db, sql: &str, arg: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(arg)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        }
+        // The surviving mirror keeps its slug-scoped records (the collision guard
+        // skips the slug-scoped cascade because a sibling row shares the slug).
+        assert!(
+            count(&db, "SELECT COUNT(*) FROM branch_cids WHERE repo=$1", &slug).await > 0,
+            "sibling's branch_cids must survive the collision purge"
+        );
+        assert!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM arweave_anchors WHERE repo=$1",
+                &slug
+            )
+            .await
+                > 0,
+            "sibling's arweave_anchors must survive the collision purge"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM repos WHERE id=$1",
+                "z6MkSiblingCollisionFixture/victim"
+            )
+            .await,
+            1,
+            "the surviving mirror repos row is untouched"
+        );
+        // The bounty is NOT tombstoned: the mirror still serves the logical repo, so
+        // the tombstone is gated on no sibling surviving.
+        assert_eq!(
+            db.get_bounty("bnt-collision")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "open",
+            "a bounty on a repo whose mirror survives the purge must stay open, not be tombstoned"
+        );
+    }
+
+    /// U1 (F1): the purge cascade must be serialized with mirror ingestion on the
+    /// shared slug. `delete_repo_by_id` runs a point-in-time sibling check and then,
+    /// only if no sibling was seen, wipes the slug-scoped child rows / tombstones the
+    /// bounty. A concurrent `upsert_mirror_repo` that inserts a colliding mirror row
+    /// AFTER that check but before/around the cascade would leave a half-wipe: the
+    /// mirror's `repos` row survives while its live child rows / bounty are gone.
+    ///
+    /// Deterministic race, with BOTH sides going through the real code: hold a session
+    /// advisory lock on the same `hashtextextended` slug key both sides hash, spawn the
+    /// REAL `upsert_mirror_repo` (parks on its own `lock_repo_slug`, first in the wait
+    /// queue), assert the mirror row has NOT landed while parked, then spawn the purge
+    /// (parks second) and release. Advisory-lock waiters are granted FIFO, so the
+    /// ingest commits the mirror row first and the purge's sibling check then SEES it
+    /// and skips the cascade: mirror row, child rows, and bounty all survive (GREEN).
+    /// Remove `lock_repo_slug` from `upsert_mirror_repo` and the ingest no longer
+    /// parks: the mirror row appears while the session lock is still held and the
+    /// mid-park absence assert fails (RED). Remove it from `delete_repo_by_id` and the
+    /// purge no longer blocks: it runs its sibling check before the parked ingest has
+    /// committed, cascades, and half-wipes the child rows / bounty (RED).
+    #[sqlx::test]
+    async fn purge_serializes_with_mirror_ingest_via_advisory_lock(pool: PgPool) {
+        let db = db(pool).await;
+        // Purge target: an empty canonical `did:key:` row.
+        let owner = "did:key:z6MkPurgeRaceMirrorFixtureForLock";
+        let target = rec(
+            "rid-purge-race-target",
+            owner,
+            "victim",
+            "empty canonical",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&target).await.unwrap();
+
+        // The mirror's slug-scoped live state, keyed on the shared slug. The mirror's
+        // `repos` row is deliberately NOT present yet — ingestion lands it mid-race.
+        let slug = format!("{}/victim", crate::db::normalize_owner_key(owner));
+        sqlx::query(
+            "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
+             VALUES ($1, 'refs/heads/main', '1', 'cid', 'n', '2026-02-01T00:00:00Z')",
+        )
+        .bind(&slug)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.create_bounty(&BountyRecord {
+            id: "bnt-purge-race".to_string(),
+            repo_owner: "z6MkPurgeRaceMirrorFixtureForLock".to_string(),
+            repo_name: "victim".to_string(),
+            issue_id: None,
+            title: "mirror bounty".to_string(),
+            amount: 5_000,
+            creator_did: "did:key:z6MkCreator".to_string(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: "open".to_string(),
+            created_at: "2026-02-01T00:00:00Z".to_string(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 604_800,
+            tx_hash: None,
+        })
+        .await
+        .unwrap();
+
+        // Hold a session-scoped advisory lock on the exact slug key the cascade takes.
+        // A session lock and the cascade's xact lock share Postgres' advisory lock
+        // space, so the purge's `pg_advisory_xact_lock` blocks on this until we unlock.
+        let mut lock_conn = db.pool().acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(&slug)
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        // Spawn the REAL mirror ingest; its own `lock_repo_slug` inside
+        // `upsert_mirror_repo` parks it on the held session lock, first in the wait
+        // queue. Bare owner short form, so it normalizes to the identical slug the
+        // purge locks.
+        let pool_for_ingest = db.pool().clone();
+        let ingest = tokio::spawn(async move {
+            Db::for_testing(pool_for_ingest)
+                .upsert_mirror_repo(
+                    "z6MkPurgeRaceMirrorFixtureForLock",
+                    "victim",
+                    "/srv/mirror",
+                    None,
+                    false,
+                )
+                .await
+        });
+
+        // Give the ingest time to reach the lock wait, then assert it is actually
+        // parked: the mirror row must NOT exist while the session lock is held. This
+        // is the load-bearing check for the ingest side; without `lock_repo_slug` in
+        // `upsert_mirror_repo` the insert lands during this sleep (RED).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let landed_early: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repos WHERE id=$1")
+            .bind(&slug)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            landed_early, 0,
+            "the real upsert_mirror_repo must block on the slug advisory lock, not insert past it"
+        );
+
+        // Spawn the purge; it parks on the same lock, second in the queue. Without
+        // `lock_repo_slug` in `delete_repo_by_id` it runs immediately instead: its
+        // sibling check sees no mirror row (the ingest is still parked), so it
+        // cascades the child rows and tombstones the bounty (RED below).
+        let pool_for_purge = db.pool().clone();
+        let purge = tokio::spawn(async move {
+            Db::for_testing(pool_for_purge)
+                .delete_repo_by_id("rid-purge-race-target")
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Release the lock. Advisory-lock waiters are woken FIFO: the ingest (queued
+        // first) commits the mirror row, then the purge acquires the lock and its
+        // sibling check observes the committed row.
+        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&slug)
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        ingest.await.unwrap().unwrap();
+        let removed = purge.await.unwrap().unwrap();
+        assert_eq!(removed, 1, "the empty canonical target row is purged");
+
+        async fn count(db: &Db, sql: &str, arg: &str) -> i64 {
+            sqlx::query_scalar::<_, i64>(sql)
+                .bind(arg)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+        }
+        // No half-wipe: the mirror row AND its slug-scoped state are all present.
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM repos WHERE id=$1", &slug).await,
+            1,
+            "the mirror repos row survives the purge"
+        );
+        assert!(
+            count(&db, "SELECT COUNT(*) FROM branch_cids WHERE repo=$1", &slug).await > 0,
+            "mirror branch_cids must survive: the purge serialized behind the ingest and saw the sibling"
+        );
+        assert_eq!(
+            db.get_bounty("bnt-purge-race")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "open",
+            "the mirror's bounty must stay open, not be tombstoned by the racing purge"
+        );
+    }
+
+    /// Sibling of the mirror-ingest race above, for the arweave-anchor writer.
+    /// `record_arweave_anchor` inserts a slug-scoped child row (`arweave_anchors`)
+    /// that `delete_repo_by_id`'s cascade wipes, so it must serialize on the same
+    /// `lock_repo_slug` key or a post-push anchor can land inside the purge's
+    /// sibling-check-then-cascade window. Deterministic choreography, same as the
+    /// mirror test: hold a session advisory lock on the exact `hashtextextended`
+    /// slug key, spawn the REAL `record_arweave_anchor` (its own `lock_repo_slug`
+    /// parks it), assert mid-park that the anchor row has NOT landed (this is the
+    /// load-bearing check: remove `lock_repo_slug` from `record_arweave_anchor`
+    /// and the insert lands during the sleep, RED), then release and assert the
+    /// row lands. The writer is handed the full-DID `owner/name` form so the test
+    /// also pins the `normalize_repo_slug` folding to the purge's key.
+    #[sqlx::test]
+    async fn purge_serializes_with_arweave_anchor_via_advisory_lock(pool: PgPool) {
+        let db = db(pool).await;
+        let owner = "did:key:z6MkAnchorRaceFixtureForSlugLock";
+        let target = rec(
+            "rid-anchor-race-target",
+            owner,
+            "victim",
+            "canonical",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&target).await.unwrap();
+        let slug = format!("{}/victim", crate::db::normalize_owner_key(owner));
+
+        // Hold a session-scoped advisory lock on the exact slug key the anchor
+        // writer's xact lock hashes; they share Postgres' advisory lock space.
+        let mut lock_conn = db.pool().acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(&slug)
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+
+        // Spawn the REAL anchor writer with the full-DID slug form; its
+        // `normalize_repo_slug` folds it to the identical key the session lock
+        // holds, so `lock_repo_slug` parks it here.
+        let pool_for_anchor = db.pool().clone();
+        let repo_arg = format!("{owner}/victim");
+        let repo_arg_for_task = repo_arg.clone();
+        let anchor = tokio::spawn(async move {
+            Db::for_testing(pool_for_anchor)
+                .record_arweave_anchor(&RecordAnchorInput {
+                    repo: &repo_arg_for_task,
+                    owner_did: "did:key:z6MkAnchorRaceFixtureForSlugLock",
+                    ref_name: "refs/heads/main",
+                    old_sha: "0",
+                    new_sha: "1",
+                    cid: Some("cid"),
+                    irys_tx_id: "irys-tx-race",
+                    arweave_url: "https://ar/anchor-race",
+                    node_did: "did:key:z6MkNodeFixture",
+                })
+                .await
+        });
+
+        // Give the writer time to reach the lock wait, then assert it is actually
+        // parked: no anchor row while the session lock is held. Without
+        // `lock_repo_slug` in `record_arweave_anchor` the insert commits during
+        // this sleep and the assert fails (RED).
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let landed_early: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM arweave_anchors WHERE repo=$1")
+                .bind(&repo_arg)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            landed_early, 0,
+            "record_arweave_anchor must block on the slug advisory lock, not insert past it"
+        );
+
+        // Release; the parked writer acquires the lock and commits.
+        sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
+            .bind(&slug)
+            .execute(&mut *lock_conn)
+            .await
+            .unwrap();
+        anchor.await.unwrap().unwrap();
+
+        let landed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM arweave_anchors WHERE repo=$1")
+            .bind(&repo_arg)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(landed, 1, "the anchor lands once the lock is released");
+    }
+
+    /// U8 (F): bounties key on (repo_owner, repo_name), not an immutable repo id,
+    /// and `delete_repo_by_id` deliberately does not delete them (financial record).
+    /// Without tombstoning, a purged repo's OPEN bounty stays claimable and silently
+    /// re-attaches to a same-name repo recreated by the (spam) owner. The purge must
+    /// transition the affected non-terminal bounties to the terminal `purged` status
+    /// (preserving amount/wallet/tx_hash) so no claim/dispute path can re-expose them.
+    /// A bounty on an unrelated surviving repo must be left untouched.
+    /// RED on base: the bounty stays `open` and `claim_bounty` succeeds after recreate.
+    #[sqlx::test]
+    async fn delete_repo_by_id_tombstones_bounties_against_recreation(pool: PgPool) {
+        let db = db(pool).await;
+        let owner = "did:key:z6MkBountyPurgeFixtureForTombstone";
+        let victim = rec(
+            "rid-bounty-victim",
+            owner,
+            "victim",
+            "spam repo",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&victim).await.unwrap();
+
+        // An unrelated surviving repo with its own open bounty.
+        let survivor_owner = "did:key:z6MkBountySurvivorFixtureUntouched";
+        let survivor = rec(
+            "rid-bounty-survivor",
+            survivor_owner,
+            "keeper",
+            "legit repo",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&survivor).await.unwrap();
+
+        let bounty = |id: &str, r_owner: &str, r_name: &str, status: &str| BountyRecord {
+            id: id.to_string(),
+            repo_owner: r_owner.to_string(),
+            repo_name: r_name.to_string(),
+            issue_id: None,
+            title: "fix the bug".to_string(),
+            amount: 5_000,
+            creator_did: "did:key:z6MkCreator".to_string(),
+            claimant_did: None,
+            claimant_wallet: None,
+            pr_id: None,
+            status: status.to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            claimed_at: None,
+            submitted_at: None,
+            completed_at: None,
+            deadline_secs: 604_800,
+            tx_hash: None,
+        };
+        db.create_bounty(&bounty("bnt-victim", owner, "victim", "open"))
+            .await
+            .unwrap();
+        // The common `create_bounty` path stores `repo_owner` verbatim from the URL
+        // Path param, which is the bare SHORT owner form (`z6Mk...`), not the full
+        // `did:key:z6Mk...`. The tombstone must match this form too or a short-form
+        // bounty stays `open` and re-attaches to the recreated repo.
+        let short_owner = normalize_owner_key(owner);
+        db.create_bounty(&bounty("bnt-victim-short", short_owner, "victim", "open"))
+            .await
+            .unwrap();
+        // A mid-flight `claimed` bounty must also be tombstoned: otherwise a later
+        // dispute (which resets `claimed`/`submitted` back to `open`) would re-expose
+        // it on the recreated repo.
+        db.create_bounty(&bounty("bnt-victim-claimed", owner, "victim", "claimed"))
+            .await
+            .unwrap();
+        // A mid-flight `submitted` bounty is in the tombstone set too.
+        db.create_bounty(&bounty(
+            "bnt-victim-submitted",
+            owner,
+            "victim",
+            "submitted",
+        ))
+        .await
+        .unwrap();
+        // An already-terminal `completed` bounty is outside the tombstone set.
+        db.create_bounty(&bounty(
+            "bnt-victim-completed",
+            owner,
+            "victim",
+            "completed",
+        ))
+        .await
+        .unwrap();
+        db.create_bounty(&bounty("bnt-survivor", survivor_owner, "keeper", "open"))
+            .await
+            .unwrap();
+
+        // Purge the spam repo, then let the owner recreate the same owner/name.
+        let removed = db.delete_repo_by_id("rid-bounty-victim").await.unwrap();
+        assert_eq!(removed, 1, "the purged repo row is deleted");
+        let recreated = rec(
+            "rid-bounty-recreated",
+            owner,
+            "victim",
+            "recreated repo",
+            "2026-03-01T00:00:00Z",
+            "2026-03-01T00:00:00Z",
+        );
+        db.create_repo(&recreated).await.unwrap();
+
+        // The purged repo's bounty is tombstoned, so a claim is a no-op: the
+        // `UPDATE ... WHERE status='open'` matches nothing and it stays `purged`.
+        db.claim_bounty(
+            "bnt-victim",
+            "did:key:z6MkAttacker",
+            Some("0xattacker"),
+            "2026-03-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let victim_bounty = db.get_bounty("bnt-victim").await.unwrap().unwrap();
+        assert_eq!(
+            victim_bounty.status, "purged",
+            "the purged repo's bounty must be tombstoned, not re-claimable"
+        );
+        assert!(
+            victim_bounty.claimant_did.is_none(),
+            "the tombstoned bounty must not accept a new claimant"
+        );
+        // The financial record is preserved (tombstoned, not deleted).
+        assert_eq!(victim_bounty.amount, 5_000, "amount preserved on tombstone");
+        assert_eq!(
+            victim_bounty.creator_did, "did:key:z6MkCreator",
+            "creator_did preserved on tombstone"
+        );
+
+        // The short-owner-form bounty (the common create_bounty path) is tombstoned
+        // too, so it cannot re-attach to the recreated repo and become claimable.
+        db.claim_bounty(
+            "bnt-victim-short",
+            "did:key:z6MkAttacker",
+            Some("0xattacker"),
+            "2026-03-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+        let short_bounty = db.get_bounty("bnt-victim-short").await.unwrap().unwrap();
+        assert_eq!(
+            short_bounty.status, "purged",
+            "a short-owner-form bounty on the purged repo must also be tombstoned"
+        );
+        assert!(
+            short_bounty.claimant_did.is_none(),
+            "the tombstoned short-form bounty must not accept a new claimant"
+        );
+
+        // A mid-flight claimed bounty on the same repo is tombstoned too (so a
+        // dispute cannot reopen it against the recreated repo).
+        let claimed_bounty = db.get_bounty("bnt-victim-claimed").await.unwrap().unwrap();
+        assert_eq!(
+            claimed_bounty.status, "purged",
+            "a claimed bounty on the purged repo must also be tombstoned"
+        );
+        // Dispute gates on status IN ('claimed','submitted'); a tombstoned bounty is
+        // `purged`, so dispute is inert and cannot reopen it back to `open`.
+        db.dispute_bounty("bnt-victim-claimed").await.unwrap();
+        let disputed_bounty = db.get_bounty("bnt-victim-claimed").await.unwrap().unwrap();
+        assert_eq!(
+            disputed_bounty.status, "purged",
+            "dispute must not reopen a tombstoned bounty"
+        );
+
+        // A mid-flight submitted bounty on the same repo is tombstoned too.
+        let submitted_bounty = db
+            .get_bounty("bnt-victim-submitted")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            submitted_bounty.status, "purged",
+            "a submitted bounty on the purged repo must also be tombstoned"
+        );
+
+        // An already-terminal completed bounty is left as-is (not in the tombstone set).
+        let completed_bounty = db
+            .get_bounty("bnt-victim-completed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed_bounty.status, "completed",
+            "a terminal completed bounty must be left untouched"
+        );
+
+        // The unrelated survivor's bounty is untouched and still claimable.
+        let survivor_bounty = db.get_bounty("bnt-survivor").await.unwrap().unwrap();
+        assert_eq!(
+            survivor_bounty.status, "open",
+            "an unrelated repo's bounty must stay open"
+        );
+
+        // Symmetric owner-form case (the mirror of `bnt-victim-short`). Here the repo
+        // row is the BARE short-owner mirror (`owner_did = z6X`), while the bounty was
+        // stored in the FULL `did:key:z6X` form, the shape a full-DID URL that
+        // resolves to the bare mirror produces. The tombstone must normalize BOTH the
+        // stored `repo_owner` and the target, or this full-form bounty stays `open`
+        // when the bare row is purged and re-attaches to a recreated repo, the same
+        // re-attach hole in the opposite direction. `delete_repo_by_id` is reachable on
+        // bare mirror rows (`list_repos_by_owner_did` matches under normalization).
+        // RED before the symmetric fix (only the target side was normalized): stays
+        // `open`. GREEN after: `purged`.
+        let bare_owner = "z6MkBareOwnerFixtureForSymmetricTombstone";
+        let bare = rec(
+            "rid-bounty-bare-victim",
+            bare_owner,
+            "victim",
+            "bare spam repo",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+        );
+        db.create_repo(&bare).await.unwrap();
+        db.create_bounty(&bounty(
+            "bnt-bare-full",
+            &format!("did:key:{bare_owner}"),
+            "victim",
+            "open",
+        ))
+        .await
+        .unwrap();
+        let removed_bare = db
+            .delete_repo_by_id("rid-bounty-bare-victim")
+            .await
+            .unwrap();
+        assert_eq!(removed_bare, 1, "the bare-owner repo row is deleted");
+        let bare_full_bounty = db.get_bounty("bnt-bare-full").await.unwrap().unwrap();
+        assert_eq!(
+            bare_full_bounty.status, "purged",
+            "a FULL-form bounty on a BARE-owner repo row must be tombstoned too \
+             (symmetric normalization); RED before: only the target side was \
+             normalized, so the full-form bounty stayed open"
+        );
     }
 
     /// The canonical `did:key:` row and the short-owner mirror row of one logical
