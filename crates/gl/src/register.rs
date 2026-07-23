@@ -17,6 +17,9 @@ pub struct RegisterArgs {
     #[arg(long, default_value = "https://node.gitlawb.com", env = "GITLAWB_NODE")]
     pub node: String,
 
+    #[arg(long, env = "GITLAWB_ICAPTCHA_PROOF")]
+    pub icaptcha_proof: Option<String>,
+
     /// Capabilities to advertise (comma-separated)
     #[arg(
         long,
@@ -51,7 +54,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
     }))?;
 
     let resp = client
-        .post("/api/register", &body)
+        .post_with_proof("/api/register", &body, args.icaptcha_proof.as_deref())
         .await
         .context("failed to connect to node")?;
 
@@ -147,6 +150,7 @@ mod tests {
             capabilities: vec!["git:push".to_string(), "git:fetch".to_string()],
             model: None,
             dir: Some(dir.path().to_path_buf()),
+            icaptcha_proof: None,
         })
         .await
         .unwrap();
@@ -179,6 +183,7 @@ mod tests {
             capabilities: vec!["git:push".to_string()],
             model: None,
             dir: Some(dir.path().to_path_buf()),
+            icaptcha_proof: None,
         })
         .await;
 
@@ -198,6 +203,7 @@ mod tests {
             capabilities: vec![],
             model: None,
             dir: Some(dir.path().to_path_buf()),
+            icaptcha_proof: None,
         })
         .await;
 
