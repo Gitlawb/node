@@ -107,10 +107,64 @@ impl RepoArchive {
     }
 }
 
+/// Remove orphaned swap-phase work dirs (`.{repo}.tmp-extract.{uuid}` and
+/// `.{repo}.bak-{uuid}`) left under `repos_dir/{owner_slug}/` by a process
+/// killed mid-`decompress_repo`. Safe to run only at startup, before any
+/// extraction is in flight: a live swap owns exactly these names. Deleting a
+/// `.bak-` orphan loses no data — these dirs only exist on the download path,
+/// so storage still holds the archive and the next `acquire()` re-downloads.
+/// Returns the number of directories removed.
+pub fn sweep_orphaned_swap_dirs(repos_dir: &Path) -> usize {
+    let mut removed = 0;
+    let Ok(owners) = std::fs::read_dir(repos_dir) else {
+        return 0;
+    };
+    for owner in owners.flatten() {
+        let owner_path = owner.path();
+        if !owner_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&owner_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_swap_litter =
+                name.starts_with('.') && (name.contains(".tmp-extract.") || name.contains(".bak-"));
+            if is_swap_litter && entry.path().is_dir() {
+                match std::fs::remove_dir_all(entry.path()) {
+                    Ok(()) => {
+                        info!(dir = %entry.path().display(), "removed orphaned swap dir");
+                        removed += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(dir = %entry.path().display(), err = %e,
+                            "failed to remove orphaned swap dir");
+                    }
+                }
+            }
+        }
+    }
+    removed
+}
+
 /// Compress a bare repo directory into a tar.zst byte vector.
 fn compress_repo(repo_path: &Path) -> Result<Vec<u8>> {
     let buf = Vec::new();
-    let encoder = zstd::stream::Encoder::new(buf, 3)?; // level 3 = fast + decent ratio
+    // Level 3 = fast + decent ratio. Compression dominates the post-push upload
+    // for larger repos; zstd's multithreaded mode splits the stream across
+    // worker threads for a near-linear speedup at the same ratio. Capped so a
+    // single push can't monopolize a small node's cores.
+    let mut encoder = zstd::stream::Encoder::new(buf, 3)?;
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get().min(4) as u32)
+        .unwrap_or(1);
+    if workers > 1 {
+        encoder
+            .multithread(workers)
+            .context("enabling multithreaded zstd")?;
+    }
     let mut tar = tar::Builder::new(encoder);
     tar.append_dir_all(".", repo_path)
         .context("building tar archive")?;
@@ -278,6 +332,32 @@ mod tests {
         // existing copy is preserved (atomicity claim).
         assert!(decompress_repo(b"not a real archive", &out).is_err());
         assert_eq!(fs::read(out.join("HEAD")).unwrap(), b"good\n");
+    }
+
+    #[test]
+    fn sweep_removes_only_orphaned_swap_dirs() {
+        let repos = tempfile::tempdir().unwrap();
+        let owner = repos.path().join("did_key_z6MkAlice");
+
+        // Litter from an interrupted swap...
+        let tmp_extract = owner.join(".repo.git.tmp-extract.1234-uuid");
+        let bak = owner.join(".repo.git.bak-5678-uuid");
+        // ...alongside things the sweep must not touch.
+        let live_repo = owner.join("repo.git");
+        let dotfile = owner.join(".keep");
+        fs::create_dir_all(&tmp_extract).unwrap();
+        fs::create_dir_all(&bak).unwrap();
+        fs::create_dir_all(&live_repo).unwrap();
+        fs::write(&dotfile, b"").unwrap();
+
+        assert_eq!(sweep_orphaned_swap_dirs(repos.path()), 2);
+        assert!(!tmp_extract.exists());
+        assert!(!bak.exists());
+        assert!(live_repo.exists());
+        assert!(dotfile.exists());
+
+        // Idempotent on a clean tree.
+        assert_eq!(sweep_orphaned_swap_dirs(repos.path()), 0);
     }
 
     #[tokio::test]

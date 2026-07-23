@@ -216,39 +216,8 @@ impl RepoStore {
     pub async fn acquire_write(&self, owner_did: &str, repo_name: &str) -> Result<RepoWriteGuard> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
-
-        // Postgres advisory locks are SESSION-scoped: they bind to one backend
-        // connection and only release on that same connection. With a pool,
-        // acquiring and releasing on different checked-out connections means the
-        // unlock silently no-ops while the lock lingers on the original. So we
-        // pin ONE connection for the whole lock lifetime — acquire, release on
-        // sync error, and the final release in the guard all run on it.
-        let mut conn = self
-            .lock_pool
-            .acquire()
-            .await
-            .context("acquiring db connection for advisory lock")?;
-
-        // Acquire with retry using pg_try_advisory_lock to avoid blocking
-        // indefinitely on stale locks from crashed connections.
-        let mut acquired = false;
-        for attempt in 0..60 {
-            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-                .bind(lock_key)
-                .fetch_one(&mut *conn)
-                .await
-                .context("trying advisory lock")?;
-            if row.0 {
-                acquired = true;
-                break;
-            }
-            if attempt < 59 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
-        if !acquired {
-            anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
-        }
+        let label = format!("{owner_slug}/{repo_name}");
+        let lock = LockedConn::acquire(&self.lock_pool, lock_key, &label).await?;
 
         // Ensure local matches the latest in storage before writing. The etag
         // cache skips the full download when our copy is already current (the
@@ -259,15 +228,7 @@ impl RepoStore {
             .sync_down_if_stale(&owner_slug, repo_name, &local_path, true)
             .await
         {
-            // Release the lock on the SAME connection before bailing.
-            if let Err(unlock_err) = sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(lock_key)
-                .execute(&mut *conn)
-                .await
-            {
-                warn!(repo = %repo_name, err = %unlock_err,
-                    "failed to release advisory lock after sync error");
-            }
+            lock.unlock().await;
             return Err(e);
         }
 
@@ -275,8 +236,7 @@ impl RepoStore {
             owner_slug,
             repo_name: repo_name.to_string(),
             local_path,
-            lock_key,
-            conn,
+            lock,
             archive: self.archive.clone(),
             versions: Arc::clone(&self.versions),
         })
@@ -341,30 +301,8 @@ impl RepoStore {
             return Ok(());
         };
         let lock_key = advisory_lock_key(owner_slug, repo_name);
-        let mut conn = self
-            .lock_pool
-            .acquire()
-            .await
-            .context("acquiring db connection for upload lock")?;
-
-        let mut acquired = false;
-        for attempt in 0..30 {
-            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-                .bind(lock_key)
-                .fetch_one(&mut *conn)
-                .await
-                .context("trying advisory lock")?;
-            if row.0 {
-                acquired = true;
-                break;
-            }
-            if attempt < 29 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-        }
-        if !acquired {
-            anyhow::bail!("could not acquire advisory lock for upload of {owner_slug}/{repo_name}");
-        }
+        let label = format!("{owner_slug}/{repo_name}");
+        let lock = LockedConn::acquire(&self.lock_pool, lock_key, &label).await?;
 
         let outcome: Result<Option<String>> =
             if skip_if_exists && archive.exists(owner_slug, repo_name).await.unwrap_or(false) {
@@ -374,13 +312,7 @@ impl RepoStore {
             };
 
         // Release the lock on the same connection regardless of outcome.
-        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(lock_key)
-            .execute(&mut *conn)
-            .await
-        {
-            warn!(repo = %repo_name, err = %e, "failed to release upload lock");
-        }
+        lock.unlock().await;
 
         match outcome {
             Ok(Some(etag)) => {
@@ -496,23 +428,120 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// How long to retry acquiring the per-repo advisory lock before giving up.
+/// Matches the storage backends' total operation timeout (300s in `s3.rs` and
+/// `ipfs.rs`): the writer holding the lock may legitimately be mid-upload of a
+/// large archive, so a concurrent push must be willing to outwait the longest
+/// possible upload rather than failing while the lock holder is still healthy.
+const LOCK_ACQUIRE_TIMEOUT_SECS: u64 = 300;
+
+/// A pool connection pinned for the lifetime of a session-scoped advisory lock.
+///
+/// Postgres advisory locks bind to one backend connection and only release on
+/// that same connection; with a pool, acquiring and releasing on different
+/// checked-out connections means the unlock silently no-ops while the lock
+/// lingers on the original. So the lock's whole lifetime — acquire, use,
+/// unlock — runs on this single pinned connection.
+///
+/// `unlock()` is the graceful path: it releases the lock and returns the
+/// connection to the pool. If the holder is instead *dropped* while the lock is
+/// held — e.g. a detached write-back task cancelled by runtime shutdown mid
+/// upload — `Drop` detaches the connection from the pool and closes it, which
+/// ends the Postgres session and frees the lock server-side. The one thing this
+/// type never does is return a still-locked connection to the pool.
+struct LockedConn {
+    /// `None` once `unlock()` has run (or after a timed-out acquire hands the
+    /// never-locked connection back to the pool).
+    conn: Option<PoolConnection<Postgres>>,
+    lock_key: i64,
+    repo_label: String,
+}
+
+impl LockedConn {
+    /// Acquire `lock_key` on a freshly pinned connection, polling
+    /// `pg_try_advisory_lock` once per second up to [`LOCK_ACQUIRE_TIMEOUT_SECS`].
+    /// Polling (rather than the blocking `pg_advisory_lock`) keeps a stale lock
+    /// from a crashed session from wedging writers indefinitely.
+    async fn acquire(pool: &PgPool, lock_key: i64, repo_label: &str) -> Result<Self> {
+        let conn = pool
+            .acquire()
+            .await
+            .context("acquiring db connection for advisory lock")?;
+        // Wrap the connection before the first lock attempt so cancellation at
+        // any point in the retry loop hits `Drop` and closes the connection —
+        // a lock granted just as the caller was cancelled can't strand.
+        let mut this = Self {
+            conn: Some(conn),
+            lock_key,
+            repo_label: repo_label.to_string(),
+        };
+        for attempt in 0..LOCK_ACQUIRE_TIMEOUT_SECS {
+            let conn = this.conn.as_mut().expect("connection present until unlock");
+            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_key)
+                .fetch_one(&mut **conn)
+                .await
+                .context("trying advisory lock")?;
+            if row.0 {
+                return Ok(this);
+            }
+            if attempt < LOCK_ACQUIRE_TIMEOUT_SECS - 1 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+        // Timed out without ever holding the lock — return the connection to
+        // the pool normally rather than letting `Drop` close it.
+        drop(this.conn.take());
+        anyhow::bail!(
+            "could not acquire advisory lock for {} after {LOCK_ACQUIRE_TIMEOUT_SECS}s — \
+             possible stale lock or a long-running upload",
+            this.repo_label
+        );
+    }
+
+    /// Release the lock on the pinned connection and return it to the pool.
+    async fn unlock(mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(self.lock_key)
+                .execute(&mut *conn)
+                .await
+            {
+                warn!(repo = %self.repo_label, err = %e, "failed to release advisory lock");
+            }
+        }
+    }
+}
+
+impl Drop for LockedConn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            // Dropped while the lock is (or may be) held: closing the socket
+            // ends the Postgres session, which releases every advisory lock it
+            // held. Detach first so the closed connection is never handed back
+            // to the pool; the pool replaces it on demand.
+            warn!(repo = %self.repo_label,
+                "advisory-lock holder dropped without unlock — closing its connection to free the lock");
+            drop(conn.detach());
+        }
+    }
+}
+
 /// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
 /// uploads to storage + releases the lock on `release()`.
 ///
-/// `#[must_use]`: dropping the guard without calling `release()` returns its
-/// connection to the pool with the *session* advisory lock still held, which
-/// then lingers until that backend connection is evicted — so the lock must be
-/// released explicitly.
-#[must_use = "call release() — dropping the guard leaks the advisory lock onto the pooled connection"]
+/// `#[must_use]`: dropping the guard without calling `release()` skips the
+/// storage upload and force-closes the pinned lock connection to free the
+/// advisory lock (see [`LockedConn`]) — safe, but never what a caller wants.
+#[must_use = "call release() — dropping the guard skips the upload and force-closes the lock connection"]
 pub struct RepoWriteGuard {
     owner_slug: String,
     repo_name: String,
     pub local_path: PathBuf,
-    lock_key: i64,
-    /// The connection the session-scoped advisory lock was taken on. The lock
-    /// must be released on this same connection, so it's held for the guard's
-    /// lifetime and dropped (returned to the pool) only after `release()`.
-    conn: PoolConnection<Postgres>,
+    /// The pinned advisory-lock connection; freed on `release()`, or by
+    /// `LockedConn::drop` if the guard (or a write-back task driving it) is
+    /// dropped or cancelled mid-flight.
+    lock: LockedConn,
     archive: Option<RepoArchive>,
     versions: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -533,7 +562,7 @@ impl RepoWriteGuard {
     /// concurrent writer on another machine cannot read a stale archive. When
     /// callers want a fast client ack, they spawn this future as a background
     /// task (write-back) — the lock + etag-cache update still complete in order.
-    pub async fn release(mut self, success: bool) -> Result<()> {
+    pub async fn release(self, success: bool) -> Result<()> {
         let key = format!("{}/{}", self.owner_slug, self.repo_name);
 
         // Upload to storage only on success. Capture the outcome so we can both
@@ -573,14 +602,8 @@ impl RepoWriteGuard {
         };
 
         // Release the advisory lock on the same connection it was taken on
-        // regardless of the upload outcome, then drop the connection.
-        if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(self.lock_key)
-            .execute(&mut *self.conn)
-            .await
-        {
-            warn!(repo = %self.repo_name, err = %e, "failed to release advisory lock");
-        }
+        // regardless of the upload outcome, then return it to the pool.
+        self.lock.unlock().await;
 
         upload_result
     }

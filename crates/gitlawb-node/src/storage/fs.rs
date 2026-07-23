@@ -36,18 +36,17 @@ impl FsBlobStore {
         Ok(path)
     }
 
-    fn meta_of(path: &Path) -> Result<ObjectMeta> {
-        let md = std::fs::metadata(path).context("stat blob")?;
+    fn meta_from(md: &std::fs::Metadata) -> ObjectMeta {
         let mtime = md
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        Ok(ObjectMeta {
+        ObjectMeta {
             size: md.len(),
             etag: Some(format!("{}-{}", md.len(), mtime)),
-        })
+        }
     }
 }
 
@@ -77,30 +76,33 @@ impl BlobStore for FsBlobStore {
         let tmp = path.with_extension(format!("{}.tmp-put", uuid::Uuid::new_v4()));
         let path2 = path.clone();
         // Atomic write: temp file in the same dir, then rename into place. On any
-        // failure, remove the temp file so a failed write can't leak it.
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        // failure, remove the temp file so a failed write can't leak it. The
+        // trailing stat runs inside the same blocking task — no synchronous fs
+        // call ever touches the async runtime.
+        tokio::task::spawn_blocking(move || -> Result<ObjectMeta> {
             std::fs::create_dir_all(&parent).context("creating blob parent dir")?;
             let write_and_swap = (|| -> Result<()> {
                 std::fs::write(&tmp, &body).context("writing temp blob")?;
                 std::fs::rename(&tmp, &path2).context("renaming blob into place")?;
                 Ok(())
             })();
-            if write_and_swap.is_err() {
+            if let Err(e) = write_and_swap {
                 let _ = std::fs::remove_file(&tmp);
+                return Err(e);
             }
-            write_and_swap
+            let md = std::fs::metadata(&path2).context("stat blob after write")?;
+            Ok(Self::meta_from(&md))
         })
         .await
-        .context("fs put task panicked")??;
-        Self::meta_of(&path)
+        .context("fs put task panicked")?
     }
 
     async fn head(&self, key: &str) -> Result<Option<ObjectMeta>> {
         let path = self.path_for(key)?;
         // Probe existence by io error kind, not path.exists(): a permission/IO
         // error must surface, not be silently reported as "not found".
-        match std::fs::metadata(&path) {
-            Ok(_) => Self::meta_of(&path).map(Some),
+        match tokio::fs::metadata(&path).await {
+            Ok(md) => Ok(Some(Self::meta_from(&md))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).context(format!("stat {}", path.display())),
         }

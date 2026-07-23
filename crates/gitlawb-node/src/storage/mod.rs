@@ -78,8 +78,13 @@ pub trait BlobStore: Send + Sync {
 ///   1. Explicit `GITLAWB_STORAGE_BACKEND` (`s3` | `fs` | `ipfs`).
 ///   2. Auto: `s3` if a bucket is configured (incl. legacy `GITLAWB_TIGRIS_BUCKET`),
 ///      else `fs` if `GITLAWB_STORAGE_FS_DIR` is set,
-///      else `ipfs` if `GITLAWB_IPFS_API` is set,
 ///      else local-only.
+///
+/// The `ipfs` backend is never auto-selected: `GITLAWB_IPFS_API` predates this
+/// layer and configures the per-object encrypted pinning path, so treating its
+/// presence as "store repo archives in IPFS" would silently repurpose an
+/// existing pinning config on upgrade. Routing repo archives into IPFS MFS
+/// requires the explicit `GITLAWB_STORAGE_BACKEND=ipfs` opt-in.
 pub async fn build(config: &Config) -> Result<Option<Arc<dyn BlobStore>>> {
     let bucket = if !config.s3_bucket.is_empty() {
         config.s3_bucket.clone()
@@ -93,8 +98,6 @@ pub async fn build(config: &Config) -> Result<Option<Arc<dyn BlobStore>>> {
         "s3".to_string()
     } else if !config.storage_fs_dir.is_empty() {
         "fs".to_string()
-    } else if !config.ipfs_api.is_empty() {
-        "ipfs".to_string()
     } else {
         info!("object storage disabled (no backend configured) — local-only mode");
         return Ok(None);

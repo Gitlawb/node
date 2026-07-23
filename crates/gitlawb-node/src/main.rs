@@ -284,6 +284,17 @@ async fn main() -> Result<()> {
         .await
         .context("creating advisory-lock connection pool")?;
 
+    // Sweep swap-phase litter (`.tmp-extract.`/`.bak-` dirs) orphaned by a hard
+    // kill mid-extraction. Must run before any request can start an extraction,
+    // as a live swap owns exactly these names — synchronous here, and cheap:
+    // it's a two-level directory scan that removes only matching orphans.
+    {
+        let removed = storage::archive::sweep_orphaned_swap_dirs(&config.repos_dir);
+        if removed > 0 {
+            info!(removed, "swept orphaned repo swap dirs from previous run");
+        }
+    }
+
     let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), archive, lock_pool);
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated

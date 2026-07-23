@@ -950,10 +950,13 @@ pub async fn git_receive_pack(
         // Write-back: ack the client now; the durable upload to object storage
         // and the advisory-lock release run in the background. The lock is held
         // until the upload finishes, so a concurrent writer on another machine
-        // can't observe a stale archive. Durability tradeoff: if the node stops
-        // after this ack but before the upload, the local copy survives but
-        // STORAGE stays stale until this repo's next successful push re-uploads
-        // — it is not automatically reconciled. Hence async_upload is opt-in.
+        // can't observe a stale archive. If this detached task is cancelled by
+        // runtime shutdown mid-upload, the guard's lock connection is closed
+        // rather than repooled, so Postgres frees the advisory lock (see
+        // `LockedConn`). Durability tradeoff: if the node stops after this ack
+        // but before the upload, the local copy survives but STORAGE stays
+        // stale until this repo's next successful push re-uploads — it is not
+        // automatically reconciled. Hence async_upload is opt-in.
         let repo_label = name.to_string();
         tokio::spawn(async move {
             if let Err(e) = guard.release(true).await {
@@ -1615,17 +1618,30 @@ pub async fn fork_repo(
         )));
     }
 
+    // From here until the DB row exists, an error must remove the cloned mirror:
+    // an orphaned `disk_path` makes a retry (or a later fork with the same name)
+    // fail because the destination already exists.
+    let cleanup_local_fork = |disk_path: std::path::PathBuf| async move {
+        if let Err(e) = tokio::fs::remove_dir_all(&disk_path).await {
+            tracing::warn!(
+                path = %disk_path.display(), err = %e,
+                "failed to clean up local fork dir after fork error"
+            );
+        }
+    };
+
     // Upload fork to storage — fail closed if the durable upload fails rather
     // than reporting a fork that only exists on this node's local disk.
-    state
+    if let Err(e) = state
         .repo_store
         .release_after_write(&forker_did, &fork_name)
         .await
-        .map_err(|e| {
-            AppError::Git(format!(
-                "fork created locally but durable upload failed: {e}"
-            ))
-        })?;
+    {
+        cleanup_local_fork(disk_path).await;
+        return Err(AppError::Git(format!(
+            "fork created locally but durable upload failed: {e}"
+        )));
+    }
 
     let now = Utc::now();
     let record = crate::db::RepoRecord {
@@ -1642,7 +1658,10 @@ pub async fn fork_repo(
         machine_id: state.machine_id.clone(),
     };
 
-    state.db.create_repo(&record).await?;
+    if let Err(e) = state.db.create_repo(&record).await {
+        cleanup_local_fork(disk_path).await;
+        return Err(e.into());
+    }
 
     // Persist the proof so the fork carries it when it propagates to peers.
     if let Some(p) = verified_proof {
