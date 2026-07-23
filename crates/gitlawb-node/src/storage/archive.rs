@@ -100,7 +100,10 @@ impl RepoArchive {
         Ok(())
     }
 
-    /// Delete a repo archive.
+    /// Delete a repo archive. No production caller yet (creation flows are
+    /// claim-first, so they never need to delete an archive); kept for the
+    /// repo-deletion path that will need it.
+    #[allow(dead_code)]
     pub async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
         self.store.delete(&Self::key(owner_slug, repo_name)).await
     }

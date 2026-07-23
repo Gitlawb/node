@@ -2,8 +2,10 @@
 //!
 //! Stores each object as a file under a configured root directory, using the
 //! object key as a relative path. For self-hosters without S3 and for tests of
-//! the storage abstraction. The etag is a `size-mtime` fingerprint so the
-//! skip-redundant-download optimization works against it.
+//! the storage abstraction. The etag is a fresh UUID persisted in a `.etag`
+//! sidecar on every write, so the skip-redundant-download optimization can rely
+//! on "etag unchanged ⇒ content unchanged" even on filesystems with coarse
+//! timestamps (objects predating the sidecar fall back to size-mtime).
 
 use std::path::{Path, PathBuf};
 
@@ -36,17 +38,26 @@ impl FsBlobStore {
         Ok(path)
     }
 
-    fn meta_from(md: &std::fs::Metadata) -> ObjectMeta {
+    /// Sidecar file persisting the object's etag: a fresh UUID per `put`.
+    /// RepoStore treats etag equality as proof the local copy is current, so
+    /// the token must change on EVERY write. A `size-mtime` fingerprint cannot
+    /// guarantee that on mounted filesystems with coarse timestamp precision
+    /// (two same-size writes in one tick collide); a per-write UUID can.
+    fn sidecar_of(path: &Path) -> PathBuf {
+        let mut os = path.as_os_str().to_owned();
+        os.push(".etag");
+        PathBuf::from(os)
+    }
+
+    /// Fallback fingerprint for objects written before the sidecar existed.
+    fn legacy_etag(md: &std::fs::Metadata) -> String {
         let mtime = md
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        ObjectMeta {
-            size: md.len(),
-            etag: Some(format!("{}-{}", md.len(), mtime)),
-        }
+        format!("{}-{}", md.len(), mtime)
     }
 }
 
@@ -77,8 +88,8 @@ impl BlobStore for FsBlobStore {
         let path2 = path.clone();
         // Atomic write: temp file in the same dir, then rename into place. On any
         // failure, remove the temp file so a failed write can't leak it. The
-        // trailing stat runs inside the same blocking task — no synchronous fs
-        // call ever touches the async runtime.
+        // trailing stat + etag-sidecar write run inside the same blocking task —
+        // no synchronous fs call ever touches the async runtime.
         tokio::task::spawn_blocking(move || -> Result<ObjectMeta> {
             std::fs::create_dir_all(&parent).context("creating blob parent dir")?;
             let write_and_swap = (|| -> Result<()> {
@@ -91,7 +102,14 @@ impl BlobStore for FsBlobStore {
                 return Err(e);
             }
             let md = std::fs::metadata(&path2).context("stat blob after write")?;
-            Ok(Self::meta_from(&md))
+            // Persist a fresh per-write etag; see `sidecar_of` for why
+            // size-mtime is not collision-resistant enough here.
+            let etag = uuid::Uuid::new_v4().to_string();
+            std::fs::write(Self::sidecar_of(&path2), &etag).context("writing etag sidecar")?;
+            Ok(ObjectMeta {
+                size: md.len(),
+                etag: Some(etag),
+            })
         })
         .await
         .context("fs put task panicked")?
@@ -101,19 +119,36 @@ impl BlobStore for FsBlobStore {
         let path = self.path_for(key)?;
         // Probe existence by io error kind, not path.exists(): a permission/IO
         // error must surface, not be silently reported as "not found".
-        match tokio::fs::metadata(&path).await {
-            Ok(md) => Ok(Some(Self::meta_from(&md))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).context(format!("stat {}", path.display())),
-        }
+        let md = match tokio::fs::metadata(&path).await {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).context(format!("stat {}", path.display())),
+        };
+        let etag = match tokio::fs::read_to_string(Self::sidecar_of(&path)).await {
+            Ok(tag) => tag.trim().to_string(),
+            // Object written before the sidecar existed — legacy fingerprint.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::legacy_etag(&md),
+            Err(e) => {
+                return Err(e).context(format!("reading etag sidecar for {}", path.display()))
+            }
+        };
+        Ok(Some(ObjectMeta {
+            size: md.len(),
+            etag: Some(etag),
+        }))
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.path_for(key)?;
         match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context(format!("deleting {}", path.display())),
+        }
+        match tokio::fs::remove_file(Self::sidecar_of(&path)).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).context(format!("deleting {}", path.display())),
+            Err(e) => Err(e).context(format!("deleting etag sidecar for {}", path.display())),
         }
     }
 }
@@ -144,7 +179,8 @@ impl FsBlobStore {
                         stack.push(path);
                     } else if let Ok(rel) = path.strip_prefix(&root) {
                         let key = rel.to_string_lossy().replace('\\', "/");
-                        if key.starts_with(&prefix) {
+                        // Etag sidecars are backend metadata, not objects.
+                        if key.starts_with(&prefix) && !key.ends_with(".etag") {
                             keys.push(key);
                         }
                     }
@@ -198,6 +234,30 @@ mod tests {
         store.delete("repos/v1/a/x.tar.zst").await.unwrap();
         store.delete("repos/v1/a/x.tar.zst").await.unwrap();
         assert!(store.get("repos/v1/a/x.tar.zst").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rewrite_always_changes_etag_even_for_identical_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsBlobStore::new(dir.path()).unwrap();
+        let key = "repos/v1/a/x.tar.zst";
+        let body = Bytes::from_static(b"same bytes");
+
+        // Two writes of identical content back-to-back: a size-mtime
+        // fingerprint can collide inside one timestamp tick on coarse
+        // filesystems; the persisted per-write etag must always differ.
+        let m1 = store.put(key, body.clone()).await.unwrap();
+        let m2 = store.put(key, body).await.unwrap();
+        assert_ne!(m1.etag, m2.etag, "every put must produce a new etag");
+
+        // head() reports the latest persisted etag.
+        let h = store.head(key).await.unwrap().unwrap();
+        assert_eq!(h.etag, m2.etag);
+
+        // delete() removes the sidecar with the object.
+        store.delete(key).await.unwrap();
+        assert!(store.head(key).await.unwrap().is_none());
+        assert!(store.list("repos/v1/").await.unwrap().is_empty());
     }
 
     #[tokio::test]

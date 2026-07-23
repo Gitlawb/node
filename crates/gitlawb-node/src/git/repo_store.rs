@@ -97,17 +97,51 @@ impl RepoStore {
         if marker.exists() {
             if local_path.exists() {
                 // The local copy has a write that storage never received (its
-                // upload failed, or the node stopped first). Storage is BEHIND
-                // local, so the etag-mismatch-means-remote-newer rule below is
-                // inverted here — downloading would roll the acked write back.
-                // Serve the local copy; the next successful post-write upload
-                // clears the marker and re-syncs storage. Cross-node caveat:
-                // until that upload lands, other nodes still see the stale
-                // archive — the marker protects this node's copy, it does not
-                // replicate it.
-                warn!(repo = %repo_name,
-                    "local copy ahead of storage (pending upload) — skipping download");
-                return Ok(());
+                // upload failed, or the node stopped first). The marker records
+                // the storage etag that write was BASED on, so we can tell
+                // "storage unchanged — local strictly ahead" apart from
+                // "another node advanced storage — genuine divergence" rather
+                // than treating local as authoritative forever.
+                let base = std::fs::read_to_string(&marker).unwrap_or_default();
+                let base = base.trim();
+                let remote = match archive.head_etag(owner_slug, repo_name).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        if require_fresh {
+                            return Err(e).context("storage head while local pending upload");
+                        }
+                        warn!(repo = %repo_name, err = %e,
+                            "storage head failed while pending upload — using local copy");
+                        return Ok(());
+                    }
+                };
+                match remote.as_deref() {
+                    // Storage empty, or exactly the version our write built on:
+                    // local is strictly ahead. Serve it; the next successful
+                    // post-write upload re-syncs storage and clears the marker.
+                    None => return Ok(()),
+                    Some(r) if r == base => {
+                        warn!(repo = %repo_name,
+                            "local copy ahead of storage (pending upload) — skipping download");
+                        return Ok(());
+                    }
+                    // Storage advanced past our base while this node held
+                    // un-uploaded local changes: both sides have writes the
+                    // other lacks. Overwriting either silently loses a push.
+                    Some(_) => {
+                        if require_fresh {
+                            anyhow::bail!(
+                                "storage for {owner_slug}/{repo_name} advanced while local \
+                                 changes were pending upload — refusing to overwrite either \
+                                 side; reconcile manually (fetch both, merge, remove the \
+                                 pending-upload marker)"
+                            );
+                        }
+                        warn!(repo = %repo_name,
+                            "storage diverged from pending local copy — serving local for read");
+                        return Ok(());
+                    }
+                }
             }
             // Marker without a local copy: the repo dir was removed out from
             // under us, so the storage copy is the best remaining state. Drop
@@ -272,7 +306,11 @@ impl RepoStore {
     pub async fn init(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
-        store::init_bare(&local_path).context("initializing bare repo")?;
+        if let Err(e) = store::init_bare(&local_path) {
+            // A half-initialized dir would block a retry on "already exists".
+            let _ = std::fs::remove_dir_all(&local_path);
+            return Err(e).context("initializing bare repo");
+        }
 
         // Upload the new repo synchronously under the advisory lock: a background
         // upload could land the empty repo *after* a racing first push and clobber
@@ -306,7 +344,8 @@ impl RepoStore {
             .local_path(owner_did, repo_name)
             .context("rejected unsafe path in release_after_write")?;
         let key = format!("{owner_slug}/{repo_name}");
-        mark_pending_upload(&local_path, repo_name);
+        let base = self.versions.lock().await.get(&key).cloned();
+        mark_pending_upload(&local_path, repo_name, base.as_deref());
         match archive.upload(&owner_slug, repo_name, &local_path).await {
             Ok(Some(etag)) => {
                 self.versions.lock().await.insert(key, etag);
@@ -328,23 +367,6 @@ impl RepoStore {
         }
     }
 
-    /// Remove a repo's archive object from storage. Cleanup for creation flows
-    /// that uploaded successfully but then failed before the DB row existed —
-    /// without this, the archive is orphaned with no owning record.
-    pub async fn delete_archive(&self, owner_did: &str, repo_name: &str) -> Result<()> {
-        let Some(ref archive) = self.archive else {
-            return Ok(());
-        };
-        let (owner_slug, _) = self
-            .local_path(owner_did, repo_name)
-            .context("rejected unsafe path in delete_archive")?;
-        self.versions
-            .lock()
-            .await
-            .remove(&format!("{owner_slug}/{repo_name}"));
-        archive.delete(&owner_slug, repo_name).await
-    }
-
     /// Upload `local_path` to storage while holding the per-repo advisory lock,
     /// so a background or init-time upload can't clobber a concurrent locked
     /// write by landing an older snapshot after it. With `skip_if_exists`, skips
@@ -363,12 +385,23 @@ impl RepoStore {
         let label = format!("{owner_slug}/{repo_name}");
         let lock = LockedConn::acquire(&self.lock_pool, lock_key, &label).await?;
 
-        let outcome: Result<Option<String>> =
-            if skip_if_exists && archive.exists(owner_slug, repo_name).await.unwrap_or(false) {
-                Ok(None) // already present — nothing to upload
-            } else {
-                archive.upload(owner_slug, repo_name, local_path).await
-            };
+        let outcome: Result<Option<String>> = async {
+            if skip_if_exists {
+                // Propagate a failed existence check instead of treating it as
+                // "absent": HEAD failing transiently while PUT would succeed
+                // must not let this node's cache overwrite a newer shared
+                // archive. The lazy-migration caller just retries later.
+                let exists = archive
+                    .exists(owner_slug, repo_name)
+                    .await
+                    .context("checking storage before migration upload")?;
+                if exists {
+                    return Ok(None); // already present — nothing to upload
+                }
+            }
+            archive.upload(owner_slug, repo_name, local_path).await
+        }
+        .await;
 
         // Release the lock on the same connection regardless of outcome.
         lock.unlock().await;
@@ -631,6 +664,18 @@ impl RepoWriteGuard {
         &self.local_path
     }
 
+    /// Durably record intent-to-upload NOW, before the caller acks the client.
+    /// Write-back callers must call this before spawning `release()`: the
+    /// spawned task may never be polled if the process stops right after the
+    /// ack, and without the marker already on disk a restart would treat the
+    /// stale storage archive as newer and roll the acked write back.
+    /// Idempotent with the marker `release()` writes itself.
+    pub async fn mark_pending(&self) {
+        let key = format!("{}/{}", self.owner_slug, self.repo_name);
+        let base = self.versions.lock().await.get(&key).cloned();
+        mark_pending_upload(&self.local_path, &self.repo_name, base.as_deref());
+    }
+
     /// Upload to storage (only when the write succeeded) and release the advisory
     /// lock. Pass `success = false` when the write operation failed — uploading a
     /// half-applied or otherwise inconsistent repo would propagate corruption to
@@ -650,7 +695,8 @@ impl RepoWriteGuard {
         // error; a write-back caller logs it).
         let upload_result: Result<()> = if success {
             if let Some(ref archive) = self.archive {
-                mark_pending_upload(&self.local_path, &self.repo_name);
+                let base = self.versions.lock().await.get(&key).cloned();
+                mark_pending_upload(&self.local_path, &self.repo_name, base.as_deref());
                 match archive
                     .upload(&self.owner_slug, &self.repo_name, &self.local_path)
                     .await
@@ -711,8 +757,15 @@ fn pending_upload_marker(local_path: &Path) -> PathBuf {
     local_path.with_file_name(format!(".{name}.pending-upload"))
 }
 
-fn mark_pending_upload(local_path: &Path, repo_name: &str) {
-    if let Err(e) = std::fs::write(pending_upload_marker(local_path), b"") {
+/// `base_etag` is the storage etag the local write was built on (empty when
+/// storage held nothing). `sync_down_if_stale` compares it against the current
+/// remote etag to distinguish "local strictly ahead" from cross-node
+/// divergence.
+fn mark_pending_upload(local_path: &Path, repo_name: &str, base_etag: Option<&str>) {
+    if let Err(e) = std::fs::write(
+        pending_upload_marker(local_path),
+        base_etag.unwrap_or_default(),
+    ) {
         // Best-effort: without the marker we fall back to the pre-marker
         // behavior (a failed upload risks rollback), but the upload itself
         // must still proceed.
@@ -970,10 +1023,18 @@ mod tests {
             .unwrap();
 
         // Simulate an acked write whose upload failed: local advances, the
-        // pending marker persists, and storage still holds the older v1 with a
-        // *different* etag than the local cache (cache invalidated on failure).
+        // pending marker (recording the storage etag the write was based on)
+        // persists, and the in-memory cache was invalidated on failure.
+        let base = store
+            .archive
+            .as_ref()
+            .unwrap()
+            .head_etag("owner", "repo")
+            .await
+            .unwrap()
+            .unwrap();
         std::fs::write(local.join("HEAD"), b"ACKED-WRITE\n").unwrap();
-        mark_pending_upload(&local, "repo");
+        mark_pending_upload(&local, "repo", Some(&base));
         store.versions.lock().await.clear();
 
         // Both the read and the write path must serve local, not roll it back.
@@ -1011,6 +1072,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_marker_detects_cross_node_divergence() {
+        let store_root = tempfile::tempdir().unwrap();
+        let repos_dir = tempfile::tempdir().unwrap();
+        let store = store_with_fs_archive(repos_dir.path().to_path_buf(), store_root.path());
+
+        // Storage v1; local synced, then advanced with a failed upload (marker
+        // records v1's etag as its base).
+        let seed = tempfile::tempdir().unwrap();
+        std::fs::write(seed.path().join("HEAD"), b"v1\n").unwrap();
+        let archive = store.archive.as_ref().unwrap();
+        archive.upload("owner", "repo", seed.path()).await.unwrap();
+        let local = repos_dir.path().join("owner").join("repo.git");
+        store
+            .sync_down_if_stale("owner", "repo", &local, true)
+            .await
+            .unwrap();
+        let base = archive.head_etag("owner", "repo").await.unwrap().unwrap();
+        std::fs::write(local.join("HEAD"), b"LOCAL-AHEAD\n").unwrap();
+        mark_pending_upload(&local, "repo", Some(&base));
+        store.versions.lock().await.clear();
+
+        // Another node advances storage past our base.
+        let seed2 = tempfile::tempdir().unwrap();
+        std::fs::write(seed2.path().join("HEAD"), b"OTHER-NODE\n").unwrap();
+        archive.upload("owner", "repo", seed2.path()).await.unwrap();
+
+        // Write path: refuse — proceeding would clobber one side or the other.
+        assert!(
+            store
+                .sync_down_if_stale("owner", "repo", &local, true)
+                .await
+                .is_err(),
+            "diverged marker must fail the write path closed"
+        );
+        // Read path: serve local (read-only cannot propagate damage), and the
+        // local copy must be untouched either way.
+        store
+            .sync_down_if_stale("owner", "repo", &local, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(local.join("HEAD")).unwrap(), b"LOCAL-AHEAD\n");
+    }
+
+    #[tokio::test]
     async fn stale_pending_marker_without_local_copy_is_dropped() {
         let store_root = tempfile::tempdir().unwrap();
         let repos_dir = tempfile::tempdir().unwrap();
@@ -1030,7 +1135,7 @@ mod tests {
         // the marker is stale — drop it and download normally.
         let local = repos_dir.path().join("owner").join("repo.git");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-        mark_pending_upload(&local, "repo");
+        mark_pending_upload(&local, "repo", Some("whatever"));
         store
             .sync_down_if_stale("owner", "repo", &local, true)
             .await
@@ -1066,6 +1171,14 @@ mod tests {
         // decompresses garbage and fails.
         let blob_path = store_root.path().join("repos/v1/owner/repo.tar.zst");
         std::fs::write(&blob_path, b"corrupted not-a-tar-zst").unwrap();
+        // The fs backend's etag lives in a sidecar, so a direct file overwrite
+        // must also bump it for the change to be visible (as any real writer's
+        // put() would).
+        std::fs::write(
+            store_root.path().join("repos/v1/owner/repo.tar.zst.etag"),
+            "corrupted-generation",
+        )
+        .unwrap();
 
         // Write path: must fail closed rather than fall back to the stale local
         // copy (which a later upload would use to clobber the newer remote).

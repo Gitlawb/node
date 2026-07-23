@@ -74,13 +74,15 @@ pub async fn create_issue(
     let release_result = guard.release(create_result.is_ok()).await;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;
-    // The write succeeded locally; surface a durable-upload failure rather than
-    // acking an issue that never reached storage.
-    release_result.map_err(|e| {
-        AppError::Git(format!(
-            "issue stored locally but durable upload failed: {e}"
-        ))
-    })?;
+    // The git mutation is committed locally and protected by the pending-upload
+    // marker, so a durable-upload failure here is recoverable (the next
+    // successful upload re-syncs storage) — NOT a request failure. Failing the
+    // request would make the caller retry a non-idempotent mutation: the retry
+    // mints a new issue UUID and both issues eventually publish.
+    if let Err(e) = release_result {
+        tracing::error!(repo = %record.name, issue = %issue_id, err = %e,
+            "issue committed locally but durable upload failed — storage re-syncs on next upload");
+    }
 
     // Bump trust score for the issue author — increment current score by 0.05
     // (avoids the push_count=0 stuck-at-0.05 bug for agents who only file issues)
@@ -278,11 +280,12 @@ pub async fn close_issue(
     let updated = close_result
         .map_err(|e| AppError::Git(e.to_string()))?
         .ok_or_else(|| AppError::RepoNotFound(format!("issue {issue_id} not found")))?;
-    release_result.map_err(|e| {
-        AppError::Git(format!(
-            "issue stored locally but durable upload failed: {e}"
-        ))
-    })?;
+    // Committed locally + marker-protected: a durable-upload failure is
+    // recoverable, not a request failure (see create_issue).
+    if let Err(e) = release_result {
+        tracing::error!(repo = %repo, issue = %issue_id, err = %e,
+            "issue close committed locally but durable upload failed — storage re-syncs on next upload");
+    }
 
     let issue: serde_json::Value = serde_json::from_str(&updated)
         .map_err(|e| AppError::BadRequest(format!("invalid issue data: {e}")))?;

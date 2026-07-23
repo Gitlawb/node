@@ -984,6 +984,17 @@ impl Db {
         Ok(())
     }
 
+    /// Compensating delete for creation flows: remove the row a failed
+    /// create/fork just inserted, keyed strictly by our own generated id so a
+    /// concurrent same-name winner's row can never be affected.
+    pub async fn delete_repo_by_id(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM repos WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Register a mirrored repo from a peer in the local DB so git smart HTTP can serve it.
     /// Uses INSERT OR IGNORE (SQLite) / ON CONFLICT DO NOTHING (Postgres) so it's idempotent.
     pub async fn upsert_mirror_repo(
