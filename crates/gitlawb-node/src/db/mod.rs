@@ -2159,19 +2159,16 @@ impl Db {
 // ── Pinned CIDs ───────────────────────────────────────────────────────────────
 
 impl Db {
-    pub async fn is_pinned(&self, sha256_hex: &str) -> Result<bool> {
-        let row = sqlx::query("SELECT COUNT(*) as cnt FROM pinned_cids WHERE sha256_hex = $1")
-            .bind(sha256_hex)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.get::<i64, _>("cnt") > 0)
-    }
-
+    /// Record the local IPFS CID for a git object.
+    /// If a Pinata-only row already exists (cid IS NULL), this updates it with
+    /// the real IPFS CID so that `has_ipfs_cid` correctly reflects IPFS state.
     pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
              VALUES ($1, $2, $3)
-             ON CONFLICT(sha256_hex) DO NOTHING",
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+               cid = COALESCE(pinned_cids.cid, EXCLUDED.cid),
+               pinned_at = EXCLUDED.pinned_at",
         )
         .bind(sha256_hex)
         .bind(cid)
@@ -2268,6 +2265,17 @@ impl Db {
             .collect())
     }
 
+    /// Returns true if this object already has a local IPFS CID recorded.
+    pub async fn has_ipfs_cid(&self, sha256_hex: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM pinned_cids WHERE sha256_hex = $1 AND cid IS NOT NULL",
+        )
+        .bind(sha256_hex)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt") > 0)
+    }
+
     /// Returns true if this object already has a Pinata CID recorded.
     pub async fn has_pinata_cid(&self, sha256_hex: &str) -> Result<bool> {
         let row = sqlx::query(
@@ -2279,9 +2287,42 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
+    /// Given a list of sha256_hex values, returns the subset that already have
+    /// a Pinata CID recorded. Used by the reconciliation sweep to skip objects
+    /// that Pinata has already handled.
+    pub async fn filter_pinata_pinned_oids(&self, oids: &[String]) -> Result<Vec<String>> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT sha256_hex FROM pinned_cids WHERE sha256_hex = ANY($1) AND pinata_cid IS NOT NULL",
+        )
+        .bind(oids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("sha256_hex")).collect())
+    }
+
+    /// Given a list of sha256_hex values, returns the subset that already have
+    /// a local IPFS CID recorded. Used by the reconciliation sweep to skip objects
+    /// that local IPFS has already handled.
+    pub async fn filter_ipfs_pinned_oids(&self, oids: &[String]) -> Result<Vec<String>> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT sha256_hex FROM pinned_cids WHERE sha256_hex = ANY($1) AND cid IS NOT NULL",
+        )
+        .bind(oids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("sha256_hex")).collect())
+    }
+
     /// Record the Pinata CID for a git object.
-    /// Inserts the row if it doesn't exist (objects pinned directly to Pinata
-    /// without a prior local IPFS pin get cid = pinata_cid).
+    /// `cid` is left NULL for new rows so that `has_ipfs_cid` (which checks
+    /// `cid IS NOT NULL`) correctly distinguishes local IPFS state from
+    /// Pinata-only state.
     pub async fn record_pinata_cid(&self, sha256_hex: &str, pinata_cid: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
@@ -2289,7 +2330,7 @@ impl Db {
              ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid",
         )
         .bind(sha256_hex)
-        .bind(pinata_cid) // fallback local cid if row is new
+        .bind(Option::<&str>::None) // cid is NULL for Pinata-only new rows
         .bind(Utc::now().to_rfc3339())
         .bind(pinata_cid)
         .execute(&self.pool)
