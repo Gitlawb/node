@@ -3925,8 +3925,8 @@ pub struct RecordAnchorInputV2<'a> {
     pub cid: Option<&'a str>,
     pub arweave_tx_id: &'a str,
     pub node_did: &'a str,
-    #[allow(dead_code)]
-    pub gateway_url: &'a str,
+    /// ID of the [`RefCertificate`] embedded in this anchor, if any.
+    pub cert_id: Option<String>,
 }
 
 impl Db {
@@ -3934,8 +3934,8 @@ impl Db {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, cert_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         )
         .bind(&id)
         .bind(input.repo)
@@ -3948,6 +3948,7 @@ impl Db {
         .bind(input.node_did)
         .bind(&now)
         .bind("pending")
+        .bind(input.cert_id.clone())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -7714,7 +7715,7 @@ mod arweave_anchor_tests {
             cid: Some("bafyreib5..."),
             arweave_tx_id: "test-tx-id-123",
             node_did: "did:key:zNODE",
-            gateway_url: "https://arweave.net",
+            cert_id: None,
         };
 
         db.record_arweave_anchor(&input).await.unwrap();
@@ -7740,7 +7741,7 @@ mod arweave_anchor_tests {
             cid: None,
             arweave_tx_id: "tx-confirm",
             node_did: "did:key:zNODE",
-            gateway_url: "https://arweave.net",
+            cert_id: None,
         };
         db.record_arweave_anchor(&input).await.unwrap();
 
@@ -7775,7 +7776,7 @@ mod arweave_anchor_tests {
             cid: None,
             arweave_tx_id: "tx-fail",
             node_did: "did:key:zNODE",
-            gateway_url: "https://arweave.net",
+            cert_id: None,
         };
         db.record_arweave_anchor(&input).await.unwrap();
 
@@ -7808,12 +7809,12 @@ mod arweave_anchor_tests {
             cid: None,
             arweave_tx_id: "tx-pending-1",
             node_did: "did:key:zNODE",
-            gateway_url: "https://arweave.net",
+            cert_id: None,
         })
         .await
         .unwrap();
 
-        // Record a second anchor for the same repo
+        // Record a second anchor for a different repo
         db.record_arweave_anchor(&RecordAnchorInputV2 {
             repo: "dave/repo-b",
             owner_did: "did:key:zOWNER",
@@ -7823,7 +7824,7 @@ mod arweave_anchor_tests {
             cid: None,
             arweave_tx_id: "tx-pending-2",
             node_did: "did:key:zNODE",
-            gateway_url: "https://arweave.net",
+            cert_id: None,
         })
         .await
         .unwrap();
