@@ -882,12 +882,19 @@ mod tests {
         let db = crate::db::Db::for_testing(pool);
 
         let result = verify_anchor(&client, &server.url(), "test-tx", &db).await;
-        assert!(result.is_ok(), "Expected Ok response, got Err: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "Expected Ok response, got Err: {:?}",
+            result
+        );
 
         let verify_result = result.unwrap();
         assert!(!verify_result.valid, "VerifyResult should be invalid");
         assert!(
-            verify_result.errors.iter().any(|e| e.contains("invalid node DID")),
+            verify_result
+                .errors
+                .iter()
+                .any(|e| e.contains("invalid node DID")),
             "Expected 'invalid node DID' error in: {:?}",
             verify_result.errors
         );
