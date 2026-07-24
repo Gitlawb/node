@@ -19,6 +19,7 @@
 
 use anyhow::Result;
 use base64::Engine as _;
+use futures::StreamExt;
 use serde::Serialize;
 use serde_json::json;
 use sha2::Digest;
@@ -29,6 +30,7 @@ use std::str::FromStr;
 #[derive(Debug, Clone)]
 pub struct RefAnchor {
     pub repo: String,
+    pub repo_id: String,
     pub owner_did: String,
     pub ref_name: String,
     pub old_sha: String,
@@ -58,6 +60,7 @@ pub async fn anchor_ref_update(
     let mut payload = json!({
         "schema": "gitlawb/ref-update/v1",
         "repo": anchor.repo,
+        "repo_id": anchor.repo_id,
         "owner_did": anchor.owner_did,
         "ref_name": anchor.ref_name,
         "old_sha": anchor.old_sha,
@@ -278,10 +281,23 @@ pub async fn verify_anchor(
             errors: vec![format!("Arweave gateway returned {}", resp.status())],
         });
     }
-    // Bound the untrusted response to 1 MiB to prevent memory exhaustion.
-    // Check Content-Length first so we never buffer a giant body.
-    if let Some(cl) = resp.content_length() {
-        if cl > 1_048_576 {
+    // Stream the response body with a running 1 MiB cap so a chunked or
+    // header-omitting gateway cannot drive multi-hundred-MB allocations.
+    let mut body_bytes = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let data = match chunk {
+            Ok(d) => d,
+            Err(e) => {
+                return Ok(VerifyResult {
+                    valid: false,
+                    anchor: serde_json::Value::Null,
+                    certificate: None,
+                    errors: vec![format!("failed to read response body: {e}")],
+                });
+            }
+        };
+        if body_bytes.len() + data.len() > 1_048_576 {
             return Ok(VerifyResult {
                 valid: false,
                 anchor: serde_json::Value::Null,
@@ -289,15 +305,7 @@ pub async fn verify_anchor(
                 errors: vec!["response body exceeds 1 MiB limit".to_string()],
             });
         }
-    }
-    let body_bytes = resp.bytes().await?;
-    if body_bytes.len() > 1_048_576 {
-        return Ok(VerifyResult {
-            valid: false,
-            anchor: serde_json::Value::Null,
-            certificate: None,
-            errors: vec!["response body exceeds 1 MiB limit".to_string()],
-        });
+        body_bytes.extend_from_slice(&data);
     }
 
     // Parse the payload — could be JSON or raw bytes depending on gateway.
@@ -325,17 +333,19 @@ pub async fn verify_anchor(
     if let Some(ref c) = cert {
         // 0. Cross-check the outer anchor fields against the embedded certificate.
         //    A valid anchor must commit to the same identities and ref state.
-        let outer_repo = anchor.get("repo").and_then(|v| v.as_str());
+        //    The outer repo_id (UUID) is compared against the cert's repo_id (UUID)
+        //    to avoid comparing a human-readable slug against a UUID.
+        let outer_repo_id = anchor.get("repo_id").and_then(|v| v.as_str());
         let outer_ref = anchor.get("ref_name").and_then(|v| v.as_str());
         let outer_old = anchor.get("old_sha").and_then(|v| v.as_str());
         let outer_new = anchor.get("new_sha").and_then(|v| v.as_str());
         let outer_node = anchor.get("node_did").and_then(|v| v.as_str());
-        if outer_repo.is_none() {
-            errors.push("anchor payload is missing top-level 'repo'".to_string());
-        } else if outer_repo != Some(&c.repo_id) {
+        if outer_repo_id.is_none() {
+            errors.push("anchor payload is missing top-level 'repo_id'".to_string());
+        } else if outer_repo_id != Some(&c.repo_id) {
             errors.push(format!(
-                "anchor outer repo ({}) does not match certificate repo_id ({})",
-                outer_repo.unwrap_or(""),
+                "anchor outer repo_id ({}) does not match certificate repo_id ({})",
+                outer_repo_id.unwrap_or(""),
                 c.repo_id
             ));
         }
@@ -348,21 +358,30 @@ pub async fn verify_anchor(
                 c.ref_name
             ));
         }
-        if outer_old.is_some() && outer_old != Some(&c.old_sha) {
+        // Fail closed: old_sha, new_sha, and node_did are mandatory in the
+        // outer anchor when a certificate is embedded.  A forger who omits
+        // them must not pass verification.
+        if outer_old.is_none() {
+            errors.push("anchor payload is missing top-level 'old_sha'".to_string());
+        } else if outer_old != Some(&c.old_sha) {
             errors.push(format!(
                 "anchor outer old_sha ({}) does not match certificate old_sha ({})",
                 outer_old.unwrap_or(""),
                 c.old_sha
             ));
         }
-        if outer_new.is_some() && outer_new != Some(&c.new_sha) {
+        if outer_new.is_none() {
+            errors.push("anchor payload is missing top-level 'new_sha'".to_string());
+        } else if outer_new != Some(&c.new_sha) {
             errors.push(format!(
                 "anchor outer new_sha ({}) does not match certificate new_sha ({})",
                 outer_new.unwrap_or(""),
                 c.new_sha
             ));
         }
-        if outer_node.is_some() && outer_node != Some(&c.node_did) {
+        if outer_node.is_none() {
+            errors.push("anchor payload is missing top-level 'node_did'".to_string());
+        } else if outer_node != Some(&c.node_did) {
             errors.push(format!(
                 "anchor outer node_did ({}) does not match certificate node_did ({})",
                 outer_node.unwrap_or(""),
@@ -379,9 +398,12 @@ pub async fn verify_anchor(
             "pusher":     c.pusher_did,
             "node":       c.node_did,
             "ts":         c.issued_at,
-            "seq":        c.seq,
-            "prev":       c.prev,
-            "pusher_sig": c.pusher_sig,
+            "seq":              c.seq,
+            "prev":             c.prev,
+            "pusher_sig":       c.pusher_sig,
+            "signature_input":  c.signature_input,
+            "content_digest":   c.content_digest,
+            "request_path":     c.request_path,
         });
         let payload_bytes = serde_json::to_vec(&payload)?;
 
@@ -460,92 +482,109 @@ pub async fn verify_anchor(
             }
         }
 
-        // 3. Verify the pusher authorization proof (RFC 9421 HTTP Signature)
-        //    when all required context is available.
-        if let (Some(pusher_sig), Some(sig_input), Some(content_digest), Some(request_path)) = (
-            &c.pusher_sig,
-            &c.signature_input,
-            &c.content_digest,
-            &c.request_path,
-        ) {
-            match gitlawb_core::http_sig::HttpSignature::parse(
-                sig_input,
-                &format!("sig1=:{pusher_sig}:"),
-            ) {
-                Ok(http_sig) => {
-                    let mut request_values: HashMap<String, String> = HashMap::new();
-                    request_values.insert("@method".to_string(), "POST".to_string());
-                    request_values.insert("@path".to_string(), request_path.clone());
-                    request_values.insert("content-digest".to_string(), content_digest.clone());
-
-                    let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
-                    let components_ref: Vec<&str> =
-                        http_sig.components.iter().map(String::as_str).collect();
-
-                    match gitlawb_core::http_sig::build_signing_string(
-                        &components_ref,
-                        sig_params_value,
-                        &request_values,
+        // 3. Verify the pusher authorization proof (RFC 9421 HTTP Signature).
+        //    The context fields (signature_input, content_digest, request_path)
+        //    are bound into the node signing payload, so a certificate whose
+        //    node signature verified already commits to them.  When pusher_sig
+        //    is present but a context field is missing, the proof cannot be
+        //    checked and is treated as invalid rather than silently skipped.
+        if let Some(pusher_sig) = &c.pusher_sig {
+            match (&c.signature_input, &c.content_digest, &c.request_path) {
+                (Some(sig_input), Some(content_digest), Some(request_path)) => {
+                    match gitlawb_core::http_sig::HttpSignature::parse(
+                        sig_input,
+                        &format!("sig1=:{pusher_sig}:"),
                     ) {
-                        Ok(signing_string) => {
-                            let pusher_did = gitlawb_core::did::Did::from_str(&c.pusher_did);
-                            let pusher_vk = pusher_did.and_then(|d| d.to_verifying_key());
-                            match pusher_vk {
-                                Ok(vk) => {
-                                    let sig_bytes: [u8; 64] =
-                                        match base64::engine::general_purpose::STANDARD
-                                            .decode(pusher_sig)
-                                        {
-                                            Ok(bytes) => match bytes.as_slice().try_into() {
-                                                Ok(a) => a,
-                                                Err(_) => {
-                                                    errors.push(
+                        Ok(http_sig) => {
+                            let mut request_values: HashMap<String, String> = HashMap::new();
+                            request_values.insert("@method".to_string(), "POST".to_string());
+                            request_values.insert("@path".to_string(), request_path.clone());
+                            request_values
+                                .insert("content-digest".to_string(), content_digest.clone());
+
+                            let sig_params_value =
+                                sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
+                            let components_ref: Vec<&str> =
+                                http_sig.components.iter().map(String::as_str).collect();
+
+                            match gitlawb_core::http_sig::build_signing_string(
+                                &components_ref,
+                                sig_params_value,
+                                &request_values,
+                            ) {
+                                Ok(signing_string) => {
+                                    let pusher_did =
+                                        gitlawb_core::did::Did::from_str(&c.pusher_did);
+                                    let pusher_vk = pusher_did.and_then(|d| d.to_verifying_key());
+                                    match pusher_vk {
+                                        Ok(vk) => {
+                                            let sig_bytes: [u8; 64] =
+                                                match base64::engine::general_purpose::STANDARD
+                                                    .decode(pusher_sig)
+                                                {
+                                                    Ok(bytes) => {
+                                                        match bytes.as_slice().try_into() {
+                                                            Ok(a) => a,
+                                                            Err(_) => {
+                                                                errors.push(
                                                         "pusher signature is not 64 bytes"
                                                             .to_string(),
                                                     );
-                                                    return Ok(VerifyResult {
-                                                        valid: false,
-                                                        anchor,
-                                                        certificate: cert,
-                                                        errors,
-                                                    });
-                                                }
-                                            },
-                                            Err(_) => {
-                                                errors.push(
-                                                    "pusher signature is not valid base64"
-                                                        .to_string(),
-                                                );
-                                                return Ok(VerifyResult {
-                                                    valid: false,
-                                                    anchor,
-                                                    certificate: cert,
-                                                    errors,
-                                                });
+                                                                return Ok(VerifyResult {
+                                                                    valid: false,
+                                                                    anchor,
+                                                                    certificate: cert,
+                                                                    errors,
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(_) => {
+                                                        errors.push(
+                                                            "pusher signature is not valid base64"
+                                                                .to_string(),
+                                                        );
+                                                        return Ok(VerifyResult {
+                                                            valid: false,
+                                                            anchor,
+                                                            certificate: cert,
+                                                            errors,
+                                                        });
+                                                    }
+                                                };
+                                            if let Err(e) = gitlawb_core::identity::verify(
+                                                &vk,
+                                                signing_string.as_bytes(),
+                                                &sig_bytes,
+                                            ) {
+                                                errors.push(format!(
+                                                    "pusher signature verification failed: {e}"
+                                                ));
                                             }
-                                        };
-                                    if let Err(e) = gitlawb_core::identity::verify(
-                                        &vk,
-                                        signing_string.as_bytes(),
-                                        &sig_bytes,
-                                    ) {
-                                        errors.push(format!(
-                                            "pusher signature verification failed: {e}"
-                                        ));
+                                        }
+                                        Err(e) => {
+                                            errors.push(format!("unresolvable pusher DID: {e}"));
+                                        }
                                     }
                                 }
                                 Err(e) => {
-                                    errors.push(format!("unresolvable pusher DID: {e}"));
+                                    errors.push(format!("failed to build signing string: {e}"));
                                 }
                             }
                         }
                         Err(e) => {
-                            errors.push(format!("failed to build signing string: {e}"));
+                            errors.push(format!("failed to parse pusher Signature-Input: {e}"));
                         }
-                    }
+                    } // inner match
                 }
-                Err(e) => {
-                    errors.push(format!("failed to parse pusher Signature-Input: {e}"));
+                (sig_input, content_digest, request_path) => {
+                    errors.push(format!(
+                        "pusher signature present but context fields incomplete \
+                         (signature_input={}, content_digest={}, request_path={})",
+                        sig_input.is_some(),
+                        content_digest.is_some(),
+                        request_path.is_some(),
+                    ));
                 }
             }
         }
@@ -570,6 +609,7 @@ mod tests {
         let client = reqwest::Client::new();
         let anchor = RefAnchor {
             repo: "alice/myrepo".into(),
+            repo_id: "repo-uuid".into(),
             owner_did: "did:key:z6Mk...".into(),
             ref_name: "refs/heads/main".into(),
             old_sha: "0000000000000000000000000000000000000000".into(),
@@ -598,6 +638,7 @@ mod tests {
         let client = reqwest::Client::new();
         let anchor = RefAnchor {
             repo: "alice/myrepo".into(),
+            repo_id: "repo-uuid".into(),
             owner_did: "did:key:z6Mk...".into(),
             ref_name: "refs/heads/main".into(),
             old_sha: "0".repeat(40),
@@ -640,6 +681,7 @@ mod tests {
         let client = reqwest::Client::new();
         let anchor = RefAnchor {
             repo: "alice/myrepo".into(),
+            repo_id: "repo-uuid".into(),
             owner_did: "did:key:z6Mk...".into(),
             ref_name: "refs/heads/main".into(),
             old_sha: real_old.into(),

@@ -467,6 +467,14 @@ impl Db {
 // appended to v1. Operators can read `schema_migrations` to confirm a node
 // is at the expected version.
 //
+// NOTE: the v1 migration in this branch already includes columns (seq, prev,
+// pusher_sig on ref_certificates; status, deadline_height, receipt_sig, cert_id
+// on arweave_anchors) that were historically added by migrations v12/v13. These
+// were bundled into v1 for development convenience and kept there to avoid a
+// schema reset. The v12/v13 migrations remain as no-ops for existing installs
+// that upgrade from an older branch. See v12/v13 for the actual DDL that newer
+// installs skip via IF NOT EXISTS.
+//
 // Each migration runs in a single transaction, so statements that Postgres
 // forbids inside a transaction (notably `CREATE INDEX CONCURRENTLY`) cannot be
 // used here. Build such indexes the ordinary, transaction-safe way, or stage
@@ -927,6 +935,11 @@ const MIGRATIONS: &[Migration] = &[
             // Backfill: assign sequential seq values to existing certificates
             // before creating the unique index. Migrations v10/v11 may have left
             // multiple rows per repo (from different refs) all at seq = 1.
+            // The prev column is intentionally NOT backfilled here: chain
+            // verification in verify_anchor computes expected_prev dynamically
+            // from the predecessor's 7 canonical fields (repo_id, ref, old,
+            // new, pusher, node, ts), never reading the DB's prev column.
+            // Existing prev values already match what was computed at issuance.
             r#"UPDATE ref_certificates
                SET seq = subq.new_seq
                FROM (
@@ -2238,11 +2251,12 @@ impl Db {
 }
 
 /// Deterministic 64-bit hash of a repo_id for advisory lock keys.
+/// Uses the first 8 bytes of SHA-256 rather than DefaultHasher (which the
+/// std docs do not guarantee stable across Rust versions or platforms).
 fn repo_lock_hash(repo_id: &str) -> i64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    repo_id.hash(&mut h);
-    h.finish() as i64
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(repo_id.as_bytes());
+    i64::from_ne_bytes(hash[..8].try_into().expect("sha256 output >= 8 bytes"))
 }
 
 // ── Peers ─────────────────────────────────────────────────────────────────────
@@ -2894,65 +2908,6 @@ impl Db {
             .await?
         };
 
-        Ok(rows
-            .into_iter()
-            .map(|r| ArweaveAnchor {
-                id: r.get("id"),
-                repo: r.get("repo"),
-                owner_did: r.get("owner_did"),
-                ref_name: r.get("ref_name"),
-                old_sha: r.get("old_sha"),
-                new_sha: r.get("new_sha"),
-                cid: r.get("cid"),
-                arweave_tx_id: r.get("arweave_tx_id"),
-                node_did: r.get("node_did"),
-                anchored_at: r.get("anchored_at"),
-                status: r.get("status"),
-                deadline_height: r.try_get("deadline_height").unwrap_or(None),
-                receipt_sig: r.try_get("receipt_sig").unwrap_or(None),
-                cert_id: r.try_get("cert_id").unwrap_or(None),
-            })
-            .collect())
-    }
-
-    #[allow(dead_code)]
-    /// Update the anchor status to confirmed with receipt details.
-    pub async fn confirm_arweave_anchor(
-        &self,
-        id: &str,
-        deadline_height: i64,
-        receipt_sig: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE arweave_anchors SET status='confirmed', deadline_height=$1, receipt_sig=$2 WHERE id=$3",
-        )
-        .bind(deadline_height)
-        .bind(receipt_sig)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    /// Mark an anchor as failed (retries exhausted).
-    pub async fn fail_arweave_anchor(&self, id: &str) -> Result<()> {
-        sqlx::query("UPDATE arweave_anchors SET status='failed' WHERE id=$1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    /// List pending anchors that need confirmation check.
-    pub async fn list_pending_anchors(&self) -> Result<Vec<ArweaveAnchor>> {
-        let rows = sqlx::query(
-            "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, deadline_height, receipt_sig, cert_id
-             FROM arweave_anchors WHERE status='pending' ORDER BY anchored_at ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
         Ok(rows
             .into_iter()
             .map(|r| ArweaveAnchor {
@@ -5735,6 +5690,103 @@ mod ref_certificate_tests {
         );
     }
 
+    /// INV-7: upgrade-path test for migration v13 — seed a database at v12
+    /// with multiple same-repo/different-ref certificates (all at seq=1),
+    /// then let run_migrations() apply v13 and verify (a) seq values are
+    /// distinct per repo, (b) the (repo_id, seq) unique index exists and
+    /// rejects a raw INSERT with a colliding seq.
+    #[sqlx::test]
+    async fn v13_seq_backfill_via_migration(pool: PgPool) {
+        // 1. Bootstrap schema via the full migration chain.
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        // 2. Roll back to v12: drop the (repo_id, seq) index and the
+        //    schema_migrations record for v13 so run_migrations() re-applies it.
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_seq")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 13")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 3. Seed repos and certs (all with seq=DEFAULT 1).
+        let r1 = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&RepoRecord {
+            id: r1.clone(),
+            name: "v13-upgrade-a".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/v13-upgrade-a".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Insert 3 certs for repo r1 on different refs — all with seq=1 (DEFAULT).
+        for (i, ref_name) in ["refs/heads/main", "refs/heads/feature", "refs/heads/dev"]
+            .iter()
+            .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO ref_certificates
+                 (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(format!("v13-cert-{i}"))
+            .bind(&r1)
+            .bind(ref_name)
+            .bind("0000")
+            .bind("1111")
+            .bind("did:key:zPUSHER")
+            .bind("did:key:zNODE")
+            .bind("sig")
+            .bind(format!("2026-07-0{}T12:00:00Z", i + 1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // 4. Re-run migrations — v13 backfills seq.
+        db.run_migrations().await.unwrap();
+
+        // 5. Assert distinct seq values per repo.
+        let certs = db.list_ref_certificates(&r1, 10).await.unwrap();
+        assert_eq!(certs.len(), 3, "all three certs survive the migration");
+        let mut seqs: Vec<i64> = certs.iter().map(|c| c.seq).collect();
+        seqs.sort();
+        assert_eq!(seqs, vec![1, 2, 3], "seq values are distinct and ascending");
+
+        // 6. Raw INSERT with colliding seq must be rejected by the unique index.
+        let err = sqlx::query(
+            "INSERT INTO ref_certificates
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("collide-seq")
+        .bind(&r1)
+        .bind("refs/heads/other")
+        .bind("xxxx")
+        .bind("yyyy")
+        .bind("did:key:zPUSHER")
+        .bind("did:key:zNODE")
+        .bind("sig-collide")
+        .bind("2026-07-10T12:00:00Z")
+        .execute(&pool)
+        .await;
+        assert!(
+            err.is_err(),
+            "raw INSERT with default seq=1 must be rejected by the unique index"
+        );
+    }
+
     #[sqlx::test]
     async fn get_most_recent_cert_returns_highest_seq(pool: PgPool) {
         let db = db(pool).await;
@@ -5821,119 +5873,6 @@ mod arweave_anchor_tests {
         assert_eq!(anchors.len(), 1, "one anchor recorded");
         assert_eq!(anchors[0].status, "pending", "default status is pending");
         assert_eq!(anchors[0].arweave_tx_id, "test-tx-id-123");
-    }
-
-    #[sqlx::test]
-    async fn confirm_anchor_updates_status(pool: PgPool) {
-        let db = db(pool).await;
-        let input = RecordAnchorInputV2 {
-            repo: "bob/myrepo",
-            owner_did: "did:key:zOWNER",
-            ref_name: "refs/heads/main",
-            old_sha: "0000000000000000000000000000000000000000",
-            new_sha: "1111111111111111111111111111111111111111",
-            cid: None,
-            arweave_tx_id: "tx-confirm",
-            node_did: "did:key:zNODE",
-            cert_id: None,
-        };
-        db.record_arweave_anchor(&input).await.unwrap();
-
-        let anchors = db
-            .list_arweave_anchors(Some("bob/myrepo"), 10)
-            .await
-            .unwrap();
-        let id = &anchors[0].id;
-
-        db.confirm_arweave_anchor(id, 1234567, "receipt-sig-value")
-            .await
-            .unwrap();
-
-        let updated = db
-            .list_arweave_anchors(Some("bob/myrepo"), 10)
-            .await
-            .unwrap();
-        assert_eq!(updated[0].status, "confirmed");
-        assert_eq!(updated[0].deadline_height, Some(1234567));
-        assert_eq!(updated[0].receipt_sig, Some("receipt-sig-value".into()));
-    }
-
-    #[sqlx::test]
-    async fn fail_anchor_updates_status(pool: PgPool) {
-        let db = db(pool).await;
-        let input = RecordAnchorInputV2 {
-            repo: "carol/myrepo",
-            owner_did: "did:key:zOWNER",
-            ref_name: "refs/heads/main",
-            old_sha: "0000000000000000000000000000000000000000",
-            new_sha: "1111111111111111111111111111111111111111",
-            cid: None,
-            arweave_tx_id: "tx-fail",
-            node_did: "did:key:zNODE",
-            cert_id: None,
-        };
-        db.record_arweave_anchor(&input).await.unwrap();
-
-        let anchors = db
-            .list_arweave_anchors(Some("carol/myrepo"), 10)
-            .await
-            .unwrap();
-        let id = &anchors[0].id;
-
-        db.fail_arweave_anchor(id).await.unwrap();
-
-        let updated = db
-            .list_arweave_anchors(Some("carol/myrepo"), 10)
-            .await
-            .unwrap();
-        assert_eq!(updated[0].status, "failed");
-    }
-
-    #[sqlx::test]
-    async fn list_pending_anchors_returns_only_pending(pool: PgPool) {
-        let db = db(pool).await;
-
-        // Record two anchors for different repos
-        db.record_arweave_anchor(&RecordAnchorInputV2 {
-            repo: "dave/repo-a",
-            owner_did: "did:key:zOWNER",
-            ref_name: "refs/heads/main",
-            old_sha: "0000000000000000000000000000000000000000",
-            new_sha: "1111111111111111111111111111111111111111",
-            cid: None,
-            arweave_tx_id: "tx-pending-1",
-            node_did: "did:key:zNODE",
-            cert_id: None,
-        })
-        .await
-        .unwrap();
-
-        // Record a second anchor for a different repo
-        db.record_arweave_anchor(&RecordAnchorInputV2 {
-            repo: "dave/repo-b",
-            owner_did: "did:key:zOWNER",
-            ref_name: "refs/heads/feature",
-            old_sha: "aaaa",
-            new_sha: "bbbb",
-            cid: None,
-            arweave_tx_id: "tx-pending-2",
-            node_did: "did:key:zNODE",
-            cert_id: None,
-        })
-        .await
-        .unwrap();
-
-        let pending = db.list_pending_anchors().await.unwrap();
-        assert_eq!(pending.len(), 2, "both anchors are pending");
-
-        // Confirm one anchor
-        let first_id = pending[0].id.clone();
-        db.confirm_arweave_anchor(&first_id, 100, "sig")
-            .await
-            .unwrap();
-
-        let pending_after = db.list_pending_anchors().await.unwrap();
-        assert_eq!(pending_after.len(), 1, "only one pending remains");
     }
 }
 #[cfg(test)]

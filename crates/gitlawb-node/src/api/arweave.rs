@@ -6,8 +6,18 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::state::AppState;
+
+/// Validate an Arweave transaction ID: 43-character base64url string.
+fn is_valid_tx_id(tx_id: &str) -> bool {
+    if tx_id.len() != 43 {
+        return false;
+    }
+    tx_id
+        .bytes()
+        .all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
+}
 
 /// GET /api/v1/arweave/verify/:tx_id
 ///
@@ -20,6 +30,11 @@ pub async fn verify_anchor_endpoint(
     State(state): State<AppState>,
     Path(tx_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
+    if !is_valid_tx_id(&tx_id) {
+        return Err(AppError::BadRequest(
+            "invalid transaction ID: expected 43-character base64url".to_string(),
+        ));
+    }
     let gateway = &state.config.arweave_gateway;
     let result = crate::arweave::verify_anchor(&state.http_client, gateway, &tx_id, &state.db)
         .await
