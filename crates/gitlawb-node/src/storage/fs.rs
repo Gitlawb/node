@@ -49,21 +49,23 @@ impl FsBlobStore {
         PathBuf::from(os)
     }
 
-    /// Per-final-path lock serializing the sidecar+blob publish step of `put`.
+    /// Striped lock serializing the sidecar+blob publish step of `put`.
     /// The two renames are only pairwise-consistent when same-key puts don't
     /// interleave: unserialized, put A's content can land under put B's etag,
     /// and "etag unchanged ⇒ content unchanged" breaks in the direction that
-    /// serves stale data as current. (Same never-evicted-map tradeoff as
-    /// `archive::publish_lock` — bounded by distinct keys per process life.)
-    fn put_publish_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
-        use std::collections::HashMap;
-        use std::sync::{Arc, Mutex, OnceLock};
-        static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-        let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut map = locks.lock().expect("put publish lock map poisoned");
-        map.entry(path.to_path_buf())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    /// serves stale data as current. A fixed stripe array (same-key puts
+    /// always hash to the same stripe) bounds memory regardless of how many
+    /// distinct keys the process ever writes; cross-key collisions only cost
+    /// a moment of extra serialization on the cheap rename pair.
+    fn put_publish_lock(path: &Path) -> &'static std::sync::Mutex<()> {
+        use std::hash::{Hash, Hasher};
+        use std::sync::{Mutex, OnceLock};
+        const STRIPES: usize = 64;
+        static LOCKS: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+        let locks = LOCKS.get_or_init(|| (0..STRIPES).map(|_| Mutex::new(())).collect());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        &locks[(hasher.finish() as usize) % STRIPES]
     }
 
     /// Fallback fingerprint for objects written before the sidecar existed.
@@ -122,8 +124,9 @@ impl BlobStore for FsBlobStore {
                 // silently serve as current while stale. The publish pair is
                 // serialized per key so concurrent same-key puts can't
                 // interleave one put's etag with another's content.
-                let publish = Self::put_publish_lock(&path2);
-                let _guard = publish.lock().expect("put publish lock poisoned");
+                let _guard = Self::put_publish_lock(&path2)
+                    .lock()
+                    .expect("put publish lock poisoned");
                 std::fs::write(&sidecar_tmp, &etag).context("writing etag sidecar")?;
                 std::fs::rename(&sidecar_tmp, &sidecar).context("publishing etag sidecar")?;
                 std::fs::rename(&tmp, &path2).context("renaming blob into place")?;

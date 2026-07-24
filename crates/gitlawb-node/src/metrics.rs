@@ -287,6 +287,16 @@ pub fn set_pending_upload_markers(count: i64) {
     }
 }
 
+/// Adjust the pending-upload marker gauge by a delta (marker created = +1,
+/// marker removed = -1). The startup sweep seeds the absolute count via
+/// [`set_pending_upload_markers`]; runtime marker churn keeps it current
+/// through this.
+pub fn add_pending_upload_markers(delta: i64) {
+    if let Some(g) = PENDING_UPLOAD_MARKERS.get() {
+        g.add(delta);
+    }
+}
+
 /// Encode the registry as the standard Prometheus text exposition format.
 /// Returns an error if `init` was never called.
 pub fn encode() -> Result<String, prometheus::Error> {

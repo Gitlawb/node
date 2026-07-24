@@ -467,6 +467,11 @@ impl RepoStore {
             }
         }
 
+        // Seed the gauge with the surviving-marker count before processing;
+        // the clears below (and all runtime marker churn) then keep it
+        // current via deltas.
+        crate::metrics::set_pending_upload_markers(markers.len() as i64);
+
         for (slug, repo_name, local_path) in markers {
             if !local_path.exists() {
                 // Stale litter (repo dir gone) — storage is the best remaining
@@ -503,7 +508,6 @@ impl RepoStore {
                 }
             }
         }
-        crate::metrics::set_pending_upload_markers(still_pending as i64);
         (reuploaded, still_pending)
     }
 
@@ -992,11 +996,15 @@ fn mark_pending_upload(local_path: &Path, base_etag: Option<&str>) -> Result<()>
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })
-        .context("publishing pending-upload marker")
+        .context("publishing pending-upload marker")?;
+    crate::metrics::add_pending_upload_markers(1);
+    Ok(())
 }
 
 pub(crate) fn clear_pending_upload(local_path: &Path) {
-    let _ = std::fs::remove_file(pending_upload_marker(local_path));
+    if std::fs::remove_file(pending_upload_marker(local_path)).is_ok() {
+        crate::metrics::add_pending_upload_markers(-1);
+    }
 }
 
 /// Remove the marker after a *successful* upload, first atomically rewriting
@@ -1018,7 +1026,9 @@ fn clear_pending_upload_after_success(local_path: &Path, new_etag: Option<&str>)
             }
         }
     }
-    let _ = std::fs::remove_file(&marker);
+    if std::fs::remove_file(&marker).is_ok() {
+        crate::metrics::add_pending_upload_markers(-1);
+    }
 }
 
 /// Outcome of a marker-protected upload attempt.
