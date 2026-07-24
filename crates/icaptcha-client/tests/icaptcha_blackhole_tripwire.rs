@@ -13,6 +13,9 @@
 //! intercepts the connection and blocks it; without the blackhole the request
 //! would reach the server directly and succeed, turning this test RED.
 //!
+//! A positive control (disarmed blackhole) runs first, proving the fixture is
+//! valid and `127.0.0.2` is reachable.
+//!
 //! Design constraints (see issue #211):
 //!   - An unresolvable host would keep the request failing even when the guard
 //!     is disarmed (DNS failure masquerading as the blackhole), so we must use
@@ -45,10 +48,11 @@ fn serve_icaptcha(listener: TcpListener) {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut buf = [0; 4096];
-            if stream.read(&mut buf).is_err() {
-                continue;
-            }
-            let request = String::from_utf8_lossy(&buf);
+            let n = match stream.read(&mut buf) {
+                Ok(0) | Err(_) => continue,
+                Ok(n) => n,
+            };
+            let request = String::from_utf8_lossy(&buf[..n]);
             let body = if request.contains("/v1/answer") {
                 r#"{"status":"passed","proof":"PROOF-TRIP"}"#
             } else {
@@ -63,32 +67,48 @@ fn serve_icaptcha(listener: TcpListener) {
     });
 }
 
-#[test]
-fn obtain_proof_fails_when_blackhole_blocks_non_loopback_destination() {
-    // Start a listener on 127.0.0.2, a loopback alias NOT listed in NO_PROXY.
-    let listener = TcpListener::bind("127.0.0.2:0")
-        .expect("bind on 127.0.0.2 (requires OS support for 127/8 loopback)");
-    let port = listener.local_addr().unwrap().port();
-    serve_icaptcha(listener);
-
-    support::arm_blackhole("http://127.0.0.1:1");
-
-    let cfg = IcaptchaCfg {
-        url: format!("http://127.0.0.2:{port}"),
+fn make_cfg(url: &str) -> IcaptchaCfg {
+    IcaptchaCfg {
+        url: url.to_string(),
         did: "did:key:zTEST".to_string(),
         level: 1,
         api_key: None,
+    }
+}
+
+#[test]
+fn obtain_proof_blackhole_tripwire() {
+    // Try to bind to 127.0.0.2 — skip if the OS doesn't route 127/8 as
+    // loopback (macOS needs an explicit alias).
+    let listener = match TcpListener::bind("127.0.0.2:0") {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("SKIP: 127.0.0.2 not available ({e}); skipping tripwire test");
+            return;
+        }
     };
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.2:{port}");
+    serve_icaptcha(listener);
 
-    let solve = |_c: &Challenge| Some("silent".to_string());
-    let solver: &dyn Fn(&Challenge) -> Option<String> = &solve;
+    // ── Positive control: disarmed blackhole → obtain_proof succeeds ──────
+    let _disarmed_guard = support::disarm_proxy_env();
 
-    let result = obtain_proof(&cfg, Some(solver));
+    let solve: &dyn Fn(&Challenge) -> Option<String> = &|_c| Some("silent".to_string());
+    let cfg = make_cfg(&url);
+    let proof = obtain_proof(&cfg, Some(solve))
+        .expect("positive control: obtain_proof should succeed when the proxy is disarmed");
+    assert_eq!(
+        proof, "PROOF-TRIP",
+        "positive control: unexpected proof value"
+    );
+    drop(_disarmed_guard);
 
-    // The blackhole should block the connection via the proxy, producing a
-    // connect-level failure.  Narrowing the assertion to a reqwest connect
-    // error defends against fixture bugs that would otherwise make any error
-    // (e.g. deserialization of a truncated body) vacuously pass.
+    // ── Negative control: armed blackhole → obtain_proof fails with connect error ──
+    let _armed_guard = support::arm_blackhole("http://127.0.0.1:1");
+
+    let result = obtain_proof(&cfg, Some(solve));
+
     let err = result.expect_err(
         "blackhole tripwire: obtain_proof succeeded against 127.0.0.2, \
          meaning the proxy blackhole did not intercept the request; \
