@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::config::Config;
@@ -18,7 +19,12 @@ const REPOS_PER_PASS: usize = 100;
 /// after filtering out already-pinned objects so the cap reflects actual work.
 const MAX_OBJECTS_PER_REPO: usize = 50_000;
 
+/// Per-repo deadline for the blocking git scan (list_all_objects + visibility
+/// filter).  A pathological repo that stalls past this is skipped for the pass.
+const REPO_SCAN_DEADLINE: Duration = Duration::from_secs(300);
+
 /// Spawn the periodic reconciliation sweep background task.
+/// No-op when neither IPFS nor Pinata is configured.
 pub fn spawn(
     db: Arc<Db>,
     config: Arc<Config>,
@@ -27,6 +33,11 @@ pub fn spawn(
     node_did: gitlawb_core::did::Did,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    if config.ipfs_api.is_empty() && config.pinata_jwt.is_empty() {
+        tracing::info!("reconciliation sweep: neither IPFS nor Pinata configured, skipping spawn");
+        return;
+    }
+
     tokio::spawn(async move {
         let node_seed = *node_keypair.to_seed();
         let mut cursor = 0usize;
@@ -58,7 +69,6 @@ pub fn spawn(
                 }
             }
 
-            // Check shutdown before sleeping.
             if *shutdown_rx.borrow() {
                 tracing::info!("reconciliation sweep: shutdown signal received, exiting");
                 return;
@@ -87,14 +97,15 @@ async fn run_pass(
     cursor: &mut usize,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<(usize, usize, usize)> {
-    let all = db.list_all_repos_deduped().await?;
+    // Use stable ordering so a positional cursor deterministically covers every
+    // repo regardless of push activity — idle repos are not starved.
+    let all = db.list_all_repos_deduped_stable().await?;
 
     if all.is_empty() {
         *cursor = 0;
         return Ok((0, 0, 0));
     }
 
-    // Clamp the cursor so a shrinking eligible set never panics.
     let start = (*cursor).min(all.len());
     let end = (start + REPOS_PER_PASS).min(all.len());
     let batch = &all[start..end];
@@ -104,7 +115,6 @@ async fn run_pass(
     let mut total_gaps_filled = 0usize;
 
     for repo in batch {
-        // Cooperative shutdown: exit between repos if signal received.
         if *shutdown_rx.borrow() {
             tracing::info!("reconciliation sweep: shutdown signal received mid-pass, exiting");
             break;
@@ -134,33 +144,42 @@ async fn run_pass(
             continue;
         }
 
+        // Bound the blocking git scan with a deadline so a pathological repo
+        // cannot stall the entire pass.
         let disk_clone = disk.clone();
         let owner_clone = repo.owner_did.clone();
         let rules_clone = rules.clone();
         let is_public = repo.is_public;
-        let object_list = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-            let all_objs = crate::git::push_delta::list_all_objects(&disk_clone)?;
-            let allowed = crate::git::visibility_pack::replicable_blob_set(
-                &disk_clone,
-                &rules_clone,
-                is_public,
-                &owner_clone,
-            )?;
-            let all_blobs = crate::git::push_delta::all_blob_oids(&disk_clone)?;
-            Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
-                all_objs, &allowed, &all_blobs,
-            ))
-        })
+        let object_list = tokio::time::timeout(
+            REPO_SCAN_DEADLINE,
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                let all_objs = crate::git::push_delta::list_all_objects(&disk_clone)?;
+                let allowed = crate::git::visibility_pack::replicable_blob_set(
+                    &disk_clone,
+                    &rules_clone,
+                    is_public,
+                    &owner_clone,
+                )?;
+                let all_blobs = crate::git::push_delta::all_blob_oids(&disk_clone)?;
+                Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
+                    all_objs, &allowed, &all_blobs,
+                ))
+            }),
+        )
         .await;
 
-        let object_list = match object_list {
-            Ok(Ok(list)) => list,
-            Ok(Err(e)) => {
+        let object_list: Vec<String> = match object_list {
+            Ok(Ok(Ok(list))) => list,
+            Ok(Ok(Err(e))) => {
                 tracing::warn!(repo = %repo_slug, err = %e, "full-scan failed, skipping");
                 continue;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(repo = %repo_slug, err = %e, "full-scan task panicked, skipping");
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!(repo = %repo_slug, "full-scan deadline exceeded, skipping");
                 continue;
             }
         };
@@ -169,29 +188,14 @@ async fn run_pass(
             continue;
         }
 
-        // Pre-cap the object list before batch-filtering to keep queries bounded.
-        let candidates: Vec<String> = if object_list.len() > MAX_OBJECTS_PER_REPO {
-            tracing::warn!(
-                repo = %repo_slug,
-                cap = MAX_OBJECTS_PER_REPO,
-                total = object_list.len(),
-                "reconciliation per-repo candidate list truncated to cap"
-            );
-            object_list.into_iter().take(MAX_OBJECTS_PER_REPO).collect()
-        } else {
-            object_list
-        };
-
         // ── Phase 1: Public-object pinning (IPFS + Pinata) ────────────────
-        // Each backend independently tracks its own completion state, so we
-        // compute the actually-missing set per backend and cap independently.
-
+        // Compute the actually-missing set per backend from the FULL object
+        // list (no pre-cap) so trailing objects are never excluded.  The cap
+        // applies to the missing sets, bounding pin work.
         // Recheck quarantine before attempting any external pinning.
         match db.is_repo_quarantined(&repo.id).await {
             Ok(true) => {
-                tracing::warn!(repo = %repo_slug, "repo quarantined, skipping public-object pinning");
-                // Phase 2 (encrypted) is also skipped — a quarantined repo's
-                // withheld blobs should not be published either.
+                tracing::warn!(repo = %repo_slug, "repo quarantined, skipping");
                 continue;
             }
             Ok(false) => {}
@@ -201,55 +205,67 @@ async fn run_pass(
             }
         }
 
-        // Compute IPFS-missing set, capped per-repo.
-        let already_ipfs = db.filter_ipfs_pinned_oids(&candidates).await?;
-        let ipfs_missing_set: HashSet<&str> = candidates
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<HashSet<_>>()
-            .difference(&already_ipfs.iter().map(|s| s.as_str()).collect())
-            .copied()
-            .collect();
-        let mut ipfs_candidates: Vec<String> =
-            ipfs_missing_set.into_iter().map(String::from).collect();
-        if ipfs_candidates.len() > MAX_OBJECTS_PER_REPO {
-            ipfs_candidates.truncate(MAX_OBJECTS_PER_REPO);
-            tracing::warn!(
-                repo = %repo_slug,
-                cap = MAX_OBJECTS_PER_REPO,
-                "IPFS per-repo missing cap reached, truncating"
-            );
-        }
+        // IPFS-missing set (capped).
+        let already_ipfs = match db.filter_ipfs_pinned_oids(&object_list).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "filter_ipfs_pinned_oids failed, skipping");
+                continue;
+            }
+        };
+        let ipfs_missing: Vec<String> = {
+            let all_set: HashSet<&str> = object_list.iter().map(|s| s.as_str()).collect();
+            let done_set: HashSet<&str> = already_ipfs.iter().map(|s| s.as_str()).collect();
+            let mut v: Vec<String> = all_set
+                .difference(&done_set)
+                .map(|s| s.to_string())
+                .collect();
+            if v.len() > MAX_OBJECTS_PER_REPO {
+                v.truncate(MAX_OBJECTS_PER_REPO);
+                tracing::warn!(
+                    repo = %repo_slug,
+                    cap = MAX_OBJECTS_PER_REPO,
+                    "IPFS per-repo missing cap reached, truncating"
+                );
+            }
+            v
+        };
 
-        // Compute Pinata-missing set, capped per-repo.
-        let already_pinata = db.filter_pinata_pinned_oids(&candidates).await?;
-        let pinata_missing_set: HashSet<&str> = candidates
-            .iter()
-            .map(|s| s.as_str())
-            .collect::<HashSet<_>>()
-            .difference(&already_pinata.iter().map(|s| s.as_str()).collect())
-            .copied()
-            .collect();
-        let mut pinata_candidates: Vec<String> =
-            pinata_missing_set.into_iter().map(String::from).collect();
-        if pinata_candidates.len() > MAX_OBJECTS_PER_REPO {
-            pinata_candidates.truncate(MAX_OBJECTS_PER_REPO);
-            tracing::warn!(
-                repo = %repo_slug,
-                cap = MAX_OBJECTS_PER_REPO,
-                "Pinata per-repo missing cap reached, truncating"
-            );
-        }
+        // Pinata-missing set (capped).
+        let already_pinata = match db.filter_pinata_pinned_oids(&object_list).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "filter_pinata_pinned_oids failed, skipping");
+                continue;
+            }
+        };
+        let pinata_missing: Vec<String> = {
+            let all_set: HashSet<&str> = object_list.iter().map(|s| s.as_str()).collect();
+            let done_set: HashSet<&str> = already_pinata.iter().map(|s| s.as_str()).collect();
+            let mut v: Vec<String> = all_set
+                .difference(&done_set)
+                .map(|s| s.to_string())
+                .collect();
+            if v.len() > MAX_OBJECTS_PER_REPO {
+                v.truncate(MAX_OBJECTS_PER_REPO);
+                tracing::warn!(
+                    repo = %repo_slug,
+                    cap = MAX_OBJECTS_PER_REPO,
+                    "Pinata per-repo missing cap reached, truncating"
+                );
+            }
+            v
+        };
 
         let pinned_ipfs =
-            crate::ipfs_pin::pin_new_objects(&config.ipfs_api, &disk, ipfs_candidates, db).await;
+            crate::ipfs_pin::pin_new_objects(&config.ipfs_api, &disk, ipfs_missing, db).await;
 
         let pinned_pinata = crate::pinata::pin_new_objects(
             http_client,
             &config.pinata_upload_url,
             &config.pinata_jwt,
             &disk,
-            pinata_candidates,
+            pinata_missing,
             db,
         )
         .await;
@@ -276,20 +292,18 @@ async fn run_pass(
         }
 
         // ── Phase 2: Encrypted recovery-copy resealing (withheld blobs) ──
-        // Only relevant when path-scoped visibility rules exist — without them
-        // no blobs are withheld and withheld_blob_recipients returns empty.
 
         // Recheck quarantine before encrypted pinning.
-        let quarantined = match db.is_repo_quarantined(&repo.id).await {
-            Ok(q) => q,
+        match db.is_repo_quarantined(&repo.id).await {
+            Ok(true) => {
+                tracing::warn!(repo = %repo_slug, "repo quarantined, skipping encrypted pinning");
+                continue;
+            }
+            Ok(false) => {}
             Err(e) => {
                 tracing::warn!(repo = %repo_slug, err = %e, "quarantine recheck failed, skipping encrypted pin");
                 continue;
             }
-        };
-        if quarantined {
-            tracing::warn!(repo = %repo_slug, "repo quarantined, skipping encrypted pinning");
-            continue;
         }
 
         let has_path_scoped = crate::git::visibility_pack::has_path_scoped_rule(&rules);
@@ -315,47 +329,56 @@ async fn run_pass(
                     )
                     .await;
 
-                    // Anchor ALL existing encrypted blobs for this repo, not
-                    // just the ones encrypted this pass.  This ensures that if
-                    // a prior manifest anchor failed the retry will include
-                    // previously-encrypted blobs too.
-                    let all_existing = db.list_all_encrypted_blobs(&repo.id).await?;
-                    if !all_existing.is_empty() && !config.irys_url.is_empty() {
-                        let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
-                        let slug = format!("{}/{}", owner_short, repo.name);
-                        let ts = chrono::Utc::now().to_rfc3339();
-                        let node_did_str = node_did.to_string();
-
-                        // Merge existing blobs with freshly-sealed ones,
-                        // preferring later entries (newly-sealed) on conflict.
-                        let mut blob_map: HashMap<String, String> = HashMap::new();
-                        for (oid, cid) in &all_existing {
-                            blob_map.insert(oid.clone(), cid.clone());
-                        }
-                        for (oid, cid) in &sealed {
-                            blob_map.insert(oid.clone(), cid.clone());
-                        }
-                        let merged: Vec<(String, String)> = blob_map.into_iter().collect();
-
-                        let manifest = crate::arweave::EncryptedManifest {
-                            repo: &slug,
-                            owner_did: &repo.owner_did,
-                            node_did: &node_did_str,
-                            timestamp: &ts,
-                            blobs: &merged,
+                    // Anchor only when something was newly sealed this pass.
+                    // This avoids unbounded Irys writes on a timer — repos
+                    // with no withheld changes do not re-anchor the manifest.
+                    if !sealed.is_empty() && !config.irys_url.is_empty() {
+                        let all_existing = match db.list_all_encrypted_blobs(&repo.id).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    repo = %repo_slug,
+                                    err = %e,
+                                    "list_all_encrypted_blobs failed, skipping anchor"
+                                );
+                                continue;
+                            }
                         };
-                        if let Err(e) = crate::arweave::anchor_encrypted_manifest(
-                            http_client,
-                            &config.irys_url,
-                            &manifest,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                repo = %slug,
-                                err = %e,
-                                "encrypted manifest anchor failed (will retry next pass)"
-                            );
+                        if !all_existing.is_empty() {
+                            let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
+                            let slug = format!("{}/{}", owner_short, repo.name);
+                            let ts = chrono::Utc::now().to_rfc3339();
+                            let node_did_str = node_did.to_string();
+
+                            let mut blob_map: HashMap<String, String> = HashMap::new();
+                            for (oid, cid) in &all_existing {
+                                blob_map.insert(oid.clone(), cid.clone());
+                            }
+                            for (oid, cid) in &sealed {
+                                blob_map.insert(oid.clone(), cid.clone());
+                            }
+                            let merged: Vec<(String, String)> = blob_map.into_iter().collect();
+
+                            let manifest = crate::arweave::EncryptedManifest {
+                                repo: &slug,
+                                owner_did: &repo.owner_did,
+                                node_did: &node_did_str,
+                                timestamp: &ts,
+                                blobs: &merged,
+                            };
+                            if let Err(e) = crate::arweave::anchor_encrypted_manifest(
+                                http_client,
+                                &config.irys_url,
+                                &manifest,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    repo = %slug,
+                                    err = %e,
+                                    "encrypted manifest anchor failed (will retry next pass)"
+                                );
+                            }
                         }
                     }
                 }
@@ -379,4 +402,24 @@ async fn run_pass(
     }
 
     Ok((batch.len(), total_gaps_found, total_gaps_filled))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A helper that returns a Config with nothing configured so the spawn
+    /// returns early.  Used to verify the no-op gating.
+    #[tokio::test]
+    async fn test_spawn_is_noop_when_no_backend_configured() {
+        let db = Arc::new(Db::new_in_memory());
+        let config = Arc::new(Config::default());
+        let http_client = Arc::new(reqwest::Client::new());
+        let node_keypair = Arc::new(gitlawb_core::identity::Keypair::generate());
+        let node_did = gitlawb_core::did::Did::from_keypair(&node_keypair);
+        let (_tx, rx) = watch::channel(false);
+
+        // spawn returns immediately when neither IPFS nor Pinata is configured
+        spawn(db, config, http_client, node_keypair, node_did, rx);
+    }
 }
