@@ -1,6 +1,6 @@
-//! Arweave permanent anchoring via Irys.
+//! Arweave permanent anchoring via Bundler (Irys).
 //!
-//! Every ref-update event (push) is anchored to Arweave through the Irys
+//! Every ref-update event (push) is anchored to Arweave through the Bundler
 //! network. The anchor payload is a small JSON object containing:
 //!
 //!   { repo, owner_did, ref_name, old_sha, new_sha, cid, timestamp, node_did }
@@ -8,12 +8,15 @@
 //! Irys allows free uploads for data < 100 KiB on both devnet and mainnet
 //! (via Turbo). No wallet is required for payloads under the free threshold.
 //!
-//! Set `GITLAWB_IRYS_URL` to override the default endpoint:
+//! Set `GITLAWB_BUNDLER_URL` (deprecated name: `GITLAWB_IRYS_URL`) to override the default endpoint:
 //!   - devnet (free, no cost): https://devnet.irys.xyz
 //!   - mainnet:                https://node2.irys.xyz
 //!
-//! Each anchor returns an Irys transaction ID (43-char base58 string).
-//! The permanent Arweave URL is: https://arweave.net/<tx_id>
+//! Configure `GITLAWB_ARWEAVE_GATEWAY` to override the gateway used for resolving anchors
+//! (defaults to https://arweave.net).
+//!
+//! Each anchor returns a transaction ID (43-char base58 string).
+//! The permanent Arweave URL is: <gateway>/<tx_id>
 //!
 //! Anchors are stored in the `arweave_anchors` table for auditability.
 
@@ -408,11 +411,30 @@ pub async fn verify_anchor(
         let payload_bytes = serde_json::to_vec(&payload)?;
 
         // Resolve node DID to public key
-        let node_did = gitlawb_core::did::Did::from_str(&c.node_did)
-            .map_err(|e| anyhow::anyhow!("invalid node DID: {e}"))?;
-        let verifying_key = node_did
-            .to_verifying_key()
-            .map_err(|e| anyhow::anyhow!("unresolvable node DID: {e}"))?;
+        let node_did = match gitlawb_core::did::Did::from_str(&c.node_did) {
+            Ok(did) => did,
+            Err(e) => {
+                errors.push(format!("invalid node DID: {e}"));
+                return Ok(VerifyResult {
+                    valid: false,
+                    anchor,
+                    certificate: cert,
+                    errors,
+                });
+            }
+        };
+        let verifying_key = match node_did.to_verifying_key() {
+            Ok(vk) => vk,
+            Err(e) => {
+                errors.push(format!("unresolvable node DID: {e}"));
+                return Ok(VerifyResult {
+                    valid: false,
+                    anchor,
+                    certificate: cert,
+                    errors,
+                });
+            }
+        };
 
         let sig_array: [u8; 64] =
             match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&c.signature) {
@@ -818,5 +840,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_verify_anchor_malformed_node_did() {
+        let mut server = mockito::Server::new_async().await;
+
+        let bad_cert_json = serde_json::json!({
+            "certificate": {
+                "id": "cert-1",
+                "repo_id": "repo-uuid",
+                "ref_name": "refs/heads/main",
+                "old_sha": "0000000000000000000000000000000000000000",
+                "new_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+                "pusher_did": "did:key:zPusher",
+                "node_did": "malformed-node-did",
+                "signature": "c2lnbmF0dXJl",
+                "issued_at": "2026-06-11T00:00:00Z",
+                "seq": 1,
+                "prev": "0000000000000000000000000000000000000000000000000000000000000000",
+            },
+            "repo_id": "repo-uuid",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0000000000000000000000000000000000000000",
+            "new_sha": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            "node_did": "malformed-node-did",
+        });
+
+        let _mock = server
+            .mock("GET", "/test-tx")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&bad_cert_json).unwrap())
+            .create_async()
+            .await;
+
+        let client = reqwest::Client::new();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
+            .expect("lazy pool creation should not fail");
+        let db = crate::db::Db::for_testing(pool);
+
+        let result = verify_anchor(&client, &server.url(), "test-tx", &db).await;
+        assert!(result.is_ok(), "Expected Ok response, got Err: {:?}", result);
+
+        let verify_result = result.unwrap();
+        assert!(!verify_result.valid, "VerifyResult should be invalid");
+        assert!(
+            verify_result.errors.iter().any(|e| e.contains("invalid node DID")),
+            "Expected 'invalid node DID' error in: {:?}",
+            verify_result.errors
+        );
     }
 }

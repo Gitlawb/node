@@ -158,7 +158,10 @@ async fn cmd_show(
     let issued_at = cert["issued_at"].as_str().unwrap_or("?");
     let seq = cert["seq"].as_i64().unwrap_or(0);
     let prev = cert["prev"].as_str().unwrap_or("?");
-    let pusher_sig = cert["pusher_sig"].as_str().map(|s| s.to_string());
+    let pusher_sig = cert["pusher_sig"].as_str();
+    let signature_input = cert["signature_input"].as_str();
+    let content_digest = cert["content_digest"].as_str();
+    let request_path = cert["request_path"].as_str();
 
     println!("Ref Certificate: {cert_id}");
     println!("  Ref:       {ref_name}");
@@ -187,7 +190,10 @@ async fn cmd_show(
         issued_at,
         seq,
         prev,
-        pusher_sig.as_deref(),
+        pusher_sig,
+        signature_input,
+        content_digest,
+        request_path,
         signature,
     );
 
@@ -268,6 +274,9 @@ fn verify_signature(
     seq: i64,
     prev: &str,
     pusher_sig: Option<&str>,
+    signature_input: Option<&str>,
+    content_digest: Option<&str>,
+    request_path: Option<&str>,
     signature_b64: &str,
 ) -> std::result::Result<(), String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -284,6 +293,9 @@ fn verify_signature(
         "seq":     seq,
         "prev":    prev,
         "pusher_sig": pusher_sig,
+        "signature_input": signature_input,
+        "content_digest": content_digest,
+        "request_path": request_path,
     });
     let payload_bytes =
         serde_json::to_vec(&payload).map_err(|e| format!("could not serialize payload: {e}"))?;
@@ -357,12 +369,15 @@ mod tests {
             "seq":     1,
             "prev":   "0000000000000000000000000000000000000000000000000000000000000000",
             "pusher_sig": serde_json::Value::Null,
+            "signature_input": serde_json::Value::Null,
+            "content_digest": serde_json::Value::Null,
+            "request_path": serde_json::Value::Null,
         });
         let frozen = concat!(
-            r#"{"new":"newsha","node":"did:key:z6MkNode","old":"oldsha","#,
+            r#"{"content_digest":null,"new":"newsha","node":"did:key:z6MkNode","old":"oldsha","#,
             r#""prev":"0000000000000000000000000000000000000000000000000000000000000000","#,
-            r#""pusher":"did:key:z6MkPusher","pusher_sig":null,"#,
-            r#""ref":"refs/heads/main","repo_id":"repo-1","seq":1,"#,
+            r#""pusher":"did:key:z6MkPusher","pusher_sig":null,"ref":"refs/heads/main","#,
+            r#""repo_id":"repo-1","request_path":null,"seq":1,"signature_input":null,"#,
             r#""ts":"2026-07-22T00:00:00+00:00"}"#,
         );
         assert_eq!(serde_json::to_string(&payload).unwrap(), frozen);
@@ -387,6 +402,9 @@ mod tests {
             "seq":     1,
             "prev":    prev,
             "pusher_sig": serde_json::Value::Null,
+            "signature_input": serde_json::Value::Null,
+            "content_digest": serde_json::Value::Null,
+            "request_path": serde_json::Value::Null,
         });
         let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
 
@@ -400,6 +418,9 @@ mod tests {
             "2026-07-22T00:00:00+00:00",
             1,
             prev,
+            None,
+            None,
+            None,
             None,
             &sig,
         );
@@ -416,6 +437,9 @@ mod tests {
             1,
             prev,
             None,
+            None,
+            None,
+            None,
             &sig,
         );
         assert!(tampered.is_err(), "tampered payload must not verify");
@@ -431,8 +455,58 @@ mod tests {
             1,
             prev,
             None,
+            None,
+            None,
+            None,
             "not-base64url!!!",
         );
         assert!(garbage.is_err(), "malformed signature must not verify");
+    }
+
+    #[test]
+    fn verify_signature_all_fields_populated() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let pusher_sig = "sig-123";
+        let signature_input = "sig-input-123";
+        let content_digest = "sha256-123";
+        let request_path = "/repo.git/git-receive-pack";
+
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+            "seq":     1,
+            "prev":    prev,
+            "pusher_sig": pusher_sig,
+            "signature_input": signature_input,
+            "content_digest": content_digest,
+            "request_path": request_path,
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+
+        let ok = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            Some(pusher_sig),
+            Some(signature_input),
+            Some(content_digest),
+            Some(request_path),
+            &sig,
+        );
+        assert!(ok.is_ok(), "expected valid signature, got: {ok:?}");
     }
 }
