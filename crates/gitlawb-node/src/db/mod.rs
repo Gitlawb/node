@@ -884,6 +884,18 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
+    Migration {
+        version: 12,
+        name: "pinned_cids_cid_nullable",
+        stmts: &[
+            // Allow cid to be NULL so record_pinata_cid can create Pinata-only
+            // rows without a local IPFS CID.  has_ipfs_cid uses
+            // "cid IS NOT NULL AND cid IS DISTINCT FROM pinata_cid" so that
+            // legacy rows where cid was set to pinata_cid as fallback are
+            // still correctly classified.
+            "ALTER TABLE pinned_cids ALTER COLUMN cid DROP NOT NULL",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1218,6 +1230,27 @@ impl Db {
                  d.forked_from, d.machine_id
              FROM deduped d
              ORDER BY d.updated_at DESC",
+            Self::dedup_cte()
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Like `list_all_repos_deduped` but ordered by a stable key (`id`) so a
+    /// positional cursor deterministically covers every repo regardless of push
+    /// activity.  Used by the reconciliation sweep to avoid starving idle repos.
+    pub async fn list_all_repos_deduped_stable(&self) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             ORDER BY d.id ASC",
             Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
