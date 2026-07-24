@@ -2822,6 +2822,7 @@ async fn post_receive_replication_tail(
                     let cert_id = cert.as_ref().map(|c| c.id.clone());
                     let anchor = crate::arweave::RefAnchor {
                         repo: repo_slug.clone(),
+                        repo_id: record.id.clone(),
                         owner_did: owner_did_for_arweave.clone(),
                         ref_name: ref_name.clone(),
                         old_sha: old_sha.clone(),
@@ -2835,7 +2836,7 @@ async fn post_receive_replication_tail(
                         .await
                     {
                         Ok(tx_id) if !tx_id.is_empty() => {
-                            let _ = db_clone
+                            if let Err(e) = db_clone
                                 .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
                                     repo: &repo_slug,
                                     owner_did: &owner_did_for_arweave,
@@ -2847,7 +2848,10 @@ async fn post_receive_replication_tail(
                                     node_did: &node_did_str,
                                     cert_id,
                                 })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(repo=%repo_slug, tx_id=%tx_id, err=%e, "failed to persist arweave anchor");
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => {

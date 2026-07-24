@@ -241,17 +241,23 @@ pub async fn list_repo_events(
         .iter()
         .map(|c| {
             serde_json::json!({
-                "type":       "local_cert",
-                "id":         c.id,
-                "repo":       repo_id_str,
-                "ref_name":   c.ref_name,
-                "old_sha":    c.old_sha,
-                "new_sha":    c.new_sha,
-                "pusher_did": c.pusher_did,
-                "node_did":   c.node_did,
-                "timestamp":  c.issued_at,
-                "owner_did":  record.owner_did,
-                "source":     "local",
+                "type":             "local_cert",
+                "id":               c.id,
+                "repo":             repo_id_str,
+                "ref_name":         c.ref_name,
+                "old_sha":          c.old_sha,
+                "new_sha":          c.new_sha,
+                "pusher_did":       c.pusher_did,
+                "node_did":         c.node_did,
+                "timestamp":        c.issued_at,
+                "seq":              c.seq,
+                "prev":             c.prev,
+                "pusher_sig":       c.pusher_sig,
+                "signature_input":  c.signature_input,
+                "content_digest":   c.content_digest,
+                "request_path":     c.request_path,
+                "owner_did":        record.owner_did,
+                "source":           "local",
             })
         })
         .collect();
