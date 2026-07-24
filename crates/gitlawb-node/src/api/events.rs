@@ -1440,7 +1440,8 @@ mod ref_updates_feed_tests {
 
     // A DB error in the gate fails closed as 500, not swallowed into an empty 200 (the
     // regression the old get_repo().ok().flatten() allowed). Inject by dropping a
-    // column get_repo selects so its query errors.
+    // column get_repo selects so its query errors. Also assert the body is opaque
+    // (#226): schema text must not reach an anonymous caller.
     #[sqlx::test]
     async fn repo_events_db_error_fails_closed_500(pool: PgPool) {
         let state = test_state(pool.clone()).await;
@@ -1462,6 +1463,22 @@ mod ref_updates_feed_tests {
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a DB error must fail closed (500), never serve an empty 200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("is_public"),
+            "DB schema detail leaked to anonymous caller: {body}"
+        );
+        assert!(
+            !body.contains("column"),
+            "DB schema detail leaked to anonymous caller: {body}"
+        );
+        assert!(
+            body.contains("db_error") || body.contains("internal_error"),
+            "expected opaque error code, got: {body}"
         );
     }
 

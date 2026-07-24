@@ -89,6 +89,10 @@ impl From<anyhow::Error> for AppError {
 /// logged server-side; never put sqlx/anyhow detail in the HTTP body (#226).
 pub const INTERNAL_ERROR_MESSAGE: &str = "an internal error occurred";
 
+/// Generic client-facing message for non-unavailable `AppError::Db`. Query /
+/// schema errors stay in logs; the HTTP body must not leak them (#226).
+pub const DB_ERROR_MESSAGE: &str = "a database error occurred";
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // iCaptcha challenges carry structured discovery so clients don't have to
@@ -151,9 +155,19 @@ impl IntoResponse for AppError {
                 DB_UNAVAILABLE_CODE,
                 DB_UNAVAILABLE_MESSAGE.into(),
             ),
-            AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
-            // Opaque body: raw sqlx/anyhow text must not reach unauthenticated
-            // callers (GET /ipfs/{cid} and siblings map DB failures here) (#226).
+            // Opaque body + server log: bare `?` on sqlx paths becomes `AppError::Db`
+            // via `From`, so this arm (not `Internal`) is the common leak for open
+            // routes like GET /api/v1/repos and GET /api/v1/peers (#226).
+            AppError::Db(e) => {
+                tracing::error!(error = %e, "database error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db_error",
+                    DB_ERROR_MESSAGE.into(),
+                )
+            }
+            // Opaque body: handlers that map with `.map_err(AppError::Internal)`
+            // (e.g. GET /ipfs/{cid}) land here; other DB failures usually hit `Db`.
             AppError::Internal(e) => {
                 tracing::error!(error = %e, "internal error");
                 (
@@ -214,6 +228,32 @@ mod tests {
         assert!(
             !rendered.contains(leak),
             "raw internal error leaked into body: {rendered}"
+        );
+    }
+
+    /// #226: `AppError::Db` query errors (the common `?` path) must also be opaque.
+    #[tokio::test]
+    async fn db_error_body_is_opaque() {
+        let resp = AppError::Db(sqlx::Error::Protocol(
+            "error returned from database: column \"is_public\" does not exist".into(),
+        ))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(v["error"], "db_error");
+        assert_eq!(v["message"], DB_ERROR_MESSAGE);
+        let rendered = String::from_utf8_lossy(&bytes);
+        assert!(
+            !rendered.contains("is_public"),
+            "DB schema detail leaked into body: {rendered}"
+        );
+        assert!(
+            !rendered.contains("column"),
+            "DB schema detail leaked into body: {rendered}"
         );
     }
 }
