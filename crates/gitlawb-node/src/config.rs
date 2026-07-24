@@ -174,8 +174,14 @@ pub struct Config {
     /// Max connections in the dedicated advisory-lock pool. A push pins one
     /// connection for its whole lifetime (lock held across receive-pack and
     /// the storage upload), so this bounds per-node push concurrency. Counts
-    /// against Postgres `max_connections` on top of the handler pool.
-    #[arg(long, env = "GITLAWB_ADVISORY_LOCK_POOL_SIZE", default_value_t = 16)]
+    /// against Postgres `max_connections` on top of the handler pool. Must be
+    /// at least 1 — zero would let the node start but time out every write.
+    #[arg(
+        long,
+        env = "GITLAWB_ADVISORY_LOCK_POOL_SIZE",
+        default_value_t = 16,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub advisory_lock_pool_size: u32,
 
     /// Maximum pack body size for git-receive-pack and git-upload-pack, in bytes.
@@ -314,6 +320,23 @@ mod tests {
         // 0 is a footgun (immediate-504 on every request); clap must reject it.
         assert!(
             Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn advisory_lock_pool_size_defaults_to_16_and_rejects_zero() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).advisory_lock_pool_size,
+            16
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--advisory-lock-pool-size", "1"])
+                .advisory_lock_pool_size,
+            1
+        );
+        // 0 would let the node start but time out every write on pool acquire.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--advisory-lock-pool-size", "0"]).is_err()
         );
     }
 }

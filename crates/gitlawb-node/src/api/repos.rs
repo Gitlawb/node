@@ -208,10 +208,12 @@ pub async fn create_repo(
     let verified_proof = proof.consume(&state.db).await?;
 
     // Claim-first ordering: insert the DB row before creating anything durable.
-    // The row is the claim on (owner, name) — a concurrent same-name create
-    // loses at the insert with nothing on disk or in storage yet, so failure
-    // compensation below only ever touches state THIS attempt created and can
-    // never delete a racing winner's repo or archive.
+    // Within one node's database the row is the claim on (owner, name) — a
+    // concurrent same-name create loses at the insert with nothing on disk or
+    // in storage yet. Across nodes (each fly app has its own Postgres) the
+    // insert arbitrates nothing; the cross-node safety property is that
+    // failure compensation below only ever touches state THIS attempt created
+    // (its own row by id, its own local dir) and never deletes a storage key.
     let disk_path = store::repo_disk_path(&state.config.repos_dir, &owner_did, &req.name);
     let now = Utc::now();
     let record = crate::db::RepoRecord {
@@ -955,7 +957,11 @@ pub async fn git_receive_pack(
     // from blocking subsequent pushes. Only upload to storage when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
     let push_ok = receive_result.is_ok();
+    // `Some` = the guard still needs a synchronous (strict) release; taken by
+    // the write-back path only once its intent marker is durably on disk.
+    let mut strict_guard = Some(guard);
     if push_ok && state.config.async_upload {
+        let guard = strict_guard.take().expect("guard present before release");
         // Write-back: ack the client now; the durable upload to object storage
         // and the advisory-lock release run in the background. The lock is held
         // until the upload finishes, so a concurrent writer on another machine
@@ -972,17 +978,29 @@ pub async fn git_receive_pack(
         // The intent marker must be on disk BEFORE the ack: the spawned task
         // may never be polled if the process stops right after the response,
         // and without the marker a restart would treat the stale storage
-        // archive as newer and roll the acked push back.
-        guard.mark_pending().await;
-        let repo_label = name.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = guard.release(true).await {
-                tracing::error!(repo = %repo_label, err = %e,
-                    "write-back durable upload failed after push was acked");
+        // archive as newer and roll the acked push back. If the marker itself
+        // cannot be persisted, do NOT ack early — fall back to the strict
+        // upload-before-ack path below.
+        match guard.mark_pending().await {
+            Ok(()) => {
+                let repo_label = name.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = guard.release(true).await {
+                        tracing::error!(repo = %repo_label, err = %e,
+                            "write-back durable upload failed after push was acked");
+                    }
+                });
             }
-        });
-    } else {
-        // Strict path (or failed push): upload-before-ack.
+            Err(e) => {
+                tracing::warn!(repo = %name, err = %e,
+                    "pending-upload marker write failed — falling back to strict upload-before-ack");
+                strict_guard = Some(guard);
+            }
+        }
+    }
+    if let Some(guard) = strict_guard {
+        // Strict path (failed push, async_upload off, or marker write failure):
+        // upload-before-ack.
         if let Err(e) = guard.release(push_ok).await {
             if push_ok {
                 // A successful push whose durable upload then failed — the
@@ -1622,11 +1640,13 @@ pub async fn fork_repo(
     let disk_path = store::repo_disk_path(&state.config.repos_dir, &forker_did, &fork_name);
 
     // Claim-first ordering: insert the DB row before cloning or uploading
-    // anything. The row is the claim on (owner, name) — a concurrent same-name
-    // fork loses at the insert with nothing on disk or in storage, so the
-    // failure compensation below only ever removes state THIS attempt created
-    // (its own row by id, its own clone dir) and never touches a storage
-    // archive that may belong to a racing winner's live repo.
+    // anything. Within one node's database the row is the claim on (owner,
+    // name) — a concurrent same-name fork loses at the insert with nothing on
+    // disk or in storage. Across nodes (per-node Postgres) the insert
+    // arbitrates nothing; the cross-node safety property is that the failure
+    // compensation below only ever removes state THIS attempt created (its own
+    // row by id, its own clone dir) and never touches a storage archive that
+    // may belong to a racing winner's live repo.
     let now = Utc::now();
     let record = crate::db::RepoRecord {
         id: Uuid::new_v4().to_string(),
@@ -1647,6 +1667,13 @@ pub async fn fork_repo(
     // our generated id) and whatever `git clone` left at `disk_path` — clone
     // can create the destination before failing, and an orphaned dir makes a
     // retry fail on an existing destination.
+    //
+    // KNOWN COMPOUND-FAILURE WINDOW: the row makes the fork pushable before
+    // the clone+upload complete, and this flow holds no advisory lock across
+    // that phase. A push acked in the window, whose own upload also failed,
+    // lives only in this dir — undoing the claim then discards it. Requires
+    // fork-upload failure + an interleaved push + that push's upload failure;
+    // the follow-up is to hold the advisory lock across clone+publication.
     let undo_claim = |state: AppState, record_id: String, disk_path: std::path::PathBuf| async move {
         match tokio::fs::remove_dir_all(&disk_path).await {
             Ok(()) => {}
@@ -1656,6 +1683,9 @@ pub async fn fork_repo(
                 "failed to clean up local fork dir after fork error"
             ),
         }
+        // Also drop the pending-upload marker a failed upload just wrote: left
+        // behind, it would read as divergence and wedge a same-name recreate.
+        crate::git::repo_store::clear_pending_upload(&disk_path);
         if let Err(e) = state.db.delete_repo_by_id(&record_id).await {
             tracing::warn!(record_id = %record_id, err = %e,
                 "failed to remove fork row after fork error");

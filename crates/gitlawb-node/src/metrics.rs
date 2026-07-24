@@ -15,6 +15,8 @@
 //!     `gitlawb_pack_size_bytes`
 //!   * a single `gitlawb_info{version, did}` gauge = 1, for joins/dashboards
 //!   * currently-connected peer count — `gitlawb_peers_connected`
+//!   * repos whose local copy is ahead of durable storage —
+//!     `gitlawb_pending_upload_markers`
 //!
 //! All metrics live in a single process-wide registry initialized by
 //! [`init`]. Increment helpers (`record_push`, `record_auth_failure`, ...)
@@ -51,6 +53,7 @@ static SYNC_PROCESSED: OnceLock<IntCounterVec> = OnceLock::new();
 static WEBHOOK_DELIVERIES: OnceLock<IntCounterVec> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
 static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
+static PENDING_UPLOAD_MARKERS: OnceLock<IntGauge> = OnceLock::new();
 
 /// One-time initializer. Builds the registry, registers every metric,
 /// and sets the constant `gitlawb_info` gauge. Idempotent — calling
@@ -197,6 +200,18 @@ pub fn init(version: &str, node_did: &str) {
         .set(peers_connected)
         .expect("set PEERS_CONNECTED once");
 
+    let pending_markers = IntGauge::with_opts(Opts::new(
+        "gitlawb_pending_upload_markers",
+        "Repos whose local copy is ahead of durable storage (pending-upload markers outstanding)",
+    ))
+    .expect("gitlawb_pending_upload_markers definition");
+    registry
+        .register(Box::new(pending_markers.clone()))
+        .expect("register gitlawb_pending_upload_markers");
+    PENDING_UPLOAD_MARKERS
+        .set(pending_markers)
+        .expect("set PENDING_UPLOAD_MARKERS once");
+
     REGISTRY
         .set(registry)
         .expect("set REGISTRY once (init must be called exactly once)");
@@ -260,6 +275,14 @@ pub fn observe_pack_size(bytes: f64) {
 /// Update the currently-connected peer count gauge.
 pub fn set_peers_connected(count: i64) {
     if let Some(g) = PEERS_CONNECTED.get() {
+        g.set(count);
+    }
+}
+
+/// Update the outstanding pending-upload marker gauge (repos whose local copy
+/// is ahead of durable storage).
+pub fn set_pending_upload_markers(count: i64) {
+    if let Some(g) = PENDING_UPLOAD_MARKERS.get() {
         g.set(count);
     }
 }

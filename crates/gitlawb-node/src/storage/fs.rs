@@ -49,6 +49,23 @@ impl FsBlobStore {
         PathBuf::from(os)
     }
 
+    /// Per-final-path lock serializing the sidecar+blob publish step of `put`.
+    /// The two renames are only pairwise-consistent when same-key puts don't
+    /// interleave: unserialized, put A's content can land under put B's etag,
+    /// and "etag unchanged ⇒ content unchanged" breaks in the direction that
+    /// serves stale data as current. (Same never-evicted-map tradeoff as
+    /// `archive::publish_lock` — bounded by distinct keys per process life.)
+    fn put_publish_lock(path: &Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+        static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+        let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = locks.lock().expect("put publish lock map poisoned");
+        map.entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Fallback fingerprint for objects written before the sidecar existed.
     fn legacy_etag(md: &std::fs::Metadata) -> String {
         let mtime = md
@@ -92,20 +109,32 @@ impl BlobStore for FsBlobStore {
         // no synchronous fs call ever touches the async runtime.
         tokio::task::spawn_blocking(move || -> Result<ObjectMeta> {
             std::fs::create_dir_all(&parent).context("creating blob parent dir")?;
+            let etag = uuid::Uuid::new_v4().to_string();
+            let sidecar = Self::sidecar_of(&path2);
+            let sidecar_tmp = sidecar.with_extension(format!("{}.tmp-put", uuid::Uuid::new_v4()));
             let write_and_swap = (|| -> Result<()> {
                 std::fs::write(&tmp, &body).context("writing temp blob")?;
+                // Publish the new etag BEFORE the blob (each via its own
+                // tmp+rename): a crash between the two renames then yields
+                // new-etag/old-content — a redundant download, or at worst a
+                // loud-and-safe pending-marker divergence — instead of
+                // old-etag/new-content, which etag-equality consumers would
+                // silently serve as current while stale. The publish pair is
+                // serialized per key so concurrent same-key puts can't
+                // interleave one put's etag with another's content.
+                let publish = Self::put_publish_lock(&path2);
+                let _guard = publish.lock().expect("put publish lock poisoned");
+                std::fs::write(&sidecar_tmp, &etag).context("writing etag sidecar")?;
+                std::fs::rename(&sidecar_tmp, &sidecar).context("publishing etag sidecar")?;
                 std::fs::rename(&tmp, &path2).context("renaming blob into place")?;
                 Ok(())
             })();
             if let Err(e) = write_and_swap {
                 let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(&sidecar_tmp);
                 return Err(e);
             }
             let md = std::fs::metadata(&path2).context("stat blob after write")?;
-            // Persist a fresh per-write etag; see `sidecar_of` for why
-            // size-mtime is not collision-resistant enough here.
-            let etag = uuid::Uuid::new_v4().to_string();
-            std::fs::write(Self::sidecar_of(&path2), &etag).context("writing etag sidecar")?;
             Ok(ObjectMeta {
                 size: md.len(),
                 etag: Some(etag),
@@ -250,9 +279,18 @@ mod tests {
         let m2 = store.put(key, body).await.unwrap();
         assert_ne!(m1.etag, m2.etag, "every put must produce a new etag");
 
-        // head() reports the latest persisted etag.
+        // head() reports the latest persisted etag, and it really is the
+        // sidecar's content — not a size-mtime fingerprint that would also
+        // pass the assert_ne above when consecutive writes get distinct
+        // mtimes.
         let h = store.head(key).await.unwrap().unwrap();
         assert_eq!(h.etag, m2.etag);
+        let sidecar = dir.path().join(format!("{key}.etag"));
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            m2.etag.clone().unwrap(),
+            "etag must come from the persisted sidecar"
+        );
 
         // delete() removes the sidecar with the object.
         store.delete(key).await.unwrap();

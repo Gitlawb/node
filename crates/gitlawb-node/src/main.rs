@@ -303,6 +303,20 @@ async fn main() -> Result<()> {
 
     let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), archive, lock_pool);
 
+    // Re-attempt uploads for repos whose pending-upload marker survived a
+    // crash or failed upload — otherwise a repo with no further writes stays
+    // divergent from storage indefinitely. Background task: it takes the
+    // per-repo advisory locks, so it serializes correctly with live pushes.
+    {
+        let store = repo_store.clone();
+        tokio::spawn(async move {
+            let (reuploaded, still_pending) = store.retry_pending_uploads().await;
+            if reuploaded > 0 || still_pending > 0 {
+                info!(reuploaded, still_pending, "pending-upload marker sweep");
+            }
+        });
+    }
+
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.
     let rate_limiter =
