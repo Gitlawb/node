@@ -2460,86 +2460,60 @@ impl Db {
     /// Bounded global pin query: returns pins for any of the given (repo, owner_did)
     /// pairs, ordered by pinned_at DESC, capped at `limit`.
     /// Fetch pinned CIDs matching the readable (repo, owner_did) pairs,
-    /// ordered by (pinned_at DESC, repo DESC, sha256_hex DESC) for stable
-    /// keyset pagination.  When `cursor` is `Some((pinned_at, repo,
-    /// sha256_hex))`, only rows strictly before that cursor are returned (no
-    /// duplicates across batches).
+    /// ordered by (pinned_at DESC, sha256_hex DESC, repo DESC) for stable
+    /// keyset pagination.  Multiple associations for the same SHA may be
+    /// returned (one per readable repo); the caller deduplicates by
+    /// sha256_hex after per-association visibility evaluation (P2).
+    /// When `cursor` is `Some((pinned_at, sha256_hex))`, only rows
+    /// strictly before that cursor are returned (no duplicates across
+    /// pages, since every association for a given SHA shares the same
+    /// (pinned_at, sha256_hex) pair).
     pub async fn list_pinned_cids_for_repos(
         &self,
         repos: &[String],
         owner_dids: &[String],
         no_rules: &[bool],
         limit: i64,
-        cursor: Option<(&str, &str, &str)>,
+        cursor: Option<(&str, &str)>,
     ) -> Result<Vec<PinnedCidRecord>> {
-        // LEFT JOIN with pinned_cid_repos so legacy rows inserted directly
-        // into pinned_cids (before the junction-table migration, or by tests
-        // that use raw SQL) are still returned.  When the junction table has
-        // no entry we fall back to pinned_cids.repo / pinned_cids.owner_did.
-        //
-        // Deduplicate by sha256_hex at the SQL level so page boundaries do
-        // not re-expose an object that appeared on a prior page via a
-        // different (repo, owner_did) association (P2).  The ROW_NUMBER
-        // ordering prefers associations from repos without path-scoped
-        // rules (no_rules = true) so that a hidden association that sorts
-        // alphabetically first does not suppress a visible one (P2).
-        let rows = if let Some((pa, r, sha)) = cursor {
+        let rows = if let Some((pa, sha)) = cursor {
             sqlx::query(
-                "SELECT sub.sha256_hex, sub.cid, sub.pinned_at, sub.pinata_cid,
-                        sub.repo, sub.owner_did
-                 FROM (
-                     SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
-                            COALESCE(pr.repo, p.repo) AS repo,
-                            COALESCE(pr.owner_did, p.owner_did) AS owner_did,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY p.sha256_hex
-                                ORDER BY pairs.no_rules DESC,
-                                         COALESCE(pr.repo, p.repo) ASC
-                            ) AS rn
-                     FROM pinned_cids p
-                     LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
-                     JOIN UNNEST($1::text[], $2::text[], $3::bool[])
-                          AS pairs(repo, owner_did, no_rules)
-                       ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
-                          = (pairs.repo, pairs.owner_did)
-                     WHERE (p.pinned_at, COALESCE(pr.repo, p.repo), p.sha256_hex)
-                           < ($4::text, $5::text, $6::text)
-                 ) sub
-                 WHERE sub.rn = 1
-                 ORDER BY sub.pinned_at DESC, sub.repo DESC, sub.sha256_hex DESC
-                 LIMIT $7",
+                "SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
+                        COALESCE(pr.repo, p.repo) AS repo,
+                        COALESCE(pr.owner_did, p.owner_did) AS owner_did
+                 FROM pinned_cids p
+                 LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                 JOIN UNNEST($1::text[], $2::text[], $3::bool[])
+                      AS pairs(repo, owner_did, no_rules)
+                   ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                      = (pairs.repo, pairs.owner_did)
+                 WHERE (p.pinned_at, p.sha256_hex)
+                       < ($4::text, $5::text)
+                 ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
+                          COALESCE(pr.repo, p.repo) DESC
+                 LIMIT $6",
             )
             .bind(repos)
             .bind(owner_dids)
             .bind(no_rules)
             .bind(pa)
-            .bind(r)
             .bind(sha)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query(
-                "SELECT sub.sha256_hex, sub.cid, sub.pinned_at, sub.pinata_cid,
-                        sub.repo, sub.owner_did
-                 FROM (
-                     SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
-                            COALESCE(pr.repo, p.repo) AS repo,
-                            COALESCE(pr.owner_did, p.owner_did) AS owner_did,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY p.sha256_hex
-                                ORDER BY pairs.no_rules DESC,
-                                         COALESCE(pr.repo, p.repo) ASC
-                            ) AS rn
-                     FROM pinned_cids p
-                     LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
-                     JOIN UNNEST($1::text[], $2::text[], $3::bool[])
-                          AS pairs(repo, owner_did, no_rules)
-                       ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
-                          = (pairs.repo, pairs.owner_did)
-                 ) sub
-                 WHERE sub.rn = 1
-                 ORDER BY sub.pinned_at DESC, sub.repo DESC, sub.sha256_hex DESC
+                "SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
+                        COALESCE(pr.repo, p.repo) AS repo,
+                        COALESCE(pr.owner_did, p.owner_did) AS owner_did
+                 FROM pinned_cids p
+                 LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                 JOIN UNNEST($1::text[], $2::text[], $3::bool[])
+                      AS pairs(repo, owner_did, no_rules)
+                   ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                      = (pairs.repo, pairs.owner_did)
+                 ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
+                          COALESCE(pr.repo, p.repo) DESC
                  LIMIT $4",
             )
             .bind(repos)
