@@ -331,10 +331,11 @@ mod tests {
             msg.contains("502"),
             "expected 502 error with bounded body, got: {msg}"
         );
+        let display = format!("{err}");
         assert!(
-            msg.len() < 1000,
+            display.len() < 1000,
             "error message too long ({} bytes) — body was not capped",
-            msg.len()
+            display.len()
         );
     }
 
