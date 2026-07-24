@@ -377,6 +377,19 @@ async fn main() -> Result<()> {
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
+        walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.walk_concurrency_limit as usize,
+        )),
+        ipfs_list_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_list_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        ipfs_list_global_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_list_global_rate_limit,
+            std::time::Duration::from_secs(3600),
+            1,
+        ),
         shutdown_tx: shutdown_tx.clone(),
     };
 

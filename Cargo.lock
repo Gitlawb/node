@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-gitlawb"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "gitlawb-core",
@@ -3312,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-attest"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-core"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-node"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3368,6 +3368,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "chacha20poly1305",
  "chrono",
  "cid",
  "clap",
@@ -3376,6 +3377,7 @@ dependencies = [
  "futures",
  "gitlawb-core",
  "hex",
+ "hkdf",
  "hmac",
  "http-body-util",
  "libc",
@@ -3390,6 +3392,7 @@ dependencies = [
  "mockito",
  "multiaddr",
  "prometheus",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
@@ -3412,10 +3415,11 @@ dependencies = [
 
 [[package]]
 name = "gl"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "dirs",

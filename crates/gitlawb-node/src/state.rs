@@ -81,6 +81,16 @@ pub struct AppState {
     /// sink as trigger and accepts unsigned requests from known peers, so it is
     /// braked too; each peer's distinct IP gets its own bucket.
     pub peer_write_rate_limiter: RateLimiter,
+    /// Concurrency limiter for expensive visibility walks (git rev-list /
+    /// git ls-tree) triggered by the IPFS pin listing endpoint (P1).
+    /// Prevents a flood of signed requests from exhausting the blocking
+    /// pool or leaving git children running past their timeout.
+    pub walk_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Per-DID rate limiter for the IPFS pin listing endpoint.
+    pub ipfs_list_rate_limiter: RateLimiter,
+    /// Global (non-sybil) rate limiter for the IPFS pin listing endpoint.
+    /// Keyed on a fixed value so rotating DIDs cannot bypass it (P1).
+    pub ipfs_list_global_limiter: RateLimiter,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:

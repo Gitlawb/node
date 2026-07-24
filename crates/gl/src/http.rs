@@ -196,6 +196,30 @@ impl NodeClient {
     }
 }
 
+/// Read a response body with a streaming byte cap so chunked responses don't
+/// allocate unbounded memory before the check (P2).
+///
+/// Returns an error if the body exceeds `max_bytes` *before* buffering the
+/// full payload.  Handles both `Content-Length` and chunked transfer-encoding.
+pub async fn capped_response(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = resp.chunk().await?;
+        match chunk {
+            Some(bytes) => {
+                if body.len() + bytes.len() > max_bytes {
+                    anyhow::bail!(
+                        "response body exceeds {max_bytes} byte limit (already read {})",
+                        body.len()
+                    );
+                }
+                body.extend_from_slice(&bytes);
+            }
+            None => return Ok(body),
+        }
+    }
+}
+
 /// Run the (blocking) iCaptcha solve loop off the async runtime.
 async fn obtain_proof(cfg: IcaptchaCfg) -> Result<String> {
     tokio::task::spawn_blocking(move || icaptcha_client::obtain_proof(&cfg, None))

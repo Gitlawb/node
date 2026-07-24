@@ -6,7 +6,7 @@ use gitlawb_core::identity::Keypair;
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{capped_response, NodeClient};
 use crate::identity::load_keypair_from_dir;
 use crate::node_stake;
 
@@ -189,8 +189,15 @@ async fn try_get_json(client: &NodeClient, path: &str) -> Option<Value> {
 /// sign in. A pins failure never aborts the dashboard.
 #[derive(Debug)]
 enum PinsPanel {
-    /// Signed read succeeded and returned pins (carries the resolved count).
-    Pins(u64),
+    /// Signed read succeeded and returned pins.
+    Pins {
+        count: u64,
+        /// True when the traversal hit its safety bounds (page cap, row cap,
+        /// or cursor cycle) before consuming all available data.  The count
+        /// is an undercount; the dashboard signals that the listing was
+        /// truncated (P2).
+        incomplete: bool,
+    },
     /// Signed read succeeded but the node has no pins recorded.
     Empty,
     /// Signed read was rejected (401/other) or errored.
@@ -241,30 +248,156 @@ async fn fetch_pins(node: &str, auth: PinsAuth) -> PinsPanel {
         PinsAuth::DirUnusable(dir) => return PinsPanel::IdentityError(dir),
     };
     let client = NodeClient::new(node, Some(kp));
-    let resp = match client.get_signed("/api/v1/ipfs/pins").await {
-        Ok(r) => r,
-        Err(_) => return PinsPanel::Unavailable,
-    };
-    if !resp.status().is_success() {
-        return PinsPanel::Unavailable;
+    let mut total: u64 = 0;
+    let mut cursor: Option<String> = None;
+    let mut truncated_cursor: Option<String> = None;
+    // Persist the last next_cursor across the truncated leg so that an
+    // expired truncated_cursor (400) can resume from where we left off
+    // rather than restarting at page 1 (P2).
+    let mut last_next_cursor: Option<String> = None;
+    let mut seen_cursors: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut incomplete = false;
+    let mut pages = 0u32;
+    // Consecutive empty pages without forward progress: a buggy or hostile
+    // node that returns empty pages with fresh cursors cannot loop
+    // indefinitely (P2).
+    let mut consecutive_empty_pages = 0u32;
+    const MAX_CONSECUTIVE_EMPTY: u32 = 5;
+    const MAX_PAGES: u32 = 10_000;
+    const MAX_ROWS: u64 = 1_000_000;
+    const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+    // Aggregate memory bound for retained cursor/cycle-key bytes (P3).
+    // Shared with the pin data budget from ipfs_cmd.rs.
+    const MAX_AGGREGATE_BYTES: usize = 512 * 1024 * 1024;
+    let mut all_cursor_bytes: usize = 0;
+
+    loop {
+        pages += 1;
+        if pages > MAX_PAGES {
+            incomplete = true;
+            break;
+        }
+
+        // Request the max page size to minimise page-turn requests
+        // against the per-DID quota (P2).  The server clamps to 200.
+        let mut path = "/api/v1/ipfs/pins?limit=200".to_string();
+        let mut had_truncated = false;
+        if let Some(c) = cursor.take() {
+            path.push_str(&format!("&cursor={}", urlencoding::encode(&c)));
+        }
+        if let Some(tc) = truncated_cursor.take() {
+            had_truncated = true;
+            path.push_str(&format!("&truncated_cursor={}", urlencoding::encode(&tc)));
+        }
+
+        let resp = match client.get_signed(&path).await {
+            Ok(r) => r,
+            Err(_) => return PinsPanel::Unavailable,
+        };
+
+        if !resp.status().is_success() {
+            // P2: rate-limited — surface a partial result instead of failing.
+            if resp.status().as_u16() == 429 {
+                incomplete = true;
+                break;
+            }
+            if resp.status().as_u16() == 400 && had_truncated {
+                let body = String::from_utf8_lossy(
+                    &capped_response(resp, MAX_RESPONSE_BYTES)
+                        .await
+                        .unwrap_or_default(),
+                )
+                .to_string();
+                if body.contains("invalid or expired truncated_cursor") {
+                    cursor = last_next_cursor.clone();
+                    continue;
+                }
+            }
+            return PinsPanel::Unavailable;
+        }
+        let body = match capped_response(resp, MAX_RESPONSE_BYTES).await {
+            Ok(b) => b,
+            Err(_) => return PinsPanel::Unavailable,
+        };
+        let Ok(body) = serde_json::from_slice::<Value>(&body) else {
+            return PinsPanel::Unavailable;
+        };
+
+        let page_pins = body["pins"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+
+        if total + page_pins > MAX_ROWS {
+            incomplete = true;
+            break;
+        }
+        total += page_pins;
+
+        if page_pins == 0 {
+            consecutive_empty_pages += 1;
+            if consecutive_empty_pages >= MAX_CONSECUTIVE_EMPTY {
+                incomplete = true;
+                break;
+            }
+        } else {
+            consecutive_empty_pages = 0;
+        }
+
+        let next = body["next_cursor"].as_str().map(String::from);
+        let new_trunc = body["truncated_cursor"].as_str().map(String::from);
+
+        // Detect cursor cycling
+        let cycle_key =
+            next.as_deref().unwrap_or("").to_string() + "|" + new_trunc.as_deref().unwrap_or("");
+
+        // Bound retained cursor bytes against the same aggregate budget used
+        // by ipfs_cmd.rs so a node returning near-64 MiB cursors per page
+        // cannot exhaust memory (P3).  Check before insert so cycle_key is
+        // not moved.
+        all_cursor_bytes += cycle_key.len() + 32; // +32 for HashSet entry overhead
+        if all_cursor_bytes > MAX_AGGREGATE_BYTES {
+            incomplete = true;
+            break;
+        }
+
+        if !cycle_key.is_empty() && !seen_cursors.insert(cycle_key) {
+            incomplete = true;
+            break;
+        }
+
+        if next.is_none() && new_trunc.is_none() {
+            break;
+        }
+        if let Some(ref n) = next {
+            last_next_cursor = Some(n.clone());
+        }
+        cursor = next;
+        truncated_cursor = new_trunc;
     }
-    let Ok(body) = resp.json::<Value>().await else {
-        return PinsPanel::Unavailable;
-    };
-    let count = body["count"]
-        .as_u64()
-        .unwrap_or_else(|| body["pins"].as_array().map(|a| a.len() as u64).unwrap_or(0));
+    let count = total;
     if count == 0 {
-        PinsPanel::Empty
+        if incomplete {
+            // Buggy or capacity-constrained node: the listing was truncated
+            // before any row was emitted.  Render as unavailable so an
+            // authoritative "Pinned CIDs: 0" is never shown for a partial
+            // result (P2).
+            PinsPanel::Unavailable
+        } else {
+            PinsPanel::Empty
+        }
     } else {
-        PinsPanel::Pins(count)
+        PinsPanel::Pins { count, incomplete }
     }
 }
 
 /// Render the one-line pins-panel status for the `gl node status` dashboard.
 fn pins_status_line(panel: &PinsPanel) -> String {
     match panel {
-        PinsPanel::Pins(count) => format!("  Pinned CIDs: {count}"),
+        PinsPanel::Pins { count, incomplete } => {
+            let mut s = format!("  Pinned CIDs: {count}");
+            if *incomplete {
+                s.push_str(" (truncated)");
+            }
+            s
+        }
         PinsPanel::Empty => "  Pinned CIDs: 0".to_string(),
         PinsPanel::Unavailable => "  IPFS pins: unavailable".to_string(),
         PinsPanel::NeedsIdentity => {
@@ -523,7 +656,7 @@ mod tests {
         // A keyed fetch must sign the request (RFC 9421 headers) and, on a
         // populated 200 body, land in the Pins state carrying the pins.
         let m = server
-            .mock("GET", "/api/v1/ipfs/pins")
+            .mock("GET", mockito::Matcher::Regex(r"^/api/v1/ipfs/pins(\?.*)?$".to_string()))
             .match_header("signature", mockito::Matcher::Any)
             .match_header("signature-input", mockito::Matcher::Any)
             .match_header("content-digest", mockito::Matcher::Any)
@@ -537,7 +670,7 @@ mod tests {
 
         let panel = fetch_pins(&server.url(), PinsAuth::Keyed(kp)).await;
         match panel {
-            PinsPanel::Pins(count) => assert_eq!(count, 1),
+            PinsPanel::Pins { count, .. } => assert_eq!(count, 1),
             other => panic!("expected Pins, got {other:?}"),
         }
 
@@ -550,7 +683,10 @@ mod tests {
         let kp = Keypair::generate();
 
         let m = server
-            .mock("GET", "/api/v1/ipfs/pins")
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/ipfs/pins(\?.*)?$".to_string()),
+            )
             .match_header("signature", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -575,7 +711,10 @@ mod tests {
         // Node rejects the signed read (401): the panel must degrade to
         // Unavailable without panicking, so cmd_status still completes.
         let m = server
-            .mock("GET", "/api/v1/ipfs/pins")
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/ipfs/pins(\?.*)?$".to_string()),
+            )
             .match_header("signature", mockito::Matcher::Any)
             .with_status(401)
             .with_header("content-type", "application/json")
@@ -620,7 +759,10 @@ mod tests {
         // 2xx but the body is not valid JSON: must degrade to Unavailable,
         // never panic.
         let m = server
-            .mock("GET", "/api/v1/ipfs/pins")
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/api/v1/ipfs/pins(\?.*)?$".to_string()),
+            )
             .match_header("signature", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -656,7 +798,13 @@ mod tests {
 
     #[test]
     fn test_pins_status_line_renders_each_state() {
-        assert_eq!(pins_status_line(&PinsPanel::Pins(3)), "  Pinned CIDs: 3");
+        assert_eq!(
+            pins_status_line(&PinsPanel::Pins {
+                count: 3,
+                incomplete: false
+            }),
+            "  Pinned CIDs: 3"
+        );
         assert_eq!(pins_status_line(&PinsPanel::Empty), "  Pinned CIDs: 0");
         assert_eq!(
             pins_status_line(&PinsPanel::Unavailable),

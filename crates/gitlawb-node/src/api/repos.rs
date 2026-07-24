@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::response::Response;
 use axum::Json;
 use bytes::Bytes;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
@@ -65,8 +66,9 @@ async fn replication_withheld_set(
         Some(rules) => {
             let owner_did = owner_did.to_string();
             tokio::task::spawn_blocking(move || {
+                let uncancelled = AtomicBool::new(false);
                 crate::git::visibility_pack::withheld_blob_oids(
-                    &disk_path, &rules, is_public, &owner_did, None,
+                    &disk_path, &rules, is_public, &owner_did, None, &uncancelled,
                 )
             })
             .await
@@ -108,8 +110,9 @@ async fn fail_closed_full_scan_objects(
     candidates: Vec<String>,
 ) -> Vec<String> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+        let uncancelled = AtomicBool::new(false);
         let allowed = crate::git::visibility_pack::replicable_blob_set(
-            &disk_path, &rules, is_public, &owner_did,
+            &disk_path, &rules, is_public, &owner_did, &uncancelled,
         )?;
         let all_blobs = crate::git::push_delta::all_blob_oids(&disk_path)?;
         Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
@@ -659,12 +662,14 @@ pub async fn git_upload_pack(
             let caller_owned = caller.map(str::to_string);
             let is_public = record.is_public;
             tokio::task::spawn_blocking(move || {
+                let uncancelled = AtomicBool::new(false);
                 visibility_pack::withheld_blob_oids(
                     &path,
                     &rules,
                     is_public,
                     &owner_did,
                     caller_owned.as_deref(),
+                    &uncancelled,
                 )
             })
             .await
@@ -1114,18 +1119,22 @@ pub async fn git_receive_pack(
         let rules_for_enc = rules_opt.clone();
         let repo_id = record.id.clone();
         let owner_did = record.owner_did.clone();
+        let owner_short = crate::db::normalize_owner_key(&record.owner_did).to_string();
         let is_public = record.is_public;
         let irys_url = state.config.irys_url.clone();
         let http_client = std::sync::Arc::clone(&state.http_client);
         let node_did_str = state.node_did.to_string();
         let node_seed = state.node_keypair.to_seed();
         let repo_name = record.name.clone();
+        let repo_slug = format!("{owner_short}/{repo_name}");
         tokio::spawn(async move {
             let pinned = crate::ipfs_pin::pin_new_objects(
                 &ipfs_api,
                 &repo_path_clone,
                 object_list_ipfs,
                 &db_clone,
+                &repo_slug,
+                &owner_did,
             )
             .await;
             if !pinned.is_empty() {
@@ -1145,8 +1154,13 @@ pub async fn git_receive_pack(
                 let p = repo_path_clone.clone();
                 let owner = owner_did.clone();
                 let recip = tokio::task::spawn_blocking(move || {
+                    let uncancelled = AtomicBool::new(false);
                     crate::git::visibility_pack::withheld_blob_recipients(
-                        &p, &rules, is_public, &owner,
+                        &p,
+                        &rules,
+                        is_public,
+                        &owner,
+                        &uncancelled,
                     )
                 })
                 .await;
@@ -1213,6 +1227,7 @@ pub async fn git_receive_pack(
             crate::db::normalize_owner_key(&record.owner_did),
             record.name
         );
+        let owner_did_for_pinata = record.owner_did.clone();
         let ref_updates_clone = ref_updates
             .iter()
             .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
@@ -1236,6 +1251,8 @@ pub async fn git_receive_pack(
                     &repo_path_clone,
                     object_list_pinata,
                     &db_clone,
+                    &repo_slug,
+                    &owner_did_for_pinata,
                 )
                 .await
             } else {

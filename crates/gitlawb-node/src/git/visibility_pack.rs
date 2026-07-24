@@ -9,6 +9,7 @@ use crate::visibility::{visibility_check, Decision};
 use anyhow::{Context, Result};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Fail closed unless every ref ultimately resolves to a commit (a ref pointing
 /// directly at a blob or tree, or an annotated tag — even a nested one — of such
@@ -21,19 +22,13 @@ use std::path::Path;
 /// Full peeling is why this is not `for-each-ref %(*objecttype)`, which
 /// dereferences only one tag level and so misclassifies a tag-of-a-tag-of-a-
 /// commit as a non-commit.
-fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
-    let refs = std::process::Command::new("git")
-        .args(["for-each-ref", "--format=%(refname)"])
-        .current_dir(repo_path)
-        .output()
-        .context("git for-each-ref failed")?;
-    if !refs.status.success() {
-        anyhow::bail!(
-            "git for-each-ref failed: {}",
-            String::from_utf8_lossy(&refs.stderr)
-        );
-    }
-    let refs_stdout = String::from_utf8_lossy(&refs.stdout);
+fn assert_all_refs_are_commits(repo_path: &Path, cancelled: &AtomicBool) -> Result<()> {
+    let refs = run_git(
+        repo_path,
+        &["for-each-ref", "--format=%(refname)"],
+        cancelled,
+    )?;
+    let refs_stdout = String::from_utf8_lossy(&refs);
     let refnames: Vec<&str> = refs_stdout
         .lines()
         .map(str::trim)
@@ -65,37 +60,55 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn git cat-file")?;
-    // Feed stdin on a writer thread so this thread can drain stdout via
-    // wait_with_output concurrently; a None handle (the pipe vanished) becomes a
-    // broken-pipe write error. wait_with_output reaps the child unconditionally
-    // before any error is surfaced, so no path drops it unwaited (#53), and the
-    // writer is joined only after the drain so the join cannot deadlock.
+    // Feed stdin on a writer thread so this thread can poll the child for
+    // cancellation (wait_with_output would block indefinitely).
     let writer = child
         .stdin
         .take()
         .map(|mut stdin| std::thread::spawn(move || stdin.write_all(queries.as_bytes())));
-    let peel_result = child.wait_with_output();
-    let write_result = match writer {
-        Some(handle) => handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("git cat-file stdin writer thread panicked"))?,
-        None => Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "git cat-file stdin unavailable",
-        )),
+    // Read stdout on a background thread — the pipe blocks, so we poll
+    // through the child for cancellation.
+    let mut stdout = child.stdout.take().unwrap();
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        let _ = stdout_tx.send(buf);
+    });
+    let (peel_status, peel_stdout_bytes, peel_stderr) = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = writer.map(|h| h.join());
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout_buf = stdout_rx.recv().unwrap_or_default();
+                let mut stderr_buf = Vec::new();
+                let _ =
+                    std::io::Read::read_to_end(&mut child.stderr.take().unwrap(), &mut stderr_buf);
+                let _ = writer.map(|h| h.join());
+                break (status, stdout_buf, stderr_buf);
+            }
+            Ok(None) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => {
+                let _ = writer.map(|h| h.join());
+                anyhow::bail!("git cat-file wait failed: {e}");
+            }
+        }
     };
-    // Surface a write error only if the process didn't already fail with a
-    // clearer status.
-    let peel = peel_result.context("git cat-file failed")?;
-    if !peel.status.success() {
+    if !peel_status.success() {
         anyhow::bail!(
             "git cat-file --batch-check failed: {}",
-            String::from_utf8_lossy(&peel.stderr)
+            String::from_utf8_lossy(&peel_stderr)
         );
     }
-    write_result.context("failed to write to git cat-file stdin")?;
 
-    let peel_stdout = String::from_utf8_lossy(&peel.stdout);
+    let peel_stdout = String::from_utf8_lossy(&peel_stdout_bytes);
     let types: Vec<&str> = peel_stdout.lines().map(str::trim).collect();
     // A short read means at least one ref went unclassified — fail closed.
     if types.len() != refnames.len() {
@@ -147,65 +160,34 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
 /// Fails closed: if commit enumeration or any tree walk fails, returns an error so
 /// the caller aborts the serve/pin rather than producing a partial (under-withheld)
 /// set.
-fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    assert_all_refs_are_commits(repo_path)?;
+fn blob_paths(repo_path: &Path, cancelled: &AtomicBool) -> Result<Vec<(String, String)>> {
+    assert_all_refs_are_commits(repo_path, cancelled)?;
 
-    // Enumerate every reachable commit, not just ref tips. `--all` walks all refs;
-    // append HEAD so a detached HEAD (reachable by rev-list/upload-pack but in no
-    // ref) is still classified. When HEAD does not resolve (unborn branch on an
-    // empty repo) `--all` alone yields nothing, which is correct — no objects exist.
+    // Enumerate every reachable commit, not just ref tips.
     let head = store::head_commit(repo_path).context("resolve HEAD failed")?;
     let mut rev_args = vec!["rev-list", "--all"];
     if head.is_some() {
         rev_args.push("HEAD");
     }
-    let commits = std::process::Command::new("git")
-        .args(&rev_args)
-        .current_dir(repo_path)
-        .output()
-        .context("git rev-list --all failed")?;
-    if !commits.status.success() {
-        anyhow::bail!(
-            "git rev-list --all failed: {}",
-            String::from_utf8_lossy(&commits.stderr)
-        );
-    }
-    let commits_stdout = String::from_utf8_lossy(&commits.stdout);
+    let commits = run_git(repo_path, &rev_args, cancelled)?;
+    let commits_stdout = String::from_utf8_lossy(&commits);
     let mut out: HashSet<(String, String)> = HashSet::new();
     for commit in commits_stdout.lines() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
         let commit = commit.trim();
         if commit.is_empty() {
             continue;
         }
-        let listing = std::process::Command::new("git")
-            .args(["ls-tree", "-rz", commit])
-            .current_dir(repo_path)
-            .output()
-            .context("git ls-tree -rz failed")?;
-        if !listing.status.success() {
-            anyhow::bail!(
-                "git ls-tree -rz {commit} failed: {}",
-                String::from_utf8_lossy(&listing.stderr)
-            );
-        }
-        // `-z` NUL-delimits records and emits paths raw; plain `git ls-tree -r`
-        // C-quotes any path with non-ASCII or special bytes (e.g. café.txt becomes
-        // "secret/caf\303\251.txt"), and that quoted literal would not match a
-        // visibility rule like "/secret/**", under-withholding the blob. The TAB
-        // field separator survives `-z`, so the per-record parse is unchanged.
-        //
-        // Parse strictly: a lossy decode would replace an invalid byte in a denied
-        // path (e.g. a non-UTF-8 directory name) with U+FFFD, and the mangled string
-        // would no longer match its deny rule — the same under-withholding class, one
-        // layer down. Fail closed instead so the caller aborts rather than leaks.
-        let Ok(listing_stdout) = std::str::from_utf8(&listing.stdout) else {
+        let listing = run_git(repo_path, &["ls-tree", "-rz", commit], cancelled)?;
+        let Ok(listing_stdout) = std::str::from_utf8(&listing) else {
             anyhow::bail!(
                 "git ls-tree -rz {commit} returned a non-UTF-8 path; \
                  refusing to produce a partial (under-withheld) set"
             );
         };
         for record in listing_stdout.split('\0') {
-            // "<mode> blob <oid>\t<path>"
             let Some((meta, path)) = record.split_once('\t') else {
                 continue;
             };
@@ -223,6 +205,64 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
     Ok(out.into_iter().collect())
 }
 
+/// Spawn a git subprocess and return its stdout, killing the child process if
+/// the cancellation flag is set (P1).  Reads stdout on a background thread
+/// while polling cancellation in a loop so long-running `git rev-list` /
+/// `git ls-tree` can be interrupted promptly.
+fn run_git(repo_path: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Vec<u8>> {
+    let mut child = std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn git subprocess")?;
+
+    let mut stdout = child.stdout.take().unwrap();
+
+    // Read stdout on a background thread — the pipe blocks, so we poll
+    // through the child instead.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        let _ = tx.send(buf);
+    });
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(Vec::new());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout_buf = rx.recv().unwrap_or_default();
+                if !status.success() {
+                    let mut stderr_buf = Vec::new();
+                    let _ = std::io::Read::read_to_end(
+                        &mut child.stderr.take().unwrap(),
+                        &mut stderr_buf,
+                    );
+                    return Err(anyhow::anyhow!(
+                        "git {} failed: {}",
+                        args.join(" "),
+                        String::from_utf8_lossy(&stderr_buf)
+                    ));
+                }
+                return Ok(stdout_buf);
+            }
+            Ok(None) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("git wait failed: {e}"));
+            }
+        }
+    }
+}
+
 /// Blob OIDs the caller may not read. A blob is withheld only if visibility
 /// denies the caller at *every* path the blob appears at; a blob that is also
 /// reachable through an allowed path is sent (its content is public elsewhere).
@@ -235,8 +275,9 @@ pub fn withheld_blob_oids(
     is_public: bool,
     owner_did: &str,
     caller: Option<&str>,
+    cancelled: &AtomicBool,
 ) -> Result<HashSet<String>> {
-    let pairs = blob_paths(repo_path)?;
+    let pairs = blob_paths(repo_path, cancelled)?;
     Ok(withheld_from_pairs(
         &pairs, rules, is_public, owner_did, caller,
     ))
@@ -309,8 +350,9 @@ pub fn replicable_blob_set(
     rules: &[VisibilityRule],
     is_public: bool,
     owner_did: &str,
+    cancelled: &AtomicBool,
 ) -> Result<HashSet<String>> {
-    allowed_blob_set_for_caller(repo_path, rules, is_public, owner_did, None)
+    allowed_blob_set_for_caller(repo_path, rules, is_public, owner_did, None, cancelled)
 }
 
 /// Reachable blob OIDs that visibility ALLOWS `caller` at some path. The
@@ -331,8 +373,9 @@ pub fn allowed_blob_set_for_caller(
     is_public: bool,
     owner_did: &str,
     caller: Option<&str>,
+    cancelled: &AtomicBool,
 ) -> Result<HashSet<String>> {
-    let pairs = blob_paths(repo_path)?;
+    let pairs = blob_paths(repo_path, cancelled)?;
     let mut allowed = HashSet::new();
     for (oid, path) in &pairs {
         if visibility_check(rules, is_public, owner_did, caller, path) == Decision::Allow {
@@ -370,9 +413,10 @@ pub fn withheld_blob_recipients(
     rules: &[VisibilityRule],
     is_public: bool,
     owner_did: &str,
+    cancelled: &AtomicBool,
 ) -> Result<HashMap<String, BTreeSet<String>>> {
     // One history walk feeds both the withheld set and the recipient mapping.
-    let pairs = blob_paths(repo_path)?;
+    let pairs = blob_paths(repo_path, cancelled)?;
     let withheld = withheld_from_pairs(&pairs, rules, is_public, owner_did, None);
     if withheld.is_empty() {
         return Ok(HashMap::new());
@@ -473,7 +517,8 @@ mod tests {
         let (_td, bare, secret_oid, public_oid) = fixture();
         let rules = [rule("/secret/**", &[])];
         // caller = None models the public / any peer: what must not replicate.
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.contains(&secret_oid),
             "secret blob must be withheld"
@@ -490,8 +535,15 @@ mod tests {
     fn non_reader_withholds_only_the_private_blob() {
         let (_td, bare, secret, public) = fixture();
         let rules = [rule("/secret/**", &["did:key:zFriend"])];
-        let withheld =
-            withheld_blob_oids(&bare, &rules, true, OWNER, Some("did:key:zStranger")).unwrap();
+        let withheld = withheld_blob_oids(
+            &bare,
+            &rules,
+            true,
+            OWNER,
+            Some("did:key:zStranger"),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(withheld.contains(&secret), "secret blob must be withheld");
         assert!(
             !withheld.contains(&public),
@@ -503,7 +555,15 @@ mod tests {
     fn owner_withholds_nothing() {
         let (_td, bare, secret, public) = fixture();
         let rules = [rule("/secret/**", &["did:key:zFriend"])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, Some(OWNER)).unwrap();
+        let withheld = withheld_blob_oids(
+            &bare,
+            &rules,
+            true,
+            OWNER,
+            Some(OWNER),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(withheld.is_empty(), "owner sees everything");
         let _ = (secret, public);
     }
@@ -512,15 +572,23 @@ mod tests {
     fn listed_reader_withholds_nothing() {
         let (_td, bare, _secret, _public) = fixture();
         let rules = [rule("/secret/**", &["did:key:zFriend"])];
-        let withheld =
-            withheld_blob_oids(&bare, &rules, true, OWNER, Some("did:key:zFriend")).unwrap();
+        let withheld = withheld_blob_oids(
+            &bare,
+            &rules,
+            true,
+            OWNER,
+            Some("did:key:zFriend"),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(withheld.is_empty(), "listed reader sees the subtree");
     }
 
     #[test]
     fn no_subtree_rules_withholds_nothing() {
         let (_td, bare, _secret, _public) = fixture();
-        let withheld = withheld_blob_oids(&bare, &[], true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &[], true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.is_empty(),
             "public repo, no rules, nothing withheld"
@@ -579,7 +647,9 @@ mod tests {
         ];
         for (rules, caller) in cases {
             assert!(!has_path_scoped_rule(&rules));
-            let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, caller).unwrap();
+            let withheld =
+                withheld_blob_oids(&bare, &rules, true, OWNER, caller, &AtomicBool::new(false))
+                    .unwrap();
             assert!(
                 withheld.is_empty(),
                 "no path-scoped rule must withhold nothing for a gate-passing caller (caller={caller:?})"
@@ -603,7 +673,15 @@ mod tests {
         // the walk is empty and the served set is complete.
         let root_only = vec![rule("/", &["did:key:zReader"])];
         assert!(!has_path_scoped_rule(&root_only));
-        let withheld_a = withheld_blob_oids(&bare, &root_only, true, OWNER, reader).unwrap();
+        let withheld_a = withheld_blob_oids(
+            &bare,
+            &root_only,
+            true,
+            OWNER,
+            reader,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(
             withheld_a.is_empty(),
             "root-only rules withhold nothing for a gate-passing reader; the skip is safe"
@@ -622,7 +700,9 @@ mod tests {
             rule("/secret/**", &["did:key:zOther"]),
         ];
         assert!(has_path_scoped_rule(&scoped));
-        let withheld_b = withheld_blob_oids(&bare, &scoped, true, OWNER, reader).unwrap();
+        let withheld_b =
+            withheld_blob_oids(&bare, &scoped, true, OWNER, reader, &AtomicBool::new(false))
+                .unwrap();
         let served_b = replicable_objects(all, &withheld_b);
         assert!(
             !served_b.contains(&secret),
@@ -636,7 +716,15 @@ mod tests {
         // Branch C — same path-scoped rules, but the caller is the owner. The
         // owner bypasses every rule, so the walk withholds nothing and the full
         // pack (secret included) is served even though a path-scoped rule exists.
-        let withheld_c = withheld_blob_oids(&bare, &scoped, true, OWNER, Some(OWNER)).unwrap();
+        let withheld_c = withheld_blob_oids(
+            &bare,
+            &scoped,
+            true,
+            OWNER,
+            Some(OWNER),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(
             withheld_c.is_empty(),
             "the owner bypasses path-scoped rules and is served everything"
@@ -742,7 +830,8 @@ mod tests {
         );
 
         let rules: Vec<VisibilityRule> = vec![];
-        let allowed = replicable_blob_set(&work, &rules, true, OWNER).unwrap();
+        let allowed =
+            replicable_blob_set(&work, &rules, true, OWNER, &AtomicBool::new(false)).unwrap();
         assert!(
             !allowed.contains(&dangling_oid),
             "dangling blob is unreachable, so never in the allowed set"
@@ -823,7 +912,15 @@ mod tests {
         // Every gate-relevant caller: anonymous, listed reader, owner. None of
         // them can put the dangling blob in the allowed set — it has no path.
         for caller in [None, Some(reader), Some(OWNER)] {
-            let allowed = allowed_blob_set_for_caller(&work, &rules, true, OWNER, caller).unwrap();
+            let allowed = allowed_blob_set_for_caller(
+                &work,
+                &rules,
+                true,
+                OWNER,
+                caller,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
             assert!(
                 !allowed.contains(&dangling_oid),
                 "dangling blob must be absent from allowed-set (caller={caller:?})"
@@ -842,7 +939,8 @@ mod tests {
         let (_td, repo, secret_oid, public_oid) = fixture();
         let reader = "did:key:zReader";
         let rules = vec![rule("/secret/**", &[reader])];
-        let map = withheld_blob_recipients(&repo, &rules, true, OWNER).unwrap();
+        let map =
+            withheld_blob_recipients(&repo, &rules, true, OWNER, &AtomicBool::new(false)).unwrap();
 
         let recips = map.get(&secret_oid).expect("secret blob has recipients");
         assert!(recips.contains(OWNER));
@@ -895,7 +993,8 @@ mod tests {
         run(&["update-ref", "-d", &head_ref]);
 
         let rules = [rule("/secret/**", &[])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.contains(&secret_oid),
             "blob reachable only via refs/custom/* must still be withheld"
@@ -940,7 +1039,8 @@ mod tests {
         run(&["update-ref", "-d", &head_ref]);
 
         let rules = [rule("/secret/**", &[])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.contains(&secret_oid),
             "blob reachable only via detached HEAD must still be withheld"
@@ -1007,7 +1107,8 @@ mod tests {
         );
 
         let rules = [rule("/secret/**", &[])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.contains(&secret_oid),
             "secret blob deleted at the tip but reachable in history must be withheld"
@@ -1064,7 +1165,8 @@ mod tests {
         );
 
         let rules = [rule("/secret/**", &[])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.contains(&secret_oid),
             "secret blob at a non-ASCII path must be withheld"
@@ -1141,7 +1243,8 @@ mod tests {
         );
 
         let rules = [rule(nfc_rule, &[])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.contains(&secret_oid),
             "NFC-authored deny rule must withhold the secret blob under the NFD-named directory"
@@ -1217,7 +1320,8 @@ mod tests {
         );
 
         let rules = [rule("/secret/**", &[])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.contains(&secret_oid),
             "secret blob at a path with TAB/newline must be withheld"
@@ -1304,7 +1408,7 @@ mod tests {
         );
 
         let rules = [rule("/s\u{fffd}cret/**", &[])];
-        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false));
         assert!(
             result.is_err(),
             "a non-UTF-8 path must fail closed (Err), not be lossy-decoded and leaked"
@@ -1319,7 +1423,7 @@ mod tests {
         // ref and under-withholding.
         std::fs::write(bare.join("refs/heads/blobref"), format!("{secret}\n")).unwrap();
         let rules = [rule("/secret/**", &[])];
-        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false));
         assert!(
             result.is_err(),
             "a ref that cannot be traversed must fail closed (Err)"
@@ -1350,7 +1454,8 @@ mod tests {
         run(&["tag", "-a", "-m", "outer", "v2", "v1"]);
 
         let rules = [rule("/secret/**", &[])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             withheld.contains(&secret_oid),
             "secret blob must still be withheld with annotated and nested tags present"
@@ -1378,7 +1483,7 @@ mod tests {
         run(&["tag", "-a", "-m", "blobtag", "blobtag", &secret]);
 
         let rules = [rule("/secret/**", &[])];
-        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false));
         assert!(
             result.is_err(),
             "an annotated tag of a blob must fail closed (Err)"
@@ -1397,7 +1502,7 @@ mod tests {
         )
         .unwrap();
         let rules = [rule("/secret/**", &[])];
-        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None);
+        let result = withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false));
         assert!(
             result.is_err(),
             "a ref pointing at a missing object must fail closed (Err)"
@@ -1425,7 +1530,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rules = [rule("/secret/**", &[])];
-            let is_err = withheld_blob_oids(&bare, &rules, true, OWNER, None).is_err();
+            let is_err =
+                withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false))
+                    .is_err();
             let _ = tx.send(is_err);
         });
         match rx.recv_timeout(std::time::Duration::from_secs(10)) {
@@ -1487,7 +1594,8 @@ mod tests {
         );
 
         let rules = [rule("/secret/**", &[])];
-        let withheld = withheld_blob_oids(&bare, &rules, true, OWNER, None).unwrap();
+        let withheld =
+            withheld_blob_oids(&bare, &rules, true, OWNER, None, &AtomicBool::new(false)).unwrap();
         assert!(
             !withheld.contains(&shared_oid),
             "a blob also reachable via an allowed path must not be withheld"
