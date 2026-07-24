@@ -107,12 +107,13 @@ pub async fn pin_new_objects(
     let mut pinned = Vec::new();
 
     for sha in object_list {
-        // Skip if already pinned
-        match db.is_pinned(&sha).await {
+        // Skip if already pinned to local IPFS (checks cid column,
+        // which is NULL for Pinata-only rows so those will be retried).
+        match db.has_ipfs_cid(&sha).await {
             Ok(true) => continue,
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(sha = %sha, err = %e, "DB error checking pinned status");
+                tracing::warn!(sha = %sha, err = %e, "DB error checking IPFS pinned status");
                 continue;
             }
         }
