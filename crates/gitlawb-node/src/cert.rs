@@ -21,6 +21,9 @@ fn cert_payload(
     seq: i64,
     prev: &str,
     pusher_sig: Option<String>,
+    signature_input: Option<String>,
+    content_digest: Option<String>,
+    request_path: Option<String>,
 ) -> serde_json::Value {
     serde_json::json!({
         "repo_id": repo_id,
@@ -33,6 +36,9 @@ fn cert_payload(
         "seq": seq,
         "prev": prev,
         "pusher_sig": pusher_sig,
+        "signature_input": signature_input,
+        "content_digest": content_digest,
+        "request_path": request_path,
     })
 }
 
@@ -88,6 +94,9 @@ async fn issue_once(
         seq,
         &prev,
         pusher_sig.clone(),
+        signature_input.clone(),
+        content_digest.clone(),
+        request_path.clone(),
     );
     let payload_bytes = serde_json::to_vec(&payload)?;
     let signature = state.node_keypair.sign_b64(&payload_bytes);

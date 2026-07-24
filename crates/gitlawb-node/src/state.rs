@@ -52,6 +52,10 @@ pub struct AppState {
     pub repo_store: RepoStore,
     /// Per-DID rate limiter for creation endpoints (repos, issues, PRs)
     pub rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for the Arweave verify endpoint. The verify
+    /// route is unauthenticated and the per-DID creation limiter is far too
+    /// restrictive (10/hr). Bounded key set — the key is a client-influenced IP.
+    pub arweave_rate_limiter: RateLimiter,
     /// Per-client-IP rate limiter for the same creation endpoints. The per-DID
     /// limiter above cannot brake a creation flood from a DID farm — one
     /// throwaway `did:key` per repo means each DID makes a single create call

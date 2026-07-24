@@ -156,6 +156,9 @@ async fn cmd_show(
     let node_did = cert["node_did"].as_str().unwrap_or("?");
     let signature = cert["signature"].as_str().unwrap_or("?");
     let issued_at = cert["issued_at"].as_str().unwrap_or("?");
+    let seq = cert["seq"].as_i64().unwrap_or(0);
+    let prev = cert["prev"].as_str().unwrap_or("?");
+    let pusher_sig = cert["pusher_sig"].as_str().map(|s| s.to_string());
 
     println!("Ref Certificate: {cert_id}");
     println!("  Ref:       {ref_name}");
@@ -163,6 +166,7 @@ async fn cmd_show(
     println!("  New SHA:   {new_sha}");
     println!("  Pusher:    {pusher}");
     println!("  Node DID:  {node_did}");
+    println!("  Seq:       {seq}");
     println!("  Issued at: {issued_at}");
     println!("  Signature: {signature}");
     println!();
@@ -174,7 +178,17 @@ async fn cmd_show(
     // names; the node-DID comparison below covers *which* node that is.
     let repo_id = cert["repo_id"].as_str().unwrap_or("");
     let verdict = verify_signature(
-        repo_id, ref_name, old_sha, new_sha, pusher, node_did, issued_at, signature,
+        repo_id,
+        ref_name,
+        old_sha,
+        new_sha,
+        pusher,
+        node_did,
+        issued_at,
+        seq,
+        prev,
+        pusher_sig.as_deref(),
+        signature,
     );
 
     println!("Signature verification:");
@@ -251,6 +265,9 @@ fn verify_signature(
     pusher: &str,
     node_did: &str,
     issued_at: &str,
+    seq: i64,
+    prev: &str,
+    pusher_sig: Option<&str>,
     signature_b64: &str,
 ) -> std::result::Result<(), String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -264,6 +281,9 @@ fn verify_signature(
         "pusher":  pusher,
         "node":    node_did,
         "ts":      issued_at,
+        "seq":     seq,
+        "prev":    prev,
+        "pusher_sig": pusher_sig,
     });
     let payload_bytes =
         serde_json::to_vec(&payload).map_err(|e| format!("could not serialize payload: {e}"))?;
@@ -334,11 +354,16 @@ mod tests {
             "pusher":  "did:key:z6MkPusher",
             "node":    "did:key:z6MkNode",
             "ts":      "2026-07-22T00:00:00+00:00",
+            "seq":     1,
+            "prev":   "0000000000000000000000000000000000000000000000000000000000000000",
+            "pusher_sig": serde_json::Value::Null,
         });
         let frozen = concat!(
             r#"{"new":"newsha","node":"did:key:z6MkNode","old":"oldsha","#,
-            r#""pusher":"did:key:z6MkPusher","ref":"refs/heads/main","#,
-            r#""repo_id":"repo-1","ts":"2026-07-22T00:00:00+00:00"}"#,
+            r#""prev":"0000000000000000000000000000000000000000000000000000000000000000","#,
+            r#""pusher":"did:key:z6MkPusher","pusher_sig":null,"#,
+            r#""ref":"refs/heads/main","repo_id":"repo-1","seq":1,"#,
+            r#""ts":"2026-07-22T00:00:00+00:00"}"#,
         );
         assert_eq!(serde_json::to_string(&payload).unwrap(), frozen);
     }
@@ -349,6 +374,7 @@ mod tests {
     fn verify_signature_round_trip_and_tamper() {
         let kp = gitlawb_core::identity::Keypair::generate();
         let node_did = kp.did().as_str().to_string();
+        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
 
         let payload = serde_json::json!({
             "repo_id": "repo-1",
@@ -358,6 +384,9 @@ mod tests {
             "pusher":  "did:key:z6MkPusher",
             "node":    node_did,
             "ts":      "2026-07-22T00:00:00+00:00",
+            "seq":     1,
+            "prev":    prev,
+            "pusher_sig": serde_json::Value::Null,
         });
         let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
 
@@ -369,6 +398,9 @@ mod tests {
             "did:key:z6MkPusher",
             &node_did,
             "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            None,
             &sig,
         );
         assert!(ok.is_ok(), "expected valid signature, got: {ok:?}");
@@ -381,6 +413,9 @@ mod tests {
             "did:key:z6MkPusher",
             &node_did,
             "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            None,
             &sig,
         );
         assert!(tampered.is_err(), "tampered payload must not verify");
@@ -393,6 +428,9 @@ mod tests {
             "did:key:z6MkPusher",
             &node_did,
             "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            None,
             "not-base64url!!!",
         );
         assert!(garbage.is_err(), "malformed signature must not verify");
