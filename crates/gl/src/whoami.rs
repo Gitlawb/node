@@ -344,7 +344,7 @@ mod tests {
             .mock("GET", format!("/api/v1/agents/{did}").as_str())
             .with_status(500)
             .with_header("content-type", "application/json")
-            .with_body("{\"message\":\"\\u{1b}[31mowned\\u{07}\\u{202e}evil\"}")
+            .with_body("{\"message\":\"\\u001b[31mowned\\u0007\\u202eevil\"}")
             .create_async()
             .await;
 
