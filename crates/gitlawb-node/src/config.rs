@@ -129,10 +129,60 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_HEARTBEAT_INTERVAL_HOURS", default_value_t = 20)]
     pub heartbeat_interval_hours: u64,
 
-    /// Tigris (S3-compatible) bucket for repo storage.
+    /// Tigris (S3-compatible) bucket for repo storage. Legacy alias for
+    /// `s3_bucket` — still honoured so existing deployments keep working.
     /// Leave empty to disable Tigris and use local-only storage.
     #[arg(long, env = "GITLAWB_TIGRIS_BUCKET", default_value = "")]
     pub tigris_bucket: String,
+
+    /// Object-storage backend: `s3` (any S3-compatible service), `fs` (local
+    /// directory), or `ipfs` (Kubo MFS). Empty = auto-detect: `s3` when a bucket
+    /// is set, else `fs` when a storage dir is set, else local-only. `ipfs` is
+    /// never auto-selected (`GITLAWB_IPFS_API` alone keeps its pinning-only
+    /// meaning) — set this explicitly to `ipfs` to opt in.
+    #[arg(long, env = "GITLAWB_STORAGE_BACKEND", default_value = "")]
+    pub storage_backend: String,
+
+    /// Bucket for the `s3` backend (Tigris, R2, AWS S3, MinIO, B2). Falls back to
+    /// `tigris_bucket` when empty.
+    #[arg(long, env = "GITLAWB_S3_BUCKET", default_value = "")]
+    pub s3_bucket: String,
+
+    /// Endpoint URL override for the `s3` backend (e.g. R2/MinIO). On Tigris/Fly
+    /// the endpoint is auto-provided via `AWS_ENDPOINT_URL_S3`, so leave empty.
+    #[arg(long, env = "GITLAWB_S3_ENDPOINT", default_value = "")]
+    pub s3_endpoint: String,
+
+    /// Force path-style S3 addressing (required by MinIO and some S3-compatibles).
+    #[arg(long, env = "GITLAWB_S3_FORCE_PATH_STYLE", default_value_t = false)]
+    pub s3_force_path_style: bool,
+
+    /// Directory for the `fs` (local filesystem) storage backend.
+    #[arg(long, env = "GITLAWB_STORAGE_FS_DIR", default_value = "")]
+    pub storage_fs_dir: String,
+
+    /// Acknowledge a push to the client before the durable upload to object
+    /// storage finishes (write-back). Lowers push latency, but opens a
+    /// durability window: if the upload fails or the node stops first, storage
+    /// stays stale until the next successful upload. A persisted pending-upload
+    /// marker keeps the local copy authoritative on this node in that window
+    /// (no rollback of the acked push), but other nodes serve the stale archive
+    /// until the re-upload lands. Off by default (strict upload-before-ack).
+    #[arg(long, env = "GITLAWB_ASYNC_UPLOAD", default_value_t = false)]
+    pub async_upload: bool,
+
+    /// Max connections in the dedicated advisory-lock pool. A push pins one
+    /// connection for its whole lifetime (lock held across receive-pack and
+    /// the storage upload), so this bounds per-node push concurrency. Counts
+    /// against Postgres `max_connections` on top of the handler pool. Must be
+    /// at least 1 — zero would let the node start but time out every write.
+    #[arg(
+        long,
+        env = "GITLAWB_ADVISORY_LOCK_POOL_SIZE",
+        default_value_t = 16,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub advisory_lock_pool_size: u32,
 
     /// Maximum pack body size for git-receive-pack and git-upload-pack, in bytes.
     /// Applies only to git smart-HTTP routes — all other API routes keep the 2 MB default.
@@ -270,6 +320,23 @@ mod tests {
         // 0 is a footgun (immediate-504 on every request); clap must reject it.
         assert!(
             Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
+        );
+    }
+
+    #[test]
+    fn advisory_lock_pool_size_defaults_to_16_and_rejects_zero() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).advisory_lock_pool_size,
+            16
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--advisory-lock-pool-size", "1"])
+                .advisory_lock_pool_size,
+            1
+        );
+        // 0 would let the node start but time out every write on pool acquire.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--advisory-lock-pool-size", "0"]).is_err()
         );
     }
 }

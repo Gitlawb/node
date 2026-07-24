@@ -250,11 +250,6 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
@@ -986,6 +981,17 @@ impl Db {
         .bind(&repo.machine_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Compensating delete for creation flows: remove the row a failed
+    /// create/fork just inserted, keyed strictly by our own generated id so a
+    /// concurrent same-name winner's row can never be affected.
+    pub async fn delete_repo_by_id(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM repos WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

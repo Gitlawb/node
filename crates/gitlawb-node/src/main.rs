@@ -18,6 +18,7 @@ mod pinata;
 mod rate_limit;
 mod server;
 mod state;
+mod storage;
 mod sync;
 #[cfg(test)]
 mod test_support;
@@ -262,25 +263,59 @@ async fn main() -> Result<()> {
         info!("  fly machine: {mid}");
     }
 
-    // Initialize Tigris S3 client if bucket is configured
-    let tigris = if !config.tigris_bucket.is_empty() {
-        match git::tigris::TigrisClient::new(&config.tigris_bucket).await {
-            Ok(client) => {
-                info!(bucket = %config.tigris_bucket, "tigris storage enabled");
-                Some(client)
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "failed to initialize Tigris client — using local-only storage");
-                None
-            }
-        }
-    } else {
-        info!("tigris storage disabled (no bucket configured)");
-        None
-    };
+    // Initialize the storage-agnostic blob backend (S3-compatible / filesystem /
+    // IPFS), then wrap it in the repo-archive layer. `None` = local-only mode.
+    // Fail closed: a configured-but-unreachable backend aborts boot rather than
+    // silently running local-only and dropping durability.
+    let blob_store = storage::build(&config)
+        .await
+        .context("initializing object storage backend")?;
+    let archive = blob_store.map(storage::archive::RepoArchive::new);
 
-    let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
+    // Dedicated, bounded pool for advisory-lock connections. A push pins one
+    // connection for its whole lifetime (lock held across receive-pack +
+    // upload), so giving locks their own budget keeps a burst of concurrent or
+    // slow pushes from draining the main pool and stalling every other DB
+    // handler node-wide. Sized independently of the handler pool
+    // (GITLAWB_ADVISORY_LOCK_POOL_SIZE). acquire_timeout matches the advisory
+    // lock's own wait budget: with the default 30s, a burst that pins every
+    // connection would fail waiters at 30s even though the lock path is
+    // prepared to outwait a full 300s storage upload.
+    let lock_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(config.advisory_lock_pool_size)
+        .acquire_timeout(std::time::Duration::from_secs(
+            git::repo_store::LOCK_ACQUIRE_TIMEOUT_SECS,
+        ))
+        .connect(&config.database_url)
+        .await
+        .context("creating advisory-lock connection pool")?;
+
+    // Sweep swap-phase litter (`.tmp-extract.`/`.bak-` dirs) orphaned by a hard
+    // kill mid-extraction. Must run before any request can start an extraction,
+    // as a live swap owns exactly these names — synchronous here, and cheap:
+    // it's a two-level directory scan that removes only matching orphans.
+    {
+        let removed = storage::archive::sweep_orphaned_swap_dirs(&config.repos_dir);
+        if removed > 0 {
+            info!(removed, "swept orphaned repo swap dirs from previous run");
+        }
+    }
+
+    let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), archive, lock_pool);
+
+    // Re-attempt uploads for repos whose pending-upload marker survived a
+    // crash or failed upload — otherwise a repo with no further writes stays
+    // divergent from storage indefinitely. Background task: it takes the
+    // per-repo advisory locks, so it serializes correctly with live pushes.
+    {
+        let store = repo_store.clone();
+        tokio::spawn(async move {
+            let (reuploaded, still_pending) = store.retry_pending_uploads().await;
+            if reuploaded > 0 || still_pending > 0 {
+                info!(reuploaded, still_pending, "pending-upload marker sweep");
+            }
+        });
+    }
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.

@@ -33,6 +33,7 @@ sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chron
 clap = { version = "4", features = ["derive", "env"] }
 bytes = "1"
 libc = "0.2"
+async-trait = "0.1"
 cid = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
@@ -57,7 +58,7 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "d
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 async-compression = { version = "0.4", features = ["tokio", "zstd"] }
 tar = "0.4"
-zstd = "0.13"
+zstd = { version = "0.13", features = ["zstdmt"] }
 # Prometheus metrics. Used to expose a /metrics endpoint for ops/observability
 # on the opt-in GITLAWB_METRICS_ADDR listener. The crate is also the de-facto
 # exposition format encoder in the Rust ecosystem.
