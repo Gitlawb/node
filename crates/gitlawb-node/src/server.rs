@@ -220,7 +220,20 @@ pub fn build_router(state: AppState) -> Router {
         .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
-    let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
+    // Rate-limited per-IP to prevent the verify endpoint from being used as an
+    // open arweave gateway proxy or abused in a resource-exhaustion attack.
+    let arweave_limiter = rate_limit::IpRateLimiter {
+        limiter: state.arweave_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
+    let arweave_routes = Router::new()
+        .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
+        .route(
+            "/api/v1/arweave/verify/{tx_id}",
+            get(arweave::verify_anchor_endpoint),
+        )
+        .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+        .layer(axum::Extension(arweave_limiter));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
@@ -567,6 +580,17 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Json<serde_json::Val
     }))
 }
 
+/// Mask a URL that might contain embedded credentials by stripping everything
+/// after the '@' separator (user:pass@host → host).
+fn mask_credential_url(url: &str) -> String {
+    if let Some(at_pos) = url.find('@') {
+        // Strip userinfo: keep everything after '@'
+        url[at_pos + 1..].to_string()
+    } else {
+        url.to_string()
+    }
+}
+
 async fn contracts_info(State(state): State<AppState>) -> Json<serde_json::Value> {
     let did_registry = &state.config.contract_did_registry;
     let name_registry = &state.config.contract_name_registry;
@@ -579,14 +603,15 @@ async fn contracts_info(State(state): State<AppState>) -> Json<serde_json::Value
     Json(serde_json::json!({
         "chain": if chain_id == 8453 { "base" } else { "base-sepolia" },
         "chain_id": chain_id,
-        "rpc_url": rpc_url,
+        "rpc_url": mask_credential_url(rpc_url),
         "contracts": {
             "did_registry": if did_registry.is_empty() { serde_json::Value::Null } else { serde_json::json!(did_registry) },
             "name_registry": if name_registry.is_empty() { serde_json::Value::Null } else { serde_json::json!(name_registry) },
         },
         "arweave": {
-            "enabled": !state.config.irys_url.is_empty(),
-            "irys_url": if state.config.irys_url.is_empty() { serde_json::Value::Null } else { serde_json::json!(&state.config.irys_url) },
+            "enabled": !state.config.bundler_url.is_empty(),
+            "bundler_url": if state.config.bundler_url.is_empty() { serde_json::Value::Null } else { serde_json::json!(mask_credential_url(&state.config.bundler_url)) },
+            "gateway": mask_credential_url(&state.config.arweave_gateway),
         }
     }))
 }

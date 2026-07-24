@@ -17,6 +17,24 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// The raw RFC 9421 HTTP Signature value (the `Signature` header), injected into
+/// request extensions by `require_signature`. Pushers sign the request, and the
+/// node persists this signature so it can be presented as proof of authorization.
+#[derive(Clone, Debug)]
+pub struct PusherSignature(pub String);
+
+/// Full RFC 9421 HTTP Signature context, needed to reconstruct the signing
+/// string when verifying the pusher authorization proof.
+#[derive(Clone, Debug)]
+pub struct PusherProof {
+    /// The `Signature-Input` header value (e.g. `sig1=("@method" "@path" "content-digest");keyid="...";alg="ed25519";created=1234`)
+    pub signature_input: String,
+    /// The `Content-Digest` header value (e.g. `sha-256=:base64:`)
+    pub content_digest: String,
+    /// The HTTP request path+query, e.g. /owner/repo.git/git-receive-pack
+    pub request_path: String,
+}
+
 /// Whether `caller` is authorized to push to `record`.
 ///
 /// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only, via the canonical
@@ -29,6 +47,7 @@ pub fn caller_authorized_to_push(record: &crate::db::RepoRecord, caller: &str) -
     crate::api::did_matches(caller, &record.owner_did)
 }
 
+use base64::Engine as _;
 use gitlawb_core::http_sig::{
     build_signing_string, compute_content_digest, HttpSignature, COVERED_COMPONENTS,
 };
@@ -170,9 +189,9 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
         .to_string();
 
     let mut request_values: HashMap<String, String> = HashMap::new();
-    request_values.insert("@method".to_string(), method);
-    request_values.insert("@path".to_string(), path_and_query);
-    request_values.insert("content-digest".to_string(), content_digest);
+    request_values.insert("@method".to_string(), method.clone());
+    request_values.insert("@path".to_string(), path_and_query.clone());
+    request_values.insert("content-digest".to_string(), content_digest.clone());
 
     // The @signature-params value is the part of Signature-Input after "sig1="
     let sig_params_value = sig_input.strip_prefix("sig1=").unwrap_or(&sig_input);
@@ -242,6 +261,14 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     request
         .extensions_mut()
         .insert(AuthenticatedDid(sig.key_id.to_string()));
+    request.extensions_mut().insert(PusherSignature(
+        base64::engine::general_purpose::STANDARD.encode(&sig.signature_bytes),
+    ));
+    request.extensions_mut().insert(PusherProof {
+        signature_input: sig_input,
+        content_digest,
+        request_path: path_and_query,
+    });
     next.run(request).await
 }
 
@@ -514,6 +541,7 @@ mod tests {
             machine_id: None,
             repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
             rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+            arweave_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
             create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
             push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             push_limiter_trust: crate::rate_limit::TrustedProxy::None,

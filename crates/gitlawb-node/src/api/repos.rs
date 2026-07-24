@@ -5,7 +5,7 @@ use axum::Json;
 use bytes::Bytes;
 use std::sync::Arc;
 
-use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
+use crate::auth::{caller_authorized_to_push, AuthenticatedDid, PusherProof, PusherSignature};
 use crate::db::RepoRecord;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -855,6 +855,8 @@ pub async fn git_receive_pack(
     State(state): State<AppState>,
     Path((owner, repo)): Path<(String, String)>,
     Extension(auth): Extension<AuthenticatedDid>,
+    Extension(pusher_sig): Extension<PusherSignature>,
+    Extension(pusher_proof): Extension<PusherProof>,
     body: Bytes,
 ) -> Result<Response> {
     let name = smart_http_repo_name(&repo)?;
@@ -971,6 +973,10 @@ pub async fn git_receive_pack(
     // The route is behind `require_signature`, so the verified pusher identity is
     // always present; use it directly rather than re-parsing the headers.
     let did = auth.0.as_str();
+    // Collect certs keyed by ref_name so the anchoring loop below uses
+    // the correct per-update certificate rather than a repo-wide latest.
+    let mut ref_certs: std::collections::HashMap<String, crate::db::RefCertificate> =
+        std::collections::HashMap::new();
     {
         // Use the first new commit hash we parsed, fall back to timestamp
         let commit_hash = ref_updates
@@ -997,11 +1003,16 @@ pub async fn git_receive_pack(
                 &update.old_sha,
                 &update.new_sha,
                 did,
+                Some(pusher_sig.0.clone()),
+                Some(pusher_proof.signature_input.clone()),
+                Some(pusher_proof.content_digest.clone()),
+                Some(pusher_proof.request_path.clone()),
             )
             .await
             {
                 Ok(c) => {
-                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate")
+                    tracing::info!(cert_id = %c.id, repo = %record.name, ref_name = %update.ref_name, pusher = %did, "issued ref certificate");
+                    ref_certs.insert(update.ref_name.clone(), c);
                 }
                 Err(e) => {
                     tracing::warn!(err = %e, ref_name = %update.ref_name, "failed to issue ref certificate")
@@ -1115,7 +1126,7 @@ pub async fn git_receive_pack(
         let repo_id = record.id.clone();
         let owner_did = record.owner_did.clone();
         let is_public = record.is_public;
-        let irys_url = state.config.irys_url.clone();
+        let bundler_url = state.config.bundler_url.clone();
         let http_client = std::sync::Arc::clone(&state.http_client);
         let node_did_str = state.node_did.to_string();
         let node_seed = state.node_keypair.to_seed();
@@ -1164,7 +1175,7 @@ pub async fn git_receive_pack(
                     // Option B3: anchor a per-push manifest of the blobs sealed
                     // this push to Arweave, so the oid->cid index survives total
                     // node loss. Best-effort; never fails the push.
-                    if !delta.is_empty() && !irys_url.is_empty() {
+                    if !delta.is_empty() && !bundler_url.is_empty() {
                         let owner_short = crate::db::normalize_owner_key(&owner_did);
                         let repo_slug = format!("{owner_short}/{repo_name}");
                         let ts = chrono::Utc::now().to_rfc3339();
@@ -1177,7 +1188,7 @@ pub async fn git_receive_pack(
                         };
                         match crate::arweave::anchor_encrypted_manifest(
                             &http_client,
-                            &irys_url,
+                            &bundler_url,
                             &manifest,
                         )
                         .await
@@ -1217,11 +1228,12 @@ pub async fn git_receive_pack(
             .iter()
             .map(|u| (u.ref_name.clone(), u.old_sha.clone(), u.new_sha.clone()))
             .collect::<Vec<_>>();
+        let ref_certs_clone = ref_certs.clone();
         let p2p_handle = state.p2p.clone();
         let pusher_did_clone = did.to_string();
         let db_for_peers = state.db.clone();
         let ref_update_tx = state.ref_update_tx.clone();
-        let irys_url = state.config.irys_url.clone();
+        let bundler_url = state.config.bundler_url.clone();
         let owner_did_for_arweave = record.owner_did.clone();
         let self_public_url = state.config.public_url.clone();
         let node_keypair = Arc::clone(&state.node_keypair);
@@ -1304,11 +1316,17 @@ pub async fn git_receive_pack(
 
             // Arweave permanent anchoring — fire for each ref update.
             // Suppressed for repos the public cannot read (public permanent ledger).
-            if announce && !irys_url.is_empty() {
+            if announce && !bundler_url.is_empty() {
                 for (ref_name, old_sha, new_sha) in &ref_updates_clone {
                     let cid = cid_map.get(new_sha).cloned();
+                    // Use the per-update certificate issued above, not a
+                    // repo-wide latest, so each anchor embeds the exact
+                    // certificate for its own ref transition.
+                    let cert = ref_certs_clone.get(ref_name).cloned();
+                    let cert_id = cert.as_ref().map(|c| c.id.clone());
                     let anchor = crate::arweave::RefAnchor {
                         repo: repo_slug.clone(),
+                        repo_id: record.id.clone(),
                         owner_did: owner_did_for_arweave.clone(),
                         ref_name: ref_name.clone(),
                         old_sha: old_sha.clone(),
@@ -1316,24 +1334,28 @@ pub async fn git_receive_pack(
                         cid: cid.clone(),
                         timestamp: now_ts.clone(),
                         node_did: node_did_str.clone(),
+                        certificate: cert,
                     };
-                    match crate::arweave::anchor_ref_update(&http_client, &irys_url, &anchor).await
+                    match crate::arweave::anchor_ref_update(&http_client, &bundler_url, &anchor)
+                        .await
                     {
                         Ok(tx_id) if !tx_id.is_empty() => {
-                            let arweave_url = crate::arweave::arweave_url(&tx_id);
-                            let _ = db_clone
-                                .record_arweave_anchor(&crate::db::RecordAnchorInput {
+                            if let Err(e) = db_clone
+                                .record_arweave_anchor(&crate::db::RecordAnchorInputV2 {
                                     repo: &repo_slug,
                                     owner_did: &owner_did_for_arweave,
                                     ref_name,
                                     old_sha,
                                     new_sha,
                                     cid: cid.as_deref(),
-                                    irys_tx_id: &tx_id,
-                                    arweave_url: &arweave_url,
+                                    arweave_tx_id: &tx_id,
                                     node_did: &node_did_str,
+                                    cert_id,
                                 })
-                                .await;
+                                .await
+                            {
+                                tracing::warn!(repo=%repo_slug, tx_id=%tx_id, err=%e, "failed to persist arweave anchor");
+                            }
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(repo=%repo_slug, err=%e, "Arweave anchor failed"),

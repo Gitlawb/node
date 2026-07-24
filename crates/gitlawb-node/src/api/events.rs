@@ -241,17 +241,23 @@ pub async fn list_repo_events(
         .iter()
         .map(|c| {
             serde_json::json!({
-                "type":       "local_cert",
-                "id":         c.id,
-                "repo":       repo_id_str,
-                "ref_name":   c.ref_name,
-                "old_sha":    c.old_sha,
-                "new_sha":    c.new_sha,
-                "pusher_did": c.pusher_did,
-                "node_did":   c.node_did,
-                "timestamp":  c.issued_at,
-                "owner_did":  record.owner_did,
-                "source":     "local",
+                "type":             "local_cert",
+                "id":               c.id,
+                "repo":             repo_id_str,
+                "ref_name":         c.ref_name,
+                "old_sha":          c.old_sha,
+                "new_sha":          c.new_sha,
+                "pusher_did":       c.pusher_did,
+                "node_did":         c.node_did,
+                "timestamp":        c.issued_at,
+                "seq":              c.seq,
+                "prev":             c.prev,
+                "pusher_sig":       c.pusher_sig,
+                "signature_input":  c.signature_input,
+                "content_digest":   c.content_digest,
+                "request_path":     c.request_path,
+                "owner_did":        record.owner_did,
+                "source":           "local",
             })
         })
         .collect();
@@ -426,6 +432,13 @@ mod ref_updates_feed_tests {
             .with_state(state)
     }
 
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static NEXT_FCERT_SEQ: AtomicI64 = AtomicI64::new(1);
+
+    fn ref_cert_seq() -> i64 {
+        NEXT_FCERT_SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn ref_cert(id: &str, repo_id: &str) -> RefCertificate {
         RefCertificate {
             id: id.into(),
@@ -437,6 +450,12 @@ mod ref_updates_feed_tests {
             node_did: "did:key:z6MkNode".into(),
             signature: "sig".into(),
             issued_at: Utc::now().to_rfc3339(),
+            seq: ref_cert_seq(),
+            prev: "0".repeat(64),
+            pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         }
     }
 

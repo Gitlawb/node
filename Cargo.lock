@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "git-remote-gitlawb"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "gitlawb-core",
@@ -3312,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-attest"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-core"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "gitlawb-node"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "alloy",
  "anyhow",
@@ -3412,10 +3412,11 @@ dependencies = [
 
 [[package]]
 name = "gl"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "dirs",
@@ -5630,12 +5631,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.6",
 ]
@@ -7399,6 +7402,19 @@ dependencies = [
  "indexmap 2.13.0",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

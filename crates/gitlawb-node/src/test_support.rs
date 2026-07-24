@@ -76,6 +76,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         machine_id: None,
         repo_store: crate::git::repo_store::RepoStore::for_testing(PathBuf::from("/tmp"), pool),
         rate_limiter: RateLimiter::new(100, Duration::from_secs(60)),
+        arweave_rate_limiter: RateLimiter::new(120, Duration::from_secs(3600)),
         create_ip_rate_limiter: RateLimiter::new(1000, Duration::from_secs(3600)),
         push_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
@@ -1478,6 +1479,12 @@ mod tests {
                 node_did: owner.to_string(),
                 signature: "sig".to_string(),
                 issued_at: Utc::now().to_rfc3339(),
+                seq: next_cert_seq(),
+                prev: "0".repeat(64),
+                pusher_sig: None,
+                signature_input: None,
+                content_digest: None,
+                request_path: None,
             })
             .await
             .expect("seed private cert");
@@ -3556,6 +3563,12 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -3591,6 +3604,12 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -4100,6 +4119,12 @@ mod tests {
             node_did: "did:key:zNode".into(),
             signature: "sig".into(),
             issued_at: "2026-01-01T00:00:00Z".into(),
+            seq: 1,
+            prev: "0".repeat(64),
+            pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         };
         state.db.insert_ref_certificate(&cert).await.unwrap();
 
@@ -4940,6 +4965,13 @@ mod tests {
 
     // ── #147: list_certs respects ?limit ──────────────────────────────────────
 
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static NEXT_CERT_SEQ: AtomicI64 = AtomicI64::new(1);
+
+    fn next_cert_seq() -> i64 {
+        NEXT_CERT_SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn seed_cert(
         id: &str,
         repo_id: &str,
@@ -4956,6 +4988,12 @@ mod tests {
             node_did: "did:key:zNODE".into(),
             signature: "sig".into(),
             issued_at: issued_at.to_string(),
+            seq: next_cert_seq(),
+            prev: "0".repeat(64),
+            pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         }
     }
 

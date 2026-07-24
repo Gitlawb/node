@@ -136,6 +136,20 @@ pub struct RefCertificate {
     pub node_did: String,
     pub signature: String,
     pub issued_at: String,
+    /// Monotonic sequence number for chain continuity
+    pub seq: i64,
+    /// Hash of the previous certificate in the chain (first cert uses zeros)
+    pub prev: String,
+    /// RFC 9421 HTTP Signature from the pusher, proving they authorized this push
+    pub pusher_sig: Option<String>,
+    /// RFC 9421 Signature-Input header value, needed to reconstruct the signing
+    /// string for pusher authorization verification.
+    pub signature_input: Option<String>,
+    /// Content-Digest header value covering the request body (RFC 9421).
+    pub content_digest: Option<String>,
+    /// The HTTP request path (e.g. /owner/repo.git/git-receive-pack) for RFC 9421
+    /// signing-string reconstruction.
+    pub request_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,7 +260,7 @@ pub struct ProfileRecord {
 
 #[derive(Clone)]
 pub struct Db {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
 }
 
 impl Db {
@@ -453,6 +467,14 @@ impl Db {
 // appended to v1. Operators can read `schema_migrations` to confirm a node
 // is at the expected version.
 //
+// NOTE: the v1 migration in this branch already includes columns (seq, prev,
+// pusher_sig on ref_certificates; status, deadline_height, receipt_sig, cert_id
+// on arweave_anchors) that were historically added by migrations v12/v13. These
+// were bundled into v1 for development convenience and kept there to avoid a
+// schema reset. The v12/v13 migrations remain as no-ops for existing installs
+// that upgrade from an older branch. See v12/v13 for the actual DDL that newer
+// installs skip via IF NOT EXISTS.
+//
 // Each migration runs in a single transaction, so statements that Postgres
 // forbids inside a transaction (notably `CREATE INDEX CONCURRENTLY`) cannot be
 // used here. Build such indexes the ordinary, transaction-safe way, or stage
@@ -517,7 +539,10 @@ const MIGRATIONS: &[Migration] = &[
                 pusher_did  TEXT NOT NULL,
                 node_did    TEXT NOT NULL,
                 signature   TEXT NOT NULL,
-                issued_at   TEXT NOT NULL
+                issued_at   TEXT NOT NULL,
+                seq         BIGINT NOT NULL DEFAULT 1,
+                prev        TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000',
+                pusher_sig  TEXT
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_ref_certs_repo ON ref_certificates(repo_id)",
             r#"CREATE TABLE IF NOT EXISTS peers (
@@ -629,17 +654,20 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_agent_tasks_repo      ON agent_tasks(repo_id)",
             // ── Arweave permanent anchors ────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS arweave_anchors (
-                id          TEXT NOT NULL PRIMARY KEY,
-                repo        TEXT NOT NULL,
-                owner_did   TEXT NOT NULL,
-                ref_name    TEXT NOT NULL,
-                old_sha     TEXT NOT NULL,
-                new_sha     TEXT NOT NULL,
-                cid         TEXT,
-                irys_tx_id  TEXT NOT NULL,
-                arweave_url TEXT NOT NULL,
-                node_did    TEXT NOT NULL,
-                anchored_at TEXT NOT NULL
+                id              TEXT NOT NULL PRIMARY KEY,
+                repo            TEXT NOT NULL,
+                owner_did       TEXT NOT NULL,
+                ref_name        TEXT NOT NULL,
+                old_sha         TEXT NOT NULL,
+                new_sha         TEXT NOT NULL,
+                cid             TEXT,
+                arweave_tx_id   TEXT NOT NULL,
+                node_did        TEXT NOT NULL,
+                anchored_at     TEXT NOT NULL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                deadline_height BIGINT,
+                receipt_sig     TEXT,
+                cert_id         TEXT
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo    ON arweave_anchors(repo)",
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_new_sha ON arweave_anchors(new_sha)",
@@ -881,6 +909,56 @@ const MIGRATIONS: &[Migration] = &[
         stmts: &[
             // Index deferred — the feed gate (#144) does not read owner_did yet.
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
+        ],
+    },
+    Migration {
+        version: 12,
+        name: "arweave_anchor_v2_and_cert_chain",
+        stmts: &[
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS seq BIGINT NOT NULL DEFAULT 1",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS prev TEXT NOT NULL DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS pusher_sig TEXT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending'",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS deadline_height BIGINT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS receipt_sig TEXT",
+            "ALTER TABLE arweave_anchors ADD COLUMN IF NOT EXISTS cert_id TEXT",
+            // Rename irys_tx_id → arweave_tx_id only if the old column still exists
+            // (fresh databases created by v1 already use arweave_tx_id).
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='arweave_anchors' AND column_name='irys_tx_id') THEN ALTER TABLE arweave_anchors RENAME COLUMN irys_tx_id TO arweave_tx_id; END IF; END $$",
+            "ALTER TABLE arweave_anchors DROP COLUMN IF EXISTS arweave_url",
+        ],
+    },
+    Migration {
+        version: 13,
+        name: "append_only_certs_and_pusher_proof",
+        stmts: &[
+            // Backfill: assign sequential seq values to existing certificates
+            // before creating the unique index. Migrations v10/v11 may have left
+            // multiple rows per repo (from different refs) all at seq = 1.
+            // The prev column is intentionally NOT backfilled here: chain
+            // verification in verify_anchor computes expected_prev dynamically
+            // from the predecessor's 7 canonical fields (repo_id, ref, old,
+            // new, pusher, node, ts), never reading the DB's prev column.
+            // Existing prev values already match what was computed at issuance.
+            r#"UPDATE ref_certificates
+               SET seq = subq.new_seq
+               FROM (
+                   SELECT id, ROW_NUMBER() OVER (
+                       PARTITION BY repo_id ORDER BY issued_at ASC, id ASC
+                   ) AS new_seq
+                   FROM ref_certificates
+               ) subq
+               WHERE ref_certificates.id = subq.id"#,
+            // Make cert chain append-only: drop the (repo_id, ref_name) unique index
+            // and add a unique constraint on (repo_id, seq) so concurrent pushes
+            // cannot collide on the same sequence number.
+            "DROP INDEX IF EXISTS idx_ref_certs_repo_ref",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ref_certs_repo_seq ON ref_certificates(repo_id, seq)",
+            // Store the full HTTP Signature context so a third party can verify
+            // the pusher authorization proof (RFC 9421).
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS signature_input TEXT",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS content_digest TEXT",
+            "ALTER TABLE ref_certificates ADD COLUMN IF NOT EXISTS request_path TEXT",
         ],
     },
 ];
@@ -1981,31 +2059,16 @@ impl Db {
 // ── Ref Certificates ──────────────────────────────────────────────────────────
 
 impl Db {
-    /// Insert a ref certificate, or update it if a row for `(repo_id, ref_name)`
-    /// already exists.  The update only applies when the incoming row is newer
-    /// (compared by `issued_at`, which assumes a monotonic wall clock), so a
-    /// late-landing older cert cannot regress a ref's persisted state.  Returns
-    /// the full row as it now exists in the database (the original row on a
-    /// rejected upsert; the passed row on insert).
+    /// Insert a ref certificate (append-only). The unique constraint on
+    /// `(repo_id, seq)` prevents duplicate sequence numbers; callers must
+    /// handle retry on collision.
+    #[allow(dead_code)]
     pub async fn insert_ref_certificate(&self, cert: &RefCertificate) -> Result<RefCertificate> {
         let row = sqlx::query(
             "INSERT INTO ref_certificates
-             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-             ON CONFLICT (repo_id, ref_name) DO UPDATE SET
-                old_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.old_sha   ELSE ref_certificates.old_sha   END,
-                new_sha   = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.new_sha   ELSE ref_certificates.new_sha   END,
-                pusher_did = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                  THEN EXCLUDED.pusher_did ELSE ref_certificates.pusher_did END,
-                node_did  = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.node_did  ELSE ref_certificates.node_did  END,
-                signature = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.signature ELSE ref_certificates.signature END,
-                issued_at = CASE WHEN EXCLUDED.issued_at > ref_certificates.issued_at
-                                 THEN EXCLUDED.issued_at ELSE ref_certificates.issued_at END
-             RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at",
+              (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+              RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path",
         )
         .bind(&cert.id)
         .bind(&cert.repo_id)
@@ -2016,7 +2079,47 @@ impl Db {
         .bind(&cert.node_did)
         .bind(&cert.signature)
         .bind(&cert.issued_at)
+        .bind(cert.seq)
+        .bind(&cert.prev)
+        .bind(&cert.pusher_sig)
+        .bind(&cert.signature_input)
+        .bind(&cert.content_digest)
+        .bind(&cert.request_path)
         .fetch_one(&self.pool)
+        .await?;
+        Ok(row_to_cert(row))
+    }
+
+    /// Transaction-scoped variant of [`insert_ref_certificate`].
+    /// Uses the same advisory-lock hash for the repo_id so the lock key
+    /// stays consistent with [`lock_repo_cert_issuance`].
+    pub async fn insert_ref_certificate_tx(
+        &self,
+        cert: &RefCertificate,
+        conn: &mut sqlx::postgres::PgConnection,
+    ) -> Result<RefCertificate> {
+        let row = sqlx::query(
+            "INSERT INTO ref_certificates
+              (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path)
+              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+              RETURNING id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path",
+        )
+        .bind(&cert.id)
+        .bind(&cert.repo_id)
+        .bind(&cert.ref_name)
+        .bind(&cert.old_sha)
+        .bind(&cert.new_sha)
+        .bind(&cert.pusher_did)
+        .bind(&cert.node_did)
+        .bind(&cert.signature)
+        .bind(&cert.issued_at)
+        .bind(cert.seq)
+        .bind(&cert.prev)
+        .bind(&cert.pusher_sig)
+        .bind(&cert.signature_input)
+        .bind(&cert.content_digest)
+        .bind(&cert.request_path)
+        .fetch_one(&mut *conn)
         .await?;
         Ok(row_to_cert(row))
     }
@@ -2030,8 +2133,8 @@ impl Db {
         // bounded even if a raw/negative value slips through the handler layer.
         let limit = limit.max(1);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 ORDER BY issued_at DESC LIMIT $2",
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
+              FROM ref_certificates WHERE repo_id = $1 ORDER BY seq DESC, issued_at DESC LIMIT $2",
         )
         .bind(repo_id)
         .bind(limit)
@@ -2053,8 +2156,8 @@ impl Db {
         let limit = limit.max(1);
         let pattern = format!("{}%", prefix);
         let rows = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
-             FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY issued_at DESC LIMIT $3",
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
+              FROM ref_certificates WHERE repo_id = $1 AND id LIKE $2 ORDER BY seq DESC, issued_at DESC LIMIT $3",
         )
         .bind(repo_id)
         .bind(&pattern)
@@ -2066,7 +2169,7 @@ impl Db {
 
     pub async fn get_ref_certificate(&self, id: &str) -> Result<Option<RefCertificate>> {
         let row = sqlx::query(
-            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
              FROM ref_certificates WHERE id = $1",
         )
         .bind(id)
@@ -2074,6 +2177,86 @@ impl Db {
         .await?;
         Ok(row.map(row_to_cert))
     }
+
+    /// Retrieve the most recent certificate for a repo (highest seq).
+    pub async fn get_cert_by_seq(&self, repo_id: &str, seq: i64) -> Result<Option<RefCertificate>> {
+        let row = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
+             FROM ref_certificates WHERE repo_id = $1 AND seq = $2",
+        )
+        .bind(repo_id)
+        .bind(seq)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_cert))
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_most_recent_cert(&self, repo_id: &str) -> Result<Option<RefCertificate>> {
+        let row = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
+             FROM ref_certificates WHERE repo_id = $1 ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_cert))
+    }
+
+    /// Transaction-scoped variant of [`get_most_recent_cert`].
+    pub async fn get_most_recent_cert_tx(
+        &self,
+        repo_id: &str,
+        conn: &mut sqlx::postgres::PgConnection,
+    ) -> Result<Option<RefCertificate>> {
+        let row = sqlx::query(
+            "SELECT id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at, seq, prev, pusher_sig, signature_input, content_digest, request_path
+             FROM ref_certificates WHERE repo_id = $1 ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+        Ok(row.map(row_to_cert))
+    }
+
+    /// Acquire a per-repo advisory lock to serialize certificate issuance.
+    /// This prevents two concurrent pushes to the same repo from racing on
+    /// the sequence number allocation.
+    /// Uses a transaction-scoped lock (`pg_advisory_xact_lock`) so it MUST
+    /// be called within an active transaction to be effective.
+    #[allow(dead_code)]
+    pub async fn lock_repo_cert_issuance(&self, repo_id: &str) -> Result<()> {
+        let hash = repo_lock_hash(repo_id);
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Transaction-scoped variant of [`lock_repo_cert_issuance`].
+    /// The lock is held until the enclosing transaction commits or rolls back.
+    pub async fn lock_repo_cert_issuance_tx(
+        &self,
+        repo_id: &str,
+        conn: &mut sqlx::postgres::PgConnection,
+    ) -> Result<()> {
+        let hash = repo_lock_hash(repo_id);
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(hash)
+            .execute(&mut *conn)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Deterministic 64-bit hash of a repo_id for advisory lock keys.
+/// Uses the first 8 bytes of SHA-256 rather than DefaultHasher (which the
+/// std docs do not guarantee stable across Rust versions or platforms).
+fn repo_lock_hash(repo_id: &str) -> i64 {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(repo_id.as_bytes());
+    i64::from_ne_bytes(hash[..8].try_into().expect("sha256 output >= 8 bytes"))
 }
 
 // ── Peers ─────────────────────────────────────────────────────────────────────
@@ -2653,32 +2836,36 @@ pub struct ArweaveAnchor {
     pub old_sha: String,
     pub new_sha: String,
     pub cid: Option<String>,
-    pub irys_tx_id: String,
-    pub arweave_url: String,
+    pub arweave_tx_id: String,
     pub node_did: String,
     pub anchored_at: String,
+    pub status: String,
+    pub deadline_height: Option<i64>,
+    pub receipt_sig: Option<String>,
+    pub cert_id: Option<String>,
 }
 
 /// Input parameters for recording an Arweave anchor.
-pub struct RecordAnchorInput<'a> {
+pub struct RecordAnchorInputV2<'a> {
     pub repo: &'a str,
     pub owner_did: &'a str,
     pub ref_name: &'a str,
     pub old_sha: &'a str,
     pub new_sha: &'a str,
     pub cid: Option<&'a str>,
-    pub irys_tx_id: &'a str,
-    pub arweave_url: &'a str,
+    pub arweave_tx_id: &'a str,
     pub node_did: &'a str,
+    /// ID of the [`RefCertificate`] embedded in this anchor, if any.
+    pub cert_id: Option<String>,
 }
 
 impl Db {
-    pub async fn record_arweave_anchor(&self, input: &RecordAnchorInput<'_>) -> Result<()> {
+    pub async fn record_arweave_anchor(&self, input: &RecordAnchorInputV2<'_>) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, cert_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         )
         .bind(&id)
         .bind(input.repo)
@@ -2687,10 +2874,11 @@ impl Db {
         .bind(input.old_sha)
         .bind(input.new_sha)
         .bind(input.cid)
-        .bind(input.irys_tx_id)
-        .bind(input.arweave_url)
+        .bind(input.arweave_tx_id)
         .bind(input.node_did)
         .bind(&now)
+        .bind("pending")
+        .bind(input.cert_id.clone())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2703,7 +2891,7 @@ impl Db {
     ) -> Result<Vec<ArweaveAnchor>> {
         let rows = if let Some(repo) = repo {
             sqlx::query(
-                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
+                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, deadline_height, receipt_sig, cert_id
                  FROM arweave_anchors WHERE repo=$1 ORDER BY anchored_at DESC LIMIT $2",
             )
             .bind(repo)
@@ -2712,7 +2900,7 @@ impl Db {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
+                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, deadline_height, receipt_sig, cert_id
                  FROM arweave_anchors ORDER BY anchored_at DESC LIMIT $1",
             )
             .bind(limit)
@@ -2730,10 +2918,13 @@ impl Db {
                 old_sha: r.get("old_sha"),
                 new_sha: r.get("new_sha"),
                 cid: r.get("cid"),
-                irys_tx_id: r.get("irys_tx_id"),
-                arweave_url: r.get("arweave_url"),
+                arweave_tx_id: r.get("arweave_tx_id"),
                 node_did: r.get("node_did"),
                 anchored_at: r.get("anchored_at"),
+                status: r.get("status"),
+                deadline_height: r.try_get("deadline_height").unwrap_or(None),
+                receipt_sig: r.try_get("receipt_sig").unwrap_or(None),
+                cert_id: r.try_get("cert_id").unwrap_or(None),
             })
             .collect())
     }
@@ -2808,6 +2999,12 @@ fn row_to_cert(r: sqlx::postgres::PgRow) -> RefCertificate {
         node_did: r.get("node_did"),
         signature: r.get("signature"),
         issued_at: r.get("issued_at"),
+        seq: r.try_get("seq").unwrap_or(0),
+        prev: r.try_get("prev").unwrap_or_default(),
+        pusher_sig: r.try_get("pusher_sig").unwrap_or(None),
+        signature_input: r.try_get("signature_input").unwrap_or(None),
+        content_digest: r.try_get("content_digest").unwrap_or(None),
+        request_path: r.try_get("request_path").unwrap_or(None),
     }
 }
 
@@ -3613,7 +3810,7 @@ mod migration_tests {
             "pre-migration row must exist"
         );
 
-        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did) ──
+        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did, v12 arweave) ──
         db.migrate().await.unwrap();
 
         // ── Assertions ────────────────────────────────────────────────────
@@ -4968,6 +5165,13 @@ mod ref_certificate_tests {
     use super::{Db, RefCertificate, RepoRecord};
     use chrono::Utc;
     use sqlx::PgPool;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    static NEXT_SEQ: AtomicI64 = AtomicI64::new(1);
+
+    fn next_seq() -> i64 {
+        NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
+    }
 
     async fn db(pool: PgPool) -> Db {
         let db = Db::for_testing(pool);
@@ -4993,6 +5197,12 @@ mod ref_certificate_tests {
             node_did: "did:key:zNODE".to_string(),
             signature: "sig".to_string(),
             issued_at: issued_at.to_string(),
+            seq: next_seq(),
+            prev: "0".repeat(64),
+            pusher_sig: None,
+            signature_input: None,
+            content_digest: None,
+            request_path: None,
         }
     }
 
@@ -5044,20 +5254,20 @@ mod ref_certificate_tests {
     }
 
     #[sqlx::test]
-    async fn insert_ref_certificate_upserts_on_repo_ref(pool: PgPool) {
+    async fn insert_ref_certificate_append_only(pool: PgPool) {
         let db = db(pool).await;
         let repo_id = uuid::Uuid::new_v4().to_string();
 
         db.create_repo(&RepoRecord {
             id: repo_id.clone(),
-            name: "upsert-test".into(),
+            name: "append-test".into(),
             owner_did: "did:key:zOWNER".into(),
             description: None,
             is_public: true,
             default_branch: "main".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
-            disk_path: "/tmp/upsert-test".into(),
+            disk_path: "/tmp/append-test".into(),
             forked_from: None,
             machine_id: None,
         })
@@ -5066,7 +5276,7 @@ mod ref_certificate_tests {
 
         // First insert
         db.insert_ref_certificate(&make_cert(
-            "cert-original",
+            "cert-first",
             &repo_id,
             "refs/heads/main",
             "0000",
@@ -5076,9 +5286,9 @@ mod ref_certificate_tests {
         .await
         .unwrap();
 
-        // Upsert same ref with new values
+        // Second insert for the same ref — append-only means both rows exist
         db.insert_ref_certificate(&make_cert(
-            "cert-upserted",
+            "cert-second",
             &repo_id,
             "refs/heads/main",
             "aaaa",
@@ -5088,49 +5298,11 @@ mod ref_certificate_tests {
         .await
         .unwrap();
 
-        // Only one row exists for this ref
+        // Two rows now exist for this ref (append-only)
         let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
-        assert_eq!(certs.len(), 1, "upsert must not create a duplicate row");
-        assert_eq!(
-            certs[0].id, "cert-original",
-            "upsert must preserve the original ID across re-pushes"
-        );
-        assert_eq!(certs[0].old_sha, "aaaa", "old_sha updated");
-        assert_eq!(certs[0].new_sha, "bbbb", "new_sha updated");
-        assert_eq!(
-            certs[0].issued_at, "2026-07-03T21:00:00Z",
-            "newer issued_at overwrites older"
-        );
-
-        // Now try to overwrite with an OLDER cert — the guard must reject it.
-        db.insert_ref_certificate(&make_cert(
-            "stale-id",
-            &repo_id,
-            "refs/heads/main",
-            "stale",
-            "stale",
-            "2026-07-03T19:00:00Z",
-        ))
-        .await
-        .unwrap();
-        let certs = db.list_ref_certificates(&repo_id, 10).await.unwrap();
-        assert_eq!(certs.len(), 1, "no extra row from stale cert");
-        assert_eq!(
-            certs[0].id, "cert-original",
-            "stale cert does not change the original id"
-        );
-        assert_eq!(
-            certs[0].old_sha, "aaaa",
-            "stale cert does not regress old_sha"
-        );
-        assert_eq!(
-            certs[0].new_sha, "bbbb",
-            "stale cert does not regress new_sha"
-        );
-        assert_eq!(
-            certs[0].issued_at, "2026-07-03T21:00:00Z",
-            "stale cert does not regress issued_at"
-        );
+        assert_eq!(certs.len(), 2, "append-only must keep both rows");
+        assert_eq!(certs[0].id, "cert-second", "most recent first");
+        assert_eq!(certs[1].id, "cert-first", "second most recent");
     }
 
     #[sqlx::test]
@@ -5194,8 +5366,14 @@ mod ref_certificate_tests {
     async fn v10_dedup_removes_old_duplicates(pool: PgPool) {
         let db = db(pool.clone()).await;
 
-        // Drop the unique index so we can simulate pre-v10 duplicate rows.
+        // Drop the unique indexes so we can simulate pre-v10 duplicate rows.
+        // v13's (repo_id, seq) index must also be removed because raw INSERTS
+        // without an explicit seq all get DEFAULT 1.
         sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_seq")
             .execute(&pool)
             .await
             .unwrap();
@@ -5298,9 +5476,14 @@ mod ref_certificate_tests {
         let db = Db::for_testing(pool.clone());
         db.run_migrations().await.unwrap();
 
-        // 2. Roll back to v9: remove the v10-unique index and the
+        // 2. Roll back to v9: remove unique indexes and the
         //    schema_migrations record so that run_migrations() re-applies v10.
+        //    Also drop v13's (repo_id, seq) index so raw INSERTS below work.
         sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_seq")
             .execute(&pool)
             .await
             .unwrap();
@@ -5463,33 +5646,26 @@ mod ref_certificate_tests {
             "non-duplicate singleton untouched"
         );
 
-        // 6. Verify the unique index exists: the upsert helper must succeed
-        //    (exercises ON CONFLICT) and a direct duplicate INSERT must fail.
+        // 6. Verify the unique indexes exist: an append-only INSERT for
+        //    a new (repo_id, ref_name) succeeds, and a raw INSERT for an
+        //    existing (repo_id, ref_name) must fail (catches regressions).
         db.insert_ref_certificate(&make_cert(
-            "post-migration-upsert",
+            "post-migration-insert",
             &r1,
-            "refs/heads/main",
+            "refs/heads/new-ref",
             "1111",
             "2222",
             "2026-07-03T10:00:00Z",
         ))
         .await
         .unwrap();
-        let after_upsert = db.list_ref_certificates(&r1, 10).await.unwrap();
-        let r1_main_after: Vec<_> = after_upsert
-            .iter()
-            .filter(|c| c.ref_name == "refs/heads/main")
-            .collect();
-        assert_eq!(
-            r1_main_after.len(),
-            1,
-            "upsert keeps exactly one row for main"
+        let after_migration = db.list_ref_certificates(&r1, 10).await.unwrap();
+        assert!(
+            after_migration
+                .iter()
+                .any(|c| c.id == "post-migration-insert"),
+            "append-only insert for new ref succeeds"
         );
-        assert_eq!(
-            r1_main_after[0].id, "dup-a-new",
-            "upsert preserves original id"
-        );
-        assert_eq!(r1_main_after[0].old_sha, "1111", "upsert updated old_sha");
 
         // A raw INSERT for the same (repo_id, ref_name) must now fail.
         let err = sqlx::query(
@@ -5512,6 +5688,191 @@ mod ref_certificate_tests {
             err.is_err(),
             "raw duplicate INSERT must be rejected by the unique index"
         );
+    }
+
+    /// INV-7: upgrade-path test for migration v13 — seed a database at v12
+    /// with multiple same-repo/different-ref certificates (all at seq=1),
+    /// then let run_migrations() apply v13 and verify (a) seq values are
+    /// distinct per repo, (b) the (repo_id, seq) unique index exists and
+    /// rejects a raw INSERT with a colliding seq.
+    #[sqlx::test]
+    async fn v13_seq_backfill_via_migration(pool: PgPool) {
+        // 1. Bootstrap schema via the full migration chain.
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        // 2. Roll back to v12: drop the (repo_id, seq) index and the
+        //    schema_migrations record for v13 so run_migrations() re-applies it.
+        sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_seq")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 13")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // 3. Seed repos and certs (all with seq=DEFAULT 1).
+        let r1 = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&RepoRecord {
+            id: r1.clone(),
+            name: "v13-upgrade-a".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/v13-upgrade-a".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Insert 3 certs for repo r1 on different refs — all with seq=1 (DEFAULT).
+        for (i, ref_name) in ["refs/heads/main", "refs/heads/feature", "refs/heads/dev"]
+            .iter()
+            .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO ref_certificates
+                 (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(format!("v13-cert-{i}"))
+            .bind(&r1)
+            .bind(ref_name)
+            .bind("0000")
+            .bind("1111")
+            .bind("did:key:zPUSHER")
+            .bind("did:key:zNODE")
+            .bind("sig")
+            .bind(format!("2026-07-0{}T12:00:00Z", i + 1))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // 4. Re-run migrations — v13 backfills seq.
+        db.run_migrations().await.unwrap();
+
+        // 5. Assert distinct seq values per repo.
+        let certs = db.list_ref_certificates(&r1, 10).await.unwrap();
+        assert_eq!(certs.len(), 3, "all three certs survive the migration");
+        let mut seqs: Vec<i64> = certs.iter().map(|c| c.seq).collect();
+        seqs.sort();
+        assert_eq!(seqs, vec![1, 2, 3], "seq values are distinct and ascending");
+
+        // 6. Raw INSERT with colliding seq must be rejected by the unique index.
+        let err = sqlx::query(
+            "INSERT INTO ref_certificates
+             (id, repo_id, ref_name, old_sha, new_sha, pusher_did, node_did, signature, issued_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind("collide-seq")
+        .bind(&r1)
+        .bind("refs/heads/other")
+        .bind("xxxx")
+        .bind("yyyy")
+        .bind("did:key:zPUSHER")
+        .bind("did:key:zNODE")
+        .bind("sig-collide")
+        .bind("2026-07-10T12:00:00Z")
+        .execute(&pool)
+        .await;
+        assert!(
+            err.is_err(),
+            "raw INSERT with default seq=1 must be rejected by the unique index"
+        );
+    }
+
+    #[sqlx::test]
+    async fn get_most_recent_cert_returns_highest_seq(pool: PgPool) {
+        let db = db(pool).await;
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        db.create_repo(&RepoRecord {
+            id: repo_id.clone(),
+            name: "most-recent-test".into(),
+            owner_did: "did:key:zOWNER".into(),
+            description: None,
+            is_public: true,
+            default_branch: "main".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: "/tmp/most-recent-test".into(),
+            forked_from: None,
+            machine_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Insert certs with increasing seq
+        for i in 1..=3 {
+            let mut cert = make_cert(
+                &format!("cert-seq-{i}"),
+                &repo_id,
+                "refs/heads/main",
+                "0000",
+                "1111",
+                &format!("2026-07-03T20:0{i}:00Z"),
+            );
+            cert.seq = i;
+            db.insert_ref_certificate(&cert).await.unwrap();
+        }
+
+        let most_recent = db.get_most_recent_cert(&repo_id).await.unwrap();
+        assert!(most_recent.is_some(), "should find a cert");
+        assert_eq!(most_recent.unwrap().seq, 3, "highest seq returned");
+    }
+
+    #[sqlx::test]
+    async fn get_most_recent_cert_returns_none_for_empty_repo(pool: PgPool) {
+        let db = db(pool).await;
+        let result = db
+            .get_most_recent_cert("nonexistent-repo-id")
+            .await
+            .unwrap();
+        assert!(result.is_none(), "empty repo returns None");
+    }
+}
+
+#[cfg(test)]
+mod arweave_anchor_tests {
+    use super::{Db, RecordAnchorInputV2};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    #[sqlx::test]
+    async fn record_and_list_arweave_anchors(pool: PgPool) {
+        let db = db(pool).await;
+
+        let input = RecordAnchorInputV2 {
+            repo: "alice/myrepo",
+            owner_did: "did:key:zOWNER",
+            ref_name: "refs/heads/main",
+            old_sha: "0000000000000000000000000000000000000000",
+            new_sha: "1111111111111111111111111111111111111111",
+            cid: Some("bafyreib5..."),
+            arweave_tx_id: "test-tx-id-123",
+            node_did: "did:key:zNODE",
+            cert_id: None,
+        };
+
+        db.record_arweave_anchor(&input).await.unwrap();
+
+        let anchors = db
+            .list_arweave_anchors(Some("alice/myrepo"), 10)
+            .await
+            .unwrap();
+        assert_eq!(anchors.len(), 1, "one anchor recorded");
+        assert_eq!(anchors[0].status, "pending", "default status is pending");
+        assert_eq!(anchors[0].arweave_tx_id, "test-tx-id-123");
     }
 }
 #[cfg(test)]
