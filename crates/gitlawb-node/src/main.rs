@@ -16,6 +16,7 @@ mod operator;
 mod p2p;
 mod pinata;
 mod rate_limit;
+mod reconciliation;
 mod server;
 mod state;
 mod sync;
@@ -496,6 +497,19 @@ async fn main() -> Result<()> {
             state.subscribe_shutdown(),
         );
         info!("auto-sync worker started");
+    }
+
+    // Periodic reconciliation sweep: re-derives pin/seal sets and fills gaps
+    // so a dropped replication job never means data loss.
+    {
+        let db = state.db.clone();
+        let config = Arc::clone(&state.config);
+        let http_client = Arc::clone(&state.http_client);
+        let node_keypair = Arc::clone(&state.node_keypair);
+        let node_did = state.node_did.clone();
+        let shutdown_rx = state.subscribe_shutdown();
+        reconciliation::spawn(db, config, http_client, node_keypair, node_did, shutdown_rx);
+        info!("reconciliation sweep worker started");
     }
 
     // On-chain operator setup: verify stake + spawn heartbeat loop

@@ -1,8 +1,9 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
-use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
@@ -883,6 +884,18 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
+    Migration {
+        version: 12,
+        name: "pinned_cids_cid_nullable",
+        stmts: &[
+            // Allow cid to be NULL so record_pinata_cid can create Pinata-only
+            // rows without a local IPFS CID.  has_ipfs_cid uses
+            // "cid IS NOT NULL AND cid IS DISTINCT FROM pinata_cid" so that
+            // legacy rows where cid was set to pinata_cid as fallback are
+            // still correctly classified.
+            "ALTER TABLE pinned_cids ALTER COLUMN cid DROP NOT NULL",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1057,6 +1070,22 @@ impl Db {
         Ok(row.map(row_to_repo))
     }
 
+    /// Look up a repo by its internal UUID `id` column.  Used by the
+    /// reconciliation sweep to re-fetch `is_public` and `owner_did` right
+    /// before each pin phase so it never pins against a stale, more-permissive
+    /// visibility snapshot captured before the git scan (P2).
+    pub async fn get_repo_by_id(&self, repo_id: &str) -> Result<Option<RepoRecord>> {
+        let row = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE id = $1 LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_repo))
+    }
+
     #[allow(dead_code)]
     pub async fn list_repos(&self, owner_did: &str) -> Result<Vec<RepoRecord>> {
         let rows = sqlx::query(
@@ -1217,6 +1246,27 @@ impl Db {
                  d.forked_from, d.machine_id
              FROM deduped d
              ORDER BY d.updated_at DESC",
+            Self::dedup_cte()
+        );
+        let rows = sqlx::query(&sql)
+            .bind(None::<&str>)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows.into_iter().map(row_to_repo).collect())
+    }
+
+    /// Like `list_all_repos_deduped` but ordered by a stable key (`id`) so a
+    /// positional cursor deterministically covers every repo regardless of push
+    /// activity.  Used by the reconciliation sweep to avoid starving idle repos.
+    pub async fn list_all_repos_deduped_stable(&self) -> Result<Vec<RepoRecord>> {
+        let sql = format!(
+            "{}
+             SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
+                 d.default_branch, d.created_at, d.updated_at, d.disk_path,
+                 d.forked_from, d.machine_id
+             FROM deduped d
+             ORDER BY d.id ASC",
             Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
@@ -2169,19 +2219,18 @@ impl Db {
 // ── Pinned CIDs ───────────────────────────────────────────────────────────────
 
 impl Db {
-    pub async fn is_pinned(&self, sha256_hex: &str) -> Result<bool> {
-        let row = sqlx::query("SELECT COUNT(*) as cnt FROM pinned_cids WHERE sha256_hex = $1")
-            .bind(sha256_hex)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.get::<i64, _>("cnt") > 0)
-    }
-
+    /// Record the local IPFS CID for a git object.
+    /// If a Pinata-only row already exists (cid IS NULL or was set as Pinata
+    /// fallback so cid = pinata_cid), this replaces it with the real IPFS CID.
     pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
              VALUES ($1, $2, $3)
-             ON CONFLICT(sha256_hex) DO NOTHING",
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+               cid = EXCLUDED.cid,
+               pinned_at = EXCLUDED.pinned_at
+             WHERE pinned_cids.cid IS NULL
+                OR pinned_cids.cid = pinned_cids.pinata_cid",
         )
         .bind(sha256_hex)
         .bind(cid)
@@ -2278,6 +2327,21 @@ impl Db {
             .collect())
     }
 
+    /// Returns true when this object has a real local IPFS CID (not a legacy
+    /// Pinata fallback where cid was set to pinata_cid for new rows).
+    pub async fn has_ipfs_cid(&self, sha256_hex: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as cnt FROM pinned_cids
+             WHERE sha256_hex = $1
+               AND cid IS NOT NULL
+               AND cid IS DISTINCT FROM pinata_cid",
+        )
+        .bind(sha256_hex)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("cnt") > 0)
+    }
+
     /// Returns true if this object already has a Pinata CID recorded.
     pub async fn has_pinata_cid(&self, sha256_hex: &str) -> Result<bool> {
         let row = sqlx::query(
@@ -2289,9 +2353,45 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
+    /// Given a list of sha256_hex values, returns the subset that already have
+    /// a Pinata CID recorded. Used by the reconciliation sweep to skip objects
+    /// that Pinata has already handled.
+    pub async fn filter_pinata_pinned_oids(&self, oids: &[String]) -> Result<Vec<String>> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT sha256_hex FROM pinned_cids WHERE sha256_hex = ANY($1) AND pinata_cid IS NOT NULL",
+        )
+        .bind(oids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("sha256_hex")).collect())
+    }
+
+    /// Given a list of sha256_hex values, returns the subset that have a real
+    /// local IPFS CID (excluding legacy Pinata fallback rows where cid equals
+    /// pinata_cid). Used by the reconciliation sweep to skip IPFS-complete objects.
+    pub async fn filter_ipfs_pinned_oids(&self, oids: &[String]) -> Result<Vec<String>> {
+        if oids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT sha256_hex FROM pinned_cids
+             WHERE sha256_hex = ANY($1)
+               AND cid IS NOT NULL
+               AND cid IS DISTINCT FROM pinata_cid",
+        )
+        .bind(oids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("sha256_hex")).collect())
+    }
+
     /// Record the Pinata CID for a git object.
-    /// Inserts the row if it doesn't exist (objects pinned directly to Pinata
-    /// without a prior local IPFS pin get cid = pinata_cid).
+    /// `cid` is left NULL for new rows so that `has_ipfs_cid` (which checks
+    /// `cid IS NOT NULL`) correctly distinguishes local IPFS state from
+    /// Pinata-only state.
     pub async fn record_pinata_cid(&self, sha256_hex: &str, pinata_cid: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
@@ -2299,7 +2399,7 @@ impl Db {
              ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid",
         )
         .bind(sha256_hex)
-        .bind(pinata_cid) // fallback local cid if row is new
+        .bind(Option::<&str>::None) // cid is NULL for Pinata-only new rows
         .bind(Utc::now().to_rfc3339())
         .bind(pinata_cid)
         .execute(&self.pool)
