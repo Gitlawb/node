@@ -4,7 +4,7 @@ This file carries the rules a patch author cannot recover from the code alone, f
 
 ## Authorization invariants (the rules PRs most often break)
 
-Every repo-scoped endpoint must bind the caller to an authorization decision before serving or mutating anything.
+Every repo-scoped endpoint must bind the caller to an authorization decision before serving or mutating anything. Three handlers are tracked exceptions still being closed, not yet gated: `list_webhooks`, `list_replicas`, and `list_protected_branches` are exempted via the `known_ungated` allowlist in `authz_guard::every_repo_scoped_handler_is_gated` (#94, PR #113). Do not treat their repo-metadata exposure as protected.
 
 - Owner-only mutations (visibility, webhooks, protected branches, merges) are gated against the repo owner. Three gate forms are in use and all are recognized: webhooks and merges call `require_repo_owner` (`crates/gitlawb-node/src/api/mod.rs`), visibility uses its module-local `require_owner`, and protected branches compare inline with `did_matches`. Use the form the surrounding module already uses.
 - Not every write is owner-only, and that is by design: `star_repo`/`unstar_repo` bind to the signer (they still require repo read access), `register_replica`/`unregister_replica` bind to the replica's own DID, the bounty actions (claim, submit, approve, cancel, dispute) have their own multi-party rules, and closing a PR or issue is owner-or-author. Do not add owner gates to these.
@@ -15,7 +15,7 @@ Every repo-scoped endpoint must bind the caller to an authorization decision bef
 
 ## Adding or changing routes
 
-- A new gated handler needs a test proving the gate fires: sign as a non-owner and as an anonymous caller, assert the exact denial status each way, and assert the body leaks nothing. The non-owner tests in `crates/gitlawb-node/src/test_support.rs` show the shape.
+- A new gated handler needs tests proving its route-specific gate fires: exercise an unauthorized authenticated caller and an anonymous caller where applicable, assert the exact denial status each way, and assert the body leaks nothing. The non-owner tests in `crates/gitlawb-node/src/test_support.rs` show the shape for owner-gated routes.
 - A new mutation handler also gets a row in `every_in_scope_mutation_has_its_gate` naming its gate type; the per-handler row is the point of that test.
 - A table-driven deny suite covering every deny-bearing route is in review (#194, #195). If it is present in your checkout, add a probe row there for any new deny-bearing route.
 
@@ -34,5 +34,5 @@ When a node denies a request, surface the denial to the user. Never render a den
 ## Toolchain and CI reality
 
 - MSRV is Rust 1.91 (`rust-version` in the workspace `Cargo.toml`). The MSRV CI job runs `cargo check --workspace --all-targets` on exactly 1.91, so check that an API you rely on is stable there; the full test suite runs on stable.
-- CI blocks merges on: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (against Postgres), a release build, `cargo audit`, the MSRV check, and a Docker build.
+- The PR workflow runs these jobs on every PR: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (against Postgres), a release build, `cargo audit`, the MSRV check, and a Docker build. The `main` branch ruleset currently requires one approving review but does not require these checks to pass before merge; a failing job should block review approval in practice, but nothing enforces that mechanically today.
 - Conventional commit titles (`feat:`, `fix:`, `docs:`, ...) are required by convention and drive releases, but no CI job checks them; a bad title fails review, not the pipeline.
