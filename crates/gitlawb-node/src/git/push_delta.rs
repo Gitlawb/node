@@ -176,13 +176,12 @@ fn rev_list_delta(repo_path: &Path, new_tips: &[&str], old_tips: &[&str]) -> Res
 /// unreachable/dangling ones), which is what the sweep needs to catch
 /// stragglers — do not swap it for a reachability walk.
 pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = crate::git::GitCommand::new(repo_path)
         .args([
             "cat-file",
             "--batch-all-objects",
             "--batch-check=%(objectname)",
         ])
-        .current_dir(repo_path)
         .output()
         .context("failed to run git cat-file")?;
 
@@ -204,13 +203,12 @@ pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
 /// filter needs to tell blobs (content, withholdable) from commits/trees
 /// (structural, never withheld) without typing the candidate list itself.
 pub fn list_all_objects_with_type(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    let output = Command::new("git")
+    let output = crate::git::GitCommand::new(repo_path)
         .args([
             "cat-file",
             "--batch-all-objects",
             "--batch-check=%(objectname) %(objecttype)",
         ])
-        .current_dir(repo_path)
         .output()
         .context("failed to run git cat-file")?;
 

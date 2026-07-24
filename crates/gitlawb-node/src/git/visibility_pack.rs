@@ -22,9 +22,8 @@ use std::path::Path;
 /// dereferences only one tag level and so misclassifies a tag-of-a-tag-of-a-
 /// commit as a non-commit.
 fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
-    let refs = std::process::Command::new("git")
+    let refs = crate::git::GitCommand::new(repo_path)
         .args(["for-each-ref", "--format=%(refname)"])
-        .current_dir(repo_path)
         .output()
         .context("git for-each-ref failed")?;
     if !refs.status.success() {
@@ -57,9 +56,8 @@ fn assert_all_refs_are_commits(repo_path: &Path) -> Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
     use std::io::Write;
-    let mut child = std::process::Command::new("git")
+    let (mut child, _guard) = crate::git::GitCommand::new(repo_path)
         .args(["cat-file", "--batch-check=%(objecttype)"])
-        .current_dir(repo_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -159,9 +157,8 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
     if head.is_some() {
         rev_args.push("HEAD");
     }
-    let commits = std::process::Command::new("git")
+    let commits = crate::git::GitCommand::new(repo_path)
         .args(&rev_args)
-        .current_dir(repo_path)
         .output()
         .context("git rev-list --all failed")?;
     if !commits.status.success() {
@@ -177,9 +174,8 @@ fn blob_paths(repo_path: &Path) -> Result<Vec<(String, String)>> {
         if commit.is_empty() {
             continue;
         }
-        let listing = std::process::Command::new("git")
+        let listing = crate::git::GitCommand::new(repo_path)
             .args(["ls-tree", "-rz", commit])
-            .current_dir(repo_path)
             .output()
             .context("git ls-tree -rz failed")?;
         if !listing.status.success() {

@@ -1070,6 +1070,22 @@ impl Db {
         Ok(row.map(row_to_repo))
     }
 
+    /// Look up a repo by its internal UUID `id` column.  Used by the
+    /// reconciliation sweep to re-fetch `is_public` and `owner_did` right
+    /// before each pin phase so it never pins against a stale, more-permissive
+    /// visibility snapshot captured before the git scan (P2).
+    pub async fn get_repo_by_id(&self, repo_id: &str) -> Result<Option<RepoRecord>> {
+        let row = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE id = $1 LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_repo))
+    }
+
     #[allow(dead_code)]
     pub async fn list_repos(&self, owner_did: &str) -> Result<Vec<RepoRecord>> {
         let rows = sqlx::query(
