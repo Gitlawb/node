@@ -331,6 +331,11 @@ mod tests {
             msg.contains("502"),
             "expected 502 error with bounded body, got: {msg}"
         );
+        assert!(
+            msg.len() < 1000,
+            "error message too long ({} bytes) — body was not capped",
+            msg.len()
+        );
     }
 
     #[tokio::test]
