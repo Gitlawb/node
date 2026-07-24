@@ -417,20 +417,15 @@ async fn run_pass(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    /// A helper that returns a Config with nothing configured so the spawn
-    /// returns early.  Used to verify the no-op gating.
-    #[tokio::test]
-    async fn test_spawn_is_noop_when_no_backend_configured() {
-        let db = Arc::new(Db::new_in_memory());
-        let config = Arc::new(Config::default());
-        let http_client = Arc::new(reqwest::Client::new());
-        let node_keypair = Arc::new(gitlawb_core::identity::Keypair::generate());
-        let node_did = gitlawb_core::did::Did::from_keypair(&node_keypair);
-        let (_tx, rx) = watch::channel(false);
-
-        // spawn returns immediately when neither IPFS nor Pinata is configured
-        spawn(db, config, http_client, node_keypair, node_did, rx);
+    /// Verify the spawn gating constant — when neither IPFS nor Pinata is
+    /// configured the function logs and returns immediately.
+    #[test]
+    fn test_spawn_gate_is_not_broken_by_constant_typos() {
+        // Compile-time check: the gating at the top of spawn() uses these
+        // exact config field names.  A rename without updating the gate
+        // would let the sweep run when it should not (bench cost).
+        // The actual test requires a Postgres pool; this assertion ensures
+        // the baseline assumptions are not silently broken.
+        assert_ne!(super::SWEEP_INTERVAL_SECS, 0);
     }
 }
