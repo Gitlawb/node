@@ -40,7 +40,7 @@ pub fn spawn(
 
     tokio::spawn(async move {
         let node_seed = *node_keypair.to_seed();
-        let mut cursor = 0usize;
+        let mut cursor: Option<String> = None;
 
         loop {
             let start = std::time::Instant::now();
@@ -94,22 +94,32 @@ async fn run_pass(
     http_client: &reqwest::Client,
     node_seed: &[u8; 32],
     node_did: &gitlawb_core::did::Did,
-    cursor: &mut usize,
+    cursor: &mut Option<String>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<(usize, usize, usize)> {
-    // Use stable ordering so a positional cursor deterministically covers every
-    // repo regardless of push activity — idle repos are not starved.
+    // Keyset pagination over repos ordered by immutable id so the cursor is
+    // robust against insertions, deletions, or updated_at shifts.
     let all = db.list_all_repos_deduped_stable().await?;
 
     if all.is_empty() {
-        *cursor = 0;
+        *cursor = None;
         return Ok((0, 0, 0));
     }
 
-    let start = (*cursor).min(all.len());
-    let end = (start + REPOS_PER_PASS).min(all.len());
-    let batch = &all[start..end];
-    *cursor = if end >= all.len() { 0 } else { end };
+    let start_idx = cursor
+        .as_ref()
+        .and_then(|last_id| all.iter().position(|r| r.id == *last_id))
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+
+    if start_idx >= all.len() {
+        *cursor = None;
+        return Ok((0, 0, 0));
+    }
+
+    let end = (start_idx + REPOS_PER_PASS).min(all.len());
+    let batch = &all[start_idx..end];
+    *cursor = Some(batch.last().unwrap().id.clone());
 
     let mut total_gaps_found = 0usize;
     let mut total_gaps_filled = 0usize;
@@ -257,6 +267,14 @@ async fn run_pass(
             v
         };
 
+        let gaps_ipfs = ipfs_missing.len();
+        let gaps_pinata = pinata_missing.len();
+        let repo_gaps = gaps_ipfs + gaps_pinata;
+        if repo_gaps > 0 {
+            total_gaps_found += repo_gaps;
+            crate::metrics::record_reconciliation_gaps_found(repo_gaps as u64);
+        }
+
         let pinned_ipfs =
             crate::ipfs_pin::pin_new_objects(&config.ipfs_api, &disk, ipfs_missing, db).await;
 
@@ -273,13 +291,6 @@ async fn run_pass(
         let repo_filled = pinned_ipfs.len() + pinned_pinata.len();
         if repo_filled > 0 {
             total_gaps_filled += repo_filled;
-            let deduped = pinned_ipfs
-                .iter()
-                .chain(&pinned_pinata)
-                .collect::<HashSet<_>>()
-                .len();
-            total_gaps_found += deduped;
-            crate::metrics::record_reconciliation_gaps_found(deduped as u64);
             crate::metrics::record_reconciliation_gaps_filled(repo_filled as u64);
 
             tracing::info!(
