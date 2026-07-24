@@ -324,10 +324,7 @@ fn decode_opaque_cursor(seed: &[u8; 32], token: &str) -> Option<(String, String)
 
     let parts: Vec<&str> = cursor.splitn(2, '|').collect();
     if parts.len() == 2 {
-        Some((
-            parts[0].to_string(),
-            parts[1].to_string(),
-        ))
+        Some((parts[0].to_string(), parts[1].to_string()))
     } else {
         None
     }
@@ -510,17 +507,13 @@ pub async fn list_pins(
         let decoded = String::from_utf8(bytes).ok()?;
         let parts: Vec<&str> = decoded.splitn(2, '|').collect();
         if parts.len() == 2 {
-            Some((
-                parts[0].to_string(),
-                parts[1].to_string(),
-            ))
+            Some((parts[0].to_string(), parts[1].to_string()))
         } else {
             None
         }
     };
-    let encode_cursor = |pa: &str, sha: &str| -> String {
-        URL_SAFE_NO_PAD.encode(format!("{pa}|{sha}"))
-    };
+    let encode_cursor =
+        |pa: &str, sha: &str| -> String { URL_SAFE_NO_PAD.encode(format!("{pa}|{sha}")) };
 
     let initial_cursor = match query.cursor.as_ref() {
         Some(c) => match decode_cursor(c) {
@@ -646,19 +639,13 @@ pub async fn list_pins(
 
         for (i, pin) in batch.iter().enumerate() {
             if pin.repo.is_empty() {
-                db_cursor = Some((
-                    pin.pinned_at.clone(),
-                    pin.sha256_hex.clone(),
-                ));
+                db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone()));
                 pin_outcome.push(None);
                 continue;
             }
             let Some((repo, rules)) = repos_by_slug.get(&pin.repo) else {
                 // Unknown slug — advance cursor past it, no visibility check.
-                db_cursor = Some((
-                    pin.pinned_at.clone(),
-                    pin.sha256_hex.clone(),
-                ));
+                db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone()));
                 pin_outcome.push(None);
                 continue;
             };
@@ -794,10 +781,7 @@ pub async fn list_pins(
             // All pins had empty/unmatched repos — advance past the batch so
             // we don't loop forever on the same unprocessable rows (P1).
             if let Some(last) = batch.last() {
-                db_cursor = Some((
-                    last.pinned_at.clone(),
-                    last.sha256_hex.clone(),
-                ));
+                db_cursor = Some((last.pinned_at.clone(), last.sha256_hex.clone()));
             }
         }
 
@@ -916,10 +900,7 @@ pub async fn list_pins(
                         db_cursor = batch_cursor;
                     }
                 } else if let Some(pin) = i.checked_sub(1).and_then(|prev| batch.get(prev)) {
-                    db_cursor = Some((
-                        pin.pinned_at.clone(),
-                        pin.sha256_hex.clone(),
-                    ));
+                    db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone()));
                 }
                 break;
             }
@@ -927,10 +908,7 @@ pub async fn list_pins(
             let pin = batch[i].clone();
             let Some((repo, rules)) = repos_by_slug.get(&pin.repo) else {
                 // Already advanced past in phase 1 — just maintain cursor.
-                db_cursor = Some((
-                    pin.pinned_at.clone(),
-                    pin.sha256_hex.clone(),
-                ));
+                db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone()));
                 continue;
             };
 
