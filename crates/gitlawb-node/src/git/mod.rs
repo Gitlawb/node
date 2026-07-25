@@ -23,9 +23,9 @@ pub mod visibility_pack;
 //      whole git tree (including pack-objects / cat-file grandchildren).
 //
 // Usage pattern inside a `spawn_blocking` closure:
-//   let _guard = crate::git::set_active_registry(registry.clone());
+//   let _guard = crate::git::set_scan_context(ctx.clone());
 //   // ... then call list_all_objects / replicable_blob_set / etc. ...
-//   // Each of those uses GitCommand::output() which honours the registry.
+//   // Each of those uses GitCommand::output() which honours the ctx.
 //
 // The _guard resets the thread-local on drop so the thread is clean if reused.
 
@@ -33,35 +33,55 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Shared state between the async timeout handler and the blocking git scan.
+pub struct ScanContext {
+    /// Process-group ids of active git subprocesses, registered by
+    /// `spawn_registered` and deregistered by `PgidGuard`.
+    pub registry: Mutex<HashSet<i32>>,
+    /// Set to `true` by the async side when the per-repo deadline fires.
+    /// `spawn_registered` checks this before and after spawning so a child
+    /// started just as the timeout fires is killed on the spot.
+    pub canceled: AtomicBool,
+}
+
+impl ScanContext {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            registry: Mutex::new(HashSet::new()),
+            canceled: AtomicBool::new(false),
+        })
+    }
+}
+
 thread_local! {
-    /// Registry of active process-group ids for the currently executing
-    /// blocking git scan.  `None` when no registry is active (i.e. outside a
-    /// reconciliation scan closure).
-    static ACTIVE_REGISTRY: std::cell::RefCell<Option<Arc<Mutex<HashSet<i32>>>>> =
+    /// Shared scan context for the currently executing blocking git scan.
+    /// `None` when no scan is active (i.e. outside a reconciliation closure).
+    static SCAN_CTX: std::cell::RefCell<Option<Arc<ScanContext>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// RAII guard that clears the thread-local registry on drop.
-pub struct RegistryGuard;
+/// RAII guard that clears the thread-local scan context on drop.
+pub struct ScanGuard;
 
-impl Drop for RegistryGuard {
+impl Drop for ScanGuard {
     fn drop(&mut self) {
-        ACTIVE_REGISTRY.with(|reg| {
-            *reg.borrow_mut() = None;
+        SCAN_CTX.with(|ctx| {
+            *ctx.borrow_mut() = None;
         });
     }
 }
 
-/// Arm the per-thread process registry so that subsequent `GitCommand` calls
-/// on this thread register their pgids into `registry`.  Returns a guard that
-/// clears the thread-local on drop.
-pub fn set_active_registry(registry: Arc<Mutex<HashSet<i32>>>) -> RegistryGuard {
-    ACTIVE_REGISTRY.with(|reg| {
-        *reg.borrow_mut() = Some(registry);
+/// Arm the per-thread scan context so subsequent `GitCommand` calls on this
+/// thread register their pgids into `ctx.registry` and respect `ctx.canceled`.
+/// Returns a guard that clears the thread-local on drop.
+pub fn set_scan_context(ctx: Arc<ScanContext>) -> ScanGuard {
+    SCAN_CTX.with(|c| {
+        *c.borrow_mut() = Some(ctx);
     });
-    RegistryGuard
+    ScanGuard
 }
 
 // ── GitCommand: std::process::Command wrapper that auto-registers pgids ───────
@@ -73,7 +93,7 @@ pub fn set_active_registry(registry: Arc<Mutex<HashSet<i32>>>) -> RegistryGuard 
 ///   returns, and deregisters it on completion.
 ///
 /// This is intentionally only used from functions called inside
-/// `spawn_blocking` closures that have called `set_active_registry`.
+/// `spawn_blocking` closures that have called `set_scan_context`.
 pub struct GitCommand {
     inner: Command,
 }
@@ -133,15 +153,44 @@ impl GitCommand {
     }
 
     fn spawn_registered(mut self) -> io::Result<(Child, PgidGuard)> {
-        let registry = ACTIVE_REGISTRY.with(|reg| reg.borrow().clone());
+        let ctx = SCAN_CTX.with(|c| c.borrow().clone());
+
+        // If the deadline has already fired, refuse to spawn.
+        if let Some(ref ctx) = ctx {
+            if ctx.canceled.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "scan canceled before spawn",
+                ));
+            }
+        }
 
         #[cfg(unix)]
-        if registry.is_some() {
+        if ctx.is_some() {
             use std::os::unix::process::CommandExt as _;
             self.inner.process_group(0);
         }
 
         let child = self.inner.spawn()?;
+
+        // Double-check cancellation immediately after spawn.  If the timeout
+        // fired just as we spawned, kill the child and report cancellation so
+        // the caller doesn't proceed with a half-dead process.
+        if let Some(ref ctx) = ctx {
+            if ctx.canceled.load(Ordering::SeqCst) {
+                // The child exists but we must not register it.  Kill it and
+                // wait so it doesn't become a zombie.
+                #[cfg(unix)]
+                unsafe {
+                    let _ = libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                let _ = child.wait_with_output();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "scan canceled immediately after spawn",
+                ));
+            }
+        }
 
         let pgid = {
             #[cfg(unix)]
@@ -155,25 +204,25 @@ impl GitCommand {
             }
         };
 
-        if let (Some(pgid), Some(ref reg)) = (pgid, &registry) {
-            reg.lock().unwrap().insert(pgid);
+        if let (Some(pgid), Some(ref ctx)) = (pgid, &ctx) {
+            ctx.registry.lock().unwrap().insert(pgid);
         }
 
-        let guard = PgidGuard { pgid, registry };
+        let guard = PgidGuard { pgid, ctx };
         Ok((child, guard))
     }
 }
 
-/// Deregisters a pgid from the active registry when dropped.
+/// Deregisters a pgid from the active scan context when dropped.
 struct PgidGuard {
     pgid: Option<i32>,
-    registry: Option<Arc<Mutex<HashSet<i32>>>>,
+    ctx: Option<Arc<ScanContext>>,
 }
 
 impl Drop for PgidGuard {
     fn drop(&mut self) {
-        if let (Some(pgid), Some(ref reg)) = (self.pgid, &self.registry) {
-            reg.lock().unwrap().remove(&pgid);
+        if let (Some(pgid), Some(ref ctx)) = (self.pgid, &self.ctx) {
+            ctx.registry.lock().unwrap().remove(&pgid);
         }
     }
 }

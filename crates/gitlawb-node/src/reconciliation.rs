@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -165,20 +166,26 @@ async fn run_pass(
         let rules_clone = rules.clone();
         let is_public = repo.is_public;
 
-        let registry = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        let registry_clone = registry.clone();
+        let ctx = crate::git::ScanContext::new();
+        let ctx_clone = ctx.clone();
 
         let object_list = tokio::time::timeout(
             REPO_SCAN_DEADLINE,
             tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-                let _guard = crate::git::set_active_registry(registry_clone);
+                let _guard = crate::git::set_scan_context(ctx_clone.clone());
                 let all_objs = crate::git::push_delta::list_all_objects(&disk_clone)?;
+                if ctx_clone.canceled.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("scan canceled after list_all_objects"));
+                }
                 let allowed = crate::git::visibility_pack::replicable_blob_set(
                     &disk_clone,
                     &rules_clone,
                     is_public,
                     &owner_clone,
                 )?;
+                if ctx_clone.canceled.load(Ordering::SeqCst) {
+                    return Err(anyhow::anyhow!("scan canceled after replicable_blob_set"));
+                }
                 let all_blobs = crate::git::push_delta::all_blob_oids(&disk_clone)?;
                 Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
                     all_objs, &allowed, &all_blobs,
@@ -198,9 +205,10 @@ async fn run_pass(
                 continue;
             }
             Err(_) => {
+                ctx.canceled.store(true, Ordering::SeqCst);
                 #[cfg(unix)]
                 {
-                    let active = registry.lock().unwrap();
+                    let active = ctx.registry.lock().unwrap();
                     for &pgid in active.iter() {
                         unsafe {
                             let _ = libc::kill(-pgid, libc::SIGTERM);
