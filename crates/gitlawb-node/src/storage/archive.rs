@@ -55,6 +55,29 @@ impl RepoArchive {
         repo_name: &str,
         local_path: &Path,
     ) -> Result<Option<String>> {
+        self.upload_with_intent(owner_slug, repo_name, local_path, |_| {})
+            .await
+    }
+
+    /// Like [`upload`](Self::upload), but calls `record_intent` with the
+    /// archive's content MD5 after compressing and BEFORE the PUT. On backends
+    /// whose etag is the body MD5 (S3-compatibles for single-part puts; the fs
+    /// backend by construction), that value equals the etag the PUT will
+    /// produce, letting crash recovery recognize "storage holds exactly what
+    /// this node was uploading" — its own completed upload, not divergence.
+    /// Best-effort provenance: on backends where etags aren't content MD5
+    /// (IPFS CIDs), the recorded intent simply never matches and recovery
+    /// keeps its fail-safe behavior.
+    pub async fn upload_with_intent<F>(
+        &self,
+        owner_slug: &str,
+        repo_name: &str,
+        local_path: &Path,
+        record_intent: F,
+    ) -> Result<Option<String>>
+    where
+        F: FnOnce(&str) + Send,
+    {
         let key = Self::key(owner_slug, repo_name);
         let archive_bytes = tokio::task::spawn_blocking({
             let local_path = local_path.to_path_buf();
@@ -63,6 +86,8 @@ impl RepoArchive {
         .await
         .context("tar task panicked")?
         .context("compressing repo")?;
+
+        record_intent(&content_md5_hex(&archive_bytes));
 
         let meta = self
             .store
@@ -107,6 +132,13 @@ impl RepoArchive {
     pub async fn delete(&self, owner_slug: &str, repo_name: &str) -> Result<()> {
         self.store.delete(&Self::key(owner_slug, repo_name)).await
     }
+}
+
+/// Hex MD5 of a byte body — the etag an S3-compatible single-part PUT (and
+/// the fs backend, by construction) will assign to it.
+pub(crate) fn content_md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    format!("{:x}", Md5::digest(bytes))
 }
 
 /// Remove orphaned swap-phase work dirs (`.{repo}.tmp-extract.{uuid}` and

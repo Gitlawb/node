@@ -2,10 +2,12 @@
 //!
 //! Stores each object as a file under a configured root directory, using the
 //! object key as a relative path. For self-hosters without S3 and for tests of
-//! the storage abstraction. The etag is a fresh UUID persisted in a `.etag`
-//! sidecar on every write, so the skip-redundant-download optimization can rely
-//! on "etag unchanged ⇒ content unchanged" even on filesystems with coarse
-//! timestamps (objects predating the sidecar fall back to size-mtime).
+//! the storage abstraction. The etag is the body's MD5 (matching S3 semantics
+//! for single-part puts) persisted in a `.etag` sidecar at write time, so the
+//! skip-redundant-download optimization can rely on "etag unchanged ⇒ content
+//! unchanged" even on filesystems with coarse timestamps, and an uploader can
+//! predict the etag its PUT will produce (crash-recovery provenance). Objects
+//! predating the sidecar fall back to a size-mtime fingerprint.
 
 use std::path::{Path, PathBuf};
 
@@ -38,11 +40,13 @@ impl FsBlobStore {
         Ok(path)
     }
 
-    /// Sidecar file persisting the object's etag: a fresh UUID per `put`.
-    /// RepoStore treats etag equality as proof the local copy is current, so
-    /// the token must change on EVERY write. A `size-mtime` fingerprint cannot
-    /// guarantee that on mounted filesystems with coarse timestamp precision
-    /// (two same-size writes in one tick collide); a per-write UUID can.
+    /// Sidecar file persisting the object's etag: the body's MD5, computed at
+    /// write time. RepoStore treats etag equality as proof the local copy is
+    /// current, so different content must always yield a different token — a
+    /// `size-mtime` fingerprint cannot guarantee that on mounted filesystems
+    /// with coarse timestamp precision (two different same-size writes in one
+    /// tick collide); a content hash can. Identical content re-written yields
+    /// the same etag, which is semantically exact for a freshness token.
     fn sidecar_of(path: &Path) -> PathBuf {
         let mut os = path.as_os_str().to_owned();
         os.push(".etag");
@@ -111,9 +115,14 @@ impl BlobStore for FsBlobStore {
         // no synchronous fs call ever touches the async runtime.
         tokio::task::spawn_blocking(move || -> Result<ObjectMeta> {
             std::fs::create_dir_all(&parent).context("creating blob parent dir")?;
-            let etag = uuid::Uuid::new_v4().to_string();
+            let etag = crate::storage::archive::content_md5_hex(&body);
             let sidecar = Self::sidecar_of(&path2);
             let sidecar_tmp = sidecar.with_extension(format!("{}.tmp-put", uuid::Uuid::new_v4()));
+            // Remember the published etag so a failed blob rename can restore
+            // it: leaving the NEW etag over the OLD content is no longer a
+            // harmless redundant download — under the pending-marker rules an
+            // unexplained remote etag is terminal divergence.
+            let prev_etag = std::fs::read_to_string(&sidecar).ok();
             let write_and_swap = (|| -> Result<()> {
                 std::fs::write(&tmp, &body).context("writing temp blob")?;
                 // Publish the new etag BEFORE the blob (each via its own
@@ -135,6 +144,17 @@ impl BlobStore for FsBlobStore {
             if let Err(e) = write_and_swap {
                 let _ = std::fs::remove_file(&tmp);
                 let _ = std::fs::remove_file(&sidecar_tmp);
+                // Roll the sidecar back to describe the content actually on
+                // disk (the sidecar may have been published before the blob
+                // rename failed).
+                match prev_etag {
+                    Some(prev) => {
+                        let _ = std::fs::write(&sidecar, prev);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&sidecar);
+                    }
+                }
                 return Err(e);
             }
             let md = std::fs::metadata(&path2).context("stat blob after write")?;
@@ -269,29 +289,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rewrite_always_changes_etag_even_for_identical_content() {
+    async fn etag_is_persisted_content_md5() {
         let dir = tempfile::tempdir().unwrap();
         let store = FsBlobStore::new(dir.path()).unwrap();
         let key = "repos/v1/a/x.tar.zst";
         let body = Bytes::from_static(b"same bytes");
 
-        // Two writes of identical content back-to-back: a size-mtime
-        // fingerprint can collide inside one timestamp tick on coarse
-        // filesystems; the persisted per-write etag must always differ.
+        // Content-addressed: different same-size content must yield a
+        // different etag even inside one coarse-filesystem timestamp tick
+        // (the size-mtime failure mode); identical content is the same token.
         let m1 = store.put(key, body.clone()).await.unwrap();
-        let m2 = store.put(key, body).await.unwrap();
-        assert_ne!(m1.etag, m2.etag, "every put must produce a new etag");
+        let m2 = store
+            .put(key, Bytes::from_static(b"diff bytes"))
+            .await
+            .unwrap();
+        assert_ne!(m1.etag, m2.etag, "different content ⇒ different etag");
+        let m3 = store.put(key, body).await.unwrap();
+        assert_eq!(m1.etag, m3.etag, "identical content ⇒ identical etag");
+        assert_eq!(
+            m3.etag.as_deref(),
+            Some(crate::storage::archive::content_md5_hex(b"same bytes").as_str()),
+            "etag must be the body MD5 (predictable pre-PUT)"
+        );
 
-        // head() reports the latest persisted etag, and it really is the
-        // sidecar's content — not a size-mtime fingerprint that would also
-        // pass the assert_ne above when consecutive writes get distinct
-        // mtimes.
+        // head() reports the persisted sidecar etag, not a recomputed
+        // fingerprint.
         let h = store.head(key).await.unwrap().unwrap();
-        assert_eq!(h.etag, m2.etag);
+        assert_eq!(h.etag, m3.etag);
         let sidecar = dir.path().join(format!("{key}.etag"));
         assert_eq!(
             std::fs::read_to_string(&sidecar).unwrap(),
-            m2.etag.clone().unwrap(),
+            m3.etag.clone().unwrap(),
             "etag must come from the persisted sidecar"
         );
 

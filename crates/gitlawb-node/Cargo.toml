@@ -37,6 +37,11 @@ async-trait = "0.1"
 cid = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
+# Content etags for repo archives: S3 single-part ETags are the body MD5, so a
+# client-side MD5 lets the uploader record its *intended* etag before the PUT
+# (crash-recovery provenance for the pending-upload marker). Not used for
+# anything security-sensitive.
+md-5 = "0.10"
 hmac = { workspace = true }
 http-body-util = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
