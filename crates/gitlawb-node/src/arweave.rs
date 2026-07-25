@@ -267,15 +267,23 @@ pub async fn verify_anchor(
     gateway_url: &str,
     tx_id: &str,
     db: &crate::db::Db,
+    node_did: &str,
 ) -> Result<VerifyResult> {
     // Fetch the data item from the Arweave gateway's data path.
     // Gateways serve data at /{tx_id}, not /v1/tx/{id} (which is the bundler API).
     let url = format!("{}/{}", gateway_url.trim_end_matches('/'), tx_id);
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to fetch data from Arweave gateway: {e}"))?;
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Arweave gateway connection failed: {e}");
+            return Ok(VerifyResult {
+                valid: false,
+                anchor: serde_json::Value::Null,
+                certificate: None,
+                errors: vec![format!("Arweave gateway connection failed: {e}")],
+            });
+        }
+    };
     if !resp.status().is_success() {
         return Ok(VerifyResult {
             valid: false,
@@ -334,7 +342,15 @@ pub async fn verify_anchor(
     let mut errors = Vec::new();
 
     if let Some(ref c) = cert {
-        // 0. Cross-check the outer anchor fields against the embedded certificate.
+        // 0a. Verify the certificate was issued by this node.
+        if c.node_did != node_did {
+            errors.push(format!(
+                "certificate node_did ({}) does not match this node ({})",
+                c.node_did, node_did
+            ));
+        }
+
+        // 0b. Cross-check the outer anchor fields against the embedded certificate.
         //    A valid anchor must commit to the same identities and ref state.
         //    The outer repo_id (UUID) is compared against the cert's repo_id (UUID)
         //    to avoid comparing a human-readable slug against a UUID.
@@ -392,23 +408,16 @@ pub async fn verify_anchor(
             ));
         }
 
-        // 1. Verify node signature on the certificate payload
-        let payload = serde_json::json!({
-            "repo_id":    c.repo_id,
-            "ref":        c.ref_name,
-            "old":        c.old_sha,
-            "new":        c.new_sha,
-            "pusher":     c.pusher_did,
-            "node":       c.node_did,
-            "ts":         c.issued_at,
-            "seq":              c.seq,
-            "prev":             c.prev,
-            "pusher_sig":       c.pusher_sig,
-            "signature_input":  c.signature_input,
-            "content_digest":   c.content_digest,
-            "request_path":     c.request_path,
-        });
-        let payload_bytes = serde_json::to_vec(&payload)?;
+        // 1. Verify node signature on the certificate payload.
+        //    Certificates produced after this PR use a 13-field payload
+        //    that includes seq, prev, and proof fields.  Pre-PR certificates
+        //    used a 7-field payload (repo_id, ref, old, new, pusher, node, ts)
+        //    with NULL proof fields.  Try the 13-field check first; if it
+        //    fails and all proof fields are NULL, fall back to 7-field.
+        let proof_fields_null = c.pusher_sig.is_none()
+            && c.signature_input.is_none()
+            && c.content_digest.is_none()
+            && c.request_path.is_none();
 
         // Resolve node DID to public key
         let node_did = match gitlawb_core::did::Did::from_str(&c.node_did) {
@@ -461,11 +470,53 @@ pub async fn verify_anchor(
                 }
             };
 
-        if let Err(e) = gitlawb_core::identity::verify(&verifying_key, &payload_bytes, &sig_array) {
+        // Try 13-field payload first.
+        let payload_13 = serde_json::json!({
+            "repo_id":    c.repo_id,
+            "ref":        c.ref_name,
+            "old":        c.old_sha,
+            "new":        c.new_sha,
+            "pusher":     c.pusher_did,
+            "node":       c.node_did,
+            "ts":         c.issued_at,
+            "seq":              c.seq,
+            "prev":             c.prev,
+            "pusher_sig":       c.pusher_sig,
+            "signature_input":  c.signature_input,
+            "content_digest":   c.content_digest,
+            "request_path":     c.request_path,
+        });
+        let payload_bytes_13 = serde_json::to_vec(&payload_13)?;
+        let sig_valid_13 =
+            gitlawb_core::identity::verify(&verifying_key, &payload_bytes_13, &sig_array);
+
+        if proof_fields_null && sig_valid_13.is_err() {
+            // Fall back to 7-field payload for pre-PR certificates.
+            let payload_7 = serde_json::json!({
+                "repo_id":    c.repo_id,
+                "ref":        c.ref_name,
+                "old":        c.old_sha,
+                "new":        c.new_sha,
+                "pusher":     c.pusher_did,
+                "node":       c.node_did,
+                "ts":         c.issued_at,
+            });
+            let payload_bytes_7 = serde_json::to_vec(&payload_7)?;
+            if let Err(e) =
+                gitlawb_core::identity::verify(&verifying_key, &payload_bytes_7, &sig_array)
+            {
+                errors.push(format!(
+                    "certificate signature verification failed (7-field): {e}"
+                ));
+            }
+        } else if let Err(e) = sig_valid_13 {
             errors.push(format!("certificate signature verification failed: {e}"));
         }
 
         // 2. Verify prev hash linkage against the predecessor at seq - 1.
+        //    The prev hash covers the 7-field payload (repo_id, ref, old, new,
+        //    pusher, node, ts) — seq, prev, and proof fields are excluded so
+        //    that the hash chain is stable across certificate versions.
         //    Fail closed: a missing declared predecessor is treated as invalid.
         if c.seq > 1 {
             match db.get_cert_by_seq(&c.repo_id, c.seq - 1).await {
@@ -496,10 +547,8 @@ pub async fn verify_anchor(
                     ));
                 }
                 Err(e) => {
-                    errors.push(format!(
-                        "error looking up predecessor seq {}: {e}",
-                        c.seq - 1
-                    ));
+                    tracing::warn!("predecessor lookup failed for seq {}: {e}", c.seq - 1);
+                    errors.push(format!("error looking up predecessor seq {}", c.seq - 1));
                 }
             }
         }
@@ -507,9 +556,15 @@ pub async fn verify_anchor(
         // 3. Verify the pusher authorization proof (RFC 9421 HTTP Signature).
         //    The context fields (signature_input, content_digest, request_path)
         //    are bound into the node signing payload, so a certificate whose
-        //    node signature verified already commits to them.  When pusher_sig
-        //    is present but a context field is missing, the proof cannot be
-        //    checked and is treated as invalid rather than silently skipped.
+        //    node signature verified already commits to them.
+        //    Additionally, the ref transition (ref_name, old_sha, new_sha) is
+        //    bound into the HTTP signature signing string as derived components
+        //    so a captured pusher proof cannot be replayed for a different ref.
+        //    When proof fields are present, pusher_sig is REQUIRED; a missing
+        //    pusher_sig is treated as invalid rather than silently skipped.
+        if !proof_fields_null && c.pusher_sig.is_none() {
+            errors.push("pusher signature is required when proof fields are present".to_string());
+        }
         if let Some(pusher_sig) = &c.pusher_sig {
             match (&c.signature_input, &c.content_digest, &c.request_path) {
                 (Some(sig_input), Some(content_digest), Some(request_path)) => {
@@ -523,6 +578,9 @@ pub async fn verify_anchor(
                             request_values.insert("@path".to_string(), request_path.clone());
                             request_values
                                 .insert("content-digest".to_string(), content_digest.clone());
+                            request_values.insert("@ref_name".to_string(), c.ref_name.clone());
+                            request_values.insert("@old_sha".to_string(), c.old_sha.clone());
+                            request_values.insert("@new_sha".to_string(), c.new_sha.clone());
 
                             let sig_params_value =
                                 sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
@@ -814,10 +872,11 @@ mod tests {
     #[tokio::test]
     async fn test_verify_anchor_uses_correct_gateway_url() {
         let mut server = mockito::Server::new_async().await;
-        // Gateways serve data at /{tx_id}, not /v1/tx/{id}.
-        let _mock = server
+        let mock = server
             .mock("GET", "/does-not-exist")
-            .with_status(404)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"valid":false}"#)
             .create_async()
             .await;
 
@@ -826,20 +885,18 @@ mod tests {
             .connect_lazy("postgres://localhost/gitlawb_test_placeholder")
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
-        let result = verify_anchor(&client, &server.url(), "does-not-exist", &db).await;
+        let result = verify_anchor(
+            &client,
+            &server.url(),
+            "does-not-exist",
+            &db,
+            "did:key:zNODE",
+        )
+        .await;
 
-        match result {
-            Ok(r) => {
-                assert!(!r.valid);
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("pool") || msg.contains("error"),
-                    "unexpected error: {msg}"
-                );
-            }
-        }
+        let r = result.expect("verify_anchor should return Ok for gateway errors");
+        assert!(!r.valid, "non-certificate JSON should be invalid");
+        mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -881,7 +938,7 @@ mod tests {
             .expect("lazy pool creation should not fail");
         let db = crate::db::Db::for_testing(pool);
 
-        let result = verify_anchor(&client, &server.url(), "test-tx", &db).await;
+        let result = verify_anchor(&client, &server.url(), "test-tx", &db, "did:key:zNODE").await;
         assert!(
             result.is_ok(),
             "Expected Ok response, got Err: {:?}",
@@ -894,8 +951,8 @@ mod tests {
             verify_result
                 .errors
                 .iter()
-                .any(|e| e.contains("invalid node DID")),
-            "Expected 'invalid node DID' error in: {:?}",
+                .any(|e| e.contains("does not match this node") || e.contains("invalid node DID")),
+            "Expected issuer or DID error in: {:?}",
             verify_result.errors
         );
     }

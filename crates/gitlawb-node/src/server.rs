@@ -583,8 +583,7 @@ pub(crate) async fn stats(State(state): State<AppState>) -> Json<serde_json::Val
 /// Mask a URL that might contain embedded credentials by stripping everything
 /// after the '@' separator (user:pass@host → host).
 fn mask_credential_url(url: &str) -> String {
-    if let Some(at_pos) = url.find('@') {
-        // Strip userinfo: keep everything after '@'
+    if let Some(at_pos) = url.rfind('@') {
         url[at_pos + 1..].to_string()
     } else {
         url.to_string()

@@ -36,9 +36,11 @@ pub async fn verify_anchor_endpoint(
         ));
     }
     let gateway = &state.config.arweave_gateway;
-    let result = crate::arweave::verify_anchor(&state.http_client, gateway, &tx_id, &state.db)
-        .await
-        .map_err(crate::error::AppError::Internal)?;
+    let node_did = state.node_did.to_string();
+    let result =
+        crate::arweave::verify_anchor(&state.http_client, gateway, &tx_id, &state.db, &node_did)
+            .await
+            .map_err(crate::error::AppError::Internal)?;
 
     Ok(Json(serde_json::json!({
         "valid": result.valid,

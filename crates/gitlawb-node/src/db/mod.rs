@@ -467,13 +467,13 @@ impl Db {
 // appended to v1. Operators can read `schema_migrations` to confirm a node
 // is at the expected version.
 //
-// NOTE: the v1 migration in this branch already includes columns (seq, prev,
-// pusher_sig on ref_certificates; status, deadline_height, receipt_sig, cert_id
-// on arweave_anchors) that were historically added by migrations v12/v13. These
-// were bundled into v1 for development convenience and kept there to avoid a
-// schema reset. The v12/v13 migrations remain as no-ops for existing installs
-// that upgrade from an older branch. See v12/v13 for the actual DDL that newer
-// installs skip via IF NOT EXISTS.
+// NOTE: the v1 migration includes columns (seq, prev, pusher_sig on
+// ref_certificates) that were historically added by later migrations. These
+// were bundled into v1 for development convenience. cert_id on arweave_anchors
+// is added by migration v12 as ALTER TABLE; signature_input, content_digest,
+// and request_path are added by v13.  New installs reach v12/v13 via sequential
+// migration; existing installs with the columns already present are no-ops via
+// IF NOT EXISTS.
 //
 // Each migration runs in a single transaction, so statements that Postgres
 // forbids inside a transaction (notably `CREATE INDEX CONCURRENTLY`) cannot be
@@ -663,11 +663,7 @@ const MIGRATIONS: &[Migration] = &[
                 cid             TEXT,
                 arweave_tx_id   TEXT NOT NULL,
                 node_did        TEXT NOT NULL,
-                anchored_at     TEXT NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'pending',
-                deadline_height BIGINT,
-                receipt_sig     TEXT,
-                cert_id         TEXT
+                anchored_at     TEXT NOT NULL
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo    ON arweave_anchors(repo)",
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_new_sha ON arweave_anchors(new_sha)",
@@ -2303,7 +2299,7 @@ impl Db {
 fn repo_lock_hash(repo_id: &str) -> i64 {
     use sha2::Digest;
     let hash = sha2::Sha256::digest(repo_id.as_bytes());
-    i64::from_ne_bytes(hash[..8].try_into().expect("sha256 output >= 8 bytes"))
+    i64::from_be_bytes(hash[..8].try_into().expect("sha256 output >= 8 bytes"))
 }
 
 // ── Peers ─────────────────────────────────────────────────────────────────────
@@ -2922,9 +2918,6 @@ pub struct ArweaveAnchor {
     pub arweave_tx_id: String,
     pub node_did: String,
     pub anchored_at: String,
-    pub status: String,
-    pub deadline_height: Option<i64>,
-    pub receipt_sig: Option<String>,
     pub cert_id: Option<String>,
 }
 
@@ -2947,8 +2940,8 @@ impl Db {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         sqlx::query(
-            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, cert_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+            "INSERT INTO arweave_anchors (id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, cert_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
         )
         .bind(&id)
         .bind(input.repo)
@@ -2960,7 +2953,6 @@ impl Db {
         .bind(input.arweave_tx_id)
         .bind(input.node_did)
         .bind(&now)
-        .bind("pending")
         .bind(input.cert_id.clone())
         .execute(&self.pool)
         .await?;
@@ -2974,7 +2966,7 @@ impl Db {
     ) -> Result<Vec<ArweaveAnchor>> {
         let rows = if let Some(repo) = repo {
             sqlx::query(
-                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, deadline_height, receipt_sig, cert_id
+                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, cert_id
                  FROM arweave_anchors WHERE repo=$1 ORDER BY anchored_at DESC LIMIT $2",
             )
             .bind(repo)
@@ -2983,7 +2975,7 @@ impl Db {
             .await?
         } else {
             sqlx::query(
-                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, status, deadline_height, receipt_sig, cert_id
+                "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, arweave_tx_id, node_did, anchored_at, cert_id
                  FROM arweave_anchors ORDER BY anchored_at DESC LIMIT $1",
             )
             .bind(limit)
@@ -3004,9 +2996,6 @@ impl Db {
                 arweave_tx_id: r.get("arweave_tx_id"),
                 node_did: r.get("node_did"),
                 anchored_at: r.get("anchored_at"),
-                status: r.get("status"),
-                deadline_height: r.try_get("deadline_height").unwrap_or(None),
-                receipt_sig: r.try_get("receipt_sig").unwrap_or(None),
                 cert_id: r.try_get("cert_id").unwrap_or(None),
             })
             .collect())
@@ -6290,7 +6279,6 @@ mod arweave_anchor_tests {
             .await
             .unwrap();
         assert_eq!(anchors.len(), 1, "one anchor recorded");
-        assert_eq!(anchors[0].status, "pending", "default status is pending");
         assert_eq!(anchors[0].arweave_tx_id, "test-tx-id-123");
     }
 }
