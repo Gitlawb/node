@@ -443,18 +443,10 @@ pub async fn ping_peer(
         .find(|p| p.did == did)
         .ok_or_else(|| AppError::RepoNotFound(format!("peer {did} not found")))?;
 
-    // Async ping
-    let url = format!("{}/health", peer.http_url.trim_end_matches('/'));
-    // Use the shared no-redirect client: bare `reqwest::get` follows redirects,
-    // so a peer could answer with `302 -> http://127.0.0.1/` and turn the ping
-    // into an SSRF probe.
-    let ok = state
-        .http_client
-        .get(&url)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // Use DB-aware readiness rather than process liveness: `/health` stays 200
+    // during a mid-life database outage, while `/ready` reports 503. The shared
+    // helper also preserves the no-redirect SSRF guard on peer-controlled URLs.
+    let ok = crate::ping_peer_readiness(&state.http_client, &peer.http_url).await;
 
     let _ = state.db.mark_peer_ping(&did, ok).await;
 
