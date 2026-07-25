@@ -939,7 +939,7 @@ async fn gossip_task(
     }
 
     // Reuse the shared no-redirect client for every gossip outbound call (the
-    // bootstrap announce POST and the periodic peer /health ping). Peer URLs are
+    // bootstrap announce POST and the periodic peer /ready ping). Peer URLs are
     // attacker-influenceable, so a 3xx to a private address must not be followed.
     // Do NOT fall back to reqwest::Client::new(): its default follows redirects
     // and would reintroduce the SSRF closed here (#93).
@@ -1018,7 +1018,7 @@ async fn gossip_task(
                     Err(_) => continue,
                 };
                 for peer in peers {
-                    let ok = ping_peer_health(&client, &peer.http_url).await;
+                    let ok = ping_peer_readiness(&client, &peer.http_url).await;
                     let _ = state.db.mark_peer_ping(&peer.did, ok).await;
                 }
             }
@@ -1106,15 +1106,15 @@ fn build_http_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-/// Ping a peer's `/health` endpoint and report whether it answered 2xx.
+/// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
 ///
 /// Takes the client by reference so callers supply the shared, no-redirect
 /// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
 /// private address must not be followed. Do NOT call this with a bare
 /// `reqwest::Client::new()`: its default follows redirects and would
 /// reintroduce the SSRF this guards against (#93).
-async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
-    let url = format!("{}/health", http_url.trim_end_matches('/'));
+pub(crate) async fn ping_peer_readiness(client: &reqwest::Client, http_url: &str) -> bool {
+    let url = format!("{}/ready", http_url.trim_end_matches('/'));
     client
         .get(&url)
         .send()
@@ -1158,20 +1158,20 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
 #[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::ping_peer_health;
+    use super::ping_peer_readiness;
 
     // Build the client exactly as production does (super::build_http_client) so
     // these tests bind the redirect guarantee to the real shared client the
     // node runs. A regression that makes build_http_client follow redirects
-    // fails ping_peer_health_does_not_follow_redirect.
+    // fails ping_peer_readiness_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
     }
 
-    // A peer answering `/health` with a 302 toward an internal address must not
+    // A peer answering `/ready` with a 302 toward an internal address must not
     // be followed: the redirect target must never be requested (#93).
     #[tokio::test]
-    async fn ping_peer_health_does_not_follow_redirect() {
+    async fn ping_peer_readiness_does_not_follow_redirect() {
         let mut server = mockito::Server::new_async().await;
         let internal = server
             .mock("GET", "/internal-metadata")
@@ -1179,14 +1179,14 @@ mod gossip_ssrf_tests {
             .expect(0)
             .create_async()
             .await;
-        let _health = server
-            .mock("GET", "/health")
+        let _ready = server
+            .mock("GET", "/ready")
             .with_status(302)
             .with_header("location", &format!("{}/internal-metadata", server.url()))
             .create_async()
             .await;
 
-        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
 
         assert!(!ok, "a 302 must not count as a healthy peer");
         // expect(0) is enforced only at assert time; this fails if the redirect
@@ -1195,24 +1195,47 @@ mod gossip_ssrf_tests {
     }
 
     #[tokio::test]
-    async fn ping_peer_health_reports_success_on_200() {
+    async fn ping_peer_readiness_reports_success_on_200() {
         let mut server = mockito::Server::new_async().await;
-        let _health = server
-            .mock("GET", "/health")
+        let _ready = server
+            .mock("GET", "/ready")
             .with_status(200)
             .create_async()
             .await;
 
-        let ok = ping_peer_health(&production_http_client(), &server.url()).await;
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
 
-        assert!(ok, "a 200 /health must count as a healthy peer");
+        assert!(ok, "a 200 /ready must count as a ready peer");
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_ignores_liveness_only_health() {
+        let mut server = mockito::Server::new_async().await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "a peer with an unavailable database must not be ready");
+        health.assert_async().await;
+        ready.assert_async().await;
     }
 
     // A transport error (nothing listening) must map to unhealthy, never a
     // spurious healthy — the .unwrap_or(false) arm.
     #[tokio::test]
-    async fn ping_peer_health_reports_unhealthy_on_connection_error() {
-        let ok = ping_peer_health(&production_http_client(), "http://127.0.0.1:1").await;
-        assert!(!ok, "a connection error must count as an unhealthy peer");
+    async fn ping_peer_readiness_reports_unready_on_connection_error() {
+        let ok = ping_peer_readiness(&production_http_client(), "http://127.0.0.1:1").await;
+        assert!(!ok, "a connection error must count as an unready peer");
     }
 }
