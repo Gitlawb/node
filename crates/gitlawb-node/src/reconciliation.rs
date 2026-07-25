@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 #[cfg(unix)]
+#[allow(clippy::single_component_path_imports)]
 use libc;
 
 use crate::config::Config;
@@ -256,7 +257,12 @@ async fn run_pass(
                 continue;
             }
         };
-        if !crate::visibility::listable_at_root(&rules, fresh_repo.is_public, &fresh_repo.owner_did, None) {
+        if !crate::visibility::listable_at_root(
+            &rules,
+            fresh_repo.is_public,
+            &fresh_repo.owner_did,
+            None,
+        ) {
             tracing::warn!(repo = %repo_slug, "visibility narrowed mid-scan, skipping phase 1");
             continue;
         }
@@ -380,7 +386,12 @@ async fn run_pass(
                 continue;
             }
         };
-        if !crate::visibility::listable_at_root(&rules, fresh_repo.is_public, &fresh_repo.owner_did, None) {
+        if !crate::visibility::listable_at_root(
+            &rules,
+            fresh_repo.is_public,
+            &fresh_repo.owner_did,
+            None,
+        ) {
             tracing::warn!(repo = %repo_slug, "visibility narrowed mid-scan, skipping phase 2");
             continue;
         }

@@ -40,7 +40,7 @@ thread_local! {
     /// blocking git scan.  `None` when no registry is active (i.e. outside a
     /// reconciliation scan closure).
     static ACTIVE_REGISTRY: std::cell::RefCell<Option<Arc<Mutex<HashSet<i32>>>>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 /// RAII guard that clears the thread-local registry on drop.
@@ -85,6 +85,7 @@ impl GitCommand {
         Self { inner }
     }
 
+    #[allow(dead_code)]
     pub fn arg<S: AsRef<std::ffi::OsStr>>(mut self, arg: S) -> Self {
         self.inner.arg(arg);
         self
@@ -114,10 +115,13 @@ impl GitCommand {
         self
     }
 
-    /// Execute the command, collecting all output.  On Unix, if a registry is
+    /// Execute the command, collecting all output.  stdout and stderr are
+    /// piped so `wait_with_output` captures them.  On Unix, if a registry is
     /// active on this thread, the child is started in its own process group and
     /// the pgid is registered for the duration of the call.
-    pub fn output(self) -> io::Result<Output> {
+    pub fn output(mut self) -> io::Result<Output> {
+        self.inner.stdout(Stdio::piped());
+        self.inner.stderr(Stdio::piped());
         let (child, _guard) = self.spawn_registered()?;
         child.wait_with_output()
     }
