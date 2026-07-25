@@ -42,7 +42,7 @@ pub async fn run(args: WhoamiArgs) -> Result<()> {
                 if let Some(caps) = info["capabilities"].as_array() {
                     capabilities = caps
                         .iter()
-                        .filter_map(|c| c.as_str().map(String::from))
+                        .filter_map(|c| c.as_str().map(sanitize_node_msg))
                         .collect();
                 }
                 // Try to get repo count
