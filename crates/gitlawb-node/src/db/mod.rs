@@ -976,6 +976,31 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
+        version: 15,
+        name: "pinned_cid_repos_backfill_all_associations",
+        stmts: &[
+            // Migration 12's UPDATE … FROM branch_cids selects one arbitrary
+            // row per SHA because UPDATE … FROM picks one matching source row
+            // when multiple match.  Migration 14 then backfills pinned_cid_repos
+            // from the scalar pinned_cids.repo, losing every other association.
+            // This migration backfills the junction table directly from ALL
+            // matching branch_cids rows so every repo that pinned an object
+            // can discover it through the scoped listing (P2).
+            r#"INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+               SELECT DISTINCT p.sha256_hex, m.repo, m.owner_did, p.pinned_at
+               FROM pinned_cids p
+               INNER JOIN (
+                   SELECT DISTINCT bc.cid, bc.sha, bc.repo, r.owner_did
+                   FROM branch_cids bc
+                   JOIN repos r
+                     ON r.name = split_part(bc.repo, '/', 2)
+                    AND (CASE WHEN r.owner_did LIKE 'did:key:%' AND position(':' in substr(r.owner_did, 9)) = 0 THEN substr(r.owner_did, 9) ELSE r.owner_did END)
+                        = split_part(bc.repo, '/', 1)
+               ) m ON p.cid = m.cid AND p.sha256_hex = m.sha
+               ON CONFLICT (sha256_hex, repo) DO NOTHING"#,
+        ],
+    },
+    Migration {
         version: 17,
         name: "sync_queue_attempted_at",
         stmts: &[
@@ -2458,44 +2483,53 @@ impl Db {
     }
 
     /// Bounded global pin query: returns pins for any of the given (repo, owner_did)
-    /// pairs, ordered by pinned_at DESC, capped at `limit`.
-    /// Fetch pinned CIDs matching the readable (repo, owner_did) pairs,
-    /// ordered by (pinned_at DESC, sha256_hex DESC, repo DESC) for stable
-    /// keyset pagination.  Multiple associations for the same SHA may be
-    /// returned (one per readable repo); the caller deduplicates by
-    /// sha256_hex after per-association visibility evaluation (P2).
-    /// When `cursor` is `Some((pinned_at, sha256_hex))`, only rows
-    /// strictly before that cursor are returned (no duplicates across
-    /// pages, since every association for a given SHA shares the same
-    /// (pinned_at, sha256_hex) pair).
+    /// pairs, ordered by pinned_at DESC, capped at `limit` distinct objects.
+    /// Each batch returns up to `limit` unique SHAs (determined by DISTINCT ON)
+    /// and ALL repo associations for those SHAs, so the caller can evaluate
+    /// per-association visibility before deduplicating (P2).
+    /// Uses keyset pagination on (pinned_at, sha256_hex). Resume from a client
+    /// 2-tuple cursor uses the same (pinned_at, sha256_hex) directly; all
+    /// associations of the last SHA are guaranteed to be in the same batch.
     pub async fn list_pinned_cids_for_repos(
         &self,
         repos: &[String],
         owner_dids: &[String],
-        no_rules: &[bool],
         limit: i64,
         cursor: Option<(&str, &str)>,
     ) -> Result<Vec<PinnedCidRecord>> {
         let rows = if let Some((pa, sha)) = cursor {
             sqlx::query(
-                "SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
-                        COALESCE(pr.repo, p.repo) AS repo,
-                        COALESCE(pr.owner_did, p.owner_did) AS owner_did
-                 FROM pinned_cids p
-                 LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
-                 JOIN UNNEST($1::text[], $2::text[], $3::bool[])
-                      AS pairs(repo, owner_did, no_rules)
-                   ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
-                      = (pairs.repo, pairs.owner_did)
-                 WHERE (p.pinned_at, p.sha256_hex)
-                       < ($4::text, $5::text)
-                 ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
-                          COALESCE(pr.repo, p.repo) DESC
-                 LIMIT $6",
+                r#"WITH batch_shas AS (
+                    SELECT sha256_hex
+                    FROM (
+                        SELECT DISTINCT ON (p.sha256_hex) p.sha256_hex, p.pinned_at
+                        FROM pinned_cids p
+                        LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                        JOIN UNNEST($1::text[], $2::text[])
+                             AS pairs(repo, owner_did)
+                          ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                             = (pairs.repo, pairs.owner_did)
+                        WHERE (p.pinned_at, p.sha256_hex) < ($3::text, $4::text)
+                        ORDER BY p.sha256_hex, p.pinned_at DESC
+                    ) deduped
+                    ORDER BY pinned_at DESC, sha256_hex DESC
+                    LIMIT $5
+                )
+                SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
+                       COALESCE(pr.repo, p.repo) AS repo,
+                       COALESCE(pr.owner_did, p.owner_did) AS owner_did
+                FROM pinned_cids p
+                LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                JOIN batch_shas bs ON bs.sha256_hex = p.sha256_hex
+                JOIN UNNEST($1::text[], $2::text[])
+                     AS pairs(repo, owner_did)
+                  ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                     = (pairs.repo, pairs.owner_did)
+                ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
+                         COALESCE(pr.repo, p.repo) DESC"#,
             )
             .bind(repos)
             .bind(owner_dids)
-            .bind(no_rules)
             .bind(pa)
             .bind(sha)
             .bind(limit)
@@ -2503,22 +2537,36 @@ impl Db {
             .await?
         } else {
             sqlx::query(
-                "SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
-                        COALESCE(pr.repo, p.repo) AS repo,
-                        COALESCE(pr.owner_did, p.owner_did) AS owner_did
-                 FROM pinned_cids p
-                 LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
-                 JOIN UNNEST($1::text[], $2::text[], $3::bool[])
-                      AS pairs(repo, owner_did, no_rules)
-                   ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
-                      = (pairs.repo, pairs.owner_did)
-                 ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
-                          COALESCE(pr.repo, p.repo) DESC
-                 LIMIT $4",
+                r#"WITH batch_shas AS (
+                    SELECT sha256_hex
+                    FROM (
+                        SELECT DISTINCT ON (p.sha256_hex) p.sha256_hex, p.pinned_at
+                        FROM pinned_cids p
+                        LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                        JOIN UNNEST($1::text[], $2::text[])
+                             AS pairs(repo, owner_did)
+                          ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                             = (pairs.repo, pairs.owner_did)
+                        ORDER BY p.sha256_hex, p.pinned_at DESC
+                    ) deduped
+                    ORDER BY pinned_at DESC, sha256_hex DESC
+                    LIMIT $3
+                )
+                SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
+                       COALESCE(pr.repo, p.repo) AS repo,
+                       COALESCE(pr.owner_did, p.owner_did) AS owner_did
+                FROM pinned_cids p
+                LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                JOIN batch_shas bs ON bs.sha256_hex = p.sha256_hex
+                JOIN UNNEST($1::text[], $2::text[])
+                     AS pairs(repo, owner_did)
+                  ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                     = (pairs.repo, pairs.owner_did)
+                ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
+                         COALESCE(pr.repo, p.repo) DESC"#,
             )
             .bind(repos)
             .bind(owner_dids)
-            .bind(no_rules)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?

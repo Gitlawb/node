@@ -445,6 +445,27 @@ pub async fn list_pins(
         ));
     }
 
+    // Clamp/handle zero limit before any expensive work so short-lived
+    // requests do not drain rate-limit buckets or enumerate the node (P2).
+    let max_visible = query.limit.clamp(0, 200);
+
+    if max_visible == 0 {
+        return Ok(Json(serde_json::json!({
+            "pins": [],
+            "count": 0,
+        })));
+    }
+
+    // Global rate limit: keyed on a fixed value so DID rotation cannot
+    // bypass the enumeration cost guard (P1).  Checked after the limit=0
+    // fast path but before the whole-node reads so the bucket protects
+    // the actual work (P2).
+    if !state.ipfs_list_global_limiter.check("global").await {
+        return Err(AppError::TooManyRequests(
+            "rate limit exceeded for IPFS pin listing".into(),
+        ));
+    }
+
     // Build the set of readable repo slugs and owner DIDs from the deduped repo view
     // (mirror rows already collapsed, quarantined excluded), then query
     // pins bounded in SQL.
@@ -460,14 +481,9 @@ pub async fn list_pins(
         .await
         .map_err(AppError::Internal)?;
 
-    // Build parallel vectors of readable (slug, owner_did) pairs to query in SQL,
-    // plus a boolean flag per pair indicating whether the repo has *no* path-scoped
-    // visibility rules.  The SQL ROW_NUMBER dedup uses this flag to prefer
-    // associations from rule-free repos (always visible at root level) over those
-    // from repos with /secret/**-style rules (P2).
+    // Build parallel vectors of readable (slug, owner_did) pairs to query in SQL.
     let mut query_repos = Vec::new();
     let mut query_owner_dids = Vec::new();
-    let mut query_no_rules = Vec::new();
 
     for r in &repos {
         let rules = rules_by_repo.get(&r.id).map(Vec::as_slice).unwrap_or(&[]);
@@ -478,25 +494,6 @@ pub async fn list_pins(
         let slug = format!("{}/{}", short, r.name);
         query_repos.push(slug);
         query_owner_dids.push(r.owner_did.clone());
-        query_no_rules.push(!has_path_scoped_rule(rules));
-    }
-
-    let max_visible = query.limit.clamp(0, 200);
-
-    if max_visible == 0 {
-        return Ok(Json(serde_json::json!({
-            "pins": [],
-            "count": 0,
-        })));
-    }
-
-    // Global rate limit: keyed on a fixed value so DID rotation cannot
-    // bypass the enumeration cost guard (P1).  Checked after the limit=0
-    // fast path so short-lived requests do not drain the shared bucket (P2).
-    if !state.ipfs_list_global_limiter.check("global").await {
-        return Err(AppError::TooManyRequests(
-            "rate limit exceeded for IPFS pin listing".into(),
-        ));
     }
 
     // Decode the optional keyset cursor from base64.
@@ -528,7 +525,7 @@ pub async fn list_pins(
     };
 
     // Truncated resume cursor: XChaCha20Poly1305 AEAD token. Decrypts to the
-    // same (pinned_at, repo, sha256_hex) cursor on the server side but the
+    // same (pinned_at, sha256_hex) cursor on the server side but the
     // caller cannot decode hidden-row metadata from the wire format. If the
     // token is present but undecodable we return an explicit error so the
     // client does not silently restart at page 1.
@@ -583,10 +580,10 @@ pub async fn list_pins(
     let mut batch_count = 0usize;
     let mut batch_hit_limit = false;
     let mut pins = Vec::new();
-    // Within-batch dedup by sha256_hex: SQL ROW_NUMBER guarantees one row
-    // per SHA across pages, but within a single batch of an all-deferred
-    // page the same object could still appear via a different association
-    // (P2).  Track seen SHAs so each object is emitted at most once.
+    // Dedup by sha256_hex: the SQL query returns all associations per SHA
+    // (one per readable repo), so the same object can appear via multiple
+    // repo associations.  Track seen SHAs so each object is emitted at most
+    // once, after evaluating per-association visibility (P2).
     let mut seen_shas: HashSet<String> = HashSet::new();
     let mut db_cursor: Option<(String, String)> = truncated_resume.or(initial_cursor);
     let mut response_cursor: Option<(String, String)> = None;
@@ -612,7 +609,6 @@ pub async fn list_pins(
                 .list_pinned_cids_for_repos(
                     &query_repos,
                     &query_owner_dids,
-                    &query_no_rules,
                     BATCH_SIZE,
                     db_cursor
                         .as_ref()
