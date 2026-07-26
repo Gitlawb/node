@@ -5,8 +5,8 @@ tag="${1-}"
 : "${GITHUB_OUTPUT:?GITHUB_OUTPUT must be set}"
 
 case "$tag" in
-  ""|*[!A-Za-z0-9._-]*)
-    printf '%s\n' "::error::release tag is empty or contains invalid characters" >&2
+  ""|*[!A-Za-z0-9._+-]*)
+    printf '%s\n' "::error::release tag is empty or contains invalid characters"
     exit 1
     ;;
 esac
@@ -14,7 +14,7 @@ esac
 case "$tag" in
   v[0-9]*) ;;
   *)
-    printf '%s\n' "::error::'$tag' does not look like a release tag (vX.Y.Z)" >&2
+    printf '%s\n' "::error::'$tag' does not look like a release tag (vX.Y.Z)"
     exit 1
     ;;
 esac
