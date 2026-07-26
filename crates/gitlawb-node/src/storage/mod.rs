@@ -27,7 +27,7 @@ pub mod ipfs;
 pub mod s3;
 
 /// Metadata about a stored object. `etag` is an opaque change-detection token
-/// (S3 ETag, IPFS CID, or a persisted per-write UUID for the filesystem
+/// (S3 ETag, IPFS CID, or the persisted content MD5 for the filesystem
 /// backend).
 #[derive(Debug, Clone)]
 pub struct ObjectMeta {
@@ -129,6 +129,14 @@ pub async fn build(config: &Config) -> Result<Option<Arc<dyn BlobStore>>> {
             }
             let s =
                 ipfs::IpfsBlobStore::new(&config.ipfs_api).context("initializing IPFS storage")?;
+            // MFS is a namespace of ONE Kubo daemon, not a shared network
+            // pointer: no CID registry or IPNS mapping is published, so two
+            // nodes pointed at separate daemons read and write disjoint
+            // storage and every cross-node archive assumption breaks.
+            tracing::warn!(api = %config.ipfs_api, backend = "ipfs",
+                "IPFS backend stores archives in the Kubo daemon's LOCAL MFS namespace — \
+                 ALL nodes sharing this network must point at the SAME Kubo instance; \
+                 separate daemons produce disjoint, silently-diverging storage");
             info!(api = %config.ipfs_api, backend = "ipfs", "object storage enabled");
             Ok(Some(Arc::new(s) as Arc<dyn BlobStore>))
         }

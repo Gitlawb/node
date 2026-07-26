@@ -344,7 +344,7 @@ Important node settings:
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
 | `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack/receive-pack may run before it is aborted (504). Default 600. Does not bound `info/refs` or the withheld-blob path. |
-| `GITLAWB_STORAGE_BACKEND` | Object-storage backend for repo archives: `s3`, `fs`, or `ipfs`. Empty = auto-detect (`s3` if a bucket is set, else `fs` if a dir is set, else local-only). `ipfs` is never auto-selected. |
+| `GITLAWB_STORAGE_BACKEND` | Object-storage backend for repo archives: `s3`, `fs`, or `ipfs`. Empty = auto-detect (`s3` if a bucket is set, else `fs` if a dir is set, else local-only). `ipfs` is never auto-selected and requires all nodes to share one Kubo instance (MFS is daemon-local). |
 | `GITLAWB_S3_BUCKET` | Bucket for the `s3` backend (Tigris, R2, AWS S3, MinIO, B2). |
 | `GITLAWB_S3_ENDPOINT` | Endpoint URL override for the `s3` backend (R2/MinIO; empty on Tigris/Fly). |
 | `GITLAWB_S3_FORCE_PATH_STYLE` | Force path-style S3 addressing (MinIO and some S3-compatibles). |

@@ -139,7 +139,9 @@ pub struct Config {
     /// directory), or `ipfs` (Kubo MFS). Empty = auto-detect: `s3` when a bucket
     /// is set, else `fs` when a storage dir is set, else local-only. `ipfs` is
     /// never auto-selected (`GITLAWB_IPFS_API` alone keeps its pinning-only
-    /// meaning) — set this explicitly to `ipfs` to opt in.
+    /// meaning) — set this explicitly to `ipfs` to opt in, and note the ipfs
+    /// backend requires ALL nodes to share one Kubo instance (MFS is
+    /// daemon-local, not shared network storage).
     #[arg(long, env = "GITLAWB_STORAGE_BACKEND", default_value = "")]
     pub storage_backend: String,
 

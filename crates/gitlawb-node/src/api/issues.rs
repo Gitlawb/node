@@ -74,14 +74,27 @@ pub async fn create_issue(
     let release_result = guard.release(create_result.is_ok()).await;
 
     create_result.map_err(|e| AppError::Git(e.to_string()))?;
-    // The git mutation is committed locally and protected by the pending-upload
-    // marker, so a durable-upload failure here is recoverable (the next
-    // successful upload re-syncs storage) — NOT a request failure. Failing the
-    // request would make the caller retry a non-idempotent mutation: the retry
-    // mints a new issue UUID and both issues eventually publish.
+    // A durable-upload failure is recoverable ONLY while the pending-upload
+    // marker protects the committed mutation (the next successful upload
+    // re-syncs storage). Verify the marker actually exists before choosing to
+    // succeed: if the marker write itself also failed, nothing protects the
+    // mutation from a stale-archive rollback, and the request must fail.
+    // (Succeeding here avoids non-idempotent retries: a retried create mints
+    // a second issue UUID and both eventually publish.)
     if let Err(e) = release_result {
-        tracing::error!(repo = %record.name, issue = %issue_id, err = %e,
-            "issue committed locally but durable upload failed — storage re-syncs on next upload");
+        if state
+            .repo_store
+            .pending_marker_exists(&record.owner_did, &record.name)
+        {
+            tracing::error!(repo = %record.name, issue = %issue_id, err = %e,
+                "issue committed locally but durable upload failed — storage re-syncs on next upload");
+        } else {
+            tracing::error!(repo = %record.name, issue = %issue_id, err = %e,
+                "issue committed locally with NO durable protection — failing the request");
+            return Err(AppError::Git(format!(
+                "issue stored locally but durability could not be guaranteed: {e}"
+            )));
+        }
     }
 
     // Bump trust score for the issue author — increment current score by 0.05
@@ -280,11 +293,22 @@ pub async fn close_issue(
     let updated = close_result
         .map_err(|e| AppError::Git(e.to_string()))?
         .ok_or_else(|| AppError::RepoNotFound(format!("issue {issue_id} not found")))?;
-    // Committed locally + marker-protected: a durable-upload failure is
-    // recoverable, not a request failure (see create_issue).
+    // Recoverable only while the marker protects the committed mutation
+    // (see create_issue).
     if let Err(e) = release_result {
-        tracing::error!(repo = %repo, issue = %issue_id, err = %e,
-            "issue close committed locally but durable upload failed — storage re-syncs on next upload");
+        if state
+            .repo_store
+            .pending_marker_exists(&record.owner_did, &record.name)
+        {
+            tracing::error!(repo = %repo, issue = %issue_id, err = %e,
+                "issue close committed locally but durable upload failed — storage re-syncs on next upload");
+        } else {
+            tracing::error!(repo = %repo, issue = %issue_id, err = %e,
+                "issue close committed locally with NO durable protection — failing the request");
+            return Err(AppError::Git(format!(
+                "issue close stored locally but durability could not be guaranteed: {e}"
+            )));
+        }
     }
 
     let issue: serde_json::Value = serde_json::from_str(&updated)

@@ -8,6 +8,13 @@
 //! Requires a reachable Kubo HTTP API (`GITLAWB_IPFS_API`, e.g.
 //! `http://127.0.0.1:5001`). Objects written here are also retrievable by CID
 //! from the wider IPFS network once pinned/announced by the node.
+//!
+//! DEPLOYMENT RESTRICTION: MFS is the mutable namespace of ONE Kubo daemon —
+//! nothing here publishes a shared CID registry or IPNS mapping. Every
+//! gitlawb node in a network using this backend MUST point at the same Kubo
+//! instance; separate daemons produce disjoint namespaces where a push
+//! accepted on one node is invisible to the others. `storage::build` logs a
+//! startup warning to the same effect.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;

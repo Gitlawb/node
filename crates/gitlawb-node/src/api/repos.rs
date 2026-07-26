@@ -214,6 +214,9 @@ pub async fn create_repo(
     // insert arbitrates nothing; the cross-node safety property is that
     // failure compensation below only ever touches state THIS attempt created
     // (its own row by id, its own local dir) and never deletes a storage key.
+    // init() publishes under the per-repo advisory lock, so a push arriving
+    // through the just-visible row serializes behind publication and can
+    // never be destroyed by this compensation.
     let disk_path = store::repo_disk_path(&state.config.repos_dir, &owner_did, &req.name);
     let now = Utc::now();
     let record = crate::db::RepoRecord {
@@ -231,10 +234,10 @@ pub async fn create_repo(
     };
     state.db.create_repo(&record).await?;
 
-    // Create the bare repo locally and upload the initial archive. On failure,
-    // compensate by removing our own just-inserted row (keyed by our id) so a
-    // retry starts clean; init() already removes its local dir on upload
-    // failure.
+    // Create the bare repo locally and publish the initial archive (under the
+    // advisory lock). On failure, compensate by removing our own just-inserted
+    // row (keyed by our id) so a retry starts clean; create_published removes
+    // its local dir itself.
     if let Err(e) = state.repo_store.init(&owner_did, &req.name).await {
         // `{:#}` walks the anyhow chain to the leaf cause; the other git
         // handlers log their failures, this one didn't.
@@ -1643,10 +1646,10 @@ pub async fn fork_repo(
     // anything. Within one node's database the row is the claim on (owner,
     // name) — a concurrent same-name fork loses at the insert with nothing on
     // disk or in storage. Across nodes (per-node Postgres) the insert
-    // arbitrates nothing; the cross-node safety property is that the failure
-    // compensation below only ever removes state THIS attempt created (its own
-    // row by id, its own clone dir) and never touches a storage archive that
-    // may belong to a racing winner's live repo.
+    // arbitrates nothing; the cross-node safety properties are that
+    // publication runs under the per-repo advisory lock (below) and that the
+    // failure compensation only ever removes state THIS attempt created (its
+    // own row by id, its own clone dir) — never a storage archive.
     let now = Utc::now();
     let record = crate::db::RepoRecord {
         id: Uuid::new_v4().to_string(),
@@ -1663,71 +1666,38 @@ pub async fn fork_repo(
     };
     state.db.create_repo(&record).await?;
 
-    // Any failure from here must undo the claim: remove our own row (keyed by
-    // our generated id) and whatever `git clone` left at `disk_path` — clone
-    // can create the destination before failing, and an orphaned dir makes a
-    // retry fail on an existing destination.
-    //
-    // KNOWN COMPOUND-FAILURE WINDOW: the row makes the fork pushable before
-    // the clone+upload complete, and this flow holds no advisory lock across
-    // that phase. A push acked in the window, whose own upload also failed,
-    // lives only in this dir — undoing the claim then discards it. Requires
-    // fork-upload failure + an interleaved push + that push's upload failure;
-    // the follow-up is to hold the advisory lock across clone+publication.
-    let undo_claim = |state: AppState, record_id: String, disk_path: std::path::PathBuf| async move {
-        match tokio::fs::remove_dir_all(&disk_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(
-                path = %disk_path.display(), err = %e,
-                "failed to clean up local fork dir after fork error"
-            ),
-        }
-        // Also drop the pending-upload marker a failed upload just wrote: left
-        // behind, it would read as divergence and wedge a same-name recreate.
-        crate::git::repo_store::clear_pending_upload(&disk_path);
-        if let Err(e) = state.db.delete_repo_by_id(&record_id).await {
-            tracing::warn!(record_id = %record_id, err = %e,
+    // The whole clone-and-publish lifecycle runs under the per-repo advisory
+    // lock inside `create_published`: pushes to the just-visible row serialize
+    // on the same lock, so none can execute (let alone be destroyed by the
+    // compensation below) until publication has succeeded or been unwound.
+    // On failure, compensation removes only what THIS attempt created: its
+    // clone dir (inside create_published) and its own row, keyed by our
+    // generated id.
+    let clone_result = state
+        .repo_store
+        .create_published(&forker_did, &fork_name, |dest| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "clone",
+                    "--mirror",
+                    source_path.to_str().unwrap_or(""),
+                    dest.to_str().unwrap_or(""),
+                ])
+                .output()
+                .map_err(|e| anyhow::anyhow!("git clone --mirror failed: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("git clone --mirror failed: {stderr}");
+            }
+            Ok(())
+        })
+        .await;
+    if let Err(e) = clone_result {
+        if let Err(db_err) = state.db.delete_repo_by_id(&record.id).await {
+            tracing::warn!(record_id = %record.id, err = %db_err,
                 "failed to remove fork row after fork error");
         }
-    };
-
-    // Clone the source repo as a mirror
-    let output = match std::process::Command::new("git")
-        .args([
-            "clone",
-            "--mirror",
-            source_path.to_str().unwrap_or(""),
-            disk_path.to_str().unwrap_or(""),
-        ])
-        .output()
-    {
-        Ok(output) => output,
-        Err(e) => {
-            undo_claim(state.clone(), record.id.clone(), disk_path).await;
-            return Err(AppError::Git(format!("git clone --mirror failed: {e}")));
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        undo_claim(state.clone(), record.id.clone(), disk_path).await;
-        return Err(AppError::Git(format!(
-            "git clone --mirror failed: {stderr}"
-        )));
-    }
-
-    // Upload fork to storage — fail closed if the durable upload fails rather
-    // than reporting a fork that only exists on this node's local disk.
-    if let Err(e) = state
-        .repo_store
-        .release_after_write(&forker_did, &fork_name)
-        .await
-    {
-        undo_claim(state.clone(), record.id.clone(), disk_path).await;
-        return Err(AppError::Git(format!(
-            "fork created locally but durable upload failed: {e}"
-        )));
+        return Err(AppError::Git(format!("fork failed: {e}")));
     }
 
     // Persist the proof so the fork carries it when it propagates to peers.

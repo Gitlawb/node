@@ -228,15 +228,26 @@ pub async fn merge_pr(
     let release_result = guard.release(merge_result.is_ok()).await;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
-    // The merge commit exists locally and is protected by the pending-upload
-    // marker, so a durable-upload failure is recoverable — NOT a request
-    // failure. Failing here would leave the target ref already merged while
-    // the PR row stays open, and a retry cannot un-merge it; proceed so the
-    // DB status matches the git state, and let the next successful upload
-    // re-sync storage.
+    // A durable-upload failure is recoverable ONLY while the pending-upload
+    // marker protects the merge commit; verify it exists before choosing to
+    // proceed (proceeding keeps the DB status consistent with the already
+    // merged ref, which a retry cannot un-merge). Without the marker nothing
+    // protects the merge from a stale-archive rollback — fail the request so
+    // the inconsistency is surfaced instead of silently losable.
     if let Err(e) = release_result {
-        tracing::error!(repo = %record.name, pr = %pr.id, err = %e,
-            "merge committed locally but durable upload failed — storage re-syncs on next upload");
+        if state
+            .repo_store
+            .pending_marker_exists(&record.owner_did, &record.name)
+        {
+            tracing::error!(repo = %record.name, pr = %pr.id, err = %e,
+                "merge committed locally but durable upload failed — storage re-syncs on next upload");
+        } else {
+            tracing::error!(repo = %record.name, pr = %pr.id, err = %e,
+                "merge committed locally with NO durable protection — failing the request");
+            return Err(AppError::Git(format!(
+                "merge applied locally but durability could not be guaranteed: {e}"
+            )));
+        }
     }
 
     state.db.merge_pr(&pr.id, &merger_did).await?;

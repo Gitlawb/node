@@ -55,7 +55,7 @@ impl RepoArchive {
         repo_name: &str,
         local_path: &Path,
     ) -> Result<Option<String>> {
-        self.upload_with_intent(owner_slug, repo_name, local_path, |_| {})
+        self.upload_with_intent(owner_slug, repo_name, local_path, |_| Ok(()))
             .await
     }
 
@@ -65,9 +65,12 @@ impl RepoArchive {
     /// backend by construction), that value equals the etag the PUT will
     /// produce, letting crash recovery recognize "storage holds exactly what
     /// this node was uploading" — its own completed upload, not divergence.
-    /// Best-effort provenance: on backends where etags aren't content MD5
-    /// (IPFS CIDs), the recorded intent simply never matches and recovery
-    /// keeps its fail-safe behavior.
+    /// `record_intent` returning `Err` ABORTS the upload before the PUT: an
+    /// intent that could not be durably recorded must not be outrun by the
+    /// upload it describes, or a crash after the PUT reads as external
+    /// divergence. Recovery validates a candidate by fetching the remote
+    /// bytes and comparing their MD5, so the mechanism is backend-independent
+    /// (it does not assume the backend's etag is a content hash).
     pub async fn upload_with_intent<F>(
         &self,
         owner_slug: &str,
@@ -76,7 +79,7 @@ impl RepoArchive {
         record_intent: F,
     ) -> Result<Option<String>>
     where
-        F: FnOnce(&str) + Send,
+        F: FnOnce(&str) -> Result<()> + Send,
     {
         let key = Self::key(owner_slug, repo_name);
         let archive_bytes = tokio::task::spawn_blocking({
@@ -87,7 +90,8 @@ impl RepoArchive {
         .context("tar task panicked")?
         .context("compressing repo")?;
 
-        record_intent(&content_md5_hex(&archive_bytes));
+        record_intent(&content_md5_hex(&archive_bytes))
+            .context("recording upload intent before PUT")?;
 
         let meta = self
             .store
@@ -123,6 +127,13 @@ impl RepoArchive {
         .context("extracting repo")?;
         info!(key = %key, path = %local_path.display(), "downloaded repo archive");
         Ok(())
+    }
+
+    /// Fetch the raw archive object bytes (no extraction). Recovery-path
+    /// helper: lets the caller validate a heal candidate by hashing the
+    /// actual remote content instead of trusting backend etag semantics.
+    pub async fn fetch_raw(&self, owner_slug: &str, repo_name: &str) -> Result<Option<Bytes>> {
+        self.store.get(&Self::key(owner_slug, repo_name)).await
     }
 
     /// Delete a repo archive. No production caller yet (creation flows are
