@@ -733,8 +733,8 @@ fn build_degraded_router(node_did: String, db_startup: Arc<DbStartupStatus>) -> 
         db_startup,
     };
     // Everything answers 503 with the same body — including /health and
-    // /ready, so peer pings (which treat any 2xx /health as alive) and
-    // uptime monitors correctly see a node that cannot serve traffic.
+    // /ready, so peer readiness probes and uptime monitors correctly see a
+    // node that cannot serve traffic.
     // `/` additionally carries the node identity for probing peers.
     Router::new()
         .route("/", get(degraded_node_info))
@@ -976,19 +976,29 @@ fn build_http_client() -> reqwest::Result<reqwest::Client> {
 
 /// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
 ///
+/// A 404 falls back to `/health` for compatibility with nodes released before
+/// `/ready` existed. Other readiness failures, including 503 during a database
+/// outage, fail closed and must not use the liveness-only endpoint.
+///
 /// Takes the client by reference so callers supply the shared, no-redirect
 /// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
 /// private address must not be followed. Do NOT call this with a bare
 /// `reqwest::Client::new()`: its default follows redirects and would
 /// reintroduce the SSRF this guards against (#93).
 pub(crate) async fn ping_peer_readiness(client: &reqwest::Client, http_url: &str) -> bool {
-    let url = format!("{}/ready", http_url.trim_end_matches('/'));
-    client
-        .get(&url)
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false)
+    let base_url = http_url.trim_end_matches('/');
+    let readiness = client.get(format!("{base_url}/ready")).send().await;
+
+    match readiness {
+        Ok(response) if response.status().is_success() => true,
+        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .map(|response| response.status().is_success())
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
@@ -1097,6 +1107,59 @@ mod gossip_ssrf_tests {
         assert!(!ok, "a peer with an unavailable database must not be ready");
         health.assert_async().await;
         ready.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_falls_back_for_legacy_peer() {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let health = server
+            .mock("GET", "/health")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(
+            ok,
+            "a legacy peer with a healthy /health must remain reachable"
+        );
+        ready.assert_async().await;
+        health.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_does_not_follow_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let internal = server
+            .mock("GET", "/internal-metadata")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+        let _ready = server
+            .mock("GET", "/ready")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _health = server
+            .mock("GET", "/health")
+            .with_status(302)
+            .with_header("location", &format!("{}/internal-metadata", server.url()))
+            .create_async()
+            .await;
+
+        let ok = ping_peer_readiness(&production_http_client(), &server.url()).await;
+
+        assert!(!ok, "the legacy fallback must not follow redirects");
+        internal.assert_async().await;
     }
 
     // A transport error (nothing listening) must map to unhealthy, never a

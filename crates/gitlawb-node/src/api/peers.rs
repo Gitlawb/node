@@ -444,8 +444,9 @@ pub async fn ping_peer(
         .ok_or_else(|| AppError::RepoNotFound(format!("peer {did} not found")))?;
 
     // Use DB-aware readiness rather than process liveness: `/health` stays 200
-    // during a mid-life database outage, while `/ready` reports 503. The shared
-    // helper also preserves the no-redirect SSRF guard on peer-controlled URLs.
+    // during a mid-life database outage, while `/ready` reports 503. A 404-only
+    // fallback keeps pre-readiness peers compatible. The shared helper also
+    // preserves the no-redirect SSRF guard on peer-controlled URLs.
     let ok = crate::ping_peer_readiness(&state.http_client, &peer.http_url).await;
 
     let _ = state.db.mark_peer_ping(&did, ok).await;
