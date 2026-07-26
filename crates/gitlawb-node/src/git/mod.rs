@@ -173,25 +173,6 @@ impl GitCommand {
 
         let child = self.inner.spawn()?;
 
-        // Double-check cancellation immediately after spawn.  If the timeout
-        // fired just as we spawned, kill the child and report cancellation so
-        // the caller doesn't proceed with a half-dead process.
-        if let Some(ref ctx) = ctx {
-            if ctx.canceled.load(Ordering::SeqCst) {
-                // The child exists but we must not register it.  Kill it and
-                // wait so it doesn't become a zombie.
-                #[cfg(unix)]
-                unsafe {
-                    let _ = libc::kill(child.id() as i32, libc::SIGTERM);
-                }
-                let _ = child.wait_with_output();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "scan canceled immediately after spawn",
-                ));
-            }
-        }
-
         let pgid = {
             #[cfg(unix)]
             {
@@ -204,8 +185,31 @@ impl GitCommand {
             }
         };
 
-        if let (Some(pgid), Some(ref ctx)) = (pgid, &ctx) {
-            ctx.registry.lock().unwrap().insert(pgid);
+        // Atomically (under the registry lock) check cancellation and
+        // register the pgid.  This prevents the timeout sweep from
+        // interleaving between the check and the insert — if canceled
+        // is set while we hold the lock, the sweep cannot drain the
+        // registry until we release it.
+        if let Some(ref ctx) = ctx {
+            let mut registry = ctx.registry.lock().unwrap();
+            if ctx.canceled.load(Ordering::SeqCst) {
+                // Canceled after spawn: kill the whole process group (not
+                // just the immediate child) and wait to avoid zombies.
+                if let Some(pgid) = pgid {
+                    #[cfg(unix)]
+                    unsafe {
+                        let _ = libc::kill(-pgid, libc::SIGTERM);
+                    }
+                }
+                let _ = child.wait_with_output();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "scan canceled after spawn",
+                ));
+            }
+            if let Some(pgid) = pgid {
+                registry.insert(pgid);
+            }
         }
 
         let guard = PgidGuard { pgid, ctx };

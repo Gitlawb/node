@@ -103,33 +103,24 @@ async fn run_pass(
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<(usize, usize, usize)> {
     // Keyset pagination over repos ordered by immutable id so the cursor is
-    // robust against insertions, deletions, or updated_at shifts.
-    let all = db.list_all_repos_deduped_stable().await?;
+    // robust against insertions, deletions, or updated_at shifts.  The LIMIT
+    // is pushed into the SQL query so the hourly pass does not allocate,
+    // transfer, or deduplicate every repo on every sweep.
+    let batch = db
+        .list_all_repos_deduped_stable(cursor.as_deref(), REPOS_PER_PASS as i64)
+        .await?;
 
-    if all.is_empty() {
+    if batch.is_empty() {
         *cursor = None;
         return Ok((0, 0, 0));
     }
 
-    let start_idx = cursor
-        .as_ref()
-        .and_then(|last_id| all.iter().position(|r| r.id == *last_id))
-        .map(|pos| pos + 1)
-        .unwrap_or(0);
-
-    if start_idx >= all.len() {
-        *cursor = None;
-        return Ok((0, 0, 0));
-    }
-
-    let end = (start_idx + REPOS_PER_PASS).min(all.len());
-    let batch = &all[start_idx..end];
     *cursor = Some(batch.last().unwrap().id.clone());
 
     let mut total_gaps_found = 0usize;
     let mut total_gaps_filled = 0usize;
 
-    for repo in batch {
+    for repo in &batch {
         if *shutdown_rx.borrow() {
             tracing::info!("reconciliation sweep: shutdown signal received mid-pass, exiting");
             break;
@@ -275,17 +266,36 @@ async fn run_pass(
             continue;
         }
 
-        // IPFS-missing set (capped).
-        let already_ipfs = match db.filter_ipfs_pinned_oids(&object_list).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(repo = %repo_slug, err = %e, "filter_ipfs_pinned_oids failed, skipping");
-                continue;
-            }
-        };
-        let ipfs_missing: Vec<String> = {
+        // Visibility may have narrowed mid-scan with a path-scoped deny.
+        // Recompute the allowed set from fresh rules and intersect it with
+        // the existing object_list so newly-withheld blobs are excluded from
+        // the missing sets and never published to a public backend.
+        let fresh_allowed = crate::git::visibility_pack::replicable_blob_set(
+            &disk,
+            &rules,
+            fresh_repo.is_public,
+            &fresh_repo.owner_did,
+        )?;
+        let object_list: Vec<String> = object_list
+            .into_iter()
+            .filter(|oid| fresh_allowed.contains(oid))
+            .collect();
+
+        let ipfs_enabled = !config.ipfs_api.is_empty();
+        let pinata_enabled = !config.pinata_jwt.is_empty();
+
+        // Only compute missing sets for enabled backends so that a Pinata-only
+        // or IPFS-only node does not report permanent unfillable gaps.
+        let ipfs_missing: Vec<String> = if ipfs_enabled {
+            let already = match db.filter_ipfs_pinned_oids(&object_list).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(repo = %repo_slug, err = %e, "filter_ipfs_pinned_oids failed, skipping");
+                    continue;
+                }
+            };
             let all_set: HashSet<&str> = object_list.iter().map(|s| s.as_str()).collect();
-            let done_set: HashSet<&str> = already_ipfs.iter().map(|s| s.as_str()).collect();
+            let done_set: HashSet<&str> = already.iter().map(|s| s.as_str()).collect();
             let mut v: Vec<String> = all_set
                 .difference(&done_set)
                 .map(|s| s.to_string())
@@ -299,19 +309,20 @@ async fn run_pass(
                 );
             }
             v
+        } else {
+            Vec::new()
         };
 
-        // Pinata-missing set (capped).
-        let already_pinata = match db.filter_pinata_pinned_oids(&object_list).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(repo = %repo_slug, err = %e, "filter_pinata_pinned_oids failed, skipping");
-                continue;
-            }
-        };
-        let pinata_missing: Vec<String> = {
+        let pinata_missing: Vec<String> = if pinata_enabled {
+            let already = match db.filter_pinata_pinned_oids(&object_list).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(repo = %repo_slug, err = %e, "filter_pinata_pinned_oids failed, skipping");
+                    continue;
+                }
+            };
             let all_set: HashSet<&str> = object_list.iter().map(|s| s.as_str()).collect();
-            let done_set: HashSet<&str> = already_pinata.iter().map(|s| s.as_str()).collect();
+            let done_set: HashSet<&str> = already.iter().map(|s| s.as_str()).collect();
             let mut v: Vec<String> = all_set
                 .difference(&done_set)
                 .map(|s| s.to_string())
@@ -325,6 +336,8 @@ async fn run_pass(
                 );
             }
             v
+        } else {
+            Vec::new()
         };
 
         let gaps_ipfs = ipfs_missing.len();
@@ -335,18 +348,25 @@ async fn run_pass(
             crate::metrics::record_reconciliation_gaps_found(repo_gaps as u64);
         }
 
-        let pinned_ipfs =
-            crate::ipfs_pin::pin_new_objects(&config.ipfs_api, &disk, ipfs_missing, db).await;
+        let pinned_ipfs = if ipfs_enabled && !ipfs_missing.is_empty() {
+            crate::ipfs_pin::pin_new_objects(&config.ipfs_api, &disk, ipfs_missing, db).await
+        } else {
+            Vec::new()
+        };
 
-        let pinned_pinata = crate::pinata::pin_new_objects(
-            http_client,
-            &config.pinata_upload_url,
-            &config.pinata_jwt,
-            &disk,
-            pinata_missing,
-            db,
-        )
-        .await;
+        let pinned_pinata = if pinata_enabled && !pinata_missing.is_empty() {
+            crate::pinata::pin_new_objects(
+                http_client,
+                &config.pinata_upload_url,
+                &config.pinata_jwt,
+                &disk,
+                pinata_missing,
+                db,
+            )
+            .await
+        } else {
+            Vec::new()
+        };
 
         let repo_filled = pinned_ipfs.len() + pinned_pinata.len();
         if repo_filled > 0 {
@@ -406,94 +426,123 @@ async fn run_pass(
 
         let has_path_scoped = crate::git::visibility_pack::has_path_scoped_rule(&rules);
         if has_path_scoped && !config.ipfs_api.is_empty() {
+            let ctx2 = crate::git::ScanContext::new();
+            let ctx2_clone = ctx2.clone();
             let p = disk.clone();
             let owner = repo.owner_did.clone();
             let r = rules.clone();
             let is_public_2 = repo.is_public;
-            let recipients = tokio::task::spawn_blocking(move || {
-                crate::git::visibility_pack::withheld_blob_recipients(&p, &r, is_public_2, &owner)
-            })
+            let recipients = tokio::time::timeout(
+                REPO_SCAN_DEADLINE,
+                tokio::task::spawn_blocking(move || {
+                    let _guard = crate::git::set_scan_context(ctx2_clone);
+                    crate::git::visibility_pack::withheld_blob_recipients(
+                        &p,
+                        &r,
+                        is_public_2,
+                        &owner,
+                    )
+                }),
+            )
             .await;
 
-            match recipients {
-                Ok(Ok(rec)) if !rec.is_empty() => {
-                    let sealed = crate::encrypted_pin::encrypt_and_pin(
-                        &config.ipfs_api,
-                        &disk,
-                        db,
-                        &repo.id,
-                        node_seed,
-                        &rec,
-                    )
-                    .await;
-
-                    // Anchor only when something was newly sealed this pass.
-                    // This avoids unbounded Irys writes on a timer — repos
-                    // with no withheld changes do not re-anchor the manifest.
-                    if !sealed.is_empty() && !config.irys_url.is_empty() {
-                        let all_existing = match db.list_all_encrypted_blobs(&repo.id).await {
-                            Ok(v) => v,
-                            Err(e) => {
-                                tracing::warn!(
-                                    repo = %repo_slug,
-                                    err = %e,
-                                    "list_all_encrypted_blobs failed, skipping anchor"
-                                );
-                                continue;
-                            }
-                        };
-                        if !all_existing.is_empty() {
-                            let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
-                            let slug = format!("{}/{}", owner_short, repo.name);
-                            let ts = chrono::Utc::now().to_rfc3339();
-                            let node_did_str = node_did.to_string();
-
-                            let mut blob_map: HashMap<String, String> = HashMap::new();
-                            for (oid, cid) in &all_existing {
-                                blob_map.insert(oid.clone(), cid.clone());
-                            }
-                            for (oid, cid) in &sealed {
-                                blob_map.insert(oid.clone(), cid.clone());
-                            }
-                            let merged: Vec<(String, String)> = blob_map.into_iter().collect();
-
-                            let manifest = crate::arweave::EncryptedManifest {
-                                repo: &slug,
-                                owner_did: &repo.owner_did,
-                                node_did: &node_did_str,
-                                timestamp: &ts,
-                                blobs: &merged,
-                            };
-                            if let Err(e) = crate::arweave::anchor_encrypted_manifest(
-                                http_client,
-                                &config.irys_url,
-                                &manifest,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    repo = %slug,
-                                    err = %e,
-                                    "encrypted manifest anchor failed (will retry next pass)"
-                                );
+            let rec = match recipients {
+                Ok(Ok(Ok(rec))) => rec,
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(
+                        repo = %repo_slug, err = %e,
+                        "withheld_blob_recipients failed, skipping encrypted pin"
+                    );
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        repo = %repo_slug, err = %e,
+                        "withheld_blob_recipients task panicked, skipping encrypted pin"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    ctx2.canceled.store(true, Ordering::SeqCst);
+                    #[cfg(unix)]
+                    {
+                        let active = ctx2.registry.lock().unwrap();
+                        for &pgid in active.iter() {
+                            unsafe {
+                                let _ = libc::kill(-pgid, libc::SIGTERM);
                             }
                         }
                     }
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
                     tracing::warn!(
                         repo = %repo_slug,
-                        err = %e,
-                        "withheld_blob_recipients failed, skipping encrypted pin"
+                        "encrypted recovery deadline exceeded, killed active git subprocesses, skipping"
                     );
+                    continue;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        repo = %repo_slug,
-                        err = %e,
-                        "withheld_blob_recipients task panicked, skipping encrypted pin"
-                    );
+            };
+
+            if !rec.is_empty() {
+                let sealed = crate::encrypted_pin::encrypt_and_pin(
+                    &config.ipfs_api,
+                    &disk,
+                    db,
+                    &repo.id,
+                    node_seed,
+                    &rec,
+                )
+                .await;
+
+                // Anchor only when something was newly sealed this pass.
+                // This avoids unbounded Irys writes on a timer — repos
+                // with no withheld changes do not re-anchor the manifest.
+                if !sealed.is_empty() && !config.irys_url.is_empty() {
+                    let all_existing = match db.list_all_encrypted_blobs(&repo.id).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                repo = %repo_slug,
+                                err = %e,
+                                "list_all_encrypted_blobs failed, skipping anchor"
+                            );
+                            continue;
+                        }
+                    };
+                    if !all_existing.is_empty() {
+                        let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
+                        let slug = format!("{}/{}", owner_short, repo.name);
+                        let ts = chrono::Utc::now().to_rfc3339();
+                        let node_did_str = node_did.to_string();
+
+                        let mut blob_map: HashMap<String, String> = HashMap::new();
+                        for (oid, cid) in &all_existing {
+                            blob_map.insert(oid.clone(), cid.clone());
+                        }
+                        for (oid, cid) in &sealed {
+                            blob_map.insert(oid.clone(), cid.clone());
+                        }
+                        let merged: Vec<(String, String)> = blob_map.into_iter().collect();
+
+                        let manifest = crate::arweave::EncryptedManifest {
+                            repo: &slug,
+                            owner_did: &repo.owner_did,
+                            node_did: &node_did_str,
+                            timestamp: &ts,
+                            blobs: &merged,
+                        };
+                        if let Err(e) = crate::arweave::anchor_encrypted_manifest(
+                            http_client,
+                            &config.irys_url,
+                            &manifest,
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                repo = %slug,
+                                err = %e,
+                                "encrypted manifest anchor failed (will retry next pass)"
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -158,7 +158,9 @@ pub struct RepoReplica {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinnedCidRecord {
     pub sha256_hex: String,
-    pub cid: String,
+    /// Local IPFS CID.  NULL for Pinata-only rows where the object was never
+    /// fetched by this node's IPFS instance.
+    pub cid: Option<String>,
     pub pinned_at: String,
     pub pinata_cid: Option<String>,
 }
@@ -1279,20 +1281,29 @@ impl Db {
     }
 
     /// Like `list_all_repos_deduped` but ordered by a stable key (`id`) so a
-    /// positional cursor deterministically covers every repo regardless of push
+    /// keyset cursor deterministically covers every repo regardless of push
     /// activity.  Used by the reconciliation sweep to avoid starving idle repos.
-    pub async fn list_all_repos_deduped_stable(&self) -> Result<Vec<RepoRecord>> {
+    /// Only `limit` rows are returned; pass `cursor = None` for the first page.
+    pub async fn list_all_repos_deduped_stable(
+        &self,
+        cursor: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<RepoRecord>> {
         let sql = format!(
             "{}
              SELECT d.id, d.name, d.owner_did, d.description, d.is_public,
                  d.default_branch, d.created_at, d.updated_at, d.disk_path,
                  d.forked_from, d.machine_id
              FROM deduped d
-             ORDER BY d.id ASC",
+             WHERE ($2::text IS NULL OR d.id > $2::text)
+             ORDER BY d.id ASC
+             LIMIT $3",
             Self::dedup_cte()
         );
         let rows = sqlx::query(&sql)
             .bind(None::<&str>)
+            .bind(cursor)
+            .bind(limit)
             .fetch_all(&self.pool)
             .await?;
 
