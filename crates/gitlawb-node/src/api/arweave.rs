@@ -73,6 +73,16 @@ pub async fn list_anchors(
         .list_arweave_anchors(q.repo.as_deref(), limit)
         .await?;
 
+    let gateway = state.config.arweave_gateway.trim_end_matches('/');
+    let anchors: Vec<crate::db::ArweaveAnchor> = anchors
+        .into_iter()
+        .map(|mut a| {
+            a.irys_tx_id = Some(a.arweave_tx_id.clone());
+            a.arweave_url = Some(format!("{}/{}", gateway, a.arweave_tx_id));
+            a
+        })
+        .collect();
+
     Ok(Json(serde_json::json!({
         "anchors": anchors,
         "count": anchors.len(),

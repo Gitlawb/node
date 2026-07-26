@@ -262,6 +262,11 @@ async fn cmd_show(
 /// Rebuild the node's canonical signing payload (field order must match
 /// gitlawb-node/src/cert.rs::issue_ref_certificate exactly) and verify the
 /// certificate's Ed25519 signature against the key embedded in `node_did`.
+///
+/// Certificates after this PR use a 13-field payload.  Pre-PR certificates
+/// were signed over 7 fields (repo_id, ref, old, new, pusher, node, ts) with
+/// NULL proof columns.  Try 13-field first; if it fails and all proof fields
+/// are None, retry with the 7-field payload.
 #[allow(clippy::too_many_arguments)]
 fn verify_signature(
     repo_id: &str,
@@ -282,23 +287,10 @@ fn verify_signature(
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use std::str::FromStr;
 
-    let payload = serde_json::json!({
-        "repo_id": repo_id,
-        "ref":     ref_name,
-        "old":     old_sha,
-        "new":     new_sha,
-        "pusher":  pusher,
-        "node":    node_did,
-        "ts":      issued_at,
-        "seq":     seq,
-        "prev":    prev,
-        "pusher_sig": pusher_sig,
-        "signature_input": signature_input,
-        "content_digest": content_digest,
-        "request_path": request_path,
-    });
-    let payload_bytes =
-        serde_json::to_vec(&payload).map_err(|e| format!("could not serialize payload: {e}"))?;
+    let proof_fields_null = pusher_sig.is_none()
+        && signature_input.is_none()
+        && content_digest.is_none()
+        && request_path.is_none();
 
     let did =
         gitlawb_core::did::Did::from_str(node_did).map_err(|e| format!("bad node DID: {e}"))?;
@@ -313,8 +305,47 @@ fn verify_signature(
         .try_into()
         .map_err(|_| "signature is not 64 bytes".to_string())?;
 
-    gitlawb_core::identity::verify(&verifying_key, &payload_bytes, &sig_bytes)
-        .map_err(|_| "Ed25519 signature does not match the signed payload".to_string())
+    // Try 13-field payload first.
+    let payload_13 = serde_json::json!({
+        "repo_id": repo_id,
+        "ref":     ref_name,
+        "old":     old_sha,
+        "new":     new_sha,
+        "pusher":  pusher,
+        "node":    node_did,
+        "ts":      issued_at,
+        "seq":     seq,
+        "prev":    prev,
+        "pusher_sig": pusher_sig,
+        "signature_input": signature_input,
+        "content_digest": content_digest,
+        "request_path": request_path,
+    });
+    let payload_bytes_13 =
+        serde_json::to_vec(&payload_13).map_err(|e| format!("could not serialize payload: {e}"))?;
+
+    let sig_valid_13 =
+        gitlawb_core::identity::verify(&verifying_key, &payload_bytes_13, &sig_bytes);
+
+    if proof_fields_null && sig_valid_13.is_err() {
+        // Fall back to 7-field payload for pre-PR certificates.
+        let payload_7 = serde_json::json!({
+            "repo_id": repo_id,
+            "ref":     ref_name,
+            "old":     old_sha,
+            "new":     new_sha,
+            "pusher":  pusher,
+            "node":    node_did,
+            "ts":      issued_at,
+        });
+        let payload_bytes_7 = serde_json::to_vec(&payload_7)
+            .map_err(|e| format!("could not serialize payload: {e}"))?;
+        gitlawb_core::identity::verify(&verifying_key, &payload_bytes_7, &sig_bytes).map_err(|_| {
+            "Ed25519 signature does not match the signed payload (7-field)".to_string()
+        })
+    } else {
+        sig_valid_13.map_err(|_| "Ed25519 signature does not match the signed payload".to_string())
+    }
 }
 
 async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str) -> Result<String> {
@@ -508,5 +539,68 @@ mod tests {
             &sig,
         );
         assert!(ok.is_ok(), "expected valid signature, got: {ok:?}");
+    }
+
+    #[test]
+    fn verify_signature_7_field_legacy_fallback() {
+        // A true 7-field (pre-PR) payload — no seq, prev, or proof fields.
+        // The fallback must detect the 13-field mismatch and retry with 7.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+
+        let payload_7 = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload_7).unwrap());
+
+        // All proof fields None → triggers 7-field fallback.
+        let ok = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            1,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            None,
+            None,
+            None,
+            None,
+            &sig,
+        );
+        assert!(
+            ok.is_ok(),
+            "legacy 7-field certificate must verify via fallback, got: {ok:?}"
+        );
+
+        // Tampered new_sha must still fail.
+        let tampered = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            1,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            None,
+            None,
+            None,
+            None,
+            &sig,
+        );
+        assert!(
+            tampered.is_err(),
+            "tampered 7-field payload must not verify"
+        );
     }
 }

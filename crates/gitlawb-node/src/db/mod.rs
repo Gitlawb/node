@@ -3915,6 +3915,12 @@ pub struct ArweaveAnchor {
     pub node_did: String,
     pub anchored_at: String,
     pub cert_id: Option<String>,
+    /// Backward-compat alias for arweave_tx_id.  v1 clients expect this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irys_tx_id: Option<String>,
+    /// Permanent Arweave URL derived from the gateway and tx_id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arweave_url: Option<String>,
 }
 
 /// Input parameters for recording an Arweave anchor.
@@ -3993,6 +3999,8 @@ impl Db {
                 node_did: r.get("node_did"),
                 anchored_at: r.get("anchored_at"),
                 cert_id: r.try_get("cert_id").unwrap_or(None),
+                irys_tx_id: None,
+                arweave_url: None,
             })
             .collect())
     }
