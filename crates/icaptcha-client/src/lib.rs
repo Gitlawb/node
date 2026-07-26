@@ -105,8 +105,9 @@ fn icaptcha_insecure_enabled() -> bool {
                 true
             } else {
                 if !t.is_empty() {
+                    // Do not log the raw env value: it is arbitrary deployment
+                    // input and may contain secrets or terminal controls (#246).
                     tracing::warn!(
-                        value = %t,
                         "GITLAWB_ICAPTCHA_INSECURE is set but not truthy (expected 1 or true); \
                          loopback HTTP trust relaxation remains disabled"
                     );
