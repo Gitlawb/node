@@ -1440,8 +1440,9 @@ mod ref_updates_feed_tests {
 
     // A DB error in the gate fails closed as 500, not swallowed into an empty 200 (the
     // regression the old get_repo().ok().flatten() allowed). Inject by dropping a
-    // column get_repo selects so its query errors. Also assert the body is opaque
-    // (#226): schema text must not reach an anonymous caller.
+    // column get_repo selects so its query errors. Also pin the anonymous body to
+    // the exact opaque object (#226): substring checks miss truncated or differently
+    // shaped leaks, and a vacuous "db_error || internal_error" assert cannot fail.
     #[sqlx::test]
     async fn repo_events_db_error_fails_closed_500(pool: PgPool) {
         let state = test_state(pool.clone()).await;
@@ -1468,17 +1469,13 @@ mod ref_updates_feed_tests {
             .await
             .expect("read body");
         let body = String::from_utf8_lossy(&bytes);
-        assert!(
-            !body.contains("is_public"),
-            "DB schema detail leaked to anonymous caller: {body}"
-        );
-        assert!(
-            !body.contains("column"),
-            "DB schema detail leaked to anonymous caller: {body}"
-        );
-        assert!(
-            body.contains("db_error") || body.contains("internal_error"),
-            "expected opaque error code, got: {body}"
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": "db_error",
+                "message": crate::error::DB_ERROR_MESSAGE,
+            })
         );
     }
 

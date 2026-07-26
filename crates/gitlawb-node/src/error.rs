@@ -168,8 +168,10 @@ impl IntoResponse for AppError {
             }
             // Opaque body: handlers that map with `.map_err(AppError::Internal)`
             // (e.g. GET /ipfs/{cid}) land here; other DB failures usually hit `Db`.
+            // Log `{e:#}` so context-wrapped anyhow chains keep the leaf cause
+            // (Display alone is only the outermost layer; see api/repos.rs).
             AppError::Internal(e) => {
-                tracing::error!(error = %e, "internal error");
+                tracing::error!(error = %format!("{e:#}"), "internal error");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "internal_error",
@@ -192,7 +194,7 @@ pub type Result<T> = std::result::Result<T, AppError>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     #[test]
     fn timeout_maps_to_504_distinct_from_git_500() {
@@ -218,16 +220,14 @@ mod tests {
             .await
             .expect("read body");
         let v: Value = serde_json::from_slice(&bytes).expect("json body");
-        assert_eq!(v["error"], "internal_error");
-        assert_eq!(v["message"], INTERNAL_ERROR_MESSAGE);
-        let rendered = String::from_utf8_lossy(&bytes);
-        assert!(
-            !rendered.contains("relation"),
-            "DB schema detail leaked into body: {rendered}"
-        );
-        assert!(
-            !rendered.contains(leak),
-            "raw internal error leaked into body: {rendered}"
+        // Exact object: a new `detail` field with different sensitive text must
+        // also fail, not only a repeat of the original error string.
+        assert_eq!(
+            v,
+            json!({
+                "error": "internal_error",
+                "message": INTERNAL_ERROR_MESSAGE,
+            })
         );
     }
 
@@ -244,16 +244,32 @@ mod tests {
             .await
             .expect("read body");
         let v: Value = serde_json::from_slice(&bytes).expect("json body");
-        assert_eq!(v["error"], "db_error");
-        assert_eq!(v["message"], DB_ERROR_MESSAGE);
-        let rendered = String::from_utf8_lossy(&bytes);
-        assert!(
-            !rendered.contains("is_public"),
-            "DB schema detail leaked into body: {rendered}"
+        assert_eq!(
+            v,
+            json!({
+                "error": "db_error",
+                "message": DB_ERROR_MESSAGE,
+            })
         );
-        assert!(
-            !rendered.contains("column"),
-            "DB schema detail leaked into body: {rendered}"
+    }
+
+    /// Connection-level failures must stay 503 `db_unavailable`, not collapse
+    /// into the opaque 500 `db_error` arm if `db_unavailable` loses a variant.
+    #[tokio::test]
+    async fn db_pool_timeout_stays_503_unavailable() {
+        let resp = AppError::Db(sqlx::Error::PoolTimedOut).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v,
+            json!({
+                "error": DB_UNAVAILABLE_CODE,
+                "message": DB_UNAVAILABLE_MESSAGE,
+            })
         );
     }
 }
