@@ -969,16 +969,19 @@ async fn gossip_task(
 /// runs, not a hand-rolled equivalent.
 fn build_http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(OUTBOUND_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
+
+const OUTBOUND_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Ping a peer's DB-aware `/ready` endpoint and report whether it answered 2xx.
 ///
 /// A 404 falls back to `/health` for compatibility with nodes released before
 /// `/ready` existed. Other readiness failures, including 503 during a database
-/// outage, fail closed and must not use the liveness-only endpoint.
+/// outage, fail closed and must not use the liveness-only endpoint. The complete
+/// `/ready`-then-`/health` probe shares one timeout budget.
 ///
 /// Takes the client by reference so callers supply the shared, no-redirect
 /// `state.http_client`. Peer URLs are attacker-influenceable, so a `3xx` to a
@@ -986,19 +989,31 @@ fn build_http_client() -> reqwest::Result<reqwest::Client> {
 /// `reqwest::Client::new()`: its default follows redirects and would
 /// reintroduce the SSRF this guards against (#93).
 pub(crate) async fn ping_peer_readiness(client: &reqwest::Client, http_url: &str) -> bool {
-    let base_url = http_url.trim_end_matches('/');
-    let readiness = client.get(format!("{base_url}/ready")).send().await;
+    ping_peer_readiness_with_timeout(client, http_url, OUTBOUND_HTTP_TIMEOUT).await
+}
 
-    match readiness {
-        Ok(response) if response.status().is_success() => true,
-        Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => client
-            .get(format!("{base_url}/health"))
-            .send()
-            .await
-            .map(|response| response.status().is_success())
-            .unwrap_or(false),
-        _ => false,
-    }
+async fn ping_peer_readiness_with_timeout(
+    client: &reqwest::Client,
+    http_url: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let base_url = http_url.trim_end_matches('/');
+    tokio::time::timeout(timeout, async {
+        let readiness = client.get(format!("{base_url}/ready")).send().await;
+
+        match readiness {
+            Ok(response) if response.status().is_success() => true,
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => client
+                .get(format!("{base_url}/health"))
+                .send()
+                .await
+                .map(|response| response.status().is_success())
+                .unwrap_or(false),
+            _ => false,
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
@@ -1036,7 +1051,11 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
 #[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::ping_peer_readiness;
+    use super::{ping_peer_readiness, ping_peer_readiness_with_timeout};
+    use axum::{http::StatusCode, routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     // Build the client exactly as production does (super::build_http_client) so
     // these tests bind the redirect guarantee to the real shared client the
@@ -1133,6 +1152,62 @@ mod gossip_ssrf_tests {
         );
         ready.assert_async().await;
         health.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ping_peer_readiness_legacy_fallback_shares_deadline() {
+        let health_requests = Arc::new(AtomicUsize::new(0));
+        let health_requests_for_route = Arc::clone(&health_requests);
+        let app = Router::new()
+            .route(
+                "/ready",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    StatusCode::NOT_FOUND
+                }),
+            )
+            .route(
+                "/health",
+                get(move || {
+                    let health_requests = Arc::clone(&health_requests_for_route);
+                    async move {
+                        health_requests.fetch_add(1, Ordering::Relaxed);
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind delayed legacy peer");
+        let peer_url = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .expect("delayed legacy peer has no local address")
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("delayed legacy peer failed");
+        });
+
+        let ok = ping_peer_readiness_with_timeout(
+            &production_http_client(),
+            &peer_url,
+            // Each response arrives within 350 ms, but the two serial requests
+            // cannot both finish within one 350 ms probe budget.
+            Duration::from_millis(350),
+        )
+        .await;
+
+        assert!(!ok, "the fallback must not start a fresh timeout budget");
+        assert_eq!(
+            health_requests.load(Ordering::Relaxed),
+            1,
+            "the delayed 404 should reach the legacy fallback"
+        );
+        server.abort();
     }
 
     #[tokio::test]
