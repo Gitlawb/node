@@ -557,9 +557,16 @@ pub async fn verify_anchor(
         //    The context fields (signature_input, content_digest, request_path)
         //    are bound into the node signing payload, so a certificate whose
         //    node signature verified already commits to them.
-        //    Additionally, the ref transition (ref_name, old_sha, new_sha) is
-        //    bound into the HTTP signature signing string as derived components
-        //    so a captured pusher proof cannot be replayed for a different ref.
+        //
+        //    The ref transition is NOT directly signed by the pusher — the
+        //    shipped pusher signs only @method, @path, and content-digest.
+        //    Instead the binding works through the node certificate: the node
+        //    verifies the pusher proof during push, then issues a certificate
+        //    whose 13-field signed payload includes ref_name, old_sha, new_sha.
+        //    A captured pusher proof for one ref transition cannot be reused
+        //    to authorize a different transition because the node signature on
+        //    the mismatch would fail verification in step 1 above.
+        //
         //    When proof fields are present, pusher_sig is REQUIRED; a missing
         //    pusher_sig is treated as invalid rather than silently skipped.
         if !proof_fields_null && c.pusher_sig.is_none() {
@@ -578,9 +585,6 @@ pub async fn verify_anchor(
                             request_values.insert("@path".to_string(), request_path.clone());
                             request_values
                                 .insert("content-digest".to_string(), content_digest.clone());
-                            request_values.insert("@ref_name".to_string(), c.ref_name.clone());
-                            request_values.insert("@old_sha".to_string(), c.old_sha.clone());
-                            request_values.insert("@new_sha".to_string(), c.new_sha.clone());
 
                             let sig_params_value =
                                 sig_input.strip_prefix("sig1=").unwrap_or(sig_input);
