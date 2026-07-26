@@ -47,11 +47,24 @@ fn serve_icaptcha(listener: TcpListener) {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
-            let mut buf = [0; 4096];
-            let n = match stream.read(&mut buf) {
-                Ok(0) | Err(_) => continue,
-                Ok(n) => n,
-            };
+            // Read until the first \n (end of request line) so TCP
+            // segmentation cannot split the path out of a single read.
+            let mut buf = [0u8; 4096];
+            let mut n = 0usize;
+            while n < buf.len() {
+                match stream.read(&mut buf[n..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        n += read;
+                        if buf[..n].contains(&b'\n') {
+                            break;
+                        }
+                    }
+                }
+            }
+            if n == 0 {
+                continue;
+            }
             let request = String::from_utf8_lossy(&buf[..n]);
             let body = if request.contains("/v1/answer") {
                 r#"{"status":"passed","proof":"PROOF-TRIP"}"#
