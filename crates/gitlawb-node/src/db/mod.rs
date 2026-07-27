@@ -2488,17 +2488,26 @@ impl Db {
     /// keeping the first-pinner), so the INV-10 bound on serve-time work holds at
     /// `O(MAX_PIN_SOURCES + 1)` regardless of a table overshoot.
     ///
-    /// A successful record also CLEARS the `pin_sources_incomplete` marker for the
-    /// object, in the SAME transaction as the insert (U3, #173), so the clear cannot
-    /// drift across the four call sites or land without the row it describes. The
-    /// marker is per-object, not per-(object, repo): a record from repo B clears a
-    /// marker set by a failed record from repo A, which can re-hide A's hole until A
-    /// pushes again. That is the deliberate cost of a single boolean, and it fails in
-    /// the safe direction relative to today (the marker only ever ADDS the fallback,
-    /// never removes a source the resolver already tries).
+    /// A record that ACTUALLY ADDS a source row also CLEARS the
+    /// `pin_sources_incomplete` marker for the object, in the SAME transaction as the
+    /// insert (U3, #173), so the clear cannot drift across the four call sites or land
+    /// without the row it describes.
+    ///
+    /// The clear is gated on `rows_affected() > 0` because the INSERT is a no-op in two
+    /// ordinary cases: the `(oid, repo)` pair already exists (`ON CONFLICT DO NOTHING`)
+    /// and the source set is at cap (the count guard). The skip path calls this for
+    /// EVERY already-pinned object, and on a requeue pass that list is the whole-repo
+    /// enumeration, so an unconditional clear meant the next coalesced push from a repo
+    /// already in the set wiped the marker for every object in the repo without
+    /// recording anything (round 11 regression). The residual, which the gate does not
+    /// close: the marker is per-object, not per-(object, repo), so a GENUINE record from
+    /// a third repo C still clears a marker that repo A's failed record set. That is the
+    /// deliberate cost of a single boolean; closing it needs a per-(oid, repo) marker
+    /// table, and it fails in the safe direction (the marker only ever ADDS the scan
+    /// fallback, never removes a source the resolver already tries).
     pub async fn record_pin_source(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
              SELECT $1, $2
              WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
@@ -2508,14 +2517,17 @@ impl Db {
         .bind(repo_id)
         .bind(MAX_PIN_SOURCES)
         .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
-              WHERE sha256_hex = $1 AND pin_sources_incomplete",
-        )
-        .bind(sha256_hex)
-        .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            sqlx::query(
+                "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
+                  WHERE sha256_hex = $1 AND pin_sources_incomplete",
+            )
+            .bind(sha256_hex)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -2526,6 +2538,13 @@ impl Db {
     /// source set that is silently missing its own first pinner. One transaction
     /// removes that window entirely: either both rows land or neither does, and a
     /// total failure leaves the object unpinned so the next push retries it.
+    ///
+    /// The marker clear carries the same `rows_affected` gate as `record_pin_source`.
+    /// It is not load-bearing here: this path runs only when `is_pinned` said no row
+    /// exists, and `mark_pin_sources_incomplete` is a no-op without a `pinned_cids` row,
+    /// so there is no marker to wrongly clear. The gate is kept for the one window that
+    /// is not covered by that argument, a concurrent pinner landing the row between the
+    /// `is_pinned` check and this upsert, and so the two clears cannot drift apart.
     pub async fn record_pinned_cid_with_source(
         &self,
         sha256_hex: &str,
@@ -2545,7 +2564,7 @@ impl Db {
         .bind(repo_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
              SELECT $1, $2
              WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
@@ -2555,14 +2574,17 @@ impl Db {
         .bind(repo_id)
         .bind(MAX_PIN_SOURCES)
         .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
-              WHERE sha256_hex = $1 AND pin_sources_incomplete",
-        )
-        .bind(sha256_hex)
-        .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            sqlx::query(
+                "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
+                  WHERE sha256_hex = $1 AND pin_sources_incomplete",
+            )
+            .bind(sha256_hex)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }

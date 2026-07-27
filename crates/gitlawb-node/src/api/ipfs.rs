@@ -340,38 +340,52 @@ pub async fn get_by_cid(
             // Only a set with NONE of these three signals is treated as complete (every
             // recorded source was just tried), so it skips the scan and lets the tail 404, and
             // ordinary denials never fan out to O(repos) (INV-10 / F3). Both extra queries run
-            // only on a provenance MISS (we return above on Served), so neither costs the serve
-            // path, and the fallback is not an authorization bypass: the scan gates every repo
+            // only on a provenance MISS (we return above on Served) by a caller that still has
+            // work budget, so neither costs the serve path nor a shed caller, and the fallback
+            // is not an authorization bypass: the scan gates every repo
             // through the SAME per-caller gate, so a caller who may not read the object is
             // still denied.
-            let needs_scan = sources.is_empty()
-                || state
+            //
+            // F3 (#173, INV-10/INV-15): peek the per-IP WORK-budget limiter WITHOUT
+            // consuming a token so an already-throttled source is shed BEFORE the
+            // O(repos) preload; the consuming per-probe charge inside gate_and_serve is
+            // left UNCHANGED (it is load-bearing for the across-request bound), so this
+            // adds no double-charge. This peeks `ipfs_work_rate_limiter`, the SAME bucket
+            // the per-probe charge below debits — NOT the route limiter (`ipfs_rate_limiter`,
+            // charged once per request by the middleware): peeking the route bucket here
+            // would re-shed a request the route already admitted (R6, U5).
+            //
+            // The peek runs BEFORE the two marker queries (#173 round 11, F5): shedding is
+            // the whole point of a peek, so a spent-budget caller should not pay two
+            // lookups per request first. It stays AFTER the provenance walk, so no caller
+            // who could have been served is shed. The one caller this moves: a spent-budget
+            // caller whose source set turns out COMPLETE now takes the 429 tail instead of
+            // the 404 tail. That is the honest answer (its search never ran), and it drops
+            // an oracle, since the old order let a throttled caller tell a complete source
+            // set from an incomplete one by 404 vs 429.
+            if let Some(key) =
+                crate::rate_limit::client_key(rctx.headers, rctx.peer, state.push_limiter_trust)
+            {
+                if state.ipfs_work_rate_limiter.is_throttled(&key).await {
+                    throttled = true;
+                    continue;
+                }
+            }
+            let needs_scan = sources.is_empty() || {
+                #[cfg(test)]
+                bump_marker_queries();
+                state
                     .db
                     .pin_sources_at_cap(sha256_hex)
                     .await
                     .map_err(AppError::Internal)?
-                || state
-                    .db
-                    .pin_sources_incomplete(sha256_hex)
-                    .await
-                    .map_err(AppError::Internal)?;
+                    || state
+                        .db
+                        .pin_sources_incomplete(sha256_hex)
+                        .await
+                        .map_err(AppError::Internal)?
+            };
             if needs_scan {
-                // F3 (#173, INV-10/INV-15): peek the per-IP WORK-budget limiter WITHOUT
-                // consuming a token so an already-throttled source is shed BEFORE the
-                // O(repos) preload; the consuming per-probe charge inside gate_and_serve is
-                // left UNCHANGED (it is load-bearing for the across-request bound), so this
-                // adds no double-charge. This peeks `ipfs_work_rate_limiter`, the SAME bucket
-                // the per-probe charge below debits — NOT the route limiter (`ipfs_rate_limiter`,
-                // charged once per request by the middleware): peeking the route bucket here
-                // would re-shed a request the route already admitted (R6, U5).
-                if let Some(key) =
-                    crate::rate_limit::client_key(rctx.headers, rctx.peer, state.push_limiter_trust)
-                {
-                    if state.ipfs_work_rate_limiter.is_throttled(&key).await {
-                        throttled = true;
-                        continue;
-                    }
-                }
                 // Load the scan context once, lazily (shared across oid candidates).
                 if scan_ctx.is_none() {
                     #[cfg(test)]
@@ -908,6 +922,30 @@ pub(crate) fn preload_queries() -> usize {
 #[cfg(test)]
 fn bump_preload_queries() {
     PRELOAD_QUERIES.with(|c| c.set(c.get() + 1));
+}
+
+// Test-only cost counter (F5, #173 round 11): how many times the fallback gate ran the
+// `pin_sources_at_cap` / `pin_sources_incomplete` pair. The work-budget peek sits ahead
+// of them, so an already-throttled caller leaves this at 0; putting the peek back after
+// the pair turns that assertion red. Same thread_local discipline as the preload counter.
+#[cfg(test)]
+thread_local! {
+    static MARKER_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_marker_queries() {
+    MARKER_QUERIES.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn marker_queries() -> usize {
+    MARKER_QUERIES.with(|c| c.get())
+}
+
+#[cfg(test)]
+fn bump_marker_queries() {
+    MARKER_QUERIES.with(|c| c.set(c.get() + 1));
 }
 
 // Test-only INV-10 cost counter (F6, U6/U7): how many times the serve path withheld an

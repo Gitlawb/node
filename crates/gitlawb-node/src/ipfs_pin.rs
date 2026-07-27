@@ -66,37 +66,77 @@ async fn repair_legacy_provider_cid(
     git_timeout: Duration,
     sha: &str,
     db: &crate::db::Db,
-) -> Result<()> {
+) -> Result<RepairOutcome> {
     let stored = match db.cid_for_oid(sha).await? {
         Some(c) => c,
-        None => return Ok(()),
+        None => return Ok(RepairOutcome::Settled),
     };
     // Cost gate: a canonical raw CIDv1 key is already correct — never read bytes.
     if gitlawb_core::cid::is_raw_cidv1(&stored) {
-        return Ok(());
+        return Ok(RepairOutcome::Settled);
     }
     // Legacy-codec row: read the object to recompute. Counted so a test can prove
     // the gate above spares non-legacy rows this read.
     #[cfg(test)]
     note_legacy_repair_read();
-    let data = match crate::git::store::read_object_bounded(git_bin, repo_path, sha, git_timeout) {
-        Ok(Some((_ty, bytes))) => bytes,
-        // Bytes gone: the row stays withheld, never destructively rewritten.
-        Ok(None) => return Ok(()),
+    // `read_object_bounded` is SYNCHRONOUS `git cat-file`, and its budget is
+    // `git_service_timeout_secs` (600 by default), so running it inline parks a tokio
+    // worker for as long as git takes: one wedged read on the sweep's first pass at boot
+    // holds a worker for ten minutes, per legacy row. Push it to the blocking pool, the
+    // same shape `replication_withheld_set` uses in api/repos.rs (#173 round 11, F4).
+    // Both callers of this function are async, so neither changes shape. The read-counter
+    // increment above stays on THIS thread so the thread_local cost-gate assertion holds.
+    let read = {
+        let repo_path = repo_path.to_path_buf();
+        let git_bin = git_bin.to_string();
+        let sha = sha.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::git::store::read_object_bounded(&git_bin, &repo_path, &sha, git_timeout)
+        })
+        .await
+    };
+    let data = match read {
+        Ok(Ok(Some((_ty, bytes)))) => bytes,
+        // Bytes gone: the row stays withheld, never destructively rewritten. Nothing a
+        // later pass changes, so this is a TERMINAL outcome for the sweep's re-walk gate.
+        Ok(Ok(None)) => return Ok(RepairOutcome::Settled),
         // A wedged/D-state `git cat-file` (timeout/infra): the repair is opportunistic
         // and best-effort, so skip it and return Ok so the pin task PROCEEDS to
         // requeue_or_release rather than hanging the coalescing key until process death
         // (grok F2, #173). A later re-push or the deferred sweep retries the repair.
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::warn!(sha = %sha, err = %e, "skipping legacy provider-CID repair: bounded object read failed");
-            return Ok(());
+            return Ok(RepairOutcome::Retryable);
+        }
+        // The blocking task panicked or was cancelled: same best-effort treatment, and
+        // worth another walk because it says nothing about the row itself.
+        Err(e) => {
+            tracing::warn!(sha = %sha, err = %e, "skipping legacy provider-CID repair: object read task failed");
+            return Ok(RepairOutcome::Retryable);
         }
     };
     let raw = Cid::from_git_object_bytes(&data).to_string();
     if raw == stored {
-        return Ok(());
+        return Ok(RepairOutcome::Settled);
     }
-    db.repair_legacy_provider_cid(sha, &raw, &stored).await
+    db.repair_legacy_provider_cid(sha, &raw, &stored).await?;
+    Ok(RepairOutcome::Repaired)
+}
+
+/// What one opportunistic repair did with a row, so the sweep can tell a skip a later
+/// run could fix from one nothing will (U4 re-walk, #173 round 11). The push skip path
+/// ignores the value: it repairs whatever the push happens to carry and a failure there
+/// is already warn-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RepairOutcome {
+    /// Nothing to do, or nothing a re-walk would change: the stored key is already the
+    /// raw resolver key, the recomputed key matches it, or the object's bytes are gone.
+    Settled,
+    /// The bounded object read failed (a wedged `git cat-file`, an unreadable repo).
+    /// The bytes may be readable later, so the row is worth walking again.
+    Retryable,
+    /// The row's key was rewritten to the raw-content CID.
+    Repaired,
 }
 
 /// What one sweep pass (or a whole sweep run) did. `scanned` counts `pinned_cids`
@@ -107,6 +147,12 @@ pub(crate) struct SweepStats {
     pub scanned: usize,
     pub repaired: usize,
     pub passes: usize,
+    /// Rows left unrepaired for a reason a LATER run could fix (the source repo is not
+    /// on this node's local disk, a DB read failed, a bounded object read failed). A
+    /// nonzero count is what makes the run rewind its cursor instead of parking it at
+    /// the end of the table forever. Rows that are unrepairable in principle (no
+    /// provenance, the repo row is gone, the bytes are gone) are NOT counted here.
+    pub retryable_skips: usize,
 }
 
 /// One bounded pass of the U4 sweep: read at most `batch` `pinned_cids` rows after
@@ -131,6 +177,7 @@ async fn sweep_pass(
     let rows = db.pinned_cids_after(&cursor, batch).await?;
     let scanned = rows.len();
     let mut repaired = 0usize;
+    let mut retryable_skips = 0usize;
     let mut last = cursor;
 
     for (sha, stored) in rows {
@@ -149,16 +196,24 @@ async fn sweep_pass(
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(sha = %sha, err = %e, "sweep: failed to read pin sources");
+                // A DB read error says nothing about the row, so a later run retries it.
+                retryable_skips += 1;
                 continue;
             }
         };
+        // Whether this row ended the source walk repaired, and whether anything it hit
+        // along the way was a transient obstacle rather than a permanent one.
+        let mut row_repaired = false;
+        let mut row_retryable = false;
         for repo_id in sources {
             let repo = match db.get_repo_by_id(&repo_id).await {
                 Ok(Some(r)) => r,
-                // The repo row is gone: a later source may still hold the bytes.
+                // The repo row is gone: a later source may still hold the bytes. A
+                // deleted repo does not come back, so this is not a retryable skip.
                 Ok(None) => continue,
                 Err(e) => {
                     tracing::warn!(repo_id = %repo_id, err = %e, "sweep: failed to read repo");
+                    row_retryable = true;
                     continue;
                 }
             };
@@ -166,31 +221,49 @@ async fn sweep_pass(
             // The sweep is opportunistic background maintenance over every pinned row on
             // the node, so it must never pull a cold repo back from remote storage: that
             // would turn a repair pass into a bulk restore. A repo that is not on local
-            // disk simply reads no bytes here and stays withheld for a later pass or a
-            // re-push, which is the same non-destructive outcome as missing bytes.
-            let repo_path =
-                crate::git::store::repo_disk_path(repos_dir, &repo.owner_did, &repo.name);
-            if let Err(e) =
-                repair_legacy_provider_cid(&repo_path, git_bin, git_timeout, &sha, db).await
-            {
-                tracing::warn!(sha = %sha, err = %e, "sweep: legacy provider-CID repair failed");
-                continue;
-            }
-            // `repair_legacy_provider_cid` is best-effort and silent about which of its
-            // outcomes it took (bytes gone, read failed, rewritten), so read the key back
-            // to decide whether to stop trying sources. A no-op re-read on an
-            // already-repaired row is one indexed lookup.
-            match db.cid_for_oid(&sha).await {
-                Ok(Some(c)) if gitlawb_core::cid::is_raw_cidv1(&c) => {
-                    repaired += 1;
-                    break;
-                }
-                Ok(_) => continue,
+            // disk simply reads no bytes here and stays withheld, but it IS a retryable
+            // skip: on a Tigris-backed node the repo is cold now and warm later, and
+            // without the re-walk that row would never be repaired by anything.
+            // The path goes through the repo store's VALIDATED resolver (allowlisted
+            // components, rooted at repos_dir, no ParentDir/CurDir segment), not the raw
+            // join: the sweep is a second caller of that path logic and gets the same
+            // barrier the acquire path has (#173 round 11, F3). It is the non-fetching
+            // variant, so the no-cold-pull property above is untouched.
+            let repo_path = match crate::git::repo_store::validated_repo_disk_path(
+                repos_dir,
+                &repo.owner_did,
+                &repo.name,
+            ) {
+                Ok(p) => p,
+                // An unsafe name is not something a later run fixes, so it is terminal.
                 Err(e) => {
-                    tracing::warn!(sha = %sha, err = %e, "sweep: failed to re-read repaired key");
+                    tracing::warn!(repo_id = %repo_id, err = %e, "sweep: rejected unsafe repo path");
                     continue;
                 }
+            };
+            if !repo_path.is_dir() {
+                row_retryable = true;
+                continue;
             }
+            match repair_legacy_provider_cid(&repo_path, git_bin, git_timeout, &sha, db).await {
+                Ok(RepairOutcome::Repaired) => {
+                    repaired += 1;
+                    row_repaired = true;
+                    break;
+                }
+                // The bytes could not be read from this source right now: try the next
+                // source, and if none of them works, walk the row again on a later run.
+                Ok(RepairOutcome::Retryable) => row_retryable = true,
+                // Nothing to repair from this source and nothing a re-walk changes.
+                Ok(RepairOutcome::Settled) => {}
+                Err(e) => {
+                    tracing::warn!(sha = %sha, err = %e, "sweep: legacy provider-CID repair failed");
+                    row_retryable = true;
+                }
+            }
+        }
+        if !row_repaired && row_retryable {
+            retryable_skips += 1;
         }
     }
 
@@ -199,6 +272,7 @@ async fn sweep_pass(
         scanned,
         repaired,
         passes: 1,
+        retryable_skips,
     })
 }
 
@@ -230,6 +304,16 @@ pub(crate) async fn sweep_legacy_provider_cids_once(
 /// its cursor every pass so a restart continues instead of rewinding. Errors reading
 /// or repairing an individual row are warn-and-skip; only a failure of the batch query
 /// or the cursor write ends the run, and a later run picks up from the stored cursor.
+///
+/// A run that skipped at least one RETRYABLE row rewinds the cursor to the start of the
+/// table on its way out (#173 round 11). Without that the cursor parked at the maximum
+/// `sha256_hex` for good: every later boot read zero rows, so a row skipped for a
+/// transient reason (its repo cold on a Tigris-backed node, a DB or object read error)
+/// was skipped permanently, unadvertised and unresolvable with nothing left to fix it.
+/// The rewind is a per-RUN decision made after the walk has already finished, never
+/// mid-walk, so it cannot spin: the cost is one extra ordered scan on the next run, and
+/// a row that is unrepairable in principle (bytes gone, provenance gone) does not count
+/// as retryable, so a node holding one does not re-walk on every boot forever.
 pub(crate) async fn sweep_legacy_provider_cids(
     repos_dir: &std::path::Path,
     git_bin: &str,
@@ -244,19 +328,26 @@ pub(crate) async fn sweep_legacy_provider_cids(
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(err = %e, "legacy provider-CID sweep pass failed; stopping");
-                return totals;
+                break;
             }
         };
         totals.scanned += pass.scanned;
         totals.repaired += pass.repaired;
+        totals.retryable_skips += pass.retryable_skips;
         totals.passes += 1;
         // A short batch means the ordered walk reached the end of the table. Stop here
         // rather than after an extra empty pass, and do NOT sleep on the way out.
         if (pass.scanned as i64) < batch {
-            return totals;
+            break;
         }
         tokio::time::sleep(delay).await;
     }
+    if totals.retryable_skips > 0 {
+        if let Err(e) = db.set_pin_repair_cursor("").await {
+            tracing::warn!(err = %e, "failed to rewind the legacy provider-CID sweep cursor");
+        }
+    }
+    totals
 }
 
 // Test-only cost-gate counter (R8, U7): how many times the opportunistic repair
