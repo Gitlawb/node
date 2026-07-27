@@ -14,7 +14,7 @@ impl QueryRoot {
         let repos = db
             .list_all_repos_deduped()
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
 
         // Apply the same "/" visibility gate the REST/per-repo endpoints use so
         // this surface does not enumerate private repos (#97). The caller DID is
@@ -27,7 +27,7 @@ impl QueryRoot {
         let rules_by_repo = db
             .list_visibility_rules_for_repos(&ids)
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
 
         Ok(repos
             .into_iter()
@@ -71,7 +71,7 @@ impl QueryRoot {
         let updates =
             crate::api::events::collect_visible_ref_updates(db, repo.as_deref(), limit, caller)
                 .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                .map_err(|e| crate::graphql::graphql_db_err(e))?;
 
         // Resolve the trusted display owner_did per row, identical to the REST
         // feed: the stored wire value is untrusted, so it is echoed only when it
@@ -86,7 +86,7 @@ impl QueryRoot {
         let owner_dids = db
             .resolve_ref_update_owner_dids(&pairs)
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
 
         let resolved: Vec<RefUpdateType> = updates
             .into_iter()
@@ -116,7 +116,7 @@ impl QueryRoot {
         let tasks = db
             .list_tasks(status.as_deref(), assignee_did.as_deref(), limit)
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
         Ok(tasks.into_iter().map(AgentTaskType::from).collect())
     }
 
@@ -125,7 +125,7 @@ impl QueryRoot {
         let t = db
             .get_task(&id)
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
         Ok(t.map(AgentTaskType::from))
     }
 }
@@ -418,5 +418,38 @@ mod tests {
         let schema = schema(db);
         let q = r#"{ refUpdates { repo } }"#;
         assert_eq!(count(&authed(&schema, q, "did:key:z6MkQuar").await), 0);
+    }
+
+    /// #250: anonymous GraphQL query DB failures must not leak sqlx/schema text.
+    #[sqlx::test]
+    async fn repos_query_db_error_message_is_opaque(pool: PgPool) {
+        let db = db(pool.clone()).await;
+        db.create_repo(&repo("r1", OWNER, "widget", true))
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE repos DROP COLUMN is_public")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let schema = schema(db);
+        let resp = anon(&schema, "{ repos { name ownerDid } }").await;
+        assert!(
+            !resp.errors.is_empty(),
+            "DB failure must surface as a GraphQL error"
+        );
+        for err in &resp.errors {
+            assert_eq!(
+                err.message,
+                crate::graphql::GRAPHQL_DB_ERROR_MESSAGE,
+                "raw DB detail leaked into GraphQL error: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("is_public") && !err.message.contains("column"),
+                "schema text leaked: {}",
+                err.message
+            );
+        }
     }
 }

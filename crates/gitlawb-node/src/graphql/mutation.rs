@@ -54,7 +54,7 @@ impl MutationRoot {
         };
         db.create_task(&task)
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
         Ok(AgentTaskType::from(task))
     }
 
@@ -76,7 +76,7 @@ impl MutationRoot {
         let task = db
             .claim_task(&id, &assignee_did)
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "pending".to_string(),
@@ -108,7 +108,7 @@ impl MutationRoot {
         let existing = db
             .get_task(&id)
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| crate::graphql::graphql_db_err(e))?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
             return Err(async_graphql::Error::new(
@@ -118,7 +118,7 @@ impl MutationRoot {
         let task = db
             .finish_task(&id, "completed", input.result.as_deref())
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -149,7 +149,7 @@ impl MutationRoot {
         let existing = db
             .get_task(&id)
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| crate::graphql::graphql_db_err(e))?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
             return Err(async_graphql::Error::new(
@@ -160,7 +160,7 @@ impl MutationRoot {
         let task = db
             .finish_task(&id, "failed", Some(&reason))
             .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            .map_err(|e| crate::graphql::graphql_db_err(e))?;
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
