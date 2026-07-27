@@ -8,11 +8,16 @@
 //!
 //! RFC 9421 headers produced by `sign_request`:
 //!   Content-Digest:   sha-256=:base64hash:
-//!   Signature-Input:  sig1=("@method" "@path" "content-digest");keyid="did:key:z6Mk...";alg="ed25519";created=<unix>
+//!   Signature-Input:  sig1=("@method" "@path" "content-digest");keyid="did:key:z6Mk...";alg="ed25519";created=<unix>;nonce="<32 hex chars>"
 //!   Signature:        sig1=:base64signature:
+//!
+//! The `nonce` is a per-request 128-bit value. It sits in the parameter tail,
+//! which is what `@signature-params` is built from, so it is covered by the
+//! signature without appearing in the covered-component list.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use chrono::Utc;
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
@@ -39,10 +44,12 @@ pub const MAX_FUTURE_SKEW_SECS: i64 = 30;
 pub struct SignedHeaders {
     /// `Content-Digest: sha-256=:base64:`
     pub content_digest: String,
-    /// `Signature-Input: sig1=(...);keyid="...";alg="ed25519";created=<unix>`
+    /// `Signature-Input: sig1=(...);keyid="...";alg="ed25519";created=<unix>;nonce="..."`
     pub signature_input: String,
     /// `Signature: sig1=:base64:`
     pub signature: String,
+    /// The per-request nonce carried in `Signature-Input`.
+    pub nonce: String,
 }
 
 /// A parsed RFC 9421 signature (from Signature-Input + Signature headers).
@@ -53,6 +60,8 @@ pub struct HttpSignature {
     pub created: i64,
     pub components: Vec<String>,
     pub signature_bytes: Vec<u8>,
+    /// The `nonce` param, absent on signatures from a pre-nonce signer.
+    pub nonce: Option<String>,
 }
 
 impl HttpSignature {
@@ -104,6 +113,9 @@ impl HttpSignature {
             .parse()
             .map_err(|_| Error::HttpSignature("invalid created timestamp".into()))?;
 
+        // Optional: absent on signatures from a signer that predates the nonce.
+        let nonce = params.get("nonce").map(|v| v.trim_matches('"').to_string());
+
         // Signature: sig1=:base64bytes:
         let sig_b64 = sig_header
             .trim()
@@ -121,6 +133,7 @@ impl HttpSignature {
             created,
             components,
             signature_bytes,
+            nonce,
         })
     }
 
@@ -234,8 +247,16 @@ pub fn sign_request(
     // derived from COVERED_COMPONENTS rather than written out, so the wire
     // header and the list we actually sign over cannot drift apart.
     let advertised = covered_components_list();
-    let signature_input =
-        format!(r#"sig1=({advertised});keyid="{did}";alg="ed25519";created={created}"#);
+    // 128 bits from the OS CSPRNG, appended to the parameter tail. The tail is
+    // sliced into `sig_params_value` below and so lands in the
+    // `@signature-params` line, which puts the nonce under the signature
+    // (RFC 9421 §2.3) without touching COVERED_COMPONENTS. Verifiers that
+    // predate the nonce rebuild `@signature-params` from the received header
+    // text, so they keep verifying an unknown parameter unchanged.
+    let nonce = generate_nonce();
+    let signature_input = format!(
+        r#"sig1=({advertised});keyid="{did}";alg="ed25519";created={created};nonce="{nonce}""#
+    );
 
     // The @signature-params component value is the part after "sig1="
     let sig_params_value = &signature_input["sig1=".len()..];
@@ -256,7 +277,15 @@ pub fn sign_request(
         content_digest,
         signature_input,
         signature: format!("sig1=:{sig_b64}:"),
+        nonce,
     }
+}
+
+/// Draw a fresh 128-bit nonce from the OS CSPRNG, hex-encoded.
+fn generate_nonce() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 /// Compute RFC 9421 Content-Digest value: `sha-256=:base64(sha256(body)):`
@@ -534,6 +563,113 @@ mod tests {
         let d1 = compute_content_digest(b"body one");
         let d2 = compute_content_digest(b"body two");
         assert_ne!(d1, d2);
+    }
+
+    /// U2: the nonce is per-call, so two signatures over an identical request
+    /// differ and so do the `Signature-Input` values they were computed over.
+    #[test]
+    fn two_signatures_over_an_identical_request_differ() {
+        let kp = Keypair::generate();
+        let a = sign_request(&kp, "POST", "/api/register", b"same body");
+        let b = sign_request(&kp, "POST", "/api/register", b"same body");
+
+        assert_ne!(
+            a.nonce, b.nonce,
+            "each sign_request call must draw a fresh nonce"
+        );
+        assert_ne!(
+            a.signature_input, b.signature_input,
+            "the nonce must reach the wire header, not just the struct"
+        );
+        assert_ne!(
+            a.signature, b.signature,
+            "a covered nonce must change the signature bytes"
+        );
+    }
+
+    /// U2: `parse` round-trips the nonce, and a nonce-less header still parses.
+    #[test]
+    fn parse_exposes_nonce_and_tolerates_its_absence() {
+        let kp = Keypair::generate();
+        let headers = sign_request(&kp, "POST", "/api/register", b"body");
+        let parsed = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert_eq!(
+            parsed.nonce.as_deref(),
+            Some(headers.nonce.as_str()),
+            "the parsed nonce must be the one that was signed, unquoted"
+        );
+
+        let did = kp.did();
+        let nonceless = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let parsed = HttpSignature::parse(&nonceless, &headers.signature).unwrap();
+        assert_eq!(
+            parsed.nonce, None,
+            "a pre-U2 signer's header must parse with no nonce"
+        );
+    }
+
+    /// U2: 128 bits of entropy, hex-encoded.
+    #[test]
+    fn nonce_is_128_bits() {
+        let kp = Keypair::generate();
+        let headers = sign_request(&kp, "GET", "/api/v1/agents", b"");
+        let raw = hex::decode(&headers.nonce).expect("nonce must be hex");
+        assert_eq!(raw.len(), 16, "nonce must carry exactly 128 bits");
+    }
+
+    /// U2 backward compatibility, the load-bearing one: a nonce-bearing
+    /// signature still verifies through the same reconstruct-and-verify flow
+    /// the node runs, with no verifier change.
+    #[test]
+    fn nonce_bearing_signature_verifies_through_the_unchanged_flow() {
+        use crate::identity::verify;
+
+        let kp = Keypair::generate();
+        let body = b"{\"did\":\"did:key:z6Mk\"}";
+        let headers = sign_request(&kp, "POST", "/api/register", body);
+        assert!(
+            headers.signature_input.contains(";nonce=\""),
+            "this test is only meaningful once the header carries a nonce"
+        );
+
+        let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert_eq!(
+            sig.components, COVERED_COMPONENTS,
+            "the nonce must not disturb the covered-component list"
+        );
+
+        // Exactly what the node does: rebuild @signature-params from the
+        // received header text and verify over it.
+        let sig_params_value = headers.signature_input.strip_prefix("sig1=").unwrap();
+        let mut request_values = HashMap::new();
+        request_values.insert("@method".to_string(), "POST".to_string());
+        request_values.insert("@path".to_string(), "/api/register".to_string());
+        request_values.insert("content-digest".to_string(), headers.content_digest.clone());
+        let components_ref: Vec<&str> = sig.components.iter().map(String::as_str).collect();
+        let signing_string =
+            build_signing_string(&components_ref, sig_params_value, &request_values).unwrap();
+
+        let vk = sig.key_id.to_verifying_key().unwrap();
+        let sig_bytes: [u8; 64] = sig.signature_bytes.clone().try_into().unwrap();
+        assert!(
+            verify(&vk, signing_string.as_bytes(), &sig_bytes).is_ok(),
+            "a nonce-bearing signature must verify unchanged"
+        );
+
+        // And the nonce is genuinely covered: strip it and verification fails.
+        let without_nonce = sig_params_value
+            .split(";nonce=")
+            .next()
+            .unwrap()
+            .to_string();
+        let tampered =
+            build_signing_string(&components_ref, &without_nonce, &request_values).unwrap();
+        assert!(
+            verify(&vk, tampered.as_bytes(), &sig_bytes).is_err(),
+            "the nonce must be inside @signature-params, not decoration"
+        );
     }
 
     #[test]
