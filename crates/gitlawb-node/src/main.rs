@@ -31,6 +31,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -937,6 +938,7 @@ async fn gossip_task(
 
     // Periodic ping every 5 minutes — exit on shutdown.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    let mut failed_once = HashSet::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -946,7 +948,17 @@ async fn gossip_task(
                 };
                 for peer in peers {
                     let ok = ping_peer_readiness(&client, &peer.http_url).await;
-                    let _ = state.db.mark_peer_ping(&peer.did, ok).await;
+                    match peer_ping_db_update(&mut failed_once, &peer.did, ok) {
+                        Some(reachable) => {
+                            if let Err(error) = state.db.mark_peer_ping(&peer.did, reachable).await {
+                                warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
+                            }
+                        }
+                        None => warn!(
+                            did = %peer.did,
+                            "peer readiness probe failed once; preserving previous federation status"
+                        ),
+                    }
                 }
             }
             _ = shutdown_rx.changed() => {
@@ -956,6 +968,21 @@ async fn gossip_task(
                 }
             }
         }
+    }
+}
+
+/// Decide whether one readiness sample should update the persisted federation
+/// gate. A success is authoritative immediately. A failure must repeat on the
+/// next gossip tick before it can mark a peer unreachable, so one transient
+/// database hiccup does not hide the peer's repositories for five minutes.
+fn peer_ping_db_update(failed_once: &mut HashSet<String>, did: &str, ready: bool) -> Option<bool> {
+    if ready {
+        failed_once.remove(did);
+        Some(true)
+    } else if failed_once.insert(did.to_owned()) {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -998,22 +1025,67 @@ async fn ping_peer_readiness_with_timeout(
     timeout: std::time::Duration,
 ) -> bool {
     let base_url = http_url.trim_end_matches('/');
-    tokio::time::timeout(timeout, async {
+    let result = tokio::time::timeout(timeout, async {
         let readiness = client.get(format!("{base_url}/ready")).send().await;
 
         match readiness {
             Ok(response) if response.status().is_success() => true,
-            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => client
-                .get(format!("{base_url}/health"))
-                .send()
-                .await
-                .map(|response| response.status().is_success())
-                .unwrap_or(false),
-            _ => false,
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
+                info!(
+                    peer_url = %http_url,
+                    "peer has no readiness endpoint; falling back to legacy health probe"
+                );
+                match client.get(format!("{base_url}/health")).send().await {
+                    Ok(response) if response.status().is_success() => true,
+                    Ok(response) => {
+                        warn!(
+                            peer_url = %http_url,
+                            status = %response.status(),
+                            "legacy peer health probe reported unhealthy"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        warn!(
+                            peer_url = %http_url,
+                            err = %error,
+                            "legacy peer health probe failed"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(response) => {
+                warn!(
+                    peer_url = %http_url,
+                    status = %response.status(),
+                    "peer readiness probe reported unready"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(
+                    peer_url = %http_url,
+                    err = %error,
+                    "peer readiness probe failed"
+                );
+                false
+            }
         }
     })
-    .await
-    .unwrap_or(false)
+    .await;
+
+    match result {
+        Ok(ready) => ready,
+        Err(_) => {
+            warn!(
+                peer_url = %http_url,
+                timeout_ms = timeout.as_millis(),
+                "peer readiness probe timed out"
+            );
+            false
+        }
+    }
 }
 
 fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
@@ -1051,8 +1123,9 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
 #[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::{ping_peer_readiness, ping_peer_readiness_with_timeout};
+    use super::{peer_ping_db_update, ping_peer_readiness, ping_peer_readiness_with_timeout};
     use axum::{http::StatusCode, routing::get, Router};
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1063,6 +1136,33 @@ mod gossip_ssrf_tests {
     // fails ping_peer_readiness_does_not_follow_redirect.
     fn production_http_client() -> reqwest::Client {
         super::build_http_client().expect("failed to build production http client")
+    }
+
+    #[test]
+    fn peer_ping_requires_two_failures_before_marking_unreachable() {
+        let mut failed_once = HashSet::new();
+        let did = "did:key:z6MkPeer";
+
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "one transient failure must preserve the persisted federation gate"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            Some(false),
+            "a sustained failure must mark the peer unreachable"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, true),
+            Some(true),
+            "a success must restore reachability immediately"
+        );
+        assert_eq!(
+            peer_ping_db_update(&mut failed_once, did, false),
+            None,
+            "a success must reset the consecutive-failure state"
+        );
     }
 
     // A peer answering `/ready` with a 302 toward an internal address must not
