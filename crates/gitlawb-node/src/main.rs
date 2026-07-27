@@ -938,7 +938,7 @@ async fn gossip_task(
 
     // Periodic ping every 5 minutes — exit on shutdown.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-    let mut failed_once = HashSet::new();
+    let mut failed_once: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
             _ = interval.tick() => {
@@ -946,6 +946,11 @@ async fn gossip_task(
                     Ok(p) => p,
                     Err(_) => continue,
                 };
+                {
+                    let current_dids: HashSet<&str> =
+                        peers.iter().map(|peer| peer.did.as_str()).collect();
+                    failed_once.retain(|did| current_dids.contains(did.as_str()));
+                }
                 for peer in peers {
                     let ok = ping_peer_readiness(&client, &peer.http_url).await;
                     match peer_ping_db_update(&mut failed_once, &peer.did, ok) {
