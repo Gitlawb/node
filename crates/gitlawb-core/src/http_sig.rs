@@ -84,6 +84,15 @@ impl HttpSignature {
             .find(')')
             .ok_or_else(|| Error::HttpSignature("missing ')' in Signature-Input".into()))?;
 
+        // Both parentheses are located independently, so a header carrying them
+        // out of order (`sig1=)(`) would build a reversed range and panic. This
+        // runs on unauthenticated header text, so it has to be a rejection.
+        if close < open {
+            return Err(Error::HttpSignature(
+                "'(' must precede ')' in Signature-Input".into(),
+            ));
+        }
+
         let components_str = &rest[open + 1..close];
         let params_str = &rest[close + 1..]; // starts with ';'
 
@@ -670,6 +679,66 @@ mod tests {
             verify(&vk, tampered.as_bytes(), &sig_bytes).is_err(),
             "the nonce must be inside @signature-params, not decoration"
         );
+    }
+
+    /// A `)` before the `(` must be rejected, not sliced backwards. The two
+    /// parentheses are found independently, so an out-of-order pair used to
+    /// build a reversed range and panic inside `parse` — reachable with two
+    /// headers and no credentials at all.
+    #[test]
+    fn reversed_parentheses_are_rejected_not_panicked() {
+        let err = HttpSignature::parse("sig1=)(", "sig1=:AAAA:")
+            .expect_err("reversed parentheses must return an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'(' must precede ')'"),
+            "expected the paren-ordering error, got: {msg}"
+        );
+    }
+
+    /// `parse` runs on attacker-controlled header text before any
+    /// authentication, so no input may reach a panic. Every entry here must
+    /// come back as `Err`; the test failing by panic is the case it exists for.
+    #[test]
+    fn malformed_signature_input_always_errors_never_panics() {
+        let did = Keypair::generate().did();
+        let long = format!("sig1=({}", "(".repeat(4096));
+        let cases: Vec<(&str, &str)> = vec![
+            ("", "sig1=:AAAA:"),
+            ("sig1=", "sig1=:AAAA:"),
+            ("sig1=()", "sig1=:AAAA:"),
+            ("sig1=)(", "sig1=:AAAA:"),
+            ("sig1=(", "sig1=:AAAA:"),
+            ("sig1=)", "sig1=:AAAA:"),
+            ("sig1=))((", "sig1=:AAAA:"),
+            ("sig1=;", "sig1=:AAAA:"),
+            (";", "sig1=:AAAA:"),
+            ("sig1=)(", ""),
+            ("sig1=)(", "sig1=:not base64!:"),
+            ("sig1=(\"@method\");created=notanumber", "sig1=:AAAA:"),
+            ("sig1=(\"@method\");created=", "sig1=:AAAA:"),
+            ("sig1=(é)é;created=1000", "sig1=:AAAA:"),
+            ("sig1=)é(", "sig1=:AAAA:"),
+            ("sig1=é)(é", "sig1=:AAAA:"),
+            (&long, "sig1=:AAAA:"),
+        ];
+
+        for (input, header) in cases {
+            let out = HttpSignature::parse(input, header);
+            assert!(
+                out.is_err(),
+                "malformed Signature-Input {input:?} parsed successfully"
+            );
+        }
+
+        // An unbalanced quote inside an otherwise well-formed header is
+        // tolerated: `trim_matches('"')` strips whatever quotes are there.
+        // The invariant that matters is that it returns rather than panics, so
+        // assert it parses and leaves the quote-stripped component behind.
+        let unbalanced = format!(r#"sig1=("@method);keyid="{did}";alg="ed25519";created=1000"#);
+        let parsed = HttpSignature::parse(&unbalanced, "sig1=:AAAA:")
+            .expect("an unbalanced quote is tolerated, not a parse failure");
+        assert_eq!(parsed.components, vec!["@method".to_string()]);
     }
 
     #[test]
