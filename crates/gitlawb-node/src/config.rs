@@ -307,6 +307,17 @@ pub struct Config {
     /// Default: 32. Must be between 1 and 1_048_576 (the ceiling keeps the value
     /// under tokio's `Semaphore` permit limit so an oversized value is a clean CLI
     /// error rather than a boot-time panic).
+    ///
+    /// CONNECTION BUDGET. A push holds a Postgres connection from the node's separate
+    /// advisory-lock pool for the whole receive-pack, and that pool is sized from this
+    /// knob (this value + 8, clamped to 64 in `main.rs`). The node's total ceiling is
+    /// therefore `db_max_connections` (default 20) + the lock pool (default 40), i.e.
+    /// 60 by default, and at most `db_max_connections` + 64. Size BOTH against the
+    /// database server's `max_connections`: `db_max_connections`' own doc predates the
+    /// lock pool and no longer covers most of the node's connections. The +8 headroom
+    /// is shared with the three non-push `acquire_write` callers (`api/issues.rs` x2,
+    /// `api/pulls.rs`). Raising this knob past the clamp does NOT buy more lock-pool
+    /// connections; pushes beyond it wait briefly and then shed a 503 + Retry-After.
     #[arg(
         long,
         env = "GITLAWB_MAX_CONCURRENT_GIT_PUSHES",

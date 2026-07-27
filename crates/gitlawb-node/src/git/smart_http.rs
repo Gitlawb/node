@@ -14,13 +14,13 @@ use tokio::process::Command;
 /// the work they admitted, so admission is released only when that work is truly
 /// done — not the instant the handler future drops on a client disconnect.
 ///
-/// A move-only wrapper: no methods beyond construction and `Drop`. The handler
-/// MOVEs its permits in and keeps no copy (a retained copy would drop early and
-/// release admission the moment the future is dropped, defeating the guard). It is
-/// threaded into `drive_git_child`, whose [`KillGroupOnDrop`] moves it into the
-/// detached reaper on disconnect, so both permits drop only after the process group
-/// is confirmed reaped (`kill(-pgid,0)==ESRCH`) rather than while the group is still
-/// alive holding PIDs past the concurrency cap (#174 P1-a, plain-spawn residual).
+/// A drop-only wrapper: nothing here inspects what it holds. The handler MOVEs its
+/// permits in and keeps no copy (a retained copy would drop early and release admission
+/// the moment the future is dropped, defeating the guard). It is threaded into
+/// `drive_git_child`, whose [`KillGroupOnDrop`] moves it into the detached reaper on
+/// disconnect, so both permits drop only after the process group is confirmed reaped
+/// (`kill(-pgid,0)==ESRCH`) rather than while the group is still alive holding PIDs past
+/// the concurrency cap (#174 P1-a, plain-spawn residual).
 ///
 /// The `be0cdd6` path-scoped upload-pack walk already applies this discipline by
 /// moving its permits into the `spawn_blocking`; this generalizes it to the plain
@@ -31,6 +31,8 @@ pub struct AdmissionGuard {
     // 'static` so the guard can move into the detached reaper task.
     _global: Option<Box<dyn Send + 'static>>,
     _caller: Option<Box<dyn Send + 'static>>,
+    // Any further work-scoped hold that must outlive the process group; see `with_hold`.
+    _hold: Option<Box<dyn Send + 'static>>,
 }
 
 impl AdmissionGuard {
@@ -40,7 +42,23 @@ impl AdmissionGuard {
         Self {
             _global: Some(Box::new(global)),
             _caller: caller.map(|c| Box::new(c) as Box<dyn Send + 'static>),
+            _hold: None,
         }
+    }
+
+    /// Attach a further hold that must not be released until the process group is
+    /// reaped, and ride it through the same seam as the permits.
+    ///
+    /// The push handler uses this for the repo WRITE LOCK (#173 F2). Its
+    /// `guard.release(..)` line is only reached if `receive_pack` returns, so on a client
+    /// disconnect the lock used to be freed by the dropped future while the detached
+    /// reaper was still giving the group its SIGTERM grace, admitting a second
+    /// `receive-pack` on the same repo. Carrying the lock here holds it until the group
+    /// is ESRCH-confirmed gone, which is the same invariant the timeout path already
+    /// keeps ("a caller releasing a write lock can't race them", `reap_group_on_timeout`).
+    pub fn with_hold(mut self, hold: impl Send + 'static) -> Self {
+        self._hold = Some(Box::new(hold));
+        self
     }
 }
 

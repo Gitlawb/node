@@ -58,6 +58,32 @@ struct DbStartupStatus {
     next_retry_secs: AtomicU64,
 }
 
+/// Hard ceiling on the advisory-lock pool's `max_connections`.
+///
+/// `max_concurrent_git_pushes` is validated all the way up to 1_048_576, and the lock
+/// pool used to derive its size straight from that knob, so raising the push cap
+/// silently raised the node's Postgres connection ceiling with no CLI error and no
+/// relation to the server's own `max_connections` (#173 F4). The node's total budget is
+/// now bounded: `db_max_connections` (default 20) + at most this.
+const LOCK_POOL_MAX_CONNECTIONS: u32 = 64;
+
+/// Connections the lock pool keeps above the push cap. Covers the three non-push
+/// `acquire_write` callers (`api/issues.rs` x2, `api/pulls.rs`), which hold no
+/// concurrency permit, so a push never queues here for a connection where it did not
+/// before.
+const LOCK_POOL_PUSH_HEADROOM: u8 = 8;
+
+/// Size the advisory-lock pool for a given push cap: the cap plus
+/// [`LOCK_POOL_PUSH_HEADROOM`], clamped to [`LOCK_POOL_MAX_CONNECTIONS`]. Past the
+/// clamp a push may wait for a lock-pool connection, which is a bounded wait that sheds
+/// a clean 503 (see `LockPoolBusy`), not an unbounded hang.
+fn lock_pool_size(max_concurrent_git_pushes: usize) -> u32 {
+    u32::try_from(max_concurrent_git_pushes)
+        .unwrap_or(u32::MAX)
+        .saturating_add(u32::from(LOCK_POOL_PUSH_HEADROOM))
+        .min(LOCK_POOL_MAX_CONNECTIONS)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -282,14 +308,11 @@ async fn main() -> Result<()> {
     // Repo write locks run on their own pool, never the main query pool: each
     // push holds its connection for the whole receive-pack, and
     // db_max_connections (20) is below max_concurrent_git_pushes (32), so sharing
-    // would starve every other query under a push burst. Headroom above the push
-    // cap keeps a push from ever queueing here for a connection where it did not
-    // before. See build_lock_pool for the cancellation semantics (#173).
+    // would starve every other query under a push burst. See build_lock_pool for
+    // the cancellation semantics (#173).
     let lock_pool = git::repo_store::build_lock_pool(
         db.pool(),
-        u32::try_from(config.max_concurrent_git_pushes)
-            .unwrap_or(u32::MAX)
-            .saturating_add(8),
+        lock_pool_size(config.max_concurrent_git_pushes),
         std::time::Duration::from_secs(config.db_acquire_timeout_secs),
     );
     let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, lock_pool);
@@ -1136,6 +1159,36 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
         info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
         Ok(kp)
+    }
+}
+
+#[cfg(test)]
+mod lock_pool_sizing_tests {
+    use super::{lock_pool_size, LOCK_POOL_MAX_CONNECTIONS, LOCK_POOL_PUSH_HEADROOM};
+
+    /// The default push cap gets its cap plus headroom, so no push ever queues for a
+    /// lock-pool connection where it did not before.
+    #[test]
+    fn default_push_cap_gets_headroom_over_the_cap() {
+        assert_eq!(lock_pool_size(32), 32 + u32::from(LOCK_POOL_PUSH_HEADROOM));
+        assert_eq!(lock_pool_size(1), 1 + u32::from(LOCK_POOL_PUSH_HEADROOM));
+    }
+
+    /// #173 F4: `max_concurrent_git_pushes` is validated all the way to 1_048_576, so an
+    /// operator raising it used to raise the node's Postgres connection ceiling with it,
+    /// silently and without bound. The lock pool is CLAMPED instead.
+    #[test]
+    fn an_oversized_push_cap_is_clamped_not_propagated() {
+        assert_eq!(lock_pool_size(1_048_576), LOCK_POOL_MAX_CONNECTIONS);
+        assert_eq!(lock_pool_size(usize::MAX), LOCK_POOL_MAX_CONNECTIONS);
+        // The largest cap that still fits under the clamp keeps its full headroom.
+        let widest = (LOCK_POOL_MAX_CONNECTIONS - u32::from(LOCK_POOL_PUSH_HEADROOM)) as usize;
+        assert_eq!(lock_pool_size(widest), LOCK_POOL_MAX_CONNECTIONS);
+        assert_eq!(
+            lock_pool_size(widest - 1),
+            LOCK_POOL_MAX_CONNECTIONS - 1,
+            "values below the clamp must not be rounded up to it"
+        );
     }
 }
 

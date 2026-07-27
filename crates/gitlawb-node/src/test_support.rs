@@ -9995,6 +9995,198 @@ mod tests {
                     "the key is released once the task is clean"
                 );
             }
+
+            /// Wait for the tail's atomic check-and-clear to consume the pending dirty
+            /// bit (`Some(true)` -> `Some(false)`), which is the exact instant the task
+            /// enters `requeue_refresh_state`'s retry window. Deterministic, so the
+            /// coalescing push below lands INSIDE that window rather than on a sleep
+            /// guess. `None` means the key is already gone (the task exited), which the
+            /// caller reports as its own failure.
+            async fn wait_for_refresh_window(
+                inflight: &crate::state::EncryptInflight,
+                repo_id: &str,
+            ) -> bool {
+                for _ in 0..5_000 {
+                    match inflight.dirty(repo_id) {
+                        Some(false) => return true,
+                        None => return false,
+                        Some(true) => {}
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                false
+            }
+
+            /// SCENARIO 7 (#173 F3, RED-before/GREEN-after). A push that coalesces WHILE
+            /// the re-read is retrying must not be thrown away when that re-read finally
+            /// gives up. `requeue_or_release` returning true cleared the dirty bit without
+            /// marking the guard released, so a `break` on `Failed` let
+            /// `EncryptInflightGuard::drop` remove the key outright and push C's pass was
+            /// never attempted, a silent drop with no reconciliation sweep behind it.
+            ///
+            /// Exactly `REQUEUE_REREAD_MAX_ATTEMPTS` injected repo-read faults, so the
+            /// first refresh exhausts its budget and the DB is healthy for the next one.
+            /// Push C coalesces inside that window. RED with `Failed => break`: obj_c is
+            /// never pinned. GREEN when `Failed` falls through and lets the tail decide.
+            #[sqlx::test]
+            async fn u2_failed_reread_keeps_a_push_that_coalesced_during_the_window(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-window");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let git_repo = init_repo();
+                let obj_a = commit(&git_repo.path, "a.txt", "one\n");
+                let obj_c = commit(&git_repo.path, "c.txt", "three\n");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // Exactly the bound: the FIRST refresh burns all three attempts and gives
+                // up; every later refresh sees a healthy DB.
+                requeue_faults::inject(&repo.id, 3, 0);
+
+                let guard = state
+                    .encrypt_inflight
+                    .try_begin(&repo.id)
+                    .expect("push A admits");
+                assert!(
+                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
+                    "push B coalesces while A is in flight"
+                );
+
+                // Push C lands during the retry window, after the tail already consumed
+                // push B's dirty bit.
+                let inflight = state.encrypt_inflight.clone();
+                let repo_id = repo.id.clone();
+                let coalesced = tokio::spawn(async move {
+                    if !wait_for_refresh_window(&inflight, &repo_id).await {
+                        return false;
+                    }
+                    inflight.try_begin(&repo_id).is_none()
+                });
+
+                crate::api::repos::run_post_push_replication_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    server.url(),
+                    true,
+                    owner.clone(),
+                    vec![obj_a.clone()],
+                    Some(vec![]),
+                    HashSet::new(),
+                )
+                .await;
+
+                assert!(
+                    coalesced.await.expect("coalescing task"),
+                    "push C must have coalesced inside the retry window for this test to \
+                     mean anything"
+                );
+                assert!(
+                    state.db.is_pinned(&obj_c).await.unwrap(),
+                    "the push that coalesced during the retry window must still get a pass \
+                     once the DB recovers (RED with `Failed => break`: the dirty bit was \
+                     already consumed, so the pass was dropped with nothing to re-derive it)"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is released once the task exits"
+                );
+            }
+
+            /// SCENARIO 8 (#173 F3, the sustained-outage guard on the fall-through). Falling
+            /// through on `Failed` means `requeue_or_release` runs again, so a DB that never
+            /// recovers must still TERMINATE rather than spin. It does: an extra lap only
+            /// happens when a push actually coalesced, and each lap pays a full bounded
+            /// re-read (3 attempts with backoff). One coalescing push during the window buys
+            /// exactly one extra lap: 6 repo-read attempts, then exit.
+            #[sqlx::test]
+            async fn u2_sustained_failure_with_a_coalesce_terminates_after_one_more_lap(
+                pool: PgPool,
+            ) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-sustained-window");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let git_repo = init_repo();
+                let obj_a = commit(&git_repo.path, "a.txt", "one\n");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // The outage never clears.
+                requeue_faults::inject(&repo.id, 10_000, 0);
+
+                let guard = state
+                    .encrypt_inflight
+                    .try_begin(&repo.id)
+                    .expect("push A admits");
+                assert!(
+                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
+                    "push B coalesces"
+                );
+
+                let inflight = state.encrypt_inflight.clone();
+                let repo_id = repo.id.clone();
+                let coalesced = tokio::spawn(async move {
+                    if !wait_for_refresh_window(&inflight, &repo_id).await {
+                        return false;
+                    }
+                    inflight.try_begin(&repo_id).is_none()
+                });
+
+                // The watchdog is the real assertion: a fall-through that re-spins without
+                // the dirty gate would never return here.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    crate::api::repos::run_post_push_replication_for_test(
+                        &state,
+                        guard,
+                        git_repo.path.clone(),
+                        repo.id.clone(),
+                        server.url(),
+                        true,
+                        owner.clone(),
+                        vec![obj_a.clone()],
+                        Some(vec![]),
+                        HashSet::new(),
+                    ),
+                )
+                .await
+                .expect(
+                    "the task must terminate under a sustained outage; a fall-through that \
+                     does not gate on the dirty bit spins forever",
+                );
+
+                assert!(
+                    coalesced.await.expect("coalescing task"),
+                    "push C must have coalesced inside the retry window"
+                );
+                assert_eq!(
+                    requeue_faults::counters(&repo.id).repo_read_attempts,
+                    6,
+                    "one coalescing push buys exactly one more bounded re-read lap \
+                     (3 + 3 attempts), never an unbounded retry"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is released on the give-up path"
+                );
+            }
         }
     }
 }

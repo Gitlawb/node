@@ -184,47 +184,60 @@ impl RepoStore {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
-        // Check out ONE connection from the lock pool and keep it for the whole
-        // lock lifetime. Two reasons, both bugs we hit with `fetch_one(&pool)`:
+        // Acquire the Postgres advisory lock with retry, using pg_try_advisory_lock so a
+        // stale lock from a crashed connection can't block us indefinitely.
         //
-        //   * A session-level advisory lock belongs to the CONNECTION that took
-        //     it. Running the lock and the unlock through the pool lets them land
-        //     on different connections, so `pg_advisory_unlock` silently returns
-        //     false and the lock leaks, while a competing acquire that happens to
-        //     draw the holding connection re-enters the lock and pushes to the
-        //     same repo run concurrently.
-        //   * Cancellation. `api/repos.rs` bounds this call with
-        //     `tokio::time::timeout`; when it fires during the Tigris phase below
-        //     the future is dropped after the lock was taken and before
-        //     `RepoWriteGuard` (the only caller of `pg_advisory_unlock`) exists.
-        //     Dropping this connection instead runs the pool's `after_release`
-        //     hook, which clears the lock (#173).
-        let mut lock_conn = self
-            .lock_pool
-            .acquire()
-            .await
-            .context("checking out a lock-pool connection")?;
-
-        // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
-        // to avoid blocking indefinitely on stale locks from crashed connections.
-        let mut acquired = false;
+        // The connection is checked out INSIDE the loop and RETURNED before each sleep.
+        // Only the connection that actually took the lock is retained. Two constraints
+        // pull in opposite directions here, and this is what satisfies both:
+        //
+        //   * Session ownership. A session-level advisory lock belongs to the CONNECTION
+        //     that took it, so the lock and its `pg_advisory_unlock` must run on the same
+        //     one. Running them through the pool (`fetch_one(&self.pool)`) lets them land
+        //     on different connections: the unlock silently returns false and the lock
+        //     leaks, while a competing acquire that happens to draw the holding
+        //     connection re-enters the lock and two pushes to one repo run concurrently.
+        //     Hence: keep the connection that WON.
+        //   * Occupancy. Holding a connection across the ~60 one-second sleeps would let
+        //     one spinning acquire park a lock-pool connection for a minute. That is not
+        //     just a push-path concern: `api/issues.rs` and `api/pulls.rs` reach
+        //     acquire_write holding no concurrency permit at all, so a caller could park
+        //     the whole pool and starve authenticated pushes on every repo (#173 F1).
+        //     Hence: return the connection when we LOSE, before sleeping.
+        //
+        // Returning a losing connection is safe with respect to the cancellation design:
+        // `after_release` runs `pg_advisory_unlock_all()`, a no-op on a connection that
+        // took nothing, so it cannot disturb a lock held by any other connection
+        // (proven by `returning_an_unlocked_connection_does_not_clear_another_connections_lock`).
+        //
+        // Cancellation safety is unchanged: the future can only be dropped while a
+        // connection is checked out, and dropping it runs the same `after_release` hook,
+        // which clears whatever lock it had just taken (#173 U1).
+        let mut lock_conn = None;
         for attempt in 0..60 {
+            let mut conn = self.lock_pool.acquire().await.map_err(|e| {
+                anyhow::Error::new(LockPoolBusy)
+                    .context(format!("checking out a lock-pool connection: {e}"))
+            })?;
             let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_key)
-                .fetch_one(&mut *lock_conn)
+                .fetch_one(&mut *conn)
                 .await
                 .context("trying advisory lock")?;
             if row.0 {
-                acquired = true;
+                lock_conn = Some(conn);
                 break;
             }
+            // Lost the race: give the connection back so a spinning acquire occupies
+            // nothing while it waits.
+            drop(conn);
             if attempt < 59 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
-        if !acquired {
+        let Some(lock_conn) = lock_conn else {
             anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
-        }
+        };
 
         #[cfg(test)]
         if let Some(stall) = self.tigris_stall {
@@ -399,6 +412,19 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Error marker for "no lock-pool connection was available in time".
+///
+/// Carried through the `anyhow` chain (like [`smart_http::GitServiceTimeout`]) so the
+/// HTTP handler can `downcast_ref` it and shed a 503 + Retry-After instead of the
+/// generic 500 a git error maps to: an exhausted lock pool is a CAPACITY signal, and
+/// telling the client to retry shortly is the same shed semantics the surrounding
+/// admission code already uses (#173 F1).
+///
+/// [`smart_http::GitServiceTimeout`]: crate::git::smart_http::GitServiceTimeout
+#[derive(Debug, thiserror::Error)]
+#[error("no lock-pool connection available")]
+pub struct LockPoolBusy;
 
 /// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
 /// uploads to Tigris + releases the lock on `release()`.
@@ -726,6 +752,183 @@ mod tests {
         assert!(
             err.to_string().contains("lock-pool connection"),
             "the error must name the lock-pool checkout, got: {err}"
+        );
+
+        held.release(false).await;
+    }
+
+    /// #173 F1 (RED-before/GREEN-after). A contended `acquire_write` spins for up to
+    /// 60 one-second attempts. It must not OCCUPY a lock-pool connection for that whole
+    /// spin: `acquire_write` has non-push callers (`api/issues.rs`, `api/pulls.rs`) that
+    /// hold no concurrency permit, so any self-minted did:key could otherwise park a
+    /// connection per call and starve authenticated pushes on EVERY repo.
+    ///
+    /// Lock pool of exactly 2, two spinners. Pre-fix (checkout hoisted above the retry
+    /// loop) they pin both connections for the full spin and an UNCONTENDED acquire on a
+    /// third repo dies on the pool acquire timeout. Post-fix each spinner returns its
+    /// connection before sleeping, so it occupies ~0 and the uncontended acquire sails
+    /// through.
+    #[sqlx::test]
+    async fn a_spinning_acquire_write_does_not_occupy_a_lock_pool_connection(pool: PgPool) {
+        let owner = "did:key:z6MkSpinOccupancy";
+        let owner_slug = owner.replace([':', '/'], "_");
+        let store = RepoStore::new(
+            PathBuf::from("/tmp/gitlawb-test-repos"),
+            None,
+            build_lock_pool(&pool, 2, Duration::from_secs(2)),
+        );
+
+        // An independent session holds both contended keys, so the spinners' try-locks
+        // return false on every iteration and they stay in the retry loop.
+        let holder = sibling_pool(&pool, 2);
+        let mut held_conn = holder.acquire().await.expect("holder connection");
+        for repo in ["spin-a", "spin-b"] {
+            let taken: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+                .bind(advisory_lock_key(&owner_slug, repo))
+                .fetch_one(&mut *held_conn)
+                .await
+                .expect("holder try-lock");
+            assert!(taken.0, "the holder must own {repo}'s key");
+        }
+
+        let mut spinners = Vec::new();
+        for repo in ["spin-a", "spin-b"] {
+            let store = store.clone();
+            spinners.push(tokio::spawn(async move {
+                store.acquire_write(owner, repo).await
+            }));
+        }
+        // Let both reach the spin (each has done at least one failed try-lock by now).
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let started = std::time::Instant::now();
+        let uncontended = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.acquire_write(owner, "spin-free"),
+        )
+        .await
+        .expect("the uncontended acquire must return, not hang");
+        let elapsed = started.elapsed();
+        let free_guard = uncontended.unwrap_or_else(|e| {
+            panic!(
+                "an UNCONTENDED acquire_write on a DIFFERENT repo must not be starved by \
+                 spinners holding the lock pool; got: {e}"
+            )
+        });
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the uncontended acquire must not queue behind the spinners for the pool \
+             acquire timeout; took {elapsed:?}"
+        );
+        free_guard.release(false).await;
+
+        // The drop-and-retake cycle must still END in a real, exclusive lock: free
+        // spin-a's key and the spinner that was cycling connections must take it.
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(advisory_lock_key(&owner_slug, "spin-a"))
+            .execute(&mut *held_conn)
+            .await
+            .expect("release spin-a");
+        let winner = tokio::time::timeout(Duration::from_secs(15), spinners.remove(0))
+            .await
+            .expect("the spinner must finish once its key frees")
+            .expect("spinner task")
+            .expect("the spinner must acquire once the key frees");
+        let probe = sibling_pool(&pool, 2);
+        assert!(
+            !lock_is_free_elsewhere(&probe, advisory_lock_key(&owner_slug, "spin-a")).await,
+            "the lock a spinner finally took must be observably held from another session"
+        );
+        winner.release(false).await;
+
+        for s in spinners {
+            s.abort();
+        }
+        sqlx::query("SELECT pg_advisory_unlock_all()")
+            .execute(&mut *held_conn)
+            .await
+            .expect("release the remaining holder lock");
+    }
+
+    /// #173 F1, the property the fix rests on: returning a lock-pool connection that
+    /// holds NOTHING runs `after_release`'s `pg_advisory_unlock_all()`, which is a no-op
+    /// and must not disturb a lock held on a DIFFERENT connection of the same pool.
+    /// Session advisory locks are per connection, so this is by construction, but the
+    /// spin fix depends on it, so it is proven by execution rather than assumed.
+    #[sqlx::test]
+    async fn returning_an_unlocked_connection_does_not_clear_another_connections_lock(
+        pool: PgPool,
+    ) {
+        let owner = "did:key:z6MkNoOpUnlockAll";
+        let repo = "noop-unlock";
+        let key = advisory_lock_key(&owner.replace([':', '/'], "_"), repo);
+        let probe = sibling_pool(&pool, 2);
+        let lock_pool = build_lock_pool(&pool, 4, Duration::from_secs(5));
+        let store = RepoStore::new(
+            PathBuf::from("/tmp/gitlawb-test-repos"),
+            None,
+            lock_pool.clone(),
+        );
+
+        let guard = store.acquire_write(owner, repo).await.expect("acquire");
+
+        // Churn the pool: check out and drop connections that hold no lock, exactly what
+        // a spinning acquire now does between attempts. Each return fires
+        // pg_advisory_unlock_all() on that connection.
+        for _ in 0..10 {
+            let mut conn = lock_pool.acquire().await.expect("churn checkout");
+            let _: (i32,) = sqlx::query_as("SELECT 1")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("churn query");
+            drop(conn);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert!(
+            !lock_is_free_elsewhere(&probe, key).await,
+            "a held write lock must survive other lock-pool connections being returned"
+        );
+        guard.release(true).await;
+        assert!(
+            lock_is_free_elsewhere(&probe, key).await,
+            "release must still free the lock after the churn"
+        );
+    }
+
+    /// #173 F1: lock-pool exhaustion is a DISTINCT error the handler can shed as a 503,
+    /// not a generic git 500. Both directions: an exhausted pool downcasts to
+    /// [`LockPoolBusy`], and an unrelated failure (a rejected repo name) does not.
+    #[sqlx::test]
+    async fn lock_pool_exhaustion_is_a_distinct_downcastable_error(pool: PgPool) {
+        let owner = "did:key:z6MkBusyDowncast";
+        let store = RepoStore::new(
+            PathBuf::from("/tmp/gitlawb-test-repos"),
+            None,
+            build_lock_pool(&pool, 1, Duration::from_secs(1)),
+        );
+        let held = store
+            .acquire_write(owner, "busy-a")
+            .await
+            .expect("first acquire");
+
+        let err = match store.acquire_write(owner, "busy-b").await {
+            Ok(_) => panic!("an exhausted lock pool must error, not hand back a guard"),
+            Err(e) => e,
+        };
+        assert!(
+            err.downcast_ref::<LockPoolBusy>().is_some(),
+            "lock-pool exhaustion must be downcastable so the handler sheds 503, got: {err}"
+        );
+
+        // MUST-NOT: an ordinary rejection is not a capacity signal.
+        let other = match store.acquire_write(owner, "../escape").await {
+            Ok(_) => panic!("a traversal repo name must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            other.downcast_ref::<LockPoolBusy>().is_none(),
+            "a validation failure must not masquerade as lock-pool capacity, got: {other}"
         );
 
         held.release(false).await;
