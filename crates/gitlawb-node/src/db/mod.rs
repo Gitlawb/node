@@ -883,6 +883,32 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
+    Migration {
+        version: 12,
+        name: "consumed_signatures",
+        stmts: &[
+            // Single-use ledger for HTTP message signatures. `sig_hash` is a
+            // fixed-width hex SHA-256 digest of the canonical signature key,
+            // never the raw nonce or signing string: the value is
+            // attacker-influenced, so storing a digest bounds bytes per row and
+            // keeps unbounded input out of the table. The CHECK enforces the
+            // fixed width at the schema level so a caller cannot store
+            // something else by accident.
+            // `keyid` backs the per-identity live-row cap
+            // (`MAX_LIVE_SIGNATURES_PER_KEYID`); `expires_at` is the
+            // unix-seconds instant after which the signature can no longer be
+            // accepted, used by the sweep.
+            r#"CREATE TABLE IF NOT EXISTS consumed_signatures (
+                sig_hash   TEXT   NOT NULL PRIMARY KEY
+                                  CHECK (char_length(sig_hash) = 64),
+                keyid      TEXT   NOT NULL,
+                expires_at BIGINT NOT NULL
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_consumed_signatures_expires ON consumed_signatures(expires_at)",
+            // The cap counts live rows for one keyid, so it needs both columns.
+            "CREATE INDEX IF NOT EXISTS idx_consumed_signatures_keyid_expires ON consumed_signatures(keyid, expires_at)",
+        ],
+    },
     // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
     // The runner keys the applied set on the integer alone, so a version another
     // in-flight branch also claims is skipped in full on whichever side merges
@@ -902,6 +928,43 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
 ];
+
+// ── HTTP-signature replay ledger ──────────────────────────────────────────────
+
+/// Outcome of charging one HTTP message signature against the replay ledger.
+/// The three cases are deliberately distinct so a caller can answer each with
+/// its own status code: a replay is the client's fault and is permanent for
+/// that signature, whereas a full identity ledger is a rate condition the same
+/// client can retry once its live rows expire.
+// Only the tests consume this so far; the middleware that charges signatures
+// against the ledger lands separately.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ConsumeSignature {
+    /// The signature had not been seen; it is now spent.
+    Inserted,
+    /// The signature was already spent. Reject as a replay.
+    Replayed,
+    /// This `keyid` already holds `MAX_LIVE_SIGNATURES_PER_KEYID` live rows.
+    /// The signature was NOT recorded.
+    IdentityLedgerFull,
+}
+
+/// Cap on live (unexpired) ledger rows a single `keyid` may hold.
+///
+/// The ledger is an attacker-influenced key map on routes that carry no rate
+/// limiter (tasks, bounties, issue and PR comments, hooks, profile), and
+/// identities are permissionless, so a flood of *distinct* signatures from one
+/// identity would otherwise allocate rows without bound. Hashing the key bounds
+/// bytes per row; only this bounds row count.
+///
+/// 512 over the 330s retention window is ~1.5 sustained requests per second
+/// from one identity, an order of magnitude above any real client (a push plus
+/// its API calls is tens of requests), while capping one identity's worst case
+/// at roughly 512 rows of ~100 bytes.
+#[allow(dead_code)] // read by `consume_signature`, which the middleware wires up separately
+pub const MAX_LIVE_SIGNATURES_PER_KEYID: i64 = 512;
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
@@ -1359,6 +1422,68 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Atomically consume an HTTP message signature. `sig_hash` is the
+    /// fixed-width hex SHA-256 digest of the canonical signature key, `keyid`
+    /// the signing identity it is charged against, `now` the arrival instant in
+    /// unix seconds, and `expires_at` the instant after which the signature can
+    /// no longer be accepted (so the row can be swept).
+    ///
+    /// One statement does the whole decision. The `INSERT ... ON CONFLICT DO
+    /// NOTHING` is what makes the check atomic: two concurrent replays of the
+    /// same signature cannot both win, because the primary key arbitrates. A
+    /// separate SELECT first would reintroduce exactly that race.
+    #[allow(dead_code)] // called by the signature-consuming middleware, added separately
+    pub async fn consume_signature(
+        &self,
+        sig_hash: &str,
+        keyid: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> Result<ConsumeSignature> {
+        let (inserted, live): (i64, i64) = sqlx::query_as(
+            r#"WITH live AS (
+                   SELECT COUNT(*) AS n FROM consumed_signatures
+                   WHERE keyid = $2 AND expires_at >= $4
+               ), ins AS (
+                   INSERT INTO consumed_signatures (sig_hash, keyid, expires_at)
+                   SELECT $1, $2, $3 FROM live WHERE live.n < $5
+                   ON CONFLICT (sig_hash) DO NOTHING
+                   RETURNING 1
+               )
+               SELECT (SELECT COUNT(*) FROM ins) AS inserted,
+                      (SELECT n FROM live)       AS live_count"#,
+        )
+        .bind(sig_hash)
+        .bind(keyid)
+        .bind(expires_at)
+        .bind(now)
+        .bind(MAX_LIVE_SIGNATURES_PER_KEYID)
+        .fetch_one(&self.pool)
+        .await?;
+
+        if inserted > 0 {
+            Ok(ConsumeSignature::Inserted)
+        } else if live >= MAX_LIVE_SIGNATURES_PER_KEYID {
+            // The insert was suppressed by the cap. A capped identity replaying
+            // an already-spent signature also lands here; that is deliberate,
+            // since the cap is the more actionable condition to report.
+            Ok(ConsumeSignature::IdentityLedgerFull)
+        } else {
+            Ok(ConsumeSignature::Replayed)
+        }
+    }
+
+    /// Delete ledger rows for signatures that can no longer be accepted.
+    /// Returns rows removed. This is what keeps the table proportional to the
+    /// retention window rather than to total requests seen.
+    pub async fn sweep_expired_signatures(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM consumed_signatures WHERE expires_at < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// Delete consumed-proof rows whose proof has expired. Returns rows removed.
@@ -4992,6 +5117,329 @@ mod icaptcha_ledger_tests {
                 .await
                 .unwrap(),
             "the token must stay spent so it can't admit a second mirror"
+        );
+    }
+}
+
+/// Exercises the HTTP-signature replay ledger (`consumed_signatures`): its
+/// single-use accessor, the sweep that bounds it, the per-identity cap, and the
+/// v12 upgrade path from an existing v11 database.
+#[cfg(test)]
+mod signature_ledger_tests {
+    use super::{ConsumeSignature, Db, MIGRATIONS};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// The ledger key is a fixed-width hex SHA-256 digest, never a raw nonce
+    /// (KTD6). Build one deterministically from a seed so tests stay readable.
+    fn key(seed: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(seed.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    /// First sighting of a signature is recorded (allowed); the identical key
+    /// again is a replay (rejected); a distinct key is independently allowed.
+    #[sqlx::test]
+    async fn consume_signature_is_single_use(pool: PgPool) {
+        let db = db(pool).await;
+        let now = 1_000i64;
+        let exp = now + 330;
+        let kid = "did:key:zAlice";
+
+        assert_eq!(
+            db.consume_signature(&key("a"), kid, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "first sighting is recorded and allowed"
+        );
+        assert_eq!(
+            db.consume_signature(&key("a"), kid, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed,
+            "the identical signature is a replay and must be rejected"
+        );
+        assert_eq!(
+            db.consume_signature(&key("b"), kid, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "a different signature is independent and allowed"
+        );
+    }
+
+    /// The sweep deletes only rows whose `expires_at` is strictly before the
+    /// cutoff and returns the deleted count. A swept signature is usable again
+    /// (its acceptance window has passed, so the time check now rejects it
+    /// anyway), while an unswept one keeps rejecting replays.
+    #[sqlx::test]
+    async fn sweep_expired_signatures_removes_only_expired(pool: PgPool) {
+        let db = db(pool).await;
+        let kid = "did:key:zAlice";
+        let (old_a, old_b, fresh) = (key("old-a"), key("old-b"), key("fresh"));
+
+        for (k, exp) in [(&old_a, 100i64), (&old_b, 199), (&fresh, 500)] {
+            assert_eq!(
+                db.consume_signature(k, kid, 0, exp).await.unwrap(),
+                ConsumeSignature::Inserted
+            );
+        }
+
+        let deleted = db.sweep_expired_signatures(200).await.unwrap();
+        assert_eq!(
+            deleted, 2,
+            "only the two rows with expires_at < 200 are swept"
+        );
+
+        assert_eq!(
+            db.consume_signature(&old_a, kid, 200, 530).await.unwrap(),
+            ConsumeSignature::Inserted,
+            "a swept signature is free again"
+        );
+        assert_eq!(
+            db.consume_signature(&fresh, kid, 200, 530).await.unwrap(),
+            ConsumeSignature::Replayed,
+            "an unexpired spent signature survives the sweep and still blocks replays"
+        );
+    }
+
+    /// KTD6, proved by execution rather than by pointing at the TTL: a single
+    /// identity flooding *distinct* signatures fills its cap and is then
+    /// rejected with an outcome distinct from a replay, and its row count stops
+    /// growing. A second identity is untouched by the first one's cap.
+    #[sqlx::test]
+    async fn per_identity_cap_bounds_row_count(pool: PgPool) {
+        let db = db(pool).await;
+        let now = 1_000i64;
+        let exp = now + 330; // every row stays live for the whole run
+        let flooder = "did:key:zFlooder";
+        let cap = super::MAX_LIVE_SIGNATURES_PER_KEYID;
+
+        // Fill exactly to the cap with distinct keys.
+        for i in 0..cap {
+            assert_eq!(
+                db.consume_signature(&key(&format!("flood-{i}")), flooder, now, exp)
+                    .await
+                    .unwrap(),
+                ConsumeSignature::Inserted,
+                "distinct signature {i} is below the cap and must be recorded"
+            );
+        }
+
+        // Every further distinct signature is refused, with an outcome the
+        // caller can tell apart from a replay.
+        for i in cap..cap + 25 {
+            assert_eq!(
+                db.consume_signature(&key(&format!("flood-{i}")), flooder, now, exp)
+                    .await
+                    .unwrap(),
+                ConsumeSignature::IdentityLedgerFull,
+                "signature {i} is over the cap and must be refused distinctly"
+            );
+        }
+
+        // Storage stopped growing: the flood allocated cap rows, not cap + 25.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM consumed_signatures WHERE keyid = $1"
+            )
+            .bind(flooder)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            cap,
+            "the flood must not allocate a row per request seen"
+        );
+
+        // A second identity is unaffected by the first one's cap, and its own
+        // replays still read as replays.
+        let bystander = "did:key:zBystander";
+        assert_eq!(
+            db.consume_signature(&key("bystander-1"), bystander, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "the cap is per identity, not global"
+        );
+        assert_eq!(
+            db.consume_signature(&key("bystander-1"), bystander, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed
+        );
+
+        // The cap counts *live* rows only: once the flooder's rows age out and
+        // are swept, it can sign again.
+        // Everything inserted above shares `exp`, so this clears the flooder's
+        // `cap` rows plus the bystander's single row.
+        assert_eq!(
+            db.sweep_expired_signatures(exp + 1).await.unwrap(),
+            cap as u64 + 1
+        );
+        assert_eq!(
+            db.consume_signature(&key("flood-after-sweep"), flooder, exp + 1, exp + 331)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "the cap must lift once the identity's rows expire"
+        );
+    }
+
+    /// Upgrade path: an existing node sitting at v11 must gain the ledger table
+    /// and its sweep index when it applies v12, and the table must round-trip.
+    /// A fresh-database test cannot cover this — it never exercises the
+    /// v11 -> v12 step in isolation.
+    #[sqlx::test]
+    async fn migration_v12_creates_signature_ledger(pool: PgPool) {
+        let db = Db::for_testing(pool);
+
+        // Build the whole schema, then tear the v12 objects back down and
+        // re-seed `schema_migrations` at v11 to simulate a node that has run
+        // v1..v11 but not yet v12.
+        db.run_migrations().await.unwrap();
+        sqlx::query("DROP TABLE IF EXISTS consumed_signatures")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 12) {
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(m.version)
+            .bind(m.name)
+            .bind("2026-07-01T00:00:00Z")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_migrations")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            11,
+            "baseline must be a v11 database"
+        );
+
+        // ── Apply the pending v12 migration ───────────────────────────────
+        db.run_migrations().await.unwrap();
+
+        // (a) The table exists.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_name = 'consumed_signatures'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "v12 must create consumed_signatures"
+        );
+
+        // (b) The sweep index exists.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE tablename = 'consumed_signatures'
+                   AND indexname = 'idx_consumed_signatures_expires'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "the sweep needs an index on expires_at"
+        );
+
+        // (c) It round-trips: insert, read back, and the digest survives whole.
+        let k = key("upgrade-path");
+        sqlx::query(
+            "INSERT INTO consumed_signatures (sig_hash, keyid, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(&k)
+        .bind("did:key:zUpgrade")
+        .bind(9_000_000_000i64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (got_key, got_keyid, got_exp): (String, String, i64) = sqlx::query_as(
+            "SELECT sig_hash, keyid, expires_at FROM consumed_signatures WHERE sig_hash = $1",
+        )
+        .bind(&k)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(got_key, k);
+        assert_eq!(got_keyid, "did:key:zUpgrade");
+        assert_eq!(got_exp, 9_000_000_000i64);
+    }
+
+    /// Re-running migrations over an already-migrated database is a no-op: v12
+    /// applies cleanly a second time, records exactly one `schema_migrations`
+    /// row, and does not disturb rows already in the ledger.
+    #[sqlx::test]
+    async fn migrations_are_idempotent(pool: PgPool) {
+        let db = db(pool).await;
+        let k = key("survives-remigration");
+        assert_eq!(
+            db.consume_signature(&k, "did:key:zAlice", 1_000, 1_330)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted
+        );
+
+        // Third and fourth passes over the same database.
+        db.run_migrations().await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 12"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "v12 must be recorded exactly once"
+        );
+        assert_eq!(
+            db.consume_signature(&k, "did:key:zAlice", 1_000, 1_330)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed,
+            "re-running migrations must not drop or recreate the ledger"
+        );
+
+        // The skip-by-version check is only half of it. Force v12's statements
+        // to actually execute a second time (a node that lost its
+        // `schema_migrations` row, or a re-applied deploy) and they must still
+        // succeed against the objects they already created.
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 12")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.run_migrations()
+            .await
+            .expect("v12's own statements must be safe to re-execute");
+        assert_eq!(
+            db.consume_signature(&k, "did:key:zAlice", 1_000, 1_330)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed,
+            "re-executing v12 must not wipe the ledger"
         );
     }
 }

@@ -406,7 +406,8 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Periodic cleanup of expired rate limit entries + consumed-proof ledger
+    // Periodic cleanup of expired rate limit entries, the consumed-proof
+    // ledger, and the HTTP-signature replay ledger
     {
         let rl = state.rate_limiter.clone();
         let create_ip_rl = state.create_ip_rate_limiter.clone();
@@ -430,6 +431,9 @@ async fn main() -> Result<()> {
                             .unwrap_or(0);
                         if let Err(e) = db.sweep_expired_proofs(now).await {
                             tracing::warn!(err = %e, "failed to sweep expired iCaptcha proofs");
+                        }
+                        if let Err(e) = db.sweep_expired_signatures(now).await {
+                            tracing::warn!(err = %e, "failed to sweep expired signature ledger rows");
                         }
                     }
                     _ = shutdown_rx.changed() => {
