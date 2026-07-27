@@ -1490,7 +1490,10 @@ pub async fn git_receive_pack(
     // exhausted Postgres pool (so the 60-count never advances) — and the write permit
     // is held the whole time, draining the pool (#174 P1-2). The outer
     // `tokio::time::timeout` cancels a mid-sleep/mid-`fetch_one` future, so it bounds
-    // both the loop and a hung iteration without any repo_store.rs change (KTD3). The
+    // both the loop and a hung iteration. Cancelling here is only safe because
+    // acquire_write holds its advisory lock on a connection from a pool whose
+    // `after_release` hook unlocks (#173): the dropped future used to leave the lock
+    // held with no guard alive to release it, wedging later pushes to that repo. The
     // permit is a handler local here (moved into the AdmissionGuard only after this),
     // so the early return on timeout drops it and frees the slot; shed a bounded 503.
     let acquire_deadline = std::time::Duration::from_secs(state.config.git_acquire_timeout_secs);
