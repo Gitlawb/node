@@ -93,7 +93,8 @@ fn sanitize_excerpt(s: &str) -> String {
 /// deployment input — secrets / terminal controls).
 fn warn_icaptcha_insecure_non_truthy() {
     tracing::warn!(
-        "GITLAWB_ICAPTCHA_INSECURE is set but not truthy (expected 1 or true);          loopback HTTP trust relaxation remains disabled"
+        "GITLAWB_ICAPTCHA_INSECURE is set but not truthy (expected 1 or true); \
+         loopback HTTP trust relaxation remains disabled"
     );
 }
 
@@ -446,6 +447,83 @@ fn interactive_prompt(challenge: &Challenge) -> Option<String> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes the real-env reader test so it never races with other
+    /// process-global env mutations (and recovers from a poisoned lock).
+    static ICAPTCHA_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        prev: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn lock() -> MutexGuard<'static, ()> {
+            ICAPTCHA_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn with_value(val: &str) -> Self {
+            let lock = Self::lock();
+            let prev = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
+            std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", val);
+            EnvGuard { _lock: lock, prev }
+        }
+
+        fn unset() -> Self {
+            let lock = Self::lock();
+            let prev = std::env::var_os("GITLAWB_ICAPTCHA_INSECURE");
+            std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE");
+            EnvGuard { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_INSECURE", v),
+                None => std::env::remove_var("GITLAWB_ICAPTCHA_INSECURE"),
+            }
+        }
+    }
+
+    /// #227 / #246: cover the production env read in `icaptcha_insecure_enabled`.
+    /// Pure-helper tests alone leave mutations of this function green.
+    #[test]
+    fn icaptcha_insecure_enabled_reads_real_env() {
+        {
+            let _g = EnvGuard::unset();
+            assert!(!icaptcha_insecure_enabled(), "unset must disable");
+        }
+        {
+            let _g = EnvGuard::with_value("0");
+            assert!(!icaptcha_insecure_enabled(), "=0 must disable");
+        }
+        {
+            let _g = EnvGuard::with_value("false");
+            assert!(!icaptcha_insecure_enabled(), "=false must disable");
+        }
+        {
+            let _g = EnvGuard::with_value("");
+            assert!(!icaptcha_insecure_enabled(), "empty must disable");
+        }
+        {
+            let _g = EnvGuard::with_value("1");
+            assert!(icaptcha_insecure_enabled(), "=1 must enable");
+        }
+        {
+            let _g = EnvGuard::with_value("true");
+            assert!(icaptcha_insecure_enabled(), "=true must enable");
+        }
+        {
+            let _g = EnvGuard::with_value("TRUE");
+            assert!(icaptcha_insecure_enabled(), "=TRUE must enable");
+        }
+        {
+            let _g = EnvGuard::with_value(" 1 ");
+            assert!(icaptcha_insecure_enabled(), "\" 1 \" (trimmed) must enable");
+        }
+    }
 
     /// #227: `=0` / `=false` / empty / unset must NOT enable loopback HTTP;
     /// only explicit truthy `1` / `true` may. Uses pure helpers so tests do
