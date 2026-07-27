@@ -350,7 +350,7 @@ mod tests {
     /// The last entry is a plain node failure with no signature code: the task
     /// commands must fail on that too, not just on the ledger denials.
     fn denials() -> Vec<(usize, String)> {
-        gitlawb_core::signature_denial::SignatureDenial::ALL
+        gitlawb_core::node_denial::NodeDenial::ALL
             .iter()
             .map(|d| {
                 (

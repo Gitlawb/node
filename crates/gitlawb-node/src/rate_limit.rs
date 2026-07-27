@@ -7,6 +7,9 @@ use axum::extract::{ConnectInfo, Request};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
+use gitlawb_core::node_denial::NodeDenial;
+use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::auth::AuthenticatedDid;
@@ -142,12 +145,10 @@ pub async fn rate_limit_by_did(request: Request, next: Next) -> Response {
 
     if let (Some(limiter), Some(did)) = (limiter, did) {
         if !limiter.check(&did).await {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", "60")],
-                "rate limit exceeded — try again later",
-            )
-                .into_response();
+            // Same response as the per-IP brake: a client cannot act on the
+            // difference between the two buckets, and both need the code that
+            // tells them apart from the ledger's 429.
+            return too_many_requests();
         }
     }
 
@@ -250,14 +251,24 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
-/// The shared 429 response for the per-IP flood brakes. Route-agnostic: this
-/// middleware now serves the push path AND the peer-sync routes, so the message
-/// stays generic (the offending path is recorded in the warn log below).
+/// The shared 429 response for the flood brakes. Route-agnostic: this serves
+/// the push path AND the peer-sync routes, so the message stays generic (the
+/// offending path is recorded in the warn log at the call site).
+///
+/// Carries `X-Gitlawb-Error: rate_limited` and the same JSON shape the ledger's
+/// `ledger_rejection` uses, because the brake shares 429 with the ledger's
+/// `signature_ledger_full` on every route group the brake covers. Without a
+/// code the only discriminator between two unrelated conditions is the
+/// *absence* of a header, which is exactly what a proxy stripping unknown `X-`
+/// headers produces. A client cannot act on a difference it cannot see: `gl`
+/// would print "invalid JSON response" for a rate limit, and a peer's sync
+/// sender would retry a brake it can never clear inside its budget.
 pub fn too_many_requests() -> Response {
+    let code = NodeDenial::RateLimited.as_str();
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [("retry-after", "60")],
-        "rate limit exceeded — try again later",
+        [("retry-after", "60"), ("X-Gitlawb-Error", code)],
+        Json(json!({ "error": code, "message": "rate limit exceeded — try again later" })),
     )
         .into_response()
 }
@@ -287,6 +298,41 @@ pub async fn rate_limit_by_ip(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The brake shares 429 with the spent-signature ledger's
+    /// `signature_ledger_full`, so it has to be told apart by something other
+    /// than the status. It carries the same shape the ledger uses: an
+    /// `X-Gitlawb-Error` header and a JSON body whose `error` matches it.
+    #[tokio::test]
+    async fn brake_429_carries_a_machine_readable_code_and_json_body() {
+        let resp = too_many_requests();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some("60"),
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-gitlawb-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("rate_limited"),
+            "a brake 429 must be distinguishable from a ledger 429 by its code",
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("brake body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("brake body must be JSON, not text/plain");
+        assert_eq!(body["error"], "rate_limited");
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("rate limit exceeded")),
+            "body: {body}",
+        );
+    }
 
     #[tokio::test]
     async fn allows_within_limit() {

@@ -1278,6 +1278,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The brake shares 429 with the ledger's `signature_ledger_full` on
+        // this route group, so the code is what tells a client which one it
+        // hit. Asserted end-to-end here, through the real router.
+        assert_eq!(
+            resp.headers()
+                .get("x-gitlawb-error")
+                .and_then(|v| v.to_str().ok()),
+            Some("rate_limited"),
+        );
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();

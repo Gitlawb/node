@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
-use gitlawb_core::signature_denial::SignatureDenial;
+use gitlawb_core::node_denial::NodeDenial;
 use icaptcha_client::IcaptchaCfg;
 
 /// Max times we'll fetch a fresh proof and retry a 403-iCaptcha response
@@ -120,7 +120,7 @@ impl NodeClient {
     /// signs afresh, so the retry is a new signature over the same bytes, not a
     /// resend of the original one. Emits an actionable hint on a 401 "not an
     /// agent" (the old-CLI / unregistered failure mode), and converts every
-    /// signature-ledger denial into an error.
+    /// denial the node names in `x-gitlawb-error` into an error.
     async fn send_signed(
         &self,
         method: &str,
@@ -213,11 +213,11 @@ impl NodeClient {
     }
 }
 
-/// A write the node refused because of the spent-signature ledger.
+/// A write the node refused with a code this build recognises.
 struct SignatureRejection {
     /// Which denial it was. Its `as_str` is the `x-gitlawb-error` code, printed
     /// verbatim so scripts can match on it.
-    denial: SignatureDenial,
+    denial: NodeDenial,
     /// What the user should actually do next.
     hint: &'static str,
 }
@@ -253,7 +253,7 @@ impl SignatureRejection {
     }
 }
 
-/// Recognise a spent-signature-ledger rejection from the status and the
+/// Recognise a node rejection from the status and the
 /// `x-gitlawb-error` header, before anything reads the body.
 ///
 /// Known limit: the node also puts the same code in the body's `error` field,
@@ -278,7 +278,7 @@ impl SignatureRejection {
 /// automatically would only hammer a node that is already saying "not now", so
 /// they surface to the user instead.
 ///
-/// The set of codes is [`SignatureDenial`], shared with the node so both halves
+/// The set of codes is [`NodeDenial`], shared with the node so both halves
 /// spell them the same way. The `match` below has no wildcard arm on purpose:
 /// adding a denial to the node stops this crate compiling until someone writes
 /// the caller's instructions for it. That is the whole point of the type, since
@@ -289,38 +289,43 @@ fn signature_rejection(resp: &reqwest::Response) -> Option<SignatureRejection> {
     // A code this build does not know: not our denial to describe. The header
     // came from a node the user chose, which may be newer, older, or hostile,
     // so the response goes back to the caller untouched.
-    let denial = SignatureDenial::from_code(code)?;
+    let denial = NodeDenial::from_code(code)?;
     // The status has to agree with the code, so a stray header on a 200 cannot
     // turn a success into a refusal.
     if resp.status().as_u16() != denial.status() {
         return None;
     }
     let hint = match denial {
-        SignatureDenial::NonceRequired => {
+        NodeDenial::NonceRequired => {
             "this node requires a nonce in the request signature and the request did not carry \
              one. The write did not happen; upgrade `gl` and run the command again"
         }
-        SignatureDenial::NonceTooShort => {
+        NodeDenial::NonceTooShort => {
             "this node rejected the nonce in the request signature as too short to be unique. \
              The write did not happen; upgrade `gl` and run the command again"
         }
-        SignatureDenial::Replayed => {
+        NodeDenial::Replayed => {
             "the node already admitted a request with this signature and will not take it twice. \
              Do not resend: check whether the change took effect before running the command again"
         }
-        SignatureDenial::LedgerFull => {
+        NodeDenial::LedgerFull => {
             "this identity has too many unexpired signatures on the node, so it is refusing more \
              signed writes for now. The write did not happen; wait a moment and run the command \
              again"
         }
-        SignatureDenial::IdentityMissing => {
+        NodeDenial::IdentityMissing => {
             "the node reached its signature ledger without a verified identity and refused the \
              write. The write did not happen; this is a fault on the node, so report it to the \
              operator"
         }
-        SignatureDenial::LedgerUnavailable => {
+        NodeDenial::LedgerUnavailable => {
             "the node's signature ledger is unavailable, so it is refusing signed writes. \
              The write did not happen; retry later or ask the node operator to check the node"
+        }
+        NodeDenial::RateLimited => {
+            "the node is throttling requests from your network address, so it refused this one \
+             before running it. The write did not happen; this is not about your identity or \
+             your signature, so re-running immediately will not help — wait and try again"
         }
     };
     Some(SignatureRejection { denial, hint })
@@ -763,11 +768,57 @@ mod tests {
         );
     }
 
+    /// Two unrelated conditions now share 429: the node's per-client flood
+    /// brake and the spent-signature ledger's per-identity cap. They must reach
+    /// the user as different errors, and neither may be retried.
+    #[tokio::test]
+    async fn send_signed_tells_a_rate_limit_brake_apart_from_a_full_ledger() {
+        let (brake, _s1) = send_signed_once(
+            429,
+            &[("x-gitlawb-error", "rate_limited")],
+            r#"{"error":"rate_limited","message":"rate limit exceeded — try again later"}"#,
+        )
+        .await;
+        let brake = brake
+            .expect_err("a rate-limit brake must surface as an error, not Ok(429)")
+            .to_string();
+
+        let (ledger, _s2) = send_signed_once(
+            429,
+            &[("x-gitlawb-error", "signature_ledger_full")],
+            r#"{"error":"signature_ledger_full","message":"ledger at capacity"}"#,
+        )
+        .await;
+        let ledger = ledger
+            .expect_err("a full ledger must surface as an error")
+            .to_string();
+
+        assert!(brake.contains("rate_limited"), "got: {brake}");
+        assert!(
+            !brake.contains("signature_ledger_full"),
+            "a brake must not be described as a ledger denial: {brake}"
+        );
+        assert!(
+            brake.contains("network address"),
+            "the brake hint must say it is keyed on the client address: {brake}"
+        );
+        assert!(ledger.contains("signature_ledger_full"), "got: {ledger}");
+        assert!(
+            !ledger.contains("rate_limited"),
+            "a ledger denial must not be described as a brake: {ledger}"
+        );
+        assert!(
+            ledger.contains("unexpired signatures"),
+            "the ledger hint must say it is keyed on the identity: {ledger}"
+        );
+        assert_ne!(brake, ledger);
+    }
+
     /// Every signature denial the node can return, as (status, code). Derived
     /// from the shared enum rather than retyped, so it cannot drift from what
     /// the node emits.
     fn all_denials() -> Vec<(usize, &'static str)> {
-        SignatureDenial::ALL
+        NodeDenial::ALL
             .iter()
             .map(|d| (d.status() as usize, d.as_str()))
             .collect()

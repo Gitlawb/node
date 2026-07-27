@@ -132,9 +132,13 @@ impl IntoResponse for AppError {
             // IcaptchaProofRequired is handled above (it carries extra headers/fields).
             AppError::IcaptchaProofRequired { .. } => unreachable!("handled before this match"),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
-            AppError::TooManyRequests(msg) => {
-                (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
-            }
+            // Same wire code as the flood brake's `too_many_requests`, taken
+            // from the shared enum rather than retyped so the two cannot drift.
+            AppError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                gitlawb_core::node_denial::NodeDenial::RateLimited.as_str(),
+                msg.clone(),
+            ),
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }

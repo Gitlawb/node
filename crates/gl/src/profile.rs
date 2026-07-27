@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -248,16 +248,10 @@ async fn cmd_set(
         .await
         .context("failed to update profile")?;
 
-    let status = resp.status();
-    let resp_body: serde_json::Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = resp_body
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("profile update failed ({status}): {msg}");
-    }
+    // Status before body. A denial need not be JSON at all — the per-client
+    // rate-limit brake used to answer text/plain — and parsing first turned a
+    // 429 into "invalid JSON response", which names the wrong problem.
+    let resp_body: serde_json::Value = json_or_denial("profile update", resp).await?;
 
     println!();
     println!("✓ Profile updated");
@@ -398,16 +392,8 @@ async fn cmd_import(path: PathBuf, pin: bool, node: String, dir: Option<PathBuf>
         .await
         .context("failed to import profile")?;
 
-    let status = resp.status();
-    let resp_body: serde_json::Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = resp_body
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("profile import failed ({status}): {msg}");
-    }
+    // Parsed only to reject a denial; the success body carries nothing to print.
+    json_or_denial::<serde_json::Value>("profile import", resp).await?;
 
     println!("✓ Profile imported successfully");
     Ok(())
@@ -456,6 +442,66 @@ fn did_short(did: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn write_identity(dir: &TempDir) {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+    }
+
+    async fn set_against(status: usize, headers: &[(&str, &str)], body: &str) -> String {
+        let dir = TempDir::new().unwrap();
+        write_identity(&dir);
+        let mut server = mockito::Server::new_async().await;
+        let mut m = server.mock("PUT", "/api/v1/profile").with_status(status);
+        for (k, v) in headers {
+            m = m.with_header(*k, v);
+        }
+        let _m = m.with_body(body).create_async().await;
+        let err = cmd_set(
+            Some("Axiom".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .expect_err("a 429 must not be reported as success");
+        format!("{err:#}")
+    }
+
+    /// A per-IP brake 429 is newly reachable on this route. Parsing the body
+    /// before checking the status turned it into "invalid JSON response",
+    /// which tells the user nothing about the real condition.
+    #[tokio::test]
+    async fn profile_set_surfaces_a_rate_limit_brake_not_invalid_json() {
+        // Header present: the client recognises the code up front.
+        let err = set_against(
+            429,
+            &[("x-gitlawb-error", "rate_limited")],
+            r#"{"error":"rate_limited","message":"rate limit exceeded — try again later"}"#,
+        )
+        .await;
+        assert!(!err.contains("invalid JSON"), "got: {err}");
+        assert!(err.contains("rate_limited"), "got: {err}");
+
+        // Header stripped by a proxy, body not JSON: the status still has to
+        // decide, so this must read as a 429, not as a parse failure.
+        let err = set_against(429, &[], "rate limit exceeded — try again later").await;
+        assert!(!err.contains("invalid JSON"), "got: {err}");
+        assert!(err.contains("429"), "got: {err}");
+        assert!(err.contains("rate limit exceeded"), "got: {err}");
+    }
 
     #[test]
     fn test_did_short_extracts_suffix() {

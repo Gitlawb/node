@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::auth::{caller_authorized_to_push, AuthenticatedDid};
 use crate::db::RepoRecord;
 use chrono::{DateTime, Utc};
+use gitlawb_core::node_denial::NodeDenial;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -773,6 +774,15 @@ struct NotifyRetryPolicy {
     /// ref count and would keep the background task alive against a wedged
     /// peer for hours. With a shared budget the whole fan-out adds at most
     /// this much wall clock, however wide the push.
+    ///
+    /// The tradeoff, stated plainly because it is not obvious from the code:
+    /// the budget is spent first-come, so on a peer rejecting every ref the
+    /// first ~10 failing refs consume all of it and every later ref gets a
+    /// single attempt with no retry at all. That is deliberate — retries are
+    /// worth most on a peer that is briefly rejecting and worth nothing on one
+    /// that is rejecting everything, and the alternative (dividing the budget
+    /// by the ref count) would make each share too small to ride out anything.
+    /// Refs that do not land are reported, not silently dropped.
     budget: std::time::Duration,
 }
 
@@ -803,12 +813,25 @@ enum NotifyDisposition {
     Fatal,
 }
 
-/// Classify a peer's `/sync/notify` response status.
+/// Classify a peer's `/sync/notify` response.
 ///
-/// Only the two statuses that mean "the write did not happen, come back
-/// later" are retryable: 429 (`signature_ledger_full`, the per-identity
-/// spent-signature cap) and 503 (`signature_ledger_unavailable`). This matches
-/// how `gl` classifies the same rejections client-side.
+/// The gate is the peer's `X-Gitlawb-Error` code, not the status. Only two
+/// codes mean "the write did not happen and another attempt can clear it":
+/// `signature_ledger_full` (the per-identity spent-signature cap, which drains
+/// as entries expire) and `signature_ledger_unavailable`. Everything else is
+/// `Fatal`, including a 429 or 503 carrying any other code and one carrying no
+/// code at all.
+///
+/// Status alone is not enough because the peer's per-client flood brake answers
+/// 429 on this route too, and on a peer running the default config (where
+/// `require_signed_peer_writes` is off) `/sync/notify` never reaches the ledger
+/// at all — so every 429 the sender can see is the brake. Retrying that spends
+/// the whole budget on the one class it can never recover from (the brake's
+/// window is an hour, the budget is a minute) while pushing the sender further
+/// into the peer's peer-write bucket, which `/peers/announce` shares.
+///
+/// The status still has to agree with the code, so a stray `signature_ledger_full`
+/// header on a 409 cannot turn "the peer already applied this" into a retry.
 /// The result of one `/sync/notify` attempt, with the reason kept for the
 /// end-of-fan-out summary.
 #[must_use]
@@ -818,15 +841,20 @@ enum NotifyAttempt {
     Fatal(String),
 }
 
-fn classify_notify_status(status: reqwest::StatusCode) -> NotifyDisposition {
+fn classify_notify_status(status: reqwest::StatusCode, code: Option<&str>) -> NotifyDisposition {
     if status.is_success() {
-        NotifyDisposition::Delivered
-    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-    {
-        NotifyDisposition::Retryable
-    } else {
-        NotifyDisposition::Fatal
+        return NotifyDisposition::Delivered;
+    }
+    // `from_code` rather than string literals: this is the second consumer of
+    // the same wire vocabulary as `gl`, with the same drift exposure, and the
+    // enum is what makes a new code a compile error rather than a silent miss.
+    match code.and_then(NodeDenial::from_code) {
+        Some(denial @ (NodeDenial::LedgerFull | NodeDenial::LedgerUnavailable))
+            if status.as_u16() == denial.status() =>
+        {
+            NotifyDisposition::Retryable
+        }
+        _ => NotifyDisposition::Fatal,
     }
 }
 
@@ -882,10 +910,9 @@ async fn notify_peer_of_ref(
     {
         Ok(r) => {
             let status = r.status();
-            let code = crate::api::peers::peer_error_code(r.headers())
-                .unwrap_or("none")
-                .to_string();
-            match classify_notify_status(status) {
+            let peer_code = crate::api::peers::peer_error_code(r.headers());
+            let code = peer_code.unwrap_or("none").to_string();
+            match classify_notify_status(status, peer_code) {
                 NotifyDisposition::Delivered => {
                     tracing::info!(peer = %peer_did, repo = %repo_slug, ref_name = %ref_name, "notified peer to sync");
                     NotifyAttempt::Delivered
@@ -911,6 +938,19 @@ async fn notify_peer_of_ref(
     }
 }
 
+/// What one peer's fan-out achieved. The refs that never landed are named
+/// rather than merely counted, so the summary log and the tests are reading the
+/// same fact: a ref the peer rejected past the bound is reported unfederated,
+/// not quietly dropped.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FanOutSummary {
+    total: usize,
+    unfederated: Vec<String>,
+    /// Why the last failing ref failed, as `"<status> <code>"` or a transport
+    /// message. Empty when nothing failed.
+    last_reason: String,
+}
+
 /// Notify a single peer of every ref in a push — one request per ref.
 ///
 /// Looping here (rather than sending one flattened request) is what keeps a
@@ -918,15 +958,19 @@ async fn notify_peer_of_ref(
 /// `old_sha`.
 ///
 /// Because every request in the fan-out is signed by the same node keypair, a
-/// peer that requires signed peer writes charges them all to one identity, and
-/// a wide push (`git push --mirror` of hundreds of branches) runs that
-/// identity into the peer's spent-signature cap. The tail then comes back 429
-/// `signature_ledger_full`, which is a retryable rate condition, so retry it
-/// under `retry`; `sign_request` draws a fresh nonce per attempt, so the retry
-/// carries a signature the peer has never seen rather than a replay. Refs that
-/// still do not land are counted and reported in one summary line, because a
-/// per-ref warning inside a 600-ref loop is not something an operator will
-/// ever correlate back to the push.
+/// peer that requires signed peer writes charges them all to one identity, so a
+/// ref the peer is briefly rejecting with `signature_ledger_full` is worth
+/// another attempt: `sign_request` draws a fresh nonce per attempt, so the
+/// retry carries a signature the peer has never seen rather than a replay.
+///
+/// What the retry does NOT solve is a wide push against a peer whose ledger cap
+/// is genuinely exceeded (`git push --mirror` of hundreds of branches against a
+/// few-hundred-row cap with minutes of retention). There the rejection clears
+/// only when the window ages out, which is longer than the whole fan-out's
+/// budget, so those refs do not federate however many times they are retried.
+/// They are counted and reported in one summary line — a per-ref warning inside
+/// a 600-ref loop is not something an operator will ever correlate back to the
+/// push — and returned to the caller so a test can assert on them.
 #[allow(clippy::too_many_arguments)]
 async fn notify_peer_of_refs(
     http_client: &reqwest::Client,
@@ -939,7 +983,7 @@ async fn notify_peer_of_refs(
     pusher_did: &str,
     owner_did: &str,
     retry: &NotifyRetryPolicy,
-) {
+) -> FanOutSummary {
     let mut budget_left = retry.budget;
     let mut failed: Vec<&str> = Vec::new();
     let mut last_reason = String::new();
@@ -997,6 +1041,12 @@ async fn notify_peer_of_refs(
             last_reason = %last_reason,
             "refs failed to federate to peer; they will not be retried again"
         );
+    }
+
+    FanOutSummary {
+        total: ref_updates.len(),
+        unfederated: failed.into_iter().map(str::to_string).collect(),
+        last_reason,
     }
 }
 
@@ -2710,10 +2760,17 @@ mod tests {
         );
     }
 
-    // 429 twice then 200: the ref IS federated, and the attempt count is
-    // pinned so the bound cannot silently grow.
+    // 429 twice then 200: a peer whose ledger rejection clears within the
+    // budget does federate, and the attempt count is pinned so the bound
+    // cannot silently grow.
+    //
+    // This proves the TRANSIENT case only. It is not evidence for the wide
+    // push that motivated the retry: there the cap is exceeded for as long as
+    // the retention window, which outlasts the whole fan-out's budget, and
+    // `notify_peer_reports_refs_a_permanently_429_peer_never_took` is what
+    // pins that outcome.
     #[tokio::test]
-    async fn notify_peer_retries_a_429_ledger_full_and_federates_on_retry() {
+    async fn notify_peer_retries_a_transient_ledger_rejection_and_federates_on_retry() {
         let mut server = mockito::Server::new_async().await;
         let keypair = Keypair::generate();
         let http_client = reqwest::Client::new();
@@ -2754,11 +2811,13 @@ mod tests {
         accepted.assert_async().await;
     }
 
-    // A peer that answers 429 forever must stop at the bound, not spin. The
-    // count is the whole assertion: an unbounded retry never terminates and an
-    // off-by-one bound shows up here.
+    // The wide-push shape the retry cannot fix: a peer whose ledger stays at
+    // its cap answers 429 for the whole fan-out. Two things must hold. It stops
+    // at the bound rather than spinning (an unbounded retry never terminates,
+    // and an off-by-one shows up in the count), and the ref it never delivered
+    // comes back named as unfederated rather than being dropped on the floor.
     #[tokio::test]
-    async fn notify_peer_stops_retrying_a_permanently_429_peer() {
+    async fn notify_peer_reports_refs_a_permanently_429_peer_never_took() {
         let mut server = mockito::Server::new_async().await;
         let keypair = Keypair::generate();
         let http_client = reqwest::Client::new();
@@ -2773,7 +2832,7 @@ mod tests {
 
         let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
 
-        notify_peer_of_refs(
+        let summary = notify_peer_of_refs(
             &http_client,
             &keypair,
             "did:key:zPeer",
@@ -2788,6 +2847,17 @@ mod tests {
         .await;
 
         mock.assert_async().await;
+        assert_eq!(summary.total, 1);
+        assert_eq!(
+            summary.unfederated,
+            vec!["refs/heads/b0".to_string()],
+            "a ref the peer never took must be reported unfederated, not dropped",
+        );
+        assert!(
+            summary.last_reason.contains("signature_ledger_full"),
+            "the reason must name the peer's code, got: {}",
+            summary.last_reason,
+        );
     }
 
     // The retry budget is shared across the whole per-peer fan-out, so a
@@ -2823,6 +2893,79 @@ mod tests {
             &notify_url,
             "owner/repo",
             &refs(budgeted + 1),
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &FAST_POLICY,
+        )
+        .await;
+
+        mock.assert_async().await;
+    }
+
+    // A peer's per-IP flood brake also answers 429, and the sender can never
+    // clear it inside the retry budget (the brake's window is an hour). Only
+    // the ledger's own 429 is worth another attempt, so a 429 carrying any
+    // other code — or no code at all — is a single attempt.
+    #[tokio::test]
+    async fn notify_peer_does_not_retry_a_429_with_an_unrelated_code() {
+        for headers in [
+            vec![("x-gitlawb-error", "rate_limited")],
+            vec![("x-gitlawb-error", "some_code_from_a_newer_node")],
+            vec![],
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let keypair = Keypair::generate();
+            let http_client = reqwest::Client::new();
+
+            let mut m = server.mock("POST", SYNC_NOTIFY_PATH).with_status(429);
+            for (k, v) in &headers {
+                m = m.with_header(*k, v);
+            }
+            let mock = m.expect(1).create_async().await;
+
+            let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+            notify_peer_of_refs(
+                &http_client,
+                &keypair,
+                "did:key:zPeer",
+                &notify_url,
+                "owner/repo",
+                &refs(1),
+                "did:key:zNode",
+                "did:key:zPusher",
+                "did:key:zOwner",
+                &FAST_POLICY,
+            )
+            .await;
+
+            mock.assert_async().await;
+        }
+    }
+
+    // Same rule on the other retryable status: only the ledger's own 503 is
+    // worth another attempt.
+    #[tokio::test]
+    async fn notify_peer_does_not_retry_a_503_with_an_unrelated_code() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let mock = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(503)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &refs(1),
             "did:key:zNode",
             "did:key:zPusher",
             "did:key:zOwner",
@@ -2869,6 +3012,48 @@ mod tests {
         mock.assert_async().await;
     }
 
+    // A transport error may mean the peer applied the update and only the
+    // response was lost, so it is never retried. There is no mock to count
+    // here, so the assertion is wall clock against a backoff long enough that
+    // a single retry could not hide inside it.
+    #[tokio::test]
+    async fn notify_peer_does_not_retry_a_transport_error() {
+        const SLOW_BACKOFF: [std::time::Duration; 2] = [
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(5),
+        ];
+        const SLOW_POLICY: NotifyRetryPolicy = NotifyRetryPolicy {
+            backoff: &SLOW_BACKOFF,
+            budget: std::time::Duration::from_secs(60),
+        };
+
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+        // Port 1 is reserved and nothing listens there: connect refused.
+        let notify_url = format!("http://127.0.0.1:1{SYNC_NOTIFY_PATH}");
+
+        let started = std::time::Instant::now();
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &refs(1),
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &SLOW_POLICY,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a transport error slept on the backoff, so it was retried: {:?}",
+            started.elapsed(),
+        );
+    }
+
     // The happy path must not gain a single extra request: N refs, N POSTs.
     #[tokio::test]
     async fn notify_peer_sends_exactly_one_request_per_ref_on_success() {
@@ -2906,32 +3091,88 @@ mod tests {
     fn classify_notify_status_separates_retryable_from_fatal() {
         use reqwest::StatusCode;
         assert_eq!(
-            classify_notify_status(StatusCode::OK),
+            classify_notify_status(StatusCode::OK, None),
             NotifyDisposition::Delivered
         );
         assert_eq!(
-            classify_notify_status(StatusCode::TOO_MANY_REQUESTS),
+            classify_notify_status(StatusCode::TOO_MANY_REQUESTS, Some("signature_ledger_full")),
             NotifyDisposition::Retryable,
-            "429 signature_ledger_full is the retryable rate condition"
+            "the ledger's own 429 is the retryable rate condition"
         );
         assert_eq!(
-            classify_notify_status(StatusCode::SERVICE_UNAVAILABLE),
+            classify_notify_status(
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("signature_ledger_unavailable")
+            ),
             NotifyDisposition::Retryable,
             "503 signature_ledger_unavailable did not apply the write"
         );
         assert_eq!(
-            classify_notify_status(StatusCode::CONFLICT),
+            classify_notify_status(StatusCode::CONFLICT, Some("signature_replayed")),
             NotifyDisposition::Fatal,
             "409 signature_replayed means the peer already applied it"
         );
         assert_eq!(
-            classify_notify_status(StatusCode::FORBIDDEN),
+            classify_notify_status(StatusCode::FORBIDDEN, None),
             NotifyDisposition::Fatal
         );
         assert_eq!(
-            classify_notify_status(StatusCode::BAD_REQUEST),
+            classify_notify_status(StatusCode::BAD_REQUEST, None),
             NotifyDisposition::Fatal
         );
+    }
+
+    // The gate is the code, not the status. Every one of these is a 429 or a
+    // 503 — retryable under the old status-only rule — and every one must be
+    // fatal.
+    #[test]
+    fn classify_notify_status_gates_on_the_code_not_the_status() {
+        use reqwest::StatusCode;
+        for (status, code) in [
+            // The peer's per-IP flood brake: an hour-long window the sender
+            // cannot clear inside a 60s budget.
+            (StatusCode::TOO_MANY_REQUESTS, Some("rate_limited")),
+            (StatusCode::SERVICE_UNAVAILABLE, Some("rate_limited")),
+            // No code at all — a bare status, or a proxy that stripped the
+            // header. Absence is not evidence of a ledger rejection.
+            (StatusCode::TOO_MANY_REQUESTS, None),
+            (StatusCode::SERVICE_UNAVAILABLE, None),
+            // A code from some other node, or a newer one this build predates.
+            (StatusCode::TOO_MANY_REQUESTS, Some("")),
+            (StatusCode::TOO_MANY_REQUESTS, Some("upstream_overloaded")),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("signature_ledger_full"), // right code, wrong status
+            ),
+        ] {
+            assert_eq!(
+                classify_notify_status(status, code),
+                NotifyDisposition::Fatal,
+                "{status} with code {code:?} must not be retried",
+            );
+        }
+    }
+
+    // A 409 carries "the peer already admitted this signed request", so it is
+    // fatal no matter what code rides along — including a header claiming the
+    // ledger is full, which a hostile or confused peer could send to talk the
+    // sender into re-applying a mutation.
+    #[test]
+    fn classify_notify_status_never_retries_a_409() {
+        use reqwest::StatusCode;
+        for code in [
+            None,
+            Some("signature_replayed"),
+            Some("signature_ledger_full"),
+            Some("signature_ledger_unavailable"),
+            Some("rate_limited"),
+        ] {
+            assert_eq!(
+                classify_notify_status(StatusCode::CONFLICT, code),
+                NotifyDisposition::Fatal,
+                "409 with code {code:?} must never be retried",
+            );
+        }
     }
 
     #[tokio::test]

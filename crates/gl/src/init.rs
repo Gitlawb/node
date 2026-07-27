@@ -9,7 +9,7 @@ use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -95,21 +95,12 @@ async fn run_in(cwd: &std::path::Path, args: InitArgs) -> Result<()> {
         .post("/api/register", &body)
         .await
         .context("failed to connect to node")?;
-    let status = resp.status();
-    let payload: Value = resp.json().await.context("invalid JSON from register")?;
-
-    if !status.is_success() {
-        // No tolerated failure here: `register_agent` upserts, so re-registering
-        // a known DID is a 201, not a conflict (node `api/register.rs`, and the
-        // ON CONFLICT clause in `db::register_agent`). The old check let any
-        // message containing "already" through, which included the replay denial
-        // "this signature has already been used".
-        let msg = payload["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!(
-            "registration failed ({status}): {}",
-            crate::http::sanitize_node_msg(msg)
-        );
-    }
+    // No tolerated failure here: `register_agent` upserts, so re-registering a
+    // known DID is a 201, not a conflict (node `api/register.rs`, and the ON
+    // CONFLICT clause in `db::register_agent`). An older check let any message
+    // containing "already" through, which included the replay denial "this
+    // signature has already been used".
+    let payload: Value = json_or_denial("registration", resp).await?;
 
     // Save UCAN if returned
     if let Some(ucan) = payload.get("ucan").and_then(|v| v.as_str()) {

@@ -267,6 +267,12 @@ pub fn record_auth_failure(route: &str, reason: &str) {
 /// it. `outcome` is a fixed set of literals chosen at the call sites in
 /// `auth::consume_signature` — never a DID, keyid, or path, which would be
 /// attacker-controlled and unbounded.
+///
+/// The sum is the LAYER's request count, not the routes' traffic. The per-client
+/// flood brake (`rate_limit`) rejects upstream of this layer, so its 429s appear
+/// in no series here even though they are served on the same routes. An operator
+/// counting refusals has to read `rate_limited` responses separately; this
+/// counter answers "what is the ledger doing", not "how many 429s went out".
 pub fn record_signature_ledger(outcome: &str) {
     if let Some(c) = SIGNATURE_LEDGER.get() {
         c.with_label_values(&[outcome]).inc();
