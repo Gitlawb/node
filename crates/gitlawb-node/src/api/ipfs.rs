@@ -77,21 +77,13 @@ pub async fn get_by_cid(
     let caller_owned = caller.map(|c| c.to_string());
 
     // 2. Search all repos for an object with this SHA-256
-    let repos = state
-        .db
-        .list_all_repos()
-        .await
-        .map_err(AppError::Internal)?;
+    let repos = state.db.list_all_repos().await?;
 
     // Fetch every repo's visibility rules in one query rather than one per row
     // (the gate runs each row against its OWN rules — KTD2a). A row absent from
     // the map has no rules.
     let repo_ids: Vec<String> = repos.iter().map(|r| r.id.clone()).collect();
-    let rules_by_repo = state
-        .db
-        .list_visibility_rules_for_repos(&repo_ids)
-        .await
-        .map_err(AppError::Internal)?;
+    let rules_by_repo = state.db.list_visibility_rules_for_repos(&repo_ids).await?;
 
     // Request-scoped memo of the per-repo allowed-blob set (KTD1, #126). The
     // caller is constant for one request, so `repo.id` alone is a safe,
@@ -217,14 +209,59 @@ pub async fn get_by_cid(
 /// objects received via push. Each entry includes the git SHA-256 hex, the
 /// CIDv1 string, and the timestamp when it was pinned.
 pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
-    let pins = state
-        .db
-        .list_pinned_cids()
-        .await
-        .map_err(AppError::Internal)?;
+    // Bare `?` so connection-class sqlx failures downcast to `AppError::Db` and
+    // map to 503 `db_unavailable` (not 500 via `.map_err(AppError::Internal)`) (#251).
+    let pins = state.db.list_pinned_cids().await?;
 
     Ok(Json(serde_json::json!({
         "pins": pins,
         "count": pins.len(),
     })))
+}
+
+#[cfg(test)]
+mod closed_pool_tests {
+    use super::*;
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use serde_json::Value;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    /// #251: a closed pool on /api/v1/ipfs/pins must be 503 db_unavailable,
+    /// not 500 internal_error from `.map_err(AppError::Internal)`.
+    #[sqlx::test]
+    async fn list_pins_closed_pool_returns_503_db_unavailable(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        pool.close().await;
+
+        let resp = Router::new()
+            .route("/api/v1/ipfs/pins", axum::routing::get(list_pins))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/ipfs/pins")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "closed-pool outage must be retryable 503, not 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": crate::error::DB_UNAVAILABLE_CODE,
+                "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+            })
+        );
+    }
 }
