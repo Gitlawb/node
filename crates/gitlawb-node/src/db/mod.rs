@@ -3,8 +3,40 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
+
+/// A migration version this build defines is already recorded in the database
+/// under a different name. Distinct type, not a bare `anyhow!`, because the
+/// startup retry loop has to tell this apart from a transient outage: it never
+/// heals on its own, so it must be reported as a schema conflict rather than
+/// "the database is coming up". See `is_likely_permanent_db_error`.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "migration version {version} is already applied in this database as {recorded_name:?}, but \
+     this build defines v{version} as {build_name:?}. Either two migrations claimed the same \
+     version, in which case renumber this build's migration above every applied version instead \
+     of reusing v{version}; or {recorded_name:?} is leftover bookkeeping from abandoned numbering \
+     on a build that no longer exists, in which case drop the stale row with \
+     `DELETE FROM schema_migrations WHERE version = {version}` after confirming its schema \
+     objects match what v{version} ({build_name:?}) creates."
+)]
+pub struct MigrationVersionCollision {
+    pub version: i64,
+    pub recorded_name: String,
+    pub build_name: &'static str,
+}
+
+/// A version recorded in `schema_migrations` that this build's catalogue does
+/// not define at all: a row written by a since-renumbered build, say, or by an
+/// older binary during a rollback. Never fatal on its own (see the note in
+/// `run_pending_migrations`), but reported so it is visible before a future
+/// migration claims that number and turns it into a boot failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedOrphanMigration {
+    pub version: i64,
+    pub name: String,
+}
 
 // ── Public data types ─────────────────────────────────────────────────────────
 
@@ -358,12 +390,32 @@ impl Db {
             .execute(&mut *lock_conn)
             .await;
 
-        result
+        for orphan in result.as_ref().map(Vec::as_slice).unwrap_or_default() {
+            warn!(
+                version = orphan.version,
+                name = %orphan.name,
+                "schema_migrations records a version this build does not define; it is \
+                 leftover bookkeeping (a renumbered or rolled-back build). Harmless now, but a \
+                 future migration claiming this version will abort startup. Confirm its schema \
+                 objects are already covered and then run \
+                 `DELETE FROM schema_migrations WHERE version = <version>`"
+            );
+        }
+
+        result.map(|_| ())
     }
 
     /// Apply every migration whose version isn't yet recorded, in order.
     /// Must be called while holding the migration advisory lock.
-    async fn run_pending_migrations(&self) -> Result<()> {
+    ///
+    /// Returns the recorded versions this build's catalogue does not define.
+    /// The caller reports them; they are deliberately NOT fatal. A legitimate
+    /// rollback produces them transiently (an older binary re-runs an
+    /// idempotent migration under its old number and records it), and aborting
+    /// startup would turn a supported roll-forward into an outage. The reason
+    /// to surface them anyway is that such a row is exactly what trips the
+    /// collision check later, once some other branch claims that version.
+    async fn run_pending_migrations(&self) -> Result<Vec<RecordedOrphanMigration>> {
         for m in MIGRATIONS {
             // Compare the recorded *name*, not just the version. Two branches
             // developed in parallel can each claim the same version number;
@@ -379,17 +431,12 @@ impl Db {
 
             if let Some(recorded) = recorded {
                 if recorded != m.name {
-                    anyhow::bail!(
-                        "migration version {} is already applied in this database as {:?}, \
-                         but this build defines v{} as {:?}. Two migrations claimed the same \
-                         version; renumber this build's migration above every applied version \
-                         instead of reusing v{}.",
-                        m.version,
-                        recorded,
-                        m.version,
-                        m.name,
-                        m.version
-                    );
+                    return Err(MigrationVersionCollision {
+                        version: m.version,
+                        recorded_name: recorded,
+                        build_name: m.name,
+                    }
+                    .into());
                 }
                 continue;
             }
@@ -436,7 +483,20 @@ impl Db {
             );
         }
 
-        Ok(())
+        // The loop above only ever looks at versions this build defines, so a
+        // recorded version the catalogue no longer mentions is invisible to it.
+        // That is precisely the row a renumber leaves behind. Find it by asking
+        // the database what it has, rather than by asking about what we know.
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT version, name FROM schema_migrations ORDER BY version ASC")
+                .fetch_all(&self.pool)
+                .await
+                .context("listing recorded migrations")?;
+        Ok(rows
+            .into_iter()
+            .filter(|(version, _)| !MIGRATIONS.iter().any(|m| m.version == *version))
+            .map(|(version, name)| RecordedOrphanMigration { version, name })
+            .collect())
     }
 
     /// Returns `(version, name, applied_at)` for every applied migration,
@@ -4112,6 +4172,120 @@ mod migration_tests {
         assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
         assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
         assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
+    }
+}
+
+#[cfg(test)]
+mod migration_guard_tests {
+    use super::{MigrationVersionCollision, MIGRATIONS};
+
+    async fn record(pool: &sqlx::PgPool, version: i64, name: &str) {
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+        )
+        .bind(version)
+        .bind(name)
+        .bind("2026-07-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A recorded version this build's catalogue no longer defines is
+    /// reported, and does not by itself stop startup.
+    #[sqlx::test]
+    async fn a_recorded_version_the_catalogue_does_not_define_is_reported(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        record(&db.pool, 9_001, "ghost_migration").await;
+
+        let orphans = db
+            .run_pending_migrations()
+            .await
+            .expect("an unknown recorded version must not fail startup");
+
+        assert!(
+            orphans
+                .iter()
+                .any(|o| o.version == 9_001 && o.name == "ghost_migration"),
+            "expected the orphan row to be reported, got {orphans:?}"
+        );
+        // And startup as a whole still succeeds.
+        db.migrate().await.expect("migrate must still succeed");
+    }
+
+    /// The concrete rollback sequence: this build records v16, an older binary
+    /// whose catalogue still numbers the same migration v12 records
+    /// (12, 'consumed_signatures') as a no-op, then we roll forward. The stale
+    /// row must surface as an orphan, not bail.
+    #[sqlx::test]
+    async fn a_rolled_back_binarys_stale_row_surfaces_without_bailing(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        // The rolled-back binary finds no v12 row, re-runs
+        // CREATE TABLE IF NOT EXISTS consumed_signatures as a no-op, records v12.
+        record(&db.pool, 12, "consumed_signatures").await;
+
+        let orphans = db
+            .run_pending_migrations()
+            .await
+            .expect("a rollback's leftover bookkeeping row must not abort startup");
+
+        assert!(
+            orphans
+                .iter()
+                .any(|o| o.version == 12 && o.name == "consumed_signatures"),
+            "expected the stale (12, consumed_signatures) row to be reported, got {orphans:?}"
+        );
+        assert!(
+            !MIGRATIONS.iter().any(|m| m.version == 12),
+            "this test assumes the catalogue does not define v12"
+        );
+    }
+
+    /// A version the catalogue DOES define, recorded under a different name,
+    /// is a genuine collision and still aborts startup.
+    #[sqlx::test]
+    async fn a_genuine_name_collision_still_bails(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        sqlx::query("UPDATE schema_migrations SET name = $1 WHERE version = 16")
+            .bind("pinned_cids_repo_provenance")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let err = db
+            .run_pending_migrations()
+            .await
+            .expect_err("a name collision on a defined version must abort startup");
+
+        let collision = err
+            .downcast_ref::<MigrationVersionCollision>()
+            .expect("the collision must be a distinguishable MigrationVersionCollision");
+        assert_eq!(collision.version, 16);
+        assert_eq!(collision.recorded_name, "pinned_cids_repo_provenance");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("16"), "message must name the version: {msg}");
+        assert!(
+            msg.contains("pinned_cids_repo_provenance"),
+            "message must name the recorded name: {msg}"
+        );
+        assert!(
+            msg.contains("consumed_signatures"),
+            "message must name this build's name: {msg}"
+        );
+        // Both remedies must be offered, so the operator is not sent to the
+        // wrong one.
+        assert!(
+            msg.contains("renumber"),
+            "message must offer the renumber remedy: {msg}"
+        );
+        assert!(
+            msg.contains("DELETE FROM schema_migrations"),
+            "message must offer the stale-row remedy: {msg}"
+        );
     }
 }
 
