@@ -114,9 +114,17 @@ pub async fn pin_new_objects(
                 }
                 // F1 (#173 round 8): record this repo as an additional source for the
                 // already-pinned object (mirrors the ipfs_pin skip-branch insert) so the
-                // resolver can serve a shared object from any pin-path source.
-                if let Err(e) = db.record_pin_source(&sha, repo_id).await {
+                // resolver can serve a shared object from any pin-path source. U3 (#173):
+                // retried through the SHARED helper (this was a bare call, so a single
+                // transient error dropped the source outright) and, on exhaustion, marked
+                // durably so the resolver keeps the bounded scan fallback for the object.
+                if let Err(e) =
+                    crate::ipfs_pin::retry_db_record(|| db.record_pin_source(&sha, repo_id)).await
+                {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                    if let Err(e) = db.mark_pin_sources_incomplete(&sha).await {
+                        tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                    }
                 }
                 continue;
             }
@@ -143,15 +151,26 @@ pub async fn pin_new_objects(
                 // dag-pb/UnixFS, so its returned CID does not hash the raw content and
                 // must not become an alias `/ipfs/{cid}` serves raw git bytes for (#173).
                 let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&data).to_string();
-                if let Err(e) = db
-                    .record_pinata_cid(&sha, &raw_cid, &cid, Some(repo_id))
-                    .await
+                // U3 (#173): both records go through the shared retry helper, at parity
+                // with the ipfs_pin twin. These were bare calls, so one transient DB error
+                // permanently dropped a pin source.
+                if let Err(e) = crate::ipfs_pin::retry_db_record(|| {
+                    db.record_pinata_cid(&sha, &raw_cid, &cid, Some(repo_id))
+                })
+                .await
                 {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinata_cid in DB");
                 }
                 // F1 (#173 round 8): also record the first pinner in pin_repo_sources.
-                if let Err(e) = db.record_pin_source(&sha, repo_id).await {
+                // U3: an exhausted retry marks the set incomplete so the resolver keeps
+                // the scan fallback rather than 404ing a copy it could serve.
+                if let Err(e) =
+                    crate::ipfs_pin::retry_db_record(|| db.record_pin_source(&sha, repo_id)).await
+                {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                    if let Err(e) = db.mark_pin_sources_incomplete(&sha).await {
+                        tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                    }
                 }
                 pinned.push((sha, cid));
             }

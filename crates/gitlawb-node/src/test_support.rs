@@ -2690,6 +2690,548 @@ mod tests {
         );
     }
 
+    // ── U3 (#173): durable pin-source incompleteness marker ──────────────────
+    //
+    // `record_pin_source` is best effort at every call site, so a non-empty,
+    // below-cap source set is NOT proof of completeness: an object first pinned
+    // from a PRIVATE repo and later pushed from a PUBLIC repo whose record failed
+    // has a set that names only the private source. The resolver used to treat
+    // that set as complete and 404 an object the public repo would serve. The
+    // pinned_cids.pin_sources_incomplete marker records the miss durably so the
+    // bounded scan fallback still runs. These tests drive both arms: the marker
+    // set (fallback runs, object serves, denial still denies) and the marker
+    // clear (ordinary denials stay off the O(repos) path, INV-10).
+
+    /// Make `record_pin_source` fail for the duration of `body` by moving the
+    /// `pin_repo_sources` table out from under it, the closest honest stand-in for
+    /// the transient DB error the retry wrapper is there to absorb. Every other
+    /// pin-path query keeps working, so only the source record (and its retries)
+    /// fails, which is exactly the partial-record shape the finding turns on.
+    async fn with_pin_sources_broken<F, Fut, T>(pool: &PgPool, body: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        sqlx::query("ALTER TABLE pin_repo_sources RENAME TO pin_repo_sources_hidden")
+            .execute(pool)
+            .await
+            .expect("hide pin_repo_sources");
+        let out = body().await;
+        sqlx::query("ALTER TABLE pin_repo_sources_hidden RENAME TO pin_repo_sources")
+            .execute(pool)
+            .await
+            .expect("restore pin_repo_sources");
+        out
+    }
+
+    /// Pin `oid` from `repo_id` through the real ipfs_pin path with a mock Kubo that
+    /// must NOT be called (the object is already pinned, so this drives the
+    /// skip-branch `record_pin_source` and nothing else).
+    async fn repin_via_skip_branch(
+        state: &AppState,
+        bare: &std::path::Path,
+        oid: &str,
+        repo_id: &str,
+    ) {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+            .with_status(200)
+            .with_body(r#"{"Hash":"bafyshouldnothappen"}"#)
+            .expect(0)
+            .create_async()
+            .await;
+        crate::ipfs_pin::pin_new_objects(
+            &server.url(),
+            bare,
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            vec![oid.to_string()],
+            &state.db,
+            repo_id,
+        )
+        .await;
+        m.assert_async().await;
+    }
+
+    /// U3 scenario 1 (#173, the finding's exact case): an object first pinned from a
+    /// PRIVATE repo, then pushed from a PUBLIC repo whose `record_pin_source`
+    /// exhausts its retries. The source set is non-empty and below cap, so the old
+    /// gate called it COMPLETE and 404'd an object the public repo would happily
+    /// serve. With the durable marker the bounded scan fallback still runs and the
+    /// public copy serves. RED before the marker (404); GREEN after (200).
+    #[sqlx::test]
+    async fn ipfs_cid_incomplete_source_set_falls_back_to_scan(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3priv", "u3pub"]);
+        let priv_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3priv.git");
+        let pub_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3pub.git");
+
+        // Private first-pinner owns the only recorded source.
+        let mut priv_repo = seed_repo(&owner_did, "u3priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private");
+        let cid = pin_cid_for_repo(&priv_bare, &fx.public_oid, &state.db, &priv_repo.id).await;
+
+        // The PUBLIC repo holds the same object, but its source record never lands.
+        let pub_repo = seed_repo(&owner_did, "u3pub"); // public, no rule
+        state.db.create_repo(&pub_repo).await.expect("seed public");
+        with_pin_sources_broken(&pool, || {
+            repin_via_skip_branch(&state, &pub_bare, &fx.public_oid, &pub_repo.id)
+        })
+        .await;
+
+        // The recorded set still names only the private repo, and it is below cap.
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![priv_repo.id.clone()],
+            "the public source really did fail to record"
+        );
+        assert!(
+            !state.db.pin_sources_at_cap(&fx.public_oid).await.unwrap(),
+            "the set is below cap, so at_cap cannot be what triggers the fallback"
+        );
+
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a KNOWN-incomplete source set must keep the scan fallback so the public copy serves"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the served body is the public object's bytes"
+        );
+    }
+
+    /// U3 scenario 2 (#173, INV-10 guard): the marker must not turn ORDINARY denials
+    /// into an O(repos) fan-out. With the marker false, a non-empty below-cap source
+    /// set and a provenance miss, the request must 404 WITHOUT the scan preload ever
+    /// running. The preload counter is the both-ways proof: forcing the marker true
+    /// unconditionally turns this red (count 1), which is what keeps the assertion
+    /// from being vacuous.
+    #[sqlx::test]
+    async fn ipfs_cid_complete_source_set_never_preloads(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3only"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3only.git");
+
+        // One PRIVATE source, recorded cleanly: the set is complete and below cap.
+        let mut priv_repo = seed_repo(&owner_did, "u3only");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private");
+        let cid = pin_cid_for_repo(&bare, &fx.secret_oid, &state.db, &priv_repo.id).await;
+        state
+            .db
+            .record_pin_source(&fx.secret_oid, &priv_repo.id)
+            .await
+            .expect("record source");
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.secret_oid)
+                .await
+                .unwrap(),
+            "a clean record leaves the set marked complete"
+        );
+        assert!(
+            !state.db.pin_sources_at_cap(&fx.secret_oid).await.unwrap(),
+            "the set is below cap, so at_cap cannot be what drives the gate"
+        );
+
+        crate::api::ipfs::reset_preload_queries();
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "an anonymous caller denied by the only recorded source gets the opaque 404"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "the 404 body must not leak the withheld object"
+        );
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            0,
+            "an ordinary denial against a COMPLETE source set must never run the O(repos) preload (INV-10)"
+        );
+    }
+
+    /// U3 scenario 3 (#173): the marker is not permanent. Once a later
+    /// `record_pin_source` for the object succeeds, nothing is missing, so the marker
+    /// clears and the scan stops being triggered. BOTH sources here are private, so the
+    /// provenance walk MISSES and the request actually reaches the `needs_scan` gate:
+    /// with a marker left stuck the gate arms the O(repos) preload for an ordinary
+    /// denial forever. Drop the clear and both halves go red (marker still true, preload
+    /// 1). A public second source would make the preload half vacuous, because the
+    /// provenance path serves and returns before the gate is ever evaluated.
+    #[sqlx::test]
+    async fn ipfs_cid_marker_clears_on_a_later_successful_record(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3cfirst", "u3csecond"]);
+        let first_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3cfirst.git");
+        let second_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3csecond.git");
+
+        let mut first_repo = seed_repo(&owner_did, "u3cfirst");
+        first_repo.is_public = false;
+        state.db.create_repo(&first_repo).await.expect("seed first");
+        let cid = pin_cid_for_repo(&first_bare, &fx.secret_oid, &state.db, &first_repo.id).await;
+        let mut second_repo = seed_repo(&owner_did, "u3csecond");
+        second_repo.is_public = false;
+        state
+            .db
+            .create_repo(&second_repo)
+            .await
+            .expect("seed second");
+
+        // First push from the second repo: the source record fails, so the set is marked.
+        with_pin_sources_broken(&pool, || {
+            repin_via_skip_branch(&state, &second_bare, &fx.secret_oid, &second_repo.id)
+        })
+        .await;
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.secret_oid)
+                .await
+                .unwrap(),
+            "the exhausted record marked the set incomplete"
+        );
+
+        // A later push from the same repo records cleanly, so nothing is missing.
+        repin_via_skip_branch(&state, &second_bare, &fx.secret_oid, &second_repo.id).await;
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.secret_oid)
+                .await
+                .unwrap(),
+            "a successful record clears the marker"
+        );
+        assert_eq!(
+            state
+                .db
+                .pin_sources_for_oid(&fx.secret_oid)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the repaired set really does name both sources"
+        );
+
+        crate::api::ipfs::reset_preload_queries();
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "both sources are private, so the anonymous caller is denied"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "the 404 body must not leak the withheld object"
+        );
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            0,
+            "a repaired source set stops triggering the scan: the denial is back off the O(repos) path"
+        );
+    }
+
+    /// U3 scenario 4 (#173): the marker tracks the record's OUTCOME, not the attempt.
+    /// An exhausted retry sets it; a first-attempt success never does. Without the
+    /// second arm the first could be satisfied by marking unconditionally.
+    #[sqlx::test]
+    async fn pin_sources_incomplete_marks_only_exhausted_records(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3mark"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3mark.git");
+        let repo = seed_repo(&owner_did, "u3mark");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let _ = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &repo.id).await;
+
+        // Arm A: a first-attempt success must leave the marker alone.
+        repin_via_skip_branch(&state, &bare, &fx.public_oid, &repo.id).await;
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "a record that lands on the first attempt never marks the set incomplete"
+        );
+
+        // Arm B: an exhausted retry marks it.
+        with_pin_sources_broken(&pool, || {
+            repin_via_skip_branch(&state, &bare, &fx.public_oid, &repo.id)
+        })
+        .await;
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "an exhausted record marks the set incomplete"
+        );
+
+        // An unpinned oid has no row and must read as complete, never as missing.
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&"f".repeat(64))
+                .await
+                .unwrap(),
+            "an unpinned oid reads complete, so an unknown CID cannot arm the fallback"
+        );
+    }
+
+    /// U3 scenario 5 (#173): the Pinata pin path had BARE `record_pin_source` calls, so
+    /// one transient DB error dropped a source permanently. It now shares the ipfs_pin
+    /// retry helper and marks/clears the same marker. The elapsed-time assertion is the
+    /// retry proof: a bare call returns immediately, whereas the wrapper sleeps
+    /// `PIN_RECORD_BACKOFF` between each of `PIN_RECORD_ATTEMPTS` tries.
+    #[sqlx::test]
+    async fn pinata_pin_path_retries_and_marks_incomplete(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3pinata"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3pinata.git");
+        let repo = seed_repo(&owner_did, "u3pinata");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // Already carries a pinata_cid, so pin_new_objects takes the skip branch and the
+        // only DB write under test is the source record.
+        let (_ty, raw) = crate::git::store::read_object(&bare, &fx.public_oid)
+            .unwrap()
+            .expect("object readable");
+        let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&raw).to_string();
+        state
+            .db
+            .record_pinata_cid(&fx.public_oid, &raw_cid, "QmProvider", Some(&repo.id))
+            .await
+            .expect("seed pinata pin");
+
+        let client = reqwest::Client::new();
+        let run = |db_broken: bool| {
+            let client = client.clone();
+            let bare = bare.clone();
+            let oid = fx.public_oid.clone();
+            let repo_id = repo.id.clone();
+            let state = &state;
+            async move {
+                let mut server = mockito::Server::new_async().await;
+                let m = server
+                    .mock("POST", mockito::Matcher::Any)
+                    .with_status(200)
+                    .with_body(r#"{"data":{"cid":"QmShouldNotHappen"}}"#)
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let started = std::time::Instant::now();
+                crate::pinata::pin_new_objects(
+                    &client,
+                    &server.url(),
+                    "test-jwt",
+                    &bare,
+                    vec![oid],
+                    &state.db,
+                    &repo_id,
+                )
+                .await;
+                m.assert_async().await; // the upload is skipped: DB-only path
+                let _ = db_broken;
+                started.elapsed()
+            }
+        };
+
+        // Failing arm: retried (so it sleeps the full backoff horizon) and marked.
+        let elapsed = with_pin_sources_broken(&pool, || run(true)).await;
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "the pinata source record now RETRIES (bare call returns at once, got {elapsed:?})"
+        );
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "an exhausted pinata record marks the set incomplete, same as the ipfs_pin path"
+        );
+
+        // Recovery arm: a later successful pinata record clears it, same as ipfs_pin.
+        run(false).await;
+        assert!(
+            !state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "a successful pinata record clears the marker"
+        );
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![repo.id.clone()],
+            "the recovered record actually landed the source row"
+        );
+    }
+
+    /// U3 scenario 6 (#173, authorization): the marker arms a FALLBACK, never a bypass.
+    /// With the set marked incomplete and the object living only in a repo the caller
+    /// may not read, the scan gates every repo through the same per-caller gate, so the
+    /// caller is still denied and no bytes leak.
+    #[sqlx::test]
+    async fn ipfs_cid_marked_incomplete_still_denies_unauthorized_caller(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3deny"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3deny.git");
+        let mut priv_repo = seed_repo(&owner_did, "u3deny");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private");
+        let cid = pin_cid_for_repo(&bare, &fx.secret_oid, &state.db, &priv_repo.id).await;
+
+        // The set is marked incomplete, so the fallback scan definitely runs.
+        with_pin_sources_broken(&pool, || {
+            repin_via_skip_branch(&state, &bare, &fx.secret_oid, &priv_repo.id)
+        })
+        .await;
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.secret_oid)
+                .await
+                .unwrap(),
+            "the marker is set, so the scan fallback is armed for this object"
+        );
+
+        crate::api::ipfs::reset_preload_queries();
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            crate::api::ipfs::preload_queries(),
+            1,
+            "the fallback really did run (otherwise the denial below proves nothing)"
+        );
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "the fallback scan gates every repo, so an unauthorized caller is still denied"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "the denial must not leak the withheld object's bytes"
+        );
+    }
+
+    /// U3 scenario 7 (#173, INV-7 upgrade path): a node already past v14 gets
+    /// `pinned_cids.pin_sources_incomplete` from the NEW v15 migration, re-running the
+    /// migrations is idempotent, and a row written before the column existed reads as
+    /// COMPLETE (so an upgrade cannot arm the O(repos) fallback for every legacy pin).
+    #[sqlx::test]
+    async fn pinned_cids_sources_incomplete_upgrade_path(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+
+        // Pre-v15 shape: drop the column and forget v15 was applied.
+        sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS pin_sources_incomplete")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 15")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+            .bind("preu3oid")
+            .bind("preu3cid")
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        state.db.run_migrations().await.expect("re-migrate");
+        state
+            .db
+            .run_migrations()
+            .await
+            .expect("migrations are idempotent: a second run succeeds");
+
+        assert!(
+            !state.db.pin_sources_incomplete("preu3oid").await.unwrap(),
+            "a row predating the column reads COMPLETE, so the upgrade arms no fallback"
+        );
+        state
+            .db
+            .mark_pin_sources_incomplete("preu3oid")
+            .await
+            .expect("mark after upgrade");
+        assert!(
+            state.db.pin_sources_incomplete("preu3oid").await.unwrap(),
+            "the v15 column is present and writable after the upgrade"
+        );
+    }
+
     /// #173 (jatmn round 8, F2 — load-bearing): a legacy `pinned_cids` row keyed on a
     /// PROVIDER CID (Pinata/Kubo dag-pb — every release before this branch stored the
     /// provider CID as the resolver key, not the raw-content CID) must NOT serve raw git

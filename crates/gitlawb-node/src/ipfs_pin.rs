@@ -22,13 +22,12 @@ const PIN_RECORD_BACKOFF: Duration = Duration::from_millis(50);
 /// so a dropped `record_pin_source`/`record_pinned_cid` makes `GET /ipfs/{cid}`
 /// 404 a valid public copy. Every wrapped insert is idempotent (`ON CONFLICT DO
 /// NOTHING` / provenance-preserving upsert), so re-running is safe. On exhausted
-/// attempts the last error is returned and the caller keeps its warn — behavior
-/// degrades to the pre-retry state, not worse. Process death mid-retry or a DB
-/// outage outlasting the backoff horizon leaves the same residual hole (no
-/// persisted marker to reconcile from at startup), retired only by a future
-/// reconciliation sweep. Runs inside the already-detached post-push task, so the
-/// backoff adds no push latency.
-async fn retry_db_record<F, Fut>(mut op: F) -> Result<()>
+/// attempts the last error is returned and the caller records the durable
+/// `pin_sources_incomplete` marker (U3, #173), which is what keeps the resolver's
+/// bounded scan fallback available for that object instead of 404ing a public copy.
+/// Shared with the `pinata.rs` twin so both pin paths retry identically. Runs
+/// inside the already-detached post-push task, so the backoff adds no push latency.
+pub(crate) async fn retry_db_record<F, Fut>(mut op: F) -> Result<()>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<()>>,
@@ -254,6 +253,14 @@ pub async fn pin_new_objects(
                 // when this repo would serve it. Bounded per object (MAX_PIN_SOURCES).
                 if let Err(e) = retry_db_record(|| db.record_pin_source(&sha, repo_id)).await {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
+                    // U3 (#173): the retries are spent and this repo is NOT in the source
+                    // set, so the set is known incomplete. Persist that, or the resolver
+                    // reads a non-empty below-cap set as COMPLETE and 404s an object this
+                    // repo would serve. Warn-only in turn: if the marker write also fails
+                    // the object degrades to the pre-U3 behavior, never worse.
+                    if let Err(e) = db.mark_pin_sources_incomplete(&sha).await {
+                        tracing::warn!(sha = %sha, err = %e, "failed to mark pin sources incomplete");
+                    }
                 }
                 // R8 (#173 round 10): opportunistically repair a legacy provider-CID
                 // row (Kubo dag-pb / Pinata) to the raw-content resolver key on this
@@ -300,15 +307,18 @@ pub async fn pin_new_objects(
                 // verifies them against the requested CID, so the raw CID is the correct
                 // key. Mirrors the pinata twin, which already records the raw CID.
                 let raw_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&data).to_string();
+                // F1 (#173 round 8): the first pinner is recorded in pin_repo_sources too,
+                // so every source (first and subsequent) is tried uniformly by the
+                // resolver. U3 (#173): the pin and its source go down in ONE transaction.
+                // As two independent best-effort calls this path could land the pin while
+                // dropping its own source, producing a source set silently missing its
+                // first pinner; atomically there is no such window, and a total failure
+                // leaves the object unpinned so the next push retries the whole thing.
                 if let Err(e) =
-                    retry_db_record(|| db.record_pinned_cid(&sha, &raw_cid, Some(repo_id))).await
+                    retry_db_record(|| db.record_pinned_cid_with_source(&sha, &raw_cid, repo_id))
+                        .await
                 {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinned CID in DB");
-                }
-                // F1 (#173 round 8): also record the first pinner in pin_repo_sources so
-                // every source (first and subsequent) is tried uniformly by the resolver.
-                if let Err(e) = retry_db_record(|| db.record_pin_source(&sha, repo_id)).await {
-                    tracing::warn!(sha = %sha, err = %e, "failed to record pin source");
                 }
                 // Return the provider Hash (not the resolver key), mirroring the pinata
                 // twin's contract: the DB `cid` is the raw resolver key (recorded above),
