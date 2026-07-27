@@ -518,37 +518,53 @@ pub async fn verify_anchor(
         //    pusher, node, ts) — seq, prev, and proof fields are excluded so
         //    that the hash chain is stable across certificate versions.
         //    Fail closed: a missing declared predecessor is treated as invalid.
+        //
+        //    Legacy certificates backfilled by the v13 migration have the
+        //    default all-zeros prev even when seq > 1 because the migration
+        //    only assigns sequence numbers without computing prev hashes.
+        //    For these rows the chain link is unknown — skip the check and
+        //    warn rather than reporting a valid signature as invalid.
         if c.seq > 1 {
-            match db.get_cert_by_seq(&c.repo_id, c.seq - 1).await {
-                Ok(Some(pred)) => {
-                    let prev_payload = serde_json::json!({
-                        "repo_id":    pred.repo_id,
-                        "ref":        pred.ref_name,
-                        "old":        pred.old_sha,
-                        "new":        pred.new_sha,
-                        "pusher":     pred.pusher_did,
-                        "node":       pred.node_did,
-                        "ts":         pred.issued_at,
-                    });
-                    let prev_bytes = serde_json::to_vec(&prev_payload)?;
-                    let expected_prev = hex::encode(sha2::Sha256::digest(&prev_bytes));
-                    if c.prev != expected_prev {
+            if c.prev == "0000000000000000000000000000000000000000000000000000000000000000" {
+                // Prevent legacy false-positives: the migration that assigned
+                // seq never backfilled prev, so every pre-upgrade cert after
+                // the first in a repo has default all-zeros.
+                tracing::warn!(
+                    "legacy certificate seq {} has default prev — chain continuity not verifiable, skipping prev check",
+                    c.seq
+                );
+            } else {
+                match db.get_cert_by_seq(&c.repo_id, c.seq - 1).await {
+                    Ok(Some(pred)) => {
+                        let prev_payload = serde_json::json!({
+                            "repo_id":    pred.repo_id,
+                            "ref":        pred.ref_name,
+                            "old":        pred.old_sha,
+                            "new":        pred.new_sha,
+                            "pusher":     pred.pusher_did,
+                            "node":       pred.node_did,
+                            "ts":         pred.issued_at,
+                        });
+                        let prev_bytes = serde_json::to_vec(&prev_payload)?;
+                        let expected_prev = hex::encode(sha2::Sha256::digest(&prev_bytes));
+                        if c.prev != expected_prev {
+                            errors.push(format!(
+                                "prev hash mismatch: claimed {} expected {}",
+                                c.prev, expected_prev
+                            ));
+                        }
+                    }
+                    Ok(None) => {
                         errors.push(format!(
-                            "prev hash mismatch: claimed {} expected {}",
-                            c.prev, expected_prev
+                            "predecessor cert seq {} not found for repo {}",
+                            c.seq - 1,
+                            c.repo_id
                         ));
                     }
-                }
-                Ok(None) => {
-                    errors.push(format!(
-                        "predecessor cert seq {} not found for repo {}",
-                        c.seq - 1,
-                        c.repo_id
-                    ));
-                }
-                Err(e) => {
-                    tracing::warn!("predecessor lookup failed for seq {}: {e}", c.seq - 1);
-                    errors.push(format!("error looking up predecessor seq {}", c.seq - 1));
+                    Err(e) => {
+                        tracing::warn!("predecessor lookup failed for seq {}: {e}", c.seq - 1);
+                        errors.push(format!("error looking up predecessor seq {}", c.seq - 1));
+                    }
                 }
             }
         }
