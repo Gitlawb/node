@@ -158,6 +158,36 @@ pub fn build_signing_string(
     Ok(lines.join("\n"))
 }
 
+/// Render `COVERED_COMPONENTS` as the parenthesised component list that goes
+/// inside `Signature-Input`, e.g. `"@method" "@path" "content-digest"`.
+///
+/// Both the wire header and [`build_signing_string`]'s input are built from
+/// this one source. Writing the list out by hand in the header while passing
+/// the const to the signing-string builder lets a client sign over one set
+/// while advertising another, which no verifier can reconcile.
+fn covered_components_list() -> String {
+    COVERED_COMPONENTS
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The request-derived value for every component this signer knows how to
+/// cover. Kept alongside [`covered_components_list`] so the guard test can
+/// check the two agree without signing anything.
+fn request_values_for(
+    method: &str,
+    path_and_query: &str,
+    content_digest: &str,
+) -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    values.insert("@method".to_string(), method.to_uppercase());
+    values.insert("@path".to_string(), path_and_query.to_string());
+    values.insert("content-digest".to_string(), content_digest.to_string());
+    values
+}
+
 /// Sign an HTTP request per RFC 9421 and return the three headers to inject.
 pub fn sign_request(
     keypair: &Keypair,
@@ -169,22 +199,24 @@ pub fn sign_request(
     let content_digest = compute_content_digest(body);
     let did = keypair.did();
 
-    // Full Signature-Input header value
-    let signature_input = format!(
-        r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
-    );
+    // Full Signature-Input header value. The advertised component list is
+    // derived from COVERED_COMPONENTS rather than written out, so the wire
+    // header and the list we actually sign over cannot drift apart.
+    let advertised = covered_components_list();
+    let signature_input =
+        format!(r#"sig1=({advertised});keyid="{did}";alg="ed25519";created={created}"#);
 
     // The @signature-params component value is the part after "sig1="
     let sig_params_value = &signature_input["sig1=".len()..];
 
-    let mut request_values = HashMap::new();
-    request_values.insert("@method".to_string(), method.to_uppercase());
-    request_values.insert("@path".to_string(), path_and_query.to_string());
-    request_values.insert("content-digest".to_string(), content_digest.clone());
+    let request_values = request_values_for(method, path_and_query, &content_digest);
 
+    // Guarded by `sign_request_supplies_every_covered_component`: that test
+    // fails cleanly if COVERED_COMPONENTS gains an entry `request_values_for`
+    // cannot supply, which is the only way this could fail.
     let signing_string =
         build_signing_string(COVERED_COMPONENTS, sig_params_value, &request_values)
-            .expect("required components always present when building");
+            .expect("request_values_for covers COVERED_COMPONENTS (see guard test)");
 
     let sig_bytes = keypair.sign(signing_string.as_bytes());
     let sig_b64 = STANDARD.encode(sig_bytes.to_bytes());
@@ -321,6 +353,39 @@ mod tests {
         assert!(d.ends_with(':'));
         // SHA-256 of empty string is well-known
         assert!(d.len() > 12);
+    }
+
+    /// U1 guard: the component list on the wire must be exactly what we sign
+    /// over. Load-bearing by mutation, not by red-then-green: adding a fourth
+    /// entry to COVERED_COMPONENTS turns this red.
+    #[test]
+    fn signature_input_advertises_exactly_covered_components() {
+        let kp = Keypair::generate();
+        let headers = sign_request(&kp, "POST", "/api/test", b"body");
+        let parsed = HttpSignature::parse(&headers.signature_input, &headers.signature)
+            .expect("emitted Signature-Input must parse");
+        assert_eq!(
+            parsed.components, COVERED_COMPONENTS,
+            "the advertised component list drifted from COVERED_COMPONENTS"
+        );
+    }
+
+    /// U1 guard: every covered component must have a request-derived value.
+    /// This is the check that fails *cleanly* when COVERED_COMPONENTS grows,
+    /// instead of letting sign_request panic inside build_signing_string.
+    #[test]
+    fn sign_request_supplies_every_covered_component() {
+        let values = request_values_for("POST", "/api/test", "sha-256=:abc:");
+        let missing: Vec<&str> = COVERED_COMPONENTS
+            .iter()
+            .copied()
+            .filter(|c| !values.contains_key(*c))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "COVERED_COMPONENTS entries with no value in request_values_for: {missing:?}. \
+             sign_request would panic on every call; add the value or drop the component."
+        );
     }
 
     #[test]
