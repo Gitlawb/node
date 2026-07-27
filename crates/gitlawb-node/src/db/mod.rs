@@ -936,9 +936,6 @@ const MIGRATIONS: &[Migration] = &[
 /// its own status code: a replay is the client's fault and is permanent for
 /// that signature, whereas a full identity ledger is a rate condition the same
 /// client can retry once its live rows expire.
-// Only the tests consume this so far; the middleware that charges signatures
-// against the ledger lands separately.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum ConsumeSignature {
@@ -963,7 +960,6 @@ pub enum ConsumeSignature {
 /// from one identity, an order of magnitude above any real client (a push plus
 /// its API calls is tens of requests), while capping one identity's worst case
 /// at roughly 512 rows of ~100 bytes.
-#[allow(dead_code)] // read by `consume_signature`, which the middleware wires up separately
 pub const MAX_LIVE_SIGNATURES_PER_KEYID: i64 = 512;
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1434,7 +1430,6 @@ impl Db {
     /// NOTHING` is what makes the check atomic: two concurrent replays of the
     /// same signature cannot both win, because the primary key arbitrates. A
     /// separate SELECT first would reintroduce exactly that race.
-    #[allow(dead_code)] // called by the signature-consuming middleware, added separately
     pub async fn consume_signature(
         &self,
         sig_hash: &str,

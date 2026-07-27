@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -29,9 +29,6 @@ pub struct AuthenticatedDid(pub String);
 /// what collapses those variants to a single ledger key. The signing string also
 /// embeds `keyid` and `created` through its `@signature-params` line, so the
 /// hash cannot collide across DIDs.
-// The layer that consumes this lands separately (#253 U6); nothing reads the
-// fields yet, which is why the whole struct is allowed to look dead.
-#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SignatureIdentity {
     /// The signing DID, as it appeared in the `keyid` parameter.
@@ -397,6 +394,135 @@ pub async fn require_ucan_chain(
 
     tracing::debug!(did = %signer_did, "UCAN chain validated");
     next.run(request).await
+}
+
+/// How long a spent signature stays in the ledger, in seconds.
+///
+/// Retention must cover the whole window in which the signature would still be
+/// accepted, or a key is evicted while its signature still passes the time
+/// check. `check_created` accepts a request when `created` falls in
+/// `[now - 300, now + 30]`, so for one fixed signature the acceptable *arrival*
+/// window is `[created - 30, created + 300]`: 330 seconds wide. Expiry is
+/// computed from arrival rather than from `created`, which can only over-retain
+/// (an early arrival is charged the full 330s from when it landed), never
+/// under-retain.
+const SIGNATURE_LEDGER_TTL_SECS: i64 = 330;
+
+/// The ledger key for a verified signature: always a 64-character hex SHA-256,
+/// which is what the `consumed_signatures` CHECK constraint requires.
+///
+/// Two disjoint schemes, kept apart by a domain tag so a nonce key can never
+/// collide with a signing-string key:
+///   * with a nonce, `(keyid, nonce)` — short, fixed-width, and it lets two
+///     legitimately identical requests be told apart;
+///   * without one, the signing-string hash, which is canonical by construction
+///     and collapses whitespace variants of the `Signature` header onto one key.
+fn ledger_key(identity: &SignatureIdentity) -> String {
+    let mut hasher = Sha256::new();
+    match identity.nonce.as_deref() {
+        Some(nonce) => {
+            hasher.update(b"gitlawb/sig-nonce\x00");
+            hasher.update(identity.keyid.as_bytes());
+            hasher.update(b"\x00");
+            hasher.update(nonce.as_bytes());
+        }
+        None => {
+            hasher.update(b"gitlawb/sig-string\x00");
+            hasher.update(identity.signing_string_hash.as_bytes());
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn ledger_rejection(status: StatusCode, code: &'static str, message: &str) -> Response {
+    (
+        status,
+        [("X-Gitlawb-Error", code)],
+        Json(json!({ "error": code, "message": message })),
+    )
+        .into_response()
+}
+
+/// Axum middleware that spends a verified HTTP signature exactly once.
+///
+/// Layer it so it runs *after* [`require_signature`] (which publishes the
+/// [`SignatureIdentity`] read here) and after [`require_ucan_chain`], but before
+/// the handler. Consuming last means only a request that cleared every auth
+/// check spends its signature, so a valid signature paired with a rejected UCAN
+/// can be retried with the same bytes; consuming before the handler is what
+/// closes the concurrent-replay race.
+pub async fn consume_signature(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    // Skip reads. `write_routes` chains `PUT/DELETE/GET` on one path
+    // (`/api/v1/repos/{owner}/{repo}/visibility`, `server.rs`), so
+    // `list_visibility` is served by a router inside `add_auth_layers` and `gl`
+    // drives it through `get_signed`. Ledgering there would put a database write
+    // on the signed read path, which R7 forbids. A method check is the general
+    // form of that exclusion and needs no router split: replaying a read has no
+    // side effect to spend.
+    if matches!(*request.method(), Method::GET | Method::HEAD) {
+        return next.run(request).await;
+    }
+
+    let identity = match request.extensions().get::<SignatureIdentity>() {
+        Some(identity) => identity.clone(),
+        None => {
+            // Fail closed. If this passed the request through, a wrong layer
+            // order would silently delete the replay defense while every test
+            // that exercises the correct stack kept passing.
+            tracing::error!(
+                path = %request.uri().path(),
+                "signature ledger reached without a verified SignatureIdentity — check the layer order",
+            );
+            return ledger_rejection(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "signature_identity_missing",
+                "the request reached the signature ledger without a verified identity",
+            );
+        }
+    };
+
+    let key = ledger_key(&identity);
+    let now = chrono::Utc::now().timestamp();
+    match state
+        .db
+        .consume_signature(&key, &identity.keyid, now, now + SIGNATURE_LEDGER_TTL_SECS)
+        .await
+    {
+        Ok(crate::db::ConsumeSignature::Inserted) => next.run(request).await,
+        Ok(crate::db::ConsumeSignature::Replayed) => {
+            tracing::warn!(did = %identity.keyid, "rejected a replayed HTTP signature");
+            ledger_rejection(
+                StatusCode::CONFLICT,
+                "signature_replayed",
+                "this signature has already been used — sign a fresh request",
+            )
+        }
+        Ok(crate::db::ConsumeSignature::IdentityLedgerFull) => {
+            // A rate condition, not a permanent rejection: the caller's live
+            // rows drain as they expire, so this is retryable.
+            tracing::warn!(did = %identity.keyid, "signature ledger full for this identity");
+            ledger_rejection(
+                StatusCode::TOO_MANY_REQUESTS,
+                "signature_ledger_full",
+                "too many unexpired signatures for this identity — retry shortly",
+            )
+        }
+        Err(e) => {
+            // Fail closed (KTD5). An outage is exactly when a holder of a
+            // captured signature would try, and the mutation handlers all need
+            // the same database anyway.
+            tracing::error!(did = %identity.keyid, err = %e, "signature ledger unavailable");
+            ledger_rejection(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "signature_ledger_unavailable",
+                "the signature ledger is unavailable — retry shortly",
+            )
+        }
+    }
 }
 
 fn human_detected(message: &str) -> impl IntoResponse {

@@ -42,12 +42,23 @@ async fn graphql_playground() -> impl IntoResponse {
     ))
 }
 
-/// Applies the standard auth middleware pair to a router: HTTP Signature verification
-/// followed by UCAN chain validation. The two layers run in this order for every
-/// matched request: `require_signature` first (sets `AuthenticatedDid`), then
-/// `require_ucan_chain` (reads it).
+/// Applies the standard auth middleware stack to a router. Axum runs the LAST
+/// `.layer` first, so the three below run in this order for every matched
+/// request: `require_signature` (verifies the RFC 9421 signature, sets
+/// `AuthenticatedDid` and `SignatureIdentity`), then `require_ucan_chain`
+/// (reads the DID), then `consume_signature` (spends the signature).
+///
+/// The ledger runs LAST on purpose. If it ran before `require_ucan_chain`, a
+/// request with a good signature but a rejected UCAN would burn its key and the
+/// client could not retry those exact bytes. Consuming after every auth check
+/// but still before the handler is what closes the concurrent-replay race
+/// without penalizing a request that was never going to run.
 fn add_auth_layers(router: Router<AppState>, state: AppState) -> Router<AppState> {
     router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::consume_signature,
+        ))
         .layer(middleware::from_fn_with_state(
             state,
             auth::require_ucan_chain,

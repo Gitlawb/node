@@ -5215,22 +5215,36 @@ mod tests {
             .expect("serialize task body")
         }
 
-        /// A single route mounted under the PRODUCTION `require_signature`, so the
+        /// A single route mounted under the PRODUCTION auth stack, so the
         /// signature is really verified rather than injected via `signed_request_as`.
+        /// The layer order mirrors `add_auth_layers` (`server.rs`): the last
+        /// `.layer` runs first, so `require_signature` verifies and publishes the
+        /// identity, then `consume_signature` spends it.
+        ///
+        /// The GET arm on the same path mirrors the production
+        /// `PUT/DELETE/GET` visibility route: it exists so a test can assert the
+        /// ledger stays untouched on a signed read (R7).
         fn router(state: AppState) -> Router {
             Router::new()
-                .route(PATH, axum::routing::post(crate::api::tasks::create_task))
+                .route(
+                    PATH,
+                    axum::routing::post(crate::api::tasks::create_task).get(probe_handler),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::auth::consume_signature,
+                ))
                 .layer(axum::middleware::from_fn(crate::auth::require_signature))
                 .with_state(state)
         }
 
-        async fn send(
+        async fn send_full(
             state: &AppState,
             signature: &str,
             signature_input: &str,
             content_digest: &str,
             body: &[u8],
-        ) -> StatusCode {
+        ) -> axum::response::Response {
             let req = Request::builder()
                 .method(Method::POST)
                 .uri(PATH)
@@ -5244,7 +5258,35 @@ mod tests {
                 .oneshot(req)
                 .await
                 .expect("router response")
+        }
+
+        async fn send(
+            state: &AppState,
+            signature: &str,
+            signature_input: &str,
+            content_digest: &str,
+            body: &[u8],
+        ) -> StatusCode {
+            send_full(state, signature, signature_input, content_digest, body)
+                .await
                 .status()
+        }
+
+        /// Read the `error` code out of a rejection body.
+        async fn error_code(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            json["error"].as_str().unwrap_or_default().to_string()
+        }
+
+        async fn ledger_rows(pool: &PgPool) -> i64 {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM consumed_signatures")
+                .fetch_one(pool)
+                .await
+                .expect("count ledger rows")
         }
 
         /// Sign with an arbitrary `created` and an optional extra `Signature-Input`
@@ -5277,7 +5319,6 @@ mod tests {
 
         /// #253 limb 1: a captured signature must be single-use.
         /// Observed today: 201, 201, 201 and three distinct `agent_tasks` rows.
-        #[ignore = "RED until #253 is fixed: no spent-signature ledger exists"]
         #[sqlx::test]
         async fn replayed_signature_is_rejected(pool: PgPool) {
             let kp = Keypair::generate();
@@ -5300,7 +5341,7 @@ mod tests {
                 "the genuine request must succeed"
             );
 
-            let second = send(
+            let second = send_full(
                 &state,
                 &signed.signature,
                 &signed.signature_input,
@@ -5308,10 +5349,15 @@ mod tests {
                 &body,
             )
             .await;
-            assert_ne!(
-                second,
-                StatusCode::CREATED,
-                "a replayed signature must not be accepted a second time"
+            assert_eq!(
+                second.status(),
+                StatusCode::CONFLICT,
+                "a replayed signature must be rejected with the ledger's own 409"
+            );
+            assert_eq!(
+                error_code(second).await,
+                "signature_replayed",
+                "the denial must come from the ledger, not an earlier layer"
             );
 
             let tasks = state
@@ -5327,7 +5373,6 @@ mod tests {
         /// surrounding whitespace, and `HttpSignature::parse` trims internally, so a
         /// ledger keyed on the raw header text is defeated by one space. Each variant
         /// below is a distinct byte string that verifies identically today.
-        #[ignore = "RED until #253 is fixed: key the ledger on the signing-string hash"]
         #[sqlx::test]
         async fn whitespace_variants_are_rejected_as_replays(pool: PgPool) {
             let kp = Keypair::generate();
@@ -5351,7 +5396,7 @@ mod tests {
                 format!("{} ", signed.signature),
                 format!("\t{}", signed.signature),
             ] {
-                let code = send(
+                let resp = send_full(
                     &state,
                     &variant,
                     &signed.signature_input,
@@ -5359,10 +5404,15 @@ mod tests {
                     &body,
                 )
                 .await;
-                assert_ne!(
-                    code,
-                    StatusCode::CREATED,
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::CONFLICT,
                     "whitespace-padded replay must be rejected: {variant:?}"
+                );
+                assert_eq!(
+                    error_code(resp).await,
+                    "signature_replayed",
+                    "the whitespace variant must collide on the ledger key: {variant:?}"
                 );
             }
         }
@@ -5675,6 +5725,389 @@ mod tests {
                 "the handler must never run for an unverified request: {json}"
             );
             assert_eq!(json["error"], serde_json::json!("invalid_signature"));
+        }
+
+        // ── U6: the `consume_signature` ledger layer ─────────────────────────
+
+        /// U6 scenario 3: the layer must spend signatures, not refuse them. A
+        /// never-seen signature reaches the handler exactly as before.
+        #[sqlx::test]
+        async fn fresh_signature_reaches_the_handler(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool.clone()).await;
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+
+            assert_eq!(
+                send(
+                    &state,
+                    &signed.signature,
+                    &signed.signature_input,
+                    &signed.content_digest,
+                    &body,
+                )
+                .await,
+                StatusCode::CREATED,
+                "a fresh signature must still reach the handler"
+            );
+            assert_eq!(
+                ledger_rows(&pool).await,
+                1,
+                "a mutation must spend exactly one ledger row"
+            );
+        }
+
+        /// U6 scenario 4: two requests that differ only by their nonce are two
+        /// distinct ledger keys, so a client repeating a legitimate mutation is
+        /// never mistaken for a replay.
+        #[sqlx::test]
+        async fn distinct_nonces_are_not_replays(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool.clone()).await;
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp();
+
+            let (sig_a, input_a, digest) =
+                sign_with(&kp, &body, created, r#";nonce="0123456789abcdef""#);
+            let (sig_b, input_b, _) =
+                sign_with(&kp, &body, created, r#";nonce="fedcba9876543210""#);
+
+            assert_eq!(
+                send(&state, &sig_a, &input_a, &digest, &body).await,
+                StatusCode::CREATED
+            );
+            assert_eq!(
+                send(&state, &sig_b, &input_b, &digest, &body).await,
+                StatusCode::CREATED,
+                "a fresh nonce over identical bytes must not be treated as a replay"
+            );
+            assert_eq!(
+                ledger_rows(&pool).await,
+                2,
+                "each nonce must claim its own ledger row"
+            );
+        }
+
+        /// U6 scenario 5, the documented R3 consequence: a pre-nonce signer that
+        /// repeats a byte-identical mutation inside one second is rejected, because
+        /// the fallback key is the signing-string hash and `created` is
+        /// whole-second. Un-upgraded clients must re-sign in the next second.
+        #[sqlx::test]
+        async fn identical_nonceless_requests_in_one_second_are_replays(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool).await;
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp();
+
+            let (sig, input, digest) = sign_with(&kp, &body, created, "");
+            assert_eq!(
+                send(&state, &sig, &input, &digest, &body).await,
+                StatusCode::CREATED
+            );
+
+            let resp = send_full(&state, &sig, &input, &digest, &body).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::CONFLICT,
+                "a nonce-less signer repeating identical bytes in one second is a replay"
+            );
+            assert_eq!(error_code(resp).await, "signature_replayed");
+
+            // Same again with a whitespace-padded `Signature` header. This is the
+            // FALLBACK branch of the ledger key, so it is where keying on the
+            // signing-string hash rather than on header text actually earns its
+            // keep — the nonce branch is trivially header-independent.
+            let resp = send_full(&state, &format!(" {sig}\t"), &input, &digest, &body).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::CONFLICT,
+                "whitespace must not mint a fresh key on the hash-fallback branch"
+            );
+            assert_eq!(error_code(resp).await, "signature_replayed");
+        }
+
+        /// U6 scenario 6 (R7): no database write on the signed READ path. The GET
+        /// arm shares the path with the POST, exactly like the production
+        /// `PUT/DELETE/GET` visibility route, so the skip has to be method-based.
+        #[sqlx::test]
+        async fn signed_get_is_not_ledgered(pool: PgPool) {
+            let kp = Keypair::generate();
+            let state = test_state(pool.clone()).await;
+            let signed = sign_request(&kp, "GET", PATH, b"");
+
+            for _ in 0..2 {
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(PATH)
+                    .header("content-digest", &signed.content_digest)
+                    .header("signature-input", &signed.signature_input)
+                    .header("signature", &signed.signature)
+                    .body(Body::empty())
+                    .expect("request builder");
+                let resp = router(state.clone())
+                    .oneshot(req)
+                    .await
+                    .expect("router response");
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "a signed GET must pass through, and replaying one must too"
+                );
+            }
+
+            assert_eq!(
+                ledger_rows(&pool).await,
+                0,
+                "a signed read must write no ledger row (R7)"
+            );
+        }
+
+        /// U6 scenario 7 (KTD8): `gl` hands the `reqwest::Response` back untouched
+        /// and reading the JSON body consumes it, so the replay 409 has to be
+        /// distinguishable from the existing `repo_exists` 409 by HEADER alone.
+        #[sqlx::test]
+        async fn replay_rejection_carries_the_error_header(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool).await;
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+
+            let args = (
+                signed.signature.clone(),
+                signed.signature_input.clone(),
+                signed.content_digest.clone(),
+            );
+            assert_eq!(
+                send(&state, &args.0, &args.1, &args.2, &body).await,
+                StatusCode::CREATED
+            );
+
+            let resp = send_full(&state, &args.0, &args.1, &args.2, &body).await;
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                resp.headers()
+                    .get("x-gitlawb-error")
+                    .and_then(|v| v.to_str().ok()),
+                Some("signature_replayed"),
+                "the 409 must be told apart by header, not only by body"
+            );
+        }
+
+        /// U6 scenario 8: the guard must fail CLOSED when the identity extension
+        /// is absent. Without this, a wrong layer order silently removes the whole
+        /// defense and every test that exercises the correct stack still passes.
+        #[sqlx::test]
+        async fn missing_signature_identity_fails_closed(pool: PgPool) {
+            let state = test_state(pool.clone()).await;
+            // Deliberately NO `require_signature` in front, so nothing publishes
+            // the extension.
+            let app = Router::new()
+                .route(PATH, axum::routing::post(probe_handler))
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::auth::consume_signature,
+                ))
+                .with_state(state);
+
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(PATH)
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("request builder");
+            let resp = app.oneshot(req).await.expect("router response");
+            assert_eq!(
+                resp.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "an absent identity must not pass through"
+            );
+            assert_eq!(error_code(resp).await, "signature_identity_missing");
+            assert_eq!(
+                ledger_rows(&pool).await,
+                0,
+                "nothing may be charged when there is no identity"
+            );
+        }
+
+        /// U6 scenario 9: the per-identity cap surfaces as a retryable 429 with its
+        /// own code, not as a replay. Seeded straight through SQL so the test does
+        /// not have to sign 512 requests.
+        #[sqlx::test]
+        async fn ledger_full_surfaces_as_too_many_requests(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool.clone()).await;
+
+            sqlx::query(
+                "INSERT INTO consumed_signatures (sig_hash, keyid, expires_at)
+                 SELECT md5(i::text) || md5((i + 1)::text), $1, $2
+                 FROM generate_series(1, $3) AS i",
+            )
+            .bind(&did)
+            .bind(9_000_000_000i64)
+            .bind(crate::db::MAX_LIVE_SIGNATURES_PER_KEYID)
+            .execute(&pool)
+            .await
+            .expect("seed a full ledger for this keyid");
+
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+            let resp = send_full(
+                &state,
+                &signed.signature,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "a capped identity gets a retryable rate condition, not a 409"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("x-gitlawb-error")
+                    .and_then(|v| v.to_str().ok()),
+                Some("signature_ledger_full")
+            );
+            assert_eq!(error_code(resp).await, "signature_ledger_full");
+        }
+
+        /// U6 scenario 10 (KTD5): an unavailable ledger must fail CLOSED. Dropping
+        /// the table is the cleanest way to make the accessor return `Err` against
+        /// a real database.
+        #[sqlx::test]
+        async fn ledger_error_fails_closed(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool.clone()).await;
+            sqlx::query("DROP TABLE consumed_signatures")
+                .execute(&pool)
+                .await
+                .expect("drop the ledger to force a query error");
+
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+            let resp = send_full(
+                &state,
+                &signed.signature,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "an unreachable ledger must reject, never wave the request through"
+            );
+            assert_eq!(error_code(resp).await, "signature_ledger_unavailable");
+
+            let tasks = state
+                .db
+                .list_tasks(None, None, 100)
+                .await
+                .expect("list tasks");
+            assert_eq!(
+                tasks.iter().filter(|t| t.delegator_did == did).count(),
+                0,
+                "the handler must not have run"
+            );
+        }
+
+        /// [`send_full`], but through the real `build_router` (so the request
+        /// runs the production `add_auth_layers` stack, `require_ucan_chain`
+        /// included) and with an optional `X-Ucan`. [`router`] mounts only two of
+        /// the three layers, so nothing there can observe what the ledger does
+        /// when a LATER auth check denies the request; a mirrored copy of the
+        /// stack would not catch a reordering of the real one either.
+        ///
+        /// `X-Ucan` is not a covered component, so setting or dropping it leaves
+        /// the signed bytes bit-identical.
+        async fn send_full_auth(
+            state: &AppState,
+            signed: &(String, String, String),
+            body: &[u8],
+            ucan: Option<&str>,
+        ) -> axum::response::Response {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri(PATH)
+                .header("content-type", "application/json")
+                .header("content-digest", &signed.2)
+                .header("signature-input", &signed.1)
+                .header("signature", &signed.0);
+            if let Some(token) = ucan {
+                builder = builder.header("x-ucan", token);
+            }
+            let req = builder
+                .body(Body::from(body.to_vec()))
+                .expect("request builder");
+            crate::server::build_router(state.clone())
+                .oneshot(req)
+                .await
+                .expect("router response")
+        }
+
+        /// The layer ORDER in `add_auth_layers` is load-bearing: the ledger runs
+        /// last so that a request denied by `require_ucan_chain` never spends its
+        /// key. Swap those two `.layer` calls and a good signature carrying a bad
+        /// UCAN is burned on the way to its 401, so the client cannot retry those
+        /// exact bytes and gets a 409 `signature_replayed` instead of the real
+        /// UCAN error.
+        #[sqlx::test]
+        async fn a_ucan_rejection_does_not_burn_the_signature(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool.clone()).await;
+            let body = task_body(&did);
+            let sig = sign_request(&kp, "POST", PATH, &body);
+            let signed = (sig.signature, sig.signature_input, sig.content_digest);
+
+            // Valid signature, undecodable UCAN: `require_ucan_chain` denies it.
+            let denied =
+                send_full_auth(&state, &signed, &body, Some("invalid-token-structure")).await;
+            assert_eq!(
+                denied.status(),
+                StatusCode::UNAUTHORIZED,
+                "the UCAN layer must deny this, not the ledger"
+            );
+            assert_eq!(
+                error_code(denied).await,
+                "invalid_ucan",
+                "the caller must see the UCAN error, never `signature_replayed`"
+            );
+            assert_eq!(
+                ledger_rows(&pool).await,
+                0,
+                "a request denied after the signature verified must spend no ledger row"
+            );
+
+            // The same signed bytes again, this time with no UCAN to reject.
+            let retry = send_full_auth(&state, &signed, &body, None).await;
+            assert_eq!(
+                retry
+                    .headers()
+                    .get("x-gitlawb-error")
+                    .and_then(|v| v.to_str().ok()),
+                None,
+                "the retry must not be rejected by the ledger"
+            );
+            assert_eq!(
+                retry.status(),
+                StatusCode::CREATED,
+                "the signature was never spent, so the identical bytes must still be accepted"
+            );
+            assert_eq!(
+                ledger_rows(&pool).await,
+                1,
+                "only the request that cleared every auth check spends its key"
+            );
         }
     }
 }
