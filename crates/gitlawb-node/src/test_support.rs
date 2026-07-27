@@ -5183,4 +5183,267 @@ mod tests {
             "result includes the deep cert matching the prefix"
         );
     }
+
+    // ── HTTP-signature replay guards (issue #253) ────────────────────────────
+    //
+    // `require_signature` verifies a signature and keeps no record that it did:
+    // it is `middleware::from_fn` and never receives `AppState`, so it cannot.
+    // There is no nonce, no spent-signature ledger, and `check_created` compares
+    // `(now - created).abs()` against 300, so one captured Signature-Input +
+    // Signature + body triple is a bearer credential across a ~600s span and is
+    // accepted by any node serving that path.
+    //
+    // The three `#[ignore]`d tests below assert the FIXED behavior and are red
+    // until #253 lands; drop the attribute as part of that fix. The two that are
+    // not ignored pin properties the proposed fix depends on and must stay green.
+    mod replay_guards {
+        use super::*;
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use gitlawb_core::http_sig::{
+            build_signing_string, compute_content_digest, sign_request, COVERED_COMPONENTS,
+        };
+        use std::collections::HashMap;
+
+        const PATH: &str = "/api/v1/tasks";
+
+        fn task_body(delegator: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "review",
+                "capability": "repo:write",
+                "delegator_did": delegator,
+            }))
+            .expect("serialize task body")
+        }
+
+        /// A single route mounted under the PRODUCTION `require_signature`, so the
+        /// signature is really verified rather than injected via `signed_request_as`.
+        fn router(state: AppState) -> Router {
+            Router::new()
+                .route(PATH, axum::routing::post(crate::api::tasks::create_task))
+                .layer(axum::middleware::from_fn(crate::auth::require_signature))
+                .with_state(state)
+        }
+
+        async fn send(
+            state: &AppState,
+            signature: &str,
+            signature_input: &str,
+            content_digest: &str,
+            body: &[u8],
+        ) -> StatusCode {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(PATH)
+                .header("content-type", "application/json")
+                .header("content-digest", content_digest)
+                .header("signature-input", signature_input)
+                .header("signature", signature)
+                .body(Body::from(body.to_vec()))
+                .expect("request builder");
+            router(state.clone())
+                .oneshot(req)
+                .await
+                .expect("router response")
+                .status()
+        }
+
+        /// Sign with an arbitrary `created` and an optional extra `Signature-Input`
+        /// parameter, mirroring `sign_request` byte for byte otherwise.
+        fn sign_with(
+            kp: &Keypair,
+            body: &[u8],
+            created: i64,
+            extra_params: &str,
+        ) -> (String, String, String) {
+            let did = kp.did().to_string();
+            let signature_input = format!(
+                r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}{extra_params}"#
+            );
+            let content_digest = compute_content_digest(body);
+            let sig_params_value = &signature_input["sig1=".len()..];
+            let mut values = HashMap::new();
+            values.insert("@method".to_string(), "POST".to_string());
+            values.insert("@path".to_string(), PATH.to_string());
+            values.insert("content-digest".to_string(), content_digest.clone());
+            let signing_string =
+                build_signing_string(COVERED_COMPONENTS, sig_params_value, &values)
+                    .expect("signing string");
+            let signature = format!(
+                "sig1=:{}:",
+                STANDARD.encode(kp.sign(signing_string.as_bytes()).to_bytes())
+            );
+            (signature, signature_input, content_digest)
+        }
+
+        /// #253 limb 1: a captured signature must be single-use.
+        /// Observed today: 201, 201, 201 and three distinct `agent_tasks` rows.
+        #[ignore = "RED until #253 is fixed: no spent-signature ledger exists"]
+        #[sqlx::test]
+        async fn replayed_signature_is_rejected(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool).await;
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+
+            let first = send(
+                &state,
+                &signed.signature,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_eq!(
+                first,
+                StatusCode::CREATED,
+                "the genuine request must succeed"
+            );
+
+            let second = send(
+                &state,
+                &signed.signature,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_ne!(
+                second,
+                StatusCode::CREATED,
+                "a replayed signature must not be accepted a second time"
+            );
+
+            let tasks = state
+                .db
+                .list_tasks(None, None, 100)
+                .await
+                .expect("list tasks");
+            let mine = tasks.iter().filter(|t| t.delegator_did == did).count();
+            assert_eq!(mine, 1, "replay must not create a duplicate task row");
+        }
+
+        /// #253 limb 1, malleability: the `Signature` header carries optional
+        /// surrounding whitespace, and `HttpSignature::parse` trims internally, so a
+        /// ledger keyed on the raw header text is defeated by one space. Each variant
+        /// below is a distinct byte string that verifies identically today.
+        #[ignore = "RED until #253 is fixed: key the ledger on the signing-string hash"]
+        #[sqlx::test]
+        async fn whitespace_variants_are_rejected_as_replays(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool).await;
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+
+            let first = send(
+                &state,
+                &signed.signature,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_eq!(first, StatusCode::CREATED);
+
+            for variant in [
+                format!(" {}", signed.signature),
+                format!("{} ", signed.signature),
+                format!("\t{}", signed.signature),
+            ] {
+                let code = send(
+                    &state,
+                    &variant,
+                    &signed.signature_input,
+                    &signed.content_digest,
+                    &body,
+                )
+                .await;
+                assert_ne!(
+                    code,
+                    StatusCode::CREATED,
+                    "whitespace-padded replay must be rejected: {variant:?}"
+                );
+            }
+        }
+
+        /// #253 limb 3: `check_created` takes an absolute value, so a signature dated
+        /// in the future is accepted and one capture spans ~600s. The forward bound
+        /// should be tight; the backward bound must not move (see the test below).
+        #[ignore = "RED until #253 is fixed: check_created's window is symmetric"]
+        #[sqlx::test]
+        async fn future_dated_created_is_rejected(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool).await;
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp() + 250;
+            let (signature, signature_input, content_digest) = sign_with(&kp, &body, created, "");
+
+            let code = send(&state, &signature, &signature_input, &content_digest, &body).await;
+            assert_ne!(
+                code,
+                StatusCode::CREATED,
+                "a signature dated 250s in the future must be rejected"
+            );
+        }
+
+        /// Guard on the FIX, not on the bug: the 300s backward budget must survive any
+        /// tightening of the forward bound. `require_signature` buffers the whole body
+        /// before `check_created` runs and the git routes accept up to `max_pack_bytes`,
+        /// so upload time for a large pack is charged against this window. Green today;
+        /// it must stay green.
+        #[sqlx::test]
+        async fn backward_skew_budget_is_not_narrowed(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool).await;
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp() - 280;
+            let (signature, signature_input, content_digest) = sign_with(&kp, &body, created, "");
+
+            let code = send(&state, &signature, &signature_input, &content_digest, &body).await;
+            assert_eq!(
+                code,
+                StatusCode::CREATED,
+                "a signature 280s old must still verify: a large pack spends that long uploading"
+            );
+        }
+
+        /// Guard on the FIX: the recommended remedy has clients emit an RFC 9421
+        /// `nonce` parameter before any node requires it. That is only a one-directional
+        /// rollout because a nonce is a signature PARAMETER, not a covered component:
+        /// the verifier copies the whole parameter tail into the signing string and
+        /// `missing_components` inspects only the parenthesized list. This pins that
+        /// property, so a change that starts rejecting unknown parameters is caught.
+        #[sqlx::test]
+        async fn unknown_signature_input_parameter_still_verifies(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = test_state(pool).await;
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp();
+
+            let (sig_a, input_a, digest) =
+                sign_with(&kp, &body, created, r#";nonce="0123456789abcdef""#);
+            assert_eq!(
+                send(&state, &sig_a, &input_a, &digest, &body).await,
+                StatusCode::CREATED,
+                "an unchanged verifier must accept a nonce-bearing signature"
+            );
+
+            // Two nonces over an otherwise identical request must give the ledger
+            // distinct keys, which is what stops it rejecting legitimate repeats.
+            let (sig_b, input_b, _) =
+                sign_with(&kp, &body, created, r#";nonce="fedcba9876543210""#);
+            assert_ne!(
+                sig_a, sig_b,
+                "distinct nonces must yield distinct signatures"
+            );
+            assert_eq!(
+                send(&state, &sig_b, &input_b, &digest, &body).await,
+                StatusCode::CREATED
+            );
+        }
+    }
 }
