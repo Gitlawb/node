@@ -654,12 +654,12 @@ async fn call_tool(
         }
 
         "node_info" => {
-            let info: Value = client.get("/").await?.json().await?;
+            let info = json_ok("node_info", client.get("/").await?).await?;
             Ok(serde_json::to_string_pretty(&info)?)
         }
 
         "node_health" => {
-            let health: Value = client.get("/health").await?.json().await?;
+            let health = json_ok("node_health", client.get("/health").await?).await?;
             Ok(serde_json::to_string_pretty(&health)?)
         }
 
@@ -670,39 +670,45 @@ async fn call_tool(
                 "description": args["description"],
                 "is_public": args["is_public"].as_bool().unwrap_or(true),
             }))?;
-            let resp: Value = client.post("/api/v1/repos", &body).await?.json().await?;
+            let resp = json_ok("repo_create", client.post("/api/v1/repos", &body).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "repo_list" => {
-            let repos: Value = client.get("/api/v1/repos").await?.json().await?;
+            let repos = json_ok("repo_list", client.get("/api/v1/repos").await?).await?;
             Ok(serde_json::to_string_pretty(&repos)?)
         }
 
         "repo_list_federated" => {
-            let result: Value = client.get("/api/v1/repos/federated").await?.json().await?;
+            let result = json_ok(
+                "repo_list_federated",
+                client.get("/api/v1/repos/federated").await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&result)?)
         }
 
         "repo_get" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let repo: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}"))
-                .await?
-                .json()
-                .await?;
+            let repo = json_ok(
+                "repo_get",
+                client.get(&format!("/api/v1/repos/{owner}/{name}")).await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&repo)?)
         }
 
         "repo_commits" => {
             let name = args["name"].as_str().context("missing 'name'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let commits: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
-                .await?
-                .json()
-                .await?;
+            let commits = json_ok(
+                "repo_commits",
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{name}/commits"))
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&commits)?)
         }
 
@@ -710,17 +716,19 @@ async fn call_tool(
             let name = args["name"].as_str().context("missing 'name'")?;
             let path = args["path"].as_str().unwrap_or("");
             let owner = resolve_owner(&args, &client).await?;
-            let tree: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
-                .await?
-                .json()
-                .await?;
+            let tree = json_ok(
+                "repo_tree",
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{name}/tree/{path}"))
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&tree)?)
         }
 
         "repo_clone_url" => {
             let name = args["name"].as_str().context("missing 'name'")?;
-            let info: Value = client.get("/").await?.json().await?;
+            let info = json_ok("repo_clone_url", client.get("/").await?).await?;
             let did = info["did"].as_str().context("node info missing DID")?;
             Ok(format!("gitlawb://{}/{}", did, name))
         }
@@ -736,7 +744,8 @@ async fn call_tool(
                 "capabilities": caps,
                 "model": args["model"],
             }))?;
-            let resp: Value = client.post("/api/register", &body).await?.json().await?;
+            let resp =
+                json_ok("agent_register", client.post("/api/register", &body).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -793,7 +802,13 @@ async fn call_tool(
                     "/{owner}/{name}/info/refs?service=git-upload-pack"
                 ))
                 .await?;
+            // Same reason as `json_ok`: a denial body would otherwise parse to an
+            // empty ref list and come back as a successful tool result.
+            let status = resp.status();
             let bytes = resp.bytes().await?;
+            if !status.is_success() {
+                anyhow::bail!("git_refs failed ({status})");
+            }
             // Parse pkt-line refs
             let refs = parse_info_refs(&bytes);
             Ok(serde_json::to_string_pretty(&refs)?)
@@ -814,22 +829,26 @@ async fn call_tool(
                 "source_branch": head,
                 "target_branch": base,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "pr_create",
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{repo}/pulls"), &body)
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "pr_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "pr_list",
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls"))
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -837,18 +856,22 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let pr: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
-                .await?
-                .json()
-                .await?;
-            let reviews: Value = client
-                .get(&format!(
-                    "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
-                ))
-                .await?
-                .json()
-                .await?;
+            let pr = json_ok(
+                "pr_view",
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}"))
+                    .await?,
+            )
+            .await?;
+            let reviews = json_ok(
+                "pr_view",
+                client
+                    .get(&format!(
+                        "/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"
+                    ))
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(
                 &json!({ "pr": pr, "reviews": reviews["reviews"] }),
             )?)
@@ -858,11 +881,13 @@ async fn call_tool(
             let repo = args["repo"].as_str().context("missing 'repo'")?;
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "pr_diff",
+                client
+                    .get(&format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/diff"))
+                    .await?,
+            )
+            .await?;
             let diff = resp["diff"].as_str().unwrap_or("(empty diff)");
             Ok(diff.to_string())
         }
@@ -879,14 +904,16 @@ async fn call_tool(
                 "status": status,
                 "body": args["body"],
             }))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "pr_review",
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/reviews"),
+                        &body,
+                    )
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -895,14 +922,16 @@ async fn call_tool(
             let number = args["number"].as_i64().context("missing 'number'")?;
             let owner = resolve_owner(&args, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "pr_merge",
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/merge"),
+                        &body,
+                    )
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -922,11 +951,13 @@ async fn call_tool(
                 "secret": args["secret"],
                 "events": events,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "webhook_create",
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{repo}/hooks"), &body)
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -946,18 +977,16 @@ async fn call_tool(
                 did.split(':').next_back().unwrap_or(&did).to_string()
             };
             // Owner-gated route: must be signed (get_signed), not a plain get().
-            let resp = client
-                .get_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-                .await?;
-            // Check the HTTP status before deserializing: a 401/403/404 JSON error
-            // body (missing identity, wrong owner, private/deleted repo) must fail
-            // the tool call, not be returned as a successful result.
-            let status = resp.status();
-            let body: Value = resp.json().await?;
-            if !status.is_success() {
-                let msg = body["message"].as_str().unwrap_or("unknown error");
-                anyhow::bail!("webhook_list failed ({status}): {msg}");
-            }
+            // `json_ok` checks the status first: a 401/403/404 JSON error body
+            // (missing identity, wrong owner, private/deleted repo) must fail the
+            // tool call, not be returned as a successful result.
+            let body = json_ok(
+                "webhook_list",
+                client
+                    .get_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&body)?)
         }
 
@@ -966,11 +995,13 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let owner = resolve_owner(&args, &client).await?;
             let body = serde_json::to_vec(&json!({}))?;
-            let resp: Value = client
-                .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "webhook_delete",
+                client
+                    .delete(&format!("/api/v1/repos/{owner}/{repo}/hooks/{id}"), &body)
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -990,17 +1021,17 @@ async fn call_tool(
                 }
                 u
             };
-            let resp: Value = client.get_authed(&url).await?.json().await?;
+            let resp = json_ok("bounty_list", client.get_authed(&url).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_show" => {
             let id = args["id"].as_str().context("missing 'id'")?;
-            let resp: Value = client
-                .get_authed(&format!("/api/v1/bounties/{id}"))
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "bounty_show",
+                client.get_authed(&format!("/api/v1/bounties/{id}")).await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1013,28 +1044,32 @@ async fn call_tool(
                 "issue_id": args.get("issue_id").and_then(|v| v.as_str()),
                 "tx_hash": args.get("tx_hash").and_then(|v| v.as_str()),
             });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{name}/bounties"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "bounty_create",
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{name}/bounties"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_claim" => {
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = json!({ "wallet": args.get("wallet").and_then(|v| v.as_str()) });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/bounties/{id}/claim"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "bounty_claim",
+                client
+                    .post(
+                        &format!("/api/v1/bounties/{id}/claim"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1042,19 +1077,21 @@ async fn call_tool(
             let id = args["id"].as_str().context("missing 'id'")?;
             let pr_id = args["pr_id"].as_str().context("missing 'pr_id'")?;
             let body = json!({ "pr_id": pr_id });
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/bounties/{id}/submit"),
-                    &serde_json::to_vec(&body)?,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "bounty_submit",
+                client
+                    .post(
+                        &format!("/api/v1/bounties/{id}/submit"),
+                        &serde_json::to_vec(&body)?,
+                    )
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
         "bounty_stats" => {
-            let resp: Value = client.get("/api/v1/bounties/stats").await?.json().await?;
+            let resp = json_ok("bounty_stats", client.get("/api/v1/bounties/stats").await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1068,7 +1105,7 @@ async fn call_tool(
             if let Some(a) = args.get("assignee_did").and_then(|v| v.as_str()) {
                 path.push_str(&format!("&assignee_did={}", urlencoding::encode(a)));
             }
-            let resp: Value = client.get(&path).await?.json().await?;
+            let resp = json_ok("task_list", client.get(&path).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1085,7 +1122,7 @@ async fn call_tool(
                 "deadline": args.get("deadline").and_then(|v| v.as_str()),
                 "delegator_did": delegator_did,
             }))?;
-            let resp: Value = client.post("/api/v1/tasks", &body).await?.json().await?;
+            let resp = json_ok("task_create", client.post("/api/v1/tasks", &body).await?).await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1094,11 +1131,13 @@ async fn call_tool(
             let assignee_did = kp.did().to_string();
             let id = args["id"].as_str().context("missing 'id'")?;
             let body = serde_json::to_vec(&json!({ "assignee_did": assignee_did }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/tasks/{id}/claim"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "task_claim",
+                client
+                    .post(&format!("/api/v1/tasks/{id}/claim"), &body)
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1110,11 +1149,13 @@ async fn call_tool(
                 "result": args.get("result").and_then(|v| v.as_str()),
                 "by_did": by_did,
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/tasks/{id}/complete"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "task_complete",
+                client
+                    .post(&format!("/api/v1/tasks/{id}/complete"), &body)
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1184,11 +1225,13 @@ async fn call_tool(
                 let owner = resolve_owner(&args, &client).await?;
                 (owner, repo.to_string())
             };
-            let resp: Value = client
-                .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "issue_list",
+                client
+                    .get_authed(&format!("/api/v1/repos/{owner}/{name}/issues"))
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1208,11 +1251,13 @@ async fn call_tool(
                 "title": title,
                 "body": args.get("body").and_then(|v| v.as_str()),
             }))?;
-            let resp: Value = client
-                .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body)
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "issue_create",
+                client
+                    .post(&format!("/api/v1/repos/{owner}/{name}/issues"), &body)
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1230,14 +1275,16 @@ async fn call_tool(
                 (owner, repo.to_string())
             };
             let body = serde_json::to_vec(&json!({ "body": comment_body }))?;
-            let resp: Value = client
-                .post(
-                    &format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"),
-                    &body,
-                )
-                .await?
-                .json()
-                .await?;
+            let resp = json_ok(
+                "issue_comment",
+                client
+                    .post(
+                        &format!("/api/v1/repos/{owner}/{name}/issues/{issue_id}/comments"),
+                        &body,
+                    )
+                    .await?,
+            )
+            .await?;
             Ok(serde_json::to_string_pretty(&resp)?)
         }
 
@@ -1247,12 +1294,34 @@ async fn call_tool(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Deserialize a node response, failing the tool call when the node refused it.
+///
+/// Without the status check a 4xx/5xx JSON error body deserializes cleanly into
+/// a `Value` and goes back to the MCP caller as a successful tool result, so a
+/// denial (a replayed signature, a wrong owner, a missing repo) reads as
+/// success. `what` names the tool so the message says which call failed.
+async fn json_ok(what: &str, resp: reqwest::Response) -> Result<Value> {
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .with_context(|| format!("{what} failed ({status}): response was not JSON"))?;
+    if !status.is_success() {
+        let msg = body["message"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("unknown error");
+        anyhow::bail!("{what} failed ({status}): {msg}");
+    }
+    Ok(body)
+}
+
 /// Get the owner short-DID from args or default to the node's own DID.
 async fn resolve_owner(args: &Value, client: &NodeClient) -> Result<String> {
     if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
         return Ok(o.to_string());
     }
-    let info: Value = client.get("/").await?.json().await?;
+    let info = json_ok("owner lookup", client.get("/").await?).await?;
     let did = info["did"].as_str().context("node info missing DID")?;
     Ok(did.split(':').next_back().unwrap_or(did).to_string())
 }
@@ -2024,6 +2093,178 @@ mod tests {
         .await
         .expect_err("must error without an identity");
         assert!(err.to_string().contains("no identity found"), "got: {err}");
+    }
+
+    // ── Node denials must never render as a successful tool result ──────────
+
+    /// Write an identity into a fresh temp dir so the signing path is exercised.
+    fn identity_dir() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_repo_create_replayed_signature_errors_and_is_not_retried() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = identity_dir();
+        let m = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_header("x-gitlawb-error", "signature_replayed")
+            .with_body(r#"{"error":"signature_replayed","message":"signature already spent"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_create",
+            json!({"name": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a replay rejection must fail the tool call, not return the body as success");
+        let msg = err.to_string();
+        assert!(msg.contains("signature_replayed"), "got: {msg}");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_issue_create_replayed_signature_errors_and_is_not_retried() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = identity_dir();
+        let m = server
+            .mock("POST", "/api/v1/repos/alice/myrepo/issues")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_header("x-gitlawb-error", "signature_replayed")
+            .with_body(r#"{"error":"signature_replayed","message":"signature already spent"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "issue_create",
+            json!({"repo": "alice/myrepo", "title": "New bug"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a replay rejection must fail the tool call");
+        let msg = err.to_string();
+        assert!(msg.contains("signature_replayed"), "got: {msg}");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_pr_create_denial_errors_not_success() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = identity_dir();
+        let _m = server
+            .mock("POST", "/api/v1/repos/alice/myrepo/pulls")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"forbidden","message":"not a collaborator"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "pr_create",
+            json!({"owner": "alice", "repo": "myrepo", "head": "feat", "title": "T"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a 403 must fail the tool call, not be returned as a success result");
+        let msg = err.to_string();
+        assert!(msg.contains("403"), "got: {msg}");
+        assert!(msg.contains("not a collaborator"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn test_repo_create_repo_exists_409_is_distinguishable_from_a_replay() {
+        // The pre-existing 409 carries no x-gitlawb-error header. It must still
+        // fail the tool call (a denial is not a success), but its message must
+        // not name a signature rejection.
+        let mut server = mockito::Server::new_async().await;
+        let dir = identity_dir();
+        let _m = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(409)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"repo_exists","message":"repository already exists"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_create",
+            json!({"name": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("a 409 error body must not be returned as a successful tool result");
+        let msg = err.to_string();
+        assert!(msg.contains("repository already exists"), "got: {msg}");
+        assert!(
+            !msg.contains("signature_replayed"),
+            "a repo_exists 409 must not be reported as a replay, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_git_refs_denial_errors_not_empty_refs() {
+        // git_refs reads pkt-lines, not JSON: a denial body parses to zero refs,
+        // so without the status check it would look like an empty repository.
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/alice/secret/info/refs?service=git-upload-pack")
+            .with_status(403)
+            .with_body(r#"{"error":"forbidden"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "git_refs",
+            json!({"owner": "alice", "name": "secret"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("a denied ref listing must error, not return an empty ref list");
+        assert!(err.to_string().contains("403"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_repo_get_404_errors_not_success() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/api/v1/repos/alice/ghost")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"not_found","message":"repository not found"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "repo_get",
+            json!({"owner": "alice", "name": "ghost"}),
+            &server.url(),
+            None,
+        )
+        .await
+        .expect_err("a 404 must fail the tool call");
+        assert!(
+            err.to_string().contains("repository not found"),
+            "got: {err}"
+        );
     }
 
     #[test]

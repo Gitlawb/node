@@ -141,6 +141,10 @@ impl NodeClient {
                     continue;
                 }
             }
+
+            if let Some(rejection) = signature_rejection(&resp) {
+                return Err(rejection.into_error(method, path, resp).await);
+            }
             return Ok(resp);
         }
     }
@@ -194,6 +198,67 @@ impl NodeClient {
             level.and_then(|l| l.parse().ok()),
         )))
     }
+}
+
+/// A write the node refused because of the spent-signature ledger.
+struct SignatureRejection {
+    /// The `x-gitlawb-error` code, kept verbatim so scripts can match on it.
+    code: &'static str,
+    /// What the user should actually do next.
+    hint: &'static str,
+}
+
+impl SignatureRejection {
+    /// Consume the response to fold the node's own message into the error.
+    /// Called only after [`signature_rejection`] has already decided from the
+    /// status and header, since reading the body takes the response by value.
+    async fn into_error(self, method: &str, path: &str, resp: reqwest::Response) -> anyhow::Error {
+        let status = resp.status();
+        let node_msg = resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|b| b["message"].as_str().map(str::to_string));
+        let Self { code, hint } = self;
+        match node_msg {
+            Some(m) => anyhow::anyhow!("{method} {path} rejected ({status} {code}): {hint} ({m})"),
+            None => anyhow::anyhow!("{method} {path} rejected ({status} {code}): {hint}"),
+        }
+    }
+}
+
+/// Recognise a spent-signature-ledger rejection from the status and the
+/// `x-gitlawb-error` header, before anything reads the body.
+///
+/// None of these is ever retried. A `signature_replayed` 409 means the node
+/// already consumed this signature, so the first delivery reached the handler
+/// and its side effect happened; re-signing and resending would apply the
+/// mutation a second time, which is the duplicate write the ledger exists to
+/// prevent. (The iCaptcha 403 retry above is safe only because that request is
+/// rejected *before* the handler runs.) The 429 and 503 cases did not apply the
+/// write, but retrying them automatically would just hammer a node that is
+/// already saying "not now", so they surface to the user instead.
+fn signature_rejection(resp: &reqwest::Response) -> Option<SignatureRejection> {
+    let code = resp.headers().get("x-gitlawb-error")?.to_str().ok()?;
+    let (code, hint) = match (resp.status().as_u16(), code) {
+        (409, "signature_replayed") => (
+            "signature_replayed",
+            "this request's signature was already spent, so the node has already applied it. \
+             Do not resend: check whether the change took effect before running the command again",
+        ),
+        (429, "signature_ledger_full") => (
+            "signature_ledger_full",
+            "the node is not accepting signed writes right now because its signature ledger is \
+             at capacity. The write did not happen; wait a moment and run the command again",
+        ),
+        (503, "signature_ledger_unavailable") => (
+            "signature_ledger_unavailable",
+            "the node's signature ledger is unavailable, so it is refusing signed writes. \
+             The write did not happen; retry later or ask the node operator to check the node",
+        ),
+        _ => return None,
+    };
+    Some(SignatureRejection { code, hint })
 }
 
 /// Run the (blocking) iCaptcha solve loop off the async runtime.
@@ -435,6 +500,156 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 405);
         m.assert();
+    }
+
+    // ── send_signed signature-ledger rejections ─────────────────────────
+
+    /// Mock one node reply and send a signed POST through `send_signed`,
+    /// asserting the node was called exactly once (i.e. nothing retried).
+    async fn send_signed_once(
+        status: usize,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (Result<reqwest::Response>, mockito::ServerGuard) {
+        let mut server = Server::new_async().await;
+        let mut m = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(status)
+            .with_header("content-type", "application/json");
+        for (k, v) in headers {
+            m = m.with_header(*k, v);
+        }
+        let m = m.with_body(body).expect(1).create_async().await;
+        let client = NodeClient::new(server.url(), Some(test_keypair()));
+        let resp = client.send_signed("POST", "/api/v1/repos", b"{}").await;
+        m.assert_async().await;
+        (resp, server)
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_replayed_signature_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            409,
+            &[("x-gitlawb-error", "signature_replayed")],
+            r#"{"error":"signature_replayed","message":"this signature was already used"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("a replayed signature must surface as an error, not Ok(409)")
+            .to_string();
+        assert!(err.contains("signature_replayed"), "got: {err}");
+        assert!(
+            err.contains("already"),
+            "message must tell the user the node already applied it, got: {err}"
+        );
+        assert!(
+            err.contains("this signature was already used"),
+            "must surface the node's message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_ledger_full_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            429,
+            &[("x-gitlawb-error", "signature_ledger_full")],
+            r#"{"error":"signature_ledger_full","message":"ledger at capacity"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("a full ledger must surface as an error")
+            .to_string();
+        assert!(err.contains("signature_ledger_full"), "got: {err}");
+        assert!(
+            !err.contains("already"),
+            "must not claim the write was applied, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_signed_errors_on_ledger_unavailable_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            503,
+            &[("x-gitlawb-error", "signature_ledger_unavailable")],
+            r#"{"error":"signature_ledger_unavailable","message":"ledger down"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("an unavailable ledger must surface as an error")
+            .to_string();
+        assert!(err.contains("signature_ledger_unavailable"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_repo_exists_409_unchanged() {
+        // The pre-existing 409. Callers (`gl init`, `gl repo create`) inspect the
+        // status themselves, so it must keep returning Ok(resp).
+        let (resp, _server) = send_signed_once(409, &[], r#"{"error":"repo_exists"}"#).await;
+        let resp = resp.expect("a non-replay 409 must still return Ok");
+        assert_eq!(resp.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_409_with_other_error_header_unchanged() {
+        // Only the three signature_* codes are converted; any other
+        // x-gitlawb-error on a 409 is left to the caller.
+        let (resp, _server) = send_signed_once(
+            409,
+            &[("x-gitlawb-error", "repo_exists")],
+            r#"{"error":"repo_exists"}"#,
+        )
+        .await;
+        let resp = resp.expect("an unrelated 409 error code must still return Ok");
+        assert_eq!(resp.status(), 409);
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_401_invalid_signature_unchanged() {
+        let (resp, _server) = send_signed_once(
+            401,
+            &[("x-gitlawb-error", "invalid_signature")],
+            r#"{"error":"invalid_signature"}"#,
+        )
+        .await;
+        let resp = resp.expect("a 401 must still return Ok, distinct from a replay error");
+        assert_eq!(resp.status(), 401);
+    }
+
+    #[tokio::test]
+    async fn send_signed_returns_401_unsigned_request_unchanged() {
+        // An unsigned write is rejected with human_detected; the client prints a
+        // hint and returns the response, and must not be mistaken for a replay.
+        let mut server = Server::new_async().await;
+        let m = server
+            .mock("POST", "/api/v1/repos")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_header("x-gitlawb-error", "human_detected")
+            .with_body(r#"{"error":"human_detected"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = NodeClient::new(server.url(), None);
+        let resp = client
+            .send_signed("POST", "/api/v1/repos", b"{}")
+            .await
+            .expect("an unsigned-request rejection must still return Ok");
+        assert_eq!(resp.status(), 401);
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn send_signed_does_not_convert_a_409_on_another_status() {
+        // The header alone must not trigger the conversion: the status has to
+        // match too, so a 200 carrying a stray header stays a success.
+        let (resp, _server) = send_signed_once(
+            200,
+            &[("x-gitlawb-error", "signature_replayed")],
+            r#"{"ok":true}"#,
+        )
+        .await;
+        let resp = resp.expect("a 200 must stay Ok regardless of headers");
+        assert_eq!(resp.status(), 200);
     }
 
     // ── send_signed iCaptcha retry (full integration) ────────────────────
