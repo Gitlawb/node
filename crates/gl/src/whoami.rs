@@ -23,6 +23,11 @@ pub struct WhoamiArgs {
 }
 
 pub async fn run(args: WhoamiArgs) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    run_to_writer(args, &mut stdout).await
+}
+
+pub(crate) async fn run_to_writer(args: WhoamiArgs, w: &mut impl std::io::Write) -> Result<()> {
     let keypair = load_keypair_from_dir(args.dir.as_deref())?;
     let did = keypair.did().to_string();
     let short = did.split(':').next_back().unwrap_or(&did).to_string();
@@ -95,21 +100,21 @@ pub async fn run(args: WhoamiArgs) -> Result<()> {
         if let Some(rc) = repo_count {
             out["repos"] = json!(rc);
         }
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        writeln!(w, "{}", serde_json::to_string_pretty(&out)?)?;
     } else {
-        println!("DID:        {did}");
-        println!("Short:      {short}");
+        writeln!(w, "DID:        {did}")?;
+        writeln!(w, "Short:      {short}")?;
         if let Some(reg) = registered {
-            println!("Registered: {}", if reg { "yes" } else { "no" });
+            writeln!(w, "Registered: {}", if reg { "yes" } else { "no" })?;
         }
         if let Some(ts) = trust_score {
-            println!("Trust:      {ts:.2}");
+            writeln!(w, "Trust:      {ts:.2}")?;
         }
         if !capabilities.is_empty() {
-            println!("Caps:       {}", capabilities.join(", "));
+            writeln!(w, "Caps:       {}", capabilities.join(", "))?;
         }
         if let Some(rc) = repo_count {
-            println!("Repos:      {rc}");
+            writeln!(w, "Repos:      {rc}")?;
         }
     }
     Ok(())
@@ -398,5 +403,68 @@ mod tests {
             json: true,
         };
         run(args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_whoami_sanitizes_hostile_capabilities() {
+        let dir = TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+        let did = kp.did().to_string();
+        let short = did.split(':').next_back().unwrap().to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _agent = server
+            .mock("GET", format!("/api/v1/agents/{did}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                "{\"trust_score\":0.5,\"capabilities\":[\"\\u001b]0;PWNED\\u0007repo:write\",\"\\u202egnitirw-tfel\"]}",
+            )
+            .create_async()
+            .await;
+        let _repos = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!(r"^/api/v1/repos\?owner={short}")),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        // Human mode: no control bytes or bidi overrides reach the terminal
+        let mut buf = Vec::new();
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(server.url()),
+            json: false,
+        };
+        run_to_writer(args, &mut buf).await.unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains('\u{1b}'), "ESC leaked in human mode: {out:?}");
+        assert!(!out.contains('\u{07}'), "BEL leaked in human mode: {out:?}");
+        assert!(
+            !out.contains('\u{202e}'),
+            "RLO leaked in human mode: {out:?}"
+        );
+        assert!(out.contains("repo:write"), "benign text missing: {out:?}");
+        assert!(out.contains("tfel"), "reversed text missing: {out:?}");
+
+        // JSON mode: serde escapes C0 but passes bidi — ensure no U+202E
+        let mut buf = Vec::new();
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(server.url()),
+            json: true,
+        };
+        run_to_writer(args, &mut buf).await.unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            !out.contains('\u{202e}'),
+            "RLO leaked in JSON mode: {out:?}"
+        );
     }
 }
