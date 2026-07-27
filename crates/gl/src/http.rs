@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use gitlawb_core::http_sig::sign_request;
 use gitlawb_core::identity::Keypair;
+use gitlawb_core::signature_denial::SignatureDenial;
 use icaptcha_client::IcaptchaCfg;
 
 /// Max times we'll fetch a fresh proof and retry a 403-iCaptcha response
@@ -214,8 +215,9 @@ impl NodeClient {
 
 /// A write the node refused because of the spent-signature ledger.
 struct SignatureRejection {
-    /// The `x-gitlawb-error` code, kept verbatim so scripts can match on it.
-    code: &'static str,
+    /// Which denial it was. Its `as_str` is the `x-gitlawb-error` code, printed
+    /// verbatim so scripts can match on it.
+    denial: SignatureDenial,
     /// What the user should actually do next.
     hint: &'static str,
 }
@@ -242,7 +244,8 @@ impl SignatureRejection {
             .ok()
             .and_then(|b| b["message"].as_str().map(sanitize_node_msg))
             .filter(|m| !m.is_empty());
-        let Self { code, hint } = self;
+        let Self { denial, hint } = self;
+        let code = denial.as_str();
         match node_msg {
             Some(m) => anyhow::anyhow!("{method} {path} rejected ({status} {code}): {hint} ({m})"),
             None => anyhow::anyhow!("{method} {path} rejected ({status} {code}): {hint}"),
@@ -274,39 +277,53 @@ impl SignatureRejection {
 /// 503 cases did not apply the write; 429 and 503 are retryable, but doing it
 /// automatically would only hammer a node that is already saying "not now", so
 /// they surface to the user instead.
+///
+/// The set of codes is [`SignatureDenial`], shared with the node so both halves
+/// spell them the same way. The `match` below has no wildcard arm on purpose:
+/// adding a denial to the node stops this crate compiling until someone writes
+/// the caller's instructions for it. That is the whole point of the type, since
+/// the previous arrangement (a list of literals in each crate) silently missed
+/// `signature_nonce_too_short` for several commits and returned `Ok(400)` for it.
 fn signature_rejection(resp: &reqwest::Response) -> Option<SignatureRejection> {
     let code = resp.headers().get("x-gitlawb-error")?.to_str().ok()?;
-    let (code, hint) = match (resp.status().as_u16(), code) {
-        (400, "signature_nonce_required") => (
-            "signature_nonce_required",
+    // A code this build does not know: not our denial to describe. The header
+    // came from a node the user chose, which may be newer, older, or hostile,
+    // so the response goes back to the caller untouched.
+    let denial = SignatureDenial::from_code(code)?;
+    // The status has to agree with the code, so a stray header on a 200 cannot
+    // turn a success into a refusal.
+    if resp.status().as_u16() != denial.status() {
+        return None;
+    }
+    let hint = match denial {
+        SignatureDenial::NonceRequired => {
             "this node requires a nonce in the request signature and the request did not carry \
-             one. The write did not happen; upgrade `gl` and run the command again",
-        ),
-        (409, "signature_replayed") => (
-            "signature_replayed",
+             one. The write did not happen; upgrade `gl` and run the command again"
+        }
+        SignatureDenial::NonceTooShort => {
+            "this node rejected the nonce in the request signature as too short to be unique. \
+             The write did not happen; upgrade `gl` and run the command again"
+        }
+        SignatureDenial::Replayed => {
             "the node already admitted a request with this signature and will not take it twice. \
-             Do not resend: check whether the change took effect before running the command again",
-        ),
-        (429, "signature_ledger_full") => (
-            "signature_ledger_full",
+             Do not resend: check whether the change took effect before running the command again"
+        }
+        SignatureDenial::LedgerFull => {
             "this identity has too many unexpired signatures on the node, so it is refusing more \
              signed writes for now. The write did not happen; wait a moment and run the command \
-             again",
-        ),
-        (500, "signature_identity_missing") => (
-            "signature_identity_missing",
+             again"
+        }
+        SignatureDenial::IdentityMissing => {
             "the node reached its signature ledger without a verified identity and refused the \
              write. The write did not happen; this is a fault on the node, so report it to the \
-             operator",
-        ),
-        (503, "signature_ledger_unavailable") => (
-            "signature_ledger_unavailable",
+             operator"
+        }
+        SignatureDenial::LedgerUnavailable => {
             "the node's signature ledger is unavailable, so it is refusing signed writes. \
-             The write did not happen; retry later or ask the node operator to check the node",
-        ),
-        _ => return None,
+             The write did not happen; retry later or ask the node operator to check the node"
+        }
     };
-    Some(SignatureRejection { code, hint })
+    Some(SignatureRejection { denial, hint })
 }
 
 /// Read at most `cap` bytes of a response body. Bounds the allocation from a
@@ -724,18 +741,41 @@ mod tests {
         );
     }
 
-    /// Every signature denial the node can return, as (status, code).
-    const ALL_DENIALS: [(usize, &str); 5] = [
-        (400, "signature_nonce_required"),
-        (409, "signature_replayed"),
-        (429, "signature_ledger_full"),
-        (500, "signature_identity_missing"),
-        (503, "signature_ledger_unavailable"),
-    ];
+    #[tokio::test]
+    async fn send_signed_errors_on_nonce_too_short_and_never_retries() {
+        let (resp, _server) = send_signed_once(
+            400,
+            &[("x-gitlawb-error", "signature_nonce_too_short")],
+            r#"{"error":"signature_nonce_too_short","message":"the nonce must be at least 16 characters"}"#,
+        )
+        .await;
+        let err = resp
+            .expect_err("a too-short nonce must surface as an error, not Ok(400)")
+            .to_string();
+        assert!(err.contains("signature_nonce_too_short"), "got: {err}");
+        assert!(
+            !err.contains("already"),
+            "must not claim the write was applied, got: {err}"
+        );
+        assert!(
+            err.contains("the nonce must be at least 16 characters"),
+            "must surface the node's message, got: {err}"
+        );
+    }
+
+    /// Every signature denial the node can return, as (status, code). Derived
+    /// from the shared enum rather than retyped, so it cannot drift from what
+    /// the node emits.
+    fn all_denials() -> Vec<(usize, &'static str)> {
+        SignatureDenial::ALL
+            .iter()
+            .map(|d| (d.status() as usize, d.as_str()))
+            .collect()
+    }
 
     #[tokio::test]
     async fn send_signed_errors_on_every_denial_carrying_the_header() {
-        for (status, code) in ALL_DENIALS {
+        for (status, code) in all_denials() {
             let body = format!(r#"{{"error":"{code}","message":"node says no"}}"#);
             let (resp, _server) =
                 send_signed_once(status, &[("x-gitlawb-error", code)], &body).await;
@@ -758,7 +798,7 @@ mod tests {
         // to the caller (see `signature_rejection`). The callers that must not
         // read one as a success handle it themselves: `gl init` compares
         // `error` from the body, `gl task` checks the status before parsing.
-        for (status, code) in ALL_DENIALS {
+        for (status, code) in all_denials() {
             let body = format!(r#"{{"error":"{code}","message":"node says no"}}"#);
             let (resp, _server) = send_signed_once(status, &[], &body).await;
             let resp = resp.unwrap_or_else(|e| panic!("{code} without the header: {e}"));

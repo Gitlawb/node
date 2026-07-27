@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use gitlawb_core::did::Did;
+use gitlawb_core::signature_denial::SignatureDenial;
 use gitlawb_core::ucan::Ucan;
 
 use crate::state::AppState;
@@ -503,9 +504,18 @@ fn ledger_key(identity: &SignatureIdentity) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn ledger_rejection(status: StatusCode, code: &'static str, message: &str) -> Response {
+/// Refuse a signed write with one of the shared ledger denial codes.
+///
+/// The code and status both come from [`SignatureDenial`], which `gl` matches
+/// exhaustively, so the two halves cannot drift: adding a variant there is a
+/// compile error in the client until it handles it.
+fn ledger_rejection(denial: SignatureDenial, message: &str) -> Response {
+    let code = denial.as_str();
     (
-        status,
+        // Infallible: every `SignatureDenial::status` is a real HTTP status,
+        // which `denial_statuses_are_valid_http_codes` proves over every
+        // variant.
+        StatusCode::from_u16(denial.status()).expect("SignatureDenial status is a valid HTTP code"),
         [("X-Gitlawb-Error", code)],
         Json(json!({ "error": code, "message": message })),
     )
@@ -549,8 +559,7 @@ pub async fn consume_signature(
                 "signature ledger reached without a verified SignatureIdentity — check the layer order",
             );
             return ledger_rejection(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "signature_identity_missing",
+                SignatureDenial::IdentityMissing,
                 "the request reached the signature ledger without a verified identity",
             );
         }
@@ -570,8 +579,7 @@ pub async fn consume_signature(
                 crate::metrics::record_signature_ledger("nonce_required");
                 tracing::warn!(did = %identity.keyid, "rejected a nonce-less signature: a nonce is required");
                 ledger_rejection(
-                    StatusCode::BAD_REQUEST,
-                    "signature_nonce_required",
+                    SignatureDenial::NonceRequired,
                     "this node requires a `nonce` parameter in Signature-Input — upgrade your client",
                 )
             }
@@ -583,8 +591,7 @@ pub async fn consume_signature(
                     "rejected a signature whose nonce is too short to be unique",
                 );
                 ledger_rejection(
-                    StatusCode::BAD_REQUEST,
-                    "signature_nonce_too_short",
+                    SignatureDenial::NonceTooShort,
                     &format!(
                         "the `nonce` parameter in Signature-Input must be at least \
                          {MIN_NONCE_CHARS} characters drawn from a CSPRNG — \
@@ -621,8 +628,7 @@ pub async fn consume_signature(
             crate::metrics::record_signature_ledger("replayed");
             tracing::warn!(did = %identity.keyid, "rejected a replayed HTTP signature");
             ledger_rejection(
-                StatusCode::CONFLICT,
-                "signature_replayed",
+                SignatureDenial::Replayed,
                 "this signature has already been used — sign a fresh request",
             )
         }
@@ -632,8 +638,7 @@ pub async fn consume_signature(
             crate::metrics::record_signature_ledger("identity_ledger_full");
             tracing::warn!(did = %identity.keyid, "signature ledger full for this identity");
             ledger_rejection(
-                StatusCode::TOO_MANY_REQUESTS,
-                "signature_ledger_full",
+                SignatureDenial::LedgerFull,
                 "too many unexpired signatures for this identity — retry shortly",
             )
         }
@@ -644,8 +649,7 @@ pub async fn consume_signature(
             crate::metrics::record_signature_ledger("unavailable");
             tracing::error!(did = %identity.keyid, err = %e, "signature ledger unavailable");
             ledger_rejection(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "signature_ledger_unavailable",
+                SignatureDenial::LedgerUnavailable,
                 "the signature ledger is unavailable — retry shortly",
             )
         }
@@ -693,6 +697,39 @@ mod tests {
             proof,
         )
         .unwrap()
+    }
+
+    /// `ledger_rejection` converts `SignatureDenial::status` with an `expect`.
+    /// This is what makes that infallible: every variant is a real HTTP status,
+    /// and it is the status the node has always paired with that code.
+    #[test]
+    fn denial_statuses_are_valid_http_codes() {
+        for denial in SignatureDenial::ALL {
+            let status = StatusCode::from_u16(denial.status())
+                .unwrap_or_else(|e| panic!("{denial} has an invalid status: {e}"));
+            assert_eq!(status.as_u16(), denial.status());
+        }
+    }
+
+    /// The exact bytes `consume_signature` puts on the wire for each denial:
+    /// the `X-Gitlawb-Error` header, the body's `error` field, and the status
+    /// must all agree, because `gl` keys on the header and `gl init` keys on the
+    /// body field.
+    #[tokio::test]
+    async fn ledger_rejection_emits_the_code_in_both_the_header_and_the_body() {
+        for denial in SignatureDenial::ALL {
+            let resp = ledger_rejection(denial, "why it was refused");
+            assert_eq!(resp.status().as_u16(), denial.status(), "{denial}");
+            assert_eq!(
+                resp.headers().get("X-Gitlawb-Error").unwrap(),
+                denial.as_str(),
+                "{denial}",
+            );
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], denial.as_str(), "{denial}");
+            assert_eq!(json["message"], "why it was refused", "{denial}");
+        }
     }
 
     #[test]

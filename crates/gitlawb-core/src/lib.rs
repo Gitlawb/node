@@ -6,6 +6,7 @@ pub mod error;
 pub mod http_sig;
 pub mod identity;
 pub mod sanitize;
+pub mod signature_denial;
 pub mod ucan;
 
 pub use error::Error;

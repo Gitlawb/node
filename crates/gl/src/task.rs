@@ -350,25 +350,22 @@ mod tests {
     /// The last entry is a plain node failure with no signature code: the task
     /// commands must fail on that too, not just on the ledger denials.
     fn denials() -> Vec<(usize, String)> {
-        [
-            (400, "signature_nonce_required"),
-            (409, "signature_replayed"),
-            (429, "signature_ledger_full"),
-            (500, "signature_identity_missing"),
-            (503, "signature_ledger_unavailable"),
-        ]
-        .iter()
-        .map(|(s, code)| {
-            (
-                *s,
-                format!(r#"{{"error":"{code}","message":"node refused the write"}}"#),
-            )
-        })
-        .chain(std::iter::once((
-            500,
-            r#"{"error":"internal_error","message":"boom"}"#.to_string(),
-        )))
-        .collect()
+        gitlawb_core::signature_denial::SignatureDenial::ALL
+            .iter()
+            .map(|d| {
+                (
+                    d.status() as usize,
+                    format!(
+                        r#"{{"error":"{}","message":"node refused the write"}}"#,
+                        d.as_str()
+                    ),
+                )
+            })
+            .chain(std::iter::once((
+                500,
+                r#"{"error":"internal_error","message":"boom"}"#.to_string(),
+            )))
+            .collect()
     }
 
     #[tokio::test]
