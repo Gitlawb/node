@@ -66,14 +66,21 @@ fn assert_all_refs_are_commits(repo_path: &Path, cancelled: &AtomicBool) -> Resu
         .stdin
         .take()
         .map(|mut stdin| std::thread::spawn(move || stdin.write_all(queries.as_bytes())));
-    // Read stdout on a background thread — the pipe blocks, so we poll
-    // through the child for cancellation.
+    // Drain stdout and stderr on background threads so the child does not
+    // deadlock when its stderr pipe fills with diagnostics (P1).
     let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
     let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
         let _ = stdout_tx.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+        let _ = stderr_tx.send(buf);
     });
     let (peel_status, peel_stdout_bytes, peel_stderr) = loop {
         if cancelled.load(Ordering::Relaxed) {
@@ -85,9 +92,7 @@ fn assert_all_refs_are_commits(repo_path: &Path, cancelled: &AtomicBool) -> Resu
         match child.try_wait() {
             Ok(Some(status)) => {
                 let stdout_buf = stdout_rx.recv().unwrap_or_default();
-                let mut stderr_buf = Vec::new();
-                let _ =
-                    std::io::Read::read_to_end(&mut child.stderr.take().unwrap(), &mut stderr_buf);
+                let stderr_buf = stderr_rx.recv().unwrap_or_default();
                 let _ = writer.map(|h| h.join());
                 break (status, stdout_buf, stderr_buf);
             }
@@ -219,14 +224,21 @@ fn run_git(repo_path: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Ve
         .context("failed to spawn git subprocess")?;
 
     let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
 
-    // Read stdout on a background thread — the pipe blocks, so we poll
-    // through the child instead.
-    let (tx, rx) = std::sync::mpsc::channel();
+    // Read stdout and stderr on background threads so the child does not
+    // deadlock when its stderr pipe fills with diagnostics (P1).
+    let (tx_out, rx_out) = std::sync::mpsc::channel();
+    let (tx_err, rx_err) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
-        let _ = tx.send(buf);
+        let _ = tx_out.send(buf);
+    });
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+        let _ = tx_err.send(buf);
     });
 
     loop {
@@ -237,13 +249,9 @@ fn run_git(repo_path: &Path, args: &[&str], cancelled: &AtomicBool) -> Result<Ve
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout_buf = rx.recv().unwrap_or_default();
+                let stdout_buf = rx_out.recv().unwrap_or_default();
                 if !status.success() {
-                    let mut stderr_buf = Vec::new();
-                    let _ = std::io::Read::read_to_end(
-                        &mut child.stderr.take().unwrap(),
-                        &mut stderr_buf,
-                    );
+                    let stderr_buf = rx_err.recv().unwrap_or_default();
                     return Err(anyhow::anyhow!(
                         "git {} failed: {}",
                         args.join(" "),

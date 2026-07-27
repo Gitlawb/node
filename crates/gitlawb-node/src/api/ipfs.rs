@@ -293,7 +293,7 @@ fn create_opaque_cursor(seed: &[u8; 32], cursor: &str) -> String {
 
 /// Decode and verify an opaque truncated cursor token.
 /// Returns the original cursor string if valid and not expired.
-fn decode_opaque_cursor(seed: &[u8; 32], token: &str) -> Option<(String, String)> {
+fn decode_opaque_cursor(seed: &[u8; 32], token: &str) -> Option<(String, String, String)> {
     let cursor_key = derive_cursor_key(seed);
     let cipher = XChaCha20Poly1305::new_from_slice(&cursor_key)
         .expect("32-byte key is valid for XChaCha20Poly1305");
@@ -322,9 +322,10 @@ fn decode_opaque_cursor(seed: &[u8; 32], token: &str) -> Option<(String, String)
 
     let cursor = std::str::from_utf8(&plaintext[8..]).ok()?;
 
-    let parts: Vec<&str> = cursor.splitn(2, '|').collect();
-    if parts.len() == 2 {
-        Some((parts[0].to_string(), parts[1].to_string()))
+    let parts: Vec<&str> = cursor.splitn(3, '|').collect();
+    if parts.len() >= 2 {
+        let repo = parts.get(2).map(|s| s.to_string()).unwrap_or_default();
+        Some((parts[0].to_string(), parts[1].to_string(), repo))
     } else {
         None
     }
@@ -437,15 +438,7 @@ pub async fn list_pins(
     let caller_str = caller.unwrap();
     let caller_owned = Some(caller_str.to_string());
 
-    // Per-DID rate limit: the listing performs expensive git walks and cat-file
-    // probes, so a throwaway DID with a valid signature can exhaust resources (P1).
-    if !state.ipfs_list_rate_limiter.check(caller_str).await {
-        return Err(AppError::TooManyRequests(
-            "rate limit exceeded for IPFS pin listing".into(),
-        ));
-    }
-
-    // Clamp/handle zero limit before any expensive work so short-lived
+    // Clamp/handle zero limit before any quota or expensive work so short-lived
     // requests do not drain rate-limit buckets or enumerate the node (P2).
     let max_visible = query.limit.clamp(0, 200);
 
@@ -454,6 +447,14 @@ pub async fn list_pins(
             "pins": [],
             "count": 0,
         })));
+    }
+
+    // Per-DID rate limit: the listing performs expensive git walks and cat-file
+    // probes, so a throwaway DID with a valid signature can exhaust resources (P1).
+    if !state.ipfs_list_rate_limiter.check(caller_str).await {
+        return Err(AppError::TooManyRequests(
+            "rate limit exceeded for IPFS pin listing".into(),
+        ));
     }
 
     // Global rate limit: keyed on a fixed value so DID rotation cannot
@@ -497,8 +498,10 @@ pub async fn list_pins(
     }
 
     // Decode the optional keyset cursor from base64.
-    // Internal format: "pinned_at|sha256_hex" (2-tuple) for normal
-    // pagination, or just "pinned_at" (1-tuple) for the truncated resume.
+    // Wire format: "pinned_at|sha256_hex" (2-tuple).  On resume we widen it
+    // to (pinned_at, sha256_hex, "") so the SQL 3-tuple predicate skips
+    // already-emitted SHAs while still processing remaining associations
+    // of the batch's last SHA (P1).
     let decode_cursor = |s: &str| -> Option<(String, String)> {
         let bytes = URL_SAFE_NO_PAD.decode(s.as_bytes()).ok()?;
         let decoded = String::from_utf8(bytes).ok()?;
@@ -512,9 +515,9 @@ pub async fn list_pins(
     let encode_cursor =
         |pa: &str, sha: &str| -> String { URL_SAFE_NO_PAD.encode(format!("{pa}|{sha}")) };
 
-    let initial_cursor = match query.cursor.as_ref() {
+    let initial_cursor: Option<(String, String, String)> = match query.cursor.as_ref() {
         Some(c) => match decode_cursor(c) {
-            Some(cursor) => Some(cursor),
+            Some((pa, sha)) => Some((pa, sha, String::new())),
             None => {
                 return Err(AppError::BadRequest(
                     "invalid cursor: expected base64-encoded pinned_at|sha256_hex".into(),
@@ -525,15 +528,15 @@ pub async fn list_pins(
     };
 
     // Truncated resume cursor: XChaCha20Poly1305 AEAD token. Decrypts to the
-    // same (pinned_at, sha256_hex) cursor on the server side but the
+    // same (pinned_at, sha256_hex, repo) cursor on the server side but the
     // caller cannot decode hidden-row metadata from the wire format. If the
     // token is present but undecodable we return an explicit error so the
     // client does not silently restart at page 1.
-    let truncated_resume = match query.truncated_cursor.as_ref() {
+    let truncated_resume: Option<(String, String, String)> = match query.truncated_cursor.as_ref() {
         Some(t) => {
             let seed = state.node_keypair.to_seed();
             match decode_opaque_cursor(&seed, t) {
-                Some(c) => Some(c),
+                Some((pa, sha, repo)) => Some((pa, sha, repo)),
                 None => {
                     return Err(AppError::BadRequest(
                         "invalid or expired truncated_cursor".into(),
@@ -567,7 +570,8 @@ pub async fn list_pins(
     // next_cursor is derived from the last *accepted* (visible) pin, never
     // from the last scanned row, to avoid leaking withheld-blob metadata
     // or skipping rows the caller was never shown.
-    const BATCH_SIZE: i64 = 200;
+    const BATCH_SIZE: i64 = 200; // max unique SHAs per batch
+    const MAX_ASSOC: i64 = 2000; // max association rows per batch (SHA limit × 10)
     const MAX_BATCHES: usize = 10;
     const MAX_WALKS: usize = 50;
     const MAX_PROBES: usize = 200;
@@ -585,7 +589,7 @@ pub async fn list_pins(
     // repo associations.  Track seen SHAs so each object is emitted at most
     // once, after evaluating per-association visibility (P2).
     let mut seen_shas: HashSet<String> = HashSet::new();
-    let mut db_cursor: Option<(String, String)> = truncated_resume.or(initial_cursor);
+    let mut db_cursor: Option<(String, String, String)> = truncated_resume.or(initial_cursor);
     let mut response_cursor: Option<(String, String)> = None;
     let mut allowed_blobs_by_repo: HashMap<String, (HashSet<String>, PathBuf)> = HashMap::new();
     let mut page_truncated = false;
@@ -610,9 +614,10 @@ pub async fn list_pins(
                     &query_repos,
                     &query_owner_dids,
                     BATCH_SIZE,
+                    MAX_ASSOC,
                     db_cursor
                         .as_ref()
-                        .map(|(pa, sha)| (pa.as_str(), sha.as_str())),
+                        .map(|(pa, sha, repo)| (pa.as_str(), sha.as_str(), repo.as_str())),
                 )
                 .await
                 .map_err(AppError::Internal)?
@@ -635,13 +640,17 @@ pub async fn list_pins(
 
         for (i, pin) in batch.iter().enumerate() {
             if pin.repo.is_empty() {
-                db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone()));
+                db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone(), String::new()));
                 pin_outcome.push(None);
                 continue;
             }
             let Some((repo, rules)) = repos_by_slug.get(&pin.repo) else {
                 // Unknown slug — advance cursor past it, no visibility check.
-                db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone()));
+                db_cursor = Some((
+                    pin.pinned_at.clone(),
+                    pin.sha256_hex.clone(),
+                    pin.repo.clone(),
+                ));
                 pin_outcome.push(None);
                 continue;
             };
@@ -777,7 +786,11 @@ pub async fn list_pins(
             // All pins had empty/unmatched repos — advance past the batch so
             // we don't loop forever on the same unprocessable rows (P1).
             if let Some(last) = batch.last() {
-                db_cursor = Some((last.pinned_at.clone(), last.sha256_hex.clone()));
+                db_cursor = Some((
+                    last.pinned_at.clone(),
+                    last.sha256_hex.clone(),
+                    last.repo.clone(),
+                ));
             }
         }
 
@@ -895,8 +908,12 @@ pub async fn list_pins(
                     if batch_cursor.is_some() {
                         db_cursor = batch_cursor;
                     }
-                } else if let Some(pin) = i.checked_sub(1).and_then(|prev| batch.get(prev)) {
-                    db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone()));
+                } else if let Some(prev) = i.checked_sub(1).and_then(|prev| batch.get(prev)) {
+                    db_cursor = Some((
+                        prev.pinned_at.clone(),
+                        prev.sha256_hex.clone(),
+                        prev.repo.clone(),
+                    ));
                 }
                 break;
             }
@@ -904,28 +921,34 @@ pub async fn list_pins(
             let pin = batch[i].clone();
             let Some((repo, rules)) = repos_by_slug.get(&pin.repo) else {
                 // Already advanced past in phase 1 — just maintain cursor.
-                db_cursor = Some((pin.pinned_at.clone(), pin.sha256_hex.clone()));
+                db_cursor = Some((
+                    pin.pinned_at.clone(),
+                    pin.sha256_hex.clone(),
+                    pin.repo.clone(),
+                ));
                 continue;
             };
 
             if !has_path_scoped_rule(rules) {
                 let pa = pin.pinned_at.clone();
                 let sha = pin.sha256_hex.clone();
+                let repo_slug = pin.repo.clone();
 
                 // Dedup by sha256_hex (P2): only skip if already *emitted* —
                 // do not suppress a visible association because a hidden one
                 // appeared first in the batch.
                 if !seen_shas.insert(sha.clone()) {
-                    db_cursor = Some((pa, sha));
+                    db_cursor = Some((pa, sha, repo_slug));
                     continue;
                 }
 
                 response_cursor = Some((pa.clone(), sha.clone()));
                 pins.push(pin);
-                db_cursor = Some((pa, sha));
+                db_cursor = Some((pa, sha, repo_slug));
             } else {
                 let pa = pin.pinned_at.clone();
                 let sha = pin.sha256_hex.clone();
+                let repo_slug = pin.repo.clone();
 
                 let visible = match pin_outcome[i] {
                     Some(v) => v,
@@ -943,13 +966,13 @@ pub async fn list_pins(
                 };
                 if visible {
                     if !seen_shas.insert(sha.clone()) {
-                        db_cursor = Some((pa, sha));
+                        db_cursor = Some((pa, sha, repo_slug));
                         continue;
                     }
                     response_cursor = Some((pa.clone(), sha.clone()));
                     pins.push(pin);
                 }
-                db_cursor = Some((pa, sha));
+                db_cursor = Some((pa, sha, repo_slug));
             }
 
             if pins.len() >= max_visible as usize {
@@ -966,10 +989,10 @@ pub async fn list_pins(
     // When page 1 is all-deferred (no walk permit available) neither
     // response_cursor nor db_cursor was set.  Emit a sentinel opaque cursor
     // so the client can retry; on the retry the sentinel decodes to
-    // ("\x7f", "\x7f") which the keyset WHERE < predicate treats
+    // ("\x7f", "\x7f", "\x7f") which the keyset WHERE < predicate treats
     // as "include every row" — effectively restarting from the beginning (P2).
     if page_truncated && response_cursor.is_none() && db_cursor.is_none() {
-        db_cursor = Some(("\x7f".to_string(), "\x7f".to_string()));
+        db_cursor = Some(("\x7f".to_string(), "\x7f".to_string(), "\x7f".to_string()));
     }
 
     let mut body = serde_json::json!({
@@ -991,8 +1014,8 @@ pub async fn list_pins(
         // when there are no visible rows to derive a keyset cursor from.
         if let Some((ref pa, ref sha)) = response_cursor {
             body["next_cursor"] = serde_json::json!(encode_cursor(pa, sha));
-        } else if let Some((ref pa, ref sha)) = db_cursor {
-            let cursor_str = format!("{pa}|{sha}");
+        } else if let Some((ref pa, ref sha, ref repo)) = db_cursor {
+            let cursor_str = format!("{pa}|{sha}|{repo}");
             let seed = state.node_keypair.to_seed();
             let token = create_opaque_cursor(&seed, &cursor_str);
             body["truncated_cursor"] = serde_json::json!(token);

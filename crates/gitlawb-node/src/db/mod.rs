@@ -2483,21 +2483,23 @@ impl Db {
     }
 
     /// Bounded global pin query: returns pins for any of the given (repo, owner_did)
-    /// pairs, ordered by pinned_at DESC, capped at `limit` distinct objects.
-    /// Each batch returns up to `limit` unique SHAs (determined by DISTINCT ON)
-    /// and ALL repo associations for those SHAs, so the caller can evaluate
-    /// per-association visibility before deduplicating (P2).
-    /// Uses keyset pagination on (pinned_at, sha256_hex). Resume from a client
-    /// 2-tuple cursor uses the same (pinned_at, sha256_hex) directly; all
-    /// associations of the last SHA are guaranteed to be in the same batch.
+    /// pairs, ordered by (pinned_at DESC, sha256_hex DESC, repo DESC) and capped
+    /// by both distinct-object count and total-association row count.
+    /// The inner DISTINCT ON picks up to `sha_limit` unique SHAs; the outer query
+    /// then returns ALL repo associations for those SHAs, bounded by `assoc_limit`
+    /// rows.  When `cursor` is `Some((pinned_at, sha256_hex, repo))`, the inner
+    /// query skips rows whose keyset position is not strictly before the cursor,
+    /// so a partially-returned SHA (outer result hit `assoc_limit`) resumes
+    /// correctly on the next fetch.
     pub async fn list_pinned_cids_for_repos(
         &self,
         repos: &[String],
         owner_dids: &[String],
-        limit: i64,
-        cursor: Option<(&str, &str)>,
+        sha_limit: i64,
+        assoc_limit: i64,
+        cursor: Option<(&str, &str, &str)>,
     ) -> Result<Vec<PinnedCidRecord>> {
-        let rows = if let Some((pa, sha)) = cursor {
+        let rows = if let Some((pa, sha, repo)) = cursor {
             sqlx::query(
                 r#"WITH batch_shas AS (
                     SELECT sha256_hex
@@ -2509,11 +2511,12 @@ impl Db {
                              AS pairs(repo, owner_did)
                           ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
                              = (pairs.repo, pairs.owner_did)
-                        WHERE (p.pinned_at, p.sha256_hex) < ($3::text, $4::text)
+                        WHERE (p.pinned_at, p.sha256_hex, COALESCE(pr.repo, p.repo))
+                              < ($3::text, $4::text, $5::text)
                         ORDER BY p.sha256_hex, p.pinned_at DESC
                     ) deduped
                     ORDER BY pinned_at DESC, sha256_hex DESC
-                    LIMIT $5
+                    LIMIT $6
                 )
                 SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
                        COALESCE(pr.repo, p.repo) AS repo,
@@ -2526,13 +2529,16 @@ impl Db {
                   ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
                      = (pairs.repo, pairs.owner_did)
                 ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
-                         COALESCE(pr.repo, p.repo) DESC"#,
+                         COALESCE(pr.repo, p.repo) DESC
+                LIMIT $7"#,
             )
             .bind(repos)
             .bind(owner_dids)
             .bind(pa)
             .bind(sha)
-            .bind(limit)
+            .bind(repo)
+            .bind(sha_limit)
+            .bind(assoc_limit)
             .fetch_all(&self.pool)
             .await?
         } else {
@@ -2563,11 +2569,13 @@ impl Db {
                   ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
                      = (pairs.repo, pairs.owner_did)
                 ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
-                         COALESCE(pr.repo, p.repo) DESC"#,
+                         COALESCE(pr.repo, p.repo) DESC
+                LIMIT $4"#,
             )
             .bind(repos)
             .bind(owner_dids)
-            .bind(limit)
+            .bind(sha_limit)
+            .bind(assoc_limit)
             .fetch_all(&self.pool)
             .await?
         };

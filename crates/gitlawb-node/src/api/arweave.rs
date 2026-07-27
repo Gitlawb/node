@@ -87,6 +87,21 @@ pub async fn list_anchors(
         })));
     }
 
+    // Short-circuit for zero limit before any work or admission check (P2).
+    if limit == 0 {
+        return Ok(Json(serde_json::json!({
+            "anchors": [],
+            "count": 0,
+        })));
+    }
+
+    // Global rate limit: prevent DID-rotation enumeration (P2).
+    if !state.ipfs_list_global_limiter.check("global").await {
+        return Err(AppError::TooManyRequests(
+            "rate limit exceeded for anchor listing".into(),
+        ));
+    }
+
     // Authenticated caller without ?repo=: scope to readable repos (P1).
     // Use the deduped, quarantine-filtered view (same as the pin listing).
     let repos = state

@@ -426,6 +426,8 @@ async fn main() -> Result<()> {
         let push_rl = state.push_rate_limiter.clone();
         let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
         let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let ipfs_list_rl = state.ipfs_list_rate_limiter.clone();
+        let ipfs_list_global_rl = state.ipfs_list_global_limiter.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
@@ -437,6 +439,8 @@ async fn main() -> Result<()> {
                         push_rl.cleanup().await;
                         sync_trigger_rl.cleanup().await;
                         peer_write_rl.cleanup().await;
+                        ipfs_list_rl.cleanup().await;
+                        ipfs_list_global_rl.cleanup().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
