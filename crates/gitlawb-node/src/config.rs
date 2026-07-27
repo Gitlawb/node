@@ -162,6 +162,19 @@ pub struct Config {
     #[arg(long, env = "GITLAWB_PEER_WRITE_RATE_LIMIT", default_value_t = 600)]
     pub peer_write_rate_limit: usize,
 
+    /// Per-client-IP rate limit for the signed write routes (tasks, pull-request
+    /// merge/close/review/comment, webhooks, branch protection, stars, replicas,
+    /// labels, visibility, agent deregistration, bounties, profile, issue
+    /// close/comment), in requests per hour. Every signed attempt on these routes
+    /// commits a `consumed_signatures` row before the handler runs any
+    /// authorization or existence check, and a signature proves nothing about
+    /// registration (any freshly minted `did:key` self-signs), so without a brake
+    /// an unregistered caller can force a durable write per request. Its own
+    /// bucket, so a flood here cannot drain the creation, push, or peer-sync
+    /// quotas. `0` disables. Default: 600.
+    #[arg(long, env = "GITLAWB_SIGNED_WRITE_RATE_LIMIT", default_value_t = 600)]
+    pub signed_write_rate_limit: usize,
+
     /// Optional address to bind a Prometheus `/metrics` exposition endpoint on.
     /// Example: `127.0.0.1:9091`. Leave empty (default) to disable.
     /// Bind to localhost or a private interface — the metrics endpoint is

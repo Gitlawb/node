@@ -317,7 +317,7 @@ GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
 
 `POST /api/v1/sync/trigger` is not part of the staged rollout: it always requires a signature in both config modes and returns 401 without one, because each call drives an O(peers) outbound fan-out.
 
-A verified signature is spent once on every write route, so a captured request cannot be replayed. The ledger keys on the RFC 9421 `nonce` parameter when the client signs one and falls back to the signing-string hash when it does not. The fallback is correct but coarser: a client that repeats a byte-identical mutation within the same second is rejected as a replay and has to re-sign. `GITLAWB_REQUIRE_SIGNATURE_NONCE` closes that fallback once every client emits a nonce:
+A verified signature is spent once on the write routes that require one: repo, issue, PR, task, bounty, profile, webhook, label, star, replica, visibility and agent mutations, plus git push and `POST /api/v1/sync/trigger`. A captured request to any of those cannot be replayed. The two peer-write routes are the exception. `POST /api/v1/peers/announce` and `POST /api/v1/sync/notify` reach the ledger only when `GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true`; under the default (`false`) they verify a signature when the headers are present but never spend it, so a captured signed peer write is still replayable there until the fleet upgrades and the flag is turned on. The ledger keys on the RFC 9421 `nonce` parameter when the client signs one and falls back to the signing-string hash when it does not. The fallback is correct but coarser: a client that repeats a byte-identical mutation within the same second is rejected as a replay and has to re-sign. `GITLAWB_REQUIRE_SIGNATURE_NONCE` closes that fallback once every client emits a nonce:
 
 ```bash
 GITLAWB_REQUIRE_SIGNATURE_NONCE=true
@@ -350,6 +350,7 @@ Important node settings:
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
 | `GITLAWB_REQUIRE_SIGNATURE_NONCE` | Require a signed `nonce` on write routes. Default false; see the staged rollout note above. |
+| `GITLAWB_SIGNED_WRITE_RATE_LIMIT` | Per-client-IP requests per hour on the signed write routes (tasks, PR merge/close/review/comment, webhooks, branch protection, stars, replicas, labels, visibility, agent deregistration, bounties, profile, issue close/comment). Each signed attempt spends a ledger row before the handler checks anything, so the brake bounds what an unregistered caller can write. Own bucket; `0` disables. Default 600. |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
 | `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack/receive-pack may run before it is aborted (504). Default 600. Does not bound `info/refs` or the withheld-blob path. |

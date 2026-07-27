@@ -81,6 +81,7 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         push_limiter_trust: crate::rate_limit::TrustedProxy::None,
         sync_trigger_rate_limiter: RateLimiter::new(60, Duration::from_secs(3600)),
         peer_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
+        signed_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
         shutdown_tx: tokio::sync::watch::channel(false).0,
     }
 }
@@ -5186,16 +5187,18 @@ mod tests {
 
     // ── HTTP-signature replay guards (issue #253) ────────────────────────────
     //
-    // `require_signature` verifies a signature and keeps no record that it did:
-    // it is `middleware::from_fn` and never receives `AppState`, so it cannot.
-    // There is no nonce, no spent-signature ledger, and `check_created` compares
-    // `(now - created).abs()` against 300, so one captured Signature-Input +
-    // Signature + body triple is a bearer credential across a ~600s span and is
-    // accepted by any node serving that path.
+    // Before the fix, `require_signature` verified a signature and kept no record
+    // that it did: it is `middleware::from_fn` and never received `AppState`, so
+    // it could not. There was no nonce, no spent-signature ledger, and
+    // `check_created` compared `(now - created).abs()` against 300, so one
+    // captured Signature-Input + Signature + body triple was a bearer credential
+    // across a ~600s span, accepted by any node serving that path.
     //
-    // The three `#[ignore]`d tests below assert the FIXED behavior and are red
-    // until #253 lands; drop the attribute as part of that fix. The two that are
-    // not ignored pin properties the proposed fix depends on and must stay green.
+    // That is the bug #253 fixed. The tests below now run against the fix: some
+    // assert the repaired behavior (a replay is rejected, a future-dated
+    // `created` is refused), the rest pin properties the fix depends on and must
+    // not regress (the 300s backward budget, the read surface staying free of
+    // both the ledger and the staged nonce requirement).
     mod replay_guards {
         use super::*;
         use base64::{engine::general_purpose::STANDARD, Engine};
@@ -5372,38 +5375,32 @@ mod tests {
         /// #253 limb 1, malleability: the `Signature` header carries optional
         /// surrounding whitespace, and `HttpSignature::parse` trims internally, so a
         /// ledger keyed on the raw header text is defeated by one space. Each variant
-        /// below is a distinct byte string that verifies identically today.
+        /// below is a distinct byte string that verifies identically.
+        ///
+        /// The signature is deliberately nonce-less (`sign_with(.., "")`), which is
+        /// what puts `ledger_key` on its signing-string-hash arm. Signed through
+        /// `sign_request` the key would be `(keyid, nonce)` and the header bytes
+        /// would be irrelevant by construction, so the test would pass whatever the
+        /// hash arm did.
         #[sqlx::test]
         async fn whitespace_variants_are_rejected_as_replays(pool: PgPool) {
             let kp = Keypair::generate();
             let did = kp.did().to_string();
             let state = test_state(pool).await;
             let body = task_body(&did);
-            let signed = sign_request(&kp, "POST", PATH, &body);
+            let created = chrono::Utc::now().timestamp();
+            let (signature, signature_input, content_digest) = sign_with(&kp, &body, created, "");
 
-            let first = send(
-                &state,
-                &signed.signature,
-                &signed.signature_input,
-                &signed.content_digest,
-                &body,
-            )
-            .await;
+            let first = send(&state, &signature, &signature_input, &content_digest, &body).await;
             assert_eq!(first, StatusCode::CREATED);
 
             for variant in [
-                format!(" {}", signed.signature),
-                format!("{} ", signed.signature),
-                format!("\t{}", signed.signature),
+                format!(" {signature}"),
+                format!("{signature} "),
+                format!("\t{signature}"),
             ] {
-                let resp = send_full(
-                    &state,
-                    &variant,
-                    &signed.signature_input,
-                    &signed.content_digest,
-                    &body,
-                )
-                .await;
+                let resp =
+                    send_full(&state, &variant, &signature_input, &content_digest, &body).await;
                 assert_eq!(
                     resp.status(),
                     StatusCode::CONFLICT,
@@ -6148,9 +6145,12 @@ mod tests {
             (signature, signature_input, content_digest)
         }
 
-        /// U8 scenario 1: with the flag off, the hash fallback still works. The
-        /// ledger row is the load-bearing half — asserting only "not a 400"
-        /// would pass just as well if the fallback had stopped ledgering.
+        /// U8 scenario 1: with the flag off, a nonce-less signature is served
+        /// (not a 400) and still spends exactly one ledger row. The row count is
+        /// what rules out a fallback that serves the request but ledgers nothing;
+        /// it does not check the key's shape, so any non-empty key passes here.
+        /// `whitespace_variants_are_rejected_as_replays` above is the test that
+        /// pins what the hash arm keys on.
         #[sqlx::test]
         async fn nonceless_signature_is_ledgered_by_hash_when_the_flag_is_off(pool: PgPool) {
             let kp = Keypair::generate();
@@ -6272,6 +6272,144 @@ mod tests {
                 ledger_rows(&pool).await,
                 0,
                 "a read must still write no ledger row"
+            );
+        }
+
+        // ── The per-IP brake in front of the signed write routes ─────────────
+        //
+        // `consume_signature` commits a row before the handler runs any
+        // authorization or existence check, and `require_signature` accepts any
+        // self-signed did:key, so an unregistered caller can force a durable
+        // write per request. The brake sits outside `add_auth_layers`, so the
+        // property under test is that an over-limit request costs no ledger row,
+        // not merely that it is refused.
+
+        /// A copy of `state` whose signed-write brake carries an explicit limit,
+        /// built the same way otherwise so a test compares the limit and nothing
+        /// else. `build_router` hands this limiter to the five signed-write
+        /// groups, matching how the peer-sync brake tests set theirs.
+        fn with_signed_write_limit(state: &AppState, limit: usize) -> AppState {
+            AppState {
+                signed_write_rate_limiter: crate::rate_limit::RateLimiter::new(
+                    limit,
+                    Duration::from_secs(3600),
+                ),
+                ..state.clone()
+            }
+        }
+
+        /// A genuinely signed `POST` to [`PATH`] carrying `ip` as the socket peer
+        /// address, which is what `client_key` resolves under
+        /// `TrustedProxy::None`.
+        fn signed_task_request(kp: &Keypair, body: &[u8], ip: &str) -> Request<Body> {
+            let signed = sign_request(kp, "POST", PATH, body);
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(PATH)
+                .header("content-type", "application/json")
+                .header("content-digest", &signed.content_digest)
+                .header("signature-input", &signed.signature_input)
+                .header("signature", &signed.signature)
+                .body(Body::from(body.to_vec()))
+                .expect("request builder");
+            req.extensions_mut().insert(axum::extract::ConnectInfo(
+                ip.parse::<std::net::SocketAddr>().expect("peer address"),
+            ));
+            req
+        }
+
+        #[sqlx::test]
+        async fn signed_write_flood_is_braked_before_the_ledger(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = with_signed_write_limit(&test_state(pool.clone()).await, 2);
+            let body = task_body(&did);
+            let router = crate::server::build_router(state.clone());
+            let ip = "203.0.113.40:5000";
+
+            for n in 1..=2 {
+                let resp = router
+                    .clone()
+                    .oneshot(signed_task_request(&kp, &body, ip))
+                    .await
+                    .expect("router response");
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::CREATED,
+                    "request {n} is inside the budget and must still be served"
+                );
+            }
+            assert_eq!(
+                ledger_rows(&pool).await,
+                2,
+                "each served request spends one ledger row"
+            );
+
+            let over = router
+                .clone()
+                .oneshot(signed_task_request(&kp, &body, ip))
+                .await
+                .expect("router response");
+            assert_eq!(
+                over.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "the over-limit request must be refused by the IP brake"
+            );
+            assert_eq!(
+                ledger_rows(&pool).await,
+                2,
+                "the refused request must not have been charged a ledger row"
+            );
+            let tasks = state
+                .db
+                .list_tasks(None, None, 100)
+                .await
+                .expect("list tasks");
+            assert_eq!(
+                tasks.iter().filter(|t| t.delegator_did == did).count(),
+                2,
+                "the refused request must not have reached the handler"
+            );
+        }
+
+        #[sqlx::test]
+        async fn signed_write_brake_does_not_reach_a_second_ip(pool: PgPool) {
+            // must-not-over-throttle: the brake is keyed on the resolved client
+            // IP, so exhausting one source's budget must leave another source
+            // served. Without this, a brake that rejected everything would pass
+            // the flood test above.
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = with_signed_write_limit(&test_state(pool.clone()).await, 1);
+            let body = task_body(&did);
+            let router = crate::server::build_router(state);
+
+            for ip in ["203.0.113.41:5000", "203.0.113.42:5000"] {
+                let resp = router
+                    .clone()
+                    .oneshot(signed_task_request(&kp, &body, ip))
+                    .await
+                    .expect("router response");
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::CREATED,
+                    "the first request from {ip} must be served"
+                );
+            }
+            assert_eq!(
+                ledger_rows(&pool).await,
+                2,
+                "both served requests spent a row; neither was braked"
+            );
+
+            let repeat = router
+                .oneshot(signed_task_request(&kp, &body, "203.0.113.41:5000"))
+                .await
+                .expect("router response");
+            assert_eq!(
+                repeat.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "the first IP's budget is spent"
             );
         }
     }

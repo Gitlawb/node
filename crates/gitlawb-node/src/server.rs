@@ -48,11 +48,21 @@ async fn graphql_playground() -> impl IntoResponse {
 /// `AuthenticatedDid` and `SignatureIdentity`), then `require_ucan_chain`
 /// (reads the DID), then `consume_signature` (spends the signature).
 ///
-/// The ledger runs LAST on purpose. If it ran before `require_ucan_chain`, a
-/// request with a good signature but a rejected UCAN would burn its key and the
-/// client could not retry those exact bytes. Consuming after every auth check
-/// but still before the handler is what closes the concurrent-replay race
-/// without penalizing a request that was never going to run.
+/// The ledger runs last of the three on purpose. If it ran before
+/// `require_ucan_chain`, a request with a good signature but a rejected UCAN
+/// would burn its key and the client could not retry those exact bytes.
+/// Consuming before the handler, rather than inside it, is what closes the
+/// concurrent-replay race: two copies of the same signature race the ledger, not
+/// the handler.
+///
+/// It is not the last check overall, so some rejections do still cost a ledger
+/// row. Any layer added inside the router passed in runs AFTER the ledger
+/// (`creation_routes` puts `rate_limit_by_did` there), and every check the
+/// handler itself makes (the iCaptcha 403, ownership, existence) runs later
+/// still. A request refused by the per-DID throttle, by iCaptcha, or by the
+/// handler has already spent its signature and must re-sign to retry. Only a
+/// per-IP brake layered outside this stack rejects a request before the ledger
+/// is charged.
 fn add_auth_layers(router: Router<AppState>, state: AppState) -> Router<AppState> {
     router
         .layer(middleware::from_fn_with_state(
@@ -77,6 +87,22 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn(auth::optional_signature))
         .route_service("/graphql/ws", GraphQLSubscription::new(schema));
 
+    // ── Per-IP flood brake for the signed write routes ────────────────────
+    // Every signed attempt on a route wrapped in `add_auth_layers` commits a
+    // `consumed_signatures` row before the handler runs any authorization or
+    // existence check, and `require_signature` resolves the key from the did:key
+    // itself, so any freshly minted keypair can force that durable write on a
+    // repo it does not own or that does not exist. The five groups below carried
+    // no brake at all; this one caps them on the resolved client IP. Its own
+    // bucket, so a flood here cannot drain the creation, push, or peer-sync
+    // quotas. Each group layers it OUTSIDE `add_auth_layers` (axum runs the last
+    // `.layer` first) so an over-limit request is rejected before signature
+    // verification burns CPU and before the ledger is charged.
+    let signed_write_ip_limiter = rate_limit::IpRateLimiter {
+        limiter: state.signed_write_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
+
     // ── Task routes (write — require HTTP Signature) ───────────────────────
     let task_write_routes = add_auth_layers(
         Router::new()
@@ -85,7 +111,9 @@ pub fn build_router(state: AppState) -> Router {
             .route("/api/v1/tasks/{id}/complete", post(tasks::complete_task))
             .route("/api/v1/tasks/{id}/fail", post(tasks::fail_task)),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(signed_write_ip_limiter.clone()));
 
     // ── Task routes (read — open) ──────────────────────────────────────────
     let task_read_routes = Router::new()
@@ -122,7 +150,7 @@ pub fn build_router(state: AppState) -> Router {
     .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
     .layer(axum::Extension(create_ip_limiter));
 
-    // ── Write routes — require HTTP Signature (no rate limit) ─────────────
+    // ── Write routes — require HTTP Signature, plus the signed-write IP brake ─
     let write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -192,7 +220,9 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::delete(agents::deregister_agent),
             ),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(signed_write_ip_limiter.clone()));
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.
@@ -258,7 +288,9 @@ pub fn build_router(state: AppState) -> Router {
                 post(bounties::dispute_bounty),
             ),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(signed_write_ip_limiter.clone()));
 
     // ── Bounty routes (read — open) ──────────────────────────────────────
     let bounty_read_routes = Router::new()
@@ -279,9 +311,11 @@ pub fn build_router(state: AppState) -> Router {
     let profile_write_routes = add_auth_layers(
         Router::new().route("/api/v1/profile", axum::routing::put(profiles::set_profile)),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(signed_write_ip_limiter.clone()));
 
-    // ── Issue routes (write — require HTTP Signature, no rate limit) ─────
+    // ── Issue routes (write — require HTTP Signature) ────────────────────
     let issue_write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -293,7 +327,9 @@ pub fn build_router(state: AppState) -> Router {
                 post(issues::create_issue_comment),
             ),
         state.clone(),
-    );
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(signed_write_ip_limiter));
 
     // ── Peer discovery routes ─────────────────────────────────────────────
     // Peer writes accept signatures when present and can require them after a
