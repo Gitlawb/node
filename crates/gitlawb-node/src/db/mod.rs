@@ -365,15 +365,32 @@ impl Db {
     /// Must be called while holding the migration advisory lock.
     async fn run_pending_migrations(&self) -> Result<()> {
         for m in MIGRATIONS {
-            let already: bool = sqlx::query(
-                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
-            )
-            .bind(m.version)
-            .fetch_one(&self.pool)
-            .await?
-            .get::<bool, _>("applied");
+            // Compare the recorded *name*, not just the version. Two branches
+            // developed in parallel can each claim the same version number;
+            // with a version-only check the one that merges second is silently
+            // skipped, leaving the schema it needs missing while
+            // `schema_migrations` still reads healthy. Fail loudly at startup
+            // instead, so the collision is fixed by renumbering.
+            let recorded: Option<String> =
+                sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version = $1")
+                    .bind(m.version)
+                    .fetch_optional(&self.pool)
+                    .await?;
 
-            if already {
+            if let Some(recorded) = recorded {
+                if recorded != m.name {
+                    anyhow::bail!(
+                        "migration version {} is already applied in this database as {:?}, \
+                         but this build defines v{} as {:?}. Two migrations claimed the same \
+                         version; renumber this build's migration above every applied version \
+                         instead of reusing v{}.",
+                        m.version,
+                        recorded,
+                        m.version,
+                        m.name,
+                        m.version
+                    );
+                }
                 continue;
             }
 
@@ -884,7 +901,13 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 12,
+        // v12..v15 are claimed by the in-flight IPFS CID branch
+        // (fix/issue-135-ipfs-cid-tree-gate). That branch is behind main and
+        // still numbers its four migrations 11..14, so once it rebases past
+        // main's v11 (ref_update_owner_did) they shift up to 12..15. Numbering
+        // above that range keeps whichever branch merges second from having
+        // its migration skipped as "already applied".
+        version: 16,
         name: "consumed_signatures",
         stmts: &[
             // Single-use ledger for HTTP message signatures. `sig_hash` is a
@@ -5118,7 +5141,8 @@ mod icaptcha_ledger_tests {
 
 /// Exercises the HTTP-signature replay ledger (`consumed_signatures`): its
 /// single-use accessor, the sweep that bounds it, the per-identity cap, and the
-/// v12 upgrade path from an existing v11 database.
+/// v16 upgrade path from a database sitting at the version below it, plus the
+/// runner's guard against a version applied under a different migration name.
 #[cfg(test)]
 mod signature_ledger_tests {
     use super::{ConsumeSignature, Db, MIGRATIONS};
@@ -5288,17 +5312,17 @@ mod signature_ledger_tests {
         );
     }
 
-    /// Upgrade path: an existing node sitting at v11 must gain the ledger table
-    /// and its sweep index when it applies v12, and the table must round-trip.
-    /// A fresh-database test cannot cover this — it never exercises the
-    /// v11 -> v12 step in isolation.
+    /// Upgrade path: an existing node sitting at the highest migration below
+    /// v16 must gain the ledger table and its sweep index when it applies v16,
+    /// and the table must round-trip. A fresh-database test cannot cover this —
+    /// it never exercises the "everything but v16" -> v16 step in isolation.
     #[sqlx::test]
-    async fn migration_v12_creates_signature_ledger(pool: PgPool) {
+    async fn migration_v16_creates_signature_ledger(pool: PgPool) {
         let db = Db::for_testing(pool);
 
-        // Build the whole schema, then tear the v12 objects back down and
-        // re-seed `schema_migrations` at v11 to simulate a node that has run
-        // v1..v11 but not yet v12.
+        // Build the whole schema, then tear the v16 objects back down and
+        // re-seed `schema_migrations` with every migration below v16 to
+        // simulate a node that has run everything else but not yet v16.
         db.run_migrations().await.unwrap();
         sqlx::query("DROP TABLE IF EXISTS consumed_signatures")
             .execute(&db.pool)
@@ -5308,7 +5332,7 @@ mod signature_ledger_tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        for m in MIGRATIONS.iter().take_while(|m| m.version < 12) {
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 16) {
             sqlx::query(
                 "INSERT INTO schema_migrations (version, name, applied_at)
                  VALUES ($1, $2, $3)",
@@ -5320,16 +5344,25 @@ mod signature_ledger_tests {
             .await
             .unwrap();
         }
+        // Derive the baseline from the catalogue rather than hardcoding it, so
+        // the test keeps meaning "upgrade from whatever ships below v16" as
+        // other branches land migrations in the 12..16 range.
+        let baseline = MIGRATIONS
+            .iter()
+            .map(|m| m.version)
+            .filter(|v| *v < 16)
+            .max()
+            .expect("catalogue must have migrations below v16");
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_migrations")
                 .fetch_one(&db.pool)
                 .await
                 .unwrap(),
-            11,
-            "baseline must be a v11 database"
+            baseline,
+            "baseline must be the highest migration below v16"
         );
 
-        // ── Apply the pending v12 migration ───────────────────────────────
+        // ── Apply the pending v16 migration ───────────────────────────────
         db.run_migrations().await.unwrap();
 
         // (a) The table exists.
@@ -5342,7 +5375,7 @@ mod signature_ledger_tests {
             .await
             .unwrap(),
             1,
-            "v12 must create consumed_signatures"
+            "v16 must create consumed_signatures"
         );
 
         // (b) The sweep index exists.
@@ -5357,6 +5390,20 @@ mod signature_ledger_tests {
             .unwrap(),
             1,
             "the sweep needs an index on expires_at"
+        );
+
+        // (b2) The per-keyid cap index exists too.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE tablename = 'consumed_signatures'
+                   AND indexname = 'idx_consumed_signatures_keyid_expires'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "the per-keyid live-row cap needs an index on (keyid, expires_at)"
         );
 
         // (c) It round-trips: insert, read back, and the digest survives whole.
@@ -5382,7 +5429,7 @@ mod signature_ledger_tests {
         assert_eq!(got_exp, 9_000_000_000i64);
     }
 
-    /// Re-running migrations over an already-migrated database is a no-op: v12
+    /// Re-running migrations over an already-migrated database is a no-op: v16
     /// applies cleanly a second time, records exactly one `schema_migrations`
     /// row, and does not disturb rows already in the ledger.
     #[sqlx::test]
@@ -5402,13 +5449,13 @@ mod signature_ledger_tests {
 
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM schema_migrations WHERE version = 12"
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 16"
             )
             .fetch_one(&db.pool)
             .await
             .unwrap(),
             1,
-            "v12 must be recorded exactly once"
+            "v16 must be recorded exactly once"
         );
         assert_eq!(
             db.consume_signature(&k, "did:key:zAlice", 1_000, 1_330)
@@ -5418,23 +5465,111 @@ mod signature_ledger_tests {
             "re-running migrations must not drop or recreate the ledger"
         );
 
-        // The skip-by-version check is only half of it. Force v12's statements
+        // The skip-by-version check is only half of it. Force v16's statements
         // to actually execute a second time (a node that lost its
         // `schema_migrations` row, or a re-applied deploy) and they must still
         // succeed against the objects they already created.
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 12")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 16")
             .execute(&db.pool)
             .await
             .unwrap();
         db.run_migrations()
             .await
-            .expect("v12's own statements must be safe to re-execute");
+            .expect("v16's own statements must be safe to re-execute");
         assert_eq!(
             db.consume_signature(&k, "did:key:zAlice", 1_000, 1_330)
                 .await
                 .unwrap(),
             ConsumeSignature::Replayed,
-            "re-executing v12 must not wipe the ledger"
+            "re-executing v16 must not wipe the ledger"
+        );
+    }
+
+    /// A version recorded under a *different* name than the catalogue defines
+    /// means two branches independently claimed the same version number. The
+    /// old applied-check only looked at `version`, so the loser's migration was
+    /// silently skipped and the schema quietly went missing. The runner must
+    /// refuse to start and name the version, the expected name, and the name
+    /// the database actually recorded.
+    #[sqlx::test]
+    async fn migration_version_applied_under_other_name_is_rejected(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Rewrite v16's recorded name as if a colliding branch had applied its
+        // own v16 first. The ledger objects stay in place; only the bookkeeping
+        // disagrees, which is exactly the undetectable case.
+        sqlx::query("UPDATE schema_migrations SET name = $1 WHERE version = 16")
+            .bind("something_else")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let err = db
+            .run_migrations()
+            .await
+            .expect_err("a name mismatch on an applied version must abort startup");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("16"),
+            "error must name the colliding version, got: {msg}"
+        );
+        assert!(
+            msg.contains("consumed_signatures"),
+            "error must name the migration this build expects, got: {msg}"
+        );
+        assert!(
+            msg.contains("something_else"),
+            "error must name what the database recorded, got: {msg}"
+        );
+    }
+
+    /// The guard must not be a blanket failure: a database whose recorded names
+    /// all match the catalogue migrates cleanly, and a version that is not yet
+    /// applied still applies normally even while earlier versions are present.
+    #[sqlx::test]
+    async fn matching_names_and_pending_versions_still_migrate(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // (a) Every recorded name matches -> a second run is a clean no-op.
+        db.run_migrations()
+            .await
+            .expect("matching names must not trip the guard");
+        for m in MIGRATIONS {
+            let recorded: String =
+                sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version = $1")
+                    .bind(m.version)
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, m.name, "v{} name must round-trip", m.version);
+        }
+
+        // (b) A pending version still applies: drop v16's bookkeeping (and its
+        // table) so it is genuinely unapplied while every lower version remains recorded
+        // with matching names.
+        sqlx::query("DROP TABLE IF EXISTS consumed_signatures")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 16")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.run_migrations()
+            .await
+            .expect("an unapplied version must still apply");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_name = 'consumed_signatures'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "the pending migration must have run"
         );
     }
 }
