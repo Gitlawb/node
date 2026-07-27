@@ -5370,7 +5370,6 @@ mod tests {
         /// #253 limb 3: `check_created` takes an absolute value, so a signature dated
         /// in the future is accepted and one capture spans ~600s. The forward bound
         /// should be tight; the backward bound must not move (see the test below).
-        #[ignore = "RED until #253 is fixed: check_created's window is symmetric"]
         #[sqlx::test]
         async fn future_dated_created_is_rejected(pool: PgPool) {
             let kp = Keypair::generate();

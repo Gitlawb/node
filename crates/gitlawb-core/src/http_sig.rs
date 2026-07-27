@@ -23,6 +23,17 @@ use crate::{Error, Result};
 /// The component identifiers covered by every gitlawb signature.
 pub const COVERED_COMPONENTS: &[&str] = &["@method", "@path", "content-digest"];
 
+/// How old a signature may be and still verify.
+///
+/// Do not shrink this without measuring large-pack pushes: the verifier
+/// buffers the entire request body before checking `created`, so a multi-GB
+/// pack spends its upload time inside this budget.
+pub const MAX_SIGNATURE_AGE_SECS: i64 = 300;
+
+/// How far into the future a signature's `created` may sit. Absorbs ordinary
+/// clock skew without letting a signer pre-date its way to a wider window.
+pub const MAX_FUTURE_SKEW_SECS: i64 = 30;
+
 /// The three headers produced by RFC 9421 signing.
 #[derive(Debug, Clone)]
 pub struct SignedHeaders {
@@ -113,15 +124,35 @@ impl HttpSignature {
         })
     }
 
-    /// Reject if the `created` timestamp is more than 5 minutes from now.
+    /// Reject a `created` timestamp outside the acceptance window.
+    ///
+    /// The window is deliberately asymmetric. A signature may be up to
+    /// [`MAX_SIGNATURE_AGE_SECS`] old, because the verifier buffers the whole
+    /// request body before this check runs and the git routes accept packs up
+    /// to gigabytes, so upload time is charged against that budget. It may be
+    /// only [`MAX_FUTURE_SKEW_SECS`] in the future, which is enough to absorb
+    /// ordinary clock skew.
+    ///
+    /// This used to compare `(now - created).abs()` against a single bound,
+    /// which let a signer pre-date `created` and hold a signature valid for
+    /// twice the intended span (#253).
     pub fn check_created(&self) -> Result<()> {
         let now = Utc::now().timestamp();
-        let skew = (now - self.created).abs();
-        if skew > 300 {
+
+        if self.created > now + MAX_FUTURE_SKEW_SECS {
             return Err(Error::HttpSignature(format!(
-                "clock skew too large: {skew}s (max 300s)"
+                "signature is dated {}s in the future (max {MAX_FUTURE_SKEW_SECS}s)",
+                self.created - now
             )));
         }
+
+        let age = now - self.created;
+        if age > MAX_SIGNATURE_AGE_SECS {
+            return Err(Error::HttpSignature(format!(
+                "signature is {age}s old (max {MAX_SIGNATURE_AGE_SECS}s)"
+            )));
+        }
+
         Ok(())
     }
 
@@ -385,6 +416,62 @@ mod tests {
             missing.is_empty(),
             "COVERED_COMPONENTS entries with no value in request_values_for: {missing:?}. \
              sign_request would panic on every call; add the value or drop the component."
+        );
+    }
+
+    /// U3 boundary: the forward bound is real and tight.
+    #[test]
+    fn future_dated_created_outside_skew_is_rejected() {
+        let kp = Keypair::generate();
+        let mut headers = sign_request(&kp, "GET", "/api/v1/agents", b"");
+        let future = Utc::now().timestamp() + MAX_FUTURE_SKEW_SECS + 1;
+        headers.signature_input = headers
+            .signature_input
+            .split(";created=")
+            .next()
+            .map(|head| format!("{head};created={future}"))
+            .expect("signature_input carries created");
+        let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert!(
+            sig.check_created().is_err(),
+            "created beyond the forward skew allowance must be rejected"
+        );
+    }
+
+    /// U3 boundary: just inside the forward allowance still verifies, so the
+    /// bound absorbs real clock skew rather than being effectively zero.
+    #[test]
+    fn future_dated_created_within_skew_is_accepted() {
+        let kp = Keypair::generate();
+        let mut headers = sign_request(&kp, "GET", "/api/v1/agents", b"");
+        let future = Utc::now().timestamp() + MAX_FUTURE_SKEW_SECS - 1;
+        headers.signature_input = headers
+            .signature_input
+            .split(";created=")
+            .next()
+            .map(|head| format!("{head};created={future}"))
+            .expect("signature_input carries created");
+        let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert!(sig.check_created().is_ok(), "within skew must be accepted");
+    }
+
+    /// U3 regression: the backward budget must not be narrowed. A large pack
+    /// spends this long uploading before check_created ever runs.
+    #[test]
+    fn backward_budget_still_accepts_a_nearly_stale_signature() {
+        let kp = Keypair::generate();
+        let mut headers = sign_request(&kp, "POST", "/api/test", b"body");
+        let old = Utc::now().timestamp() - (MAX_SIGNATURE_AGE_SECS - 20);
+        headers.signature_input = headers
+            .signature_input
+            .split(";created=")
+            .next()
+            .map(|head| format!("{head};created={old}"))
+            .expect("signature_input carries created");
+        let sig = HttpSignature::parse(&headers.signature_input, &headers.signature).unwrap();
+        assert!(
+            sig.check_created().is_ok(),
+            "a signature well inside the age budget must still verify"
         );
     }
 
