@@ -756,10 +756,87 @@ fn fork_withheld_blocks(
 /// and as the signing path, so they can never drift apart.
 const SYNC_NOTIFY_PATH: &str = "/api/v1/sync/notify";
 
+/// How hard the sender retries a peer that says "not now".
+///
+/// Passed in rather than read from a constant so the tests can pin the attempt
+/// counts without sleeping for real seconds (tokio's `start_paused` needs the
+/// `test-util` feature, which this crate does not carry).
+struct NotifyRetryPolicy {
+    /// Backoff before each retry. The length IS the retry count, so a ref gets
+    /// `backoff.len() + 1` attempts.
+    backoff: &'static [std::time::Duration],
+    /// Total time one peer's whole fan-out may spend sleeping between
+    /// retries, shared across every ref in the push.
+    ///
+    /// A per-ref bound alone is not enough: a `git push --mirror` of 600
+    /// branches fans out 600 requests, so a per-ref budget multiplies by the
+    /// ref count and would keep the background task alive against a wedged
+    /// peer for hours. With a shared budget the whole fan-out adds at most
+    /// this much wall clock, however wide the push.
+    budget: std::time::Duration,
+}
+
+/// Backoff before each retry of a retryable `/sync/notify` rejection.
+const NOTIFY_RETRY_BACKOFF: [std::time::Duration; 2] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(5),
+];
+
+/// Production retry policy for the peer sync fan-out. 60s is roughly ten refs'
+/// worth of full backoff, enough to ride out transient ledger pressure while
+/// keeping the worst case a wedged peer can impose to a minute per peer.
+const NOTIFY_RETRY_POLICY: NotifyRetryPolicy = NotifyRetryPolicy {
+    backoff: &NOTIFY_RETRY_BACKOFF,
+    budget: std::time::Duration::from_secs(60),
+};
+
+/// What a peer's response status says the sender should do next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyDisposition {
+    Delivered,
+    /// The peer did not apply the update and said "not now". Re-sending is
+    /// safe because `sign_request` mints a fresh nonce per attempt, so the
+    /// retry carries a signature the peer's ledger has never seen.
+    Retryable,
+    /// Anything else, including 409 `signature_replayed`: the peer already
+    /// admitted this signed request, so re-sending risks a duplicate apply.
+    Fatal,
+}
+
+/// Classify a peer's `/sync/notify` response status.
+///
+/// Only the two statuses that mean "the write did not happen, come back
+/// later" are retryable: 429 (`signature_ledger_full`, the per-identity
+/// spent-signature cap) and 503 (`signature_ledger_unavailable`). This matches
+/// how `gl` classifies the same rejections client-side.
+/// The result of one `/sync/notify` attempt, with the reason kept for the
+/// end-of-fan-out summary.
+#[must_use]
+enum NotifyAttempt {
+    Delivered,
+    Retryable(String),
+    Fatal(String),
+}
+
+fn classify_notify_status(status: reqwest::StatusCode) -> NotifyDisposition {
+    if status.is_success() {
+        NotifyDisposition::Delivered
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    {
+        NotifyDisposition::Retryable
+    } else {
+        NotifyDisposition::Fatal
+    }
+}
+
 /// Send one signed `/sync/notify` request for a single ref update.
 ///
 /// The receiver is single-ref, so a multi-ref push fans out one request per
 /// ref — each signed over its own body — carrying that ref's real `old_sha`.
+///
+/// One attempt only. Whether a failure is worth another attempt is the
+/// caller's call, because the retry budget is shared across the whole fan-out.
 #[allow(clippy::too_many_arguments)]
 async fn notify_peer_of_ref(
     http_client: &reqwest::Client,
@@ -773,7 +850,7 @@ async fn notify_peer_of_ref(
     node_did: &str,
     pusher_did: &str,
     owner_did: &str,
-) {
+) -> NotifyAttempt {
     let body = serde_json::json!({
         "repo": repo_slug,
         "ref_name": ref_name,
@@ -788,7 +865,7 @@ async fn notify_peer_of_ref(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::warn!(peer = %peer_did, ref_name = %ref_name, err = %e, "failed to serialize peer sync notify");
-            return;
+            return NotifyAttempt::Fatal(format!("body not serializable: {e}"));
         }
     };
     let signed =
@@ -803,14 +880,33 @@ async fn notify_peer_of_ref(
         .send()
         .await
     {
-        Ok(r) if r.status().is_success() => {
-            tracing::info!(peer = %peer_did, repo = %repo_slug, ref_name = %ref_name, "notified peer to sync")
-        }
         Ok(r) => {
-            tracing::warn!(peer = %peer_did, ref_name = %ref_name, status = %r.status(), "peer sync notify returned error")
+            let status = r.status();
+            let code = crate::api::peers::peer_error_code(r.headers())
+                .unwrap_or("none")
+                .to_string();
+            match classify_notify_status(status) {
+                NotifyDisposition::Delivered => {
+                    tracing::info!(peer = %peer_did, repo = %repo_slug, ref_name = %ref_name, "notified peer to sync");
+                    NotifyAttempt::Delivered
+                }
+                NotifyDisposition::Retryable => {
+                    tracing::warn!(peer = %peer_did, ref_name = %ref_name, status = %status, error_code = %code, "peer sync notify returned error");
+                    NotifyAttempt::Retryable(format!("{status} {code}"))
+                }
+                NotifyDisposition::Fatal => {
+                    tracing::warn!(peer = %peer_did, ref_name = %ref_name, status = %status, error_code = %code, "peer sync notify returned error");
+                    NotifyAttempt::Fatal(format!("{status} {code}"))
+                }
+            }
         }
+        // A transport error is never retried: the request may well have
+        // reached the peer and been applied, with only the response lost, and
+        // re-sending a mutation on that guess is exactly what the spent
+        // signature ledger exists to stop.
         Err(e) => {
-            tracing::warn!(peer = %peer_did, ref_name = %ref_name, err = %e, "failed to notify peer")
+            tracing::warn!(peer = %peer_did, ref_name = %ref_name, err = %e, "failed to notify peer");
+            NotifyAttempt::Fatal(format!("transport error: {e}"))
         }
     }
 }
@@ -820,6 +916,17 @@ async fn notify_peer_of_ref(
 /// Looping here (rather than sending one flattened request) is what keeps a
 /// multi-ref push from collapsing to its first ref; each ref carries its real
 /// `old_sha`.
+///
+/// Because every request in the fan-out is signed by the same node keypair, a
+/// peer that requires signed peer writes charges them all to one identity, and
+/// a wide push (`git push --mirror` of hundreds of branches) runs that
+/// identity into the peer's spent-signature cap. The tail then comes back 429
+/// `signature_ledger_full`, which is a retryable rate condition, so retry it
+/// under `retry`; `sign_request` draws a fresh nonce per attempt, so the retry
+/// carries a signature the peer has never seen rather than a replay. Refs that
+/// still do not land are counted and reported in one summary line, because a
+/// per-ref warning inside a 600-ref loop is not something an operator will
+/// ever correlate back to the push.
 #[allow(clippy::too_many_arguments)]
 async fn notify_peer_of_refs(
     http_client: &reqwest::Client,
@@ -831,22 +938,65 @@ async fn notify_peer_of_refs(
     node_did: &str,
     pusher_did: &str,
     owner_did: &str,
+    retry: &NotifyRetryPolicy,
 ) {
+    let mut budget_left = retry.budget;
+    let mut failed: Vec<&str> = Vec::new();
+    let mut last_reason = String::new();
+
     for (ref_name, old_sha, new_sha) in ref_updates {
-        notify_peer_of_ref(
-            http_client,
-            node_keypair,
-            peer_did,
-            notify_url,
-            repo_slug,
-            ref_name,
-            old_sha,
-            new_sha,
-            node_did,
-            pusher_did,
-            owner_did,
-        )
-        .await;
+        let mut attempt = 0usize;
+        loop {
+            let outcome = notify_peer_of_ref(
+                http_client,
+                node_keypair,
+                peer_did,
+                notify_url,
+                repo_slug,
+                ref_name,
+                old_sha,
+                new_sha,
+                node_did,
+                pusher_did,
+                owner_did,
+            )
+            .await;
+
+            let reason = match outcome {
+                NotifyAttempt::Delivered => break,
+                NotifyAttempt::Fatal(reason) => reason,
+                NotifyAttempt::Retryable(reason) => {
+                    // Two bounds, both required. `backoff` caps the attempts
+                    // for this ref; `budget_left` caps the sleeping for the
+                    // whole fan-out so the bound does not scale with the ref
+                    // count. Either one running out ends this ref here.
+                    match retry.backoff.get(attempt) {
+                        Some(&wait) if wait <= budget_left => {
+                            budget_left -= wait;
+                            attempt += 1;
+                            tokio::time::sleep(wait).await;
+                            continue;
+                        }
+                        _ => reason,
+                    }
+                }
+            };
+            failed.push(ref_name);
+            last_reason = reason;
+            break;
+        }
+    }
+
+    if !failed.is_empty() {
+        tracing::warn!(
+            peer = %peer_did,
+            repo = %repo_slug,
+            failed = failed.len(),
+            total = ref_updates.len(),
+            first_failed_ref = %failed[0],
+            last_reason = %last_reason,
+            "refs failed to federate to peer; they will not be retried again"
+        );
     }
 }
 
@@ -1369,6 +1519,7 @@ pub async fn git_receive_pack(
                             &node_did_str,
                             &pusher_did_clone,
                             &record.owner_did,
+                            &NOTIFY_RETRY_POLICY,
                         )
                         .await;
                     }
@@ -2448,6 +2599,7 @@ mod tests {
             "did:key:zNode",
             "did:key:zPusher",
             "did:key:zOwner",
+            &NOTIFY_RETRY_POLICY,
         )
         .await;
 
@@ -2496,10 +2648,290 @@ mod tests {
             "did:key:zNode",
             "did:key:zPusher",
             "did:key:zOwner",
+            &NOTIFY_RETRY_POLICY,
         )
         .await;
 
         _mock.assert_async().await;
+    }
+
+    // ── retry of a retryable peer rejection ──────────────────────────────
+    //
+    // A peer running signed peer writes charges every /sync/notify against a
+    // per-identity spent-signature ledger. A wide push fans out one signed
+    // request per ref under the same node identity, so the tail of a large
+    // push hits the cap and gets 429 signature_ledger_full, a retryable rate
+    // condition. Without a sending-side retry those refs never federate.
+    //
+    // The tests drive a millisecond-scale policy so they pin the attempt
+    // counts without sleeping for real seconds; the production numbers are
+    // pinned separately by notify_retry_policy_bound_is_what_we_think.
+
+    const FAST_BACKOFF: [std::time::Duration; 2] = [
+        std::time::Duration::from_millis(5),
+        std::time::Duration::from_millis(10),
+    ];
+
+    /// Same shape as the production policy (two retries), budgeted for exactly
+    /// two fully retried refs.
+    const FAST_POLICY: NotifyRetryPolicy = NotifyRetryPolicy {
+        backoff: &FAST_BACKOFF,
+        budget: std::time::Duration::from_millis(30),
+    };
+
+    fn refs(n: usize) -> Vec<(String, String, String)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("refs/heads/b{i}"),
+                    format!("{i:040x}"),
+                    format!("{:040x}", i + 100),
+                )
+            })
+            .collect()
+    }
+
+    // The production bound is a real operational number, so state it once here
+    // rather than leave it implied by constants nobody reads.
+    #[test]
+    fn notify_retry_policy_bound_is_what_we_think() {
+        assert_eq!(
+            NOTIFY_RETRY_BACKOFF.len() + 1,
+            3,
+            "one send plus two retries per ref"
+        );
+        assert_eq!(NOTIFY_RETRY_POLICY.backoff, &NOTIFY_RETRY_BACKOFF);
+        let per_ref: u64 = NOTIFY_RETRY_BACKOFF.iter().map(|d| d.as_secs()).sum();
+        assert_eq!(per_ref, 6, "1s + 5s of backoff per retried ref");
+        assert_eq!(
+            NOTIFY_RETRY_POLICY.budget.as_secs(),
+            60,
+            "a wedged peer adds at most one minute to the fan-out"
+        );
+    }
+
+    // 429 twice then 200: the ref IS federated, and the attempt count is
+    // pinned so the bound cannot silently grow.
+    #[tokio::test]
+    async fn notify_peer_retries_a_429_ledger_full_and_federates_on_retry() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let rejected = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(429)
+            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .expect(2)
+            .create_async()
+            .await;
+        // Created second, so it only serves once the 429 mock has taken its
+        // two hits; it also catches any attempt beyond the third.
+        let accepted = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &refs(1),
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &FAST_POLICY,
+        )
+        .await;
+
+        rejected.assert_async().await;
+        accepted.assert_async().await;
+    }
+
+    // A peer that answers 429 forever must stop at the bound, not spin. The
+    // count is the whole assertion: an unbounded retry never terminates and an
+    // off-by-one bound shows up here.
+    #[tokio::test]
+    async fn notify_peer_stops_retrying_a_permanently_429_peer() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let mock = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(429)
+            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .expect(FAST_BACKOFF.len() + 1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &refs(1),
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &FAST_POLICY,
+        )
+        .await;
+
+        mock.assert_async().await;
+    }
+
+    // The retry budget is shared across the whole per-peer fan-out, so a
+    // wedged peer cannot multiply the bound by the ref count: a 600-ref mirror
+    // push must not cost 600 times the per-ref retry budget.
+    #[tokio::test]
+    async fn notify_peer_retry_budget_is_shared_across_the_fan_out() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        // Each fully retried ref spends 5ms + 10ms of the 30ms budget, so the
+        // first two refs get three attempts each and the third, with the
+        // budget gone, gets a single attempt.
+        let per_ref: u128 = FAST_BACKOFF.iter().map(|d| d.as_millis()).sum();
+        let budgeted = (FAST_POLICY.budget.as_millis() / per_ref) as usize;
+        assert_eq!(budgeted, 2, "test constants drifted");
+
+        let mock = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(429)
+            .with_header("x-gitlawb-error", "signature_ledger_full")
+            .expect(budgeted * (FAST_BACKOFF.len() + 1) + 1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &refs(budgeted + 1),
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &FAST_POLICY,
+        )
+        .await;
+
+        mock.assert_async().await;
+    }
+
+    // 409 signature_replayed means the peer ALREADY admitted this signed
+    // request. Re-sending risks a duplicate apply, which is what the ledger
+    // exists to prevent, so it must stay a single attempt.
+    #[tokio::test]
+    async fn notify_peer_does_not_retry_a_409_replay_rejection() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let mock = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(409)
+            .with_header("x-gitlawb-error", "signature_replayed")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &refs(1),
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &FAST_POLICY,
+        )
+        .await;
+
+        mock.assert_async().await;
+    }
+
+    // The happy path must not gain a single extra request: N refs, N POSTs.
+    #[tokio::test]
+    async fn notify_peer_sends_exactly_one_request_per_ref_on_success() {
+        let mut server = mockito::Server::new_async().await;
+        let keypair = Keypair::generate();
+        let http_client = reqwest::Client::new();
+
+        let ref_updates = refs(3);
+        let mock = server
+            .mock("POST", SYNC_NOTIFY_PATH)
+            .with_status(200)
+            .expect(ref_updates.len())
+            .create_async()
+            .await;
+
+        let notify_url = format!("{}{SYNC_NOTIFY_PATH}", server.url());
+        notify_peer_of_refs(
+            &http_client,
+            &keypair,
+            "did:key:zPeer",
+            &notify_url,
+            "owner/repo",
+            &ref_updates,
+            "did:key:zNode",
+            "did:key:zPusher",
+            "did:key:zOwner",
+            &FAST_POLICY,
+        )
+        .await;
+
+        mock.assert_async().await;
+    }
+
+    #[test]
+    fn classify_notify_status_separates_retryable_from_fatal() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            classify_notify_status(StatusCode::OK),
+            NotifyDisposition::Delivered
+        );
+        assert_eq!(
+            classify_notify_status(StatusCode::TOO_MANY_REQUESTS),
+            NotifyDisposition::Retryable,
+            "429 signature_ledger_full is the retryable rate condition"
+        );
+        assert_eq!(
+            classify_notify_status(StatusCode::SERVICE_UNAVAILABLE),
+            NotifyDisposition::Retryable,
+            "503 signature_ledger_unavailable did not apply the write"
+        );
+        assert_eq!(
+            classify_notify_status(StatusCode::CONFLICT),
+            NotifyDisposition::Fatal,
+            "409 signature_replayed means the peer already applied it"
+        );
+        assert_eq!(
+            classify_notify_status(StatusCode::FORBIDDEN),
+            NotifyDisposition::Fatal
+        );
+        assert_eq!(
+            classify_notify_status(StatusCode::BAD_REQUEST),
+            NotifyDisposition::Fatal
+        );
     }
 
     #[tokio::test]

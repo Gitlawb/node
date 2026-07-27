@@ -871,6 +871,40 @@ fn build_operator_client(
     Ok(operator::OperatorClient::new(cfg))
 }
 
+/// A bootstrap peer's answer to our signed announce, reduced to what the
+/// caller has to act on.
+#[derive(Debug, PartialEq, Eq)]
+enum AnnounceOutcome {
+    Accepted,
+    /// Any non-2xx. Carries the peer's `x-gitlawb-error` code when it sent
+    /// one, which is what makes a spent-signature-ledger rejection (429
+    /// `signature_ledger_full`, 409 `signature_replayed`) diagnosable rather
+    /// than just "some 4xx".
+    Rejected {
+        status: u16,
+        error_code: Option<String>,
+    },
+}
+
+/// Classify a bootstrap announce response.
+///
+/// Split out from `gossip_task` so the rejection path is unit-testable: the
+/// whole defect was that a non-2xx fell off the end of an `if` with no `else`,
+/// leaving a node whose announces are being refused looking exactly like one
+/// succeeding.
+fn classify_announce_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> AnnounceOutcome {
+    if status.is_success() {
+        return AnnounceOutcome::Accepted;
+    }
+    AnnounceOutcome::Rejected {
+        status: status.as_u16(),
+        error_code: api::peers::peer_error_code(headers).map(str::to_string),
+    }
+}
+
 /// Announce to bootstrap peers on startup, then periodically ping all known peers.
 async fn gossip_task(
     state: AppState,
@@ -935,8 +969,8 @@ async fn gossip_task(
         )
         .await
         {
-            Ok(Ok(resp)) => {
-                if resp.status().is_success() {
+            Ok(Ok(resp)) => match classify_announce_response(resp.status(), resp.headers()) {
+                AnnounceOutcome::Accepted => {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {
                         // Add them back to our peer list
                         if let (Some(their_did), Some(their_url)) = (
@@ -950,7 +984,19 @@ async fn gossip_task(
                         }
                     }
                 }
-            }
+                // Without this arm a refused announce produced no log line at
+                // all, so a node whose peers reject it looked identical to one
+                // succeeding. Same shape as the two sibling signed calls
+                // (sync.rs replica registration, repos.rs peer sync notify).
+                AnnounceOutcome::Rejected { status, error_code } => {
+                    warn!(
+                        url = %announce_url,
+                        status = status,
+                        error_code = error_code.as_deref().unwrap_or("none"),
+                        "bootstrap peer announce rejected"
+                    );
+                }
+            },
             Ok(Err(e)) => {
                 tracing::warn!(url = %announce_url, err = %e, "failed to announce to bootstrap peer")
             }
@@ -1105,5 +1151,83 @@ mod gossip_ssrf_tests {
     async fn ping_peer_health_reports_unhealthy_on_connection_error() {
         let ok = ping_peer_health(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unhealthy peer");
+    }
+}
+
+#[cfg(test)]
+mod gossip_announce_tests {
+    use super::{classify_announce_response, AnnounceOutcome};
+    use reqwest::header::HeaderMap;
+    use reqwest::StatusCode;
+
+    fn headers(code: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(c) = code {
+            h.insert("x-gitlawb-error", c.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn a_2xx_announce_is_accepted() {
+        assert_eq!(
+            classify_announce_response(StatusCode::OK, &headers(None)),
+            AnnounceOutcome::Accepted
+        );
+    }
+
+    // The defect: every non-2xx fell off the end of an `if` with no `else`, so
+    // a node whose announces were being refused logged nothing at all. Each of
+    // these must come back Rejected, carrying the status and, when the peer
+    // sent one, the x-gitlawb-error code that names the reason.
+    #[test]
+    fn a_ledger_rejection_is_reported_with_its_error_code() {
+        assert_eq!(
+            classify_announce_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers(Some("signature_ledger_full"))
+            ),
+            AnnounceOutcome::Rejected {
+                status: 429,
+                error_code: Some("signature_ledger_full".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_announce_response(StatusCode::CONFLICT, &headers(Some("signature_replayed"))),
+            AnnounceOutcome::Rejected {
+                status: 409,
+                error_code: Some("signature_replayed".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_announce_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &headers(Some("signature_ledger_unavailable"))
+            ),
+            AnnounceOutcome::Rejected {
+                status: 503,
+                error_code: Some("signature_ledger_unavailable".to_string()),
+            }
+        );
+    }
+
+    // A proxy that strips unknown X- headers, or a peer that never sets one,
+    // must still produce a rejection with its status rather than silence.
+    #[test]
+    fn a_rejection_without_an_error_code_is_still_reported() {
+        assert_eq!(
+            classify_announce_response(StatusCode::FORBIDDEN, &headers(None)),
+            AnnounceOutcome::Rejected {
+                status: 403,
+                error_code: None,
+            }
+        );
+        assert_eq!(
+            classify_announce_response(StatusCode::INTERNAL_SERVER_ERROR, &headers(None)),
+            AnnounceOutcome::Rejected {
+                status: 500,
+                error_code: None,
+            }
+        );
     }
 }

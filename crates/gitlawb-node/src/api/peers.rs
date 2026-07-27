@@ -465,9 +465,32 @@ pub async fn ping_peer(
     })))
 }
 
+/// The `x-gitlawb-error` code a peer put on a rejection, if it sent one.
+///
+/// Kept verbatim: it is what separates a ledger rejection from a replay
+/// rejection on the same-ish status, and it is what an operator greps for. A
+/// peer behind a proxy that strips unknown `X-` headers returns `None`, which
+/// is why every caller logs the status too rather than relying on this alone.
+pub(crate) fn peer_error_code(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    headers.get("x-gitlawb-error")?.to_str().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_public_http_url;
+    use super::peer_error_code;
+
+    #[test]
+    fn peer_error_code_reads_the_header_when_present() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("x-gitlawb-error", "signature_ledger_full".parse().unwrap());
+        assert_eq!(peer_error_code(&headers), Some("signature_ledger_full"));
+    }
+
+    #[test]
+    fn peer_error_code_is_none_without_the_header() {
+        assert_eq!(peer_error_code(&reqwest::header::HeaderMap::new()), None);
+    }
 
     #[test]
     fn accepts_public_https_and_http() {
