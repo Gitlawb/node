@@ -5,7 +5,7 @@ tag="${1-}"
 : "${GITHUB_OUTPUT:?GITHUB_OUTPUT must be set}"
 
 case "$tag" in
-  ""|*[!A-Za-z0-9._+-]*)
+  ""|*[!A-Za-z0-9._-]*)
     printf '%s\n' "::error::release tag is empty or contains invalid characters"
     exit 1
     ;;
