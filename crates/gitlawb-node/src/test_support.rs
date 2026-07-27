@@ -5444,5 +5444,237 @@ mod tests {
                 StatusCode::CREATED
             );
         }
+
+        // ── U5: the signature identity published by `require_signature` ──────
+        //
+        // Nothing in production reads the extension yet (the consuming layer is
+        // U6), so this probe handler is its only reader. It reports what it was
+        // handed, and its `"probe": true` marker is how a test tells "the
+        // handler ran" from "the middleware rejected the request first".
+
+        async fn probe_handler(
+            identity: Option<axum::Extension<crate::auth::SignatureIdentity>>,
+        ) -> axum::Json<serde_json::Value> {
+            axum::Json(serde_json::json!({
+                "probe": true,
+                "keyid": identity.as_ref().map(|e| e.0.keyid.clone()),
+                "nonce": identity.as_ref().and_then(|e| e.0.nonce.clone()),
+                "hash": identity.as_ref().map(|e| e.0.signing_string_hash.clone()),
+            }))
+        }
+
+        /// Same production `require_signature` as [`router`], but the handler
+        /// reports the extension instead of writing a task, so these cases need
+        /// no database.
+        fn probe_router() -> Router {
+            Router::new()
+                .route(PATH, axum::routing::post(probe_handler))
+                .layer(axum::middleware::from_fn(crate::auth::require_signature))
+        }
+
+        async fn send_probe(
+            signature: &str,
+            signature_input: &str,
+            content_digest: &str,
+            body: &[u8],
+        ) -> (StatusCode, serde_json::Value) {
+            let req = Request::builder()
+                .method(Method::POST)
+                .uri(PATH)
+                .header("content-type", "application/json")
+                .header("content-digest", content_digest)
+                .header("signature-input", signature_input)
+                .header("signature", signature)
+                .body(Body::from(body.to_vec()))
+                .expect("request builder");
+            let resp = probe_router()
+                .oneshot(req)
+                .await
+                .expect("probe router response");
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("probe body");
+            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        /// U5 scenario 1: a verified request reaches the handler carrying a
+        /// `SignatureIdentity` with a populated 64-char hex hash.
+        #[tokio::test]
+        async fn verified_request_publishes_signature_identity() {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+
+            let (status, json) = send_probe(
+                &signed.signature,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "the signature must verify");
+            assert_eq!(json["probe"], serde_json::json!(true));
+            assert_eq!(
+                json["keyid"].as_str(),
+                Some(did.as_str()),
+                "the identity must carry the signing DID"
+            );
+            let hash = json["hash"].as_str().expect("hash must be published");
+            assert_eq!(
+                hash.len(),
+                64,
+                "the hash must be a hex SHA-256 to satisfy the ledger CHECK"
+            );
+            assert!(
+                hash.chars().all(|c| c.is_ascii_hexdigit()),
+                "the hash must be hex: {hash}"
+            );
+        }
+
+        /// U5 scenario 2: the nonce round-trips when the signer emits one, and
+        /// is `None` for a pre-nonce signer.
+        #[tokio::test]
+        async fn signature_identity_carries_the_nonce_only_when_signed() {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp();
+
+            let (sig, input, digest) =
+                sign_with(&kp, &body, created, r#";nonce="0123456789abcdef""#);
+            let (status, json) = send_probe(&sig, &input, &digest, &body).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                json["nonce"].as_str(),
+                Some("0123456789abcdef"),
+                "the published nonce must be the one that was signed"
+            );
+
+            let (sig, input, digest) = sign_with(&kp, &body, created, "");
+            let (status, json) = send_probe(&sig, &input, &digest, &body).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(
+                json["nonce"].is_null(),
+                "a pre-nonce signer must publish no nonce, got {}",
+                json["nonce"]
+            );
+        }
+
+        /// U5 scenario 3, the load-bearing one: `HttpSignature::parse` trims the
+        /// `Signature` header, and the header is not a covered component, so
+        /// whitespace variants are distinct header bytes that reconstruct to one
+        /// signing string. Keying the ledger on that reconstruction is what makes
+        /// the whitespace replay probe harmless.
+        #[tokio::test]
+        async fn whitespace_variants_share_one_signing_string_hash() {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+
+            let (status, json) = send_probe(
+                &signed.signature,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let baseline = json["hash"].as_str().expect("baseline hash").to_string();
+
+            for variant in [
+                format!(" {}", signed.signature),
+                format!("{} ", signed.signature),
+                format!(" {} ", signed.signature),
+                format!("\t{}", signed.signature),
+            ] {
+                assert_ne!(
+                    variant, signed.signature,
+                    "each variant must be a distinct header byte string"
+                );
+                let (status, json) = send_probe(
+                    &variant,
+                    &signed.signature_input,
+                    &signed.content_digest,
+                    &body,
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "whitespace variant must still verify: {variant:?}"
+                );
+                assert_eq!(
+                    json["hash"].as_str(),
+                    Some(baseline.as_str()),
+                    "whitespace variant must collapse to the same ledger key: {variant:?}"
+                );
+            }
+
+            // A space *inside* the `sig1=:...:` shape is a different story:
+            // `parse` strips the literal prefix `sig1=:` off the trimmed header,
+            // so this one never verifies at all. Recorded because it is the
+            // fourth variant the replay probe tries, and "rejected outright" is
+            // just as harmless for the ledger as "same key".
+            let inner_space = signed.signature.replacen("sig1=", "sig1= ", 1);
+            let (status, json) = send_probe(
+                &inner_space,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "a space after `sig1=` breaks the header shape, so it never verifies"
+            );
+            assert!(
+                json.get("probe").is_none(),
+                "an unparseable header must not reach the handler: {json}"
+            );
+        }
+
+        /// U5 scenario 4: a signature that fails Ed25519 verification is rejected
+        /// before the extension is inserted, so the handler never runs.
+        #[tokio::test]
+        async fn failed_verification_never_publishes_signature_identity() {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+
+            // Flip one bit of the 64 signature bytes, keeping the length legal so
+            // the request is rejected by verification, not by the length check.
+            let raw = signed
+                .signature
+                .strip_prefix("sig1=:")
+                .and_then(|s| s.strip_suffix(':'))
+                .expect("sig1=:base64: shape");
+            let mut bytes = STANDARD.decode(raw).expect("base64 signature");
+            bytes[0] ^= 0x01;
+            let tampered = format!("sig1=:{}:", STANDARD.encode(&bytes));
+
+            let (status, json) = send_probe(
+                &tampered,
+                &signed.signature_input,
+                &signed.content_digest,
+                &body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a tampered signature must be rejected with the existing 401"
+            );
+            assert!(
+                json.get("probe").is_none(),
+                "the handler must never run for an unverified request: {json}"
+            );
+            assert_eq!(json["error"], serde_json::json!("invalid_signature"));
+        }
     }
 }

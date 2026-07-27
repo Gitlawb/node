@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use http_body_util::BodyExt;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use gitlawb_core::did::Did;
@@ -16,6 +17,30 @@ use crate::state::AppState;
 /// The authenticated agent's DID, injected into request extensions by `require_signature`.
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
+
+/// The canonical identity of a verified HTTP signature, published into request
+/// extensions by [`require_signature`] so a spent-signature ledger can be keyed
+/// without re-parsing headers.
+///
+/// `signing_string_hash` is a hex SHA-256 of the *reconstructed* signing string,
+/// never of the raw `Signature` header. `HttpSignature::parse` trims, and the
+/// header is not a covered component, so whitespace variants are distinct header
+/// bytes that reconstruct to one signing string; hashing the reconstruction is
+/// what collapses those variants to a single ledger key. The signing string also
+/// embeds `keyid` and `created` through its `@signature-params` line, so the
+/// hash cannot collide across DIDs.
+// The layer that consumes this lands separately (#253 U6); nothing reads the
+// fields yet, which is why the whole struct is allowed to look dead.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct SignatureIdentity {
+    /// The signing DID, as it appeared in the `keyid` parameter.
+    pub keyid: String,
+    /// The `nonce` parameter, absent on signatures from a pre-nonce signer.
+    pub nonce: Option<String>,
+    /// Hex SHA-256 of the reconstructed signing string: exactly 64 characters.
+    pub signing_string_hash: String,
+}
 
 /// Whether `caller` is authorized to push to `record`.
 ///
@@ -242,6 +267,14 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     request
         .extensions_mut()
         .insert(AuthenticatedDid(sig.key_id.to_string()));
+    // Publish the canonical ledger key while the verified signing string is still
+    // in hand. Hashing `signing_string` (the reconstruction that was just verified
+    // against) rather than any raw header is deliberate: see `SignatureIdentity`.
+    request.extensions_mut().insert(SignatureIdentity {
+        keyid: sig.key_id.to_string(),
+        nonce: sig.nonce.clone(),
+        signing_string_hash: hex::encode(Sha256::digest(signing_string.as_bytes())),
+    });
     next.run(request).await
 }
 
