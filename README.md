@@ -317,6 +317,14 @@ GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true
 
 `POST /api/v1/sync/trigger` is not part of the staged rollout: it always requires a signature in both config modes and returns 401 without one, because each call drives an O(peers) outbound fan-out.
 
+A verified signature is spent once on every write route, so a captured request cannot be replayed. The ledger keys on the RFC 9421 `nonce` parameter when the client signs one and falls back to the signing-string hash when it does not. The fallback is correct but coarser: a client that repeats a byte-identical mutation within the same second is rejected as a replay and has to re-sign. `GITLAWB_REQUIRE_SIGNATURE_NONCE` closes that fallback once every client emits a nonce:
+
+```bash
+GITLAWB_REQUIRE_SIGNATURE_NONCE=true
+```
+
+With it on, a nonce-less signature on a write route is rejected with 400 and `X-Gitlawb-Error: signature_nonce_required`. Signed reads are never affected. Flipping it on has a federation precondition: three of the node's own outbound signed calls (peer announce, replica registration, sync-notify) are peer traffic, so a node running with both this and `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` set to true will reject peer writes from any node still on a pre-nonce binary. Upgrade the fleet before enabling it.
+
 ---
 
 ## Configuration
@@ -341,6 +349,7 @@ Important node settings:
 | `GITLAWB_P2P_BOOTSTRAP` | Comma-separated libp2p multiaddrs. |
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
+| `GITLAWB_REQUIRE_SIGNATURE_NONCE` | Require a signed `nonce` on write routes. Default false; see the staged rollout note above. |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
 | `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack/receive-pack may run before it is aborted (504). Default 600. Does not bound `info/refs` or the withheld-blob path. |

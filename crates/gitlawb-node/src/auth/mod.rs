@@ -485,6 +485,19 @@ pub async fn consume_signature(
         }
     };
 
+    // Staged rollout of R6: once every client signs a nonce, an operator closes
+    // the signing-string fallback here. This runs after the method skip above,
+    // so it never reaches a signed read, and before the ledger is charged, so a
+    // refused request spends nothing.
+    if state.config.require_signature_nonce && identity.nonce.is_none() {
+        tracing::warn!(did = %identity.keyid, "rejected a nonce-less signature: a nonce is required");
+        return ledger_rejection(
+            StatusCode::BAD_REQUEST,
+            "signature_nonce_required",
+            "this node requires a `nonce` parameter in Signature-Input — upgrade your client",
+        );
+    }
+
     let key = ledger_key(&identity);
     let now = chrono::Utc::now().timestamp();
     match state

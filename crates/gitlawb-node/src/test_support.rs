@@ -6109,5 +6109,170 @@ mod tests {
                 "only the request that cleared every auth check spends its key"
             );
         }
+
+        // ── U8: the staged `require a nonce` flag ────────────────────────────
+
+        /// A copy of `state` with the staged nonce requirement set explicitly.
+        /// Both states are built the same way, so a test that flips this is
+        /// comparing the flag and nothing else.
+        fn with_nonce_required(state: &AppState, required: bool) -> AppState {
+            let mut config = (*state.config).clone();
+            config.require_signature_nonce = required;
+            AppState {
+                config: Arc::new(config),
+                ..state.clone()
+            }
+        }
+
+        /// A nonce-less signature over the GET arm of [`PATH`]. [`sign_with`]
+        /// signs `POST`, and the read-surface case needs the method the ledger
+        /// layer skips on.
+        fn sign_get_nonceless(kp: &Keypair, created: i64) -> (String, String, String) {
+            let did = kp.did().to_string();
+            let signature_input = format!(
+                r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}"#
+            );
+            let content_digest = compute_content_digest(b"");
+            let sig_params_value = &signature_input["sig1=".len()..];
+            let mut values = HashMap::new();
+            values.insert("@method".to_string(), "GET".to_string());
+            values.insert("@path".to_string(), PATH.to_string());
+            values.insert("content-digest".to_string(), content_digest.clone());
+            let signing_string =
+                build_signing_string(COVERED_COMPONENTS, sig_params_value, &values)
+                    .expect("signing string");
+            let signature = format!(
+                "sig1=:{}:",
+                STANDARD.encode(kp.sign(signing_string.as_bytes()).to_bytes())
+            );
+            (signature, signature_input, content_digest)
+        }
+
+        /// U8 scenario 1: with the flag off, the hash fallback still works. The
+        /// ledger row is the load-bearing half — asserting only "not a 400"
+        /// would pass just as well if the fallback had stopped ledgering.
+        #[sqlx::test]
+        async fn nonceless_signature_is_ledgered_by_hash_when_the_flag_is_off(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = with_nonce_required(&test_state(pool.clone()).await, false);
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp();
+            let (sig, input, digest) = sign_with(&kp, &body, created, "");
+
+            assert_eq!(
+                send(&state, &sig, &input, &digest, &body).await,
+                StatusCode::CREATED,
+                "a pre-nonce client must still be served while the flag is off"
+            );
+            assert_eq!(
+                ledger_rows(&pool).await,
+                1,
+                "the hash fallback must still spend a ledger row"
+            );
+        }
+
+        /// U8 scenario 2: with the flag on, a nonce-less signature is refused by
+        /// its own code, and refused BEFORE the ledger is charged so a rejected
+        /// request spends nothing.
+        #[sqlx::test]
+        async fn nonceless_signature_is_rejected_when_the_flag_is_on(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = with_nonce_required(&test_state(pool.clone()).await, true);
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp();
+            let (sig, input, digest) = sign_with(&kp, &body, created, "");
+
+            let resp = send_full(&state, &sig, &input, &digest, &body).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "the request is malformed for this node's policy, not a replay"
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("x-gitlawb-error")
+                    .and_then(|v| v.to_str().ok()),
+                Some("signature_nonce_required"),
+                "the denial must be distinguishable by header from every other ledger rejection"
+            );
+            assert_eq!(error_code(resp).await, "signature_nonce_required");
+            assert_eq!(
+                ledger_rows(&pool).await,
+                0,
+                "a rejected request must spend nothing"
+            );
+
+            let tasks = state
+                .db
+                .list_tasks(None, None, 100)
+                .await
+                .expect("list tasks");
+            assert_eq!(
+                tasks.iter().filter(|t| t.delegator_did == did).count(),
+                0,
+                "the handler must not have run"
+            );
+        }
+
+        /// U8 scenario 3: an upgraded client is unaffected by the flag.
+        #[sqlx::test]
+        async fn nonce_bearing_signature_is_accepted_when_the_flag_is_on(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = with_nonce_required(&test_state(pool.clone()).await, true);
+            let body = task_body(&did);
+            let signed = sign_request(&kp, "POST", PATH, &body);
+
+            assert_eq!(
+                send(
+                    &state,
+                    &signed.signature,
+                    &signed.signature_input,
+                    &signed.content_digest,
+                    &body,
+                )
+                .await,
+                StatusCode::CREATED,
+                "a nonce-bearing signer must be served with the flag on"
+            );
+            assert_eq!(ledger_rows(&pool).await, 1);
+        }
+
+        /// U8 scenario 4: the flag must not leak onto the read surface. The GET
+        /// arm shares the path with the POST, so if the enforcement branch ran
+        /// ahead of the method skip a nonce-less signed read would start
+        /// failing for every un-upgraded client.
+        #[sqlx::test]
+        async fn nonce_requirement_does_not_reach_the_read_surface(pool: PgPool) {
+            let kp = Keypair::generate();
+            let state = with_nonce_required(&test_state(pool.clone()).await, true);
+            let created = chrono::Utc::now().timestamp();
+            let (sig, input, digest) = sign_get_nonceless(&kp, created);
+
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(PATH)
+                .header("content-digest", &digest)
+                .header("signature-input", &input)
+                .header("signature", &sig)
+                .body(Body::empty())
+                .expect("request builder");
+            let resp = router(state.clone())
+                .oneshot(req)
+                .await
+                .expect("router response");
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a nonce-less signed read must still be served with the flag on"
+            );
+            assert_eq!(
+                ledger_rows(&pool).await,
+                0,
+                "a read must still write no ledger row"
+            );
+        }
     }
 }
