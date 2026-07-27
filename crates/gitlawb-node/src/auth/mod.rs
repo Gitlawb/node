@@ -533,12 +533,14 @@ pub async fn consume_signature(
     // form of that exclusion and needs no router split: replaying a read has no
     // side effect to spend.
     if matches!(*request.method(), Method::GET | Method::HEAD) {
+        crate::metrics::record_signature_ledger("skipped_read");
         return next.run(request).await;
     }
 
     let identity = match request.extensions().get::<SignatureIdentity>() {
         Some(identity) => identity.clone(),
         None => {
+            crate::metrics::record_signature_ledger("identity_missing");
             // Fail closed. If this passed the request through, a wrong layer
             // order would silently delete the replay defense while every test
             // that exercises the correct stack kept passing.
@@ -565,6 +567,7 @@ pub async fn consume_signature(
         // instructions.
         return match identity.nonce {
             None => {
+                crate::metrics::record_signature_ledger("nonce_required");
                 tracing::warn!(did = %identity.keyid, "rejected a nonce-less signature: a nonce is required");
                 ledger_rejection(
                     StatusCode::BAD_REQUEST,
@@ -573,6 +576,7 @@ pub async fn consume_signature(
                 )
             }
             Some(nonce) => {
+                crate::metrics::record_signature_ledger("nonce_too_short");
                 tracing::warn!(
                     did = %identity.keyid,
                     len = nonce.chars().count(),
@@ -609,8 +613,12 @@ pub async fn consume_signature(
         )
         .await
     {
-        Ok(crate::db::ConsumeSignature::Inserted) => next.run(request).await,
+        Ok(crate::db::ConsumeSignature::Inserted) => {
+            crate::metrics::record_signature_ledger("admitted");
+            next.run(request).await
+        }
         Ok(crate::db::ConsumeSignature::Replayed) => {
+            crate::metrics::record_signature_ledger("replayed");
             tracing::warn!(did = %identity.keyid, "rejected a replayed HTTP signature");
             ledger_rejection(
                 StatusCode::CONFLICT,
@@ -621,6 +629,7 @@ pub async fn consume_signature(
         Ok(crate::db::ConsumeSignature::IdentityLedgerFull) => {
             // A rate condition, not a permanent rejection: the caller's live
             // rows drain as they expire, so this is retryable.
+            crate::metrics::record_signature_ledger("identity_ledger_full");
             tracing::warn!(did = %identity.keyid, "signature ledger full for this identity");
             ledger_rejection(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -632,6 +641,7 @@ pub async fn consume_signature(
             // Fail closed (KTD5). An outage is exactly when a holder of a
             // captured signature would try, and the mutation handlers all need
             // the same database anyway.
+            crate::metrics::record_signature_ledger("unavailable");
             tracing::error!(did = %identity.keyid, err = %e, "signature ledger unavailable");
             ledger_rejection(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -822,6 +832,197 @@ mod tests {
              arrival window, under the 60s skew budget: an instance running ahead \
              would sweep a row still accepted elsewhere"
         );
+    }
+
+    // ── `gitlawb_signature_ledger_total{outcome}` ────────────────────────────
+    //
+    // The ledger fails CLOSED, so a fault local to it (statement timeout, lock
+    // contention) turns every REST mutation into a 503 while the handlers' own
+    // queries stay healthy. These assert the counter is really charged on each
+    // terminal outcome, driven through the layer and read back through the same
+    // gather/encode path `/metrics` serves.
+    //
+    // Each assertion is a strict increase rather than an exact delta: the
+    // counter is process-wide, `metrics::init` is a `OnceLock`, and the ledger
+    // tests in `test_support` run in the same binary, so a concurrent test can
+    // add to any outcome. Pollution can only ever add, never subtract, so a
+    // strict increase never flakes; to attribute a delta exactly (e.g. when
+    // mutating out a `record_*` call to confirm RED), run these serially:
+    // `cargo test --bin gitlawb-node ledger_metrics -- --test-threads=1`.
+
+    fn ledger_metric(outcome: &str) -> u64 {
+        let needle = format!("gitlawb_signature_ledger_total{{outcome=\"{outcome}\"}} ");
+        crate::metrics::encode()
+            .expect("encode should succeed after init")
+            .lines()
+            .find_map(|line| line.strip_prefix(needle.as_str()))
+            .map(|value| value.trim().parse().expect("counter value is an integer"))
+            .unwrap_or(0)
+    }
+
+    /// One route, mounted behind `consume_signature` alone. The layer reads the
+    /// `SignatureIdentity` extension, so tests inject it directly rather than
+    /// producing real RFC-9421 signatures.
+    fn ledger_app(state: crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/probe",
+                axum::routing::post(|| async { StatusCode::OK }).get(|| async { StatusCode::OK }),
+            )
+            .layer(middleware::from_fn_with_state(state, consume_signature))
+    }
+
+    fn ledger_identity(seed: &str, nonce: Option<&str>) -> SignatureIdentity {
+        SignatureIdentity {
+            keyid: format!("did:key:zLedgerMetrics{seed}"),
+            key_fingerprint: hex::encode(Sha256::digest(format!("key/{seed}").as_bytes())),
+            nonce: nonce.map(str::to_owned),
+            signing_string_hash: hex::encode(Sha256::digest(format!("sig/{seed}").as_bytes())),
+        }
+    }
+
+    fn ledger_request(identity: Option<SignatureIdentity>) -> Request {
+        let builder = Request::builder().method(Method::POST).uri("/probe");
+        let builder = match identity {
+            Some(identity) => builder.extension(identity),
+            None => builder,
+        };
+        builder.body(Body::empty()).expect("request builder")
+    }
+
+    async fn ledger_status(state: crate::state::AppState, request: Request) -> StatusCode {
+        ledger_app(state)
+            .oneshot(request)
+            .await
+            .expect("router response")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn ledger_metrics_count_a_skipped_read() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let before = ledger_metric("skipped_read");
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/probe")
+            .body(Body::empty())
+            .expect("request builder");
+        let status = ledger_status(make_test_state(Keypair::generate().did()), request).await;
+
+        assert_eq!(status, StatusCode::OK, "a read must still pass through");
+        assert!(
+            ledger_metric("skipped_read") > before,
+            "the read skip must be counted, or the outcomes do not sum to the layer's traffic"
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_metrics_count_a_missing_identity() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let before = ledger_metric("identity_missing");
+
+        let status = ledger_status(
+            make_test_state(Keypair::generate().did()),
+            ledger_request(None),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(ledger_metric("identity_missing") > before);
+    }
+
+    #[tokio::test]
+    async fn ledger_metrics_count_the_nonce_rejections() {
+        use clap::Parser;
+
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let mut state = make_test_state(Keypair::generate().did());
+        state.config = Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--require-signature-nonce",
+        ]));
+
+        let before_required = ledger_metric("nonce_required");
+        let status = ledger_status(
+            state.clone(),
+            ledger_request(Some(ledger_identity("no-nonce", None))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(ledger_metric("nonce_required") > before_required);
+
+        let before_short = ledger_metric("nonce_too_short");
+        let status = ledger_status(
+            state,
+            ledger_request(Some(ledger_identity("short-nonce", Some("abc")))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(ledger_metric("nonce_too_short") > before_short);
+    }
+
+    /// The fail-closed 503 is the outcome an operator most needs a numerator
+    /// for: it is returned by the ledger while the handlers are healthy. The
+    /// state here carries a lazy pool pointed at a database that does not
+    /// exist, so `consume_signature` returns `Err`.
+    #[tokio::test]
+    async fn ledger_metrics_count_a_ledger_error() {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let before = ledger_metric("unavailable");
+
+        let status = ledger_status(
+            make_test_state(Keypair::generate().did()),
+            ledger_request(Some(ledger_identity("db-down", None))),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(ledger_metric("unavailable") > before);
+    }
+
+    #[sqlx::test]
+    async fn ledger_metrics_count_admitted_and_replayed(pool: sqlx::PgPool) {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let state = crate::test_support::test_state(pool).await;
+        let identity = ledger_identity("spend-once", None);
+
+        let before_admitted = ledger_metric("admitted");
+        let status = ledger_status(state.clone(), ledger_request(Some(identity.clone()))).await;
+        assert_eq!(status, StatusCode::OK, "a fresh signature is admitted");
+        assert!(ledger_metric("admitted") > before_admitted);
+
+        let before_replayed = ledger_metric("replayed");
+        let status = ledger_status(state, ledger_request(Some(identity))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "the same signature replays");
+        assert!(ledger_metric("replayed") > before_replayed);
+    }
+
+    #[sqlx::test]
+    async fn ledger_metrics_count_a_full_identity_ledger(pool: sqlx::PgPool) {
+        crate::metrics::init("0.0.0-test", "did:key:test");
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let identity = ledger_identity("capped", None);
+
+        // Seeded through SQL rather than 512 requests. The cap is charged
+        // against the resolved key, which is the `keyid` column's value.
+        sqlx::query(
+            "INSERT INTO consumed_signatures (sig_hash, keyid, expires_at)
+             SELECT md5(i::text) || md5((i + 1)::text), $1, $2
+             FROM generate_series(1, $3) AS i",
+        )
+        .bind(&identity.key_fingerprint)
+        .bind(9_000_000_000i64)
+        .bind(crate::db::MAX_LIVE_SIGNATURES_PER_KEYID)
+        .execute(&pool)
+        .await
+        .expect("seed a full ledger for this identity");
+
+        let before = ledger_metric("identity_ledger_full");
+        let status = ledger_status(state, ledger_request(Some(identity))).await;
+
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(ledger_metric("identity_ledger_full") > before);
     }
 
     #[tokio::test]
