@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -166,13 +166,14 @@ async fn cmd_create(
         "delegator_did": delegator_did,
     }))?;
 
-    let resp: Value = client
+    let resp = client
         .post("/api/v1/tasks", &body)
         .await
-        .context("failed to create task")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
+        .context("failed to create task")?;
+    // Check the status BEFORE parsing. Without this a denial (a 400
+    // `signature_nonce_required`, a 500, a 404) pretty-prints the node's error
+    // JSON and exits 0, so a script keying on `$?` treats the task as created.
+    let resp: Value = json_or_denial("create task", resp).await?;
     print_json(&resp);
     Ok(())
 }
@@ -221,13 +222,11 @@ async fn cmd_claim(id: String, node: String, dir: Option<PathBuf>) -> Result<()>
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&json!({ "assignee_did": assignee_did }))?;
-    let resp: Value = client
+    let resp = client
         .post(&format!("/api/v1/tasks/{}/claim", id), &body)
         .await
-        .context("failed to claim task")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
+        .context("failed to claim task")?;
+    let resp: Value = json_or_denial("claim task", resp).await?;
     print_json(&resp);
     Ok(())
 }
@@ -243,13 +242,11 @@ async fn cmd_complete(
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&json!({ "result": result, "by_did": by_did }))?;
-    let resp: Value = client
+    let resp = client
         .post(&format!("/api/v1/tasks/{}/complete", id), &body)
         .await
-        .context("failed to complete task")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
+        .context("failed to complete task")?;
+    let resp: Value = json_or_denial("complete task", resp).await?;
     print_json(&resp);
     Ok(())
 }
@@ -265,13 +262,11 @@ async fn cmd_fail(
     let client = NodeClient::new(&node, Some(keypair));
 
     let body = serde_json::to_vec(&json!({ "reason": reason, "by_did": by_did }))?;
-    let resp: Value = client
+    let resp = client
         .post(&format!("/api/v1/tasks/{}/fail", id), &body)
         .await
-        .context("failed to fail task")?
-        .json()
-        .await
-        .context("invalid JSON response")?;
+        .context("failed to fail task")?;
+    let resp: Value = json_or_denial("fail task", resp).await?;
     print_json(&resp);
     Ok(())
 }
@@ -339,6 +334,132 @@ mod tests {
         assert!(err.to_string().contains("no identity found"));
     }
 
+    /// Write an identity into a fresh dir so the signed task commands run.
+    fn identity_dir() -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Every denial a task write can come back with, as (status, body).
+    /// The last entry is a plain node failure with no signature code: the task
+    /// commands must fail on that too, not just on the ledger denials.
+    fn denials() -> Vec<(usize, String)> {
+        [
+            (400, "signature_nonce_required"),
+            (409, "signature_replayed"),
+            (429, "signature_ledger_full"),
+            (500, "signature_identity_missing"),
+            (503, "signature_ledger_unavailable"),
+        ]
+        .iter()
+        .map(|(s, code)| {
+            (
+                *s,
+                format!(r#"{{"error":"{code}","message":"node refused the write"}}"#),
+            )
+        })
+        .chain(std::iter::once((
+            500,
+            r#"{"error":"internal_error","message":"boom"}"#.to_string(),
+        )))
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn task_writes_fail_on_every_denial() {
+        for (status, body) in denials() {
+            let dir = identity_dir();
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("POST", mockito::Matcher::Any)
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(&body)
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let path = Some(dir.path().to_path_buf());
+
+            let e = cmd_create(
+                "deploy".into(),
+                "agent:task".into(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                server.url(),
+                path.clone(),
+            )
+            .await;
+            assert!(
+                e.is_err(),
+                "task create returned Ok for {status} {body}: a script keying on $? \
+                 would treat the task as created"
+            );
+
+            for (name, res) in [
+                (
+                    "claim",
+                    cmd_claim("t1".into(), server.url(), path.clone()).await,
+                ),
+                (
+                    "complete",
+                    cmd_complete("t1".into(), None, server.url(), path.clone()).await,
+                ),
+                (
+                    "fail",
+                    cmd_fail("t1".into(), None, server.url(), path.clone()).await,
+                ),
+            ] {
+                assert!(res.is_err(), "task {name} returned Ok for {status} {body}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn task_create_denial_message_is_sanitized_and_bounded() {
+        let dir = identity_dir();
+        let mut server = mockito::Server::new_async().await;
+        let hostile = format!("\u{1b}[2Jfake success\u{202e}{}", "A".repeat(5000));
+        let body = serde_json::json!({"error": "internal_error", "message": hostile}).to_string();
+        let _m = server
+            .mock("POST", "/api/v1/tasks")
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(&body)
+            .create_async()
+            .await;
+
+        let err = cmd_create(
+            "deploy".into(),
+            "agent:task".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            server.url(),
+            Some(dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!err.contains('\u{1b}'), "ESC leaked: {err:?}");
+        assert!(!err.contains('\u{202e}'), "RLO leaked: {err:?}");
+        assert!(
+            err.chars().count() < 600,
+            "not bounded: {} chars",
+            err.chars().count()
+        );
+    }
+
     #[tokio::test]
     async fn test_create_task_server_error() {
         let mut server = mockito::Server::new_async().await;
@@ -358,8 +479,7 @@ mod tests {
             .create_async()
             .await;
 
-        // Should still succeed (prints JSON, doesn't check status code)
-        cmd_create(
+        let err = cmd_create(
             "deploy".to_string(),
             "agent:task".to_string(),
             None,
@@ -371,7 +491,10 @@ mod tests {
             Some(dir.path().to_path_buf()),
         )
         .await
-        .unwrap();
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("500"), "status not surfaced: {err}");
+        assert!(err.contains("internal error"), "message dropped: {err}");
     }
 
     // ── list ─────────────────────────────────────────────────────────
