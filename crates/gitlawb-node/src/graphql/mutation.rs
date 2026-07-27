@@ -54,7 +54,7 @@ impl MutationRoot {
         };
         db.create_task(&task)
             .await
-            .map_err(|e| crate::graphql::graphql_db_err(e))?;
+            .map_err(crate::graphql::graphql_db_err)?;
         Ok(AgentTaskType::from(task))
     }
 
@@ -76,7 +76,7 @@ impl MutationRoot {
         let task = db
             .claim_task(&id, &assignee_did)
             .await
-            .map_err(|e| crate::graphql::graphql_db_err(e))?;
+            .map_err(crate::graphql::graphql_db_err)?;
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "pending".to_string(),
@@ -108,7 +108,7 @@ impl MutationRoot {
         let existing = db
             .get_task(&id)
             .await
-            .map_err(|e| crate::graphql::graphql_db_err(e))?
+            .map_err(crate::graphql::graphql_db_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
             return Err(async_graphql::Error::new(
@@ -118,7 +118,7 @@ impl MutationRoot {
         let task = db
             .finish_task(&id, "completed", input.result.as_deref())
             .await
-            .map_err(|e| crate::graphql::graphql_db_err(e))?;
+            .map_err(crate::graphql::graphql_db_err)?;
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -149,7 +149,7 @@ impl MutationRoot {
         let existing = db
             .get_task(&id)
             .await
-            .map_err(|e| crate::graphql::graphql_db_err(e))?
+            .map_err(crate::graphql::graphql_db_err)?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
             return Err(async_graphql::Error::new(
@@ -160,7 +160,7 @@ impl MutationRoot {
         let task = db
             .finish_task(&id, "failed", Some(&reason))
             .await
-            .map_err(|e| crate::graphql::graphql_db_err(e))?;
+            .map_err(crate::graphql::graphql_db_err)?;
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -218,8 +218,9 @@ mod tests {
             errors(&resp)
         );
 
-        // 3. Signed as the claimed assignee → passes the auth gate (any remaining
-        //    error is the missing task, not an auth error).
+        // 3. Signed as the claimed assignee → passes the auth gate. The missing
+        //    task is a business error from claim_task, not a sqlx fault, so the
+        //    actionable message must survive (not the opaque DB string) (#250).
         let resp = schema
             .execute(Request::new(&q).data(AuthenticatedDid(assignee.into())))
             .await;
@@ -227,6 +228,47 @@ mod tests {
         assert!(
             !errs.contains("authentication required") && !errs.contains("authenticated signer"),
             "matching signer must pass the auth gate: {errs}"
+        );
+        assert!(
+            errs.contains("task not claimable"),
+            "claim race / missing task must keep its business message: {errs}"
+        );
+        assert!(
+            !errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+            "business error must not be rewritten as opaque DB error: {errs}"
+        );
+    }
+
+    /// #250: mutation DB faults must be opaque; create_task hits agent_tasks.
+    #[sqlx::test]
+    async fn create_task_db_error_message_is_opaque(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        sqlx::query("ALTER TABLE agent_tasks DROP COLUMN status")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let delegator = "did:key:zGQLDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let q = format!(
+            r#"mutation {{
+                createTask(
+                    delegatorDid: "{delegator}",
+                    input: {{ kind: "build", capability: "repo:write" }}
+                ) {{ id }}
+            }}"#
+        );
+        let resp = state
+            .graphql_schema
+            .execute(Request::new(&q).data(AuthenticatedDid(delegator.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains(crate::graphql::GRAPHQL_DB_ERROR_MESSAGE),
+            "sqlx fault must be opaque: {errs}"
+        );
+        assert!(
+            !errs.contains("column") && !errs.contains("status"),
+            "schema text leaked: {errs}"
         );
     }
 
