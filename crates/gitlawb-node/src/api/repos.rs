@@ -1323,6 +1323,17 @@ pub async fn git_receive_pack(
                     // repo-wide latest, so each anchor embeds the exact
                     // certificate for its own ref transition.
                     let cert = ref_certs_clone.get(ref_name).cloned();
+                    if cert.is_none() {
+                        // Certificate issuance failed for this ref update.
+                        // Anchoring without a cert would produce a permanent
+                        // artifact that verify_anchor must reject — skip
+                        // instead of publishing an unverifiable anchor.
+                        tracing::warn!(
+                            ref_name,
+                            "skipping arweave anchor — no certificate was issued"
+                        );
+                        continue;
+                    }
                     let cert_id = cert.as_ref().map(|c| c.id.clone());
                     let anchor = crate::arweave::RefAnchor {
                         repo: repo_slug.clone(),
