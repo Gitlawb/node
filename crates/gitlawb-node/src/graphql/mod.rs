@@ -45,14 +45,22 @@ pub(crate) fn graphql_db_err(e: anyhow::Error) -> async_graphql::Error {
 }
 
 /// Map an `AppError` from a shared collector (e.g. ref-update feed) to a
-/// GraphQL error. DB variants are opaque; other variants stay opaque too
-/// because `AppError::Internal` can still carry raw detail on this base.
+/// GraphQL error.
+///
+/// - `Db` → opaque via [`graphql_db_err`] (sqlx detail stays in logs).
+/// - `Internal` → opaque (may carry raw anyhow/sqlx text on this base).
+/// - Other variants already carry safe, actionable messages → surface them
+///   and log at `warn!` (same posture as business errors in `graphql_db_err`).
 pub(crate) fn graphql_app_err(e: crate::error::AppError) -> async_graphql::Error {
     match e {
         crate::error::AppError::Db(sql) => graphql_db_err(sql.into()),
-        other => {
-            tracing::error!(error = %other, "graphql error");
+        crate::error::AppError::Internal(err) => {
+            tracing::error!(error = %format!("{err:#}"), "graphql internal error");
             async_graphql::Error::new(GRAPHQL_DB_ERROR_MESSAGE)
+        }
+        other => {
+            tracing::warn!(error = %other, "graphql application error");
+            async_graphql::Error::new(other.to_string())
         }
     }
 }
@@ -87,5 +95,40 @@ mod tests {
         let msg = "task not claimable: not found or already claimed";
         let err = graphql_db_err(anyhow::anyhow!("{msg}"));
         assert_eq!(err.message, msg);
+    }
+
+    #[test]
+    fn graphql_app_err_opaques_db_and_internal() {
+        let leak = "column \"is_public\" does not exist";
+        let db_err = graphql_app_err(crate::error::AppError::Db(sqlx::Error::Protocol(
+            leak.into(),
+        )));
+        assert_eq!(db_err.message, GRAPHQL_DB_ERROR_MESSAGE);
+        assert!(!db_err.message.contains("is_public"));
+
+        let internal = graphql_app_err(crate::error::AppError::Internal(anyhow::anyhow!(
+            "loading repo: {leak}"
+        )));
+        assert_eq!(internal.message, GRAPHQL_DB_ERROR_MESSAGE);
+        assert!(!internal.message.contains("is_public"));
+    }
+
+    #[test]
+    fn graphql_app_err_keeps_safe_variant_messages() {
+        let err = graphql_app_err(crate::error::AppError::NotFound("widget".into()));
+        assert!(
+            err.message.contains("widget"),
+            "safe NotFound message must reach the client: {}",
+            err.message
+        );
+        assert_ne!(err.message, GRAPHQL_DB_ERROR_MESSAGE);
+
+        let err = graphql_app_err(crate::error::AppError::BadRequest("bad cid".into()));
+        assert!(
+            err.message.contains("bad cid"),
+            "safe BadRequest message must reach the client: {}",
+            err.message
+        );
+        assert_ne!(err.message, GRAPHQL_DB_ERROR_MESSAGE);
     }
 }

@@ -110,7 +110,11 @@ impl QueryRoot {
         ctx: &Context<'_>,
         status: Option<String>,
         assignee_did: Option<String>,
-        #[graphql(default = 50)] limit: i64,
+        #[graphql(
+            default = 50,
+            desc = "Max 200; larger requests are clamped to 200 (no error). Negative values clamp to 0."
+        )]
+        limit: i64,
     ) -> Result<Vec<AgentTaskType>> {
         let db = ctx.data_unchecked::<Arc<Db>>();
         // Clamp before SQL: a negative LIMIT is a client fault that Postgres
