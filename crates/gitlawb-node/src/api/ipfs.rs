@@ -264,4 +264,44 @@ mod closed_pool_tests {
             })
         );
     }
+
+    /// #251 / CodeRabbit nit: cover `get_by_cid`'s `list_all_repos` bare-`?`
+    /// path the same way — a valid CID must still yield 503 on a closed pool.
+    #[sqlx::test]
+    async fn get_by_cid_closed_pool_returns_503_db_unavailable(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        pool.close().await;
+
+        // Any sha2-256 CIDv1 passes the codec gate and then hits the DB.
+        let cid = gitlawb_core::cid::Cid::from_git_object_bytes(b"closed-pool-probe").to_string();
+
+        let resp = Router::new()
+            .route("/ipfs/{cid}", axum::routing::get(get_by_cid))
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/ipfs/{cid}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "closed-pool outage on get_by_cid must be retryable 503, not 500"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": crate::error::DB_UNAVAILABLE_CODE,
+                "message": crate::error::DB_UNAVAILABLE_MESSAGE,
+            })
+        );
+    }
 }
