@@ -937,6 +937,25 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS legacy_provider_cid TEXT",
         ],
     },
+    Migration {
+        version: 15,
+        name: "pinned_cids_sources_incomplete",
+        stmts: &[
+            // U3 (#173): `record_pin_source` is BEST EFFORT at every call site, so a
+            // non-empty, below-cap source set is not proof that every source was
+            // recorded. An object first pinned from a private repo and later pushed
+            // from a PUBLIC repo whose record failed keeps a set naming only the
+            // private source, and the resolver used to call that set complete and 404
+            // an object the public repo would serve. Record the miss DURABLY here so
+            // `GET /ipfs/{cid}` keeps the bounded scan fallback for exactly those
+            // objects. Not inferable from row counts or timestamps: neither can tell
+            // "no other source exists" from "a source failed to record", which is the
+            // whole distinction. NEW versioned migration (never appended to an applied
+            // block, INV-7). NOT NULL DEFAULT FALSE so every pre-existing row reads as
+            // complete and ordinary denials stay off the O(repos) path (INV-10).
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS pin_sources_incomplete BOOLEAN NOT NULL DEFAULT FALSE",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -2282,6 +2301,11 @@ impl Db {
     /// gets it filled the next time the object is re-pinned with a known source.
     /// `cid`/`pinned_at` are left untouched on conflict. `repo_id` is `None` only
     /// for a legacy pin with no known source; those fall back to the resolver's scan.
+    ///
+    /// The production first-pin path now goes through [`Self::record_pinned_cid_with_source`]
+    /// (U3, #173) so the pin and its source land atomically; this remains the seam for
+    /// seeding legacy, source-less rows in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn record_pinned_cid(
         &self,
         sha256_hex: &str,
@@ -2384,7 +2408,17 @@ impl Db {
     /// (`pin_sources_for_oid`) caps the ADDITIONAL sources at `MAX_PIN_SOURCES` (always
     /// keeping the first-pinner), so the INV-10 bound on serve-time work holds at
     /// `O(MAX_PIN_SOURCES + 1)` regardless of a table overshoot.
+    ///
+    /// A successful record also CLEARS the `pin_sources_incomplete` marker for the
+    /// object, in the SAME transaction as the insert (U3, #173), so the clear cannot
+    /// drift across the four call sites or land without the row it describes. The
+    /// marker is per-object, not per-(object, repo): a record from repo B clears a
+    /// marker set by a failed record from repo A, which can re-hide A's hole until A
+    /// pushes again. That is the deliberate cost of a single boolean, and it fails in
+    /// the safe direction relative to today (the marker only ever ADDS the fallback,
+    /// never removes a source the resolver already tries).
     pub async fn record_pin_source(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
              SELECT $1, $2
@@ -2394,9 +2428,92 @@ impl Db {
         .bind(sha256_hex)
         .bind(repo_id)
         .bind(MAX_PIN_SOURCES)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(
+            "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
+              WHERE sha256_hex = $1 AND pin_sources_incomplete",
+        )
+        .bind(sha256_hex)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    /// Record a first pin and its source ATOMICALLY (U3, #173). The first-pin path
+    /// used to run `record_pinned_cid` and `record_pin_source` as two independent
+    /// best-effort calls, so the pin could land while its source did not, leaving a
+    /// source set that is silently missing its own first pinner. One transaction
+    /// removes that window entirely: either both rows land or neither does, and a
+    /// total failure leaves the object unpinned so the next push retries it.
+    pub async fn record_pinned_cid_with_source(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
+        )
+        .bind(sha256_hex)
+        .bind(cid)
+        .bind(Utc::now().to_rfc3339())
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
+              WHERE sha256_hex = $1 AND pin_sources_incomplete",
+        )
+        .bind(sha256_hex)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mark this object's pin-source set as KNOWN INCOMPLETE (U3, #173). Called when a
+    /// `record_pin_source` exhausts its retries, which is the only moment the node
+    /// knows a source it meant to record is missing. `GET /ipfs/{cid}` reads it to keep
+    /// the bounded scan fallback for that object, so a public copy that would serve is
+    /// no longer 404'd. A no-op when no `pinned_cids` row exists (the first-pin path is
+    /// transactional, so there is no half-recorded pin to describe).
+    pub async fn mark_pin_sources_incomplete(&self, sha256_hex: &str) -> Result<()> {
+        sqlx::query("UPDATE pinned_cids SET pin_sources_incomplete = TRUE WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether this object's pin-source set is KNOWN INCOMPLETE (U3, #173): a
+    /// `record_pin_source` for it failed outright and no later record has repaired the
+    /// set. `false` for an unpinned oid and for every row predating the column, so the
+    /// common path is unchanged and an ordinary denial never fans out (INV-10).
+    pub async fn pin_sources_incomplete(&self, sha256_hex: &str) -> Result<bool> {
+        let flag: Option<bool> = sqlx::query_scalar(
+            "SELECT pin_sources_incomplete FROM pinned_cids WHERE sha256_hex = $1",
+        )
+        .bind(sha256_hex)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(flag.unwrap_or(false))
     }
 
     /// Every source repository recorded for a pinned object (F1, #173 jatmn round 8):

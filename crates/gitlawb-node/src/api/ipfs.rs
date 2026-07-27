@@ -329,14 +329,30 @@ pub async fn get_by_cid(
             //               (e.g. a later PUBLIC pinner buried by 16 attacker sources — the
             //               pin-source griefing hole). The scan gates every repo through the
             //               real per-caller gate, so it finds that copy.
-            // A non-empty, non-full set is COMPLETE (every recorded source was just tried), so
-            // skip the scan and let the tail 404 — ordinary denials never fan out to O(repos)
-            // (INV-10 / F3). The at_cap query runs only on a provenance MISS (we return above
-            // on Served), so it never costs the serve path.
+            //   - marked  -> a `record_pin_source` for this object failed outright (U3, #173).
+            //               `record_pin_source` is best effort at every pin call site, so a
+            //               non-empty below-cap set is NOT self-evidently complete: an object
+            //               first pinned from a PRIVATE repo and later pushed from a PUBLIC
+            //               one whose record failed names only the private source. The
+            //               durable `pin_sources_incomplete` marker is the node's own record
+            //               that a source is missing, so the fallback stays available for
+            //               exactly those objects instead of 404ing a servable public copy.
+            // Only a set with NONE of these three signals is treated as complete (every
+            // recorded source was just tried), so it skips the scan and lets the tail 404, and
+            // ordinary denials never fan out to O(repos) (INV-10 / F3). Both extra queries run
+            // only on a provenance MISS (we return above on Served), so neither costs the serve
+            // path, and the fallback is not an authorization bypass: the scan gates every repo
+            // through the SAME per-caller gate, so a caller who may not read the object is
+            // still denied.
             let needs_scan = sources.is_empty()
                 || state
                     .db
                     .pin_sources_at_cap(sha256_hex)
+                    .await
+                    .map_err(AppError::Internal)?
+                || state
+                    .db
+                    .pin_sources_incomplete(sha256_hex)
                     .await
                     .map_err(AppError::Internal)?;
             if needs_scan {
