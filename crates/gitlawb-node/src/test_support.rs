@@ -8323,5 +8323,506 @@ mod tests {
                 "the key is released after one pass"
             );
         }
+
+        // ---- U2 (#173): a transient re-read failure must not discard the coalesced
+        // push's work ----
+        //
+        // The requeue pass re-reads repo state fresh. Before this unit, the `Err` arm of
+        // either read (repo row, visibility rules) collapsed into "no rules", which made
+        // `replication_withheld_set` return `None`, which skipped the whole pass. The
+        // dirty flag was already consumed by the atomic check-and-clear at the tail and
+        // there is no reconciliation sweep, so the coalesced push's pin/encrypt work was
+        // lost silently. These tests drive that `Err` arm through the fault seam in
+        // `api::repos::requeue_faults` (a real pool will not fail on demand) and assert
+        // on the WORK PERFORMED, not on control flow.
+        mod u2_reread_retry {
+            use super::*;
+            use crate::api::repos::requeue_faults;
+
+            /// Process-wide tracing capture so a test can assert the give-up is logged at
+            /// ERROR. A global default subscriber can only be installed once per process,
+            /// so it is shared by every test here and assertions filter on the repo id,
+            /// which is a fresh uuid per test.
+            mod logcap {
+                use std::sync::{Arc, Mutex, OnceLock};
+                use tracing::{Event, Level, Subscriber};
+                use tracing_subscriber::layer::{Context, Layer};
+                use tracing_subscriber::prelude::*;
+
+                type Lines = Arc<Mutex<Vec<(Level, String)>>>;
+
+                fn lines() -> &'static Lines {
+                    static LINES: OnceLock<Lines> = OnceLock::new();
+                    LINES.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+                }
+
+                struct Capture;
+                impl<S: Subscriber> Layer<S> for Capture {
+                    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                        struct V(String);
+                        impl tracing::field::Visit for V {
+                            fn record_debug(
+                                &mut self,
+                                field: &tracing::field::Field,
+                                value: &dyn std::fmt::Debug,
+                            ) {
+                                self.0.push_str(&format!(" {}={:?}", field.name(), value));
+                            }
+                        }
+                        let mut v = V(String::new());
+                        event.record(&mut v);
+                        lines()
+                            .lock()
+                            .unwrap()
+                            .push((*event.metadata().level(), v.0));
+                    }
+                }
+
+                pub(super) fn install() {
+                    static ONCE: OnceLock<()> = OnceLock::new();
+                    ONCE.get_or_init(|| {
+                        let _ = tracing::subscriber::set_global_default(
+                            tracing_subscriber::registry().with(Capture),
+                        );
+                    });
+                }
+
+                pub(super) fn errors_containing(needle: &str) -> Vec<String> {
+                    lines()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(lvl, msg)| *lvl == Level::ERROR && msg.contains(needle))
+                        .map(|(_, msg)| msg.clone())
+                        .collect()
+                }
+            }
+
+            /// SCENARIO 1. The repo re-read fails once, then succeeds: the requeue pass
+            /// must still RUN, under the refreshed state, and pin the coalesced push's
+            /// object. RED before the fix (the single `Err` yielded `(None, false, "")`,
+            /// the pass was skipped, and the already-consumed dirty flag meant the work
+            /// was gone for good).
+            #[sqlx::test]
+            async fn u2_transient_repo_reread_failure_is_retried_and_work_lands(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-retry");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let git_repo = init_repo();
+                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
+                // The coalesced push B adds obj2, absent from push A's spawn captures.
+                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // One transient repo re-read failure, then the real DB answers.
+                requeue_faults::inject(&repo.id, 1, 0);
+
+                let guard = state
+                    .encrypt_inflight
+                    .try_begin(&repo.id)
+                    .expect("push A admits");
+                assert!(
+                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
+                    "push B coalesces while A is in flight"
+                );
+
+                crate::api::repos::run_post_push_replication_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    server.url(),
+                    true,
+                    owner.clone(),
+                    vec![obj1.clone()],
+                    Some(vec![]),
+                    HashSet::new(),
+                )
+                .await;
+
+                assert!(
+                    state.db.is_pinned(&obj2).await.unwrap(),
+                    "the coalesced push's object is pinned after the retried re-read (RED \
+                     before this unit: the Err arm dropped the pass and the work with it)"
+                );
+                let c = requeue_faults::counters(&repo.id);
+                assert_eq!(
+                    c.repo_read_attempts, 2,
+                    "the failed re-read is retried exactly once before it succeeds"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is released once the task exits"
+                );
+            }
+
+            /// SCENARIO 2. Every re-read attempt fails: the loop must give up on a BOUND
+            /// (asserted as a literal, so raising or removing the bound goes RED) and log
+            /// the give-up at ERROR so the residual loss is observable rather than silent.
+            #[sqlx::test]
+            async fn u2_sustained_repo_reread_failure_is_bounded_and_logged(pool: PgPool) {
+                logcap::install();
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-bounded");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let git_repo = init_repo();
+                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
+                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // Far more failures than the bound allows: the outage never clears.
+                requeue_faults::inject(&repo.id, 10_000, 0);
+
+                let guard = state
+                    .encrypt_inflight
+                    .try_begin(&repo.id)
+                    .expect("push A admits");
+                assert!(
+                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
+                    "push B coalesces"
+                );
+
+                crate::api::repos::run_post_push_replication_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    server.url(),
+                    true,
+                    owner.clone(),
+                    vec![obj1.clone()],
+                    Some(vec![]),
+                    HashSet::new(),
+                )
+                .await;
+
+                let c = requeue_faults::counters(&repo.id);
+                assert_eq!(
+                    c.repo_read_attempts, 3,
+                    "the re-read is bounded at 3 attempts; unbounded retry or a raised \
+                     bound must fail here"
+                );
+                assert!(
+                    !state.db.is_pinned(&obj2).await.unwrap(),
+                    "with the read never succeeding there is nothing fresh to act on"
+                );
+                let errs = logcap::errors_containing(&repo.id);
+                assert!(
+                    !errs.is_empty(),
+                    "the exhausted requeue re-read is logged at ERROR with the repo id, so \
+                     the residual work loss is observable; captured: {errs:?}"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is still released on the give-up path"
+                );
+            }
+
+            /// SCENARIO 3. `Ok(None)` (the repo was deleted during the in-flight window)
+            /// is NOT a transient failure: it must release immediately without burning the
+            /// retry budget. The repo id is never inserted, so the re-read legitimately
+            /// returns `Ok(None)`.
+            #[sqlx::test]
+            async fn u2_repo_gone_releases_without_consuming_retries(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let missing_id = uuid::Uuid::new_v4().to_string();
+                let git_repo = init_repo();
+                let _obj1 = commit(&git_repo.path, "a.txt", "one\n");
+
+                let server = mockito::Server::new_async().await;
+
+                requeue_faults::inject(&missing_id, 0, 0);
+
+                let guard = state
+                    .encrypt_inflight
+                    .try_begin(&missing_id)
+                    .expect("push A admits");
+                assert!(
+                    state.encrypt_inflight.try_begin(&missing_id).is_none(),
+                    "push B coalesces"
+                );
+
+                // Empty object list: pass one touches no pin rows for a repo that is gone.
+                crate::api::repos::run_post_push_replication_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    missing_id.clone(),
+                    server.url(),
+                    true,
+                    owner.clone(),
+                    vec![],
+                    Some(vec![]),
+                    HashSet::new(),
+                )
+                .await;
+
+                let c = requeue_faults::counters(&missing_id);
+                assert_eq!(
+                    c.repo_read_attempts, 1,
+                    "a deleted repo is a terminal answer, never retried"
+                );
+                assert_eq!(
+                    c.rules_read_attempts, 0,
+                    "no rules read is attempted once the repo row is gone"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is released cleanly"
+                );
+            }
+
+            /// SCENARIO 4. A failed visibility-rule read is transient, never an empty
+            /// policy. RED before the fix, where `.ok()` made "the rules read failed" and
+            /// "this repo has no rules" the same value: the withheld blob was then neither
+            /// sealed nor covered, because a `None` rule set skips the pass entirely.
+            #[sqlx::test]
+            async fn u2_transient_rules_read_failure_is_retried_not_read_as_empty(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let reader = new_did();
+                let repo = seed_repo(&owner, "u2-rules");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let git_repo = init_repo();
+                let pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
+                let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
+
+                // The coalesced push B is what added the path-scoped rule.
+                state
+                    .db
+                    .set_visibility_rule(
+                        &repo.id,
+                        "/secret/**",
+                        VisibilityMode::B,
+                        &[reader],
+                        &owner,
+                    )
+                    .await
+                    .expect("set rule");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // The repo row reads fine; the RULES read is the one that blips.
+                requeue_faults::inject(&repo.id, 0, 1);
+
+                let guard = state
+                    .encrypt_inflight
+                    .try_begin(&repo.id)
+                    .expect("push A admits");
+                assert!(
+                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
+                    "push B coalesces"
+                );
+
+                // Push A's captures are stale: no rule, nothing withheld.
+                crate::api::repos::run_post_push_replication_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    server.url(),
+                    true,
+                    owner.clone(),
+                    vec![pub_oid.clone()],
+                    Some(vec![]),
+                    HashSet::new(),
+                )
+                .await;
+
+                assert!(
+                    state
+                        .db
+                        .encrypted_blob_recipients_tag(&repo.id, &secret_oid)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "the withheld blob is sealed under the RETRIED rule set (RED with \
+                     list_visibility_rules(..).ok(): an empty policy seals nothing)"
+                );
+                let c = requeue_faults::counters(&repo.id);
+                assert_eq!(
+                    c.rules_read_attempts, 2,
+                    "the failed rules read is retried, not collapsed into an empty rule set"
+                );
+                assert!(
+                    !state.db.is_pinned(&secret_oid).await.unwrap(),
+                    "the withheld blob is never pinned in the clear by the requeue"
+                );
+            }
+
+            /// SCENARIO 5. The fault-free control for scenario 4: the rules applied by the
+            /// requeue are the COALESCED push's fresh ones, never the spawn-time capture,
+            /// and the retry path does not perturb that (exactly one read of each).
+            #[sqlx::test]
+            async fn u2_requeue_applies_fresh_rules_not_spawn_captures(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let reader = new_did();
+                let repo = seed_repo(&owner, "u2-fresh");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let git_repo = init_repo();
+                let pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
+                let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
+                state
+                    .db
+                    .set_visibility_rule(
+                        &repo.id,
+                        "/secret/**",
+                        VisibilityMode::B,
+                        &[reader],
+                        &owner,
+                    )
+                    .await
+                    .expect("set rule");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                requeue_faults::inject(&repo.id, 0, 0);
+
+                let guard = state
+                    .encrypt_inflight
+                    .try_begin(&repo.id)
+                    .expect("push A admits");
+                assert!(
+                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
+                    "push B coalesces"
+                );
+
+                crate::api::repos::run_post_push_replication_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    server.url(),
+                    true,
+                    owner.clone(),
+                    vec![pub_oid.clone()],
+                    Some(vec![]),
+                    HashSet::new(),
+                )
+                .await;
+
+                let c = requeue_faults::counters(&repo.id);
+                assert_eq!(
+                    (c.repo_read_attempts, c.rules_read_attempts),
+                    (1, 1),
+                    "a healthy DB is read exactly once per requeue pass"
+                );
+                assert!(
+                    state.db.is_pinned(&pub_oid).await.unwrap(),
+                    "the visible object is pinned under the fresh rules"
+                );
+                assert!(
+                    !state.db.is_pinned(&secret_oid).await.unwrap(),
+                    "the freshly-read rule withholds the secret blob (the spawn-time \
+                     capture had no rules at all)"
+                );
+            }
+
+            /// SCENARIO 6. Regression guard on the property the fix must not disturb: the
+            /// tail check-and-clear is atomic, so a push coalescing during it is still
+            /// covered by exactly one more pass, and the key is released after.
+            #[sqlx::test]
+            async fn u2_coalesced_push_still_covered_by_exactly_one_requeue_pass(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-coalesce");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let git_repo = init_repo();
+                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
+                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                requeue_faults::inject(&repo.id, 0, 0);
+
+                let guard = state
+                    .encrypt_inflight
+                    .try_begin(&repo.id)
+                    .expect("push A admits");
+                // Push B lands during the in-flight window: dirty flag set.
+                assert!(
+                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
+                    "push B coalesces"
+                );
+                assert_eq!(
+                    state.encrypt_inflight.dirty(&repo.id),
+                    Some(true),
+                    "the coalesced push marked the repo dirty"
+                );
+
+                crate::api::repos::run_post_push_replication_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    server.url(),
+                    true,
+                    owner.clone(),
+                    vec![obj1.clone()],
+                    Some(vec![]),
+                    HashSet::new(),
+                )
+                .await;
+
+                assert_eq!(
+                    requeue_faults::counters(&repo.id).repo_read_attempts,
+                    1,
+                    "one coalesced push means exactly one requeue pass, no re-spin"
+                );
+                assert!(
+                    state.db.is_pinned(&obj1).await.unwrap(),
+                    "push A's object is pinned"
+                );
+                assert!(
+                    state.db.is_pinned(&obj2).await.unwrap(),
+                    "the coalesced push's object is covered by the requeue pass"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the key is released once the task is clean"
+                );
+            }
+        }
     }
 }

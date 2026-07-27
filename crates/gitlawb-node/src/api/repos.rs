@@ -849,6 +849,177 @@ async fn requeue_full_scan_object_list(
     .await
 }
 
+/// Test-only fault-injection seam for the requeue re-read (#173 U2). The defect this
+/// unit fixes lives entirely on the `Err` arm of the two re-reads, which a real Postgres
+/// pool will not produce on demand, so the two reads go through the wrappers below and
+/// consult this table first. Keyed by `repo_id` (a fresh uuid per test) so tests running
+/// in parallel in one process cannot see each other's injections, and it also records
+/// the ATTEMPT counts the retry-bound assertions key on.
+#[cfg(test)]
+pub(crate) mod requeue_faults {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Default, Clone, Copy, Debug)]
+    pub(crate) struct Counters {
+        pub(crate) repo_read_failures_left: usize,
+        pub(crate) rules_read_failures_left: usize,
+        pub(crate) repo_read_attempts: usize,
+        pub(crate) rules_read_attempts: usize,
+    }
+
+    fn table() -> &'static Mutex<HashMap<String, Counters>> {
+        static TABLE: OnceLock<Mutex<HashMap<String, Counters>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Make the next `repo_read_failures` repo re-reads and the next
+    /// `rules_read_failures` rule re-reads for `repo_id` return `Err`, then succeed.
+    pub(crate) fn inject(repo_id: &str, repo_read_failures: usize, rules_read_failures: usize) {
+        table().lock().unwrap().insert(
+            repo_id.to_string(),
+            Counters {
+                repo_read_failures_left: repo_read_failures,
+                rules_read_failures_left: rules_read_failures,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Observed attempt counts (and remaining injections) for `repo_id`.
+    pub(crate) fn counters(repo_id: &str) -> Counters {
+        table()
+            .lock()
+            .unwrap()
+            .get(repo_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Production-path hook: count one repo re-read attempt, return whether it must fail.
+    pub(crate) fn take_repo_read(repo_id: &str) -> bool {
+        let mut map = table().lock().unwrap();
+        let c = map.entry(repo_id.to_string()).or_default();
+        c.repo_read_attempts += 1;
+        if c.repo_read_failures_left > 0 {
+            c.repo_read_failures_left -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Production-path hook: count one rules re-read attempt, return whether it must fail.
+    pub(crate) fn take_rules_read(repo_id: &str) -> bool {
+        let mut map = table().lock().unwrap();
+        let c = map.entry(repo_id.to_string()).or_default();
+        c.rules_read_attempts += 1;
+        if c.rules_read_failures_left > 0 {
+            c.rules_read_failures_left -= 1;
+            return true;
+        }
+        false
+    }
+}
+
+/// Attempts allowed for the requeue re-read before the task gives up (#173 U2). The
+/// dirty flag that represented the coalesced push is already consumed by the atomic
+/// check-and-clear at the tail and `EncryptInflightGuard::drop` removes the key, so the
+/// flag cannot outlive the task and there is no reconciliation sweep to re-derive the
+/// work: a transient read error must be RETRIED here or the push's pin/encrypt pass is
+/// gone. The bound keeps a sustained outage from spinning forever; on exhaustion the
+/// work is still lost (the pre-existing residual), but the give-up is logged at ERROR
+/// so it is observable instead of silent.
+const REQUEUE_REREAD_MAX_ATTEMPTS: usize = 3;
+
+/// Backoff before the next re-read attempt. Doubles per attempt.
+const REQUEUE_REREAD_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The outcome of the requeue's fresh state re-read, keeping the three cases the old
+/// code collapsed into one distinct: a usable refresh, a repo that genuinely no longer
+/// exists (terminal, and NOT a retry), and a transient read failure (retryable).
+enum RequeueRefresh {
+    State {
+        rules: Vec<crate::db::VisibilityRule>,
+        is_public: bool,
+        owner_did: String,
+    },
+    Gone,
+    Failed,
+}
+
+/// Re-read repo state for a requeue pass, retrying transient read errors.
+///
+/// Both reads are retryable and neither may be read as an absence: an `Err` from the
+/// repo row is not "the repo is gone", and an `Err` from the rule list is not "this repo
+/// has no rules" (the old `.ok()` made those indistinguishable, and a `None` rule set
+/// makes `replication_withheld_set` return `None`, which skips the entire pass). Only
+/// `Ok(None)` on the repo row is a terminal absence, and it consumes no retry budget.
+async fn requeue_refresh_state(ctx: &PostPushReplication) -> RequeueRefresh {
+    let mut backoff = REQUEUE_REREAD_BACKOFF;
+    for attempt in 1..=REQUEUE_REREAD_MAX_ATTEMPTS {
+        let record = match requeue_get_repo(ctx).await {
+            Ok(Some(rec)) => rec,
+            Ok(None) => {
+                tracing::debug!(repo = %ctx.repo_id, "repo gone before requeue pass; releasing");
+                return RequeueRefresh::Gone;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %ctx.repo_id, err = %e, attempt,
+                    "requeue repo re-read failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+                continue;
+            }
+        };
+        match requeue_list_rules(ctx).await {
+            Ok(rules) => {
+                return RequeueRefresh::State {
+                    rules,
+                    is_public: record.is_public,
+                    owner_did: record.owner_did,
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    repo = %ctx.repo_id, err = %e, attempt,
+                    "requeue visibility-rule re-read failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+        }
+    }
+    tracing::error!(
+        repo = %ctx.repo_id,
+        attempts = REQUEUE_REREAD_MAX_ATTEMPTS,
+        "requeue re-read failed on every attempt; the coalesced push's pin/encrypt pass is \
+         dropped (no reconciliation sweep re-derives it)"
+    );
+    RequeueRefresh::Failed
+}
+
+/// The requeue's repo re-read, behind the test-only fault seam above.
+async fn requeue_get_repo(ctx: &PostPushReplication) -> anyhow::Result<Option<RepoRecord>> {
+    #[cfg(test)]
+    if requeue_faults::take_repo_read(&ctx.repo_id) {
+        return Err(anyhow::anyhow!("injected repo re-read failure"));
+    }
+    ctx.db.get_repo_by_id(&ctx.repo_id).await
+}
+
+/// The requeue's visibility-rule re-read, behind the test-only fault seam above.
+async fn requeue_list_rules(
+    ctx: &PostPushReplication,
+) -> anyhow::Result<Vec<crate::db::VisibilityRule>> {
+    #[cfg(test)]
+    if requeue_faults::take_rules_read(&ctx.repo_id) {
+        return Err(anyhow::anyhow!("injected visibility-rule re-read failure"));
+    }
+    ctx.db.list_visibility_rules(&ctx.repo_id).await
+}
+
 /// The detached post-push encryption + local-IPFS pin task, as a REQUEUE LOOP.
 ///
 /// Pass one uses the spawn-time captures (`first_*`) — the delta the push handler
@@ -966,20 +1137,19 @@ async fn run_post_push_replication(
         // A push coalesced during this pass. Re-read repo state FRESH (never the stale
         // spawn-time captures) so a coalesced push that changed `.gitlawb` withholding
         // is walked under the new policy, then re-enumerate the pin set fail-closed.
-        let (r_rules, r_is_public, r_owner) = match ctx.db.get_repo_by_id(&ctx.repo_id).await {
-            Ok(Some(rec)) => (
-                ctx.db.list_visibility_rules(&ctx.repo_id).await.ok(),
-                rec.is_public,
-                rec.owner_did,
-            ),
-            Ok(None) => {
-                tracing::debug!(repo = %ctx.repo_id, "repo gone before requeue pass; releasing");
-                (None, false, String::new())
-            }
-            Err(e) => {
-                tracing::warn!(repo = %ctx.repo_id, err = %e, "requeue repo re-read failed; skipping this pass's work");
-                (None, false, String::new())
-            }
+        // A read error here is retried rather than treated as "no state" (#173 U2): the
+        // dirty flag is already consumed, so skipping the pass would silently discard
+        // exactly the push this requeue exists to cover.
+        let (r_rules, r_is_public, r_owner) = match requeue_refresh_state(&ctx).await {
+            RequeueRefresh::State {
+                rules,
+                is_public,
+                owner_did,
+            } => (Some(rules), is_public, owner_did),
+            // The repo is gone (terminal) or the re-read never succeeded (already logged
+            // at ERROR). Either way there is no fresh state to act on, so exit; the guard
+            // Drop removes the key so the repo is never locked out of a future task.
+            RequeueRefresh::Gone | RequeueRefresh::Failed => break,
         };
         let (_announce, r_withheld) = replication_withheld_set(
             r_rules.clone(),
