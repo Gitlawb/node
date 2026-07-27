@@ -31,9 +31,21 @@ pub struct AuthenticatedDid(pub String);
 /// hash cannot collide across DIDs.
 #[derive(Clone, Debug)]
 pub struct SignatureIdentity {
-    /// The signing DID, as it appeared in the `keyid` parameter.
+    /// The signing DID, as it appeared in the `keyid` parameter. Human-readable
+    /// and good for logs; NOT an identity key — see [`Self::key_fingerprint`].
     pub keyid: String,
+    /// Hex of the 32 resolved Ed25519 public key bytes: the canonical identity.
+    ///
+    /// `Did` stores the wire string verbatim while `to_verifying_key` resolves
+    /// it through `multibase::decode`, which accepts any multibase prefix. One
+    /// keypair therefore has many valid `did:key` spellings (`z6Mk…` base58btc,
+    /// `f…` base16, `m…` base64url, and more) that are all distinct strings and
+    /// all resolve to the same key. Anything counting per identity by string
+    /// equality hands that keypair a fresh budget per spelling, so per-identity
+    /// accounting keys on this instead.
+    pub key_fingerprint: String,
     /// The `nonce` parameter, absent on signatures from a pre-nonce signer.
+    /// Present but short is not the same as unique: see [`unique_nonce`].
     pub nonce: Option<String>,
     /// Hex SHA-256 of the reconstructed signing string: exactly 64 characters.
     pub signing_string_hash: String,
@@ -53,6 +65,7 @@ pub fn caller_authorized_to_push(record: &crate::db::RepoRecord, caller: &str) -
 
 use gitlawb_core::http_sig::{
     build_signing_string, compute_content_digest, HttpSignature, COVERED_COMPONENTS,
+    MAX_FUTURE_SKEW_SECS, MAX_SIGNATURE_AGE_SECS,
 };
 use gitlawb_core::identity::verify;
 
@@ -269,6 +282,7 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     // against) rather than any raw header is deliberate: see `SignatureIdentity`.
     request.extensions_mut().insert(SignatureIdentity {
         keyid: sig.key_id.to_string(),
+        key_fingerprint: hex::encode(verifying_key.to_bytes()),
         nonce: sig.nonce.clone(),
         signing_string_hash: hex::encode(Sha256::digest(signing_string.as_bytes())),
     });
@@ -406,23 +420,78 @@ pub async fn require_ucan_chain(
 /// computed from arrival rather than from `created`, which can only over-retain
 /// (an early arrival is charged the full 330s from when it landed), never
 /// under-retain.
-const SIGNATURE_LEDGER_TTL_SECS: i64 = 330;
+///
+/// 330 + [`CROSS_INSTANCE_SKEW_MARGIN_SECS`] = 390. The margin is not slack:
+/// single-node a flush 330 is exactly right (at `now = created + 300` the sweep
+/// predicate `expires_at < now` is false so the row survives, and at
+/// `created + 301` the signature is already too old), but the sweep runs on
+/// whichever instance's timer fires, using ITS clock. With instance B running
+/// `d` seconds ahead of A, a flush TTL has B delete the row at true time
+/// `created + 300 - d` while A still accepts the replay until `created + 300`,
+/// a replay window of exactly `d`. 60s covers the disagreement an NTP-synced
+/// fleet can actually reach.
+///
+/// Derived rather than written out so it cannot drift from the window it has to
+/// cover: widening either skew bound in `gitlawb-core` carries the TTL with it.
+const SIGNATURE_LEDGER_TTL_SECS: i64 =
+    MAX_SIGNATURE_AGE_SECS + MAX_FUTURE_SKEW_SECS + CROSS_INSTANCE_SKEW_MARGIN_SECS;
+
+/// Clock disagreement between two instances that the ledger TTL must absorb.
+const CROSS_INSTANCE_SKEW_MARGIN_SECS: i64 = 60;
+
+/// The shortest nonce this node will treat as a unique ledger key.
+///
+/// `HttpSignature::parse` maps the raw parameter, so `nonce=""` arrives as
+/// `Some("")` rather than `None`. Length is the only property a verifier can
+/// check (entropy is not observable), so it is the floor: 16 characters is 64
+/// bits even on the weakest plausible alphabet, hex at 4 bits per character. At
+/// the enforced ceiling of `MAX_LIVE_SIGNATURES_PER_KEYID` (512) live rows per
+/// identity, the birthday probability of an accidental collision within one
+/// identity is about `512^2 / 2^65`, roughly 1e-14.
+///
+/// Set below the 32 hex characters (128 bits) our own `sign_request` emits so
+/// the floor costs no upgrade churn, yet still admits a third-party client
+/// signing a 22-character base64 UUID or a 16-character hex draw.
+const MIN_NONCE_CHARS: usize = 16;
+
+/// The nonce, but only when it is long enough to stand in as a unique key.
+///
+/// Without this filter an empty nonce is `Some("")`, which both satisfies the
+/// staged `require a nonce` flag (whose stated purpose is that every client
+/// signs one) and puts [`ledger_key`] on its `(key, nonce)` arm with a value
+/// that is CONSTANT per identity: every mutation from that keypair would
+/// collapse onto one ledger key, so the first one in a retention window would
+/// succeed and every later one would be refused as a replay.
+fn unique_nonce(identity: &SignatureIdentity) -> Option<&str> {
+    identity
+        .nonce
+        .as_deref()
+        .filter(|nonce| nonce.chars().count() >= MIN_NONCE_CHARS)
+}
 
 /// The ledger key for a verified signature: always a 64-character hex SHA-256,
 /// which is what the `consumed_signatures` CHECK constraint requires.
 ///
 /// Two disjoint schemes, kept apart by a domain tag so a nonce key can never
 /// collide with a signing-string key:
-///   * with a nonce, `(keyid, nonce)` — short, fixed-width, and it lets two
-///     legitimately identical requests be told apart;
-///   * without one, the signing-string hash, which is canonical by construction
+///   * with a nonce of usable width, `(key_fingerprint, nonce)` — short,
+///     fixed-width, and it lets two legitimately identical requests be told
+///     apart;
+///   * otherwise the signing-string hash, which is canonical by construction
 ///     and collapses whitespace variants of the `Signature` header onto one key.
+///
+/// A too-short nonce takes the second arm rather than the first. That is the
+/// safe direction: the hash arm is unique by construction, so a client with a
+/// weak nonce loses only the ability to repeat byte-identical requests inside
+/// one second, whereas trusting the nonce would collapse its whole traffic onto
+/// one key. The fingerprint rather than `keyid` keeps the nonce arm on the
+/// resolved key, so two spellings of one DID cannot reuse a nonce.
 fn ledger_key(identity: &SignatureIdentity) -> String {
     let mut hasher = Sha256::new();
-    match identity.nonce.as_deref() {
+    match unique_nonce(identity) {
         Some(nonce) => {
             hasher.update(b"gitlawb/sig-nonce\x00");
-            hasher.update(identity.keyid.as_bytes());
+            hasher.update(identity.key_fingerprint.as_bytes());
             hasher.update(b"\x00");
             hasher.update(nonce.as_bytes());
         }
@@ -489,20 +558,55 @@ pub async fn consume_signature(
     // the signing-string fallback here. This runs after the method skip above,
     // so it never reaches a signed read, and before the ledger is charged, so a
     // refused request spends nothing.
-    if state.config.require_signature_nonce && identity.nonce.is_none() {
-        tracing::warn!(did = %identity.keyid, "rejected a nonce-less signature: a nonce is required");
-        return ledger_rejection(
-            StatusCode::BAD_REQUEST,
-            "signature_nonce_required",
-            "this node requires a `nonce` parameter in Signature-Input — upgrade your client",
-        );
+    if state.config.require_signature_nonce && unique_nonce(&identity).is_none() {
+        // A present-but-short nonce gets its own code. It is a different
+        // client bug from a pre-nonce signer (the client already emits the
+        // parameter, it just does not fill it), and the two need different
+        // instructions.
+        return match identity.nonce {
+            None => {
+                tracing::warn!(did = %identity.keyid, "rejected a nonce-less signature: a nonce is required");
+                ledger_rejection(
+                    StatusCode::BAD_REQUEST,
+                    "signature_nonce_required",
+                    "this node requires a `nonce` parameter in Signature-Input — upgrade your client",
+                )
+            }
+            Some(nonce) => {
+                tracing::warn!(
+                    did = %identity.keyid,
+                    len = nonce.chars().count(),
+                    "rejected a signature whose nonce is too short to be unique",
+                );
+                ledger_rejection(
+                    StatusCode::BAD_REQUEST,
+                    "signature_nonce_too_short",
+                    &format!(
+                        "the `nonce` parameter in Signature-Input must be at least \
+                         {MIN_NONCE_CHARS} characters drawn from a CSPRNG — \
+                         `gl` signs 32 hex characters",
+                    ),
+                )
+            }
+        };
     }
 
     let key = ledger_key(&identity);
     let now = chrono::Utc::now().timestamp();
+    // Charge the cap against the RESOLVED key, never the wire DID: see
+    // `SignatureIdentity::key_fingerprint`. This does not weaken single-use,
+    // which never depended on the identity column — a replay has to reproduce
+    // the signed bytes, and `keyid` sits inside `@signature-params`, so
+    // re-spelling the DID changes the signing string and needs a fresh
+    // signature. It fixes the per-identity cap only.
     match state
         .db
-        .consume_signature(&key, &identity.keyid, now, now + SIGNATURE_LEDGER_TTL_SECS)
+        .consume_signature(
+            &key,
+            &identity.key_fingerprint,
+            now,
+            now + SIGNATURE_LEDGER_TTL_SECS,
+        )
         .await
     {
         Ok(crate::db::ConsumeSignature::Inserted) => next.run(request).await,
@@ -694,6 +798,30 @@ mod tests {
             signed_write_rate_limiter: RateLimiter::new(600, Duration::from_secs(3600)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
         }
+    }
+
+    /// The ledger TTL must keep a spent signature past the last instant any
+    /// instance would still accept it, INCLUDING one whose clock disagrees.
+    /// The sweep runs on whichever instance's timer fires, using its own clock,
+    /// so a TTL flush against the acceptance window lets an instance running
+    /// ahead delete a row that a lagging instance would still honour.
+    #[test]
+    fn ledger_ttl_keeps_a_margin_over_the_acceptance_window() {
+        // For one fixed signature the arrival window is
+        // `[created - MAX_FUTURE_SKEW_SECS, created + MAX_SIGNATURE_AGE_SECS]`.
+        let arrival_window = MAX_SIGNATURE_AGE_SECS + MAX_FUTURE_SKEW_SECS;
+        assert_eq!(arrival_window, 330, "the window this TTL is derived from");
+
+        // The floor is written out rather than read from
+        // `CROSS_INSTANCE_SKEW_MARGIN_SECS`, so zeroing that constant is caught
+        // here instead of quietly satisfying the comparison against itself.
+        let margin = SIGNATURE_LEDGER_TTL_SECS - arrival_window;
+        assert!(
+            margin >= 60,
+            "TTL {SIGNATURE_LEDGER_TTL_SECS}s leaves {margin}s over a {arrival_window}s \
+             arrival window, under the 60s skew budget: an instance running ahead \
+             would sweep a row still accepted elsewhere"
+        );
     }
 
     #[tokio::test]

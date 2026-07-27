@@ -918,7 +918,10 @@ const MIGRATIONS: &[Migration] = &[
             // fixed width at the schema level so a caller cannot store
             // something else by accident.
             // `keyid` backs the per-identity live-row cap
-            // (`MAX_LIVE_SIGNATURES_PER_KEYID`); `expires_at` is the
+            // (`MAX_LIVE_SIGNATURES_PER_KEYID`). Despite the column name it
+            // holds the hex of the RESOLVED public key, not the wire DID: the
+            // cap compares by string equality and one keypair has many valid
+            // multibase spellings. `expires_at` is the
             // unix-seconds instant after which the signature can no longer be
             // accepted, used by the sweep.
             r#"CREATE TABLE IF NOT EXISTS consumed_signatures (
@@ -966,7 +969,7 @@ pub enum ConsumeSignature {
     Inserted,
     /// The signature was already spent. Reject as a replay.
     Replayed,
-    /// This `keyid` already holds `MAX_LIVE_SIGNATURES_PER_KEYID` live rows.
+    /// This identity already holds `MAX_LIVE_SIGNATURES_PER_KEYID` live rows.
     /// The signature was NOT recorded.
     IdentityLedgerFull,
 }
@@ -979,10 +982,23 @@ pub enum ConsumeSignature {
 /// identity would otherwise allocate rows without bound. Hashing the key bounds
 /// bytes per row; only this bounds row count.
 ///
-/// 512 over the 330s retention window is ~1.5 sustained requests per second
+/// 512 over the 390s retention window is ~1.3 sustained requests per second
 /// from one identity, an order of magnitude above any real client (a push plus
-/// its API calls is tens of requests), while capping one identity's worst case
-/// at roughly 512 rows of ~100 bytes.
+/// its API calls is tens of requests).
+///
+/// The cap counts LIVE rows (`expires_at >= now`), and the sweep runs on an
+/// independent 300s tick (`main.rs`), so expired-but-unswept rows sit in the
+/// table uncounted. On-disk peak is therefore about double the cap, not equal
+/// to it: at the sustained ceiling an identity retires 512/390 rows per second,
+/// so up to `512 * 300 / 390` ≈ 394 expired rows accumulate between sweeps, for
+/// a peak near 906 and a hard bound of 1024 (one sweep period is shorter than
+/// the TTL, so at most one cap's worth can be pending deletion).
+///
+/// Measured against Postgres at 1M rows, laid out the way the cap produces them
+/// (64-hex `sig_hash`, 64-hex identity, 512 rows per identity): heap 166 MB, PK
+/// index 119 MB, expires index 21 MB, identity+expires index 101 MB, total 407
+/// MB — about 430 bytes per row including indexes. One identity's worst case is
+/// thus ~1024 rows, roughly 440 KB.
 pub const MAX_LIVE_SIGNATURES_PER_KEYID: i64 = 512;
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1444,10 +1460,23 @@ impl Db {
     }
 
     /// Atomically consume an HTTP message signature. `sig_hash` is the
-    /// fixed-width hex SHA-256 digest of the canonical signature key, `keyid`
-    /// the signing identity it is charged against, `now` the arrival instant in
-    /// unix seconds, and `expires_at` the instant after which the signature can
-    /// no longer be accepted (so the row can be swept).
+    /// fixed-width hex SHA-256 digest of the canonical signature key,
+    /// `identity` the signing identity the per-identity cap is charged against,
+    /// `now` the arrival instant in unix seconds, and `expires_at` the instant
+    /// after which the signature can no longer be accepted (so the row can be
+    /// swept).
+    ///
+    /// `identity` must be a canonical form of the resolved public key, never
+    /// the wire DID: the cap compares by string equality, and one keypair has
+    /// many valid `did:key` spellings. The column keeps its historical `keyid`
+    /// name (renaming it would need a new migration for no behavioral gain).
+    ///
+    /// A `sig_hash` of any width other than 64 violates the table's CHECK
+    /// constraint and comes back as a query `Err`, which `consume_signature`
+    /// (`auth/mod.rs`) reports as 503 `signature_ledger_unavailable` — so a
+    /// caller that ever passes one would send an operator chasing a phantom
+    /// database outage. Unreachable today: both `ledger_key` arms return a hex
+    /// SHA-256.
     ///
     /// One statement does the whole decision. The `INSERT ... ON CONFLICT DO
     /// NOTHING` is what makes the check atomic: two concurrent replays of the
@@ -1456,7 +1485,7 @@ impl Db {
     pub async fn consume_signature(
         &self,
         sig_hash: &str,
-        keyid: &str,
+        identity: &str,
         now: i64,
         expires_at: i64,
     ) -> Result<ConsumeSignature> {
@@ -1474,7 +1503,7 @@ impl Db {
                       (SELECT n FROM live)       AS live_count"#,
         )
         .bind(sig_hash)
-        .bind(keyid)
+        .bind(identity)
         .bind(expires_at)
         .bind(now)
         .bind(MAX_LIVE_SIGNATURES_PER_KEYID)

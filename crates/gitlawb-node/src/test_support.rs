@@ -5300,7 +5300,20 @@ mod tests {
             created: i64,
             extra_params: &str,
         ) -> (String, String, String) {
-            let did = kp.did().to_string();
+            sign_with_keyid(kp, &kp.did().to_string(), body, created, extra_params)
+        }
+
+        /// [`sign_with`] with an explicit `keyid` spelling, so a test can sign
+        /// under a non-default multibase encoding of the same public key. The
+        /// keyid lands in `@signature-params` and is therefore signed over, so
+        /// the two spellings produce different signing strings.
+        fn sign_with_keyid(
+            kp: &Keypair,
+            did: &str,
+            body: &[u8],
+            created: i64,
+            extra_params: &str,
+        ) -> (String, String, String) {
             let signature_input = format!(
                 r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created={created}{extra_params}"#
             );
@@ -5426,11 +5439,22 @@ mod tests {
             let created = chrono::Utc::now().timestamp() + 250;
             let (signature, signature_input, content_digest) = sign_with(&kp, &body, created, "");
 
-            let code = send(&state, &signature, &signature_input, &content_digest, &body).await;
-            assert_ne!(
-                code,
-                StatusCode::CREATED,
-                "a signature dated 250s in the future must be rejected"
+            // Assert the exact rejection, not merely "not 201": a status-class
+            // assertion stays green for a 503 from an unreachable ledger, a
+            // digest mismatch, or a 500, none of which are the forward-bound
+            // check this test exists for. `check_created` failing is a 400
+            // carrying `clock_skew` (`auth/mod.rs`).
+            let resp =
+                send_full(&state, &signature, &signature_input, &content_digest, &body).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "a signature dated 250s in the future must be rejected by the clock check"
+            );
+            assert_eq!(
+                error_code(resp).await,
+                "clock_skew",
+                "the denial must come from `check_created`, not a later layer"
             );
         }
 
@@ -5933,6 +5957,10 @@ mod tests {
         /// U6 scenario 9: the per-identity cap surfaces as a retryable 429 with its
         /// own code, not as a replay. Seeded straight through SQL so the test does
         /// not have to sign 512 requests.
+        ///
+        /// The seed is keyed on the resolved public key, which is what the ledger
+        /// charges against; see `the_identity_cap_is_keyed_on_the_resolved_key`
+        /// for why the wire DID is not an identity.
         #[sqlx::test]
         async fn ledger_full_surfaces_as_too_many_requests(pool: PgPool) {
             let kp = Keypair::generate();
@@ -5944,7 +5972,7 @@ mod tests {
                  SELECT md5(i::text) || md5((i + 1)::text), $1, $2
                  FROM generate_series(1, $3) AS i",
             )
-            .bind(&did)
+            .bind(key_fingerprint(&kp))
             .bind(9_000_000_000i64)
             .bind(crate::db::MAX_LIVE_SIGNATURES_PER_KEYID)
             .execute(&pool)
@@ -6273,6 +6301,242 @@ mod tests {
                 0,
                 "a read must still write no ledger row"
             );
+        }
+
+        // ── A nonce only counts when it carries entropy ──────────────────────
+        //
+        // `HttpSignature::parse` maps the raw parameter, so `nonce=""` is
+        // `Some("")`, not `None`. Left alone that satisfies a flag whose whole
+        // point is "every client signs a nonce", and it puts `ledger_key` on
+        // the `(keyid, nonce)` arm with a CONSTANT nonce, collapsing every
+        // request from that identity onto one key.
+
+        /// A task body with a caller-chosen `kind`, so two requests can differ
+        /// in their signed bytes and nothing else.
+        fn task_body_kind(delegator: &str, kind: &str) -> Vec<u8> {
+            serde_json::to_vec(&serde_json::json!({
+                "kind": kind,
+                "capability": "repo:write",
+                "delegator_did": delegator,
+            }))
+            .expect("serialize task body")
+        }
+
+        /// With the flag on, a nonce that is present but too short to be unique
+        /// is refused by its own code, before the ledger is charged.
+        #[sqlx::test]
+        async fn short_nonces_are_rejected_when_the_flag_is_on(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = with_nonce_required(&test_state(pool.clone()).await, true);
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp();
+
+            for nonce in ["", "0123abcd"] {
+                let (sig, input, digest) =
+                    sign_with(&kp, &body, created, &format!(r#";nonce="{nonce}""#));
+                let resp = send_full(&state, &sig, &input, &digest, &body).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "nonce={nonce:?} is too short to be a unique key"
+                );
+                assert_eq!(
+                    resp.headers()
+                        .get("x-gitlawb-error")
+                        .and_then(|v| v.to_str().ok()),
+                    Some("signature_nonce_too_short"),
+                    "nonce={nonce:?} must be told apart from a nonce-less signer by header"
+                );
+                assert_eq!(error_code(resp).await, "signature_nonce_too_short");
+            }
+
+            assert_eq!(
+                ledger_rows(&pool).await,
+                0,
+                "a refused request must spend nothing"
+            );
+        }
+
+        /// The must-not side of the check above: a real 32-hex nonce, the width
+        /// `sign_request` emits, is still served with the flag on.
+        #[sqlx::test]
+        async fn a_full_width_nonce_is_accepted_when_the_flag_is_on(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = with_nonce_required(&test_state(pool.clone()).await, true);
+            let body = task_body(&did);
+            let created = chrono::Utc::now().timestamp();
+            let (sig, input, digest) = sign_with(
+                &kp,
+                &body,
+                created,
+                r#";nonce="0123456789abcdef0123456789abcdef""#,
+            );
+
+            assert_eq!(
+                send(&state, &sig, &input, &digest, &body).await,
+                StatusCode::CREATED,
+                "a 32-hex nonce is exactly what `sign_request` emits"
+            );
+            assert_eq!(ledger_rows(&pool).await, 1);
+        }
+
+        /// With the flag OFF a short nonce must not be TRUSTED as a unique key:
+        /// it has to fall back to the signing-string-hash arm. Proven by
+        /// execution rather than by inspecting the key — two requests from one
+        /// identity that differ only in their body, both carrying `nonce=""`,
+        /// must BOTH be admitted. On the nonce arm they would share one key and
+        /// the second would be a false replay.
+        #[sqlx::test]
+        async fn an_empty_nonce_falls_back_to_the_hash_arm_when_the_flag_is_off(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did = kp.did().to_string();
+            let state = with_nonce_required(&test_state(pool.clone()).await, false);
+            let created = chrono::Utc::now().timestamp();
+
+            for kind in ["review", "build"] {
+                let body = task_body_kind(&did, kind);
+                let (sig, input, digest) = sign_with(&kp, &body, created, r#";nonce="""#);
+                let resp = send_full(&state, &sig, &input, &digest, &body).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::CREATED,
+                    "kind={kind:?} is a distinct signed request, not a replay"
+                );
+            }
+
+            assert_eq!(
+                ledger_rows(&pool).await,
+                2,
+                "an empty nonce must not collapse two distinct requests onto one key"
+            );
+        }
+
+        // ── The per-identity cap is keyed on the RESOLVED key ────────────────
+        //
+        // `Did` keeps the wire string verbatim while `to_verifying_key` resolves
+        // it through `multibase::decode`, which accepts any multibase prefix. So
+        // one keypair has many valid DID spellings that all resolve to the same
+        // VerifyingKey but compare unequal as strings. A cap counting
+        // `WHERE keyid = $2` by string equality hands that keypair a fresh 512-row
+        // budget per spelling.
+
+        /// The base16 (`f`) multibase spelling of the same `did:key`, built by
+        /// hand so this test does not depend on how `Did` chooses to encode.
+        /// `multibase::decode` accepts it, so `to_verifying_key` resolves it to
+        /// the identical key.
+        fn did_key_base16(kp: &Keypair) -> String {
+            let mut prefixed = vec![0xed, 0x01];
+            prefixed.extend_from_slice(&kp.verifying_key().to_bytes());
+            format!("did:key:f{}", hex::encode(prefixed))
+        }
+
+        /// The identity the ledger must charge against: the resolved public key,
+        /// not the spelling it arrived in.
+        fn key_fingerprint(kp: &Keypair) -> String {
+            hex::encode(kp.verifying_key().to_bytes())
+        }
+
+        #[sqlx::test]
+        async fn the_identity_cap_is_keyed_on_the_resolved_key(pool: PgPool) {
+            use gitlawb_core::did::Did;
+
+            let kp = Keypair::generate();
+            let did_a = kp.did().to_string();
+            let did_b = did_key_base16(&kp);
+
+            // The premise: two distinct strings, one key.
+            assert_ne!(did_a, did_b, "the two spellings must differ as strings");
+            let vk_a = did_a
+                .parse::<Did>()
+                .expect("base58btc did parses")
+                .to_verifying_key()
+                .expect("base58btc did resolves");
+            let vk_b = did_b
+                .parse::<Did>()
+                .expect("base16 did parses")
+                .to_verifying_key()
+                .expect("base16 did resolves");
+            assert_eq!(
+                vk_a.to_bytes(),
+                vk_b.to_bytes(),
+                "both spellings must resolve to the same VerifyingKey"
+            );
+
+            let state = test_state(pool.clone()).await;
+
+            // Fill this KEY's budget, charged the way the ledger must charge it.
+            sqlx::query(
+                "INSERT INTO consumed_signatures (sig_hash, keyid, expires_at)
+                 SELECT md5(i::text) || md5((i + 1)::text), $1, $2
+                 FROM generate_series(1, $3) AS i",
+            )
+            .bind(key_fingerprint(&kp))
+            .bind(9_000_000_000i64)
+            .bind(crate::db::MAX_LIVE_SIGNATURES_PER_KEYID)
+            .execute(&pool)
+            .await
+            .expect("seed a full ledger for this key");
+
+            // A request under the OTHER spelling must land inside the same
+            // budget. Keyed on the wire string it would find an empty one.
+            let body = task_body_kind(&did_b, "review");
+            let created = chrono::Utc::now().timestamp();
+            let (sig, input, digest) = sign_with_keyid(
+                &kp,
+                &did_b,
+                &body,
+                created,
+                r#";nonce="0123456789abcdef0123456789abcdef""#,
+            );
+            let resp = send_full(&state, &sig, &input, &digest, &body).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "re-encoding the DID must not mint a fresh 512-row budget"
+            );
+            assert_eq!(error_code(resp).await, "signature_ledger_full");
+        }
+
+        /// The must-not side: keying the CAP on the resolved key must not make
+        /// two different spellings interchangeable for single-use. A replay is
+        /// still a replay, and a genuinely different signed request under the
+        /// other spelling is still admitted.
+        #[sqlx::test]
+        async fn re_encoding_the_did_neither_defeats_nor_forges_single_use(pool: PgPool) {
+            let kp = Keypair::generate();
+            let did_a = kp.did().to_string();
+            let did_b = did_key_base16(&kp);
+            let state = test_state(pool.clone()).await;
+            let created = chrono::Utc::now().timestamp();
+
+            let body_a = task_body_kind(&did_a, "review");
+            let (sig_a, input_a, digest_a) = sign_with_keyid(&kp, &did_a, &body_a, created, "");
+            assert_eq!(
+                send(&state, &sig_a, &input_a, &digest_a, &body_a).await,
+                StatusCode::CREATED
+            );
+            let replay = send_full(&state, &sig_a, &input_a, &digest_a, &body_a).await;
+            assert_eq!(
+                replay.status(),
+                StatusCode::CONFLICT,
+                "the identical bytes are still a replay"
+            );
+            assert_eq!(error_code(replay).await, "signature_replayed");
+
+            // A replay cannot re-spell the DID: the keyid is inside
+            // `@signature-params` and therefore signed over, so the other
+            // spelling is a different signing string and needs its own
+            // signature. That request is legitimate and must be served.
+            let body_b = task_body_kind(&did_b, "review");
+            let (sig_b, input_b, digest_b) = sign_with_keyid(&kp, &did_b, &body_b, created, "");
+            assert_eq!(
+                send(&state, &sig_b, &input_b, &digest_b, &body_b).await,
+                StatusCode::CREATED,
+                "a distinct, genuinely signed request must not be refused as a replay"
+            );
+            assert_eq!(ledger_rows(&pool).await, 2);
         }
 
         // ── The per-IP brake in front of the signed write routes ─────────────
