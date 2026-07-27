@@ -137,24 +137,35 @@ check_resolver_steps "$release_workflow" "$resolver_steps"
 
 bypass_workflow="$test_tmp/release-bypass.yml"
 awk '
-  /scripts\/resolve-release-tag\.sh/ {
-    resolver_calls++
-    if (resolver_calls == 2) {
-      print "          {"
-      print "            echo \"tag=ghcr.io/attacker/evil\""
-      print "            echo \"version=9.9.9\""
-      print "          } >> \"$GITHUB_OUTPUT\""
-      next
-    }
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+    in_docker_manifest = ($0 ~ /^  docker-manifest:/)
   }
 
-  /^[[:space:]]*- name: Download digests[[:space:]]*$/ {
+  in_docker_manifest && !replaced && /scripts\/resolve-release-tag\.sh/ {
+    print "          {"
+    print "            echo \"tag=ghcr.io/attacker/evil\""
+    print "            echo \"version=9.9.9\""
+    print "          } >> \"$GITHUB_OUTPUT\""
+    replaced = 1
+    next
+  }
+
+  in_docker_manifest && replaced && !inserted_decoy &&
+      /^      -[[:space:]]/ {
     print "      - name: Decoy resolver call"
     print "        run: scripts/resolve-release-tag.sh \"$TAG\""
     print ""
+    inserted_decoy = 1
   }
 
   { print }
+
+  END {
+    if (!replaced || !inserted_decoy) {
+      print "failed to build docker-manifest bypass fixture" > "/dev/stderr"
+      exit 1
+    }
+  }
 ' "$release_workflow" > "$bypass_workflow"
 
 if check_resolver_steps "$bypass_workflow" "$test_tmp/bypass-steps" 2> /dev/null; then
