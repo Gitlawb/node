@@ -3523,11 +3523,17 @@ mod tests {
     async fn record_pinata_cid_stores_and_coalesces_provenance(pool: PgPool) {
         let state = test_state(pool).await;
 
+        // Real raw-CIDv1 resolver keys, as the pin paths write them: `list_pinned_cids`
+        // withholds any row keyed on a non-raw (legacy provider) value (U4, #173), so a
+        // placeholder string here would be filtered out and make the assertions vacuous.
+        let raw1 = gitlawb_core::cid::Cid::from_git_object_bytes(b"pinata raw 1").to_string();
+        let local2 = gitlawb_core::cid::Cid::from_git_object_bytes(b"local raw 2").to_string();
+
         // A new row created via the pinata path carries provenance, and stores the
         // raw CID in `cid` with the provider CID in `pinata_cid`.
         state
             .db
-            .record_pinata_cid("po1", "rawcid1", "pcid1", Some("repoA"))
+            .record_pinata_cid("po1", &raw1, "pcid1", Some("repoA"))
             .await
             .unwrap();
         assert_eq!(
@@ -3542,7 +3548,7 @@ mod tests {
             .into_iter()
             .find(|r| r.sha256_hex == "po1")
             .expect("po1 row exists");
-        assert_eq!(po1.cid, "rawcid1", "resolver-key cid is the raw CID");
+        assert_eq!(po1.cid, raw1, "resolver-key cid is the raw CID");
         assert_eq!(
             po1.pinata_cid.as_deref(),
             Some("pcid1"),
@@ -3553,7 +3559,7 @@ mod tests {
         // prior local pin's `cid` is left untouched (not overwritten by the raw arg).
         state
             .db
-            .record_pinned_cid("po2", "localcid2", None)
+            .record_pinned_cid("po2", &local2, None)
             .await
             .unwrap();
         state
@@ -3575,7 +3581,7 @@ mod tests {
             .find(|r| r.sha256_hex == "po2")
             .expect("po2 row exists");
         assert_eq!(
-            po2.cid, "localcid2",
+            po2.cid, local2,
             "on conflict the prior local pin's cid is left untouched"
         );
 
@@ -4270,6 +4276,630 @@ mod tests {
             stashed.as_deref(),
             Some("QmProviderLegacy"),
             "the v14 legacy_provider_cid column is present after upgrade"
+        );
+    }
+
+    // ---- #173 U4: legacy provider-CID migration sweep ----
+
+    /// Seed a legacy PROVIDER-CID `pinned_cids` row for `oid` (the pre-branch shape:
+    /// `cid` holds the Kubo dag-pb / Pinata key, not the raw-content resolver key).
+    /// Returns `(raw_cid, provider_cid)`. Raw SQL because every production helper
+    /// stores the already-correct raw key.
+    async fn seed_legacy_pin(
+        pool: &PgPool,
+        bare: &std::path::Path,
+        oid: &str,
+        repo_id: Option<&str>,
+    ) -> (String, String) {
+        let (_ty, bytes) = crate::git::store::read_object(bare, oid)
+            .expect("read object bytes")
+            .expect("object exists in the bare repo");
+        let raw = gitlawb_core::cid::Cid::from_git_object_bytes(&bytes).to_string();
+        let provider = legacy_dagpb_cid(&raw);
+        assert_ne!(provider, raw, "the legacy key differs from the raw key");
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(oid)
+        .bind(&provider)
+        .bind("2020-01-01T00:00:00Z")
+        .bind(repo_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        (raw, provider)
+    }
+
+    /// The `pinned_cids.cid` currently stored for an oid, unfiltered (unlike
+    /// `list_pinned_cids`, which withholds unrepaired legacy rows).
+    async fn stored_pin(pool: &PgPool, oid: &str) -> (String, Option<String>) {
+        sqlx::query_as("SELECT cid, legacy_provider_cid FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(oid)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// U4 (#173, INV-7 upgrade path): a node already at the prior-max schema (v15) gets
+    /// the `pin_repair_sweep` cursor table from the NEW v16 migration. Simulate the
+    /// pre-v16 node by dropping the table and un-applying v16, then re-migrate and
+    /// assert the cursor round-trips. RED before the v16 migration exists (the table is
+    /// never recreated, so the cursor read errors).
+    #[sqlx::test]
+    async fn pin_repair_sweep_cursor_upgrade_path(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+
+        // Pre-v16 shape: drop the table and forget v16 was applied.
+        sqlx::query("DROP TABLE IF EXISTS pin_repair_sweep")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 16")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        state.db.run_migrations().await.expect("migrate to v16");
+
+        // Absent row reads as the "never swept" start, and a write round-trips.
+        assert_eq!(
+            state.db.pin_repair_cursor().await.unwrap(),
+            "",
+            "a node that has never swept starts at the beginning of the table"
+        );
+        state.db.set_pin_repair_cursor("abc").await.unwrap();
+        state.db.set_pin_repair_cursor("def").await.unwrap();
+        assert_eq!(
+            state.db.pin_repair_cursor().await.unwrap(),
+            "def",
+            "the v16 cursor table persists the walk position across writes"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM pin_repair_sweep")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "the cursor is a single row, not an append log");
+    }
+
+    /// U4 scenario 1 (#173): a legacy provider-CID row with intact object bytes is
+    /// repaired to the raw-content resolver key by the SWEEP alone, with the old value
+    /// stashed in `legacy_provider_cid`. No push, no re-pin: this is the whole point of
+    /// U4, because normal git negotiation omits objects the node already has, so the
+    /// skip-branch repair's re-push trigger generally never fires on an upgraded node.
+    /// RED before the sweep is implemented (the row keeps its provider key).
+    #[sqlx::test]
+    async fn sweep_repairs_legacy_row_without_a_push(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["swsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("swsrc.git");
+        let repo = seed_repo(&owner_did, "swsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let (raw_cid, provider_cid) =
+            seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        let stats = crate::ipfs_pin::sweep_legacy_provider_cids(
+            std::path::Path::new("/tmp"),
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            16,
+            std::time::Duration::ZERO,
+            &state.db,
+        )
+        .await;
+        assert_eq!(stats.repaired, 1, "the sweep repairs the one legacy row");
+
+        let (stored, stashed) = stored_pin(&pool, &fx.public_oid).await;
+        assert_eq!(
+            stored, raw_cid,
+            "the key is rewritten to the raw-content CID"
+        );
+        assert_eq!(
+            stashed.as_deref(),
+            Some(provider_cid.as_str()),
+            "the old provider CID is stashed in legacy_provider_cid"
+        );
+
+        // End to end: the repaired key is now advertised AND serves.
+        assert!(
+            state
+                .db
+                .list_pinned_cids()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.cid == raw_cid),
+            "the repaired row is advertised"
+        );
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon(&raw_cid))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "the repaired raw key serves");
+        assert!(body.contains("public bytes"), "the object's bytes serve");
+    }
+
+    /// U4 scenario 2 (#173): a legacy row whose object bytes are gone is left exactly
+    /// as it is by the sweep: never rewritten, never deleted. The row stays withheld
+    /// until the bytes come back, which is the non-destructive contract the skip-branch
+    /// repair already holds.
+    #[sqlx::test]
+    async fn sweep_leaves_a_bytes_gone_row_untouched(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let _fx = seed_cid_repos(&slug, &short, &["gonesrc"]);
+        let repo = seed_repo(&owner_did, "gonesrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // An oid whose bytes are NOT in the repo, but whose provenance resolves fine.
+        let phantom_oid = "d".repeat(64);
+        let raw_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"bytes that live nowhere").to_string();
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&phantom_oid)
+        .bind(&provider_cid)
+        .bind("2020-01-01T00:00:00Z")
+        .bind(&repo.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let stats = crate::ipfs_pin::sweep_legacy_provider_cids(
+            std::path::Path::new("/tmp"),
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            16,
+            std::time::Duration::ZERO,
+            &state.db,
+        )
+        .await;
+        assert_eq!(stats.repaired, 0, "an unrepairable row is not repaired");
+
+        let (stored, stashed) = stored_pin(&pool, &phantom_oid).await;
+        assert_eq!(
+            stored, provider_cid,
+            "the bytes-gone row keeps its provider CID (no destructive rewrite)"
+        );
+        assert_eq!(stashed, None, "nothing is stashed when the bytes are gone");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM pinned_cids")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "the row is not deleted");
+    }
+
+    /// U4 scenario 3 (#173): the sweep inherits `repair_legacy_provider_cid`'s cost
+    /// gate, so a row already keyed on a raw CIDv1 is NEVER read for bytes. The
+    /// test-only `legacy_repair_reads` counter is the both-ways guard: dropping the
+    /// codec gate reads the raw row and trips it off zero.
+    #[sqlx::test]
+    async fn sweep_never_reads_bytes_for_a_raw_cidv1_row(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["rawsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("rawsrc.git");
+        let repo = seed_repo(&owner_did, "rawsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let raw_cid = pin_cid_for_repo(&bare, &fx.public_oid, &state.db, &repo.id).await;
+        assert!(
+            gitlawb_core::cid::is_raw_cidv1(&raw_cid),
+            "the seeded row is already the canonical resolver key"
+        );
+
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let stats = crate::ipfs_pin::sweep_legacy_provider_cids(
+            std::path::Path::new("/tmp"),
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            16,
+            std::time::Duration::ZERO,
+            &state.db,
+        )
+        .await;
+        assert_eq!(stats.scanned, 1, "the sweep walked the row");
+        assert_eq!(stats.repaired, 0, "a raw row needs no repair");
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "a raw-CIDv1 row is never read for bytes (cost gate)"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the raw row is left as-is"
+        );
+    }
+
+    /// U4 scenario 4 (#173, BOUND): one pass reads at most `batch` rows, so it repairs
+    /// at most `batch` of them. The exact count is asserted, so raising or removing the
+    /// bound fails. This is what keeps the sweep from monopolizing the DB on a node
+    /// with a large `pinned_cids` table.
+    #[sqlx::test]
+    async fn sweep_one_pass_is_bounded_by_the_batch_size(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["batchsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("batchsrc.git");
+        let repo = seed_repo(&owner_did, "batchsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // Five legacy rows, batch of two.
+        for oid in [
+            &fx.public_oid,
+            &fx.secret_oid,
+            &fx.public_tree_oid,
+            &fx.secret_tree_oid,
+            &fx.commit_oid,
+        ] {
+            seed_legacy_pin(&pool, &bare, oid, Some(&repo.id)).await;
+        }
+
+        let stats = crate::ipfs_pin::sweep_legacy_provider_cids_once(
+            std::path::Path::new("/tmp"),
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            2,
+            &state.db,
+        )
+        .await
+        .expect("one pass runs");
+        assert_eq!(stats.scanned, 2, "one pass reads exactly the batch size");
+        assert_eq!(stats.repaired, 2, "one pass repairs at most the batch size");
+
+        let repaired: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pinned_cids WHERE legacy_provider_cid IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired, 2, "exactly two of the five rows were rewritten");
+    }
+
+    /// U4 scenario 5 (#173, RESUMPTION): the walk cursor persists, so a sweep
+    /// interrupted mid-table continues from where it stopped instead of restarting.
+    /// Two bounded passes are driven by hand (the restart), and the second pass is
+    /// asserted to repair the NEXT two rows in cursor order, not the first two again.
+    /// The read counter proves the already-repaired rows are not re-read.
+    #[sqlx::test]
+    async fn sweep_resumes_from_the_persisted_cursor(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["resumesrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("resumesrc.git");
+        let repo = seed_repo(&owner_did, "resumesrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        let mut oids = vec![
+            fx.public_oid.clone(),
+            fx.secret_oid.clone(),
+            fx.public_tree_oid.clone(),
+            fx.secret_tree_oid.clone(),
+        ];
+        for oid in &oids {
+            seed_legacy_pin(&pool, &bare, oid, Some(&repo.id)).await;
+        }
+        // The cursor is an ordered walk over the `pinned_cids` primary key.
+        oids.sort();
+
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+        let pass1 = crate::ipfs_pin::sweep_legacy_provider_cids_once(
+            std::path::Path::new("/tmp"),
+            &state.git_bin,
+            git_timeout,
+            2,
+            &state.db,
+        )
+        .await
+        .expect("pass 1 runs");
+        assert_eq!(pass1.repaired, 2, "pass 1 repairs the first two rows");
+
+        // The restart: a second pass over the SAME state must continue, not rewind.
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let pass2 = crate::ipfs_pin::sweep_legacy_provider_cids_once(
+            std::path::Path::new("/tmp"),
+            &state.git_bin,
+            git_timeout,
+            2,
+            &state.db,
+        )
+        .await
+        .expect("pass 2 runs");
+        assert_eq!(pass2.repaired, 2, "pass 2 repairs the NEXT two rows");
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            2,
+            "pass 2 reads bytes only for the two rows it repaired; the already-repaired \
+             rows are not re-read"
+        );
+        for oid in &oids {
+            let (_cid, stashed) = stored_pin(&pool, oid).await;
+            assert!(
+                stashed.is_some(),
+                "every row is repaired after two resumed passes"
+            );
+        }
+    }
+
+    /// U4 scenario 7 (#173, cursor liveness): a row that cannot be repaired (NULL
+    /// provenance, or a provenance whose repo row is gone) is skipped AND the cursor
+    /// still advances past it. With `batch = 1` the two unrepairable rows sort first,
+    /// so a cursor that failed to advance would re-read the same row forever and never
+    /// reach the repairable row behind them. The outer timeout turns that into a
+    /// FAILURE rather than a hung suite.
+    #[sqlx::test]
+    async fn sweep_advances_past_unrepairable_rows(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["skipsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("skipsrc.git");
+        let repo = seed_repo(&owner_did, "skipsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+
+        // Two blockers that sort ahead of any real 64-hex oid: one with NULL
+        // provenance, one naming a repo row that no longer exists.
+        let null_prov_oid = "0".repeat(64);
+        let ghost_repo_oid = format!("{}1", "0".repeat(63));
+        seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+        for (oid, prov) in [
+            (&null_prov_oid, None),
+            (&ghost_repo_oid, Some("repo-that-is-gone")),
+        ] {
+            let raw = gitlawb_core::cid::Cid::from_git_object_bytes(oid.as_bytes()).to_string();
+            sqlx::query(
+                "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+            )
+            .bind(oid)
+            .bind(legacy_dagpb_cid(&raw))
+            .bind("2020-01-01T00:00:00Z")
+            .bind(prov)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert!(
+            null_prov_oid < fx.public_oid && ghost_repo_oid < fx.public_oid,
+            "the blockers really do sort ahead of the repairable row"
+        );
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                1,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates instead of looping on an unrepairable row");
+
+        assert_eq!(
+            stats.repaired, 1,
+            "the sweep advanced past both blockers and repaired the row behind them"
+        );
+        assert!(
+            stored_pin(&pool, &fx.public_oid).await.1.is_some(),
+            "the row behind the blockers is the one that got repaired"
+        );
+        for oid in [&null_prov_oid, &ghost_repo_oid] {
+            assert_eq!(
+                stored_pin(&pool, oid).await.1,
+                None,
+                "an unrepairable row is left untouched"
+            );
+        }
+    }
+
+    /// U4 scenario 8 (#173, degenerate states): an empty `pinned_cids` table and a
+    /// table with zero legacy rows both complete cleanly, with no repair and no read.
+    #[sqlx::test]
+    async fn sweep_completes_on_degenerate_tables(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        // Empty table.
+        crate::ipfs_pin::reset_legacy_repair_reads();
+        let empty = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                4,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates on an empty table");
+        assert_eq!(
+            (empty.scanned, empty.repaired),
+            (0, 0),
+            "an empty table is a clean no-op"
+        );
+
+        // Zero legacy rows: every row already carries the canonical raw key.
+        let fx = seed_cid_repos(&slug, &short, &["degensrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("degensrc.git");
+        let repo = seed_repo(&owner_did, "degensrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        for oid in [&fx.public_oid, &fx.secret_oid, &fx.commit_oid] {
+            pin_cid_for_repo(&bare, oid, &state.db, &repo.id).await;
+        }
+
+        let clean = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                4,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates on a table with no legacy rows");
+        assert_eq!(clean.scanned, 3, "every row is walked");
+        assert_eq!(clean.repaired, 0, "nothing needs repair");
+        assert_eq!(
+            crate::ipfs_pin::legacy_repair_reads(),
+            0,
+            "no object bytes are read when no row is legacy"
+        );
+    }
+
+    /// U4 (#173, BOUND): the inter-batch delay is real, observed by wall clock. Five
+    /// rows at a batch of two means two full batches and a trailing partial one, so the
+    /// run sleeps twice. Without the sleep the whole run is sub-millisecond DB work and
+    /// a node's `pinned_cids` table gets walked as fast as Postgres will answer.
+    #[sqlx::test]
+    async fn sweep_sleeps_between_batches(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["delaysrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("delaysrc.git");
+        let repo = seed_repo(&owner_did, "delaysrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        for oid in [
+            &fx.public_oid,
+            &fx.secret_oid,
+            &fx.public_tree_oid,
+            &fx.secret_tree_oid,
+            &fx.commit_oid,
+        ] {
+            pin_cid_for_repo(&bare, oid, &state.db, &repo.id).await;
+        }
+
+        let delay = std::time::Duration::from_millis(150);
+        let started = std::time::Instant::now();
+        let stats = crate::ipfs_pin::sweep_legacy_provider_cids(
+            std::path::Path::new("/tmp"),
+            &state.git_bin,
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            2,
+            delay,
+            &state.db,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            stats.passes, 3,
+            "five rows at a batch of two is three passes"
+        );
+        assert!(
+            elapsed >= delay * 2,
+            "the run sleeps once between each pair of full batches: {elapsed:?} < {:?}",
+            delay * 2
+        );
+    }
+
+    /// U4 scenario 6 (#173): `list_pinned_cids` never advertises a key the `/ipfs`
+    /// resolver would withhold. The resolver recomputes the raw CIDv1 from the object
+    /// bytes and 404s any row keyed on a legacy PROVIDER CID, so advertising that key
+    /// hands clients a CID this node deliberately refuses. Both states of ONE row are
+    /// asserted (omitted while legacy, present once repaired) so the test cannot pass
+    /// by accident. RED before the `is_raw_cidv1` filter lands: the legacy row is
+    /// advertised.
+    #[sqlx::test]
+    async fn list_pinned_cids_omits_unrepaired_legacy_row(pool: PgPool) {
+        let state = test_state(pool).await;
+
+        let raw_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"u4 advertise bytes").to_string();
+        let provider_cid = legacy_dagpb_cid(&raw_cid);
+        let oid = "c".repeat(64);
+        state
+            .db
+            .record_pinned_cid(&oid, &provider_cid, None)
+            .await
+            .unwrap();
+
+        let listed = state.db.list_pinned_cids().await.unwrap();
+        assert!(
+            !listed.iter().any(|r| r.sha256_hex == oid),
+            "an unrepaired legacy provider-CID row is not advertised"
+        );
+
+        // Same row, repaired: it comes back, keyed on the raw CID the resolver serves.
+        state
+            .db
+            .repair_legacy_provider_cid(&oid, &raw_cid, &provider_cid)
+            .await
+            .unwrap();
+        let listed = state.db.list_pinned_cids().await.unwrap();
+        let rec = listed
+            .iter()
+            .find(|r| r.sha256_hex == oid)
+            .expect("the repaired row is advertised again");
+        assert_eq!(
+            rec.cid, raw_cid,
+            "the advertised key is the raw-content resolver key"
         );
     }
 
