@@ -323,40 +323,61 @@ impl RepoStore {
     ///      segment is rejected. This is the CodeQL-recognised barrier
     ///      pattern for `rust/path-injection`.
     fn local_path(&self, owner_did: &str, repo_name: &str) -> Result<(String, PathBuf)> {
-        validate_path_components(owner_did, repo_name)?;
-
         let owner_slug = owner_did.replace([':', '/'], "_");
-        let local_path = self
-            .repos_dir
-            .join(&owner_slug)
-            .join(format!("{repo_name}.git"));
-
-        if !local_path.starts_with(&self.repos_dir) {
-            anyhow::bail!(
-                "computed repo path escaped repos_dir: {}",
-                local_path.display()
-            );
-        }
-
-        // Explicit component walk — sanitisation barrier that static analysers
-        // (CodeQL `rust/path-injection`) recognise. The path must be composed
-        // entirely of Normal segments after the root prefix; any ParentDir or
-        // CurDir component is a traversal attempt.
-        for component in local_path.components() {
-            use std::path::Component;
-            match component {
-                Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
-                Component::ParentDir => {
-                    anyhow::bail!("path contains parent-directory component");
-                }
-                Component::CurDir => {
-                    anyhow::bail!("path contains current-directory component");
-                }
-            }
-        }
-
+        let local_path = validated_repo_disk_path(&self.repos_dir, owner_did, repo_name)?;
         Ok((owner_slug, local_path))
     }
+}
+
+/// The three-layer validated form of `store::repo_disk_path`, with NO Tigris fetch and
+/// no `RepoStore` (#173 round 11, F3). Extracted from `RepoStore::local_path` so a
+/// second caller that must not pull a cold repo, the U4 legacy provider-CID sweep, gets
+/// the same barrier instead of the raw join. `local_path` is now a thin wrapper over
+/// this, so the two cannot drift.
+///
+/// Three-layer defence against path traversal:
+///   1. Strict allowlist on `owner_did` and `repo_name` (no `..`, slashes,
+///      null bytes, leading dots; length-bounded).
+///   2. The joined path must remain rooted at `repos_dir`.
+///   3. Every component of the joined path must be `Component::Normal`
+///      (or the prefix/root from `repos_dir`); any `ParentDir`/`CurDir`
+///      segment is rejected. This is the CodeQL-recognised barrier
+///      pattern for `rust/path-injection`.
+pub(crate) fn validated_repo_disk_path(
+    repos_dir: &Path,
+    owner_did: &str,
+    repo_name: &str,
+) -> Result<PathBuf> {
+    validate_path_components(owner_did, repo_name)?;
+
+    let owner_slug = owner_did.replace([':', '/'], "_");
+    let local_path = repos_dir.join(&owner_slug).join(format!("{repo_name}.git"));
+
+    if !local_path.starts_with(repos_dir) {
+        anyhow::bail!(
+            "computed repo path escaped repos_dir: {}",
+            local_path.display()
+        );
+    }
+
+    // Explicit component walk — sanitisation barrier that static analysers
+    // (CodeQL `rust/path-injection`) recognise. The path must be composed
+    // entirely of Normal segments after the root prefix; any ParentDir or
+    // CurDir component is a traversal attempt.
+    for component in local_path.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {}
+            Component::ParentDir => {
+                anyhow::bail!("path contains parent-directory component");
+            }
+            Component::CurDir => {
+                anyhow::bail!("path contains current-directory component");
+            }
+        }
+    }
+
+    Ok(local_path)
 }
 
 /// Strict allowlist validator for `owner_did` and `repo_name`.

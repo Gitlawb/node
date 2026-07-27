@@ -2973,6 +2973,148 @@ mod tests {
         );
     }
 
+    /// F5 (#173 round 11): the work-budget peek sheds an already-throttled caller BEFORE
+    /// the two marker queries, so a spent-budget source stops paying two lookups per
+    /// request for a scan it will never be allowed to run. The source set here is
+    /// non-empty and complete, which is the case that used to reach the queries anyway.
+    /// The counter is the both-ways guard: moving the peek back below the pair reads 1.
+    #[sqlx::test]
+    async fn ipfs_cid_throttled_caller_sheds_before_the_marker_queries(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let mut state = test_state(pool).await;
+        state.ipfs_work_rate_limiter =
+            crate::rate_limit::RateLimiter::new(1, Duration::from_secs(3600));
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::XForwardedFor;
+
+        // One PRIVATE source, recorded cleanly: the set is non-empty, below cap and
+        // unmarked, so nothing but the peek can keep the request off the queries.
+        let fx = seed_cid_repos(&slug, &short, &["f5only"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("f5only.git");
+        let mut repo = seed_repo(&owner_did, "f5only");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed private");
+        let cid = pin_cid_for_repo(&bare, &fx.secret_oid, &state.db, &repo.id).await;
+        state
+            .db
+            .record_pin_source(&fx.secret_oid, &repo.id)
+            .await
+            .expect("record source");
+
+        // Spend the caller's whole work budget before the request.
+        assert!(
+            state.ipfs_work_rate_limiter.check("9.9.9.9").await,
+            "the budget starts with room"
+        );
+
+        crate::api::ipfs::reset_marker_queries();
+        let (st, body) = cid_parts(
+            cid_router(&state)
+                .oneshot(cid_anon_xff(&cid, "9.9.9.9"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a spent-budget caller is shed at the peek"
+        );
+        assert!(
+            !body.contains("TOP SECRET"),
+            "the shed response must not leak the withheld object"
+        );
+        assert_eq!(
+            crate::api::ipfs::marker_queries(),
+            0,
+            "a shed caller pays neither marker query"
+        );
+    }
+
+    /// U3 scenario 6 (#173, regression): a record that inserts NOTHING must not clear
+    /// the marker. `record_pin_source` is called for EVERY already-pinned object on the
+    /// skip path, and on a requeue pass that is the whole-repo enumeration, so the next
+    /// coalesced push from a repo ALREADY in the source set re-runs the insert as a
+    /// no-op. Clearing on that no-op re-hides the hole a different repo's failed record
+    /// recorded: the public copy stops being scanned for and 404s again. The assertion
+    /// is the SERVE outcome, not the column, so it still bites if the resolver ever
+    /// stops consulting the marker. RED before the rows_affected gate (404); GREEN after.
+    #[sqlx::test]
+    async fn ipfs_cid_noop_record_must_not_clear_the_marker(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["u3npriv", "u3npub"]);
+        let priv_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3npriv.git");
+        let pub_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("u3npub.git");
+
+        // Repo A (private) is the first pinner AND is already recorded as a source, so a
+        // later record from A is a pure no-op insert.
+        let mut priv_repo = seed_repo(&owner_did, "u3npriv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private");
+        let cid = pin_cid_for_repo(&priv_bare, &fx.public_oid, &state.db, &priv_repo.id).await;
+        state
+            .db
+            .record_pin_source(&fx.public_oid, &priv_repo.id)
+            .await
+            .expect("record the first pinner as a source");
+
+        // Repo B (public) holds the same object, but its source record never lands, so
+        // the node marks the set known-incomplete.
+        let pub_repo = seed_repo(&owner_did, "u3npub");
+        state.db.create_repo(&pub_repo).await.expect("seed public");
+        with_pin_sources_broken(&pool, || {
+            repin_via_skip_branch(&state, &pub_bare, &fx.public_oid, &pub_repo.id)
+        })
+        .await;
+        assert!(
+            state
+                .db
+                .pin_sources_incomplete(&fx.public_oid)
+                .await
+                .unwrap(),
+            "the exhausted record marked the set incomplete"
+        );
+
+        // A pushes again. The insert affects zero rows (A is already a source), so it
+        // recorded nothing and must not claim the set is complete.
+        repin_via_skip_branch(&state, &priv_bare, &fx.public_oid, &priv_repo.id).await;
+        assert_eq!(
+            state.db.pin_sources_for_oid(&fx.public_oid).await.unwrap(),
+            vec![priv_repo.id.clone()],
+            "the re-push really did add no source"
+        );
+
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a no-op record must not clear the marker: the public copy still has to serve"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "the served body is the public object's bytes"
+        );
+    }
+
     /// U3 scenario 4 (#173): the marker tracks the record's OUTCOME, not the attempt.
     /// An exhausted retry sets it; a first-attempt success never does. Without the
     /// second arm the first could be satisfied by marking unconditionally.
@@ -4738,6 +4880,292 @@ mod tests {
                 "an unrepairable row is left untouched"
             );
         }
+    }
+
+    /// U4 scenario 9 (#173, regression): a row skipped for a TRANSIENT reason is
+    /// retried by a later run. The sweep never pulls a cold repo back from remote
+    /// storage, so on a Tigris-backed node a repo that is not on local disk at boot
+    /// contributes nothing to the pass. With the cursor parked at the end of the table
+    /// that row was skipped FOREVER: every later boot read zero rows and the row stayed
+    /// unadvertised and unresolvable with nothing left to repair it. Here the repo is
+    /// off disk for the first run and back for the second, so only a re-walk repairs it.
+    /// RED before the transient-skip cursor reset (the second run scans nothing).
+    #[sqlx::test]
+    async fn sweep_rewalks_after_a_transient_skip(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        let fx = seed_cid_repos(&slug, &short, &["coldsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("coldsrc.git");
+        let repo = seed_repo(&owner_did, "coldsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let (raw_cid, _provider) =
+            seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        // The repo is COLD: its provenance resolves, but the bytes are not on this
+        // node's disk right now, exactly the state the sweep refuses to fix by pulling.
+        let stashed_away = bare.with_extension("git.away");
+        let _ = std::fs::remove_dir_all(&stashed_away);
+        std::fs::rename(&bare, &stashed_away).expect("take the repo off local disk");
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the first run terminates");
+        assert_eq!(
+            (first.scanned, first.repaired),
+            (1, 0),
+            "the cold repo's row is walked but cannot be repaired yet"
+        );
+
+        // The repo is warm again (a later boot, a fetch, an operator restore).
+        std::fs::rename(&stashed_away, &bare).expect("put the repo back on local disk");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the second run terminates");
+        assert_eq!(
+            second.repaired, 1,
+            "a later run re-walks the transiently skipped row and repairs it"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            raw_cid,
+            "the row now carries the raw-content resolver key"
+        );
+        assert!(
+            state
+                .db
+                .list_pinned_cids()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.cid == raw_cid),
+            "the repaired row is advertised again"
+        );
+    }
+
+    /// U4 scenario 10 (#173, the other arm of scenario 9): a PERMANENTLY unrepairable
+    /// row must not make the sweep re-walk forever. Bytes that are genuinely gone are a
+    /// terminal skip, so the cursor stays parked and a later run reads nothing. Without
+    /// that split the transient-skip reset of scenario 9 turns every boot on such a node
+    /// into a full table walk. Both runs are timeout-bounded, so a hot loop FAILS here.
+    #[sqlx::test]
+    async fn sweep_does_not_rewalk_for_a_terminal_skip(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+        let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+
+        // The repo IS on local disk; the object's bytes are not in it and never will be.
+        let _fx = seed_cid_repos(&slug, &short, &["termsrc"]);
+        let repo = seed_repo(&owner_did, "termsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let phantom_oid = "e".repeat(64);
+        let raw_cid =
+            gitlawb_core::cid::Cid::from_git_object_bytes(b"bytes that live nowhere").to_string();
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&phantom_oid)
+        .bind(legacy_dagpb_cid(&raw_cid))
+        .bind("2020-01-01T00:00:00Z")
+        .bind(&repo.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the first run terminates");
+        assert_eq!(
+            (first.scanned, first.repaired),
+            (1, 0),
+            "the row is walked and cannot be repaired"
+        );
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                std::path::Path::new("/tmp"),
+                &state.git_bin,
+                git_timeout,
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the second run terminates");
+        assert_eq!(
+            (second.scanned, second.repaired, second.passes),
+            (0, 0, 1),
+            "a terminal skip leaves the cursor parked: the next run re-reads nothing"
+        );
+    }
+
+    /// U4 scenario 11 (#173, path barrier): the sweep resolves a source repo's disk path
+    /// through the SAME validated logic the repo store uses, so a repo row whose name
+    /// carries `..` reads nothing. Names are validated at creation today, so this is a
+    /// defence-in-depth barrier on a second caller of the raw path helper rather than a
+    /// live exploit. The escapee repo really does hold the object's bytes, so before the
+    /// barrier the sweep happily read them from outside `repos_dir` and repaired the row.
+    /// RED before routing through the validated path (repaired 1).
+    #[sqlx::test]
+    async fn sweep_refuses_a_source_path_that_escapes_repos_dir(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        // The bytes live at /tmp/{slug}/escapee.git, OUTSIDE the repos_dir below.
+        let fx = seed_cid_repos(&slug, &short, &["escapee"]);
+        let escapee_bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("escapee.git");
+        let repos_dir = std::path::PathBuf::from("/tmp").join(&slug).join("root");
+        std::fs::create_dir_all(repos_dir.join(&slug)).expect("create the repos_dir tree");
+
+        // A repo row whose name walks back out of repos_dir: repos_dir/{slug}/../../escapee.git
+        let mut repo = seed_repo(&owner_did, "../../escapee");
+        repo.disk_path = escapee_bare.display().to_string();
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let (_raw_cid, provider_cid) =
+            seed_legacy_pin(&pool, &escapee_bare, &fx.public_oid, Some(&repo.id)).await;
+        assert!(
+            crate::git::store::repo_disk_path(&repos_dir, &owner_did, &repo.name).exists(),
+            "the unvalidated helper really does resolve to the escapee repo"
+        );
+
+        let stats = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            crate::ipfs_pin::sweep_legacy_provider_cids(
+                &repos_dir,
+                &state.git_bin,
+                std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+                16,
+                std::time::Duration::ZERO,
+                &state.db,
+            ),
+        )
+        .await
+        .expect("the sweep terminates");
+
+        assert_eq!(
+            stats.repaired, 0,
+            "a repo path that escapes repos_dir must never be read"
+        );
+        assert_eq!(
+            stored_pin(&pool, &fx.public_oid).await.0,
+            provider_cid,
+            "the row is untouched because its bytes were never read"
+        );
+    }
+
+    /// U4 scenario 12 (#173, F4): the repair's object read is SYNCHRONOUS `git cat-file`,
+    /// so running it inline parks the async worker for as long as git takes, up to the
+    /// whole `git_service_timeout_secs` budget on a wedged read, and the sweep does this
+    /// per legacy row starting at boot. A slow git stand-in makes that observable: a
+    /// concurrent 20ms ticker cannot tick at all while the only worker thread is blocked,
+    /// and ticks freely once the read is on the blocking pool. RED before the
+    /// `spawn_blocking` (0 ticks).
+    #[sqlx::test]
+    async fn repair_object_read_does_not_block_the_async_worker(pool: PgPool) {
+        use gitlawb_core::identity::Keypair;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let owner = Keypair::generate();
+        let owner_did = owner.did().to_string();
+        let slug = owner_did.replace([':', '/'], "_");
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool.clone()).await;
+
+        let fx = seed_cid_repos(&slug, &short, &["slowsrc"]);
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join("slowsrc.git");
+        let repo = seed_repo(&owner_did, "slowsrc");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        seed_legacy_pin(&pool, &bare, &fx.public_oid, Some(&repo.id)).await;
+
+        // A git that takes 300ms per invocation (the read makes two: type, then content).
+        let slow_git = std::env::temp_dir().join(format!("gl-slow-git-{short}"));
+        std::fs::write(&slow_git, "#!/bin/sh\nsleep 0.3\nexec git \"$@\"\n").expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&slow_git, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod shim");
+        }
+
+        let ticks = std::sync::Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = ticks.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        let stats = crate::ipfs_pin::sweep_legacy_provider_cids(
+            std::path::Path::new("/tmp"),
+            slow_git.to_str().unwrap(),
+            std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+            16,
+            std::time::Duration::ZERO,
+            &state.db,
+        )
+        .await;
+        ticker.abort();
+
+        assert_eq!(stats.repaired, 1, "the slow git still repairs the row");
+        assert!(
+            ticks.load(Ordering::Relaxed) >= 5,
+            "the runtime kept running other tasks during the blocking git read (ticks: {})",
+            ticks.load(Ordering::Relaxed)
+        );
     }
 
     /// U4 scenario 8 (#173, degenerate states): an empty `pinned_cids` table and a
