@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -28,8 +28,23 @@ const MAX_OBJECTS_PER_REPO: usize = 50_000;
 /// filter).  A pathological repo that stalls past this is skipped for the pass.
 const REPO_SCAN_DEADLINE: Duration = Duration::from_secs(300);
 
+/// Per-repo deadline for the pinning phase (IPFS + Pinata uploads).  An
+/// unavailable backend that stalls per-object must not hold the sweep for
+/// the entire backlog; this bounds the total wall time per repo per pass.
+const PIN_PHASE_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Whether the sweep should spawn given the current configuration.
+/// Extracted for testing — test both directions independently.
+fn should_spawn(config: &Config) -> bool {
+    if !config.reconciliation_sweep {
+        return false;
+    }
+    !config.ipfs_api.is_empty() || !config.pinata_jwt.is_empty()
+}
+
 /// Spawn the periodic reconciliation sweep background task.
-/// No-op when neither IPFS nor Pinata is configured.
+/// No-op when neither IPFS nor Pinata is configured, or when
+/// `reconciliation_sweep` is disabled.
 pub fn spawn(
     db: Arc<Db>,
     config: Arc<Config>,
@@ -38,8 +53,10 @@ pub fn spawn(
     node_did: gitlawb_core::did::Did,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    if config.ipfs_api.is_empty() && config.pinata_jwt.is_empty() {
-        tracing::info!("reconciliation sweep: neither IPFS nor Pinata configured, skipping spawn");
+    if !should_spawn(&config) {
+        tracing::info!(
+            "reconciliation sweep: disabled or neither IPFS nor Pinata configured, skipping spawn"
+        );
         return;
     }
 
@@ -199,8 +216,14 @@ async fn run_pass(
                 ctx.canceled.store(true, Ordering::SeqCst);
                 #[cfg(unix)]
                 {
-                    let active = ctx.registry.lock().unwrap();
-                    for &pgid in active.iter() {
+                    let pgids: Vec<i32> = ctx
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .copied()
+                        .collect();
+                    for &pgid in &pgids {
                         unsafe {
                             let _ = libc::kill(-pgid, libc::SIGTERM);
                         }
@@ -267,35 +290,81 @@ async fn run_pass(
         }
 
         // Visibility may have narrowed mid-scan with a path-scoped deny.
-        // Recompute the allowed set from fresh rules and intersect it with
-        // the existing object_list so newly-withheld blobs are excluded from
-        // the missing sets and never published to a public backend.
-        let fresh_allowed = crate::git::visibility_pack::replicable_blob_set(
-            &disk,
-            &rules,
-            fresh_repo.is_public,
-            &fresh_repo.owner_did,
-        )?;
-        let object_list: Vec<String> = object_list
-            .into_iter()
-            .filter(|oid| fresh_allowed.contains(oid))
-            .collect();
+        // Recompute the allowed set from fresh rules in a spawn_blocking
+        // and intersect it with the existing object_list (R1-P1, R1-P2).
+        let fresh_disk = disk.clone();
+        let fresh_rules = rules.clone();
+        let fresh_owner = fresh_repo.owner_did.clone();
+        let fresh_is_public = fresh_repo.is_public;
+        let existing_list = object_list;
+        let refilter_ctx = ctx.clone();
 
-        let ipfs_enabled = !config.ipfs_api.is_empty();
+        let refiltered = tokio::time::timeout(
+            REPO_SCAN_DEADLINE,
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+                let _guard = crate::git::set_scan_context(refilter_ctx);
+                let allowed = crate::git::visibility_pack::replicable_blob_set(
+                    &fresh_disk,
+                    &fresh_rules,
+                    fresh_is_public,
+                    &fresh_owner,
+                )?;
+                let all_blobs = crate::git::push_delta::all_blob_oids(&fresh_disk)?;
+                Ok(crate::git::visibility_pack::replicable_objects_fail_closed(
+                    existing_list,
+                    &allowed,
+                    &all_blobs,
+                ))
+            }),
+        )
+        .await;
+
+        let object_list: Vec<String> = match refiltered {
+            Ok(Ok(Ok(list))) => list,
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "fresh-visibility re-filter failed, skipping");
+                continue;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "fresh-visibility re-filter task panicked, skipping");
+                continue;
+            }
+            Err(_) => {
+                ctx.canceled.store(true, Ordering::SeqCst);
+                #[cfg(unix)]
+                {
+                    let pgids: Vec<i32> = ctx
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .copied()
+                        .collect();
+                    for &pgid in &pgids {
+                        unsafe {
+                            let _ = libc::kill(-pgid, libc::SIGTERM);
+                        }
+                    }
+                }
+                tracing::warn!(repo = %repo_slug, "fresh-visibility re-filter deadline exceeded, skipped");
+                continue;
+            }
+        };
+
+        let _ipfs_enabled = !config.ipfs_api.is_empty();
         let pinata_enabled = !config.pinata_jwt.is_empty();
 
-        // Only compute missing sets for enabled backends so that a Pinata-only
-        // or IPFS-only node does not report permanent unfillable gaps.
-        let ipfs_missing: Vec<String> = if ipfs_enabled {
-            let already = match db.filter_ipfs_pinned_oids(&object_list).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(repo = %repo_slug, err = %e, "filter_ipfs_pinned_oids failed, skipping");
-                    continue;
-                }
-            };
+        // IPFS-missing set (capped).
+        let already_ipfs = match db.filter_ipfs_pinned_oids(&object_list).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(repo = %repo_slug, err = %e, "filter_ipfs_pinned_oids failed, skipping");
+                continue;
+            }
+        };
+        let ipfs_missing: Vec<String> = {
             let all_set: HashSet<&str> = object_list.iter().map(|s| s.as_str()).collect();
-            let done_set: HashSet<&str> = already.iter().map(|s| s.as_str()).collect();
+            let done_set: HashSet<&str> = already_ipfs.iter().map(|s| s.as_str()).collect();
             let mut v: Vec<String> = all_set
                 .difference(&done_set)
                 .map(|s| s.to_string())
@@ -309,8 +378,6 @@ async fn run_pass(
                 );
             }
             v
-        } else {
-            Vec::new()
         };
 
         let pinata_missing: Vec<String> = if pinata_enabled {
@@ -348,13 +415,21 @@ async fn run_pass(
             crate::metrics::record_reconciliation_gaps_found(repo_gaps as u64);
         }
 
-        let pinned_ipfs = if ipfs_enabled && !ipfs_missing.is_empty() {
-            crate::ipfs_pin::pin_new_objects(&config.ipfs_api, &disk, ipfs_missing, db).await
-        } else {
-            Vec::new()
+        let pinned_ipfs = match tokio::time::timeout(
+            PIN_PHASE_DEADLINE,
+            crate::ipfs_pin::pin_new_objects(&config.ipfs_api, &disk, ipfs_missing, db),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(repo = %repo_slug, "IPFS pin phase timed out after {:?}", PIN_PHASE_DEADLINE);
+                Vec::new()
+            }
         };
 
-        let pinned_pinata = if pinata_enabled && !pinata_missing.is_empty() {
+        let pinned_pinata = match tokio::time::timeout(
+            PIN_PHASE_DEADLINE,
             crate::pinata::pin_new_objects(
                 http_client,
                 &config.pinata_upload_url,
@@ -362,10 +437,15 @@ async fn run_pass(
                 &disk,
                 pinata_missing,
                 db,
-            )
-            .await
-        } else {
-            Vec::new()
+            ),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::warn!(repo = %repo_slug, "Pinata pin phase timed out after {:?}", PIN_PHASE_DEADLINE);
+                Vec::new()
+            }
         };
 
         let repo_filled = pinned_ipfs.len() + pinned_pinata.len();
@@ -466,8 +546,14 @@ async fn run_pass(
                     ctx2.canceled.store(true, Ordering::SeqCst);
                     #[cfg(unix)]
                     {
-                        let active = ctx2.registry.lock().unwrap();
-                        for &pgid in active.iter() {
+                        let pgids: Vec<i32> = ctx2
+                            .registry
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .copied()
+                            .collect();
+                        for &pgid in &pgids {
                             unsafe {
                                 let _ = libc::kill(-pgid, libc::SIGTERM);
                             }
@@ -496,52 +582,30 @@ async fn run_pass(
                 // This avoids unbounded Irys writes on a timer — repos
                 // with no withheld changes do not re-anchor the manifest.
                 if !sealed.is_empty() && !config.irys_url.is_empty() {
-                    let all_existing = match db.list_all_encrypted_blobs(&repo.id).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(
-                                repo = %repo_slug,
-                                err = %e,
-                                "list_all_encrypted_blobs failed, skipping anchor"
-                            );
-                            continue;
-                        }
+                    let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
+                    let slug = format!("{}/{}", owner_short, repo.name);
+                    let ts = chrono::Utc::now().to_rfc3339();
+                    let node_did_str = node_did.to_string();
+
+                    let manifest = crate::arweave::EncryptedManifest {
+                        repo: &slug,
+                        owner_did: &repo.owner_did,
+                        node_did: &node_did_str,
+                        timestamp: &ts,
+                        blobs: &sealed,
                     };
-                    if !all_existing.is_empty() {
-                        let owner_short = crate::db::normalize_owner_key(&repo.owner_did);
-                        let slug = format!("{}/{}", owner_short, repo.name);
-                        let ts = chrono::Utc::now().to_rfc3339();
-                        let node_did_str = node_did.to_string();
-
-                        let mut blob_map: HashMap<String, String> = HashMap::new();
-                        for (oid, cid) in &all_existing {
-                            blob_map.insert(oid.clone(), cid.clone());
-                        }
-                        for (oid, cid) in &sealed {
-                            blob_map.insert(oid.clone(), cid.clone());
-                        }
-                        let merged: Vec<(String, String)> = blob_map.into_iter().collect();
-
-                        let manifest = crate::arweave::EncryptedManifest {
-                            repo: &slug,
-                            owner_did: &repo.owner_did,
-                            node_did: &node_did_str,
-                            timestamp: &ts,
-                            blobs: &merged,
-                        };
-                        if let Err(e) = crate::arweave::anchor_encrypted_manifest(
-                            http_client,
-                            &config.irys_url,
-                            &manifest,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                repo = %slug,
-                                err = %e,
-                                "encrypted manifest anchor failed (will retry next pass)"
-                            );
-                        }
+                    if let Err(e) = crate::arweave::anchor_encrypted_manifest(
+                        http_client,
+                        &config.irys_url,
+                        &manifest,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            repo = %slug,
+                            err = %e,
+                            "encrypted manifest anchor failed (will retry next pass)"
+                        );
                     }
                 }
             }
@@ -564,25 +628,61 @@ mod tests {
         std::sync::Arc::new(cfg)
     }
 
+    /// Build a config with IPFS API set so the gate fires the other way.
+    fn ipfs_config() -> std::sync::Arc<crate::config::Config> {
+        let cfg = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            "http://127.0.0.1:5001",
+        ]);
+        std::sync::Arc::new(cfg)
+    }
+
+    #[test]
+    fn should_spawn_false_when_both_empty() {
+        let cfg = empty_pin_config();
+        assert!(!super::should_spawn(&cfg));
+    }
+
+    #[test]
+    fn should_spawn_true_when_ipfs_set() {
+        let cfg = ipfs_config();
+        assert!(super::should_spawn(&cfg));
+    }
+
+    #[test]
+    fn should_spawn_true_when_pinata_set() {
+        let cfg = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--pinata-jwt",
+            "test-jwt",
+        ]);
+        assert!(super::should_spawn(&cfg));
+    }
+
+    #[test]
+    fn should_spawn_false_when_sweep_disabled() {
+        let cfg = <crate::config::Config as clap::Parser>::parse_from([
+            "gitlawb-node-test",
+            "--ipfs-api",
+            "http://127.0.0.1:5001",
+            "--reconciliation-sweep",
+            "false",
+        ]);
+        assert!(!super::should_spawn(&cfg));
+    }
+
     /// spawn() must return immediately (without panicking or touching the DB)
     /// when neither IPFS nor Pinata is configured.  This proves the gate
-    /// branch at the top of spawn() is actually reachable: if the gate were
-    /// deleted or the field names changed, spawn() would call tokio::spawn
-    /// and then hit a missing-DB panic on the first pass instead of
-    /// returning, causing the test to time out or panic.
+    /// branch at the top of spawn() is actually reachable.
     #[tokio::test]
     async fn test_spawn_gate_skips_when_no_pin_backends_configured() {
         let config = empty_pin_config();
-        // Sanity: the config we built really has empty pin fields.
         assert!(config.ipfs_api.is_empty(), "ipfs_api should be empty");
         assert!(config.pinata_jwt.is_empty(), "pinata_jwt should be empty");
 
-        // We cannot construct a real Db without Postgres, but spawn() must
-        // return before using the Db when both pin backends are disabled.
         // Use a dummy Db built from a disconnected pool; spawn() must not
         // reach any code that would touch it.
-        // max_connections(1): crossbeam-queue requires capacity >= 1;
-        // the pool is connect_lazy with a bogus URL so no connection is made.
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect_lazy("postgresql://localhost/gitlawb_test_nonexistent")
@@ -598,8 +698,7 @@ mod tests {
         super::spawn(db, config, http, kp, node_did, rx);
     }
 
-    /// Constant smoke-check kept as a compile-time tripwire.  The real gate
-    /// behaviour is covered by test_spawn_gate_skips_when_no_pin_backends_configured.
+    /// Constant smoke-check kept as a compile-time tripwire.
     #[test]
     fn sweep_interval_constant_is_nonzero() {
         assert_ne!(super::SWEEP_INTERVAL_SECS, 0);

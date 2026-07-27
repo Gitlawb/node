@@ -2422,7 +2422,7 @@ impl Db {
             .into_iter()
             .map(|r| PinnedCidRecord {
                 sha256_hex: r.get("sha256_hex"),
-                cid: r.get("cid"),
+                cid: r.try_get("cid").ok(),
                 pinned_at: r.get("pinned_at"),
                 pinata_cid: r.get("pinata_cid"),
             })
@@ -4051,6 +4051,149 @@ mod migration_tests {
         assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
         assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
         assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
+    }
+
+    /// Migration v12 makes pinned_cids.cid nullable so record_pinata_cid can
+    /// create Pinata-only rows without a local IPFS CID.  This test seeds a
+    /// pre-v12 schema (cid NOT NULL, pinata_cid column exists but no
+    /// nullability change yet) with rows in each of the three states the
+    /// has_ipfs_cid / filter_ipfs_pinned_oids predicates must classify:
+    ///
+    ///   (1) cid IS NOT NULL, pinata_cid IS NULL              → has_ipfs = true
+    ///   (2) cid IS NOT NULL, cid != pinata_cid              → has_ipfs = true
+    ///   (3) cid IS NOT NULL, cid = pinata_cid (legacy)      → has_ipfs = false
+    ///
+    /// After the migration we also test that a Pinata-only INSERT (cid = NULL)
+    /// works and produces has_ipfs = false, has_pinata = true.
+    #[sqlx::test]
+    async fn migration_v12_makes_cid_nullable_and_preserves_classification(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+
+        // Create all tables, then drop the NOT NULL constraint on cid
+        // and drop schema_migrations records to simulate a pre-v12 node.
+        db.migrate().await.unwrap();
+        sqlx::query("ALTER TABLE pinned_cids ALTER COLUMN cid SET NOT NULL")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 12) {
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(m.version)
+            .bind(m.name)
+            .bind("2026-07-01T00:00:00Z")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // ── Seed legacy rows ───────────────────────────────────────────
+        let now = "2026-07-01T12:00:00Z";
+
+        // (1) Real local IPFS pin, no Pinata.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind("sha_real_only")
+        .bind("QmRealLocalCid")
+        .bind(now)
+        .bind(Option::<&str>::None)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // (2) Both CIDs present and distinct.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind("sha_both_distinct")
+        .bind("QmLocalForThisBlob")
+        .bind(now)
+        .bind("QmPinataForThisBlob")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // (3) Legacy row where cid was set to pinata_cid as fallback.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind("sha_legacy_fallback")
+        .bind("QmLegacyEqual")
+        .bind(now)
+        .bind("QmLegacyEqual")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // ── Apply migration v12 ────────────────────────────────────────
+        db.migrate().await.unwrap();
+
+        // ── Assertions ─────────────────────────────────────────────────
+
+        // Column is now nullable.
+        let nullable: String = sqlx::query_scalar(
+            "SELECT is_nullable FROM information_schema.columns
+             WHERE table_name = 'pinned_cids' AND column_name = 'cid'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(nullable, "YES", "cid must be nullable after v12");
+
+        // Classification: has_ipfs_cid.
+        assert!(
+            db.has_ipfs_cid("sha_real_only").await.unwrap(),
+            "real local IPFS CID must be classified as pinned"
+        );
+        assert!(
+            db.has_ipfs_cid("sha_both_distinct").await.unwrap(),
+            "distinct local CID must be classified as pinned"
+        );
+        assert!(
+            !db.has_ipfs_cid("sha_legacy_fallback").await.unwrap(),
+            "legacy equal-cid row must NOT be classified as having an IPFS CID"
+        );
+
+        // has_pinata_cid.
+        assert!(
+            !db.has_pinata_cid("sha_real_only").await.unwrap(),
+            "no pinata_cid means has_pinata = false"
+        );
+        assert!(
+            db.has_pinata_cid("sha_both_distinct").await.unwrap(),
+            "non-null pinata_cid means has_pinata = true"
+        );
+        assert!(
+            db.has_pinata_cid("sha_legacy_fallback").await.unwrap(),
+            "non-null pinata_cid means has_pinata = true (legacy row)"
+        );
+
+        // ── Pinata-only INSERT (new post-v12 row) ──────────────────────
+        db.record_pinata_cid("sha_pinata_only", "QmPinataOnly")
+            .await
+            .unwrap();
+        assert!(
+            !db.has_ipfs_cid("sha_pinata_only").await.unwrap(),
+            "Pinata-only row must NOT be classified as having a local IPFS CID"
+        );
+        assert!(
+            db.has_pinata_cid("sha_pinata_only").await.unwrap(),
+            "Pinata-only row must have has_pinata = true"
+        );
+
+        // ── Idempotent re-run ──────────────────────────────────────────
+        db.migrate().await.unwrap();
     }
 }
 

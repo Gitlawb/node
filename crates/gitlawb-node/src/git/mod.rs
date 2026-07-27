@@ -191,7 +191,7 @@ impl GitCommand {
         // is set while we hold the lock, the sweep cannot drain the
         // registry until we release it.
         if let Some(ref ctx) = ctx {
-            let mut registry = ctx.registry.lock().unwrap();
+            let mut registry = ctx.registry.lock().unwrap_or_else(|e| e.into_inner());
             if ctx.canceled.load(Ordering::SeqCst) {
                 // Canceled after spawn: kill the whole process group (not
                 // just the immediate child) and wait to avoid zombies.
@@ -226,7 +226,11 @@ struct PgidGuard {
 impl Drop for PgidGuard {
     fn drop(&mut self) {
         if let (Some(pgid), Some(ref ctx)) = (self.pgid, &self.ctx) {
-            ctx.registry.lock().unwrap().remove(&pgid);
+            let _ = ctx
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&pgid);
         }
     }
 }

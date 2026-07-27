@@ -66,9 +66,8 @@ pub fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
 /// Read the current HEAD commit hash of a repository.
 /// Returns None if the repo is empty (no commits yet).
 pub fn head_commit(repo_path: &Path) -> Result<Option<String>> {
-    let output = Command::new("git")
+    let output = crate::git::GitCommand::new(repo_path)
         .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(repo_path)
         .output()
         .context("failed to run git rev-parse")?;
 
