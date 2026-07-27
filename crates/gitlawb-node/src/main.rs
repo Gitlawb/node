@@ -520,6 +520,43 @@ async fn main() -> Result<()> {
         });
     }
 
+    // U4 (#173): one-shot legacy provider-CID repair sweep. Releases before this
+    // version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
+    // and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is
+    // not the raw-content CID. The opportunistic repair on the pin path only fires when
+    // a push re-carries the object, which normal git negotiation makes it not do, so
+    // those rows need a walk. DETACHED, never on the boot path: the server below starts
+    // and serves while this runs, and the sweep's own batch bound plus inter-batch delay
+    // keep it off the DB's critical path. Its cursor is durable, so a restart mid-walk
+    // resumes instead of rewinding.
+    {
+        let db = state.db.clone();
+        let repos_dir = config.repos_dir.clone();
+        let git_bin = state.git_bin.clone();
+        let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
+        let batch = config.pin_repair_sweep_batch;
+        let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
+        let mut shutdown_rx = state.subscribe_shutdown();
+        tokio::spawn(async move {
+            tokio::select! {
+                stats = ipfs_pin::sweep_legacy_provider_cids(
+                    &repos_dir, &git_bin, git_timeout, batch, delay, &db,
+                ) => {
+                    if stats.repaired > 0 {
+                        tracing::info!(
+                            scanned = stats.scanned,
+                            repaired = stats.repaired,
+                            "legacy provider-CID sweep finished"
+                        );
+                    }
+                }
+                // Shutdown mid-walk simply drops the run; the persisted cursor means the
+                // next boot picks up where this one stopped.
+                _ = shutdown_rx.changed() => {}
+            }
+        });
+    }
+
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
     // moment with the port closed between the degraded and full servers.

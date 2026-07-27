@@ -956,6 +956,26 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS pin_sources_incomplete BOOLEAN NOT NULL DEFAULT FALSE",
         ],
     },
+    Migration {
+        version: 16,
+        name: "pin_repair_sweep_cursor",
+        stmts: &[
+            // U4 (#173): the legacy provider-CID repair sweep walks `pinned_cids` in
+            // bounded batches over an ordered `sha256_hex` cursor. The cursor has to be
+            // DURABLE, or a restart rewinds the walk to the start of the table and an
+            // upgraded node with a large pin set never finishes repairing it. One row
+            // (`id = 1`, enforced by the CHECK) rather than a key-value table: there is
+            // exactly one sweep and no second consumer, and a real constraint beats a
+            // convention nobody can enforce. NEW versioned migration (never appended to
+            // an applied block, INV-7). No default row is inserted: an absent row is the
+            // "never swept" state, which the empty-string cursor start already means, so
+            // there is no first-run special case to get wrong.
+            "CREATE TABLE IF NOT EXISTS pin_repair_sweep (
+                 id     INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+                 cursor TEXT NOT NULL
+             )",
+        ],
+    },
 ];
 
 /// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
@@ -2368,6 +2388,65 @@ impl Db {
         Ok(())
     }
 
+    /// One ordered batch of `pinned_cids` rows strictly after `cursor`, for the U4
+    /// legacy provider-CID repair sweep. Returns `(sha256_hex, cid)` ordered by
+    /// `sha256_hex` (the table's primary key, so the walk rides the PK index) and
+    /// capped at `limit` rows, which is what BOUNDS the sweep: one pass can never read
+    /// more than a batch, however large the pin set is.
+    ///
+    /// Deliberately NOT filtered to legacy rows in SQL. "Is this a raw CIDv1" is a
+    /// multibase+codec decode (`is_raw_cidv1`), which Postgres cannot express, and a
+    /// prefix-match approximation would silently mis-classify keys under a different
+    /// multihash. The caller applies the real predicate, so `limit` bounds rows READ
+    /// (the DB cost), not rows repaired.
+    pub async fn pinned_cids_after(
+        &self,
+        cursor: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT sha256_hex, cid FROM pinned_cids
+              WHERE sha256_hex > $1
+              ORDER BY sha256_hex
+              LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("sha256_hex"), r.get::<String, _>("cid")))
+            .collect())
+    }
+
+    /// Where the U4 repair sweep's walk left off, or `""` before it has ever run.
+    /// Empty string sorts below every hex oid, so a first run and a rewound run are
+    /// the same code path (`sha256_hex > ''` is the whole table).
+    pub async fn pin_repair_cursor(&self) -> Result<String> {
+        let row = sqlx::query("SELECT cursor FROM pin_repair_sweep WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("cursor"))
+            .unwrap_or_default())
+    }
+
+    /// Persist the sweep's walk position. Written after every batch, so a restart
+    /// resumes rather than re-walking the table from the beginning. A rewrite is a
+    /// plain upsert: the sweep is the single writer, and re-repairing an
+    /// already-repaired row is a no-op anyway (the codec cost gate spares it).
+    pub async fn set_pin_repair_cursor(&self, cursor: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_repair_sweep (id, cursor) VALUES (1, $1)
+             ON CONFLICT (id) DO UPDATE SET cursor = EXCLUDED.cursor",
+        )
+        .bind(cursor)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// The repository a pinned object was recorded from (`pinned_cids.repo_id`),
     /// or `None` for a legacy pin (recorded before provenance existed) or an
     /// unpinned oid. `GET /ipfs/{cid}` uses this to gate+serve the ONE source
@@ -2642,6 +2721,17 @@ impl Db {
         Ok(row.map(|r| r.get("recipients_tag")))
     }
 
+    /// Every pinned object this node ADVERTISES (`GET /api/v1/ipfs/pins`).
+    ///
+    /// U4 (#173): rows still keyed on a legacy PROVIDER CID (Kubo dag-pb / Pinata
+    /// CIDv0, written by releases before this branch) are withheld from the listing.
+    /// The `/ipfs/{cid}` resolver recomputes the raw-content CID from the object bytes
+    /// and refuses any row whose stored key does not match, so advertising the legacy
+    /// key hands a client a CID this node deliberately will not serve. The background
+    /// repair sweep rewrites those rows to the raw key, and each one reappears here the
+    /// moment it is repaired. Filtering is done in Rust because the raw-CIDv1 test is a
+    /// multibase+codec decode (`is_raw_cidv1`), not something SQL can express; it is the
+    /// SAME predicate the repair path uses as its cost gate, so the two cannot drift.
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
         let rows = sqlx::query(
             "SELECT sha256_hex, cid, pinned_at, pinata_cid FROM pinned_cids ORDER BY pinned_at DESC",
@@ -2650,6 +2740,7 @@ impl Db {
         .await?;
         Ok(rows
             .into_iter()
+            .filter(|r| gitlawb_core::cid::is_raw_cidv1(r.get::<&str, _>("cid")))
             .map(|r| PinnedCidRecord {
                 sha256_hex: r.get("sha256_hex"),
                 cid: r.get("cid"),

@@ -99,6 +99,166 @@ async fn repair_legacy_provider_cid(
     db.repair_legacy_provider_cid(sha, &raw, &stored).await
 }
 
+/// What one sweep pass (or a whole sweep run) did. `scanned` counts `pinned_cids`
+/// rows READ, which is the quantity the batch size bounds; `repaired` counts rows
+/// whose key was actually rewritten to the raw CID.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SweepStats {
+    pub scanned: usize,
+    pub repaired: usize,
+    pub passes: usize,
+}
+
+/// One bounded pass of the U4 sweep: read at most `batch` `pinned_cids` rows after
+/// the persisted cursor, repair the legacy ones, and persist the new cursor.
+///
+/// The batch is what bounds the pass. It caps rows READ, not rows repaired, because
+/// the legacy predicate is a codec decode SQL cannot express; a table of raw rows
+/// therefore costs one indexed range scan per pass and nothing else.
+///
+/// The cursor advances to the LAST row read whatever happened to each row, including
+/// rows that were skipped as unrepairable. A cursor that only advanced on success
+/// would re-read the same unrepairable row on every pass and the sweep would never
+/// reach the rows behind it.
+async fn sweep_pass(
+    repos_dir: &std::path::Path,
+    git_bin: &str,
+    git_timeout: Duration,
+    batch: i64,
+    db: &crate::db::Db,
+) -> Result<SweepStats> {
+    let cursor = db.pin_repair_cursor().await?;
+    let rows = db.pinned_cids_after(&cursor, batch).await?;
+    let scanned = rows.len();
+    let mut repaired = 0usize;
+    let mut last = cursor;
+
+    for (sha, stored) in rows {
+        // Advance FIRST: every path below this line may skip the row, and none of them
+        // may wedge the walk (scenario 7).
+        last = sha.clone();
+        // Same cost gate as the skip-path repair: a canonical raw CIDv1 key is already
+        // the resolver key, so it reads no bytes and resolves no repo.
+        if gitlawb_core::cid::is_raw_cidv1(&stored) {
+            continue;
+        }
+        // Resolve the row's repo from its recorded provenance (first-pinner plus the
+        // bounded additional source set). An empty set is a pin recorded before
+        // provenance existed: nothing to read the bytes from, so skip it.
+        let sources = match db.pin_sources_for_oid(&sha).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(sha = %sha, err = %e, "sweep: failed to read pin sources");
+                continue;
+            }
+        };
+        for repo_id in sources {
+            let repo = match db.get_repo_by_id(&repo_id).await {
+                Ok(Some(r)) => r,
+                // The repo row is gone: a later source may still hold the bytes.
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(repo_id = %repo_id, err = %e, "sweep: failed to read repo");
+                    continue;
+                }
+            };
+            // Derive the LOCAL disk path rather than going through `repo_store.acquire`.
+            // The sweep is opportunistic background maintenance over every pinned row on
+            // the node, so it must never pull a cold repo back from remote storage: that
+            // would turn a repair pass into a bulk restore. A repo that is not on local
+            // disk simply reads no bytes here and stays withheld for a later pass or a
+            // re-push, which is the same non-destructive outcome as missing bytes.
+            let repo_path =
+                crate::git::store::repo_disk_path(repos_dir, &repo.owner_did, &repo.name);
+            if let Err(e) =
+                repair_legacy_provider_cid(&repo_path, git_bin, git_timeout, &sha, db).await
+            {
+                tracing::warn!(sha = %sha, err = %e, "sweep: legacy provider-CID repair failed");
+                continue;
+            }
+            // `repair_legacy_provider_cid` is best-effort and silent about which of its
+            // outcomes it took (bytes gone, read failed, rewritten), so read the key back
+            // to decide whether to stop trying sources. A no-op re-read on an
+            // already-repaired row is one indexed lookup.
+            match db.cid_for_oid(&sha).await {
+                Ok(Some(c)) if gitlawb_core::cid::is_raw_cidv1(&c) => {
+                    repaired += 1;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(sha = %sha, err = %e, "sweep: failed to re-read repaired key");
+                    continue;
+                }
+            }
+        }
+    }
+
+    db.set_pin_repair_cursor(&last).await?;
+    Ok(SweepStats {
+        scanned,
+        repaired,
+        passes: 1,
+    })
+}
+
+/// Test seam for a single bounded pass (scenarios 4 and 5 drive passes by hand to
+/// observe the batch bound and the restart-resumes-from-cursor behavior).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn sweep_legacy_provider_cids_once(
+    repos_dir: &std::path::Path,
+    git_bin: &str,
+    git_timeout: Duration,
+    batch: i64,
+    db: &crate::db::Db,
+) -> Result<SweepStats> {
+    sweep_pass(repos_dir, git_bin, git_timeout, batch, db).await
+}
+
+/// U4 (#173): the one-shot legacy provider-CID migration sweep.
+///
+/// Releases before this branch stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0)
+/// in `pinned_cids.cid`. This branch's `/ipfs/{cid}` resolver recomputes the raw
+/// content CID and withholds any row whose key does not match, so those rows are
+/// unresolvable. The opportunistic repair on the already-pinned skip path only fires
+/// when a later push re-carries the object, and normal git negotiation omits objects
+/// the node already has, so on an upgraded node that push generally never comes. This
+/// walks the table instead.
+///
+/// Runs until a pass comes back short of a full batch, which is the end of the table.
+/// Sleeps `delay` between full batches so it cannot monopolize the DB, and persists
+/// its cursor every pass so a restart continues instead of rewinding. Errors reading
+/// or repairing an individual row are warn-and-skip; only a failure of the batch query
+/// or the cursor write ends the run, and a later run picks up from the stored cursor.
+pub(crate) async fn sweep_legacy_provider_cids(
+    repos_dir: &std::path::Path,
+    git_bin: &str,
+    git_timeout: Duration,
+    batch: i64,
+    delay: Duration,
+    db: &crate::db::Db,
+) -> SweepStats {
+    let mut totals = SweepStats::default();
+    loop {
+        let pass = match sweep_pass(repos_dir, git_bin, git_timeout, batch, db).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(err = %e, "legacy provider-CID sweep pass failed; stopping");
+                return totals;
+            }
+        };
+        totals.scanned += pass.scanned;
+        totals.repaired += pass.repaired;
+        totals.passes += 1;
+        // A short batch means the ordered walk reached the end of the table. Stop here
+        // rather than after an extra empty pass, and do NOT sleep on the way out.
+        if (pass.scanned as i64) < batch {
+            return totals;
+        }
+        tokio::time::sleep(delay).await;
+    }
+}
+
 // Test-only cost-gate counter (R8, U7): how many times the opportunistic repair
 // read an object's bytes on the skip path. The codec gate must spare a CIDv1/raw
 // row this read; the counter is the both-ways guard (removing the gate reads the

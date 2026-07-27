@@ -403,6 +403,39 @@ pub struct Config {
     /// disables that derived bucket too.
     #[arg(long, env = "GITLAWB_IPFS_RATE_LIMIT", default_value_t = 600)]
     pub ipfs_rate_limit: usize,
+
+    /// Rows the legacy provider-CID repair sweep reads per batch (U4, #173).
+    ///
+    /// The sweep walks every `pinned_cids` row on the node once, repairing rows that
+    /// releases before this branch keyed on a PROVIDER CID (Kubo dag-pb / Pinata CIDv0)
+    /// instead of the raw-content resolver key. This bounds one batch, so the sweep can
+    /// never turn into a single unbounded table scan competing with request traffic.
+    /// Conservative on purpose: paired with the inter-batch delay below the default is
+    /// ~64 rows per minute, which finishes a large pin set in hours of idle background
+    /// work rather than one expensive burst. Must be between 1 and 100_000.
+    #[arg(
+        long,
+        env = "GITLAWB_PIN_REPAIR_SWEEP_BATCH",
+        default_value_t = 64,
+        value_parser = clap::builder::RangedU64ValueParser::<i64>::new().range(1..=100_000)
+    )]
+    pub pin_repair_sweep_batch: i64,
+
+    /// Seconds the legacy provider-CID repair sweep sleeps between batches (U4, #173).
+    ///
+    /// Each batch costs an indexed range scan plus, for the legacy rows in it, a
+    /// `git cat-file` per row. The delay is what keeps that off the DB's and the disk's
+    /// critical path: the sweep is repairing rows that have been unresolvable since the
+    /// upgrade, so finishing slowly is fine and finishing fast at the cost of live
+    /// traffic is not. `0` disables the pause (test and one-off operational use only).
+    /// Must be between 0 and 86_400.
+    #[arg(
+        long,
+        env = "GITLAWB_PIN_REPAIR_SWEEP_DELAY_SECS",
+        default_value_t = 60,
+        value_parser = clap::builder::RangedU64ValueParser::<u64>::new().range(0..=86_400)
+    )]
+    pub pin_repair_sweep_delay_secs: u64,
 }
 
 impl Config {
@@ -520,6 +553,35 @@ mod tests {
             Config::parse_from(["gitlawb-node", "--max-concurrent-ipfs-walks", "1048576"])
                 .max_concurrent_ipfs_walks,
             1_048_576
+        );
+    }
+
+    /// U4 (#173): the repair sweep's bounds are conservative by default and a batch of
+    /// 0 (a sweep that walks nothing and never terminates) is a CLI error, not a
+    /// runtime hang. The delay does accept 0, for tests and one-off operational runs.
+    #[test]
+    fn pin_repair_sweep_knobs_default_conservatively() {
+        let c = Config::parse_from(["gitlawb-node"]);
+        assert_eq!(c.pin_repair_sweep_batch, 64);
+        assert_eq!(c.pin_repair_sweep_delay_secs, 60);
+
+        assert!(Config::try_parse_from(["gitlawb-node", "--pin-repair-sweep-batch", "0"]).is_err());
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--pin-repair-sweep-batch", "100001"]).is_err()
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--pin-repair-sweep-batch", "8"])
+                .pin_repair_sweep_batch,
+            8
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--pin-repair-sweep-delay-secs", "0"])
+                .pin_repair_sweep_delay_secs,
+            0
+        );
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--pin-repair-sweep-delay-secs", "86401"])
+                .is_err()
         );
     }
 
