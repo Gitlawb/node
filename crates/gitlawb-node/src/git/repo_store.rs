@@ -44,6 +44,21 @@ pub struct RepoStore {
     /// window and cancel it there.
     #[cfg(test)]
     tigris_stall: Option<std::time::Duration>,
+    /// Test-only counter of how many times a write guard from this store REACHED the
+    /// Tigris upload site in `release` (the point past the `success` check, where a
+    /// configured client would be uploaded to). It counts the decision, not a network
+    /// call: `TigrisClient` takes its endpoint from process-wide AWS env vars and has no
+    /// injectable seam, so every test runs with `tigris: None` and a counter inside the
+    /// `Some` arm could never move. Reaching the site is the property under test anyway:
+    /// an interrupted push must not publish a half-applied repo, and the disconnect path
+    /// must therefore never get here (#173 F2).
+    ///
+    /// Per store rather than a process global, so cases running in parallel do not see
+    /// each other's uploads, and an `Arc` rather than a `thread_local` because the guard
+    /// is released from a detached task on another worker thread. Same test-only counter
+    /// idiom as `ipfs_pin::note_legacy_repair_read`.
+    #[cfg(test)]
+    upload_site_reached: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RepoStore {
@@ -66,6 +81,14 @@ impl RepoStore {
         self
     }
 
+    /// Test-only: how many write guards from this store have reached the Tigris upload
+    /// site. See [`RepoStore::upload_site_reached`].
+    #[cfg(test)]
+    pub fn tigris_upload_site_reached(&self) -> usize {
+        self.upload_site_reached
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// `lock_pool` must come from `build_lock_pool`; a plain pool leaks advisory
     /// locks on cancellation.
     pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, lock_pool: PgPool) -> Self {
@@ -76,6 +99,8 @@ impl RepoStore {
             migrated: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(test)]
             tigris_stall: None,
+            #[cfg(test)]
+            upload_site_reached: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -270,6 +295,8 @@ impl RepoStore {
             lock_key,
             lock_conn,
             tigris: self.tigris.clone(),
+            #[cfg(test)]
+            upload_site_reached: Arc::clone(&self.upload_site_reached),
         })
     }
 
@@ -461,6 +488,10 @@ pub struct RepoWriteGuard {
     /// clears the lock.
     lock_conn: PoolConnection<Postgres>,
     tigris: Option<TigrisClient>,
+    /// Shared with the store that handed this guard out; see
+    /// [`RepoStore::upload_site_reached`].
+    #[cfg(test)]
+    upload_site_reached: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RepoWriteGuard {
@@ -477,6 +508,13 @@ impl RepoWriteGuard {
     pub async fn release(mut self, success: bool) {
         // Upload to Tigris only on success.
         if success {
+            // The upload site, recorded for tests before the client is consulted: with
+            // no injectable seam on `TigrisClient` a counter inside the arm below could
+            // never move, and it is reaching this point at all that an interrupted push
+            // must not do (#173 F2).
+            #[cfg(test)]
+            self.upload_site_reached
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if let Some(ref tigris) = self.tigris {
                 if let Err(e) = tigris
                     .upload(&self.owner_slug, &self.repo_name, &self.local_path)

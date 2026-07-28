@@ -543,42 +543,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // U4 (#173): one-shot legacy provider-CID repair sweep. Releases before this
-    // version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
-    // and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is
-    // not the raw-content CID. The opportunistic repair on the pin path only fires when
-    // a push re-carries the object, which normal git negotiation makes it not do, so
-    // those rows need a walk. DETACHED, never on the boot path: the server below starts
-    // and serves while this runs, and the sweep's own batch bound plus inter-batch delay
-    // keep it off the DB's critical path. Its cursor is durable, so a restart mid-walk
-    // resumes instead of rewinding.
-    {
-        let db = state.db.clone();
-        let repos_dir = config.repos_dir.clone();
-        let git_bin = state.git_bin.clone();
-        let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
-        let batch = config.pin_repair_sweep_batch;
-        let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
-        let mut shutdown_rx = state.subscribe_shutdown();
-        tokio::spawn(async move {
-            tokio::select! {
-                stats = ipfs_pin::sweep_legacy_provider_cids(
-                    &repos_dir, &git_bin, git_timeout, batch, delay, &db,
-                ) => {
-                    if stats.repaired > 0 {
-                        tracing::info!(
-                            scanned = stats.scanned,
-                            repaired = stats.repaired,
-                            "legacy provider-CID sweep finished"
-                        );
-                    }
-                }
-                // Shutdown mid-walk simply drops the run; the persisted cursor means the
-                // next boot picks up where this one stopped.
-                _ = shutdown_rx.changed() => {}
-            }
-        });
-    }
+    let _legacy_cid_sweep = spawn_legacy_cid_sweep(&state, &config);
 
     let router = server::build_router(state.clone());
     // Re-register the socket bound at startup — same fd, so there was never a
@@ -700,6 +665,49 @@ async fn main() -> Result<()> {
     serve_result?;
     info!("clean exit");
     Ok(())
+}
+
+/// U4 (#173): spawn the one-shot legacy provider-CID repair sweep. Releases before this
+/// version stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in `pinned_cids.cid`,
+/// and this version's `/ipfs/{cid}` resolver withholds any row whose stored key is not
+/// the raw-content CID. The opportunistic repair on the pin path only fires when a push
+/// re-carries the object, which normal git negotiation makes it not do, so those rows
+/// need a walk. DETACHED, never on the boot path: the caller keeps serving while this
+/// runs, and the sweep's own batch bound plus inter-batch delay keep it off the DB's
+/// critical path. Its cursor is durable, so a restart mid-walk resumes instead of
+/// rewinding.
+///
+/// A named function rather than an inline block in `main` so the WIRING has a seam a
+/// test can call: that the task is spawned at all, that it reads its batch and delay
+/// from the config knobs rather than some other field, that the caller is not blocked
+/// on it, and that the shutdown watcher actually ends it mid-walk. The sweep's own
+/// behavior is covered elsewhere; this is the boot-path half.
+fn spawn_legacy_cid_sweep(state: &AppState, config: &Config) -> tokio::task::JoinHandle<()> {
+    let db = state.db.clone();
+    let repos_dir = config.repos_dir.clone();
+    let git_bin = state.git_bin.clone();
+    let git_timeout = std::time::Duration::from_secs(config.git_service_timeout_secs);
+    let batch = config.pin_repair_sweep_batch;
+    let delay = std::time::Duration::from_secs(config.pin_repair_sweep_delay_secs);
+    let mut shutdown_rx = state.subscribe_shutdown();
+    tokio::spawn(async move {
+        tokio::select! {
+            stats = ipfs_pin::sweep_legacy_provider_cids(
+                &repos_dir, &git_bin, git_timeout, batch, delay, &db,
+            ) => {
+                if stats.repaired > 0 {
+                    tracing::info!(
+                        scanned = stats.scanned,
+                        repaired = stats.repaired,
+                        "legacy provider-CID sweep finished"
+                    );
+                }
+            }
+            // Shutdown mid-walk simply drops the run; the persisted cursor means the
+            // next boot picks up where this one stopped.
+            _ = shutdown_rx.changed() => {}
+        }
+    })
 }
 
 fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
@@ -1159,6 +1167,110 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
         info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
         Ok(kp)
+    }
+}
+
+#[cfg(test)]
+mod legacy_cid_sweep_wiring_tests {
+    use super::spawn_legacy_cid_sweep;
+    use sqlx::PgPool;
+    use std::time::Duration;
+
+    /// Seed `count` `pinned_cids` rows whose keys are already canonical raw CIDv1, in a
+    /// known `sha256_hex` order. The sweep's own cost gate skips a raw-CIDv1 row without
+    /// reading bytes or resolving a repo, so each row is SCANNED (it advances the cursor)
+    /// and nothing else. That is what makes the cursor a clean readout of how far the
+    /// walk got, with no dependency on repos on disk.
+    async fn seed_scannable_rows(pool: &PgPool, count: usize) -> Vec<String> {
+        let mut shas = Vec::new();
+        for i in 1..=count {
+            let sha = format!("wire{i:02}");
+            let cid = gitlawb_core::cid::Cid::from_git_object_bytes(sha.as_bytes()).to_string();
+            assert!(
+                gitlawb_core::cid::is_raw_cidv1(&cid),
+                "the seeded key must hit the sweep's raw-CIDv1 skip, not a repair attempt"
+            );
+            sqlx::query("INSERT INTO pinned_cids (sha256_hex, cid, pinned_at) VALUES ($1, $2, $3)")
+                .bind(&sha)
+                .bind(&cid)
+                .bind("2020-01-01T00:00:00Z")
+                .execute(pool)
+                .await
+                .unwrap();
+            shas.push(sha);
+        }
+        shas
+    }
+
+    /// Poll the persisted sweep cursor until it reaches `want`, or give up.
+    async fn cursor_reaches(db: &crate::db::Db, want: &str, within: Duration) -> String {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            let c = db.pin_repair_cursor().await.unwrap();
+            if c == want || std::time::Instant::now() >= deadline {
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// #173 U4, the BOOT-PATH half. The sweep's own logic (batching, cursor resumption,
+    /// terminal vs retryable skips) is covered in `test_support`; what this covers is the
+    /// wiring `main` performs, which nothing else executes: the task is spawned at all,
+    /// it takes its batch and delay from the two `pin_repair_sweep_*` knobs rather than
+    /// some other config field, the caller is not blocked on the walk, and the shutdown
+    /// watcher ends the run mid-walk.
+    ///
+    /// Six scannable rows, batch 2, delay 30s. One pass must land the cursor on exactly
+    /// the second row and the task must then still be alive in its inter-batch sleep,
+    /// which pins both knobs at once: a different batch stops at a different row, and a
+    /// delay that did not come from the knob either finishes the table or leaves the task
+    /// gone. Shutdown must then end it while four rows are still unwalked.
+    #[sqlx::test]
+    async fn the_boot_path_spawns_the_sweep_detached_with_its_configured_knobs(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let shas = seed_scannable_rows(&pool, 6).await;
+        let repos_dir = tempfile::TempDir::new().unwrap();
+
+        let mut config = (*state.config).clone();
+        config.repos_dir = repos_dir.path().to_path_buf();
+        config.pin_repair_sweep_batch = 2;
+        // Far longer than this test runs, so a task still alive after the first pass can
+        // only be one that is honoring the configured inter-batch delay.
+        config.pin_repair_sweep_delay_secs = 30;
+
+        let started = std::time::Instant::now();
+        let handle = spawn_legacy_cid_sweep(&state, &config);
+        let spawn_cost = started.elapsed();
+
+        let cursor = cursor_reaches(&state.db, &shas[1], Duration::from_secs(10)).await;
+        assert_eq!(
+            cursor, shas[1],
+            "the spawned sweep must run and stop its first pass at the CONFIGURED batch \
+             bound (2), leaving the cursor on the second row"
+        );
+        assert!(
+            spawn_cost < Duration::from_secs(1),
+            "the sweep must be detached, not awaited on the boot path; the spawn took \
+             {spawn_cost:?}"
+        );
+        assert!(
+            !handle.is_finished(),
+            "with a 30s inter-batch delay the task must still be sleeping between passes, \
+             not finished: a finished task means the delay was not the configured one"
+        );
+
+        state.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("the shutdown watcher must end the sweep, and not after its 30s delay")
+            .expect("the sweep task must not panic");
+
+        assert_eq!(
+            state.db.pin_repair_cursor().await.unwrap(),
+            shas[1],
+            "shutdown must have ended the run MID-walk, with the remaining rows unwalked"
+        );
     }
 }
 

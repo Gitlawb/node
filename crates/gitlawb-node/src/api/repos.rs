@@ -4968,6 +4968,20 @@ mod tests {
             freed_after_reap,
             "the write lock must be released once the disconnected push's group is reaped"
         );
+        // The other half of the disconnect invariant, and the reason the guard rides the
+        // reaper rather than being released there: an interrupted push must not publish a
+        // half-applied repo. The guard is gone by now (the lock above only frees when it
+        // is), so the upload site has had its whole chance to be reached. The positive
+        // control is `receive_pack_success_reclaims_and_releases_the_write_lock`, which
+        // observes the same counter at 1: without it, a zero here would pass on any build
+        // where an upload is simply impossible.
+        assert_eq!(
+            state.repo_store.tigris_upload_site_reached(),
+            0,
+            "a push interrupted by a client disconnect must not reach the Tigris upload \
+             site: publishing a half-applied repo propagates it to every node that later \
+             downloads it (#173 F2)"
+        );
     }
 
     /// #173 F2, the other half: carrying the write lock through the admission seam must
@@ -5055,6 +5069,17 @@ mod tests {
         assert!(
             write_lock_is_takeable(&probe, key).await,
             "a completed push must reclaim its write lock and release it synchronously"
+        );
+        // POSITIVE CONTROL for the disconnect case's "no upload" assertion. A push that
+        // completed does reach the Tigris upload site, exactly once, so the zero the
+        // disconnect test observes is a real difference between the two paths rather than
+        // an artifact of tests running with no Tigris client configured. Exactly once,
+        // not at least once: a retried exec race releases with success = false and must
+        // not count.
+        assert_eq!(
+            state.repo_store.tigris_upload_site_reached(),
+            1,
+            "a completed push must reach the Tigris upload site once"
         );
     }
 
