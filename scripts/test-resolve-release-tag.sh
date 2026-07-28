@@ -84,7 +84,7 @@ awk '
     next
   }
 
-  in_step && !/^[[:space:]]*$/ {
+  in_step {
     step = step $0 ORS
     if ($0 ~ /^        id:[[:space:]]*rel[[:space:]]*$/) {
       is_rel = 1
@@ -110,6 +110,7 @@ job=docker
           # buildx's `--output name=` does no lowercasing — a mixed-case owner
           # makes the digest push fail with "invalid reference format".
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
 job=docker-manifest
       - name: Resolve release tag
         id: rel
@@ -119,6 +120,7 @@ job=docker-manifest
         run: |
           set -euo pipefail
           scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+
 job=npm-publish
       - name: Resolve release tag
         id: rel
@@ -128,6 +130,7 @@ job=npm-publish
         run: |
           set -euo pipefail
           scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+
 EOF
 
 if ! cmp "$expected_resolver_steps" "$actual_resolver_steps"; then
