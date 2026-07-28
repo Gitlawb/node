@@ -589,6 +589,21 @@ impl RepoWriteLeases {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// How many handlers currently reference this repo's lease entry: the holder plus
+    /// every waiter parked in [`acquire`](Self::acquire). The ref is taken SYNCHRONOUSLY,
+    /// before the (cancellable) semaphore wait, so a waiter is visible here the moment it
+    /// reaches the lease. Tests use it to observe "this push parked" as a state rather
+    /// than inferring it from a deadline that never fired.
+    #[cfg(test)]
+    pub fn refs_for(&self, repo_id: &str) -> usize {
+        self.repos
+            .lock()
+            .expect("repo_write_leases mutex poisoned")
+            .get(repo_id)
+            .map(|slot| slot.refs)
+            .unwrap_or(0)
+    }
 }
 
 /// Shared-ownership handle to a held repo write lease (#174 U2/F3). `Clone` hands a

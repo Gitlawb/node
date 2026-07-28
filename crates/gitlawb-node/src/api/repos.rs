@@ -5090,6 +5090,14 @@ mod tests {
             .execute(&mut *lock_conn)
             .await
             .expect("release the advisory lock");
+        // The follow-up asserts an ADMISSION property (the freed write slot is usable),
+        // so it must not inherit the 2s acquire deadline the shed above is testing. That
+        // budget covers a real advisory-lock round trip, and on a loaded machine it
+        // expires and returns the same `Overloaded` this assertion reads as a drained
+        // pool: a correct run going red for a reason the test is not about.
+        let mut followup_cfg = (*state.config).clone();
+        followup_cfg.git_acquire_timeout_secs = 120;
+        state.config = std::sync::Arc::new(followup_cfg);
         let followup = git_receive_pack(
             State(state.clone()),
             Path((owner.to_string(), name.to_string())),
@@ -7184,6 +7192,39 @@ mod tests {
         assert!(b_ran.exists(), "push B ran its receive-pack once unblocked");
     }
 
+    /// Backstop for the F1 wait loops below. It is a HANG detector, never the thing an
+    /// assertion rests on: every F1 conclusion is drawn from a state the loop actually
+    /// observed (a returned shed, a second reference on the lease entry), so a loaded
+    /// machine only spends more iterations getting there. It must stay comfortably under
+    /// `F1_HOLD_SECS` so push A is still holding the lease when the loop gives up.
+    #[cfg(unix)]
+    const F1_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long `f1_hanging_first_git`'s first receive-pack holds the lease. Bounded so a
+    /// RED run leaks no permanent orphan, and well above the two sequential `F1_BACKSTOP`
+    /// windows the discriminator can spend, so the hold never expires mid-observation on
+    /// a loaded machine. The old bound was 10s, which is under the 19s the pair took on a
+    /// contended box: push A's git would exit and free the lease mid-test.
+    #[cfg(unix)]
+    const F1_HOLD_SECS: usize = 150;
+
+    /// Poll `cond` until it holds, yielding between checks so spawned handlers make
+    /// progress. Returns false if `cap` elapses first. Callers assert on the state the
+    /// loop settled into, not on the elapsed time.
+    #[cfg(unix)]
+    async fn f1_wait_for(cap: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + cap;
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Fake git for the U1 lease-park tests. The FIRST receive-pack invocation marks
     /// that it reached the pack and hangs in a BOUNDED loop (so a RED run leaks no
     /// permanent orphan); every later invocation marks that it got past the lease.
@@ -7202,7 +7243,7 @@ mod tests {
                  cat >/dev/null 2>/dev/null\n\
                  if mkdir \"{seq}\" 2>/dev/null; then\n\
                    echo 1 > \"{ainp}\"\n\
-                   i=0; while [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n\
+                   i=0; while [ $i -lt {hold} ]; do sleep 1; i=$((i+1)); done\n\
                  else\n\
                    echo 1 > \"{later}\"\n\
                  fi ;;\n\
@@ -7213,6 +7254,7 @@ mod tests {
             seq = seq_a.display(),
             ainp = a_inpack.display(),
             later = later_ran.display(),
+            hold = F1_HOLD_SECS,
         );
         (write_fake_git(tmp, &body), a_inpack, later_ran)
     }
@@ -7228,10 +7270,13 @@ mod tests {
     /// them at `(max_concurrent_git_pushes / 8).max(1)` = 4 per source.
     ///
     /// Load-bearing: push A (source X) holds the lease and X's only per-caller slot.
-    /// Pre-fix push B (also X) parks on the lease and does not return inside the test
-    /// window (RED). Post-fix it sheds on the per-caller cap immediately (GREEN). The
-    /// elapsed assertion is the point: an error returned after `steal_after` would be
-    /// no fix at all.
+    /// Pre-fix push B (also X) reaches the lease and parks there (RED); post-fix it never
+    /// reaches the lease at all and sheds on the per-caller cap (GREEN). Shed-vs-park is
+    /// a question of WHICH PATH ran, so both outcomes are read as state, not as elapsed
+    /// time: the shed is B's returned `Overloaded`, and the park is the second reference
+    /// `RepoWriteLeases::acquire` takes on the lease entry (synchronously, before it
+    /// waits). The loop below waits for whichever of the two appears, so a machine that
+    /// is starved of CPU by a sibling test just iterates more times.
     #[cfg(unix)]
     #[sqlx::test]
     async fn f1_capped_source_sheds_instead_of_parking_on_a_contended_lease(pool: sqlx::PgPool) {
@@ -7246,12 +7291,20 @@ mod tests {
         // Per-source write cap of 1 so push A alone exhausts source X's budget. The
         // global write pool stays generous (64), so nothing here sheds on it.
         state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let repo_id = state
+            .db
+            .get_repo("z6f1cap", "c1")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
         let did = "did:key:z6MkF1CapPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let src_x: SocketAddr = "203.0.113.61:5000".parse().unwrap();
 
-        // Push A: drive its handler future in slices until it reaches receive-pack. It
-        // now holds the per-repo lease AND source X's single per-caller write slot.
-        let mut fut_a = Box::pin(git_receive_pack(
+        // Push A runs as its own task: the runtime schedules it, nothing here drives it in
+        // slices. It reaches receive-pack and then holds the per-repo lease AND source X's
+        // single per-caller write slot until it is aborted at the end.
+        let handle_a = tokio::spawn(git_receive_pack(
             State(state.clone()),
             Path(("z6f1cap".to_string(), "c1".to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
@@ -7259,48 +7312,59 @@ mod tests {
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
         ));
-        for _ in 0..1000 {
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut_a).await;
-            if a_inpack.exists() {
-                break;
-            }
-        }
         assert!(
-            a_inpack.exists(),
-            "push A must reach receive-pack and hold the lease plus source X's write slot"
+            f1_wait_for(F1_BACKSTOP, || a_inpack.exists()).await,
+            "push A never reached receive-pack within {F1_BACKSTOP:?}"
+        );
+        // Both preconditions read as state, so push B's shed below cannot be vacuous.
+        assert_eq!(
+            state.repo_write_leases.refs_for(&repo_id),
+            1,
+            "push A must hold the repo write lease, and be the only handler on it"
+        );
+        assert_eq!(
+            state.git_write_per_caller.tracked_keys(),
+            1,
+            "push A must be holding a per-caller write permit, so the cap of 1 is spent"
         );
 
         // Push B: SAME source, same repo. It must be turned away, not parked.
-        let started = std::time::Instant::now();
-        let b = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            git_receive_pack(
-                State(state.clone()),
-                Path(("z6f1cap".to_string(), "c1".to_string())),
-                Extension(crate::auth::AuthenticatedDid(did.to_string())),
-                crate::rate_limit::PeerAddr(Some(src_x)),
-                axum::http::HeaderMap::new(),
-                axum::body::Bytes::from_static(b"0000"),
-            ),
-        )
+        let handle_b = tokio::spawn(git_receive_pack(
+            State(state.clone()),
+            Path(("z6f1cap".to_string(), "c1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(src_x)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        // Wait for B to land in one of its two terminal states: returned (shed) or holding
+        // a reference on the lease entry (parked). They are mutually exclusive, and a
+        // parked waiter stays parked (steal_after is 1260s), so whichever the loop sees is
+        // stable rather than a sampled instant.
+        let settled = f1_wait_for(F1_BACKSTOP, || {
+            handle_b.is_finished() || state.repo_write_leases.refs_for(&repo_id) >= 2
+        })
         .await;
-        let elapsed = started.elapsed();
-        let b = b.expect(
+        assert!(
+            settled,
+            "push B neither returned nor reached the repo write lease within {F1_BACKSTOP:?}; \
+             it is stuck somewhere earlier in the handler"
+        );
+        assert_eq!(
+            state.repo_write_leases.refs_for(&repo_id),
+            1,
             "F1 RED: a source already at its per-source write cap PARKED on the contended \
              repo lease holding a fully buffered pack body. The per-caller write permit \
              must be taken BEFORE the lease so the request sheds instead of waiting out \
-             steal_after (1260s at defaults)",
+             steal_after (1260s at defaults)"
         );
+        let b = handle_b.await.expect("push B task must not panic");
         assert!(
             matches!(b, Err(AppError::Overloaded(_))),
             "the capped source's second push must shed with Overloaded/503; got {b:?}"
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "the shed must return promptly, not after the lease park; took {elapsed:?}"
-        );
 
-        drop(fut_a);
+        handle_a.abort();
     }
 
     /// #174 F1 (U1) THE DISCRIMINATOR: while source X sits at its per-source write cap
@@ -7313,9 +7377,13 @@ mod tests {
     /// resolved source IP and Y sheds too, which is exactly the node-wide shed
     /// `f02c5e1` was written to prevent.
     ///
-    /// Load-bearing on both halves: X's second push sheds promptly (RED pre-fix, where
-    /// it parks) AND Y's push stays parked rather than shedding (RED under the
-    /// constant-key mutation).
+    /// Load-bearing on both halves: X's second push reaches the lease and parks (RED
+    /// pre-fix) AND Y's push parks rather than shedding (RED under the constant-key
+    /// mutation, where Y is denied at the per-caller gate and returns). Both halves are
+    /// read as state, never as elapsed time: parked is a reference on the lease entry,
+    /// shed is a returned `Overloaded`. The old `sleep(300ms)` + `!is_finished()` check
+    /// had the worse failure mode of the two, since a starved runtime that had not yet
+    /// polled push C would satisfy it vacuously and the mutation would go green.
     #[cfg(unix)]
     #[sqlx::test]
     async fn f1_capped_source_shed_leaves_a_different_source_parked_and_served(pool: sqlx::PgPool) {
@@ -7328,12 +7396,19 @@ mod tests {
         let mut state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f1disc", "d1", false).await;
         state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let repo_id = state
+            .db
+            .get_repo("z6f1disc", "d1")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
         let did = "did:key:z6MkF1DiscPusherAAAAAAAAAAAAAAAAAAAAAAAAA";
         let src_x: SocketAddr = "203.0.113.63:5000".parse().unwrap();
         let src_y: SocketAddr = "203.0.113.64:5000".parse().unwrap();
 
         // Push A (source X) reaches receive-pack: holds the lease and X's only slot.
-        let mut fut_a = Box::pin(git_receive_pack(
+        let handle_a = tokio::spawn(git_receive_pack(
             State(state.clone()),
             Path(("z6f1disc".to_string(), "d1".to_string())),
             Extension(crate::auth::AuthenticatedDid(did.to_string())),
@@ -7341,29 +7416,35 @@ mod tests {
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from_static(b"0000"),
         ));
-        for _ in 0..1000 {
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut_a).await;
-            if a_inpack.exists() {
-                break;
-            }
-        }
-        assert!(a_inpack.exists(), "push A must reach receive-pack");
+        assert!(
+            f1_wait_for(F1_BACKSTOP, || a_inpack.exists()).await,
+            "push A never reached receive-pack within {F1_BACKSTOP:?}"
+        );
+        assert_eq!(
+            state.repo_write_leases.refs_for(&repo_id),
+            1,
+            "push A must hold the repo write lease, and be the only handler on it"
+        );
 
         // Push C from source Y: it has its own budget, so it takes Y's permit and parks
-        // on the lease A holds.
+        // on the lease A holds. Wait for it to reach either terminal state.
         let state_c = state.clone();
-        let handle_c = tokio::spawn(async move {
-            git_receive_pack(
-                State(state_c),
-                Path(("z6f1disc".to_string(), "d1".to_string())),
-                Extension(crate::auth::AuthenticatedDid(did.to_string())),
-                crate::rate_limit::PeerAddr(Some(src_y)),
-                axum::http::HeaderMap::new(),
-                axum::body::Bytes::from_static(b"0000"),
-            )
-            .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let handle_c = tokio::spawn(git_receive_pack(
+            State(state_c),
+            Path(("z6f1disc".to_string(), "d1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(src_y)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        let c_settled = f1_wait_for(F1_BACKSTOP, || {
+            handle_c.is_finished() || state.repo_write_leases.refs_for(&repo_id) >= 2
+        })
+        .await;
+        assert!(
+            c_settled,
+            "push C neither returned nor reached the repo write lease within {F1_BACKSTOP:?}"
+        );
         assert!(
             !handle_c.is_finished(),
             "F1 discriminator RED: a push from a DIFFERENT source was turned away while \
@@ -7371,28 +7452,34 @@ mod tests {
              source IP, so exhausting it denies only the exhausting source"
         );
 
-        // Push B from source X: shed, promptly, while C stays parked.
-        let started = std::time::Instant::now();
-        let b = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            git_receive_pack(
-                State(state.clone()),
-                Path(("z6f1disc".to_string(), "d1".to_string())),
-                Extension(crate::auth::AuthenticatedDid(did.to_string())),
-                crate::rate_limit::PeerAddr(Some(src_x)),
-                axum::http::HeaderMap::new(),
-                axum::body::Bytes::from_static(b"0000"),
-            ),
-        )
-        .await
-        .expect("the capped source must shed rather than park on the contended lease");
+        // Push B from source X: shed, while C stays parked. A third reference on the
+        // lease entry would mean B parked too.
+        let handle_b = tokio::spawn(git_receive_pack(
+            State(state.clone()),
+            Path(("z6f1disc".to_string(), "d1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(src_x)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        let b_settled = f1_wait_for(F1_BACKSTOP, || {
+            handle_b.is_finished() || state.repo_write_leases.refs_for(&repo_id) >= 3
+        })
+        .await;
+        assert!(
+            b_settled,
+            "push B neither returned nor reached the repo write lease within {F1_BACKSTOP:?}"
+        );
+        assert_eq!(
+            state.repo_write_leases.refs_for(&repo_id),
+            2,
+            "F1 RED: the capped source parked on the contended lease (A holding, C and B \
+             waiting) instead of shedding on its per-source write cap"
+        );
+        let b = handle_b.await.expect("push B task must not panic");
         assert!(
             matches!(b, Err(AppError::Overloaded(_))),
             "source X's second push must shed with Overloaded/503; got {b:?}"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(5),
-            "source X's shed must be prompt"
         );
         assert!(
             !handle_c.is_finished(),
@@ -7403,9 +7490,10 @@ mod tests {
             "no second receive-pack may run while A holds the lease"
         );
 
-        // Free the lease: A disconnects. Source Y's parked push is served.
-        drop(fut_a);
-        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), handle_c)
+        // Free the lease: A disconnects. Aborting drops its handler future at the child
+        // await, the same shape as a client hang-up. Source Y's parked push is served.
+        handle_a.abort();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(60), handle_c)
             .await
             .expect("push C must complete once A's group is reaped and the lease frees")
             .expect("push C task must not panic")
