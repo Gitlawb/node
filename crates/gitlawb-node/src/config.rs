@@ -319,6 +319,30 @@ pub struct Config {
     )]
     pub max_concurrent_git_pushes: usize,
 
+    /// Maximum number of pushes that may be PARKED on one repo's in-process write lease
+    /// at once. Same-repo pushes are serialized (block-and-wait), and a parked push has
+    /// already had its entire pack buffered by axum, so an unbounded queue on a contended
+    /// repo is unbounded buffered memory held for up to `git_service_timeout_secs * 2 +
+    /// 60` (1260s at defaults). Past this cap the newest push sheds a clean 503 +
+    /// Retry-After instead of joining the queue.
+    ///
+    /// The trade: raising it lets more same-repo pushes wait their turn (fewer 503s for a
+    /// hot repo, more memory pinned by waiters); lowering it sheds sooner. Only pushes to
+    /// the SAME repo count, and only ones parked right now, so the cap can never deny a
+    /// push to a different repo. The holder is deliberately not counted: a holder whose
+    /// cleanup never ran would otherwise pin a slot forever and wedge the repo, which is
+    /// the failure the `steal_after` reclaim exists to survive.
+    ///
+    /// Default: 8, a quarter of the default `max_concurrent_git_pushes` (32). Raising the
+    /// push pool does not raise this; set it explicitly. Must be between 1 and 1_048_576.
+    #[arg(
+        long,
+        env = "GITLAWB_REPO_LEASE_MAX_WAITERS",
+        default_value_t = 8,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=1_048_576)
+    )]
+    pub repo_lease_max_waiters: usize,
+
     /// Max concurrent post-push pin loops (`ipfs_pin` and `pinata`
     /// `pin_new_objects`) across all repos. `EncryptInflight` bounds the outstanding
     /// pin-task COUNT to one per repo, but each pin loop holds a full per-push

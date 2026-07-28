@@ -488,30 +488,54 @@ impl Drop for EncryptInflightGuard {
 /// block-and-wait, NOT coalesce. It mirrors [`EncryptInflight`]'s keyed-map + guard +
 /// Drop-frees-key STRUCTURE; the semantics differ (block-and-wait, so there is no
 /// lossy-coalesce degradation to fall back on).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RepoWriteLeases {
     // std::sync::Mutex: held only for O(1) map ops (get-or-create + refcount) in a sync
     // context, never across an await — the semaphore wait happens OUTSIDE this lock.
     repos: Arc<std::sync::Mutex<std::collections::HashMap<String, LeaseSlot>>>,
+    /// Most handlers allowed to be PARKED on one repo's lease at once
+    /// (`GITLAWB_REPO_LEASE_MAX_WAITERS`). Past it `acquire` sheds instead of queueing.
+    max_waiters: usize,
 }
 
-/// A per-repo lease entry: the one-permit semaphore plus a refcount of the handlers
-/// currently referencing it (holding or waiting). While `refs > 0` every acquirer
-/// shares the SAME semaphore, so mutual exclusion holds; the entry is removed only when
-/// `refs` hits 0 (no one references it), so a fresh entry can never split serialization.
+/// A per-repo lease entry: the one-permit semaphore, a refcount of the handlers
+/// currently referencing it (holding or waiting), and a count of the ones actually
+/// PARKED. While `refs > 0` every acquirer shares the SAME semaphore, so mutual exclusion
+/// holds; the entry is removed only when `refs` hits 0 (no one references it), so a fresh
+/// entry can never split serialization.
+///
+/// `waiters` and `refs` are deliberately different counts, and the shed cap is on
+/// `waiters`. `refs` includes the HOLDER, and a holder whose Drop never runs (task abort,
+/// runtime teardown without unwind, `mem::forget`: precisely the leak `steal_after` exists
+/// to survive) keeps its ref forever. Capping `refs` would let that leaked ref
+/// permanently occupy a slot and wedge the repo, reintroducing the permanent wedge the
+/// steal backstop was written to prevent. A waiter, by contrast, always leaves: it either
+/// gets the permit, steals at `steal_after`, is shed, or is cancelled, and every one of
+/// those paths drops the RAII waiter guard.
 struct LeaseSlot {
     sem: Arc<tokio::sync::Semaphore>,
     refs: usize,
+    waiters: usize,
 }
 
 impl RepoWriteLeases {
-    pub fn new() -> Self {
-        Self::default()
+    /// `max_waiters` is the per-repo live-waiter cap (see [`acquire`](Self::acquire)).
+    pub fn new(max_waiters: usize) -> Self {
+        Self {
+            repos: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            max_waiters: max_waiters.max(1),
+        }
     }
 
     /// Acquire the per-repo write lease, blocking until it is free (a second same-repo
     /// writer waits). `steal_after` bounds that wait: past it the acquirer STEALS
-    /// (proceeds permit-less) rather than block forever.
+    /// (proceeds permit-less) rather than block forever. Returns `None` when this repo
+    /// already has `max_waiters` handlers parked, so the caller sheds (503) instead of
+    /// adding to an unbounded queue: `git_receive_pack` reaches here with the whole pack
+    /// already buffered by axum, and the park runs to `steal_after` (1260s at defaults),
+    /// so unbounded parking is unbounded buffered bytes. The cap is per repo and counts
+    /// only live waiters, so shedding is confined to the contended repo; a push to any
+    /// other repo, from any source, is unaffected.
     ///
     /// Why a bounded steal: block-and-wait has no degradation of its own (unlike the
     /// coalescing [`EncryptInflight`], whose lost key merely delays a best-effort copy),
@@ -528,7 +552,11 @@ impl RepoWriteLeases {
     /// it. Nothing anywhere takes the pg lock before this lease, so the two serializers
     /// can never deadlock; taking the lease first also means a blocked second writer
     /// pins no pooled pg connection while it waits.
-    pub async fn acquire(&self, repo_id: &str, steal_after: std::time::Duration) -> RepoWriteLease {
+    pub async fn acquire(
+        &self,
+        repo_id: &str,
+        steal_after: std::time::Duration,
+    ) -> Option<RepoWriteLease> {
         // Take the entry refcount BEFORE the await, so the entry cannot be GC'd out from
         // under a waiter (a fresh entry for a new acquirer would split serialization).
         let sem = {
@@ -536,6 +564,7 @@ impl RepoWriteLeases {
             let slot = map.entry(repo_id.to_string()).or_insert_with(|| LeaseSlot {
                 sem: Arc::new(tokio::sync::Semaphore::new(1)),
                 refs: 0,
+                waiters: 0,
             });
             slot.refs += 1;
             Arc::clone(&slot.sem)
@@ -550,30 +579,64 @@ impl RepoWriteLeases {
             repos: Arc::clone(&self.repos),
             repo_id: repo_id.to_string(),
         };
-        let permit = match tokio::time::timeout(steal_after, Arc::clone(&sem).acquire_owned()).await
-        {
-            Ok(Ok(p)) => Some(p),
-            // The semaphore is never closed; treat the (unreachable) closed case as a
-            // steal so acquire always makes forward progress.
-            Ok(Err(_closed)) => None,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    repo = %repo_id,
-                    steal_after_secs = steal_after.as_secs(),
-                    "repo write-lease wait exceeded the steal bound; presuming a leaked \
-                     lease and proceeding permit-less (in-process serializer reclaim)"
-                );
-                None
+
+        // Uncontended fast path: take the free permit without spending waiter budget, so
+        // the cap bounds only handlers that actually park. `try_acquire_owned` on tokio's
+        // semaphore does NOT barge a queued FIFO waiter (it fails while anyone is queued),
+        // so the fast path is not a fairness hole; probed at 2000 rounds with a queued
+        // waiter present, 0 barges.
+        let permit = match Arc::clone(&sem).try_acquire_owned() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                // Contended: park, holding a waiter slot for exactly the cancellable wait.
+                // Claimed in ONE critical section (check and increment together), so a
+                // burst of concurrent acquirers cannot all read an under-cap count and
+                // then all park. Past the cap, drop the reservation (freeing the ref, and
+                // the entry with it if nobody else holds one) and shed.
+                let waiter = match WaiterSlot::claim(&self.repos, repo_id, self.max_waiters) {
+                    Some(w) => w,
+                    None => {
+                        tracing::warn!(
+                            repo = %repo_id,
+                            max_waiters = self.max_waiters,
+                            "repo write-lease waiter cap reached; shedding this acquirer"
+                        );
+                        drop(reservation);
+                        return None;
+                    }
+                };
+                let parked =
+                    tokio::time::timeout(steal_after, Arc::clone(&sem).acquire_owned()).await;
+                // Released HERE, at the end of the wait, not at the end of the push: past
+                // this point the handler is a holder, counted by `refs`, and a waiter slot
+                // it kept would be budget no parked request could ever use.
+                drop(waiter);
+                match parked {
+                    Ok(Ok(p)) => Some(p),
+                    // The semaphore is never closed; treat the (unreachable) closed case
+                    // as a steal so acquire always makes forward progress.
+                    Ok(Err(_closed)) => None,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            repo = %repo_id,
+                            steal_after_secs = steal_after.as_secs(),
+                            "repo write-lease wait exceeded the steal bound; presuming a \
+                             leaked lease and proceeding permit-less (in-process \
+                             serializer reclaim)"
+                        );
+                        None
+                    }
+                }
             }
         };
         // Transfer the ref from the reservation to the guard: forget the reservation (so
         // it does NOT decrement) and let the guard own the single decrement on its Drop.
         std::mem::forget(reservation);
-        RepoWriteLease(Arc::new(LeaseGuardInner {
+        Some(RepoWriteLease(Arc::new(LeaseGuardInner {
             repos: Arc::clone(&self.repos),
             repo_id: repo_id.to_string(),
             _permit: permit,
-        }))
+        })))
     }
 
     /// Number of repos with a live lease entry. Test/metrics observability.
@@ -602,6 +665,19 @@ impl RepoWriteLeases {
             .expect("repo_write_leases mutex poisoned")
             .get(repo_id)
             .map(|slot| slot.refs)
+            .unwrap_or(0)
+    }
+
+    /// How many handlers are PARKED on this repo's lease right now (the count the shed
+    /// cap is enforced against, holder excluded). Tests use it to observe "this push
+    /// parked" and "the waiter slot was released" as state.
+    #[cfg(test)]
+    pub fn waiters_for(&self, repo_id: &str) -> usize {
+        self.repos
+            .lock()
+            .expect("repo_write_leases mutex poisoned")
+            .get(repo_id)
+            .map(|slot| slot.waiters)
             .unwrap_or(0)
     }
 }
@@ -651,6 +727,51 @@ struct RefReservation {
 impl Drop for RefReservation {
     fn drop(&mut self) {
         release_lease_ref(&self.repos, &self.repo_id);
+    }
+}
+
+/// Holds one LIVE-WAITER slot on a lease entry for exactly the duration of the
+/// cancellable park inside [`RepoWriteLeases::acquire`]. Every way out of that park
+/// (permit acquired, steal on timeout, shed, or the acquire future being dropped on a
+/// client disconnect) drops this guard, so the count can only reflect handlers that are
+/// parked right now. That is why the shed cap is on this count and not on `refs`.
+struct WaiterSlot {
+    repos: Arc<std::sync::Mutex<std::collections::HashMap<String, LeaseSlot>>>,
+    repo_id: String,
+}
+
+impl WaiterSlot {
+    /// Claim a waiter slot, or `None` when the repo already has `max_waiters` live
+    /// waiters. The entry always exists here: the caller took its `refs` reference in an
+    /// earlier critical section and still holds it. Check and increment share one
+    /// critical section, so concurrent acquirers cannot overshoot the cap.
+    fn claim(
+        repos: &Arc<std::sync::Mutex<std::collections::HashMap<String, LeaseSlot>>>,
+        repo_id: &str,
+        max_waiters: usize,
+    ) -> Option<Self> {
+        if let Ok(mut map) = repos.lock() {
+            if let Some(slot) = map.get_mut(repo_id) {
+                if slot.waiters >= max_waiters {
+                    return None;
+                }
+                slot.waiters += 1;
+            }
+        }
+        Some(Self {
+            repos: Arc::clone(repos),
+            repo_id: repo_id.to_string(),
+        })
+    }
+}
+
+impl Drop for WaiterSlot {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.repos.lock() {
+            if let Some(slot) = map.get_mut(&self.repo_id) {
+                slot.waiters = slot.waiters.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -713,11 +834,11 @@ mod repo_write_lease_tests {
     /// steal reclaim so a leaked (never-run Drop) holder cannot wedge the repo forever.
     #[tokio::test]
     async fn serializes_same_repo_frees_key_and_steals_on_leak() {
-        let leases = RepoWriteLeases::new();
+        let leases = RepoWriteLeases::new(8);
         let big = Duration::from_secs(3600);
 
         // Block-and-wait: a second same-repo acquire waits while the first is held.
-        let a = leases.acquire("repo1", big).await;
+        let a = leases.acquire("repo1", big).await.expect("uncontended");
         let blocked =
             tokio::time::timeout(Duration::from_millis(200), leases.acquire("repo1", big)).await;
         assert!(
@@ -728,7 +849,8 @@ mod repo_write_lease_tests {
         drop(a);
         let b = tokio::time::timeout(Duration::from_millis(500), leases.acquire("repo1", big))
             .await
-            .expect("the second acquire must proceed once the first lease frees");
+            .expect("the second acquire must proceed once the first lease frees")
+            .expect("under the waiter cap, so it must not shed");
         drop(b);
 
         // Drop-frees-key: with no holders the entry is removed (bounded map growth).
@@ -738,24 +860,100 @@ mod repo_write_lease_tests {
         );
 
         // Distinct repos never serialize against each other.
-        let x = leases.acquire("repoX", big).await;
+        let x = leases.acquire("repoX", big).await.expect("uncontended");
         let _y = tokio::time::timeout(Duration::from_millis(200), leases.acquire("repoY", big))
             .await
-            .expect("distinct repos must not serialize");
+            .expect("distinct repos must not serialize")
+            .expect("a distinct repo has its own waiter budget");
         drop(x);
         drop(_y);
+    }
 
-        // Steal-on-timeout reclaim: a leaked holder (never-run Drop, simulated by
-        // mem::forget) must NOT wedge the repo — the bounded wait proceeds permit-less.
-        let leaked = leases.acquire("repoZ", big).await;
+    /// Scenario 4: the steal backstop survives the waiter cap. A holder whose Drop never
+    /// runs (task abort, runtime teardown, `mem::forget`) keeps its entry `refs` forever;
+    /// the next acquirer must still proceed permit-less at `steal_after` and must not be
+    /// shed on the way in. This is why the cap counts LIVE WAITERS and never `refs`:
+    /// capping `refs` (which includes the holder) lets one leaked lease pin a slot
+    /// permanently and wedge the repo, the exact permanent wedge the steal exists to
+    /// prevent. `max_waiters` is 1 here, so a `refs`-based cap has no room at all.
+    #[tokio::test]
+    async fn steal_on_leaked_lease_still_works_under_the_waiter_cap() {
+        let leases = RepoWriteLeases::new(1);
+        let big = Duration::from_secs(3600);
+
+        let leaked = leases.acquire("repoZ", big).await.expect("uncontended");
         std::mem::forget(leaked);
+        assert_eq!(
+            leases.refs_for("repoZ"),
+            1,
+            "the leaked holder keeps its entry reference forever (that is the leak)"
+        );
+
         let stolen = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(5),
             leases.acquire("repoZ", Duration::from_millis(150)),
         )
         .await
-        .expect("a leaked lease must be reclaimed by the bounded-wait steal, not hang forever");
+        .expect("a leaked lease must be reclaimed by the bounded-wait steal, not hang forever")
+        .expect(
+            "the waiter cap must not shed the stealer: it counts live waiters, and a leaked \
+             HOLDER is not a waiter. Capping refs instead wedges the repo permanently",
+        );
+        assert_eq!(
+            leases.waiters_for("repoZ"),
+            0,
+            "the stealer must return its waiter slot when its wait ends"
+        );
         drop(stolen);
+    }
+
+    /// Scenario 5: a shed leaves no residue. Past the cap `acquire` returns `None`
+    /// without keeping either count, so the entry still GCs once the real holder and the
+    /// real waiter finish. A shed that stranded a ref would leak the map entry forever;
+    /// one that stranded a waiter slot would shrink the repo's budget permanently.
+    #[tokio::test]
+    async fn shed_waiter_leaves_no_ref_or_waiter_residue() {
+        let leases = RepoWriteLeases::new(1);
+        let big = Duration::from_secs(3600);
+
+        let holder = leases.acquire("repoS", big).await.expect("uncontended");
+        let waiting = leases.clone();
+        let parked = tokio::spawn(async move { waiting.acquire("repoS", big).await });
+        assert!(
+            wait_for(Duration::from_secs(5), || leases.waiters_for("repoS") == 1).await,
+            "the second acquire must park and be counted as a live waiter"
+        );
+
+        // At the cap (1 live waiter): the next acquire sheds instead of queueing.
+        let shed = tokio::time::timeout(Duration::from_secs(5), leases.acquire("repoS", big))
+            .await
+            .expect("a shed must return immediately, not park");
+        assert!(
+            shed.is_none(),
+            "past max_waiters the acquire must shed (None), not join the queue"
+        );
+        assert_eq!(
+            leases.refs_for("repoS"),
+            2,
+            "the shed must leave no refcount residue: only the holder and the real waiter"
+        );
+        assert_eq!(
+            leases.waiters_for("repoS"),
+            1,
+            "the shed must leave no waiter-count residue: only the real waiter"
+        );
+
+        // The entry still GCs once the real handlers finish.
+        drop(holder);
+        let promoted = parked
+            .await
+            .expect("the parked acquire task must not panic")
+            .expect("the parked acquire must be served once the holder frees");
+        drop(promoted);
+        assert!(
+            wait_for(Duration::from_secs(5), || leases.is_empty()).await,
+            "the lease entry must still GC after a shed (no stranded ref)"
+        );
     }
 
     /// Cancellation safety: dropping an acquire future while it is BLOCKED waiting for
@@ -763,10 +961,10 @@ mod repo_write_lease_tests {
     /// entry refcount — after the holder frees and the waiter is cancelled, the key GCs.
     #[tokio::test]
     async fn cancelled_waiter_does_not_strand_the_refcount() {
-        let leases = RepoWriteLeases::new();
+        let leases = RepoWriteLeases::new(8);
         let big = Duration::from_secs(3600);
 
-        let a = leases.acquire("repoC", big).await;
+        let a = leases.acquire("repoC", big).await.expect("uncontended");
         // A waiter blocks, then is cancelled (its acquire future dropped) mid-wait.
         let cancelled =
             tokio::time::timeout(Duration::from_millis(150), leases.acquire("repoC", big)).await;
@@ -784,5 +982,105 @@ mod repo_write_lease_tests {
             leases.is_empty(),
             "a cancelled waiter must not strand the entry refcount (key must GC)"
         );
+    }
+
+    /// Scenario 6: a cancelled waiter returns its WAITER slot too, not just its ref. A
+    /// client that disconnects while parked is the common case, so a slot stranded here
+    /// would shrink the repo's waiter budget on every disconnect until the repo shed
+    /// every push. Observed as state: the count drops back to 0, and a later acquire on
+    /// the still-held lease parks rather than shedding, with the cap at 1.
+    #[tokio::test]
+    async fn cancelled_waiter_releases_its_waiter_slot() {
+        let leases = RepoWriteLeases::new(1);
+        let big = Duration::from_secs(3600);
+
+        let holder = leases.acquire("repoX2", big).await.expect("uncontended");
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(200), leases.acquire("repoX2", big)).await;
+        assert!(
+            cancelled.is_err(),
+            "the waiter must be parked, then cancelled mid-wait"
+        );
+        assert_eq!(
+            leases.waiters_for("repoX2"),
+            0,
+            "a cancelled waiter must release its waiter slot"
+        );
+
+        // The freed budget is usable: the next acquire parks (times out) instead of
+        // shedding (returning None immediately).
+        let next =
+            tokio::time::timeout(Duration::from_millis(300), leases.acquire("repoX2", big)).await;
+        assert!(
+            next.is_err(),
+            "the next acquire must be able to park on the freed waiter slot; it was shed \
+             instead, so the cancelled waiter's slot was stranded"
+        );
+        drop(holder);
+    }
+
+    /// Scenario 7: an uncontended acquire spends no waiter budget, and a promoted waiter
+    /// hands its slot back at the END OF ITS WAIT rather than holding it for the whole
+    /// push. With `max_waiters` at 1: the uncontended holder leaves the count at 0, the
+    /// one waiter is counted while parked, and once that waiter is promoted to holder the
+    /// count returns to 0 so the NEXT push can still park. Holding the slot for the push
+    /// instead would let one waiter permanently occupy the only slot, shedding every
+    /// same-repo push behind it.
+    #[tokio::test]
+    async fn uncontended_acquire_spends_no_waiter_budget() {
+        let leases = RepoWriteLeases::new(1);
+        let big = Duration::from_secs(3600);
+
+        // Fast path: the lease is free, so this takes it without parking.
+        let holder = leases.acquire("repoF", big).await.expect("uncontended");
+        assert_eq!(
+            leases.waiters_for("repoF"),
+            0,
+            "an uncontended acquire must take the free permit without spending waiter budget"
+        );
+
+        // One waiter parks behind it, spending the single slot.
+        let waiting = leases.clone();
+        let parked = tokio::spawn(async move { waiting.acquire("repoF", big).await });
+        assert!(
+            wait_for(Duration::from_secs(5), || leases.waiters_for("repoF") == 1).await,
+            "the second acquire must park and be counted"
+        );
+
+        // Promote it: the slot must come back at the end of its WAIT.
+        drop(holder);
+        let promoted = parked
+            .await
+            .expect("the parked acquire task must not panic")
+            .expect("the parked acquire must be served once the holder frees");
+        assert!(
+            wait_for(Duration::from_secs(5), || leases.waiters_for("repoF") == 0).await,
+            "a promoted waiter must release its waiter slot when its wait ends, not when \
+             its push finishes"
+        );
+
+        // ... so a third acquire can still park behind the new holder.
+        let third =
+            tokio::time::timeout(Duration::from_millis(300), leases.acquire("repoF", big)).await;
+        assert!(
+            third.is_err(),
+            "the freed waiter slot must be usable: this acquire was shed instead of parking"
+        );
+        drop(promoted);
+    }
+
+    /// Poll `cond` until it holds, yielding so spawned tasks progress. Returns false if
+    /// `cap` elapses first; callers assert on the state the loop settled into.
+    async fn wait_for(cap: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + cap;
+        loop {
+            if cond() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

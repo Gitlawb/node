@@ -412,9 +412,10 @@ async fn main() -> Result<()> {
         encrypt_inflight: crate::state::EncryptInflight::new(),
         // Per-repo in-process write-lease serializer (#174 U2/F3): supplements the pg
         // advisory lock so a disconnected push's still-reaping git group can't be raced
-        // by a second same-node push. Natural cap (one entry per contended repo, freed
-        // when unreferenced), no sized knob.
-        repo_write_leases: crate::state::RepoWriteLeases::new(),
+        // by a second same-node push. The map is naturally capped (one entry per contended
+        // repo, freed when unreferenced); the sized knob is how many pushes may PARK on
+        // one repo, since each parked push holds a fully buffered pack.
+        repo_write_leases: crate::state::RepoWriteLeases::new(config.repo_lease_max_waiters),
         git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             config.max_concurrent_reads_per_caller,
         ),
