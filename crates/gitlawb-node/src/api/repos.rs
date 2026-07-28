@@ -1541,8 +1541,9 @@ pub async fn git_receive_pack(
     let name = smart_http_repo_name(&repo)?;
     // Fast-path shed BEFORE the DB lookup when the write pool is saturated, so a push
     // flood on a full pool does not hit Postgres per request. Best-effort (racy) and
-    // NON-holding: the authoritative, held permit is taken after the per-repo lease below
-    // (so a lease-blocked waiter pins no write slot — #174 F3 review). This peek only
+    // NON-holding: the authoritative, held GLOBAL write permit is taken after the per-repo
+    // lease below (so a lease-blocked waiter pins no global write slot, #174 F3 review;
+    // the per-SOURCE sub-cap is taken above the lease, see there). This peek only
     // restores the cheap pre-DB shed the permit reorder would otherwise have lost.
     if state.git_write_semaphore.available_permits() == 0 {
         return Err(AppError::Overloaded(
@@ -1637,27 +1638,31 @@ pub async fn git_receive_pack(
     // overlap is the ~4s disconnect/reap window, which the reaper-carried clone (a) covers.
     let lease_steal_after =
         std::time::Duration::from_secs(state.config.git_service_timeout_secs * 2 + 60);
-    let lease = state
-        .repo_write_leases
-        .acquire(&record.id, lease_steal_after)
-        .await;
 
-    // Admission permits are taken HERE, AFTER the per-repo lease and BEFORE acquire_write.
-    // Ordering is the fix (#174 P2 DoS): the lease is a block-and-wait serializer, so a
-    // second same-repo push can park on `acquire` above for up to steal_after. Taking the
-    // scarce write permits only once we own the lease means a lease-blocked waiter pins NO
-    // write-pool slot while it waits. Otherwise a few hostile sources could stack same-repo
-    // pushes, hold every global slot on zero-byte lease-waiters, and shed 503 on every push
-    // to every OTHER repo node-wide. Still before acquire_write, so the git op stays
-    // admission-gated (INV-10) and a saturated pool sheds 503 before spawning git.
+    // The two write admission permits are DELIBERATELY split around the lease park.
     //
-    // Per-source sub-cap first (#174 P1-d): one source IP cannot occupy the whole write
-    // pool via many slow pushes. Owner enforcement defaults off, so any valid did:key is
-    // accepted (auth != authz) and the push rate limiter bounds arrival RATE, not in-flight
-    // concurrency. Keyed on the resolved source IP, NEVER the signed DID (a DID farm defeats
-    // a DID key); no resolvable key -> global write pool only. Then the global write permit:
-    // pushes draw from the dedicated WRITE pool, separate from reads, and it is held for the
-    // whole op (moved into the AdmissionGuard below).
+    // Per-source sub-cap BEFORE the lease (#174 P1-d, and F1 review). One source IP
+    // cannot occupy the whole write pool via many slow pushes: owner enforcement defaults
+    // off, so any valid did:key is accepted (auth != authz) and the push rate limiter
+    // bounds arrival RATE, not in-flight concurrency. It is taken here, above the park,
+    // because `body: Bytes` means axum has ALREADY buffered the entire pack (up to
+    // max_pack_bytes) before this function runs, and `acquire` below is a block-and-wait
+    // serializer whose waiter set is unbounded (state.rs) and whose wait runs to
+    // steal_after (git_service_timeout_secs * 2 + 60 = 1260s at defaults). With both
+    // permits below the lease nothing accounted for parked waiters, so one source could
+    // stack unbounded buffered bodies on a contended repo. The sub-cap is
+    // (max_concurrent_git_pushes / 8).max(1) = 4 at defaults, so it bounds parked bodies
+    // at 4 per source. Keyed on the resolved source IP, NEVER the signed DID (a DID farm
+    // defeats a DID key); no resolvable key -> global write pool only.
+    //
+    // The GLOBAL write permit deliberately stays BELOW the lease (#174 P2 DoS, f02c5e1).
+    // That is a scarce node-wide resource: a lease-blocked waiter holding one lets a few
+    // hostile sources stack same-repo pushes, pin every global slot on zero-byte
+    // lease-waiters, and shed 503 on every push to every OTHER repo node-wide. A
+    // per-source key is not global, so exhausting it denies only the exhausting source.
+    // Self-inflicted denial is the property that makes the sub-cap safe above the park and
+    // the global permit unsafe there. Both still land before acquire_write, so the git op
+    // stays admission-gated (INV-10) and a saturated pool sheds 503 before spawning git.
     let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
     let _caller_permit = acquire_read_caller_permit(
         &state.git_write_per_caller,
@@ -1665,6 +1670,12 @@ pub async fn git_receive_pack(
         name,
         "receive-pack",
     )?;
+
+    let lease = state
+        .repo_write_leases
+        .acquire(&record.id, lease_steal_after)
+        .await;
+
     let _permit = git_permit(&state.git_write_semaphore)?;
 
     tracing::debug!(repo = %name, "acquiring write lock");
@@ -7082,5 +7093,401 @@ mod tests {
             .expect("push B must succeed");
         assert_eq!(resp.status(), 200, "push B lands 200 after serialization");
         assert!(b_ran.exists(), "push B ran its receive-pack once unblocked");
+    }
+
+    /// Fake git for the U1 lease-park tests. The FIRST receive-pack invocation marks
+    /// that it reached the pack and hangs in a BOUNDED loop (so a RED run leaks no
+    /// permanent orphan); every later invocation marks that it got past the lease.
+    /// Returns `(git_bin, a_inpack marker, later_ran marker)`.
+    #[cfg(unix)]
+    fn f1_hanging_first_git(
+        tmp: &std::path::Path,
+    ) -> (String, std::path::PathBuf, std::path::PathBuf) {
+        let seq_a = tmp.join("f1_seq_a"); // first receive-pack wins this mkdir = push A
+        let a_inpack = tmp.join("f1_a.inpack");
+        let later_ran = tmp.join("f1_later.ran");
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               receive-pack)\n\
+                 cat >/dev/null 2>/dev/null\n\
+                 if mkdir \"{seq}\" 2>/dev/null; then\n\
+                   echo 1 > \"{ainp}\"\n\
+                   i=0; while [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n\
+                 else\n\
+                   echo 1 > \"{later}\"\n\
+                 fi ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            seq = seq_a.display(),
+            ainp = a_inpack.display(),
+            later = later_ran.display(),
+        );
+        (write_fake_git(tmp, &body), a_inpack, later_ran)
+    }
+
+    /// #174 F1 (U1, RED-before/GREEN-after): a source already at its per-source WRITE
+    /// sub-cap must SHED on a contended repo rather than park on the per-repo write
+    /// lease. `git_receive_pack` takes `body: Bytes`, so axum has already buffered the
+    /// whole pack (up to `max_pack_bytes`, 2 GB by default) before the handler runs,
+    /// and the lease park runs to `lease_steal_after` = `git_service_timeout_secs * 2
+    /// + 60` = 1260s at defaults. The waiter set in `RepoWriteLeases::acquire` is
+    /// unbounded, so with BOTH admission permits taken after the lease nothing accounts
+    /// for parked bodies. Taking the per-caller write permit BEFORE the lease bounds
+    /// them at `(max_concurrent_git_pushes / 8).max(1)` = 4 per source.
+    ///
+    /// Load-bearing: push A (source X) holds the lease and X's only per-caller slot.
+    /// Pre-fix push B (also X) parks on the lease and does not return inside the test
+    /// window (RED). Post-fix it sheds on the per-caller cap immediately (GREEN). The
+    /// elapsed assertion is the point: an error returned after `steal_after` would be
+    /// no fix at all.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f1_capped_source_sheds_instead_of_parking_on_a_contended_lease(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (git_bin, a_inpack, _later_ran) = f1_hanging_first_git(tmp.path());
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f1cap", "c1", false).await;
+        // Per-source write cap of 1 so push A alone exhausts source X's budget. The
+        // global write pool stays generous (64), so nothing here sheds on it.
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let did = "did:key:z6MkF1CapPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let src_x: SocketAddr = "203.0.113.61:5000".parse().unwrap();
+
+        // Push A: drive its handler future in slices until it reaches receive-pack. It
+        // now holds the per-repo lease AND source X's single per-caller write slot.
+        let mut fut_a = Box::pin(git_receive_pack(
+            State(state.clone()),
+            Path(("z6f1cap".to_string(), "c1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(src_x)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        for _ in 0..1000 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut_a).await;
+            if a_inpack.exists() {
+                break;
+            }
+        }
+        assert!(
+            a_inpack.exists(),
+            "push A must reach receive-pack and hold the lease plus source X's write slot"
+        );
+
+        // Push B: SAME source, same repo. It must be turned away, not parked.
+        let started = std::time::Instant::now();
+        let b = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            git_receive_pack(
+                State(state.clone()),
+                Path(("z6f1cap".to_string(), "c1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(src_x)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let b = b.expect(
+            "F1 RED: a source already at its per-source write cap PARKED on the contended \
+             repo lease holding a fully buffered pack body. The per-caller write permit \
+             must be taken BEFORE the lease so the request sheds instead of waiting out \
+             steal_after (1260s at defaults)",
+        );
+        assert!(
+            matches!(b, Err(AppError::Overloaded(_))),
+            "the capped source's second push must shed with Overloaded/503; got {b:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the shed must return promptly, not after the lease park; took {elapsed:?}"
+        );
+
+        drop(fut_a);
+    }
+
+    /// #174 F1 (U1) THE DISCRIMINATOR: while source X sits at its per-source write cap
+    /// on a contended repo, a push from a DIFFERENT source Y must still park on the
+    /// lease and be served once the lease frees. This is what distinguishes moving the
+    /// PER-CALLER permit above the lease from the rejected alternative of moving the
+    /// GLOBAL write permit (or any node-wide waiter cap) above it: exhausting a
+    /// per-source key denies only the exhausting source, so the denial is
+    /// self-inflicted. Key the permit on a constant instead of `read_caller_key`'s
+    /// resolved source IP and Y sheds too, which is exactly the node-wide shed
+    /// `f02c5e1` was written to prevent.
+    ///
+    /// Load-bearing on both halves: X's second push sheds promptly (RED pre-fix, where
+    /// it parks) AND Y's push stays parked rather than shedding (RED under the
+    /// constant-key mutation).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f1_capped_source_shed_leaves_a_different_source_parked_and_served(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (git_bin, a_inpack, later_ran) = f1_hanging_first_git(tmp.path());
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f1disc", "d1", false).await;
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let did = "did:key:z6MkF1DiscPusherAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let src_x: SocketAddr = "203.0.113.63:5000".parse().unwrap();
+        let src_y: SocketAddr = "203.0.113.64:5000".parse().unwrap();
+
+        // Push A (source X) reaches receive-pack: holds the lease and X's only slot.
+        let mut fut_a = Box::pin(git_receive_pack(
+            State(state.clone()),
+            Path(("z6f1disc".to_string(), "d1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(did.to_string())),
+            crate::rate_limit::PeerAddr(Some(src_x)),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        ));
+        for _ in 0..1000 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut_a).await;
+            if a_inpack.exists() {
+                break;
+            }
+        }
+        assert!(a_inpack.exists(), "push A must reach receive-pack");
+
+        // Push C from source Y: it has its own budget, so it takes Y's permit and parks
+        // on the lease A holds.
+        let state_c = state.clone();
+        let handle_c = tokio::spawn(async move {
+            git_receive_pack(
+                State(state_c),
+                Path(("z6f1disc".to_string(), "d1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(src_y)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !handle_c.is_finished(),
+            "F1 discriminator RED: a push from a DIFFERENT source was turned away while \
+             source X was at its cap. The write sub-cap must be keyed on the resolved \
+             source IP, so exhausting it denies only the exhausting source"
+        );
+
+        // Push B from source X: shed, promptly, while C stays parked.
+        let started = std::time::Instant::now();
+        let b = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            git_receive_pack(
+                State(state.clone()),
+                Path(("z6f1disc".to_string(), "d1".to_string())),
+                Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                crate::rate_limit::PeerAddr(Some(src_x)),
+                axum::http::HeaderMap::new(),
+                axum::body::Bytes::from_static(b"0000"),
+            ),
+        )
+        .await
+        .expect("the capped source must shed rather than park on the contended lease");
+        assert!(
+            matches!(b, Err(AppError::Overloaded(_))),
+            "source X's second push must shed with Overloaded/503; got {b:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "source X's shed must be prompt"
+        );
+        assert!(
+            !handle_c.is_finished(),
+            "source Y must still be parked on the lease, unaffected by X hitting its cap"
+        );
+        assert!(
+            !later_ran.exists(),
+            "no second receive-pack may run while A holds the lease"
+        );
+
+        // Free the lease: A disconnects. Source Y's parked push is served.
+        drop(fut_a);
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(30), handle_c)
+            .await
+            .expect("push C must complete once A's group is reaped and the lease frees")
+            .expect("push C task must not panic")
+            .expect("push C must succeed");
+        assert_eq!(
+            resp.status(),
+            200,
+            "the unaffected source's parked push lands 200 once the lease frees"
+        );
+        assert!(
+            later_ran.exists(),
+            "push C ran its receive-pack once the lease freed"
+        );
+    }
+
+    /// #174 F1 (U1) key shape: the write sub-cap is keyed on the SOURCE, not the repo.
+    /// A source at its cap is shed on EVERY repo (otherwise one source could hold four
+    /// buffered bodies per repo, and the bound would be `repos x cap x max_pack_bytes`),
+    /// while a different source is shed on none. Uncontended leases here: this pins the
+    /// key's shape, not the acquisition order.
+    #[sqlx::test]
+    async fn f1_write_cap_key_is_per_source_not_per_repo(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_write_semaphore = Arc::new(Semaphore::new(4));
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        for name in ["k1", "k2"] {
+            state
+                .db
+                .upsert_mirror_repo(
+                    "z6f1key",
+                    name,
+                    &format!("/tmp/f1-key-{name}-nonexistent"),
+                    None,
+                    false,
+                )
+                .await
+                .unwrap();
+        }
+
+        let did = "did:key:z6MkF1KeyPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let capped: SocketAddr = "203.0.113.65:5000".parse().unwrap();
+        let other: SocketAddr = "203.0.113.66:5000".parse().unwrap();
+        let _slot = state
+            .git_write_per_caller
+            .try_acquire(&capped.ip().to_string())
+            .expect("pin the capped source at its single write slot");
+
+        let push = |peer: SocketAddr, repo: &'static str| {
+            let st = state.clone();
+            async move {
+                git_receive_pack(
+                    State(st),
+                    Path(("z6f1key".to_string(), repo.to_string())),
+                    Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    crate::rate_limit::PeerAddr(Some(peer)),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::from_static(b"0000"),
+                )
+                .await
+            }
+        };
+
+        for repo in ["k1", "k2"] {
+            let r = push(capped, repo).await;
+            assert!(
+                matches!(r, Err(AppError::Overloaded(_))),
+                "the capped source must shed on repo {repo} too: the sub-cap is per \
+                 source, not per repo; got {r:?}"
+            );
+        }
+        let r = push(other, "k2").await;
+        assert!(
+            !matches!(r, Err(AppError::Overloaded(_))),
+            "a different source must not be shed on any repo while the capped source \
+             holds its slot; got {r:?}"
+        );
+    }
+
+    /// #174 F1 (U1) fallback: a caller with no resolvable source key (no trusted
+    /// header, no peer address) takes no per-caller permit and is bounded by the global
+    /// write pool only, exactly as before the move. `acquire_read_caller_permit`
+    /// returns `Ok(None)` for a `None` key, so it must never 503 here.
+    #[sqlx::test]
+    async fn f1_write_cap_is_inert_without_a_resolvable_source_key(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_write_semaphore = Arc::new(Semaphore::new(4));
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 1);
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        state
+            .db
+            .upsert_mirror_repo("z6f1none", "n1", "/tmp/f1-none-nonexistent", None, false)
+            .await
+            .unwrap();
+        // Saturate the limiter's only key slot as well, so a request that DID resolve a
+        // key would be shed. The keyless request must still pass.
+        let _slot = state
+            .git_write_per_caller
+            .try_acquire("203.0.113.67")
+            .expect("occupy the limiter's single key slot");
+
+        let r = git_receive_pack(
+            State(state.clone()),
+            Path(("z6f1none".to_string(), "n1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(
+                "did:key:z6MkF1NoKeyPusherAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            )),
+            crate::rate_limit::PeerAddr(None),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+        .await;
+        assert!(
+            !matches!(r, Err(AppError::Overloaded(_))),
+            "a caller with no resolvable source key must fall back to the global write \
+             pool only, never shed on the per-caller cap; got {r:?}"
+        );
+    }
+
+    /// #174 F1 (U1) no-regression: moving the per-caller permit above the lease must
+    /// not leak it. Two SEQUENTIAL clean pushes from the SAME source with the sub-cap
+    /// set to 1 must both land 200; if the first push's permit outlived its request the
+    /// second would 503, breaking every repeat pusher.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f1_sequential_pushes_from_one_source_release_the_write_permit(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let body = "#!/bin/sh\ncase \"$1\" in\n  receive-pack) cat >/dev/null 2>/dev/null ;;\n  rev-parse) echo deadbeef ;;\n  *) : ;;\nesac\nexit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6f1seq", "s1", false).await;
+        state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(1, 100);
+        let did = "did:key:z6MkF1SeqPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let src: SocketAddr = "203.0.113.68:5000".parse().unwrap();
+
+        for attempt in 1..=2 {
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                git_receive_pack(
+                    State(state.clone()),
+                    Path(("z6f1seq".to_string(), "s1".to_string())),
+                    Extension(crate::auth::AuthenticatedDid(did.to_string())),
+                    crate::rate_limit::PeerAddr(Some(src)),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::from_static(b"0000"),
+                ),
+            )
+            .await
+            .expect("a clean push must not wedge")
+            .unwrap_or_else(|e| panic!("push {attempt} from the same source must succeed: {e:?}"));
+            assert_eq!(resp.status(), 200, "clean push {attempt} lands 200");
+        }
+        assert_eq!(
+            state.git_write_per_caller.tracked_keys(),
+            0,
+            "every per-source write permit must be released when its push completes"
+        );
     }
 }
