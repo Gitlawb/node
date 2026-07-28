@@ -525,10 +525,62 @@ mod tests {
         }
     }
 
+    /// Cover the seam in `resolve_solver_url`, which is the only place the
+    /// parsed flag reaches the trust decision it governs.
+    ///
+    /// A loopback operator URL is load-bearing here: it is the only input whose
+    /// verdict changes with the flag, so it is the only input that can detect
+    /// the seam being hardcoded. Every other resolver test deliberately passes
+    /// the flag explicitly (`resolve_solver_url_with(.., false)`) and therefore
+    /// cannot see this. Without this test, replacing the seam's argument with
+    /// `true` — restoring the #227 bug, loopback HTTP trusted unconditionally
+    /// in release — leaves both this crate's suite and `gl`'s green.
+    #[test]
+    fn resolve_solver_url_honors_the_real_env_flag() {
+        let op = "http://127.0.0.1:9000";
+
+        {
+            // Flag on: the loopback operator origin is trusted and keeps the key.
+            let _g = EnvGuard::with_value("1");
+            let (url, key_trusted) = resolve_solver_url(None, Some(op));
+            assert_eq!(url, op, "=1 must honor the loopback operator origin");
+            assert!(key_trusted, "=1 must keep the key with the operator origin");
+        }
+        {
+            // Flag absent: plaintext loopback is not a valid key destination.
+            let _g = EnvGuard::unset();
+            let (url, key_trusted) = resolve_solver_url(None, Some(op));
+            assert_eq!(url, DEFAULT_URL, "unset must reject the loopback operator");
+            assert!(!key_trusted, "unset must withhold the key");
+        }
+        {
+            // The #227 footgun: presence is not enough, the value must be truthy.
+            let _g = EnvGuard::with_value("0");
+            let (url, key_trusted) = resolve_solver_url(None, Some(op));
+            assert_eq!(url, DEFAULT_URL, "=0 must reject the loopback operator");
+            assert!(!key_trusted, "=0 must withhold the key");
+        }
+        {
+            // The advertised argument must reach the resolver, not just the
+            // operator one. This is the only assertion driving a non-None
+            // advertised URL through the env-reading wrapper, so without it a
+            // wrapper that forwards `None` in its place stays green everywhere.
+            let _g = EnvGuard::with_value("1");
+            let advertised = "http://127.0.0.1:9000/v2";
+            let (url, key_trusted) = resolve_solver_url(Some(advertised), Some(op));
+            assert_eq!(
+                url, advertised,
+                "an advertised URL on the operator's own origin must be honored verbatim"
+            );
+            assert!(key_trusted, "the operator origin still owns the key");
+        }
+    }
+
     /// #227: `=0` / `=false` / empty / unset must NOT enable loopback HTTP;
-    /// only explicit truthy `1` / `true` may. Uses pure helpers so tests do
-    /// not mutate process-global environment (avoids races with parallel
-    /// resolver tests that also call `resolve_solver_url`).
+    /// only explicit truthy `1` / `true` may. Uses pure helpers, so it covers
+    /// the parsing rules without touching process-global environment; the
+    /// env-reading path itself is covered by the two tests above, which hold
+    /// `ICAPTCHA_ENV_LOCK` for the duration.
     #[test]
     fn insecure_env_only_truthy_enables_loopback_http() {
         assert!(
@@ -667,14 +719,15 @@ mod tests {
     #[test]
     fn rejects_non_https_advertised_url() {
         // A plaintext node-advertised URL is ignored; we fall back to default.
-        let (url, key_trusted) = resolve_solver_url(Some("http://evil.example/x"), None);
+        let (url, key_trusted) =
+            resolve_solver_url_with(Some("http://evil.example/x"), None, false);
         assert_eq!(url, DEFAULT_URL);
         assert!(!key_trusted);
     }
 
     #[test]
     fn rejects_https_url_with_non_allowlisted_host() {
-        let (url, key_trusted) = resolve_solver_url(Some("https://evil.example"), None);
+        let (url, key_trusted) = resolve_solver_url_with(Some("https://evil.example"), None, false);
         assert_eq!(url, DEFAULT_URL, "attacker host must not be honored");
         assert!(!key_trusted);
     }
@@ -683,7 +736,8 @@ mod tests {
     fn honors_advertised_default_host_but_withholds_key_without_operator() {
         // Default public host is allowlisted for talking, but with no operator
         // origin configured the API key has no trusted destination.
-        let (url, key_trusted) = resolve_solver_url(Some("https://icaptcha.gitlawb.com/v2"), None);
+        let (url, key_trusted) =
+            resolve_solver_url_with(Some("https://icaptcha.gitlawb.com/v2"), None, false);
         assert_eq!(url, "https://icaptcha.gitlawb.com/v2");
         assert!(!key_trusted);
     }
@@ -693,13 +747,14 @@ mod tests {
         let op = "https://icap.mynode.example";
         // Node advertises the operator's own origin → talk there, key allowed.
         let (url, key_trusted) =
-            resolve_solver_url(Some("https://icap.mynode.example/v1"), Some(op));
+            resolve_solver_url_with(Some("https://icap.mynode.example/v1"), Some(op), false);
         assert_eq!(url, "https://icap.mynode.example/v1");
         assert!(key_trusted);
 
         // Node advertises an attacker origin while an operator is configured →
         // ignore the advert, fall back to the operator origin, key stays with it.
-        let (url, key_trusted) = resolve_solver_url(Some("https://evil.example"), Some(op));
+        let (url, key_trusted) =
+            resolve_solver_url_with(Some("https://evil.example"), Some(op), false);
         assert_eq!(url, op);
         assert!(key_trusted);
     }
@@ -707,9 +762,12 @@ mod tests {
     #[test]
     fn no_advert_uses_operator_or_default() {
         let op = "https://icap.mynode.example";
-        assert_eq!(resolve_solver_url(None, Some(op)), (op.to_string(), true));
         assert_eq!(
-            resolve_solver_url(None, None),
+            resolve_solver_url_with(None, Some(op), false),
+            (op.to_string(), true)
+        );
+        assert_eq!(
+            resolve_solver_url_with(None, None, false),
             (DEFAULT_URL.to_string(), false)
         );
     }
@@ -717,7 +775,8 @@ mod tests {
     #[test]
     fn non_https_operator_is_not_trusted() {
         // A misconfigured plaintext operator URL is not a valid key destination.
-        let (url, key_trusted) = resolve_solver_url(None, Some("http://icap.mynode.example"));
+        let (url, key_trusted) =
+            resolve_solver_url_with(None, Some("http://icap.mynode.example"), false);
         assert_eq!(url, DEFAULT_URL);
         assert!(!key_trusted);
     }
