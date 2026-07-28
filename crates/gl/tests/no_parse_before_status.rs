@@ -90,13 +90,38 @@ fn scanned_handlers(src: &Path) -> Vec<(String, String)> {
         }
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        if text.contains("read_json") {
+        if has_read_json_call_site(&text) {
             handlers.push((file_name, text));
         }
     }
     handlers.sort();
     handlers
 }
+
+/// Does this file actually CALL `read_json`, as opposed to merely mentioning it?
+///
+/// Membership in the derived set must key on a call site, never on the text of
+/// the file. A textual `contains("read_json")` matched prose too, so a handler
+/// fully reverted off `read_json` kept its membership on the strength of a
+/// leftover comment ("previously routed through read_json"). Still-derived means
+/// the pinned-vs-derived equality below never fired, and the reverted file went
+/// on being scanned as though it were converted, so the deconversion — which
+/// drops the cap and the sanitizer — shipped green. Requiring the trailing `(`
+/// on a non-comment line also drops test names and doc references.
+fn has_read_json_call_site(text: &str) -> bool {
+    text.lines().any(|l| {
+        let t = l.trim_start();
+        !t.starts_with("//") && t.contains("read_json(")
+    })
+}
+
+/// How far above a parse site to look for its status check.
+///
+/// The widest legitimate gap in the tree is `sync.rs`'s hand-rolled status-first
+/// `Trigger` arm, whose `.status()` sits 19 lines above its parse; 24 leaves a
+/// little headroom. Wider is weaker, so this should shrink if that arm is ever
+/// routed through `read_json` like its siblings.
+const STATUS_LOOKBACK: usize = 24;
 
 /// Does `line` open a JSON parse — `.json().await`, or a turbofish
 /// `.json::<T>().await`, or the head of a split-line chain (`.json(` /
@@ -126,6 +151,21 @@ fn window_is_bypass(window: &str) -> bool {
     // which the joined window still contains.
     let completes = window.contains(".await");
     completes && window.contains(".is_success()")
+}
+
+/// Is there a status check ABOVE this parse site — i.e. is the parse guarded at
+/// all?
+///
+/// `window_is_bypass` only recognises a status check that lands AFTER the parse,
+/// so it describes one specific bypass and says nothing about a parse with no
+/// status check anywhere. That shape is the more dangerous revert (it renders a
+/// denial body as a successful result with no check at all) and it went green:
+/// with nothing matching `.is_success()` after it, there was nothing to flag.
+/// Requiring positive evidence of a status check first turns the rule from
+/// "detect one bad ordering" into "require the good ordering", which also covers
+/// a check spelled `as_u16() >= 400` since that still reads `.status()`.
+fn has_status_check_above(lookback: &str) -> bool {
+    lookback.contains(".status()") || lookback.contains(".is_success()")
 }
 
 #[test]
@@ -175,6 +215,7 @@ fn converted_handlers_never_parse_before_status() {
     );
 
     let mut offenders = Vec::new();
+    let mut unguarded = Vec::new();
     for (name, text) in &handlers {
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
@@ -188,6 +229,16 @@ fn converted_handlers_never_parse_before_status() {
             let window = lines[i..(i + 6).min(lines.len())].join("\n");
             if window_is_bypass(&window) {
                 offenders.push(format!("{name}:{}", i + 1));
+                continue;
+            }
+            // A parse that never resolves is not a read; only a completed parse
+            // can render a denial body as a result.
+            if !window.contains(".await") {
+                continue;
+            }
+            let lookback = lines[i.saturating_sub(STATUS_LOOKBACK)..i].join("\n");
+            if !has_status_check_above(&lookback) {
+                unguarded.push(format!("{name}:{}", i + 1));
             }
         }
     }
@@ -196,5 +247,11 @@ fn converted_handlers_never_parse_before_status() {
         offenders.is_empty(),
         "parse-before-status bypass present in converted handler(s) — route the read \
          through crate::http::read_json (status-first, capped, sanitized): {offenders:?}"
+    );
+    assert!(
+        unguarded.is_empty(),
+        "node response parsed with NO status check above it in a converted handler — \
+         the denial body is being rendered as a result. Route the read through \
+         crate::http::read_json (status-first, capped, sanitized): {unguarded:?}"
     );
 }

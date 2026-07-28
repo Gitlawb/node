@@ -233,9 +233,21 @@ pub(crate) async fn read_json(resp: reqwest::Response, what: &str) -> Result<Val
         // or message-less body (503 degraded, 413 body-limit) never surfaces raw
         // node bytes. A body whose `message` sits past the cap parses as truncated
         // garbage here and correctly falls back rather than being buffered whole.
+        //
+        // Fall back to `error` before giving up: the node's shared AppError
+        // envelope carries both keys, but the task API answers with `error` alone
+        // (`{"error":"task not found"}` in gitlawb-node/src/api/tasks.rs), so
+        // reading only `message` blanked every `gl task` denial to the generic
+        // "request failed". `sync.rs`'s hand-rolled reader already reads both; this
+        // matches it.
         let msg = serde_json::from_str::<Value>(&raw)
             .ok()
-            .and_then(|b| b.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+            .and_then(|b| {
+                b.get("message")
+                    .or_else(|| b.get("error"))
+                    .and_then(|m| m.as_str())
+                    .map(str::to_owned)
+            })
             .unwrap_or_else(|| "request failed".to_owned());
         anyhow::bail!(
             "{what} failed ({status}): {}",
@@ -736,13 +748,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_json_errs_on_non_2xx_json_without_message() {
-        // A non-2xx JSON body that lacks a `message` key falls back to "request failed".
+    async fn read_json_errs_on_non_2xx_json_without_message_or_error() {
+        // A non-2xx JSON body carrying NEITHER key is the real fallback case.
         let mut server = Server::new_async().await;
-        let resp = response_for(&mut server, 403, r#"{"error":"forbidden"}"#, true).await;
+        let resp = response_for(&mut server, 403, r#"{"detail":"forbidden"}"#, true).await;
         let err = read_json(resp, "repo").await.unwrap_err().to_string();
         assert!(err.contains("403"), "err={err}");
         assert!(err.contains("request failed"), "err={err}");
+        // The body's own text must not leak when no recognised key carries it.
+        assert!(!err.contains("forbidden"), "raw body leaked: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_surfaces_error_key_when_message_absent() {
+        // The task API answers with `error` alone — see
+        // gitlawb-node/src/api/tasks.rs `{"error":"task not found"}`. Reading only
+        // `message` blanked those denials to the generic "request failed", so the
+        // user was told nothing about why the call failed.
+        let mut server = Server::new_async().await;
+        let resp = response_for(&mut server, 404, r#"{"error":"task not found"}"#, true).await;
+        let err = read_json(resp, "task show").await.unwrap_err().to_string();
+        assert!(err.contains("404"), "err={err}");
+        assert!(err.contains("task not found"), "reason not surfaced: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_json_prefers_message_over_error_key() {
+        // The shared AppError envelope carries both; `message` is the human text
+        // and must win over the machine code in `error`.
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            500,
+            r#"{"error":"db_error","message":"database unavailable"}"#,
+            true,
+        )
+        .await;
+        let err = read_json(resp, "repo").await.unwrap_err().to_string();
+        assert!(err.contains("database unavailable"), "err={err}");
+        assert!(
+            !err.contains("db_error"),
+            "machine code won over message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_json_sanitizes_error_key_text() {
+        // The `error` fallback goes through the same sanitizer as `message`; a
+        // hostile node must not reach the terminal through the new path. The
+        // controls are JSON \u escapes so the body stays VALID JSON — embedding
+        // them raw would fail the parse and pass this test vacuously.
+        let mut server = Server::new_async().await;
+        let resp = response_for(
+            &mut server,
+            404,
+            r#"{"error":"a\u001b[31mb\u0007c\u202ed"}"#,
+            true,
+        )
+        .await;
+        let err = read_json(resp, "task show").await.unwrap_err().to_string();
+        // Proves the parse succeeded and the `error` key was read, not the
+        // "request failed" fallback (which would make the asserts below vacuous).
+        assert!(err.contains("task show failed (404"), "err={err}");
+        assert!(
+            !err.contains("request failed"),
+            "fell back, sanitizer untested: {err}"
+        );
+        assert!(
+            err.contains('a') && err.contains('d'),
+            "text dropped: {err}"
+        );
+        assert!(!err.contains('\u{1b}'), "ESC leaked: {err:?}");
+        assert!(!err.contains('\u{7}'), "BEL leaked: {err:?}");
+        assert!(!err.contains('\u{202e}'), "bidi override leaked: {err:?}");
     }
 
     /// #186 (F2): the non-2xx error path must read a CAPPED body, not buffer and

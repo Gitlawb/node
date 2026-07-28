@@ -710,6 +710,178 @@ mod tests {
         _root.assert_async().await;
     }
 
+    // ── --verify issuer anchoring ────────────────────────────────────────────
+    //
+    // Every other cmd_show test passes require_valid=false, so the whole
+    // `if require_valid` block went unexecuted. It is the security-bearing half of
+    // the command: a valid signature only proves the certificate is internally
+    // consistent (a hostile node can mint a keypair, name it in node_did, and
+    // self-sign), so --verify must additionally anchor the issuer to a DID the
+    // caller trusts. These drive all four outcomes plus the must-not case.
+    //
+    // The certificate must carry a REAL signature over the canonical payload:
+    // with a bogus one, --verify bails on the signature and never reaches the
+    // anchoring, which would make every assertion below vacuous.
+    fn signed_cert(node_kp: &gitlawb_core::identity::Keypair) -> (String, String) {
+        let node_did = node_kp.did().as_str().to_string();
+        let id = "a".repeat(36); // >= 36 chars skips resolve_cert_id's prefix lookup
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "b".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let sig = node_kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+        let body = serde_json::json!({
+            "id": id,
+            "repo_id": "repo-1",
+            "ref_name": "refs/heads/main",
+            "old_sha": "0".repeat(40),
+            "new_sha": "b".repeat(40),
+            "pusher_did": "did:key:z6MkPusher",
+            "node_did": node_did,
+            "signature": sig,
+            "issued_at": "2026-07-22T00:00:00+00:00",
+        })
+        .to_string();
+        (id, body)
+    }
+
+    /// Mount the cert fetch, plus a `GET /` answering with `node_info` (a JSON
+    /// body) or a denial when `None`.
+    async fn cert_server(
+        server: &mut mockito::Server,
+        id: &str,
+        cert_body: &str,
+        node_info: Option<&str>,
+    ) -> (mockito::Mock, mockito::Mock) {
+        let cert = server
+            .mock("GET", format!("/api/v1/repos/alice/r/certs/{id}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(cert_body)
+            .expect(1)
+            .create_async()
+            .await;
+        let root = match node_info {
+            Some(b) => {
+                server
+                    .mock("GET", "/")
+                    .with_status(200)
+                    .with_header("content-type", "application/json")
+                    .with_body(b)
+                    .create_async()
+                    .await
+            }
+            None => {
+                server
+                    .mock("GET", "/")
+                    .with_status(403)
+                    .with_header("content-type", "application/json")
+                    .with_body(r#"{"message":"denied"}"#)
+                    .create_async()
+                    .await
+            }
+        };
+        (cert, root)
+    }
+
+    #[tokio::test]
+    async fn verify_ok_when_issuing_node_is_the_queried_node() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let info = format!(r#"{{"did":"{}"}}"#, kp.did().as_str());
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &body, Some(&info)).await;
+
+        let got = cmd_show("alice/r".to_string(), id, server.url(), None, true, None).await;
+        assert!(
+            got.is_ok(),
+            "valid sig + matching issuer must pass: {got:?}"
+        );
+        cert.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn verify_bails_when_issuer_is_a_different_node() {
+        // The self-signing-hostile-node case: the signature verifies against the
+        // key the cert names, but that key is not the node we queried.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let other = gitlawb_core::identity::Keypair::generate();
+        let info = format!(r#"{{"did":"{}"}}"#, other.did().as_str());
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &body, Some(&info)).await;
+
+        let err = cmd_show("alice/r".to_string(), id, server.url(), None, true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected issuer"), "got: {err}");
+        cert.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn verify_bails_when_node_info_denied_and_no_expect_node() {
+        // Fail closed: with no trusted DID to anchor against, --verify must NOT
+        // fall through to a pass just because the signature checked out.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &body, None).await;
+
+        let err = cmd_show("alice/r".to_string(), id, server.url(), None, true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot anchor the issuer"), "got: {err}");
+        cert.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn verify_ok_when_expect_node_anchors_a_denied_lookup() {
+        // --expect-node supplies the trust anchor the denied lookup could not, so
+        // the same denial that fails the case above now passes.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &body, None).await;
+
+        let got = cmd_show(
+            "alice/r".to_string(),
+            id,
+            server.url(),
+            None,
+            true,
+            Some(kp.did().as_str().to_string()),
+        )
+        .await;
+        assert!(got.is_ok(), "explicit anchor must pass: {got:?}");
+        cert.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn verify_bails_on_a_bad_signature_before_anchoring() {
+        // The must-not: a forged certificate naming the queried node must fail on
+        // the signature, even though its issuer would otherwise anchor cleanly.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let (id, body) = signed_cert(&kp);
+        let forged = body.replace(&"b".repeat(40), &"c".repeat(40));
+        let info = format!(r#"{{"did":"{}"}}"#, kp.did().as_str());
+        let mut server = mockito::Server::new_async().await;
+        let (cert, _root) = cert_server(&mut server, &id, &forged, Some(&info)).await;
+
+        let err = cmd_show("alice/r".to_string(), id, server.url(), None, true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("signature did not verify"), "got: {err}");
+        cert.assert_async().await;
+    }
+
     // The must-not case for the DID extraction: an empty or missing `did` has to
     // become a could-not-compare reason. If it leaks through as a value, the
     // comparison below fabricates a mismatch WARNING against a DID the node
