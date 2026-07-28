@@ -359,29 +359,19 @@ renamed_step_workflow="$test_tmp/release-renamed-step.yml"
 awk '
   /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
     in_docker = ($0 ~ /^  docker:/)
-    in_resolver_step = 0
   }
 
   in_docker && !renamed &&
       /^      - name:[[:space:]]*Resolve release tag[[:space:]]*$/ {
     print "      - name: Inline release metadata"
     renamed = 1
-    in_resolver_step = 1
-    next
-  }
-
-  in_docker && in_resolver_step && !replaced &&
-      /scripts\/resolve-release-tag\.sh/ {
-    print "          echo \"tag=$TAG\" >> \"$GITHUB_OUTPUT\""
-    print "          echo \"version=${TAG#v}\" >> \"$GITHUB_OUTPUT\""
-    replaced = 1
     next
   }
 
   { print }
 
   END {
-    if (!renamed || !replaced) {
+    if (!renamed) {
       print "failed to build renamed-step fixture" > "/dev/stderr"
       exit 1
     }
@@ -391,6 +381,34 @@ awk '
 assert_guard_rejects \
   "$renamed_step_workflow" \
   "$test_tmp/renamed-step-steps" \
+  "workflow guard is not bound to every expected release job"
+
+renamed_reverted_workflow="$test_tmp/release-renamed-reverted.yml"
+awk '
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+    in_docker = ($0 ~ /^  docker:/)
+  }
+
+  in_docker && !replaced && /scripts\/resolve-release-tag\.sh/ {
+    print "          echo \"tag=$TAG\" >> \"$GITHUB_OUTPUT\""
+    print "          echo \"version=${TAG#v}\" >> \"$GITHUB_OUTPUT\""
+    replaced = 1
+    next
+  }
+
+  { print }
+
+  END {
+    if (!replaced) {
+      print "failed to build renamed-and-reverted fixture" > "/dev/stderr"
+      exit 1
+    }
+  }
+' "$renamed_step_workflow" > "$renamed_reverted_workflow"
+
+assert_guard_rejects \
+  "$renamed_reverted_workflow" \
+  "$test_tmp/renamed-reverted-steps" \
   "workflow guard missed a renamed and reverted resolver step"
 
 printf '%s\n' "release tag resolver tests passed"
