@@ -372,6 +372,19 @@ impl EncryptInflight {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The work currently queued against a repo's in-flight task, or `None` when
+    /// no task holds the key. Test-only observability: it lets a test assert that
+    /// a coalesced push's tip pairs were actually recorded, rather than that the
+    /// outcome merely was `Coalesced`.
+    #[cfg(test)]
+    pub fn pending_for(&self, repo_id: &str) -> Option<PendingWork> {
+        self.repos
+            .lock()
+            .expect("encrypt_inflight mutex poisoned")
+            .get(repo_id)
+            .cloned()
+    }
 }
 
 /// Merge a coalesced push's tip pairs into a repo's pending slot. FullScan absorbs
