@@ -1244,7 +1244,11 @@ pub(crate) async fn run_post_push_replication_for_test(
 /// POOL is a capacity signal, not a broken repo, so it sheds 503 + Retry-After the same
 /// way the admission caps around it do; it used to fall into the generic git 500, which
 /// tells the client nothing about retrying (#173 F1). Anything else stays a git error.
-fn acquire_write_app_error(err: &anyhow::Error, repo: &str) -> AppError {
+///
+/// Shared with the non-push `acquire_write` callers (`api/issues.rs`, `api/pulls.rs`)
+/// rather than copied: those hold no admission permit, so they meet an exhausted pool
+/// first, and a second copy of this mapping would be free to drift from the push path.
+pub(crate) fn acquire_write_app_error(err: &anyhow::Error, repo: &str) -> AppError {
     if err
         .downcast_ref::<crate::git::repo_store::LockPoolBusy>()
         .is_some()
