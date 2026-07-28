@@ -403,6 +403,42 @@ pub struct RepoWriteGuard {
     test_pre_unlock_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
+/// Deadline for tearing down the connection that saw a failing `pg_advisory_unlock`.
+/// Long enough that a healthy socket always finishes well inside it, short enough that
+/// a blackholed one does not pin admission resources for a TCP timeout.
+const UNLOCK_ERROR_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Await `close` under a deadline (#174 F3c).
+///
+/// `release` awaits this INLINE while the global write permit, the per-source permit
+/// and the write lease are all still held, and sqlx puts no deadline on `close()`:
+/// it writes Terminate and then tears the socket down. The branch that reaches here is
+/// by definition a connection whose last statement errored, and a blackholed TCP path
+/// to Postgres (a cloud failover that drops packets without an RST) is a plausible
+/// cause, so an unbounded await here parks every later push to the repo behind three
+/// pinned admission resources until the steal bound.
+///
+/// On elapsed the future is simply dropped, which drops the `PoolConnection` it owns.
+/// Dropping it closes the socket, and closing the socket is what actually ends the
+/// session and makes Postgres release the lock, so the deadline costs nothing the
+/// graceful path was buying.
+async fn close_conn_bounded(
+    repo_name: &str,
+    close: impl std::future::Future<Output = Result<(), sqlx::Error>>,
+) {
+    match tokio::time::timeout(UNLOCK_ERROR_CLOSE_TIMEOUT, close).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            warn!(repo = %repo_name, err = %e,
+                "closing the write-lock connection failed, the session teardown still frees the lock server-side");
+        }
+        Err(_) => {
+            warn!(repo = %repo_name, timeout_secs = UNLOCK_ERROR_CLOSE_TIMEOUT.as_secs(),
+                "closing the write-lock connection timed out, dropping it instead; the socket goes down either way, which is what frees the lock server-side");
+        }
+    }
+}
+
 impl RepoWriteGuard {
     /// Path to the bare repo on local disk.
     pub fn path(&self) -> &Path {
@@ -476,11 +512,10 @@ impl RepoWriteGuard {
                     // whenever the returned `PgConnection` is dropped and its
                     // background close completes. If this future is cancelled during
                     // `close()`, the connection is dropped mid-close, which still
-                    // tears the session down.
-                    if let Err(e) = conn.close().await {
-                        warn!(repo = %self.repo_name, err = %e,
-                            "closing the write-lock connection failed, the session teardown still frees the lock server-side");
-                    }
+                    // tears the session down. That last point is also why the await is
+                    // safe to bound: see `close_conn_bounded`, which gives it the
+                    // deadline sqlx does not.
+                    close_conn_bounded(&self.repo_name, conn.close()).await;
                 }
             }
         }
@@ -893,6 +928,108 @@ mod tests {
         );
     }
 
+    /// How long the polls below may wait for an asynchronous server-side effect.
+    /// Postgres frees a session advisory lock when the backend exits, which happens
+    /// asynchronously to our socket close, so these are polled to a generous deadline
+    /// rather than slept for a fixed interval: a constant sleep is a flake under load,
+    /// and one that is long enough to be safe is dead time on every run.
+    const RELEASE_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+    /// Poll `cond` until it holds, failing at the deadline so a regression fails the
+    /// test rather than hanging the suite.
+    async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = std::time::Instant::now() + RELEASE_POLL_DEADLINE;
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Poll the advisory lock from `checker` until it is free. `pg_try_advisory_lock`
+    /// ACQUIRES on success, so a true result both answers the question and leaves the
+    /// checker session holding the lock; the caller unlocks it.
+    async fn wait_until_lock_free(checker: &mut sqlx::PgConnection, key: i64, what: &str) {
+        let deadline = std::time::Instant::now() + RELEASE_POLL_DEADLINE;
+        loop {
+            let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+                .bind(key)
+                .fetch_one(&mut *checker)
+                .await
+                .unwrap();
+            if free {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A second pool over the same test database with the idle reaper DISABLED.
+    ///
+    /// `#[sqlx::test]`'s own pool sets `idle_timeout(1s)`, so a connection returned to
+    /// it is closed by the reaper about a second later, which ends the session and
+    /// frees the advisory lock all on its own. The old fixed 400ms sleep landed inside
+    /// that window by luck; polling to a deadline long enough to be flake-proof would
+    /// land outside it and go green whether or not `release` disposed of the
+    /// connection, so the tests below would stop testing anything (measured: with the
+    /// reaper in play, the disposal shows up at ~2s even with the fix reverted). With
+    /// no reaper, `release` is the only thing that can end that session, so the poll
+    /// measures exactly the property these two tests exist for.
+    async fn pool_without_idle_reaper(pool: &sqlx::PgPool) -> sqlx::PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .expect("a second pool over the test database")
+    }
+
+    /// F3c (P2): the connection teardown on the failing-unlock path must be BOUNDED.
+    /// `release` awaits it inline while the global write permit, the per-source permit
+    /// and the write lease are all still held, and sqlx's `close()` carries no deadline
+    /// of its own, so a blackholed socket would park every later push to that repo
+    /// behind three pinned admission resources.
+    ///
+    /// What this covers: the deadline itself. A close that never resolves still lets
+    /// `close_conn_bounded` return, which is the property `release` depends on. What it
+    /// does NOT cover, and is reasoned rather than run: that sqlx's own `close()` is
+    /// what stalls in production. Making a real `PgConnection::close` hang needs a
+    /// blackholed TCP path to Postgres, and the flip has to land after the unlock
+    /// statement round-trips but before the Terminate write, which is not a seam this
+    /// module exposes. A never-resolving future is the faithful stand-in for that
+    /// close, and the F3b tests above already cover that `release` really routes its
+    /// close through here.
+    ///
+    /// Time is paused, so nothing here depends on wall clock: the runtime auto-advances
+    /// to the next timer, and the assertion is on which timer fired, not on elapsed
+    /// time. The outer bound is what turns a removed deadline into a failure rather
+    /// than a hung suite.
+    ///
+    /// Load-bearing: drop the `tokio::time::timeout` in `close_conn_bounded` and the
+    /// inner future never resolves, so the outer bound fires and this fails.
+    #[tokio::test(start_paused = true)]
+    async fn unlock_error_connection_close_is_bounded() {
+        let hanging = std::future::pending::<Result<(), sqlx::Error>>();
+        let outcome = tokio::time::timeout(
+            UNLOCK_ERROR_CLOSE_TIMEOUT * 4,
+            close_conn_bounded("boundedclosetest", hanging),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "a connection close that never completes must not hold the write lease and \
+             both admission permits open-endedly: close_conn_bounded must give up and \
+             drop the connection"
+        );
+    }
+
     /// F3b (P1): when `pg_advisory_unlock` ERRORS while the session is still alive
     /// (statement timeout, admin cancel, aborted transaction), the lock must not
     /// survive `release`. The old code discarded the error with `let _ =` and set
@@ -910,7 +1047,8 @@ mod tests {
     #[sqlx::test]
     async fn write_guard_release_with_failing_unlock_frees_the_lock(pool: sqlx::PgPool) {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let store_pool = pool_without_idle_reaper(&pool).await;
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), store_pool.clone());
         let owner = "did:key:z6MkUnlockErrorProofFFFFFFFFFFFFFFFFFFFFFF";
         let name = "unlockerrtest";
         let slug = owner.replace([':', '/'], "_");
@@ -935,19 +1073,18 @@ mod tests {
         );
 
         guard.release(false).await;
-        // Give a background close a moment to reach the server.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-        let (free,): (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-            .bind(key)
-            .fetch_one(&mut *checker)
-            .await
-            .unwrap();
-        assert!(
-            free,
-            "an errored pg_advisory_unlock must not leave the lock held: release \
-             must dispose of the connection so the session ends"
-        );
+        // Postgres drops the lock when the disposed session's backend exits, which is
+        // asynchronous to our socket close: poll for it rather than sleeping a
+        // constant. The deadline is what keeps this load-bearing: a release that
+        // leaves the lock held never satisfies the probe and fails here.
+        wait_until_lock_free(
+            &mut checker,
+            key,
+            "an errored pg_advisory_unlock must not leave the lock held: release must \
+             dispose of the connection so the session ends",
+        )
+        .await;
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(key)
             .execute(&mut *checker)
@@ -963,24 +1100,26 @@ mod tests {
         pool: sqlx::PgPool,
     ) {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = RepoStore::for_testing(dir.path().to_path_buf(), pool.clone());
+        let store_pool = pool_without_idle_reaper(&pool).await;
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), store_pool.clone());
         let owner = "did:key:z6MkUnlockErrorPoolProofGGGGGGGGGGGGGGGGGG";
         let name = "unlockerrpooltest";
 
         let mut guard = store.acquire_write(owner, name).await.expect("acquire");
         poison_guard_connection(&mut guard).await;
-        let size_before = pool.size();
+        let size_before = store_pool.size();
         assert!(size_before > 0, "the pool owns the guard's connection");
 
         guard.release(false).await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-        assert_eq!(
-            pool.size(),
-            size_before - 1,
-            "the connection that saw the unlock error must be closed, not returned \
-             to the pool still holding the session lock"
-        );
+        // The pool's size drops when the closed connection's slot is given up, which
+        // is not synchronous with `release` returning: poll rather than sleep.
+        wait_until(
+            || store_pool.size() == size_before - 1,
+            "the connection that saw the unlock error to be closed rather than returned \
+             to the pool still holding the session lock",
+        )
+        .await;
     }
 
     /// F3b regression guard on the success path: a normal unlock keeps the

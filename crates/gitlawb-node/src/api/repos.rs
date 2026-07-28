@@ -1101,6 +1101,14 @@ async fn pin_new_objects_gated(
     object_list: Vec<String>,
     db: &Arc<crate::db::Db>,
 ) -> Vec<(String, String)> {
+    // Nothing to pin: answer before taking a permit (#174 F2b). The permit bounds how
+    // many MB-scale object lists are held at once and an empty list holds none, so
+    // parking here would spend a global pin slot on no work. The pool DEFERS rather
+    // than sheds, so those calls stall pins for every other repo. Empty is the normal
+    // shape for a push whose walk failed or that may replicate nothing.
+    if object_list.is_empty() {
+        return Vec::new();
+    }
     let _permit = pin_sem
         .clone()
         .acquire_owned()
@@ -1960,6 +1968,13 @@ async fn post_receive_replication_tail(
         .1
     };
 
+    // #174 F2b: did THIS push run its own walk and have it fail? An admitted push that
+    // could not be vetted must not go on to take a pin permit and re-run the same
+    // failing walk in the Pinata worker below. Only the COALESCED path needs the
+    // rules-only predicate there: it has no walk of its own, so the worker's
+    // re-derivation is its only fail-closed source.
+    let own_walk_failed = announce_at_root && !coalesced && withheld.is_none();
+
     // Resolve the per-push pin candidate set once, off the async worker, then
     // filter to what may actually replicate. Delta path: the reachable-only
     // `withheld` set suffices (delta objects are reachable). Full-scan path: the
@@ -2106,7 +2121,13 @@ async fn post_receive_replication_tail(
         // `replication_withheld_set` inside the pin permit: it returns an empty
         // list AND announce=false when the walk fails or the repo may not
         // replicate, so neither blobs nor announcements escape an unvetted push.
-        let do_pinata_replication = announce_at_root;
+        //
+        // #174 F2b: except when THIS push already ran that walk and it failed. The
+        // re-derivation would fail the same way, so it buys nothing, and it would buy
+        // it at the price of a global pin permit plus a second round of git children.
+        // The pin pool DEFERS rather than sheds, so enough such pushes stall pins
+        // node-wide. A coalesced push never walked, so it is unaffected.
+        let do_pinata_replication = announce_at_root && !own_walk_failed;
         // #174 F2 / KTD-3: capture only the small inputs the re-derivation needs; the
         // MB-scale object list is NOT moved in. `pinata_object_list_for_refs` recomputes
         // it from these once a pin slot frees. rules/owner/is_public drive the fresh
@@ -5445,10 +5466,12 @@ mod tests {
         let held = pin_sem.clone().acquire_owned().await.unwrap();
 
         // Empty ipfs_api makes the pin itself a no-op, but the loop must still DEFER on
-        // the exhausted pin pool rather than run.
+        // the exhausted pin pool rather than run. The object list is non-empty because
+        // an empty one takes no permit at all by design (#174 F2b).
+        let objects = vec!["0123456789abcdef0123456789abcdef01234567".to_string()];
         let blocked = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            pin_new_objects_gated(&pin_sem, "", tmp.path(), vec![], &db),
+            pin_new_objects_gated(&pin_sem, "", tmp.path(), objects.clone(), &db),
         )
         .await;
         assert!(
@@ -5460,11 +5483,45 @@ mod tests {
         drop(held);
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            pin_new_objects_gated(&pin_sem, "", tmp.path(), vec![], &db),
+            pin_new_objects_gated(&pin_sem, "", tmp.path(), objects, &db),
         )
         .await
         .expect("the pin loop completes once admission frees");
         assert!(out.is_empty(), "an empty ipfs_api pins nothing");
+    }
+
+    /// #174 F2b: the pin permit bounds how many MB-scale object lists are held at once,
+    /// so a call with NOTHING to pin must not take one. It otherwise spends a global pin
+    /// slot on no work, and the pool DEFERS rather than sheds, so those calls stall pins
+    /// for every other repo. The empty case is the normal shape for a push whose walk
+    /// failed or that may replicate nothing.
+    ///
+    /// Load-bearing: without the guard this call parks on the exhausted pool exactly like
+    /// the non-empty one above, and the completion assertion fails.
+    #[sqlx::test]
+    async fn pin_new_objects_gated_takes_no_permit_for_an_empty_object_list(pool: sqlx::PgPool) {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+
+        let state = crate::test_support::test_state(pool).await;
+        let db = state.db.clone();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pin_sem = Arc::new(Semaphore::new(1));
+        // Hold the only pin permit for the whole call.
+        let _held = pin_sem.clone().acquire_owned().await.unwrap();
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            pin_new_objects_gated(&pin_sem, "", tmp.path(), vec![], &db),
+        )
+        .await
+        .expect("an empty object list must not wait on pin admission (#174 F2b)");
+        assert!(out.is_empty(), "and it pins nothing");
+        assert_eq!(
+            pin_sem.available_permits(),
+            0,
+            "the test still holds the only permit, so the call never took one"
+        );
     }
 
     /// Shared fixture for the F4 handler-layer tests: a state whose repo_store and
@@ -8311,5 +8368,117 @@ mod tests {
             .try_recv()
             .expect("the admitted push fires its announce");
         assert_eq!(broadcast.new_sha, c2);
+    }
+
+    // ---- #174 F2b: a failed OWN walk does not buy a pin permit and a second walk ----
+
+    /// Withheld-walk commit-enumeration attempts so far. Each `replication_withheld_set`
+    /// runs exactly one `rev-list --all`, so this counts the walks that were attempted
+    /// (the `ls-tree` counter above cannot: a walk whose enumeration fails never gets
+    /// to `ls-tree`).
+    fn f2b_walk_attempts(log: &std::path::Path) -> usize {
+        f2a_log(log)
+            .lines()
+            .filter(|l| l.starts_with("rev-list --all"))
+            .count()
+    }
+
+    /// A NON-coalesced push whose own withheld walk failed must not take a global pin
+    /// permit and must not re-run the same failing walk in the Pinata worker.
+    ///
+    /// The F2a change moved the Pinata gate from `withheld.is_some()` to the rules-only
+    /// `announce_at_root`, which a coalesced push genuinely needs (it has no walk of its
+    /// own). But it also let an ADMITTED push whose walk failed acquire `pin_semaphore`
+    /// and re-derive `replication_withheld_set`, which fails the same way. With
+    /// `max_concurrent_pin_tasks` defaulting to 8 and the pin pool DEFERRING rather than
+    /// shedding, eight such pushes stall pins node-wide.
+    ///
+    /// Asserted on observable work, twice over, with the pin pool's only permit held for
+    /// the whole first phase:
+    ///  * the walk attempts while the permit is held. Two: the tail's own (which fails)
+    ///    and the recovery task's recipients walk, which must NOT park on the pin pool
+    ///    for its empty object list. The Pinata worker's is the third and must not exist.
+    ///  * the walk attempts after the permit is released. Still two: nothing was left
+    ///    waiting on the pin pool, which is the permit assertion.
+    ///
+    /// Load-bearing both ways. With the gate back on plain `announce_at_root` the Pinata
+    /// worker parks on the held permit and then walks once it is freed (phase 2 sees 3).
+    /// Without the empty-list guard on `pin_new_objects_gated` the recovery task parks
+    /// too, so phase 1 sees 1.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn f2b_failed_own_walk_takes_no_pin_permit_and_runs_no_second_walk(pool: sqlx::PgPool) {
+        let repo = tempfile::TempDir::new().unwrap();
+        let bin = tempfile::TempDir::new().unwrap();
+        u5_init_repo(repo.path());
+        let c1 = u5_commit_file(repo.path(), "a.txt", "one\n");
+        let c2 = u5_commit_file(repo.path(), "secret/s.txt", "two\n");
+        let log = bin.path().join("git.log");
+        // Every withheld walk fails, so this push can never be vetted.
+        let git_bin = write_fake_git(
+            bin.path(),
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> \"{log}\"\n\
+                 case \"$*\" in 'rev-list --all'*) exit 1 ;; esac\n\
+                 exec git \"$@\"\n",
+                log = log.display(),
+            ),
+        );
+        let (mut state, rec) = f2a_state(pool, &git_bin, "z6f2bfail", "w1", true).await;
+        let (_server, _cid) = f2a_pinata(&mut state).await;
+        // One pin permit, held: anything that reaches a pin-admission acquire parks
+        // instead of running, which is what makes "took no permit" observable.
+        state.pin_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = state.pin_semaphore.clone().acquire_owned().await.unwrap();
+
+        // Nothing pre-takes the coalescing key, so this push is ADMITTED and runs its
+        // own walk.
+        post_receive_replication_tail(
+            state.clone(),
+            rec.clone(),
+            vec![RefUpdate {
+                old_sha: c1.clone(),
+                new_sha: c2.clone(),
+                ref_name: "refs/heads/main".to_string(),
+            }],
+            repo.path().to_path_buf(),
+            F2A_PUSHER.to_string(),
+        )
+        .await;
+
+        f2a_wait_for(
+            || f2b_walk_attempts(&log) >= 2,
+            "the tail's own walk and the recovery task's recipients walk",
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            f2b_walk_attempts(&log),
+            2,
+            "a failed own walk must not buy a third walk in the Pinata worker; log:\n{}",
+            f2a_log(&log)
+        );
+
+        // Release pin admission. A task that had parked on it now wakes and walks;
+        // nothing should have been parked.
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            f2b_walk_attempts(&log),
+            2,
+            "nothing may be left waiting on the pin permit for a push that pins \
+             nothing; log:\n{}",
+            f2a_log(&log)
+        );
+        assert!(
+            state
+                .db
+                .list_branch_cids(&f2a_slug(&rec))
+                .await
+                .unwrap()
+                .is_empty(),
+            "and the unvetted push still maps no CID"
+        );
     }
 }
