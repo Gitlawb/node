@@ -120,6 +120,18 @@ jobs:
         with:
           ref: ${{ steps.resolve.outputs.branch }}
 
+      # Resolve on a declared toolchain instead of whatever Rust the runner
+      # image happens to ship, so the lock this job writes comes off the same
+      # stable channel the other cargo jobs use. Not a claim of identical
+      # resolution: `stable` still moves between runs, and the MSRV gate
+      # checks this same lock on 1.91 (pr-checks.yml). It only removes the
+      # runner image as an undeclared input.
+      - name: Install Rust toolchain
+        if: ${{ steps.resolve.outputs.branch != '' }}
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
+        with:
+          toolchain: stable
+
       - name: Sync workspace crate versions into Cargo.lock
         if: ${{ steps.resolve.outputs.branch != '' }}
         run: cargo update --workspace
@@ -434,7 +446,7 @@ jobs:
           set -euo pipefail
           args=""
           for b in $BINS; do args="$args -p $b"; done
-          cargo build --release --target ${{ matrix.target }} $args
+          cargo build --release --locked --target ${{ matrix.target }} $args
 
       # Run each packaged binary's --version so a broken release artifact fails the
       # build instead of shipping. Every target builds on a matching-arch runner,

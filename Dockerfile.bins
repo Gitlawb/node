@@ -23,7 +23,7 @@ COPY crates/ crates/
 # Configure cross-linker for aarch64
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
 
-RUN cargo build --release --target "$TARGET" -p gl -p git-remote-gitlawb
+RUN cargo build --release --locked --target "$TARGET" -p gl -p git-remote-gitlawb
 
 FROM debian:bookworm-slim
 ARG TARGET
