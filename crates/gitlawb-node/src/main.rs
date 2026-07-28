@@ -938,6 +938,7 @@ async fn gossip_task(
 
     // Periodic ping every 5 minutes — exit on shutdown.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut failed_once: HashSet<String> = HashSet::new();
     loop {
         tokio::select! {
@@ -946,25 +947,13 @@ async fn gossip_task(
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                {
-                    let current_dids: HashSet<&str> =
-                        peers.iter().map(|peer| peer.did.as_str()).collect();
-                    failed_once.retain(|did| current_dids.contains(did.as_str()));
-                }
-                for peer in peers {
-                    let ok = ping_peer_readiness(&client, &peer.http_url).await;
-                    match peer_ping_db_update(&mut failed_once, &peer.did, ok) {
-                        Some(reachable) => {
-                            if let Err(error) = state.db.mark_peer_ping(&peer.did, reachable).await {
-                                warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
-                            }
-                        }
-                        None => warn!(
-                            did = %peer.did,
-                            "peer readiness probe failed once; preserving previous federation status"
-                        ),
-                    }
-                }
+                gossip_ping_round(
+                    state.db.as_ref(),
+                    client.as_ref(),
+                    &mut failed_once,
+                    peers,
+                )
+                .await;
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -972,6 +961,32 @@ async fn gossip_task(
                     return;
                 }
             }
+        }
+    }
+}
+
+async fn gossip_ping_round(
+    db: &Db,
+    client: &reqwest::Client,
+    failed_once: &mut HashSet<String>,
+    peers: Vec<db::PeerRecord>,
+) {
+    {
+        let current_dids: HashSet<&str> = peers.iter().map(|peer| peer.did.as_str()).collect();
+        failed_once.retain(|did| current_dids.contains(did.as_str()));
+    }
+    for peer in peers {
+        let ok = ping_peer_readiness(client, &peer.http_url).await;
+        match peer_ping_db_update(failed_once, &peer.did, ok) {
+            Some(reachable) => {
+                if let Err(error) = db.mark_peer_ping(&peer.did, reachable).await {
+                    warn!(did = %peer.did, err = %error, "failed to persist peer readiness");
+                }
+            }
+            None => warn!(
+                did = %peer.did,
+                "peer readiness probe failed once; preserving previous federation status"
+            ),
         }
     }
 }
@@ -1128,8 +1143,12 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
 #[cfg(test)]
 mod gossip_ssrf_tests {
-    use super::{peer_ping_db_update, ping_peer_readiness, ping_peer_readiness_with_timeout};
+    use super::{
+        gossip_ping_round, peer_ping_db_update, ping_peer_readiness,
+        ping_peer_readiness_with_timeout,
+    };
     use axum::{http::StatusCode, routing::get, Router};
+    use sqlx::PgPool;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1168,6 +1187,80 @@ mod gossip_ssrf_tests {
             None,
             "a success must reset the consecutive-failure state"
         );
+    }
+
+    #[sqlx::test]
+    async fn gossip_ping_round_requires_two_failures_before_persisting_unreachable(pool: PgPool) {
+        let mut server = mockito::Server::new_async().await;
+        let ready = server
+            .mock("GET", "/ready")
+            .with_status(503)
+            .expect(2)
+            .create_async()
+            .await;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let did = "did:key:z6MkGossipHysteresis";
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, TRUE, $3)",
+        )
+        .bind(did)
+        .bind(server.url())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut failed_once = HashSet::from(["did:key:z6MkRemovedPeer".to_owned()]);
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !failed_once.contains("did:key:z6MkRemovedPeer"),
+            "failure tracking must prune peers outside the current snapshot"
+        );
+        assert!(
+            failed_once.contains(did),
+            "the first failed sample must be retained for the next round"
+        );
+        assert!(
+            state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "one transient failure must preserve the persisted federation gate"
+        );
+
+        gossip_ping_round(
+            state.db.as_ref(),
+            &production_http_client(),
+            &mut failed_once,
+            state.db.list_peers().await.unwrap(),
+        )
+        .await;
+        assert!(
+            !state
+                .db
+                .list_peers()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|peer| peer.did == did)
+                .unwrap()
+                .last_ping_ok,
+            "two consecutive failed rounds must persist the peer as unreachable"
+        );
+        ready.assert_async().await;
     }
 
     // A peer answering `/ready` with a 302 toward an internal address must not
