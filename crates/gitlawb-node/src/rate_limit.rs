@@ -121,6 +121,13 @@ impl RateLimiter {
         true
     }
 
+    /// Number of keys currently tracked. Tests use it to observe what a sweep
+    /// reclaimed; there is no production reader.
+    #[cfg(test)]
+    pub async fn tracked_keys(&self) -> usize {
+        self.state.lock().await.len()
+    }
+
     pub async fn cleanup(&self) {
         let now = Instant::now();
         let mut state = self.state.lock().await;

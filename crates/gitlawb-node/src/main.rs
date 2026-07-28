@@ -481,22 +481,14 @@ async fn main() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let rl = state.rate_limiter.clone();
-        let create_ip_rl = state.create_ip_rate_limiter.clone();
-        let push_rl = state.push_rate_limiter.clone();
-        let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
-        let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let sweep_state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        rl.cleanup().await;
-                        create_ip_rl.cleanup().await;
-                        push_rl.cleanup().await;
-                        sync_trigger_rl.cleanup().await;
-                        peer_write_rl.cleanup().await;
+                        sweep_rate_limiters(&sweep_state).await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -1030,6 +1022,65 @@ async fn gossip_task(
             }
         }
     }
+}
+
+#[cfg(test)]
+mod rate_limiter_sweep_tests {
+    use crate::rate_limit::RateLimiter;
+    use std::time::Duration;
+
+    // Every per-key limiter the router mounts must be swept by the periodic
+    // task, the `/ipfs` one included: a limiter left out keeps expired keys
+    // until its map fills and the inline capacity sweep fires. Fails on the
+    // pre-fix sweeper, which skipped `ipfs_rate_limiter`.
+    #[tokio::test]
+    async fn sweep_evicts_expired_keys_from_every_limiter() {
+        let window = Duration::from_millis(30);
+        let mut state = crate::test_support::test_state_lazy();
+        state.rate_limiter = RateLimiter::new(10, window);
+        state.create_ip_rate_limiter = RateLimiter::new(10, window);
+        state.push_rate_limiter = RateLimiter::new(10, window);
+        state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
+        state.peer_write_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_rate_limiter = RateLimiter::new(10, window);
+
+        let limiters = |s: &crate::state::AppState| {
+            [
+                s.rate_limiter.clone(),
+                s.create_ip_rate_limiter.clone(),
+                s.push_rate_limiter.clone(),
+                s.sync_trigger_rate_limiter.clone(),
+                s.peer_write_rate_limiter.clone(),
+                s.ipfs_rate_limiter.clone(),
+            ]
+        };
+        for l in limiters(&state) {
+            assert!(l.check("1.2.3.4").await);
+            assert_eq!(l.tracked_keys().await, 1);
+        }
+
+        tokio::time::sleep(window * 3).await;
+        super::sweep_rate_limiters(&state).await;
+
+        for (i, l) in limiters(&state).into_iter().enumerate() {
+            assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
+        }
+    }
+}
+
+/// Evict expired entries from every per-key rate limiter on the state.
+///
+/// Named and driven off `AppState` so the periodic sweeper stays in step with
+/// the limiters the router actually mounts: adding a limiter field and
+/// forgetting it here leaves its keys pinned until the map hits `max_keys` and
+/// the inline capacity sweep runs (the `/ipfs` limiter was missed this way).
+async fn sweep_rate_limiters(state: &AppState) {
+    state.rate_limiter.cleanup().await;
+    state.create_ip_rate_limiter.cleanup().await;
+    state.push_rate_limiter.cleanup().await;
+    state.sync_trigger_rate_limiter.cleanup().await;
+    state.peer_write_rate_limiter.cleanup().await;
+    state.ipfs_rate_limiter.cleanup().await;
 }
 
 /// Build the shared node HTTP client used for every outbound fan-out (sync
