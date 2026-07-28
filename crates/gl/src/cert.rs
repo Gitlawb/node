@@ -4,7 +4,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::http::NodeClient;
@@ -177,27 +176,20 @@ async fn cmd_show(
 
     // Contextual only — the verdict above stands on its own, so a node-info
     // hiccup here must not turn a successfully displayed certificate into an
-    // error exit.
-    let current_node_did = match client.get("/").await {
-        Ok(resp) => resp
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|info| info["did"].as_str().map(str::to_string)),
-        Err(_) => None,
+    // error exit. Route the lookup through read_json so a denial or a capped
+    // error body yields a reportable reason instead of an opaque None, and keep
+    // "carried no DID" distinct from "the lookup failed": an empty DID must not
+    // reach the comparison and fabricate a mismatch warning.
+    let current: std::result::Result<String, String> = match client.get("/").await {
+        Ok(resp) => match crate::http::read_json(resp, "node info").await {
+            Ok(info) => did_from_node_info(&info),
+            Err(e) => Err(e.to_string()),
+        },
+        Err(e) => Err(e.to_string()),
     };
-    match current_node_did.as_deref() {
-        Some(current) if current == node_did => {
-            println!("  Issuing node DID matches the node being queried.");
-        }
-        Some(current) => {
-            println!("  WARNING: Certificate node DID ({node_did}) does not match");
-            println!("           current node DID ({current}).");
-            println!("           This certificate was issued by a different node.");
-        }
-        None => {
-            println!("  NOTE: could not fetch current node info — skipping node-DID comparison.");
-        }
+    let current_node_did = current.as_ref().ok().cloned();
+    for line in did_check_report(&current, node_did) {
+        println!("{line}");
     }
 
     if require_valid {
@@ -223,6 +215,46 @@ async fn cmd_show(
     }
 
     Ok(())
+}
+
+/// Pull the node's DID out of a `GET /` body for the comparison in `cmd_show`.
+///
+/// A missing OR empty `did` is a failure, not a value: letting `""` through
+/// would reach the comparison and print a mismatch WARNING against a DID the
+/// node never claimed, which reads as "issued by a different node" when the
+/// truth is that the lookup told us nothing.
+fn did_from_node_info(info: &serde_json::Value) -> std::result::Result<String, String> {
+    match info["did"].as_str() {
+        Some(did) if !did.is_empty() => Ok(did.to_string()),
+        _ => Err("node info response carried no DID".to_string()),
+    }
+}
+
+/// Select the report lines for the node-DID comparison in `cmd_show`.
+///
+/// `current` is the current node's DID, or the reason it could not be
+/// determined. A comparison verdict (match or WARNING) is only produced when a
+/// real DID was obtained; otherwise the report degrades to a could-not-compare
+/// hint naming the reason, plus the offline-verification guidance. The signature
+/// verdict printed above stands on its own either way — this block only answers
+/// *which* node issued the certificate.
+fn did_check_report(current: &std::result::Result<String, String>, node_did: &str) -> Vec<String> {
+    match current {
+        Ok(current) if current == node_did => {
+            vec!["  Issuing node DID matches the node being queried.".to_string()]
+        }
+        Ok(current) => vec![
+            format!("  WARNING: Certificate node DID ({node_did}) does not match"),
+            format!("           current node DID ({current})."),
+            "           This certificate was issued by a different node.".to_string(),
+        ],
+        Err(reason) => vec![
+            format!("  Could not fetch the current node's DID ({reason}), so the comparison"),
+            "  with the certificate's node DID is unavailable.".to_string(),
+            "  To verify offline, use the node's Ed25519 public key derived from:".to_string(),
+            format!("    did:key → {node_did}"),
+        ],
+    }
 }
 
 /// Rebuild the node's canonical signing payload (field order must match
@@ -676,5 +708,86 @@ mod tests {
         assert!(result.is_ok(), "got: {result:?}");
         _cert.assert_async().await;
         _root.assert_async().await;
+    }
+
+    // The must-not case for the DID extraction: an empty or missing `did` has to
+    // become a could-not-compare reason. If it leaks through as a value, the
+    // comparison below fabricates a mismatch WARNING against a DID the node
+    // never claimed.
+    #[test]
+    fn did_from_node_info_rejects_empty_and_missing() {
+        assert!(did_from_node_info(&serde_json::json!({"did": "n"})).is_ok());
+        for body in [
+            serde_json::json!({"did": ""}),
+            serde_json::json!({}),
+            serde_json::json!({"did": 7}),
+        ] {
+            let got = did_from_node_info(&body);
+            assert!(
+                got.is_err(),
+                "must not yield a comparable DID: {body} -> {got:?}"
+            );
+        }
+        // And the reason it produces must route to the degraded hint, never a verdict.
+        let report =
+            did_check_report(&did_from_node_info(&serde_json::json!({"did": ""})), "n").join("\n");
+        assert!(
+            !report.contains("WARNING"),
+            "fabricated a mismatch: {report}"
+        );
+        assert!(report.contains("Could not fetch"), "got: {report}");
+    }
+
+    // did_check_report is the three-way selector between the match text, the
+    // mismatch WARNING, and the degraded could-not-compare hint. Substring
+    // asserts (not full-line equality) so cosmetic wording edits don't break them.
+
+    #[test]
+    fn did_check_report_match() {
+        let report = did_check_report(&Ok("n".to_string()), "n").join("\n");
+        assert!(
+            report.contains("matches the node being queried"),
+            "got: {report}"
+        );
+        assert!(!report.contains("WARNING"), "got: {report}");
+        assert!(!report.contains("Could not fetch"), "got: {report}");
+    }
+
+    #[test]
+    fn did_check_report_mismatch() {
+        let report = did_check_report(&Ok("did:key:other".to_string()), "n").join("\n");
+        assert!(report.contains("WARNING"), "got: {report}");
+        assert!(report.contains("does not match"), "got: {report}");
+        assert!(report.contains("did:key:other"), "got: {report}");
+        assert!(!report.contains("Could not fetch"), "got: {report}");
+    }
+
+    #[test]
+    fn did_check_report_missing_did_reason() {
+        let report =
+            did_check_report(&Err("node info response carried no DID".to_string()), "n").join("\n");
+        assert!(report.contains("Could not fetch"), "got: {report}");
+        assert!(
+            report.contains("node info response carried no DID"),
+            "got: {report}"
+        );
+        assert!(report.contains("verify offline"), "got: {report}");
+        // The must-not case: no real DID was obtained, so no comparison verdict
+        // may be claimed in either direction.
+        assert!(!report.contains("WARNING"), "got: {report}");
+        assert!(
+            !report.contains("matches the node being queried"),
+            "got: {report}"
+        );
+    }
+
+    #[test]
+    fn did_check_report_lookup_error_reason() {
+        let report =
+            did_check_report(&Err("node info failed (403): denied".to_string()), "n").join("\n");
+        assert!(report.contains("Could not fetch"), "got: {report}");
+        assert!(report.contains("403"), "got: {report}");
+        assert!(report.contains("verify offline"), "got: {report}");
+        assert!(!report.contains("WARNING"), "got: {report}");
     }
 }
