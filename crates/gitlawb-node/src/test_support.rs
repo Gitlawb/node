@@ -115,6 +115,7 @@ mod tests {
     use crate::db::{AgentTask, RepoRecord};
     use axum::http::StatusCode;
     use chrono::Utc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
     fn seed_repo(owner_did: &str, name: &str) -> RepoRecord {
@@ -1695,7 +1696,10 @@ mod tests {
                 "/api/v1/repos/{owner}/{repo}/hooks",
                 axum::routing::get(crate::api::webhooks::list_webhooks),
             )
-            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::optional_signature,
+            ))
             .with_state(state);
 
         let resp = router.oneshot(req).await.unwrap();
@@ -1816,7 +1820,10 @@ mod tests {
                     "/{owner}/{repo}/info/refs",
                     axum::routing::get(crate::api::repos::git_info_refs),
                 )
-                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::optional_signature,
+                ))
                 .with_state(state.clone())
         };
         let path = |service: &str| format!("/{short}/ir-priv.git/info/refs?service={service}");
@@ -1915,7 +1922,10 @@ mod tests {
                 "/{owner}/{repo}/git-receive-pack",
                 axum::routing::post(crate::api::repos::git_receive_pack),
             )
-            .layer(axum::middleware::from_fn(crate::auth::require_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::require_signature,
+            ))
             .with_state(state);
 
         let req = Request::builder()
@@ -1963,7 +1973,10 @@ mod tests {
                     "/{owner}/{repo}/git-upload-pack",
                     axum::routing::post(crate::api::repos::git_upload_pack),
                 )
-                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::optional_signature,
+                ))
                 .with_state(state.clone())
         };
         // A non-empty body (git-remote-gitlawb skips the POST when the body is empty).
@@ -2114,7 +2127,10 @@ mod tests {
                     "/{owner}/{repo}/info/refs",
                     axum::routing::get(crate::api::repos::git_info_refs),
                 )
-                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .layer(axum::middleware::from_fn_with_state(
+                    crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                    crate::auth::optional_signature,
+                ))
                 .with_state(state.clone())
         };
         async fn body_of(resp: axum::response::Response) -> String {
@@ -2991,7 +3007,10 @@ mod tests {
                 "/ipfs/{cid}",
                 axum::routing::get(crate::api::ipfs::get_by_cid),
             )
-            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .layer(axum::middleware::from_fn_with_state(
+                crate::auth::SignatureBodyLimit(crate::server::SIGNED_BODY_LIMIT),
+                crate::auth::optional_signature,
+            ))
             .with_state(state.clone())
     }
     async fn cid_parts(resp: axum::response::Response) -> (StatusCode, String) {
@@ -5182,5 +5201,285 @@ mod tests {
             ids.iter().any(|id| id.starts_with("deep-0")),
             "result includes the deep cert matching the prefix"
         );
+    }
+
+    // ── Pre-auth body buffering in `require_signature` ───────────────────────
+    //
+    // `require_signature` buffers the whole body BEFORE it verifies anything, so
+    // an unauthenticated caller could make the node hold an arbitrary amount of
+    // memory just by opening a request. Nothing upstream bounded it: on the git
+    // write routes `RequestBodyLimitLayer` sits on the INNER router (a later
+    // `.layer()` is the OUTER service, so auth runs first and sees the raw body),
+    // and on the other eight signed groups axum's 2 MB `DefaultBodyLimit` only
+    // works through the extractors, which this middleware bypasses by collecting
+    // the body itself.
+    //
+    // Every test below asserts on bytes ACTUALLY POLLED out of the body, not just
+    // the status code: a status-only assertion passes whether or not the body was
+    // drained, which is exactly the failure mode being fixed.
+
+    /// A streaming body of `total` bytes in `chunk`-sized frames that counts the
+    /// bytes a consumer actually pulls out of it. The counter is the measurement
+    /// the drain assertions rest on.
+    fn counting_body(total: usize, chunk: usize) -> (Body, std::sync::Arc<AtomicUsize>) {
+        let polled = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = polled.clone();
+        let stream = futures::stream::unfold(0usize, move |sent| {
+            let counter = counter.clone();
+            async move {
+                if sent >= total {
+                    return None;
+                }
+                let n = chunk.min(total - sent);
+                counter.fetch_add(n, Ordering::SeqCst);
+                Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(vec![0u8; n])),
+                    sent + n,
+                ))
+            }
+        });
+        (Body::from_stream(stream), polled)
+    }
+
+    /// Frame size for the counting bodies. `Limited` rejects on the frame that
+    /// carries the total past the limit, and that frame has already been polled,
+    /// so the drain assertions allow exactly one frame of slack over the limit.
+    const DRAIN_CHUNK: usize = 8 * 1024;
+
+    /// A test state whose git routes are capped at `max_pack_bytes`, so an
+    /// oversize push body is a few hundred KiB rather than gigabytes.
+    fn state_with_pack_limit(mut state: AppState, max_pack_bytes: usize) -> AppState {
+        use clap::Parser;
+        state.config = Arc::new(crate::config::Config::parse_from([
+            "gitlawb-node",
+            "--max-pack-bytes",
+            &max_pack_bytes.to_string(),
+        ]));
+        state
+    }
+
+    /// Scenario 1, the regression test for the probe that found this: an UNSIGNED
+    /// POST to `/{owner}/{repo}/git-receive-pack` with a body far larger than the
+    /// configured `GITLAWB_MAX_PACK_BYTES`. Before the fix this drained all 4 MiB
+    /// into memory and then returned 401 (no DID, no signature, no repo needed).
+    #[tokio::test]
+    async fn unsigned_oversize_push_is_not_drained_into_memory() {
+        const LIMIT: usize = 64 * 1024;
+        let state = state_with_pack_limit(test_state_lazy(), LIMIT);
+        let router = crate::server::build_router(state);
+
+        let (body, polled) = counting_body(4 * 1024 * 1024, DRAIN_CHUNK);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/zowner/repo/git-receive-pack")
+            .body(body)
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let drained = polled.load(Ordering::SeqCst);
+        assert!(
+            drained <= LIMIT + DRAIN_CHUNK,
+            "unsigned push must stop reading at the pack limit, drained {drained} of 4 MiB \
+             against a {LIMIT}-byte limit"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an over-limit body is rejected as too large"
+        );
+    }
+
+    /// Scenario 2: the same hole on a non-git signed group. These eight groups
+    /// have no `RequestBodyLimitLayer` at all and rely on axum's 2 MB default,
+    /// which the middleware's own `collect()` bypasses.
+    #[tokio::test]
+    async fn unsigned_oversize_profile_write_is_not_drained_into_memory() {
+        let router = crate::server::build_router(test_state_lazy());
+
+        let (body, polled) = counting_body(6 * 1024 * 1024, DRAIN_CHUNK);
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/profile")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        let drained = polled.load(Ordering::SeqCst);
+        assert!(
+            drained <= crate::server::SIGNED_BODY_LIMIT + DRAIN_CHUNK,
+            "non-git signed routes stop reading at the 2 MB default, drained {drained}"
+        );
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Scenario 5: the over-limit rejection is distinguishable. It is neither the
+    /// 401 an unsigned request gets nor the 400 an unreadable body gets, so a
+    /// client can tell "too big" from "not authenticated".
+    #[tokio::test]
+    async fn over_limit_is_413_not_401_or_400() {
+        const LIMIT: usize = 64 * 1024;
+        let state = state_with_pack_limit(test_state_lazy(), LIMIT);
+        let router = crate::server::build_router(state);
+
+        let (body, _polled) = counting_body(LIMIT * 4, DRAIN_CHUNK);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/zowner/repo/git-receive-pack")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        assert_ne!(status, StatusCode::UNAUTHORIZED, "size, not identity");
+        assert_ne!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "size, not an unreadable body"
+        );
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Scenario 6, degenerate cases: an empty body and a body exactly at the limit
+    /// are both under the cap, so they fall through to the existing signature
+    /// check and get the same 401 they always did.
+    #[tokio::test]
+    async fn empty_and_exactly_at_limit_bodies_behave_as_before() {
+        const LIMIT: usize = 64 * 1024;
+        let state = state_with_pack_limit(test_state_lazy(), LIMIT);
+
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/zowner/repo/git-receive-pack")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an empty unsigned body still fails at the signature check, not the limit"
+        );
+
+        let (body, polled) = counting_body(LIMIT, DRAIN_CHUNK);
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/zowner/repo/git-receive-pack")
+                    .body(body)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            polled.load(Ordering::SeqCst),
+            LIMIT,
+            "a body exactly at the limit is read in full"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "exactly at the limit is allowed through to the signature check"
+        );
+    }
+
+    /// Scenario 3, the discriminator: without it the fix could "pass" by rejecting
+    /// everything. A correctly signed push just under `max_pack_bytes` must clear
+    /// the limit AND the signature check with its body intact, which means the
+    /// full body was read (content-digest is computed over it) and the request
+    /// reached the handler. The handler then 404s because no repo was seeded,
+    /// which is the first thing `git_receive_pack` does after auth.
+    #[sqlx::test]
+    async fn signed_push_just_under_the_pack_limit_still_reaches_the_handler(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        const LIMIT: usize = 256 * 1024;
+        let state = state_with_pack_limit(test_state(pool).await, LIMIT);
+        let kp = Keypair::generate();
+        let short = kp
+            .did()
+            .to_string()
+            .split(':')
+            .next_back()
+            .unwrap()
+            .to_string();
+
+        // Just under the cap, and signed over the exact bytes so content-digest
+        // verification proves the middleware handed the body through unmodified.
+        let payload = vec![0u8; LIMIT - 1];
+        let path = format!("/{short}/pushrepo/git-receive-pack");
+        let signed = sign_request(&kp, "POST", &path, &payload);
+        let len = payload.len();
+
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&path)
+                    .header("content-digest", signed.content_digest)
+                    .header("signature-input", signed.signature_input)
+                    .header("signature", signed.signature)
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a {len}-byte push under a {LIMIT}-byte cap must not be rejected as too large"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "auth passed with the body intact; the handler 404s on the unseeded repo"
+        );
+    }
+
+    /// Scenario 4: a correctly signed, in-limit request on a non-git signed route
+    /// still succeeds end to end, so the 2 MB constant did not narrow anything
+    /// that used to work.
+    #[sqlx::test]
+    async fn signed_in_limit_profile_write_still_succeeds(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        let kp = Keypair::generate();
+        let did = kp.did().to_string();
+        let payload =
+            serde_json::to_vec(&serde_json::json!({ "display_name": "limit-probe" })).unwrap();
+        let signed = sign_request(&kp, "PUT", "/api/v1/profile", &payload);
+
+        let resp = crate::server::build_router(test_state(pool).await)
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/v1/profile")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header("content-digest", signed.content_digest)
+                    .header("signature-input", signed.signature_input)
+                    .header("signature", signed.signature)
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "signed in-limit write succeeds"
+        );
+        let body = json_body(resp).await;
+        assert_eq!(body["did"], did);
+        assert_eq!(body["display_name"], "limit-probe");
     }
 }
