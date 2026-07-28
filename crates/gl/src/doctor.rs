@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use crate::http::NodeClient;
 
 const PUBLIC_NODE: &str = "https://node.gitlawb.com";
+const GITHUB_API_BASE: &str = "https://api.github.com";
 
 #[derive(Args)]
 pub struct DoctorArgs {
@@ -141,17 +142,19 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 
     // ── 3. GITLAWB_NODE env var ───────────────────────────────────────────
     match std::env::var("GITLAWB_NODE") {
-        Ok(v) if !v.is_empty() && !v.contains("127.0.0.1") && !v.contains("localhost") => {
-            checks.push(Check::pass("GITLAWB_NODE", v.to_string()));
-        }
-        Ok(v) if v.contains("127.0.0.1") || v.contains("localhost") => {
-            checks.push(Check::fail(
+        // A loopback host is a legitimate setup (self-hosted node, dev
+        // harness) — the connectivity check below fails loudly if it is not
+        // actually reachable, so don't red-flag the configuration itself.
+        Ok(v) if is_loopback_url(&v) => {
+            checks.push(Check::pass(
                 "GITLAWB_NODE",
                 format!(
-                    "set to local address ({v}) — git push/clone will fail against remote nodes"
+                    "{v} (local node — intentional for self-hosting/dev; unset to target the public network)"
                 ),
-                "export GITLAWB_NODE=https://node.gitlawb.com",
             ));
+        }
+        Ok(v) if !v.is_empty() => {
+            checks.push(Check::pass("GITLAWB_NODE", v.to_string()));
         }
         _ => {
             checks.push(Check::fail(
@@ -242,6 +245,15 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         ));
     }
 
+    // ── 5b. shell alias shadowing ─────────────────────────────────────────
+    // oh-my-zsh's default `git` plugin aliases gl='git pull', which silently
+    // shadows this binary in every interactive zsh — the classic symptom is
+    // `gl` printing "fatal: not a git repository". Aliases beat PATH, so no
+    // install method can fix it; the user's rc file has to unalias.
+    if let Some(check) = check_shell_alias_shadowing(dirs::home_dir()) {
+        checks.push(check);
+    }
+
     // ── 6. git ────────────────────────────────────────────────────────────
     match std::process::Command::new("git")
         .arg("--version")
@@ -263,7 +275,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 
     // ── 7. Version up to date ─────────────────────────────────────────────
     let current = env!("CARGO_PKG_VERSION");
-    checks.push(check_version(current).await);
+    checks.push(check_version(current, GITHUB_API_BASE).await);
 
     // ── Render ────────────────────────────────────────────────────────────
     for check in &checks {
@@ -308,6 +320,83 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 }
 
 /// Check if a binary name exists anywhere on PATH.
+/// True when the rc file contains a real `unalias` command naming `gl` —
+/// not a comment, and not a longer word like `unalias global`. Ordering
+/// relative to oh-my-zsh loading is not modeled (an unalias placed before the
+/// plugin loads would be ineffective); acceptable slack for a warning check.
+fn rc_unaliases_gl(rc: &str) -> bool {
+    rc.lines().any(|line| {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            return false;
+        }
+        line.split([';', '&', '|']).any(|cmd| {
+            // A trailing comment must not count: `unalias foo  # gl`
+            let cmd = cmd.split('#').next().unwrap_or("");
+            let mut tokens = cmd.split_whitespace();
+            tokens.next() == Some("unalias") && tokens.any(|t| t == "gl")
+        })
+    })
+}
+
+/// True when the URL's host is exactly a loopback address. Substring checks
+/// misclassify hosts like `localhost.example` or URLs with "localhost" in the
+/// path, so parse and compare the actual host.
+fn is_loopback_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h == "localhost" || h == "127.0.0.1" || h == "[::1]" || h == "::1")
+        })
+        .unwrap_or(false)
+}
+
+/// Detect interactive-shell setups where an alias shadows `gl` (aliases beat
+/// PATH, so no install method can fix this). Best-effort heuristic over
+/// ~/.zshrc: an explicit `alias gl=`, or oh-my-zsh's `git` plugin (which
+/// ships gl='git pull'). Returns None when nothing suspicious is found or the
+/// rc file already contains an `unalias gl`.
+fn check_shell_alias_shadowing(home: Option<PathBuf>) -> Option<Check> {
+    let home = home?;
+    let rc = std::fs::read_to_string(home.join(".zshrc")).ok()?;
+    if rc_unaliases_gl(&rc) {
+        return None;
+    }
+
+    let explicit_alias = rc.lines().any(|l| l.trim_start().starts_with("alias gl="));
+    // Single-line `plugins=(git ...)` is the overwhelmingly common form; a
+    // multi-line plugins array slips past this heuristic, which is acceptable
+    // for a warning-level check.
+    let omz_git_plugin = home.join(".oh-my-zsh/plugins/git").exists()
+        && rc.lines().any(|l| {
+            let l = l.trim_start();
+            l.starts_with("plugins=")
+                && l.trim_start_matches("plugins=(")
+                    .trim_end_matches(')')
+                    .split_whitespace()
+                    .any(|p| p == "git")
+        });
+
+    if explicit_alias || omz_git_plugin {
+        let source = if explicit_alias {
+            "~/.zshrc defines `alias gl=`"
+        } else {
+            "oh-my-zsh's git plugin aliases gl='git pull'"
+        };
+        Some(Check::warn(
+            "shell alias",
+            format!(
+                "{source} — interactive shells run that instead of this binary \
+                 (symptom: `gl` prints \"fatal: not a git repository\")"
+            ),
+            "echo 'unalias gl 2>/dev/null' >> ~/.zshrc && source ~/.zshrc  (must come after oh-my-zsh loads)",
+        ))
+    } else {
+        None
+    }
+}
+
 fn which_in_path(name: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| {
@@ -319,8 +408,9 @@ fn which_in_path(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Fetch the latest release tag from gitlawb/releases and compare to current version.
-async fn check_version(current: &'static str) -> Check {
+/// Fetch the latest release tag from Gitlawb/node (the actual release repo — see install.sh's
+/// `GITLAWB_RELEASE_REPO` default) and compare to current version.
+async fn check_version(current: &'static str, github_api_base: &str) -> Check {
     let client = match reqwest::Client::builder()
         .user_agent(format!("gl/{current}"))
         .timeout(std::time::Duration::from_secs(5))
@@ -331,13 +421,22 @@ async fn check_version(current: &'static str) -> Check {
     };
 
     let resp = match client
-        .get("https://api.github.com/repos/gitlawb/releases/releases/latest")
+        .get(format!(
+            "{github_api_base}/repos/Gitlawb/node/releases/latest"
+        ))
         .send()
         .await
     {
         Ok(r) => r,
         Err(_) => return Check::pass("version", format!("v{current} (offline — could not check)")),
     };
+
+    if !resp.status().is_success() {
+        return Check::pass(
+            "version",
+            format!("v{current} (GitHub API returned HTTP {})", resp.status()),
+        );
+    }
 
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
@@ -382,6 +481,88 @@ fn is_newer(latest: &str, current: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn fake_home(zshrc: Option<&str>, with_omz_git: bool) -> tempfile::TempDir {
+        let home = tempfile::TempDir::new().unwrap();
+        if let Some(rc) = zshrc {
+            std::fs::write(home.path().join(".zshrc"), rc).unwrap();
+        }
+        if with_omz_git {
+            std::fs::create_dir_all(home.path().join(".oh-my-zsh/plugins/git")).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn alias_shadowing_flags_omz_git_plugin() {
+        let home = fake_home(Some("plugins=(git z)\nsource $ZSH/oh-my-zsh.sh\n"), true);
+        let check = check_shell_alias_shadowing(Some(home.path().to_path_buf()));
+        assert!(check.is_some(), "omz git plugin without unalias must warn");
+    }
+
+    #[test]
+    fn alias_shadowing_flags_explicit_alias() {
+        let home = fake_home(Some("alias gl='git pull'\n"), false);
+        assert!(check_shell_alias_shadowing(Some(home.path().to_path_buf())).is_some());
+    }
+
+    #[test]
+    fn alias_shadowing_silent_when_unaliased() {
+        let home = fake_home(
+            Some("plugins=(git z)\nsource $ZSH/oh-my-zsh.sh\nunalias gl 2>/dev/null\n"),
+            true,
+        );
+        assert!(check_shell_alias_shadowing(Some(home.path().to_path_buf())).is_none());
+    }
+
+    #[test]
+    fn alias_shadowing_ignores_fake_unaliases() {
+        // None of these actually free `gl` — the warning must survive them.
+        for rc in [
+            "plugins=(git)\n# unalias gl\n",          // commented out
+            "plugins=(git)\nunalias global\n",        // longer word
+            "plugins=(git)\nunalias foo  # gl\n",     // gl only in a comment
+            "plugins=(git)\necho unalias-gl-later\n", // not an unalias command
+        ] {
+            let home = fake_home(Some(rc), true);
+            assert!(
+                check_shell_alias_shadowing(Some(home.path().to_path_buf())).is_some(),
+                "must still warn for rc: {rc:?}"
+            );
+        }
+        // Real unalias forms that do free it — all must silence the warning.
+        for rc in [
+            "plugins=(git)\nunalias gl\n",
+            "plugins=(git)\nunalias gl 2>/dev/null\n",
+            "plugins=(git)\ntrue; unalias gl\n",
+            "plugins=(git)\nunalias glog gl gst\n",
+        ] {
+            let home = fake_home(Some(rc), true);
+            assert!(
+                check_shell_alias_shadowing(Some(home.path().to_path_buf())).is_none(),
+                "must be silent for rc: {rc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_url_detection_is_host_exact() {
+        assert!(is_loopback_url("http://127.0.0.1:7545"));
+        assert!(is_loopback_url("http://localhost:7545"));
+        assert!(is_loopback_url("http://[::1]:7545"));
+        assert!(!is_loopback_url("https://localhost.example"));
+        assert!(!is_loopback_url("https://node.gitlawb.com/localhost"));
+        assert!(!is_loopback_url("not a url"));
+    }
+
+    #[test]
+    fn alias_shadowing_silent_without_signals() {
+        let home = fake_home(Some("plugins=(z)\nexport EDITOR=vim\n"), false);
+        assert!(check_shell_alias_shadowing(Some(home.path().to_path_buf())).is_none());
+        let no_rc = fake_home(None, false);
+        assert!(check_shell_alias_shadowing(Some(no_rc.path().to_path_buf())).is_none());
+        assert!(check_shell_alias_shadowing(None).is_none());
+    }
+
     #[test]
     fn test_is_newer_minor_bump() {
         assert!(is_newer("0.2.0", "0.1.0"));
@@ -416,5 +597,51 @@ mod tests {
     #[test]
     fn test_which_in_path_missing_binary() {
         assert!(!which_in_path("this-binary-does-not-exist-gl-test-12345"));
+    }
+
+    #[tokio::test]
+    async fn test_check_version_queries_gitlawb_node_releases() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tag_name":"v9.9.9"}"#)
+            .create_async()
+            .await;
+
+        let check = check_version("0.1.0", &server.url()).await;
+        assert!(matches!(check.state, CheckState::Warn));
+        assert!(check.detail.contains("v9.9.9"));
+    }
+
+    #[tokio::test]
+    async fn test_check_version_up_to_date() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"tag_name":"v0.1.0"}"#)
+            .create_async()
+            .await;
+
+        let check = check_version("0.1.0", &server.url()).await;
+        assert!(matches!(check.state, CheckState::Ok));
+        assert!(check.detail.contains("up to date"));
+    }
+
+    #[tokio::test]
+    async fn test_check_version_http_error() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/repos/Gitlawb/node/releases/latest")
+            .with_status(403)
+            .create_async()
+            .await;
+
+        let check = check_version("0.1.0", &server.url()).await;
+        assert!(matches!(check.state, CheckState::Ok));
+        assert!(check.detail.contains("GitHub API returned HTTP 403"));
     }
 }

@@ -932,13 +932,33 @@ async fn call_tool(
 
         "webhook_list" => {
             let repo = args["repo"].as_str().context("missing 'repo'")?;
-            let owner = resolve_owner(&args, &client).await?;
-            let resp: Value = client
-                .get(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
-                .await?
-                .json()
+            // Owner-gated route: an explicit `owner` arg wins, otherwise default to
+            // the signing keypair's short DID (NOT the node DID). The request is
+            // signed by this keypair, so the path owner must match it or the node
+            // returns 403/404.
+            let owner = if let Some(o) = args.get("owner").and_then(|v| v.as_str()) {
+                o.to_string()
+            } else {
+                let kp = keypair
+                    .as_ref()
+                    .context("no identity found — run `gl identity new` first")?;
+                let did = kp.did().to_string();
+                did.split(':').next_back().unwrap_or(&did).to_string()
+            };
+            // Owner-gated route: must be signed (get_signed), not a plain get().
+            let resp = client
+                .get_signed(&format!("/api/v1/repos/{owner}/{repo}/hooks"))
                 .await?;
-            Ok(serde_json::to_string_pretty(&resp)?)
+            // Check the HTTP status before deserializing: a 401/403/404 JSON error
+            // body (missing identity, wrong owner, private/deleted repo) must fail
+            // the tool call, not be returned as a successful result.
+            let status = resp.status();
+            let body: Value = resp.json().await?;
+            if !status.is_success() {
+                let msg = body["message"].as_str().unwrap_or("unknown error");
+                anyhow::bail!("webhook_list failed ({status}): {msg}");
+            }
+            Ok(serde_json::to_string_pretty(&body)?)
         }
 
         "webhook_delete" => {
@@ -1823,6 +1843,187 @@ mod tests {
         .unwrap();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["body"], "looks good");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_list_via_mcp_signs_the_request() {
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        // /hooks is owner-gated, so the MCP webhook_list tool must send a SIGNED
+        // request (get_signed). Requiring the header catches a regression to get().
+        // Passing `owner` in args makes resolve_owner skip the node-root lookup.
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"webhooks":[],"count":0}"#)
+            .create_async()
+            .await;
+
+        let result = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("webhooks"), "got: {result}");
+    }
+
+    #[tokio::test]
+    async fn test_webhook_list_default_owner_is_keypair_not_node_did() {
+        // When `owner` is omitted, the owner segment must come from the signing
+        // keypair's short DID, NOT the node root DID. The "/" mock returns a
+        // different DID; the /hooks mock only matches the keypair's short DID,
+        // so a regression to the node DID would leave the request unmatched.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _root = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"did":"did:key:z6MkNodeRootDid"}"#)
+            .create_async()
+            .await;
+
+        let did = kp.did().to_string();
+        let short = did.split(':').next_back().unwrap_or(&did).to_string();
+
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(format!(r"/api/v1/repos/{short}/myrepo/hooks$")),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"webhooks":[],"count":0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = call_tool(
+            "webhook_list",
+            json!({"repo": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("webhooks"), "got: {result}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_webhook_list_explicit_owner_overrides_keypair() {
+        // An explicit `owner` arg must win over the keypair default and the node
+        // DID. The path must use the supplied owner; "/" must not even be hit.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _m = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/v1/repos/someoneelse/myrepo/hooks$".to_string()),
+            )
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"webhooks":[],"count":0}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let result = call_tool(
+            "webhook_list",
+            json!({"repo": "myrepo", "owner": "someoneelse"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert!(result.contains("webhooks"), "got: {result}");
+        _m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_webhook_list_non_success_status_errors() {
+        // A 403 (or any non-2xx) JSON error body for a missing identity, wrong
+        // owner, or private/deleted repo must fail the tool call, NOT be returned
+        // as a successful result. Mirrors the `gl webhook list` status check.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _m = server
+            .mock("GET", mockito::Matcher::Regex(r"/hooks$".to_string()))
+            .match_header("signature", mockito::Matcher::Any)
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"only the repo owner can perform this action"}"#)
+            .create_async()
+            .await;
+
+        let err = call_tool(
+            "webhook_list",
+            json!({"owner": "alice", "repo": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("non-2xx must error, not return the error body as success");
+        let msg = err.to_string();
+        assert!(msg.contains("webhook_list failed (403"), "got: {msg}");
+        assert!(
+            msg.contains("only the repo owner"),
+            "must surface the node message, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_webhook_list_without_keypair_errors() {
+        // No identity loaded and no explicit owner → the tool must error rather
+        // than fall back to the node DID and issue an unsigned, mis-scoped GET.
+        let server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap(); // empty: no identity.pem
+
+        let err = call_tool(
+            "webhook_list",
+            json!({"repo": "myrepo"}),
+            &server.url(),
+            Some(dir.path()),
+        )
+        .await
+        .expect_err("must error without an identity");
+        assert!(err.to_string().contains("no identity found"), "got: {err}");
     }
 
     #[test]

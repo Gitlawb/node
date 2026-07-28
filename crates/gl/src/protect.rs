@@ -154,10 +154,12 @@ async fn cmd_remove(
 
 async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let (owner, name) = resolve_owner_repo(&repo, &node, dir.as_deref()).await?;
-    let client = NodeClient::new(&node, None);
+    // Read-visibility-gated on the node: public repos list anonymously, private
+    // repos need the owner's signature. Sign when an identity is available.
+    let client = NodeClient::new(&node, load_keypair_from_dir(dir.as_deref()).ok());
 
     let resp = client
-        .get(&format!("/api/v1/repos/{owner}/{name}/branches/protected"))
+        .get_maybe_signed(&format!("/api/v1/repos/{owner}/{name}/branches/protected"))
         .await
         .context("failed to connect to node")?;
 
@@ -307,6 +309,9 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"branches/protected".to_string()),
             )
+            // An identity is supplied, so get_maybe_signed must sign the request.
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"protected_branches":[],"count":0}"#)
@@ -338,6 +343,8 @@ mod tests {
                 "GET",
                 mockito::Matcher::Regex(r"branches/protected".to_string()),
             )
+            .match_header("signature", mockito::Matcher::Any)
+            .match_header("signature-input", mockito::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"protected_branches":["main","release"],"count":2}"#)
