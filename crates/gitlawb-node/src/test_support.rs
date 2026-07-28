@@ -5482,4 +5482,287 @@ mod tests {
         assert_eq!(body["did"], did);
         assert_eq!(body["display_name"], "limit-probe");
     }
+
+    // ── The buffered body must reach git byte-for-byte ──────────────────────
+    //
+    // Scenario 3 above proves a large signed push clears the limit and the
+    // signature check, but it stops at the handler's repo lookup. That leaves one
+    // hole: middleware that truncated or reordered the buffered body past some
+    // threshold would still pass it, because nothing downstream ever consumed the
+    // bytes. The two tests below close it by driving a REAL `git push` request
+    // into a REAL bare repo and asserting on the refs that land on disk.
+
+    /// Removes a fixed path on drop, so a failing assertion still cleans up.
+    /// `repo_store::for_testing` pins the on-disk layout to `/tmp/<slug>/<name>.git`,
+    /// so these paths cannot be `tempfile::TempDir` randoms.
+    struct PushDirGuard(std::path::PathBuf);
+
+    impl Drop for PushDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// What [`real_push_fixture`] hands back: the exact request bytes a git client
+    /// sends, the commit that push carries, and the empty bare repo it targets.
+    struct PushFixture {
+        body: Vec<u8>,
+        new_sha: String,
+        bare: std::path::PathBuf,
+        _guards: Vec<PushDirGuard>,
+    }
+
+    /// Build a real push: a source repo holding one commit with `payload` bytes of
+    /// incompressible content, an EMPTY bare repo at the exact path `repo_store`
+    /// will write to, and the `git-receive-pack` request body a real `git push`
+    /// produces for it.
+    ///
+    /// The body is captured off the wire from a throwaway local server rather than
+    /// hand-assembled, so the limit tests drive the bytes a client actually sends
+    /// (pkt-line command list, flush, then the pack) instead of an approximation
+    /// that real `git receive-pack` might reject for unrelated reasons.
+    async fn real_push_fixture(owner_did: &str, name: &str, payload: usize) -> PushFixture {
+        use std::process::Command;
+
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let slug = owner_did.replace([':', '/'], "_");
+        let mut guards = Vec::new();
+
+        // Source repo with one commit. The content is incompressible so the pack
+        // stays close to `payload`: a file of zeros would deflate to nothing and
+        // the request would never approach the limit under test.
+        let src = std::env::temp_dir().join(format!("gl-push-src-{slug}-{name}"));
+        let _ = std::fs::remove_dir_all(&src);
+        std::fs::create_dir_all(&src).unwrap();
+        guards.push(PushDirGuard(src.clone()));
+        run(&["init", "-q", "-b", "main"], &src);
+        run(&["config", "user.email", "t@t"], &src);
+        run(&["config", "user.name", "t"], &src);
+        let mut blob = Vec::with_capacity(payload);
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        while blob.len() < payload {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            blob.extend_from_slice(&x.to_le_bytes());
+        }
+        blob.truncate(payload);
+        std::fs::write(src.join("big.bin"), &blob).unwrap();
+        run(&["add", "big.bin"], &src);
+        run(&["commit", "-qm", "big"], &src);
+        let new_sha = run(&["rev-parse", "HEAD"], &src);
+
+        // Empty bare repo at the path repo_store.acquire_write() resolves to.
+        let bare = std::path::PathBuf::from("/tmp")
+            .join(&slug)
+            .join(format!("{name}.git"));
+        let _ = std::fs::remove_dir_all(&bare);
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        run(&["init", "-q", "--bare", bare.to_str().unwrap()], &src);
+        guards.push(PushDirGuard(bare.clone()));
+
+        // Capture server: advertises the real (empty) bare repo so the client
+        // computes a genuine old→new command list, and records the POST body.
+        let adv_repo = bare.clone();
+        let captured: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+        let sink = captured.clone();
+        let app = Router::new()
+            .route(
+                "/repo.git/info/refs",
+                axum::routing::get(move || {
+                    let repo = adv_repo.clone();
+                    async move {
+                        crate::git::smart_http::info_refs(&repo, "git-receive-pack")
+                            .await
+                            .expect("advertise refs")
+                    }
+                }),
+            )
+            .route(
+                "/repo.git/git-receive-pack",
+                axum::routing::post(move |body: bytes::Bytes| {
+                    let sink = sink.clone();
+                    async move {
+                        *sink.lock().unwrap() = body.to_vec();
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let push_src = src.clone();
+        tokio::task::spawn_blocking(move || {
+            // The capture server answers with an empty body, so git reports a
+            // disconnect once it has sent the request. The request is all we want
+            // here, so the exit status is deliberately not asserted.
+            let _ = Command::new("git")
+                .args([
+                    "push",
+                    &format!("http://127.0.0.1:{port}/repo.git"),
+                    "HEAD:refs/heads/main",
+                ])
+                .current_dir(&push_src)
+                .output()
+                .expect("git push runs");
+        })
+        .await
+        .unwrap();
+        server.abort();
+
+        let body = captured.lock().unwrap().clone();
+        assert!(
+            body.windows(4).any(|w| w == b"PACK"),
+            "the captured request must carry a real pack, got {} bytes",
+            body.len()
+        );
+        PushFixture {
+            body,
+            new_sha,
+            bare,
+            _guards: guards,
+        }
+    }
+
+    /// Read a ref out of a bare repo, or `None` when it does not exist.
+    fn bare_ref(bare: &std::path::Path, name: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["--git-dir", bare.to_str().unwrap(), "rev-parse", name])
+            .output()
+            .expect("git runs");
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    /// The discriminator with teeth: a signed push of a real ~300 KiB pack against
+    /// a limit just above it must not only return 200, it must LAND. Asserting on
+    /// the ref that appears in the bare repo is what catches a middleware that
+    /// buffers the body but hands a truncated or reordered copy downstream, which
+    /// a status-only assertion cannot see.
+    #[sqlx::test]
+    async fn signed_large_push_under_the_limit_lands_on_disk(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let fixture = real_push_fixture(&owner_did, "bigpush-ok", 300 * 1024).await;
+        let len = fixture.body.len();
+        assert!(
+            len > 256 * 1024,
+            "the fixture push must be many frames long to exercise the limit, got {len} bytes"
+        );
+
+        // The cap sits just above this push, so passing means the limit admitted a
+        // body it was sized for, not that the limit was slack.
+        let state = state_with_pack_limit(test_state(pool).await, len + 1024);
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "bigpush-ok"))
+            .await
+            .expect("seed repo");
+
+        let path = format!("/{short}/bigpush-ok.git/git-receive-pack");
+        let signed = sign_request(&kp, "POST", &path, &fixture.body);
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&path)
+                    .header("content-digest", signed.content_digest)
+                    .header("signature-input", signed.signature_input)
+                    .header("signature", signed.signature)
+                    .body(Body::from(fixture.body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a {len}-byte push under a {}-byte cap must be served",
+            len + 1024
+        );
+        assert_eq!(
+            bare_ref(&fixture.bare, "refs/heads/main").as_deref(),
+            Some(fixture.new_sha.as_str()),
+            "the push must take effect: refs/heads/main points at the pushed commit"
+        );
+        assert!(
+            bare_ref(&fixture.bare, &format!("{}^{{tree}}", fixture.new_sha)).is_some(),
+            "the pushed objects must be present, not just the ref"
+        );
+    }
+
+    /// The negative twin: the same real push against a cap one byte below it is
+    /// rejected 413, and the repo is untouched. A partial write here would mean
+    /// the middleware forwarded a prefix of an over-limit body.
+    #[sqlx::test]
+    async fn signed_large_push_over_the_limit_is_rejected_and_writes_nothing(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let fixture = real_push_fixture(&owner_did, "bigpush-over", 300 * 1024).await;
+        let len = fixture.body.len();
+
+        let state = state_with_pack_limit(test_state(pool).await, len - 1);
+        state
+            .db
+            .create_repo(&seed_repo(&owner_did, "bigpush-over"))
+            .await
+            .expect("seed repo");
+
+        let path = format!("/{short}/bigpush-over.git/git-receive-pack");
+        let signed = sign_request(&kp, "POST", &path, &fixture.body);
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(&path)
+                    .header("content-digest", signed.content_digest)
+                    .header("signature-input", signed.signature_input)
+                    .header("signature", signed.signature)
+                    .body(Body::from(fixture.body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a {len}-byte push against a {}-byte cap is too large",
+            len - 1
+        );
+        assert_eq!(
+            bare_ref(&fixture.bare, "refs/heads/main"),
+            None,
+            "a rejected push must leave no ref behind"
+        );
+        // Peel to `^{commit}`: `rev-parse` echoes a bare 40-hex SHA back without
+        // checking that the object exists, so only the peeled form is evidence.
+        assert_eq!(
+            bare_ref(&fixture.bare, &format!("{}^{{commit}}", fixture.new_sha)),
+            None,
+            "a rejected push must leave no objects behind"
+        );
+    }
 }
