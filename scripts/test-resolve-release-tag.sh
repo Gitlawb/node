@@ -59,48 +59,72 @@ resolver_steps="$test_tmp/resolver-steps"
 check_resolver_steps() {
   local workflow_file="$1"
   local steps_file="$2"
-  local resolver_call_re='(^|[[:space:]])scripts/resolve-release-tag\.sh([[:space:]]|$)'
-  local direct_output_re='(echo|printf).*(tag|version)=.*>>?[[:space:]]*"?\$(GITHUB_OUTPUT|GITHUB_ENV)'
-  local resolver_line
-  local resolver_step
-  local resolver_step_count=0
+  local job
+  local step_line
+  local step_name
+  local has_resolver_call
+  local has_output_sink
+  local has_tag_assignment
+  local expected_job
+  local is_expected_job
+  local -a expected_jobs=(docker docker-manifest npm-publish)
+  local -A resolver_step_counts=()
 
   awk '
-    function indentation(line, spaces) {
-      spaces = line
-      sub(/[^ ].*$/, "", spaces)
-      return length(spaces)
-    }
-
     function emit_step() {
-      if (!in_resolver_step) {
+      if (!in_step) {
         return
       }
 
-      gsub(/[[:space:]]+/, " ", resolver_step)
-      sub(/^ /, "", resolver_step)
-      sub(/ $/, "", resolver_step)
-      printf "%d\t%s\n", resolver_line, resolver_step
-      in_resolver_step = 0
-      resolver_step = ""
+      printf "%s\t%d\t%s\t%d\t%d\t%d\n",
+        job,
+        step_line,
+        step_name,
+        has_resolver_call,
+        has_output_sink,
+        has_tag_assignment
+      in_step = 0
     }
 
-    /^[[:space:]]*- name:[[:space:]]*Resolve release tag[[:space:]]*$/ {
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
       emit_step()
-      in_resolver_step = 1
-      resolver_indent = indentation($0)
-      resolver_line = NR
+      job = $0
+      sub(/^  /, "", job)
+      sub(/:[[:space:]]*$/, "", job)
     }
 
-    {
-      if (in_resolver_step && NR != resolver_line &&
-          $0 ~ /^[[:space:]]*-[[:space:]]/ &&
-          indentation($0) == resolver_indent) {
-        emit_step()
+    /^      - / {
+      emit_step()
+      in_step = 1
+      step_line = NR
+      step_name = "<unnamed>"
+      has_resolver_call = 0
+      has_output_sink = 0
+      has_tag_assignment = 0
+
+      if ($0 ~ /^      - name:[[:space:]]*/) {
+        step_name = $0
+        sub(/^      - name:[[:space:]]*/, "", step_name)
+        sub(/[[:space:]]*$/, "", step_name)
+      }
+    }
+
+    in_step {
+      code = $0
+      sub(/^[[:space:]]*/, "", code)
+
+      if (code !~ /^#/ &&
+          code ~ /(^|[;&|({][[:space:]]*)scripts\/resolve-release-tag\.sh([[:space:];&|)}]|$)/) {
+        has_resolver_call = 1
       }
 
-      if (in_resolver_step) {
-        resolver_step = resolver_step " " $0
+      if (code !~ /^#/ && code ~ /\$(GITHUB_OUTPUT|GITHUB_ENV)/) {
+        has_output_sink = 1
+      }
+
+      if (code !~ /^#/ &&
+          code ~ /(^|[^A-Za-z0-9_])(tag|version)=/) {
+        has_tag_assignment = 1
       }
     }
 
@@ -109,31 +133,73 @@ check_resolver_steps() {
     }
   ' "$workflow_file" > "$steps_file"
 
-  while IFS=$'\t' read -r resolver_line resolver_step; do
-    resolver_step_count=$((resolver_step_count + 1))
+  while IFS=$'\t' read -r \
+    job \
+    step_line \
+    step_name \
+    has_resolver_call \
+    has_output_sink \
+    has_tag_assignment
+  do
+    is_expected_job=0
+    for expected_job in "${expected_jobs[@]}"; do
+      if [[ "$job" == "$expected_job" ]]; then
+        is_expected_job=1
+        break
+      fi
+    done
 
-    if [[ ! "$resolver_step" =~ $resolver_call_re ]]; then
-      printf '%s\n' \
-        "'Resolve release tag' step at ${workflow_file##*/}:$resolver_line does not call the tested resolver" \
-        >&2
-      return 1
+    if [[ "$step_name" == "Resolve release tag" ]]; then
+      if [[ "$is_expected_job" -ne 1 ]]; then
+        printf '%s\n' \
+          "unexpected 'Resolve release tag' step in job '$job' at ${workflow_file##*/}:$step_line" \
+          >&2
+        return 1
+      fi
+
+      resolver_step_counts["$job"]=$(( ${resolver_step_counts["$job"]:-0} + 1 ))
+
+      if [[ "$has_resolver_call" -ne 1 ]]; then
+        printf '%s\n' \
+          "'Resolve release tag' step in job '$job' at ${workflow_file##*/}:$step_line does not invoke the tested resolver" \
+          >&2
+        return 1
+      fi
     fi
 
-    if [[ "$resolver_step" =~ $direct_output_re ]]; then
+    if [[ "$is_expected_job" -eq 1 &&
+          "$has_output_sink" -eq 1 &&
+          "$has_tag_assignment" -eq 1 ]]
+    then
       printf '%s\n' \
-        "'Resolve release tag' step at ${workflow_file##*/}:$resolver_line writes tag/version outputs directly" \
+        "step '$step_name' in job '$job' at ${workflow_file##*/}:$step_line writes tag/version outputs directly" \
         >&2
       return 1
     fi
   done < "$steps_file"
 
-  if [[ "$resolver_step_count" -lt 1 ]]; then
-    printf '%s\n' "${workflow_file##*/} has no 'Resolve release tag' steps" >&2
-    return 1
-  fi
+  for expected_job in "${expected_jobs[@]}"; do
+    if [[ "${resolver_step_counts["$expected_job"]:-0}" -ne 1 ]]; then
+      printf '%s\n' \
+        "job '$expected_job' must contain exactly one guarded 'Resolve release tag' step; found ${resolver_step_counts["$expected_job"]:-0}" \
+        >&2
+      return 1
+    fi
+  done
 }
 
 check_resolver_steps "$release_workflow" "$resolver_steps"
+
+assert_guard_rejects() {
+  local workflow_file="$1"
+  local steps_file="$2"
+  local failure_message="$3"
+
+  if check_resolver_steps "$workflow_file" "$steps_file" 2> /dev/null; then
+    printf '%s\n' "$failure_message" >&2
+    exit 1
+  fi
+}
 
 bypass_workflow="$test_tmp/release-bypass.yml"
 awk '
@@ -168,16 +234,21 @@ awk '
   }
 ' "$release_workflow" > "$bypass_workflow"
 
-if check_resolver_steps "$bypass_workflow" "$test_tmp/bypass-steps" 2> /dev/null; then
-  printf '%s\n' "per-step workflow guard missed a decoy-call output-injection bypass" >&2
-  exit 1
-fi
+assert_guard_rejects \
+  "$bypass_workflow" \
+  "$test_tmp/bypass-steps" \
+  "workflow guard missed a decoy-call output-injection bypass"
 
 direct_output_workflow="$test_tmp/release-direct-output.yml"
 awk '
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+    in_docker_manifest = ($0 ~ /^  docker-manifest:/)
+  }
+
   {
     print
-    if (!injected && $0 ~ /scripts\/resolve-release-tag\.sh/) {
+    if (in_docker_manifest && !injected &&
+        /scripts\/resolve-release-tag\.sh/) {
       print "          {"
       print "            echo \"tag=ghcr.io/attacker/evil\""
       print "            echo \"version=9.9.9\""
@@ -185,13 +256,141 @@ awk '
       injected = 1
     }
   }
+
+  END {
+    if (!injected) {
+      print "failed to build direct-output fixture" > "/dev/stderr"
+      exit 1
+    }
+  }
 ' "$release_workflow" > "$direct_output_workflow"
 
-if check_resolver_steps \
-  "$direct_output_workflow" "$test_tmp/direct-output-steps" 2> /dev/null
-then
-  printf '%s\n' "per-step workflow guard missed a multiline direct output write" >&2
-  exit 1
-fi
+assert_guard_rejects \
+  "$direct_output_workflow" \
+  "$test_tmp/direct-output-steps" \
+  "workflow guard missed a multiline direct output write"
+
+commented_call_workflow="$test_tmp/release-commented-call.yml"
+awk '
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+    in_docker_manifest = ($0 ~ /^  docker-manifest:/)
+  }
+
+  in_docker_manifest && !commented && /scripts\/resolve-release-tag\.sh/ {
+    sub(/scripts\/resolve-release-tag\.sh/, "# scripts/resolve-release-tag.sh")
+    commented = 1
+  }
+
+  { print }
+
+  END {
+    if (!commented) {
+      print "failed to build commented-call fixture" > "/dev/stderr"
+      exit 1
+    }
+  }
+' "$release_workflow" > "$commented_call_workflow"
+
+assert_guard_rejects \
+  "$commented_call_workflow" \
+  "$test_tmp/commented-call-steps" \
+  "workflow guard counted a commented resolver reference as an invocation"
+
+tee_output_workflow="$test_tmp/release-tee-output.yml"
+awk '
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+    in_docker_manifest = ($0 ~ /^  docker-manifest:/)
+  }
+
+  {
+    print
+    if (in_docker_manifest && !injected &&
+        /scripts\/resolve-release-tag\.sh/) {
+      print "          printf \"%s\\n\" \"tag=ghcr.io/attacker/evil\" | tee -a \"$GITHUB_OUTPUT\" > /dev/null"
+      injected = 1
+    }
+  }
+
+  END {
+    if (!injected) {
+      print "failed to build tee-output fixture" > "/dev/stderr"
+      exit 1
+    }
+  }
+' "$release_workflow" > "$tee_output_workflow"
+
+assert_guard_rejects \
+  "$tee_output_workflow" \
+  "$test_tmp/tee-output-steps" \
+  "workflow guard missed a tag output written through tee"
+
+heredoc_output_workflow="$test_tmp/release-heredoc-output.yml"
+awk '
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+    in_docker_manifest = ($0 ~ /^  docker-manifest:/)
+  }
+
+  {
+    print
+    if (in_docker_manifest && !injected &&
+        /scripts\/resolve-release-tag\.sh/) {
+      print "          cat >> \"$GITHUB_OUTPUT\" <<'\''EOF'\''"
+      print "          tag=ghcr.io/attacker/evil"
+      print "          version=9.9.9"
+      print "          EOF"
+      injected = 1
+    }
+  }
+
+  END {
+    if (!injected) {
+      print "failed to build heredoc-output fixture" > "/dev/stderr"
+      exit 1
+    }
+  }
+' "$release_workflow" > "$heredoc_output_workflow"
+
+assert_guard_rejects \
+  "$heredoc_output_workflow" \
+  "$test_tmp/heredoc-output-steps" \
+  "workflow guard missed tag/version outputs written through a heredoc"
+
+renamed_step_workflow="$test_tmp/release-renamed-step.yml"
+awk '
+  /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+    in_docker = ($0 ~ /^  docker:/)
+    in_resolver_step = 0
+  }
+
+  in_docker && !renamed &&
+      /^      - name:[[:space:]]*Resolve release tag[[:space:]]*$/ {
+    print "      - name: Inline release metadata"
+    renamed = 1
+    in_resolver_step = 1
+    next
+  }
+
+  in_docker && in_resolver_step && !replaced &&
+      /scripts\/resolve-release-tag\.sh/ {
+    print "          echo \"tag=$TAG\" >> \"$GITHUB_OUTPUT\""
+    print "          echo \"version=${TAG#v}\" >> \"$GITHUB_OUTPUT\""
+    replaced = 1
+    next
+  }
+
+  { print }
+
+  END {
+    if (!renamed || !replaced) {
+      print "failed to build renamed-step fixture" > "/dev/stderr"
+      exit 1
+    }
+  }
+' "$release_workflow" > "$renamed_step_workflow"
+
+assert_guard_rejects \
+  "$renamed_step_workflow" \
+  "$test_tmp/renamed-step-steps" \
+  "workflow guard missed a renamed and reverted resolver step"
 
 printf '%s\n' "release tag resolver tests passed"
