@@ -57,15 +57,16 @@ release_workflow="$repo_root/.github/workflows/release.yml"
 actual_resolver_steps="$test_tmp/actual-resolver-steps"
 expected_resolver_steps="$test_tmp/expected-resolver-steps"
 
-# Pin the complete `id: rel` step in each release job. Any change to one of
-# these three blocks must be reviewed and reflected here deliberately.
+# Pin each resolver step and the checkout step that supplies its script. Any
+# change to one of these reviewed blocks must be reflected here deliberately.
 awk '
   function emit_step() {
-    if (in_step && is_rel) {
+    if (in_step && (is_rel || is_workflow_scripts_checkout)) {
       printf "job=%s\n%s", job, step
     }
     in_step = 0
     is_rel = 0
+    is_workflow_scripts_checkout = 0
     step = ""
   }
 
@@ -80,6 +81,7 @@ awk '
   /^      - / {
     emit_step()
     in_step = 1
+    is_workflow_scripts_checkout = ($0 ~ /^      - name:[[:space:]]*Check out workflow scripts[[:space:]]*$/)
     step = $0 ORS
     next
   }
@@ -98,6 +100,12 @@ awk '
 
 cat > "$expected_resolver_steps" <<'EOF'
 job=docker
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+job=docker
       - name: Resolve release tag
         id: rel
         env:
@@ -112,6 +120,12 @@ job=docker
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
 job=docker-manifest
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+job=docker-manifest
       - name: Resolve release tag
         id: rel
         env:
@@ -120,6 +134,12 @@ job=docker-manifest
         run: |
           set -euo pipefail
           scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
+
+job=npm-publish
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
 job=npm-publish
       - name: Resolve release tag
