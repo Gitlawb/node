@@ -116,7 +116,7 @@ impl MutationRoot {
             ));
         }
         let task = db
-            .finish_task(&id, "completed", input.result.as_deref())
+            .finish_task(&id, "completed", input.result.as_deref(), &by_did)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         let _ = tx.send(TaskEventBroadcast {
@@ -158,7 +158,7 @@ impl MutationRoot {
         }
         let reason = input.reason.unwrap_or_default();
         let task = db
-            .finish_task(&id, "failed", Some(&reason))
+            .finish_task(&id, "failed", Some(&reason), &by_did)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         let _ = tx.send(TaskEventBroadcast {
@@ -289,5 +289,70 @@ mod tests {
             "the assignee should complete the task: {}",
             errors(&resp)
         );
+    }
+
+    /// Pre-assigned GraphQL claimTask must reject a stranger (no UCAN leak)
+    /// and admit the reserved assignee.
+    #[sqlx::test]
+    async fn claim_task_honors_preassigned_assignee(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let reserved = "did:key:zGQLRESERVEDAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let thief = "did:key:zGQLTHIEFBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::db::AgentTask {
+            id: "task-gql-reserved".into(),
+            repo_id: None,
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:zGQLDELEGATORCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+            assignee_did: Some(reserved.into()),
+            capability: "repo:write".into(),
+            ucan_token: Some("gql-ucan-secret".into()),
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        };
+        state.db.create_task(&task).await.expect("seed");
+        let schema = state.graphql_schema.as_ref();
+
+        let q = |actor: &str| {
+            format!(
+                r#"mutation {{ claimTask(id: "task-gql-reserved", assigneeDid: "{actor}") {{ id status ucanToken }} }}"#
+            )
+        };
+
+        let resp = schema
+            .execute(Request::new(q(thief)).data(AuthenticatedDid(thief.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains("reserved") || errs.contains("not claimable"),
+            "stranger claim must fail: {errs}"
+        );
+        assert!(
+            !errs.contains("gql-ucan-secret"),
+            "UCAN must not leak in GraphQL errors: {errs}"
+        );
+        if let Ok(data) = resp.data.into_json() {
+            let s = data.to_string();
+            assert!(
+                !s.contains("gql-ucan-secret"),
+                "UCAN must not leak in GraphQL data on failed claim: {s}"
+            );
+        }
+
+        let resp = schema
+            .execute(Request::new(q(reserved)).data(AuthenticatedDid(reserved.into())))
+            .await;
+        assert!(
+            errors(&resp).is_empty(),
+            "reserved assignee must claim: {}",
+            errors(&resp)
+        );
+        let data = resp.data.into_json().expect("json data");
+        assert_eq!(data["claimTask"]["status"], "claimed");
+        assert_eq!(data["claimTask"]["ucanToken"], "gql-ucan-secret");
     }
 }

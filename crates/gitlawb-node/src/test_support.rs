@@ -467,6 +467,122 @@ mod tests {
         );
     }
 
+    /// Pre-assigned tasks must not be stealable: a stranger claiming a pending
+    /// task reserved for another agent must fail, and must not receive the
+    /// UCAN. The reserved assignee still claims successfully.
+    #[sqlx::test]
+    async fn claim_task_honors_preassigned_assignee(pool: PgPool) {
+        let delegator = "did:key:zCLAIMDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reserved = "did:key:zCLAIMRESERVEDBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let thief = "did:key:zCLAIMTHIEFCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+        let mut task = seed_task("task-reserved", delegator);
+        task.assignee_did = Some(reserved.to_string());
+        task.ucan_token = Some("ucan-secret-for-reserved-only".into());
+        state.db.create_task(&task).await.expect("seed");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/tasks/{id}/claim",
+                    axum::routing::post(crate::api::tasks::claim_task),
+                )
+                .with_state(state.clone())
+        };
+        let uri = "/api/v1/tasks/task-reserved/claim";
+
+        // Thief signs as themselves and asks to claim — must fail, UCAN stays put.
+        let resp = router()
+            .oneshot(signed_request_as(
+                thief,
+                Method::POST,
+                uri,
+                Body::from(format!(r#"{{"assignee_did":"{thief}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "stranger must not steal a pre-assigned task, got {}",
+            resp.status()
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("ucan-secret-for-reserved-only"),
+            "UCAN must not leak on a failed steal: {text}"
+        );
+        let still = state.db.get_task("task-reserved").await.unwrap().unwrap();
+        assert_eq!(still.status, "pending");
+        assert_eq!(still.assignee_did.as_deref(), Some(reserved));
+
+        // Reserved assignee claims successfully and receives the UCAN.
+        let resp = router()
+            .oneshot(signed_request_as(
+                reserved,
+                Method::POST,
+                uri,
+                Body::from(format!(r#"{{"assignee_did":"{reserved}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "reserved assignee must claim, got {}",
+            resp.status()
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("ucan-secret-for-reserved-only"),
+            "reserved assignee must receive UCAN: {text}"
+        );
+        assert!(text.contains("\"status\":\"claimed\"") || text.contains("claimed"));
+    }
+
+    /// Open (unassigned) pending tasks remain first-claimer-wins after the
+    /// pre-assignment gate.
+    #[sqlx::test]
+    async fn claim_task_open_still_first_claimer_wins(pool: PgPool) {
+        let delegator = "did:key:zOPENDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimer = "did:key:zOPENCLAIMERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_task(&seed_task("task-open", delegator))
+            .await
+            .expect("seed");
+
+        let router = Router::new()
+            .route(
+                "/api/v1/tasks/{id}/claim",
+                axum::routing::post(crate::api::tasks::claim_task),
+            )
+            .with_state(state.clone());
+        let resp = router
+            .oneshot(signed_request_as(
+                claimer,
+                Method::POST,
+                "/api/v1/tasks/task-open/claim",
+                Body::from(format!(r#"{{"assignee_did":"{claimer}"}}"#)),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "open task must still be claimable, got {}",
+            resp.status()
+        );
+        let got = state.db.get_task("task-open").await.unwrap().unwrap();
+        assert_eq!(got.status, "claimed");
+        assert_eq!(got.assignee_did.as_deref(), Some(claimer));
+    }
+
     /// Adversarial-review GATE-2 (create_pr): opening a PR requires read access.
     /// A non-reader is denied on a private repo before any PR is created; the
     /// owner is allowed.

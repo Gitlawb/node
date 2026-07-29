@@ -2603,38 +2603,91 @@ impl Db {
         Ok(rows.into_iter().map(row_to_task).collect())
     }
 
+    /// Claim a pending task for `assignee_did`.
+    ///
+    /// If the task was created with a pre-set `assignee_did`, only that agent
+    /// (DID-normalized via [`crate::api::did_matches`]) may claim it. Open
+    /// tasks (`assignee_did IS NULL`) remain first-claimer-wins. The UPDATE
+    /// re-checks the assignee slot so a concurrent stranger cannot race past
+    /// the Rust gate and steal a reserved task (and its `ucan_token`).
     pub async fn claim_task(&self, id: &str, assignee_did: &str) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
+        let existing = self
+            .get_task(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))?;
+        if existing.status != "pending" {
+            return Err(anyhow::anyhow!(
+                "task not claimable: not found or already claimed"
+            ));
+        }
+        if let Some(ref reserved) = existing.assignee_did {
+            if !crate::api::did_matches(assignee_did, reserved) {
+                return Err(anyhow::anyhow!(
+                    "task not claimable: reserved for another assignee"
+                ));
+            }
+        }
+        // Bind the exact stored assignee (or NULL) so the race window cannot
+        // flip the slot after we authorized the caller.
+        let reserved_exact = existing.assignee_did.as_deref();
         let row = sqlx::query(
             "UPDATE agent_tasks SET status='claimed', assignee_did=$2, updated_at=$3
              WHERE id=$1 AND status='pending'
+               AND (
+                 ($4::text IS NULL AND assignee_did IS NULL)
+                 OR assignee_did = $4
+               )
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
         .bind(assignee_did)
         .bind(&now)
+        .bind(reserved_exact)
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)
             .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))
     }
 
+    /// Transition a claimed task to `new_status` (`completed` / `failed`).
+    ///
+    /// `actor_did` must be the task's assignee (DID-normalized). The UPDATE
+    /// binds the exact stored `assignee_did` so a concurrent reassignment /
+    /// re-claim cannot finish under a check-then-act race in the handler.
     pub async fn finish_task(
         &self,
         id: &str,
         new_status: &str,
         result: Option<&str>,
+        actor_did: &str,
     ) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
+        let existing = self
+            .get_task(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("task not found or not in claimed state"))?;
+        if existing.status != "claimed" {
+            return Err(anyhow::anyhow!("task not found or not in claimed state"));
+        }
+        let Some(ref assigned) = existing.assignee_did else {
+            return Err(anyhow::anyhow!("task not found or not in claimed state"));
+        };
+        if !crate::api::did_matches(actor_did, assigned) {
+            return Err(anyhow::anyhow!(
+                "task not finishable: only the assignee may finish it"
+            ));
+        }
         let row = sqlx::query(
             "UPDATE agent_tasks SET status=$2, result=$3, updated_at=$4
-             WHERE id=$1 AND status='claimed'
+             WHERE id=$1 AND status='claimed' AND assignee_did=$5
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
         )
         .bind(id)
         .bind(new_status)
         .bind(result)
         .bind(&now)
+        .bind(assigned.as_str())
         .fetch_optional(&self.pool)
         .await?;
         row.map(row_to_task)

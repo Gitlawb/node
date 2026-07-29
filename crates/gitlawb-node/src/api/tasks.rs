@@ -226,7 +226,7 @@ pub async fn complete_task(
     let by_did = auth.0;
     let task = state
         .db
-        .finish_task(&id, "completed", body.result.as_deref())
+        .finish_task(&id, "completed", body.result.as_deref(), &by_did)
         .await
         .map_err(|e| {
             (
@@ -280,7 +280,7 @@ pub async fn fail_task(
     let reason = body.reason.unwrap_or_default();
     let task = state
         .db
-        .finish_task(&id, "failed", Some(&reason))
+        .finish_task(&id, "failed", Some(&reason), &by_did)
         .await
         .map_err(|e| {
             (
