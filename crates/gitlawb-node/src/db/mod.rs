@@ -295,6 +295,40 @@ impl Db {
         Ok(db)
     }
 
+    /// Build the dedicated pool that advisory-lock connections come from.
+    ///
+    /// Deliberately **lazy**: connections open on first use rather than at boot.
+    /// The main pool has to connect eagerly because it runs migrations, which is
+    /// why it needs `connect_db_with_retry`'s backoff and degraded-server
+    /// handoff. This pool has no startup work at all, so an eager connect would
+    /// only add a new way for the process to fail to boot, and would need a
+    /// second copy of that retry machinery to be safe. Being lazy removes the
+    /// failure mode instead of handling it: if Postgres is unreachable when the
+    /// first write arrives, that write fails on the pool's own acquire timeout,
+    /// the same way any other database-backed request already does.
+    ///
+    /// Kept separate from the main pool so a burst of lock-holding connections
+    /// cannot starve ordinary request handlers. See
+    /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` for the sizing tradeoff.
+    // No caller until U3 wires this into main.rs; the attribute comes off there.
+    #[allow(dead_code)]
+    pub fn lock_pool(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<PgPool> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "creating dedicated advisory-lock pool (lazy)"
+        );
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(acquire_timeout)
+            .connect_lazy(database_url)
+            .context("creating advisory-lock pool")
+    }
+
     /// Cheap liveness probe against the pool, for readiness checks: one
     /// `SELECT 1` that fails fast when the database is unreachable.
     pub async fn ping(&self) -> Result<()> {
