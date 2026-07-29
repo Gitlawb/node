@@ -769,6 +769,13 @@ where
     }
 }
 
+/// Test-only re-export of the advisory-lock key derivation, so handler tests can
+/// hold a repo's lock from an independent session.
+#[cfg(test)]
+pub fn advisory_lock_key_for_test(owner_slug: &str, repo_name: &str) -> i64 {
+    advisory_lock_key(owner_slug, repo_name)
+}
+
 /// Compute a stable i64 hash for a Postgres advisory lock key.
 fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
     use std::hash::{Hash, Hasher};
