@@ -498,6 +498,42 @@ pub struct RepoWriteLeases {
     max_waiters: usize,
 }
 
+/// The stable per-repo identity that [`RepoWriteLeases`] and [`EncryptInflight`]
+/// key on (#174 U2).
+///
+/// NOT `record.id`. A repo deleted and recreated under the same owner/name gets a
+/// new row id while the bare repo on disk is reused, so an id-keyed serializer
+/// stops serializing across that rotation and lets two writers onto one
+/// `objects/` directory. `RepoStore::local_path` and the pg advisory lock both
+/// key on the sanitized owner slug plus repo name, and this reproduces exactly
+/// that identity so the in-process serializers agree with them.
+///
+/// Three details are load-bearing:
+///
+/// - The sanitization is [`crate::git::store::repo_disk_path`]'s
+///   (`replace([':', '/'], "_")`), NOT `db::normalize_owner_key`, which strips a
+///   `did:key:` prefix instead and would map the same input to a different
+///   string. The disk path is authoritative because the `objects/` directory is
+///   the resource being serialized.
+/// - The separator is `\0`, which cannot occur in either component. A plain join
+///   would collide (owner `a` + name `b_c` against owner `a_b` + name `c`),
+///   letting one repo's push park another's.
+/// - Callers pass `record.owner_did` / `record.name`, never the request's path
+///   segments: `db::get_repo` normalizes DID aliases, so a caller could otherwise
+///   mint two keys for one directory just by varying the DID spelling.
+///
+/// The sanitization is not injective (`did:web:example.com:alice` and
+/// `did:web:example.com/alice` fold to one slug), which would be a cross-tenant
+/// hazard for the coalescing map if it were reachable. It is not: `repos.disk_path`
+/// is `NOT NULL UNIQUE` and holds exactly this derivation, so two rows that fold
+/// to one key cannot coexist. Do not "fix" this by making the key injective —
+/// that is precisely what would let two owners sharing one `objects/` directory
+/// push concurrently.
+pub fn repo_identity_key(owner_did: &str, repo_name: &str) -> String {
+    let owner_slug = owner_did.replace([':', '/'], "_");
+    format!("{owner_slug}\0{repo_name}")
+}
+
 /// A per-repo lease entry: the one-permit semaphore, a refcount of the handlers
 /// currently referencing it (holding or waiting), and a count of the ones actually
 /// PARKED. While `refs > 0` every acquirer shares the SAME semaphore, so mutual exclusion
@@ -822,6 +858,70 @@ pub async fn acquire_scan_permit(
         "post-receive scan admitted to the scan pool"
     );
     permit
+}
+
+#[cfg(test)]
+mod repo_identity_key_tests {
+    use super::repo_identity_key;
+
+    /// The key must reproduce `repo_disk_path`'s slug derivation exactly, because
+    /// the whole point is to agree with the on-disk identity the store and the pg
+    /// advisory lock already use.
+    #[test]
+    fn matches_repo_disk_paths_sanitization() {
+        let owner = "did:key:z6Mkfoo";
+        let name = "r";
+        let expected_slug = owner.replace([':', '/'], "_");
+        assert_eq!(repo_identity_key(owner, name), format!("{expected_slug}\0{name}"));
+
+        // The disk path for the same pair must carry the same slug component.
+        let disk = crate::git::store::repo_disk_path(std::path::Path::new("/srv"), owner, name);
+        assert!(
+            disk.to_string_lossy().contains(&expected_slug),
+            "the key's slug must be the one repo_disk_path puts on disk: {disk:?}"
+        );
+    }
+
+    /// Stability across the rotation is the entire reason this key exists: the row
+    /// id changes on delete+recreate, the identity does not.
+    #[test]
+    fn is_stable_across_a_row_id_rotation() {
+        assert_eq!(
+            repo_identity_key("did:key:z6Mkfoo", "r"),
+            repo_identity_key("did:key:z6Mkfoo", "r"),
+        );
+    }
+
+    /// The `\0` separator is what stops one repo's push parking another's. With a
+    /// plain join these two pairs would produce a single key.
+    #[test]
+    fn separator_prevents_the_owner_name_boundary_collision() {
+        assert_ne!(
+            repo_identity_key("a", "b_c"),
+            repo_identity_key("a_b", "c"),
+            "owner/name boundary must not be ambiguous"
+        );
+    }
+
+    /// Distinct repos and distinct owners never share a key.
+    #[test]
+    fn distinct_repos_and_owners_do_not_share_a_key() {
+        assert_ne!(repo_identity_key("did:key:z6A", "r"), repo_identity_key("did:key:z6A", "s"));
+        assert_ne!(repo_identity_key("did:key:z6A", "r"), repo_identity_key("did:key:z6B", "r"));
+    }
+
+    /// Documents the ONE collision the sanitization admits, and why it is safe
+    /// rather than fixed: `repos.disk_path` is UNIQUE and holds this derivation,
+    /// so two rows folding to one key cannot coexist. If this assertion ever
+    /// flips to `assert_ne!`, the key became injective and two owners sharing one
+    /// `objects/` directory could push concurrently — the defect U2 closes.
+    #[test]
+    fn folds_did_web_alias_spellings_together_which_the_unique_disk_path_makes_unreachable() {
+        assert_eq!(
+            repo_identity_key("did:web:example.com:alice", "r"),
+            repo_identity_key("did:web:example.com/alice", "r"),
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1695,9 +1695,13 @@ pub async fn git_receive_pack(
     // is what the F1 review rejected, since GITLAWB_TRUSTED_PROXY defaults to unset and
     // every pusher behind a proxy/NAT then resolves to ONE key, turning one contended repo
     // into a node-wide denial.
+    // The stable disk identity, never record.id: the row id rotates on a
+    // delete+recreate under the same slug while the bare repo on disk is reused,
+    // and an id-keyed lease stops serializing exactly across that rotation.
+    let repo_key = crate::state::repo_identity_key(&record.owner_did, &record.name);
     let lease = state
         .repo_write_leases
-        .acquire(&record.id, lease_steal_after)
+        .acquire(&repo_key, lease_steal_after)
         .await
         .ok_or_else(|| {
             tracing::warn!(
@@ -1962,7 +1966,11 @@ async fn post_receive_replication_tail(
             .iter()
             .map(|u| (u.old_sha.clone(), u.new_sha.clone()))
             .collect();
-        match state.encrypt_inflight.try_begin(&record.id, tip_pairs) {
+        // Same stable disk identity as the lease above (#174 U2): keyed on
+        // record.id, a post-recreate push would take a fresh key and run a second
+        // encrypt task against the same on-disk repo instead of coalescing.
+        let coalesce_key = crate::state::repo_identity_key(&record.owner_did, &record.name);
+        match state.encrypt_inflight.try_begin(&coalesce_key, tip_pairs) {
             crate::state::BeginOutcome::Coalesced => {
                 coalesced = true;
                 tracing::debug!(
@@ -7447,6 +7455,69 @@ mod tests {
         rec.id
     }
 
+    /// #174 U2: the write lease must register under the STABLE DISK IDENTITY
+    /// (sanitized owner slug + repo name, what `RepoStore::local_path` and the pg
+    /// advisory lock key on), not `record.id`.
+    ///
+    /// The row id rotates on delete+recreate under the same slug while the bare
+    /// repo on disk is reused, so an id-keyed lease silently stops serializing
+    /// across that rotation and lets two writers onto one `objects/` directory.
+    /// Asserting on the key the holder actually registers under binds the
+    /// production call site — a helper unit test alone would not.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn u2_lease_registers_under_the_disk_identity_not_the_row_id(pool: sqlx::PgPool) {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (git_bin, a_inpack, _later_ran) = f1_hanging_first_git(tmp.path());
+        let state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6u2key", "k1", false).await;
+        let rec = state.db.get_repo("z6u2key", "k1").await.unwrap().unwrap();
+        let identity = crate::state::repo_identity_key(&rec.owner_did, &rec.name);
+        assert_ne!(
+            identity, rec.id,
+            "the identity key must differ from the row id, or this test proves nothing"
+        );
+
+        let did = "did:key:z6MkU2KeyPusherAAAAAAAAAAAAAAAAAAAAAAAA";
+        let peer: SocketAddr = "203.0.113.91:5000".parse().unwrap();
+        let handle = tokio::spawn({
+            let st = state.clone();
+            let did = did.to_string();
+            async move {
+                git_receive_pack(
+                    State(st),
+                    Path(("z6u2key".to_string(), "k1".to_string())),
+                    Extension(crate::auth::AuthenticatedDid(did)),
+                    crate::rate_limit::PeerAddr(Some(peer)),
+                    axum::http::HeaderMap::new(),
+                    axum::body::Bytes::from_static(b"0000"),
+                )
+                .await
+            }
+        });
+        assert!(
+            f1_wait_for(F1_BACKSTOP, || a_inpack.exists()).await,
+            "the push never reached receive-pack within {F1_BACKSTOP:?}"
+        );
+
+        assert_eq!(
+            state.repo_write_leases.refs_for(&identity),
+            1,
+            "the lease holder must be registered under the stable disk identity"
+        );
+        assert_eq!(
+            state.repo_write_leases.refs_for(&rec.id),
+            0,
+            "and never under the rotating row id"
+        );
+
+        handle.abort();
+    }
+
     /// #174 U1 scenario 1 (RED-before/GREEN-after): parked pushes on one repo's write
     /// lease are BOUNDED. `git_receive_pack` takes `body: Bytes`, so axum has already
     /// buffered the whole pack (up to `max_pack_bytes`) before the handler runs, and the
@@ -7473,13 +7544,11 @@ mod tests {
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6u1cap", "c1", false).await;
         // Cap of ONE live waiter, so a holder plus one parked push fills the repo's queue.
         state.repo_write_leases = crate::state::RepoWriteLeases::new(1);
-        let repo_id = state
-            .db
-            .get_repo("z6u1cap", "c1")
-            .await
-            .unwrap()
-            .unwrap()
-            .id;
+        // The lease keys on the stable disk identity (#174 U2), not the row id.
+        let repo_id = {
+            let r = state.db.get_repo("z6u1cap", "c1").await.unwrap().unwrap();
+            crate::state::repo_identity_key(&r.owner_did, &r.name)
+        };
         let did = "did:key:z6MkU1CapPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let push = |peer: SocketAddr| {
             let st = state.clone();
@@ -7579,13 +7648,10 @@ mod tests {
         let mut state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6u1two", "r1", false).await;
         state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(2, 100);
-        let repo1 = state
-            .db
-            .get_repo("z6u1two", "r1")
-            .await
-            .unwrap()
-            .unwrap()
-            .id;
+        let repo1 = {
+            let r = state.db.get_repo("z6u1two", "r1").await.unwrap().unwrap();
+            crate::state::repo_identity_key(&r.owner_did, &r.name)
+        };
         f1_add_repo(&state, "z6u1two", "r2").await;
         let did = "did:key:z6MkU1TwoPusherAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let src: SocketAddr = "203.0.113.84:5000".parse().unwrap();
@@ -7664,13 +7730,10 @@ mod tests {
         // The default proxy trust: the resolved key is the peer IP, which is the edge's.
         state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
         state.git_write_per_caller = crate::rate_limit::PerCallerConcurrency::new(2, 100);
-        let repo1 = state
-            .db
-            .get_repo("z6u1nat", "n1")
-            .await
-            .unwrap()
-            .unwrap()
-            .id;
+        let repo1 = {
+            let r = state.db.get_repo("z6u1nat", "n1").await.unwrap().unwrap();
+            crate::state::repo_identity_key(&r.owner_did, &r.name)
+        };
         f1_add_repo(&state, "z6u1nat", "n2").await;
         // Every pusher arrives from the one edge IP, so they share a source key.
         let edge: SocketAddr = "203.0.113.85:5000".parse().unwrap();
@@ -8030,7 +8093,9 @@ mod tests {
             f2a_log(&log)
         );
         assert_eq!(
-            state.encrypt_inflight.pending_for(&rec.id),
+            state
+                .encrypt_inflight
+                .pending_for(&crate::state::repo_identity_key(&rec.owner_did, &rec.name)),
             Some(crate::state::PendingWork::Tips(vec![(
                 ZERO_SHA.to_string(),
                 c1.clone()
@@ -8099,9 +8164,10 @@ mod tests {
         let c3 = u5_commit_file(repo.path(), "b.txt", "three\n");
         assert!(
             matches!(
-                state
-                    .encrypt_inflight
-                    .try_begin(&rec.id, vec![(c2.clone(), c3.clone())]),
+                state.encrypt_inflight.try_begin(
+                    &crate::state::repo_identity_key(&rec.owner_did, &rec.name),
+                    vec![(c2.clone(), c3.clone())],
+                ),
                 crate::state::BeginOutcome::Coalesced
             ),
             "a push arriving while a task is in flight must coalesce"
@@ -8179,9 +8245,10 @@ mod tests {
         // ADMITTED here instead, and this assertion is what catches that.)
         assert!(
             matches!(
-                state
-                    .encrypt_inflight
-                    .try_begin(&rec.id, vec![(c2.clone(), c3.clone())]),
+                state.encrypt_inflight.try_begin(
+                    &crate::state::repo_identity_key(&rec.owner_did, &rec.name),
+                    vec![(c2.clone(), c3.clone())],
+                ),
                 crate::state::BeginOutcome::Coalesced
             ),
             "a push arriving mid-walk must coalesce, not start a second task"
@@ -8265,7 +8332,10 @@ mod tests {
         let mut updates = state.ref_update_tx.subscribe();
 
         // A task for this repo is already in flight, so the push below coalesces.
-        let _inflight = match state.encrypt_inflight.try_begin(&rec.id, Vec::new()) {
+        let _inflight = match state.encrypt_inflight.try_begin(
+            &crate::state::repo_identity_key(&rec.owner_did, &rec.name),
+            Vec::new(),
+        ) {
             crate::state::BeginOutcome::Admitted(g) => g,
             crate::state::BeginOutcome::Coalesced => panic!("the first begin must admit"),
         };
@@ -8336,7 +8406,10 @@ mod tests {
         let (_server, _cid) = f2a_pinata(&mut state).await;
         let mut updates = state.ref_update_tx.subscribe();
 
-        let _inflight = match state.encrypt_inflight.try_begin(&rec.id, Vec::new()) {
+        let _inflight = match state.encrypt_inflight.try_begin(
+            &crate::state::repo_identity_key(&rec.owner_did, &rec.name),
+            Vec::new(),
+        ) {
             crate::state::BeginOutcome::Admitted(g) => g,
             crate::state::BeginOutcome::Coalesced => panic!("the first begin must admit"),
         };
