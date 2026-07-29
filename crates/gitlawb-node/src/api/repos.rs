@@ -7647,7 +7647,22 @@ mod tests {
         let (git_bin, a_inpack, _later_ran) = f1_hanging_first_git(tmp.path());
         let state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6u2key", "k1", false).await;
+        // Rotate the row to a UUID id first. f4_state_with_repo creates the repo
+        // through the mirror path, whose id is literally `owner_short/name` and so
+        // coincides with the identity key — which would leave this test unable to
+        // tell the two keys apart. A UUID id is also the real shape of the bug: an
+        // API-created repo, or any repo whose row was recreated under the same slug.
+        let seeded = state.db.get_repo("z6u2key", "k1").await.unwrap().unwrap();
+        let rotated_id = Uuid::new_v4().to_string();
+        sqlx::query("UPDATE repos SET id = $1 WHERE id = $2")
+            .bind(&rotated_id)
+            .bind(&seeded.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
         let rec = state.db.get_repo("z6u2key", "k1").await.unwrap().unwrap();
+        assert_eq!(rec.id, rotated_id, "the row really did take the new id");
         let identity = crate::state::repo_identity_key(&rec.owner_did, &rec.name);
         assert_ne!(
             identity, rec.id,

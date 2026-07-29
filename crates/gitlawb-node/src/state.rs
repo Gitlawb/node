@@ -515,9 +515,14 @@ pub struct RepoWriteLeases {
 ///   `did:key:` prefix instead and would map the same input to a different
 ///   string. The disk path is authoritative because the `objects/` directory is
 ///   the resource being serialized.
-/// - The separator is `\0`, which cannot occur in either component. A plain join
-///   would collide (owner `a` + name `b_c` against owner `a_b` + name `c`),
-///   letting one repo's push park another's.
+/// - The separator is `/`, which cannot occur in the owner slug by construction
+///   (`replace([':', '/'], "_")` removes it) and mirrors the shape of the disk
+///   path this key exists to reproduce. A plain join would collide (owner `a` +
+///   name `b_c` against owner `a_b` + name `c`), letting one repo's push park
+///   another's. It must stay PRINTABLE: this key is logged as the `repo` field
+///   on the lease shed and steal-bound warnings below, and an unprintable
+///   separator (a NUL, a unit separator) truncates at a NUL-hostile log sink and
+///   renders two different repos' warnings identically.
 /// - Callers pass `record.owner_did` / `record.name`, never the request's path
 ///   segments: `db::get_repo` normalizes DID aliases, so a caller could otherwise
 ///   mint two keys for one directory just by varying the DID spelling.
@@ -531,7 +536,7 @@ pub struct RepoWriteLeases {
 /// push concurrently.
 pub fn repo_identity_key(owner_did: &str, repo_name: &str) -> String {
     let owner_slug = owner_did.replace([':', '/'], "_");
-    format!("{owner_slug}\0{repo_name}")
+    format!("{owner_slug}/{repo_name}")
 }
 
 /// A per-repo lease entry: the one-permit semaphore, a refcount of the handlers
@@ -874,7 +879,7 @@ mod repo_identity_key_tests {
         let expected_slug = owner.replace([':', '/'], "_");
         assert_eq!(
             repo_identity_key(owner, name),
-            format!("{expected_slug}\0{name}")
+            format!("{expected_slug}/{name}")
         );
 
         // The disk path for the same pair must carry the same slug component.
@@ -904,6 +909,21 @@ mod repo_identity_key_tests {
             repo_identity_key("a_b", "c"),
             "owner/name boundary must not be ambiguous"
         );
+    }
+
+    /// The key is logged as the `repo` field on the lease waiter-cap shed and the
+    /// steal-bound warning, so it must contain no control characters. A NUL (or a
+    /// unit separator) truncates at a NUL-hostile log sink, which would render two
+    /// different repos' shed warnings identically — an observability lie on
+    /// exactly the messages an operator reads to find a contended repo.
+    #[test]
+    fn key_is_printable_so_the_lease_warnings_stay_readable() {
+        let k = repo_identity_key("did:web:example.com:alice", "my-repo.git");
+        assert!(
+            !k.chars().any(|c| c.is_control()),
+            "the identity key is logged; it must carry no control characters: {k:?}"
+        );
+        assert_eq!(k, "did_web_example.com_alice/my-repo.git");
     }
 
     /// Distinct repos and distinct owners never share a key.
