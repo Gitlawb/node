@@ -253,16 +253,25 @@ async fn process_batch(
         // the check then covers clone and fetch alike.
         let owner_dir = config.repos_dir.join(owner_short);
         if let Err(e) = std::fs::create_dir_all(&owner_dir) {
-            // Split by whether the error can ever clear. A read-only or briefly
-            // unmounted repos_dir is transient, so the row stays pending and is
-            // retried. A path that is simply not creatable never clears, and
-            // leaving it pending would re-pick it on every poll: since
-            // dequeue_pending_syncs is oldest-first with a fixed batch size, a
-            // handful of such rows hold the whole window and starve every
-            // healthy repo behind them.
+            // Split by whether retrying could ever change the answer. A
+            // read-only or briefly unmounted repos_dir is transient, so the row
+            // stays pending and is retried. A path that is simply not creatable
+            // is not going to become creatable on the next poll, and leaving it
+            // pending re-picks it forever.
+            //
+            // AlreadyExists is in this set because create_dir_all only reports
+            // it when something that is not a directory occupies the path — a
+            // regular file, a dangling symlink, a link loop. The concurrent
+            // mkdir race that looks like a false positive resolves to Ok
+            // instead, since the implementation falls back to is_dir() on
+            // EEXIST and a racing mkdir leaves a directory there. Clearing it
+            // takes an operator (or, for a dangling link, its target appearing),
+            // never a retry. This is also what the pre-#272 code did: the same
+            // state failed the clone and hit the terminal Err arm below.
             let permanent = matches!(
                 e.kind(),
-                std::io::ErrorKind::InvalidFilename
+                std::io::ErrorKind::AlreadyExists
+                    | std::io::ErrorKind::InvalidFilename
                     | std::io::ErrorKind::InvalidInput
                     | std::io::ErrorKind::NotADirectory
             );
@@ -1623,6 +1632,75 @@ mod tests {
 
         assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
         assert!(repos_dir.join("z6Mkfoo").join("hello.git").is_dir());
+    }
+
+    #[sqlx::test]
+    async fn process_batch_terminally_fails_when_a_file_occupies_the_owner_path(pool: PgPool) {
+        // A plain file at `repos_dir/<owner>` makes `create_dir_all` fail with
+        // `AlreadyExists`, and retrying cannot change that. Before this was
+        // classified permanent the row stayed pending and, because
+        // `dequeue_pending_syncs` is oldest-first over a fixed batch, ten such
+        // rows held the whole window and starved every healthy repo behind them.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let owner_path = repos_dir.join("z6Mkfoo");
+        std::fs::write(&owner_path, b"not a directory\n").unwrap();
+
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkOrigin";
+        seed_local_peer(&pool, did, &peer_url).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+        // Terminal, not merely skipped: the row leaves the pending set, so it
+        // can never come back as a poison item.
+        assert!(state.db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+        run_batch(&state, &repos_dir).await;
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+
+        // The occupied path is left exactly as it was, and no mirror landed.
+        assert_eq!(
+            std::fs::read(&owner_path).unwrap(),
+            b"not a directory\n".to_vec()
+        );
+        assert!(mirrors_under(home.path()).is_empty());
+    }
+
+    #[sqlx::test]
+    async fn process_batch_terminally_fails_when_a_dangling_symlink_occupies_the_owner_path(
+        pool: PgPool,
+    ) {
+        // Same `AlreadyExists` classification through a different filesystem
+        // state: `mkdir` returns EEXIST and `is_dir()` is false because the
+        // link resolves to nothing.
+        use std::os::unix::fs::symlink;
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let owner_path = repos_dir.join("z6Mkfoo");
+        symlink(home.path().join("no-such-target"), &owner_path).unwrap();
+
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkOrigin";
+        seed_local_peer(&pool, did, &peer_url).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+        assert!(state.db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+        run_batch(&state, &repos_dir).await;
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+
+        // The link is untouched and its target was never created on our behalf.
+        assert!(owner_path.is_symlink());
+        assert!(!home.path().join("no-such-target").exists());
+        assert!(mirrors_under(home.path()).is_empty());
     }
 
     #[sqlx::test]
