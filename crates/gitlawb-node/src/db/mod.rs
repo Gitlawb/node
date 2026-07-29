@@ -250,11 +250,6 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
@@ -310,8 +305,6 @@ impl Db {
     /// Kept separate from the main pool so a burst of lock-holding connections
     /// cannot starve ordinary request handlers. See
     /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` for the sizing tradeoff.
-    // No caller until U3 wires this into main.rs; the attribute comes off there.
-    #[allow(dead_code)]
     pub fn lock_pool(
         database_url: &str,
         max_connections: u32,
