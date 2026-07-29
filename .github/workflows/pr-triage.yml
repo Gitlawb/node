@@ -76,9 +76,24 @@ jobs:
             // line after horizontal whitespace, covering bare, cfg(test), namespaced,
             // optional leading ::, and raw-identifier (r#test) forms. No head-file fetch
             // or lexer: needs-tests is advisory, not a merge gate.
+            //
+            // The final path component may also carry `test` as an underscore-delimited
+            // segment, so third-party harnesses land without enumerating them one by one
+            // (#[test_case(1)], #[wasm_bindgen_test]). It is deliberately a segment and
+            // not a substring: a substring would also match #[contest] / #[latest], and a
+            // false positive here SUPPRESSES needs-tests rather than adding it. This
+            // heuristic has to fail loud, because a wrongly labeled PR gets corrected by
+            // the author while a wrongly cleared one is invisible. That trade costs the
+            // no-underscore harness names (#[rstest]), which stay unmatched on purpose.
+            //
+            // The segment classes are [A-Za-z0-9]+ rather than \w+ on purpose, so that `_`
+            // is only ever the literal delimiter. \w+ contains `_`, which makes the repeat
+            // ambiguous and backtracks exponentially: on this workflow's pull_request_target
+            // trigger f.patch is fork-controlled, so `#[test` followed by a long `_a` run is
+            // a permissionless stall of the triage job.
             const addsInlineTest = files.some(f =>
               f.filename.endsWith(".rs") && f.patch &&
-              /^\+[ \t]*#\[[ \t]*(?:cfg[ \t]*\([ \t]*test[ \t]*\)|(?:::[ \t]*)?(?:[\w-]+[ \t]*::[ \t]*)*(?:r#)?test\b)/m.test(f.patch));
+              /^\+[ \t]*#\[[ \t]*(?:cfg[ \t]*\([ \t]*test[ \t]*\)|(?:::[ \t]*)?(?:[\w-]+[ \t]*::[ \t]*)*(?:r#)?(?:[A-Za-z0-9]+_)*test(?:_[A-Za-z0-9]+)*[ \t]*[\]\(])/m.test(f.patch));
             const touchedTests =
               names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
             if (changedRust && !touchedTests) want.add("needs-tests");
