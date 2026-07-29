@@ -234,6 +234,7 @@ async fn process_batch(
             Err(e) => {
                 warn!(id = %item.id, repo = %item.repo, err = %e, "sync item has an invalid repo slug, skipping");
                 let _ = db.mark_sync_failed(&item.id).await;
+                crate::metrics::record_sync_processed("rejected");
                 continue;
             }
         };
@@ -271,6 +272,9 @@ async fn process_batch(
             );
             if permanent {
                 let _ = db.mark_sync_failed(&item.id).await;
+                crate::metrics::record_sync_processed("rejected");
+            } else {
+                crate::metrics::record_sync_processed("deferred");
             }
             continue;
         }
@@ -282,13 +286,21 @@ async fn process_batch(
                     "mirror path resolves outside repos_dir, skipping"
                 );
                 let _ = db.mark_sync_failed(&item.id).await;
+                crate::metrics::record_sync_processed("rejected");
                 continue;
             }
             crate::git::repo_store::Containment::IoError(e) => {
+                // Pending, so it is retried when the condition clears. There is
+                // deliberately no attempt cap: bounding it needs an attempts
+                // column on sync_queue, which is a migration and belongs in its
+                // own change. The metric is what makes a queue stalled on an
+                // operator condition (an unmounted repos_dir) distinguishable
+                // from an idle one, which is the gap that actually hurts.
                 error!(
                     id = %item.id, repo = %item.repo, path = %local_path.display(), err = %e,
                     "cannot resolve the mirror path against repos_dir; leaving the sync row pending"
                 );
+                crate::metrics::record_sync_processed("deferred");
                 continue;
             }
         }
@@ -1177,6 +1189,33 @@ mod tests {
         names
     }
 
+    /// Every `*.git` directory anywhere under `dir`.
+    ///
+    /// The property the escape tests actually protect is "no mirror was
+    /// planted", not "the tree is untouched". `process_batch` creates the owner
+    /// directory before it can canonicalize a parent for the containment check,
+    /// so an empty `repos_dir/<owner>` is expected debris on a rejected row and
+    /// asserting on it measures that side effect instead of the escape.
+    fn mirrors_under(dir: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(next) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&next) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "git") {
+                    found.push(path.to_string_lossy().into_owned());
+                } else if path.is_dir() && !path.is_symlink() {
+                    stack.push(path);
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
     /// Run one `process_batch` against `repos_dir`, cloning the test config and
     /// overriding only the repo root.
     async fn run_batch(state: &crate::state::AppState, repos_dir: &Path) {
@@ -1232,9 +1271,22 @@ mod tests {
             escape_dir.display()
         );
         assert_eq!(sync_status(&pool, &slug).await, "failed");
+        // What this test measures, verified by mutation rather than assumed: the
+        // slug rule and the containment check are each independently sufficient
+        // for this input, so removing either one alone leaves it green, and it
+        // goes red only when both are gone (observed: "mirror written outside
+        // repos_dir"). It is the end-to-end property, not a probe for one layer.
+        // Each layer has its own witness elsewhere: `./hello` in
+        // process_batch_rejects_malformed_slugs isolates the slug rule (it
+        // resolves back inside repos_dir, so containment approves it), and the
+        // two symlink tests isolate containment (no character rule can see a
+        // symlink). Assert on mirrors rather than on an empty repos_dir, because
+        // the owner directory is created before containment has a parent to
+        // canonicalize, so its presence is expected debris on a rejected row and
+        // asserting on it would make this flip on a side effect instead.
         assert!(
-            dir_entries(&repos_dir).is_empty(),
-            "repos_dir must stay empty"
+            mirrors_under(&repos_dir).is_empty(),
+            "no mirror may be planted inside repos_dir"
         );
     }
 
@@ -1645,9 +1697,19 @@ mod tests {
             "parent directory created outside repos_dir at {}",
             escape_dir.display()
         );
+        // Mirrors, not entries: the owner directory is created before the
+        // containment check has a parent to canonicalize, so it is expected
+        // debris on a rejected row. Asserting repos_dir is empty would make this
+        // flip on that side effect rather than on an escape.
+        //
+        // Like its sibling above, this is the end-to-end property. The slug rule
+        // and containment are each sufficient here, so it goes red only when
+        // both are removed; that was observed, with the mirror written outside
+        // repos_dir. Per-layer isolation lives in the `./hello` case and the two
+        // symlink tests.
         assert!(
-            dir_entries(&repos_dir).is_empty(),
-            "repos_dir must stay empty"
+            mirrors_under(&repos_dir).is_empty(),
+            "no mirror may be planted inside repos_dir"
         );
         assert_eq!(sync_status(&pool, &slug).await, "failed");
     }
