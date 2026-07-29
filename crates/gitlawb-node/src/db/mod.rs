@@ -2094,13 +2094,16 @@ impl Db {
         // `peers.http_url` is the existing pre-update row (the proposed value is
         // $2), and the comparison runs under the conflict row lock, so
         // concurrent announces for one DID serialize instead of racing a
-        // read-then-write.
+        // read-then-write. That orders announces against each other and nothing
+        // more: mark_peer_ping writes by DID with no http_url predicate, so a
+        // probe of the previous URL that lands after a reset can still re-grant
+        // the flag until the next round.
         //
         // Comparison is exact. http_url is stored as announced, so a cosmetic
         // difference such as a trailing slash also clears the flag; the peer
-        // re-earns it on the next gossip round. Normalizing instead would mean
-        // canonicalizing the stored value, this comparison, and the existing
-        // trim_end_matches call sites.
+        // re-earns it on a later gossip round, provided no further announce
+        // lands first. Normalizing instead would mean canonicalizing the stored
+        // value, this comparison, and the existing trim_end_matches call sites.
         //
         // last_ping_ok is NOT a trust signal. An unauthenticated caller can
         // clear it by announcing a different URL, and until #248 lands can also
@@ -2108,11 +2111,14 @@ impl Db {
         // writes mark_peer_ping from the stored URL's own probe response. Do not
         // build a new consumer on this flag as if it were attacker-resistant.
         //
-        // Four other http_url consumers never read the flag at all (sync.rs's
+        // Only the federated repo fan-out in api/repos.rs gates on this flag.
+        // Four consumers act on a repointed http_url regardless of it (sync.rs's
         // origin resolve, the post-receive notify fan-out, trigger_sync, and the
-        // public resolve route), so this bounds the automatic inheritance rather
-        // than closing the rewrite. Binding a DID to its first-seen announcing
-        // key is what closes it: #273.
+        // public resolve route), and two read surfaces republish it as
+        // `reachable` (api/resolve.rs, api/peers.rs), which is where a reset
+        // becomes externally visible. So this bounds the automatic inheritance
+        // rather than closing the rewrite. Binding a DID to its first-seen
+        // announcing key is what closes it: #273.
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
              VALUES ($1, $2, $3, FALSE, $3)
@@ -5740,6 +5746,21 @@ mod peer_reachability_tests {
         (row.http_url, row.last_ping_ok)
     }
 
+    /// Parsed rather than string-compared, so the ordering assertion does not
+    /// depend on the stored timestamp's textual precision.
+    async fn last_seen(db: &Db, did: &str) -> chrono::DateTime<chrono::Utc> {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        chrono::DateTime::parse_from_rfc3339(&row.last_seen.expect("last_seen is set by upsert"))
+            .expect("last_seen is rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
     /// Seed a peer that has earned reachability, asserting the seed took so a
     /// later case cannot pass vacuously on a row that was never written.
     async fn seed_reachable(db: &Db) {
@@ -5820,5 +5841,46 @@ mod peer_reachability_tests {
 
         let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
         assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// Comparison is exact, by decision: http_url is stored as announced and
+    /// nothing normalizes it, so a trailing slash is a different remote as far
+    /// as this row is concerned and clears the gate. Pins that decision against
+    /// a future normalizing comparison, which every other case here would pass
+    /// because they only ever compare identical or wholly different hosts.
+    #[sqlx::test]
+    async fn cosmetic_url_difference_counts_as_a_change(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        let with_slash = format!("{HONEST_URL}/");
+        db.upsert_peer(VICTIM_DID, &with_slash).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, with_slash);
+        assert!(
+            !reachable,
+            "comparison is exact, so a cosmetic difference clears the gate too"
+        );
+    }
+
+    /// The reset must ride the existing UPDATE, not gate it. Hoisting the
+    /// condition to a statement-level WHERE would leave every case above green
+    /// while silently skipping the whole update on a same-URL re-announce, so
+    /// liveness would stop advancing and the peer would age out on last_seen.
+    #[sqlx::test]
+    async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        let first = last_seen(&db, VICTIM_DID).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let second = last_seen(&db, VICTIM_DID).await;
+        assert!(
+            second > first,
+            "a same-URL re-announce is a liveness signal and must still \
+             advance last_seen: {first} then {second}"
+        );
     }
 }
