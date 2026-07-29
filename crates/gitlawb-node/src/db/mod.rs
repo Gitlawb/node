@@ -1073,14 +1073,18 @@ impl Db {
 
     /// Raw list of every repo row — NOT deduped (a mirror row and its canonical
     /// row both appear) and without stars. For enumeration callers that must see
-    /// every physical row (e.g. the IPFS object scan in `api::ipfs`), not for
-    /// listing surfaces. Listing surfaces dedupe via `list_all_repos_deduped` or
-    /// `list_all_repos_with_stars` + `dedupe_canonical_repos`.
+    /// every *servable* physical row (e.g. the IPFS object scan in `api::ipfs`).
+    /// Quarantined mirrors are excluded — same invariant as
+    /// [`crate::api::authorize_repo_read`]: admitted but withheld from every
+    /// reader. Listing surfaces that also need star counts use
+    /// `list_all_repos_with_stars` / `list_all_repos_deduped`.
     pub async fn list_all_repos(&self) -> Result<Vec<RepoRecord>> {
         let rows = sqlx::query(
             "SELECT id, name, owner_did, description, is_public, default_branch,
                     created_at, updated_at, disk_path, forked_from, machine_id
-             FROM repos ORDER BY updated_at DESC",
+             FROM repos
+             WHERE quarantined = FALSE
+             ORDER BY updated_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -4611,6 +4615,34 @@ mod icaptcha_quarantine_tests {
         );
         assert!(!db.is_repo_quarantined("z6owner/good").await.unwrap());
         assert!(db.list_quarantined_repo_ids().await.unwrap().is_empty());
+    }
+
+    /// IPFS/CID enumeration must not see quarantined rows (serve-side of the
+    /// authorize_repo_read quarantine short-circuit).
+    #[sqlx::test]
+    async fn list_all_repos_excludes_quarantined(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_mirror_repo("z6owner", "live", "/srv/live", None, false)
+            .await
+            .unwrap();
+        db.upsert_mirror_repo("z6owner", "sick", "/srv/sick", None, true)
+            .await
+            .unwrap();
+        let ids: Vec<_> = db
+            .list_all_repos()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(
+            ids.iter().any(|id| id.contains("live")),
+            "live repo must be listed: {ids:?}"
+        );
+        assert!(
+            ids.iter().all(|id| !id.contains("sick")),
+            "quarantined repo must be excluded from list_all_repos: {ids:?}"
+        );
     }
 
     /// A mirror admitted quarantined stays quarantined across a re-sync — the

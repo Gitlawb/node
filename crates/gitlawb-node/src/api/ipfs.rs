@@ -40,16 +40,17 @@ use crate::visibility::{visibility_check, Decision};
 /// caller passes. For each iterated row we gate against that row's OWN rules
 /// (`visibility_check` at `"/"`), never re-resolving via `authorize_repo_read`
 /// — `get_repo`'s fuzzy match could otherwise authorize a different physical
-/// row than the one read (KTD2a). We check object existence via
-/// `store::object_type` *before* the expensive reachability walk so random-CID
-/// spray cannot trigger full-history git walks on repos that don't carry the
-/// object. When the row carries path-scoped rules (KTD4) the served object
-/// must be either a non-blob (trees/commits are structural; KTD3) OR a blob
-/// in the caller's *reachable* allowed-set (`allowed_blob_set_for_caller`).
-/// The reachable allowed-set excludes dangling blobs — a blob written via
-/// `git hash-object -w` and never committed has no path to gate, so it is
-/// fail-closed 404'd under path-scoped rules (#126). Denial and genuine
-/// not-found both fall through to an opaque 404.
+/// row than the one read (KTD2a). Quarantined rows are excluded upstream by
+/// `list_all_repos` (same fail-closed posture as `authorize_repo_read`). We
+/// check object existence via `store::object_type` *before* the expensive
+/// reachability walk so random-CID spray cannot trigger full-history git walks
+/// on repos that don't carry the object. When the row carries path-scoped
+/// rules (KTD4) the served object must be either a non-blob (trees/commits are
+/// structural; KTD3) OR a blob in the caller's *reachable* allowed-set
+/// (`allowed_blob_set_for_caller`). The reachable allowed-set excludes dangling
+/// blobs — a blob written via `git hash-object -w` and never committed has no
+/// path to gate, so it is fail-closed 404'd under path-scoped rules (#126).
+/// Denial and genuine not-found both fall through to an opaque 404.
 ///
 /// Scope: this closes the direct unauthenticated scan, including the dangling
 /// case. A stale-public mirror row still serves withheld content (tracked

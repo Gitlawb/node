@@ -4225,6 +4225,102 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Public-but-quarantined repos must not expose encrypted blob indexes
+    /// (discovery or replicate). Previously these handlers used
+    /// `visibility_check` alone and skipped the quarantine short-circuit in
+    /// `authorize_repo_read`.
+    #[sqlx::test]
+    async fn encrypted_blobs_quarantined_repo_opaque_404(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zENCQUAROWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        let mut repo = seed_private_repo(owner, "enc-quar");
+        repo.is_public = true;
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+        state
+            .db
+            .record_encrypted_blob(&repo_id, "deadbeef", "bafybeiquarantinedcid", "")
+            .await
+            .unwrap();
+        state.db.set_repo_quarantine(&repo_id, true).await.unwrap();
+
+        let router = crate::server::build_router(state.clone());
+        for suffix in [
+            "encrypted-blobs",
+            "encrypted-blobs/replicate",
+            "encrypted-blob/deadbeef",
+        ] {
+            let path = format!("/api/v1/repos/{short}/enc-quar/{suffix}");
+            let resp = router.clone().oneshot(anon_get(&path)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "quarantined public repo must 404 on {path}"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("bafybeiquarantinedcid") && !text.contains("deadbeef"),
+                "blob index must not leak on quarantine 404 for {path}: {text}"
+            );
+        }
+
+        // Control: clear quarantine → discovery admits and returns the CID.
+        state.db.set_repo_quarantine(&repo_id, false).await.unwrap();
+        let path = format!("/api/v1/repos/{short}/enc-quar/encrypted-blobs");
+        let resp = router.oneshot(anon_get(&path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("bafybeiquarantinedcid"),
+            "released repo must expose blob index: {text}"
+        );
+    }
+
+    /// `GET /ipfs/{cid}` must not serve objects from a quarantined public repo.
+    /// `list_all_repos` previously had no quarantine filter, so visibility alone
+    /// admitted the row.
+    #[sqlx::test]
+    async fn get_by_cid_skips_quarantined_public_repo(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCIDQUAROWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let slug = owner.replace([':', '/'], "_");
+        let short = owner.split(':').next_back().unwrap();
+        let fx = seed_cid_repos(&slug, short, &["pub-quar"]);
+        let mut repo = seed_repo(owner, "pub-quar");
+        repo.is_public = true;
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+        state.db.set_repo_quarantine(&repo_id, true).await.unwrap();
+
+        let cid = cid_for_oid(&fx.public_oid);
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "quarantined public repo must not serve CID: {body}"
+        );
+        assert!(
+            !body.contains("public bytes"),
+            "object bytes must not leak: {body}"
+        );
+
+        // Control: release quarantine → same CID serves.
+        state.db.set_repo_quarantine(&repo_id, false).await.unwrap();
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(st, StatusCode::OK, "released repo must serve CID: {body}");
+        assert!(
+            body.contains("public bytes"),
+            "expected public blob content: {body}"
+        );
+    }
+
     #[sqlx::test]
     async fn repo_gate_public_repo_anon_read_admitted(pool: PgPool) {
         struct DirGuard(std::path::PathBuf);
