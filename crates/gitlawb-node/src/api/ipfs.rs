@@ -78,6 +78,20 @@ use crate::visibility::{visibility_check, Decision};
 /// Scope: this closes the direct unauthenticated scan, including the dangling
 /// case. A stale-public mirror row still serves withheld content (tracked
 /// separately, #124).
+///
+/// One `/ipfs` request's walk admission: the global pool permit plus the
+/// optional per-source sub-permit, both RAII (#174 U1).
+///
+/// Held behind an `Arc` whose clones go into every `spawn_blocking` walk this
+/// request runs, so the permits release only when the last clone drops — the
+/// handler's, or an abandoned/panicking closure's, whichever outlives the other.
+/// Admission therefore tracks real blocking-thread occupancy rather than the
+/// lifetime of the future that requested it.
+struct WalkAdmission {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _per_source: Option<crate::rate_limit::PerCallerPermit>,
+}
+
 pub async fn get_by_cid(
     Path(cid_str): Path<String>,
     State(state): State<AppState>,
@@ -131,7 +145,7 @@ pub async fn get_by_cid(
     // (`client_key`), never the DID (`/ipfs` admits any `did:key` unthrottled, so a DID
     // key would be free to mint around); a `None` key (no trusted header, no peer) is
     // bounded by the global pool only, never the per-source sub-cap.
-    let _ipfs_walk_permit = state
+    let global_permit = state
         .git_ipfs_walk_semaphore
         .clone()
         .try_acquire_owned()
@@ -140,13 +154,29 @@ pub async fn get_by_cid(
             AppError::Overloaded("ipfs service at capacity, retry shortly".into())
         })?;
     let source_key = crate::rate_limit::client_key(&req_headers, peer, state.push_limiter_trust);
-    let _ipfs_caller_permit = match &source_key {
+    let caller_permit = match &source_key {
         Some(ip) => Some(state.git_ipfs_walk_per_caller.try_acquire(ip).ok_or_else(|| {
             tracing::warn!(key = %ip, "/ipfs per-source walk cap reached; shedding request with 503");
             AppError::Overloaded("ipfs service at capacity for this source, retry shortly".into())
         })?),
         None => None,
     };
+    // Share the admission rather than holding it as a handler local (#174 U1). A
+    // clone goes into every `spawn_blocking` closure below, so the permits release
+    // only when the LAST holder drops. That makes the two failure directions one
+    // case: a client disconnect drops the handler's clone while the abandoned
+    // closure's clone keeps the slot taken for as long as its git child runs, and a
+    // panicking closure drops its clone while the handler's keeps the slot taken.
+    //
+    // Deliberately NOT a move-and-return shuttle. That shape is correct only if
+    // every arm continuing the loop re-binds the returned value, which the compiler
+    // cannot enforce — including the absent-object arm `Ok(Ok(None)) => continue`
+    // that a random-CID scan takes on nearly every iteration — and it forces a
+    // second decision about the arms where a panic destroys the moved-in permits.
+    let admission = std::sync::Arc::new(WalkAdmission {
+        _global: global_permit,
+        _per_source: caller_permit,
+    });
 
     // 2. Search all repos for an object with this SHA-256.
     //
@@ -378,7 +408,11 @@ pub async fn get_by_cid(
         // independent of `state.git_bin` (which tests point at a fake walk git).
         let probe_path = repo_path.clone();
         let probe_sha = sha256_hex.clone();
+        let probe_admission = std::sync::Arc::clone(&admission);
         let obj_type = match tokio::task::spawn_blocking(move || {
+            // Admission clone (#174 U1): the slot stays taken until this blocking
+            // work returns, even if the handler future was dropped or this closure panics.
+            let _admission = probe_admission;
             store::object_type_bounded("git", &probe_path, &probe_sha, probe_deadline)
         })
         .await
@@ -455,7 +489,11 @@ pub async fn get_by_cid(
                 );
                 // Full-history walk shells out to git — keep it off the async runtime,
                 // bounded and reaped like the served-git ops (#174).
+                let walk_admission = std::sync::Arc::clone(&admission);
                 let walk = tokio::task::spawn_blocking(move || {
+                    // Admission clone (#174 U1): the slot stays taken until this blocking
+                    // work returns, even if the handler future was dropped or this closure panics.
+                    let _admission = walk_admission;
                     allowed_blob_set_for_caller_bounded(
                         &rp,
                         &git_bin,
@@ -525,7 +563,11 @@ pub async fn get_by_cid(
         let read_path = repo_path.clone();
         let read_sha = sha256_hex.clone();
         let read_type = obj_type.clone();
+        let read_admission = std::sync::Arc::clone(&admission);
         let content = match tokio::task::spawn_blocking(move || {
+            // Admission clone (#174 U1): the slot stays taken until this blocking
+            // work returns, even if the handler future was dropped or this closure panics.
+            let _admission = read_admission;
             store::read_object_content_bounded(
                 "git",
                 &read_path,
@@ -2331,13 +2373,35 @@ mod tests {
             "a replacement must shed 503 while the prior request's blocking walk still runs"
         );
 
-        // Drop the in-flight request; the detached blocking walk keeps running (a
-        // spawn_blocking cannot be cancelled), but on the fix the permit is a handler
-        // local, so dropping the future releases it once the blocking join is abandoned.
-        // Either way, kill the sleeping child so the slot frees promptly and poll for
-        // recovery — the point already proven above is that the slot stayed held for the
-        // duration of the blocking work.
+        // Drop the in-flight request — a client disconnect. The detached blocking walk
+        // keeps running (a spawn_blocking cannot be cancelled) and its git child is still
+        // occupying a blocking thread and a PID, so the slot it was admitted under must
+        // STAY TAKEN. Admission is released by the blocking work finishing, never by the
+        // handler future going away (#174 U1).
+        //
+        // MUTATION (RED): make the admission a handler local again (drop the Arc clone
+        // moved into the spawn_blocking closures) and this assertion fails immediately —
+        // the permit count returns to 1 the moment the future is dropped, while the
+        // sleeping child is still alive.
         drop(fut);
+        // Give the runtime a chance to actually run the drop and any woken tasks, so
+        // this is not merely observing a not-yet-processed release.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "precondition: the blocking walk's git child must still be alive, or this \
+             assertion proves nothing"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "a client disconnect must NOT release the walk slot while the uncancellable \
+             blocking walk it admitted is still running"
+        );
+
+        // Now end the blocking work; the slot frees when the closure returns.
         unsafe {
             libc::kill(pid, libc::SIGKILL);
         }

@@ -356,3 +356,60 @@ fn f3_second_writer_leased_until_reap() {
          with_lease, so the lease rides the guard into KillGroupOnDrop's reaper"
     );
 }
+
+/// #174 U1 — every blocking walk in the `/ipfs` scan carries the request's walk
+/// admission.
+///
+/// The admission is an `Arc<WalkAdmission>` cloned into each `spawn_blocking`
+/// closure, so the global + per-source permits release only when the last holder
+/// drops: a client disconnect leaves the abandoned closure holding the slot, and a
+/// panicking closure leaves the handler holding it.
+///
+/// Only the walk site runs under `state.git_bin`, so only it can be pinned by the
+/// fake-git harness and mutation-verified dynamically (see
+/// `get_by_cid_walk_permit_held_through_blocking_walk`). The probe and the content
+/// read deliberately shell to the real `git`, which is why this structural check
+/// exists: it binds all three sites, and any blocking site added to this loop
+/// later, without reversing that deliberate independence.
+///
+/// MUTATION (RED): delete any one `Arc::clone(&admission)` binding, or drop the
+/// clone from inside its closure, and the count falls below three.
+#[test]
+fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
+    let ipfs = src("api/ipfs.rs");
+
+    // The shared owner must exist and be built once per request.
+    assert!(
+        ipfs.contains("struct WalkAdmission") && ipfs.contains("Arc::new(WalkAdmission {"),
+        "U1 gate missing: the /ipfs walk admission must be a shared WalkAdmission, \
+         not a handler-local permit pair"
+    );
+
+    // Every blocking site in the scan takes its own clone...
+    let clones = ipfs.matches("Arc::clone(&admission)").count();
+    assert!(
+        clones >= 3,
+        "U1 gate bypassed: expected an admission clone for each of the three \
+         /ipfs spawn_blocking sites (probe, walk, read); found {clones}. A blocking \
+         walk that does not hold the admission lets a disconnect or a panic free the \
+         slot while its git child is still running."
+    );
+
+    // ...and each clone is actually moved INTO the blocking closure, not merely
+    // created in the async frame (which would hold nothing across the join).
+    let held = ipfs.matches("let _admission = ").count();
+    assert!(
+        held >= 3,
+        "U1 gate bypassed: each admission clone must be bound inside its \
+         spawn_blocking closure so the blocking work owns it; found {held} of 3."
+    );
+
+    // The count of blocking sites is itself the thing being covered: if a fourth
+    // appears, it needs an admission clone too and this gate must be revisited.
+    let sites = ipfs.matches("spawn_blocking(move ||").count();
+    assert_eq!(
+        sites, 3,
+        "the /ipfs scan grew or lost a spawn_blocking site ({sites} found, expected 3); \
+         give any new blocking walk its own Arc::clone(&admission) and update this gate"
+    );
+}
