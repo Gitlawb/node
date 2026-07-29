@@ -475,6 +475,35 @@ mod tests {
         assert_eq!(count_tasks(&resp), 0);
     }
 
+    /// #255: ceiling of the tasks(limit) clamp must be held (schema promises Max 200).
+    #[sqlx::test]
+    async fn tasks_limit_ceiling_clamped_to_200(pool: PgPool) {
+        let db = db(pool).await;
+        let now = Utc::now().to_rfc3339();
+        for i in 0..201 {
+            db.create_task(&crate::db::AgentTask {
+                id: format!("task-ceil-{i}"),
+                repo_id: None,
+                kind: "build".into(),
+                status: "pending".into(),
+                delegator_did: OWNER.into(),
+                assignee_did: None,
+                capability: "repo:write".into(),
+                ucan_token: None,
+                payload: None,
+                result: None,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+                deadline: None,
+            })
+            .await
+            .unwrap();
+        }
+        let schema = schema(db);
+        let resp = anon(&schema, "{ tasks(limit: 5000) { id } }").await;
+        assert_eq!(count_tasks(&resp), 200, "limit above 200 must clamp to 200");
+    }
+
     fn count_tasks(resp: &async_graphql::Response) -> usize {
         assert!(resp.errors.is_empty(), "graphql errors: {:?}", resp.errors);
         let async_graphql::Value::Object(obj) = &resp.data else {

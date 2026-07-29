@@ -47,10 +47,9 @@ pub(crate) fn graphql_db_err(e: anyhow::Error) -> async_graphql::Error {
 /// Map an `AppError` from a shared collector (e.g. ref-update feed) to a
 /// GraphQL error.
 ///
-/// - `Db` → opaque via [`graphql_db_err`] (sqlx detail stays in logs).
-/// - `Internal` → opaque (may carry raw anyhow/sqlx text on this base).
-/// - Other variants already carry safe, actionable messages → surface them
-///   and log at `warn!` (same posture as business errors in `graphql_db_err`).
+/// Fail closed: only explicitly curated variants surface their `Display`
+/// text. Unnamed variants (including `Git`, which may embed on-disk paths)
+/// render opaque so a future addition cannot leak by default (#255 review).
 pub(crate) fn graphql_app_err(e: crate::error::AppError) -> async_graphql::Error {
     match e {
         crate::error::AppError::Db(sql) => graphql_db_err(sql.into()),
@@ -58,9 +57,21 @@ pub(crate) fn graphql_app_err(e: crate::error::AppError) -> async_graphql::Error
             tracing::error!(error = %format!("{err:#}"), "graphql internal error");
             async_graphql::Error::new(GRAPHQL_DB_ERROR_MESSAGE)
         }
+        // Curated client-safe variants — `Display` is intentional API text.
+        safe @ (crate::error::AppError::RepoNotFound(_)
+        | crate::error::AppError::RepoExists(_)
+        | crate::error::AppError::NotFound(_)
+        | crate::error::AppError::Unauthorized(_)
+        | crate::error::AppError::Forbidden(_)
+        | crate::error::AppError::BadRequest(_)
+        | crate::error::AppError::TooManyRequests(_)
+        | crate::error::AppError::Incomplete(_)) => {
+            tracing::warn!(error = %safe, "graphql application error");
+            async_graphql::Error::new(safe.to_string())
+        }
         other => {
-            tracing::warn!(error = %other, "graphql application error");
-            async_graphql::Error::new(other.to_string())
+            tracing::error!(error = %other, "graphql unclassified AppError (opaque)");
+            async_graphql::Error::new(GRAPHQL_DB_ERROR_MESSAGE)
         }
     }
 }
@@ -84,10 +95,15 @@ mod tests {
     #[test]
     fn graphql_db_err_opaques_sqlx_chain() {
         let leak = "error returned from database: column \"is_public\" does not exist";
-        let err = graphql_db_err(anyhow::Error::from(sqlx::Error::Protocol(leak.into())));
+        // Context layer must not hide sqlx from the chain walk (db helpers
+        // wrap with `.context(...)` in several places).
+        let err = graphql_db_err(
+            anyhow::Error::from(sqlx::Error::Protocol(leak.into())).context("loading repos"),
+        );
         assert_eq!(err.message, GRAPHQL_DB_ERROR_MESSAGE);
         assert!(!err.message.contains("is_public"));
         assert!(!err.message.contains(leak));
+        assert!(!err.message.contains("loading repos"));
     }
 
     #[test]
@@ -130,5 +146,46 @@ mod tests {
             err.message
         );
         assert_ne!(err.message, GRAPHQL_DB_ERROR_MESSAGE);
+    }
+
+    #[test]
+    fn graphql_app_err_opaques_unclassified_variants() {
+        // `Git` may embed on-disk paths from libgit2; fail closed.
+        let path = "/var/lib/gitlawb/repos/owner/secret.git";
+        let err = graphql_app_err(crate::error::AppError::Git(format!(
+            "failed to open '{path}'"
+        )));
+        assert_eq!(err.message, GRAPHQL_DB_ERROR_MESSAGE);
+        assert!(!err.message.contains(path));
+        assert!(!err.message.contains("failed to open"));
+    }
+
+    /// Every `.map_err(` in the GraphQL query/mutation resolvers must route
+    /// through the opaque helpers, or discard the error (`|_|`). Same source-
+    /// scrape pattern as `api::authz_guard` (#255 review).
+    #[test]
+    fn every_graphql_map_err_uses_opaque_helpers() {
+        for (file, src) in [
+            ("query.rs", include_str!("query.rs")),
+            ("mutation.rs", include_str!("mutation.rs")),
+        ] {
+            for (lineno, line) in src.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or(line);
+                let Some(idx) = code.find(".map_err(") else {
+                    continue;
+                };
+                let after = code[idx + ".map_err(".len()..].trim_start();
+                let ok = after.starts_with("crate::graphql::graphql_db_err")
+                    || after.starts_with("crate::graphql::graphql_app_err")
+                    || after.starts_with("|_|")
+                    || after.starts_with("|_ ");
+                assert!(
+                    ok,
+                    "{file}:{}: `.map_err(` must use graphql_db_err / graphql_app_err \
+                     or discard (`|_|`): {line}",
+                    lineno + 1
+                );
+            }
+        }
     }
 }
