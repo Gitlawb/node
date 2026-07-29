@@ -656,6 +656,22 @@ async fn close_conn_bounded(
 }
 
 impl RepoWriteGuard {
+    /// Backend pid of the session holding the lock. Test-only observable for the
+    /// must-not-over-close check: if `release` closed the session instead of
+    /// returning it, consecutive writes would report different pids.
+    #[cfg(test)]
+    async fn backend_pid_for_test(&mut self) -> i32 {
+        let conn = self
+            .conn
+            .as_mut()
+            .expect("guard still holds its connection");
+        let pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+            .fetch_one(&mut **conn)
+            .await
+            .expect("backend pid");
+        pid.0
+    }
+
     /// Path to the bare repo on local disk.
     pub fn path(&self) -> &Path {
         &self.local_path
@@ -689,6 +705,40 @@ impl RepoWriteGuard {
                 .bind(self.lock_key)
                 .execute(&mut *conn)
                 .await;
+        }
+    }
+}
+
+impl Drop for RepoWriteGuard {
+    fn drop(&mut self) {
+        let Some(mut conn) = self.conn.take() else {
+            // release() already unlocked and handed the connection back.
+            return;
+        };
+
+        // Reached on any exit that skipped release(): an early `?`, a panic, or an
+        // axum handler future cancelled when the client disconnected. The session
+        // still holds the advisory lock, so returning it to the pool would block
+        // every future write to this repo until sqlx recycles the connection.
+        //
+        // `PoolConnection::drop` spawns onto the runtime, both to close and to
+        // return, and panics outright when no runtime handle exists. A panic here
+        // would run inside a `Drop` and abort the process during unwind, so check
+        // for a runtime first. With none, the process is already going away: leak
+        // the handle deliberately rather than panic, and let socket teardown end
+        // the session, which is what frees the lock at exit anyway.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            warn!(
+                repo = %self.repo_name,
+                "write guard dropped without release() — closing its session to free the advisory lock"
+            );
+            conn.close_on_drop();
+        } else {
+            warn!(
+                repo = %self.repo_name,
+                "write guard dropped with no runtime alive — leaking the connection handle so Drop cannot panic; the lock frees when the process exits"
+            );
+            std::mem::forget(conn);
         }
     }
 }
@@ -1994,5 +2044,89 @@ mod tests {
             held.0, 0,
             "a completed write must leave zero advisory locks for its key"
         );
+    }
+
+    // ── U4: a guard that dies without releasing must free the lock ──────────
+
+    /// A guard dropped without `release()` (an early `?`, a panic, or a handler
+    /// future cancelled on client disconnect) must not return a lock-bearing
+    /// connection to the pool, where it would block every future write to that
+    /// repo until sqlx recycles the session.
+    #[sqlx::test]
+    async fn guard_dropped_without_release_frees_the_lock(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let store = write_store(&pool, &opts).await;
+        let key = advisory_lock_key("did_key_z6MkU4Drop", "dropped");
+
+        {
+            let _guard = store
+                .acquire_write("did:key:z6MkU4Drop", "dropped")
+                .await
+                .expect("acquire");
+            // dropped here without release()
+        }
+
+        assert!(
+            poll_until_free(&opts, key, std::time::Duration::from_secs(10)).await,
+            "lock must be freed when a guard is dropped without release()"
+        );
+    }
+
+    /// Must-not over-close: the normal path returns its connection to the pool, so
+    /// a healthy write does not pay a reconnect. Sized to one connection so the
+    /// backend pid is a direct observable: if `release` were closing the session,
+    /// each cycle would land on a fresh backend.
+    #[sqlx::test]
+    async fn normal_release_reuses_the_same_backend(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let store = RepoStore::for_testing(
+            PathBuf::from("/tmp/gitlawb-u4"),
+            no_reap_pool(&opts, 1).await,
+        );
+
+        let mut pids = Vec::new();
+        for i in 0..4 {
+            let repo = format!("reuse-{i}");
+            let mut guard = store
+                .acquire_write("did:key:z6MkU4Reuse", &repo)
+                .await
+                .expect("acquire");
+            pids.push(guard.backend_pid_for_test().await);
+            guard.release(true).await;
+        }
+        assert!(
+            pids.windows(2).all(|w| w[0] == w[1]),
+            "a released guard must return its connection to the pool, so all four \
+             writes share one backend; saw {pids:?}"
+        );
+    }
+
+    /// A guard abandoned while the runtime is tearing down must not panic.
+    /// `PoolConnection::drop` calls `crate::rt::spawn`, which panics without a
+    /// runtime handle, and a panic inside `Drop` during unwind aborts the process.
+    /// At real process exit the lock is freed by socket teardown, not by this Drop
+    /// body, so this asserts no-panic rather than lock release.
+    #[test]
+    fn guard_dropped_at_runtime_teardown_does_not_panic() {
+        let url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return, // no database configured; nothing to assert
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let guard = rt.block_on(async {
+            let lock_pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&url)
+                .await
+                .expect("lock pool");
+            let store = RepoStore::for_testing(PathBuf::from("/tmp/gitlawb-u4b"), lock_pool);
+            store
+                .acquire_write("did:key:z6MkU4Teardown", "teardown")
+                .await
+                .expect("acquire")
+        });
+        // Shut the runtime down first, then drop the guard with no runtime alive.
+        drop(rt);
+        drop(guard);
     }
 }
