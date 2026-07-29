@@ -872,7 +872,10 @@ mod repo_identity_key_tests {
         let owner = "did:key:z6Mkfoo";
         let name = "r";
         let expected_slug = owner.replace([':', '/'], "_");
-        assert_eq!(repo_identity_key(owner, name), format!("{expected_slug}\0{name}"));
+        assert_eq!(
+            repo_identity_key(owner, name),
+            format!("{expected_slug}\0{name}")
+        );
 
         // The disk path for the same pair must carry the same slug component.
         let disk = crate::git::store::repo_disk_path(std::path::Path::new("/srv"), owner, name);
@@ -906,8 +909,14 @@ mod repo_identity_key_tests {
     /// Distinct repos and distinct owners never share a key.
     #[test]
     fn distinct_repos_and_owners_do_not_share_a_key() {
-        assert_ne!(repo_identity_key("did:key:z6A", "r"), repo_identity_key("did:key:z6A", "s"));
-        assert_ne!(repo_identity_key("did:key:z6A", "r"), repo_identity_key("did:key:z6B", "r"));
+        assert_ne!(
+            repo_identity_key("did:key:z6A", "r"),
+            repo_identity_key("did:key:z6A", "s")
+        );
+        assert_ne!(
+            repo_identity_key("did:key:z6A", "r"),
+            repo_identity_key("did:key:z6B", "r")
+        );
     }
 
     /// Documents the ONE collision the sanitization admits, and why it is safe
