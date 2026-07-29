@@ -728,7 +728,13 @@ pub async fn git_info_refs(
     // are moved in, so admission tracks the real process lifetime.
     let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
     let git_timeout = std::time::Duration::from_secs(state.config.git_service_timeout_secs);
-    smart_http::info_refs("git", &service, &disk_path, git_timeout, Some(admission))
+    smart_http::info_refs(
+        &state.git_bin,
+        &service,
+        &disk_path,
+        git_timeout,
+        Some(admission),
+    )
         .await
         .map_err(|e| {
             let app = git_service_app_error(&e);
@@ -820,11 +826,15 @@ async fn withheld_recipients_gated(
     anyhow::Result<std::collections::HashMap<String, std::collections::BTreeSet<String>>>,
     tokio::task::JoinError,
 > {
-    let _permit = encrypt_sem
+    let permit = encrypt_sem
         .acquire_owned()
         .await
         .expect("git_encrypt_semaphore is never closed");
     tokio::task::spawn_blocking(move || {
+        // The permit lives inside the blocking closure (#174 U4, the F4 contract): a
+        // started walk always completes holding it, so a dropped future cannot free
+        // the slot while this uncancellable walk still occupies a thread and a PID.
+        let _permit = permit;
         crate::git::visibility_pack::withheld_blob_recipients_bounded(
             &repo_path, &git_bin, timeout, &rules, is_public, &owner_did,
         )
@@ -3027,6 +3037,154 @@ mod tests {
         perm.set_mode(0o755);
         std::fs::set_permissions(&p, perm).unwrap();
         p.to_str().unwrap().to_string()
+    }
+
+    /// #174 U6: the `info/refs` advertisement must run the CONFIGURED git binary,
+    /// like upload-pack and receive-pack already do. It passed a literal "git", so a
+    /// fake-git harness could drive the pack paths but never the advertisement.
+    ///
+    /// MUTATION (RED): restore the `"git"` literal at the `smart_http::info_refs`
+    /// call and the fake's marker never reaches the response body.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn u6_info_refs_runs_the_configured_git_binary(pool: sqlx::PgPool) {
+        use axum::extract::{Path, Query, State};
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Distinctive advertisement so the assertion cannot pass on real git's output.
+        let body = "#!/bin/sh\n\
+                    case \"$1\" in\n\
+                      upload-pack) printf 'U6-FAKE-ADVERTISEMENT' ;;\n\
+                      *) : ;;\n\
+                    esac\n\
+                    exit 0\n";
+        let git_bin = write_fake_git(tmp.path(), body);
+        let state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6u6adv", "a1", false).await;
+
+        let resp = git_info_refs(
+            State(state),
+            Path(("z6u6adv".to_string(), "a1".to_string())),
+            Query(InfoRefsQuery {
+                service: Some("git-upload-pack".to_string()),
+            }),
+            crate::rate_limit::PeerAddr(Some("203.0.113.95:5000".parse().unwrap())),
+            axum::http::HeaderMap::new(),
+            None,
+        )
+        .await
+        .expect("the advertisement must succeed");
+
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("U6-FAKE-ADVERTISEMENT"),
+            "info/refs must run state.git_bin, not a hardcoded \"git\"; body was: {text:?}"
+        );
+    }
+
+    /// #174 U4: `withheld_recipients_gated` must hold its encrypt-scan permit INSIDE
+    /// the blocking closure, matching every other post-receive scan helper (see
+    /// `replication_withheld_set`, where the permit is moved in with "a started walk
+    /// always completes holding it").
+    ///
+    /// Holding it in the async frame instead means dropping the future releases the
+    /// permit while the uncancellable `spawn_blocking` walk keeps running, so the
+    /// encrypt pool admits a replacement scan against a slot still occupied by a live
+    /// git child.
+    ///
+    /// MUTATION (RED): hoist `_permit` back out of the closure and the
+    /// still-held-after-drop assertion fails — the count returns to 1 immediately.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn u4_encrypt_scan_permit_is_held_through_the_blocking_walk() {
+        use std::time::Duration;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pidfile = tmp.path().join("u4_walk.pid");
+        // Hang on the first real walk command, whatever it is; only rev-parse answers.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               rev-parse) echo deadbeef ;;\n\
+               *) echo $$ > \"{pid}\"; while true; do sleep 1; done ;;\n\
+             esac\n\
+             exit 0\n",
+            pid = pidfile.display(),
+        );
+        let git_bin = write_fake_git(tmp.path(), &body);
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+
+        let mut fut = Box::pin(withheld_recipients_gated(
+            sem.clone(),
+            tmp.path().to_path_buf(),
+            git_bin,
+            Duration::from_secs(600),
+            vec![vis_rule("/secret/**", &[])],
+            true,
+            "did:key:z6MkU4OwnerAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        ));
+
+        // Drive until the blocking walk's git child records its pid.
+        let mut walk_pid: Option<i32> = None;
+        for _ in 0..500 {
+            let _ = tokio::time::timeout(Duration::from_millis(10), &mut fut).await;
+            if let Some(p) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok())
+            {
+                walk_pid = Some(p);
+                break;
+            }
+        }
+        let pid = walk_pid.expect("the fake git walk command must have spawned");
+        struct ReapOnDrop(i32);
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = ReapOnDrop(pid);
+
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "the scan permit must be held while the blocking walk runs"
+        );
+
+        drop(fut);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            unsafe { libc::kill(pid, 0) } == 0,
+            "precondition: the walk's git child must still be alive, or this \
+             assertion proves nothing"
+        );
+        assert_eq!(
+            sem.available_permits(),
+            0,
+            "dropping the future must NOT release the encrypt-scan permit while the \
+             uncancellable blocking walk it admitted is still running"
+        );
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let mut freed = false;
+        for _ in 0..400 {
+            if sem.available_permits() == 1 {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            freed,
+            "once the blocking walk ends the scan permit must return to the pool"
+        );
     }
 
     /// #174 (write-pool twin, vetted by execution not reasoning): the receive-pack
