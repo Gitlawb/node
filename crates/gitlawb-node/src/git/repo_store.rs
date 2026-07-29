@@ -303,6 +303,39 @@ fn validate_path_components(owner_did: &str, repo_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a peer-supplied `owner/name` sync slug and return its two halves.
+///
+/// The sync queue carries a single `repo` string that peers control, and the
+/// worker turns it into a filesystem path. `PathBuf::join` does not normalize,
+/// and an absolute second component replaces the accumulated path, so an
+/// unvalidated `a//tmp/x` resolved to `/tmp/x.git` outside `repos_dir` (#272).
+///
+/// The halves are checked with the same validators that guard
+/// `RepoStore::local_path`, so there is one owner rule and one name rule in the
+/// crate. The one rule added here is the leading `.`/`-` check on the owner
+/// half: `validate_owner_did` has no such rule (it also serves full DIDs, which
+/// always start with `d`), and without it an owner half of `.` puts a
+/// peer-controlled mirror at the `repos_dir` root, which canonicalizes back
+/// inside the root and so passes containment.
+pub(crate) fn validate_repo_slug(slug: &str) -> Result<(&str, &str)> {
+    let mut parts = slug.split('/');
+    let (Some(owner), Some(name)) = (parts.next(), parts.next()) else {
+        anyhow::bail!("repo slug must be 'owner/name'");
+    };
+    if parts.next().is_some() {
+        anyhow::bail!("repo slug must contain exactly one '/'");
+    }
+    if owner.is_empty() || name.is_empty() {
+        anyhow::bail!("repo slug has an empty owner or name");
+    }
+    if owner.starts_with('.') || owner.starts_with('-') {
+        anyhow::bail!("repo slug owner must not start with '.' or '-'");
+    }
+    validate_owner_did(owner)?;
+    validate_repo_name(name)?;
+    Ok((owner, name))
+}
+
 fn validate_owner_did(owner_did: &str) -> Result<()> {
     if owner_did.is_empty() {
         anyhow::bail!("owner_did is empty");
@@ -404,6 +437,102 @@ fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── sync slug validation (#272) ────────────────────────────────────────
+
+    #[test]
+    fn slug_accepts_owner_and_name() {
+        let (owner, name) = validate_repo_slug("z6Mkfoo/hello").expect("valid slug");
+        assert_eq!(owner, "z6Mkfoo");
+        assert_eq!(name, "hello");
+    }
+
+    #[test]
+    fn slug_rejects_traversal_in_owner_half() {
+        assert!(validate_repo_slug("../hello").is_err());
+    }
+
+    #[test]
+    fn slug_rejects_owner_half_only_the_did_validator_catches() {
+        // These are the cases that isolate the `validate_owner_did` delegation.
+        // `../hello` does NOT: the leading-character rule above rejects it
+        // first, so deleting the delegation leaves that case green. Each owner
+        // half here has exactly one separator, a non-empty name, and a leading
+        // character the slug rules allow, so only the delegation can reject it.
+        for bad in [
+            "a..b/hello",    // interior `..` sequence
+            "a%2e%2e/hello", // percent-encoded, disallowed `%`
+            "own\\er/hello", // backslash
+        ] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_extra_separator() {
+        // The verified #272 escape: `a//tmp/x` joined to an absolute
+        // `/tmp/x.git` outside repos_dir.
+        assert!(validate_repo_slug("a//tmp/gitlawb-probe").is_err());
+        assert!(validate_repo_slug("../../etc/evil").is_err());
+        assert!(validate_repo_slug("a/../../x").is_err());
+    }
+
+    #[test]
+    fn slug_rejects_trailing_segment_only_the_separator_count_catches() {
+        // The case that isolates the separator-count rule. Every slug in
+        // `slug_rejects_extra_separator` is caught by some earlier rule
+        // instead: `a//tmp/...` has an empty name half, `../../etc/evil` trips
+        // the leading-character rule, and `a/../../x` has `..` as its name. Here
+        // both halves are individually valid, so only the count can reject it.
+        // It matters because the worker would otherwise join
+        // `repos_dir/z6Mkfoo/hello.git` while composing the remote URL from the
+        // full three-segment slug, silently mirroring one repo under another's
+        // path.
+        assert!(validate_repo_slug("z6Mkfoo/hello/extra").is_err());
+    }
+
+    #[test]
+    fn slug_rejects_missing_separator() {
+        for bad in ["..", "demo", ""] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_empty_half() {
+        for bad in ["/hello", "z6Mkfoo/"] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_leading_dot_or_dash_owner() {
+        // `./hello` would otherwise resolve to a mirror at the repos_dir root,
+        // which the containment check would approve.
+        for bad in ["./hello", "-owner/hello"] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_bad_name_half() {
+        for bad in [
+            "z6Mkfoo/he\0llo",
+            "z6Mkfoo/.hidden",
+            "z6Mkfoo/-dash",
+            "z6Mkfoo/a..b",
+        ] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_overlong_halves() {
+        let long_owner = format!("{}/hello", "z".repeat(257));
+        let long_name = format!("z6Mkfoo/{}", "n".repeat(101));
+        assert!(validate_repo_slug(&long_owner).is_err());
+        assert!(validate_repo_slug(&long_name).is_err());
+    }
 
     // ── repo_name validation ───────────────────────────────────────────────
 
