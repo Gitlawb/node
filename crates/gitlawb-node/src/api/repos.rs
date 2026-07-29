@@ -1829,6 +1829,19 @@ pub async fn git_receive_pack(
     // the gossip event carries `cert_id: None` regardless, so no announce consumer
     // reads a certificate out of it. Each push owns its own tail, including its own
     // always-spawned announce, so per-push announcements are never coalesced away.
+    //
+    // ACCEPTED RESIDUAL, and it is the cost of this ordering: the tail also runs
+    // concurrently with the Tigris upload inside `release` below, where before it ran
+    // after. So a ref can be announced while the shared durable copy is still the old
+    // one, and on a disconnect here the upload is cancelled outright while the
+    // detached tail still pins and announces. What makes that acceptable is that
+    // upload-then-announce was never actually guaranteed: `release` tolerates a failed
+    // upload by design (it warns and continues to the unlock), so an announce over a
+    // stale Tigris copy was already reachable before this reorder, and it self-heals,
+    // since `acquire_fresh` falls back to the local copy and the next push re-uploads.
+    // The alternative, detaching `release` and the tail together to keep the ordering,
+    // would return 200 to the pusher before the durable copy lands, which is a larger
+    // change to the client contract than the window it closes.
     let push_succeeded = receive_result.is_ok();
     if push_succeeded {
         tokio::spawn(post_receive_replication_tail(
