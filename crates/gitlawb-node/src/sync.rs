@@ -1792,6 +1792,15 @@ mod tests {
         .await;
 
         run_batch(&state, &repos_dir).await;
+        // Pin the premise before the yield: the stuck rows must actually fill
+        // the first batch. Without this the test would still pass if the batch
+        // size ever grew past the stuck set, having quietly stopped exercising
+        // head-of-line yield at all.
+        assert_eq!(
+            sync_status(&pool, "z6Mkfoo/hello").await,
+            "pending",
+            "the first poll must be consumed by the stuck rows"
+        );
         run_batch(&state, &repos_dir).await;
 
         assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
@@ -1836,11 +1845,22 @@ mod tests {
         )
         .await;
 
-        for _ in 0..3 {
-            run_batch(&state, &repos_dir).await;
-        }
+        // Two polls cannot reach it: 25 stuck rows are ahead of it and the
+        // batch is 10. Asserting that keeps the ceil(N/10) claim honest rather
+        // than just asserting it eventually lands.
+        run_batch(&state, &repos_dir).await;
+        run_batch(&state, &repos_dir).await;
+        assert_eq!(
+            sync_status(&pool, "z6Mkfoo/hello").await,
+            "pending",
+            "25 stuck rows must still be ahead of it after two polls"
+        );
+        run_batch(&state, &repos_dir).await;
 
         assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
+        // Rotated, not retired: yielding the slot must not settle the row.
+        assert_eq!(sync_status(&pool, "z6Mkstuck/r0").await, "pending");
+        assert_eq!(sync_status(&pool, "z6Mkstuck/r24").await, "pending");
 
         unstick(&stuck);
     }

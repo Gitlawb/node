@@ -1647,25 +1647,39 @@ impl Db {
         Ok(())
     }
 
-    /// Claim the next batch of pending syncs, oldest attempt first.
+    /// Take up to `limit` pending syncs — the least recently attempted ones —
+    /// and stamp each with the time it was handed out.
     ///
-    /// This both selects and stamps, in one statement, and that is deliberate.
-    /// A row the worker cannot make progress on stays `pending` so it is
-    /// retried, and if its ordering key never moved it would remain among the
-    /// oldest rows forever, holding a fixed-size window against every healthy
-    /// repo behind it. Stamping on the way out makes the key "least recently
-    /// handed out", so a stuck row rotates to the back instead.
-    ///
-    /// Doing it here rather than at each deferral branch in the worker is what
-    /// makes that true by construction: no call site can forget, a batch that
-    /// dies mid-loop still leaves its rows stamped, and a failed stamp is a
-    /// failed dequeue the caller already handles rather than a silently
-    /// swallowed error. `enqueued_at` is left alone so backlog age stays
+    /// Selecting and stamping in one statement is deliberate. A row the worker
+    /// cannot make progress on stays `pending` so it is retried, and if its
+    /// ordering key never moved it would remain among the oldest rows forever,
+    /// holding a fixed-size window against every healthy repo behind it.
+    /// Stamping on the way out makes the key "least recently handed out", so a
+    /// stuck row rotates to the back instead. Doing it here rather than at each
+    /// deferral branch in the worker is what makes that hold by construction:
+    /// no call site can forget it, and a batch that dies mid-loop still leaves
+    /// its rows stamped. `enqueued_at` is left alone so backlog age stays
     /// measurable.
+    ///
+    /// Two things this deliberately does not promise. The returned rows are the
+    /// right *set*, in no particular order — `RETURNING` does not sort, and
+    /// nothing in `process_batch` depends on the order within a batch. And this
+    /// is not a claim: the rows stay `pending` with no row lock held past the
+    /// statement, so two workers against one database can still be handed the
+    /// same batch. Single-worker deployment is the existing assumption;
+    /// `FOR UPDATE SKIP LOCKED` is what would change that, and it is not here.
+    ///
+    /// Errors surface to the caller, which logs and skips the poll. That is
+    /// worth knowing now that this writes: it can fail for reasons a plain
+    /// SELECT could not, such as a read-only transaction or a lock timeout.
     pub async fn dequeue_pending_syncs(&self, limit: i64) -> Result<Vec<SyncQueueItem>> {
         let rows = sqlx::query(
+            // The outer `status = 'pending'` is not redundant with the
+            // subquery's: between the two, a concurrent worker can settle a row,
+            // and without it the UPDATE would still stamp and return a row that
+            // had already left the pending set.
             "UPDATE sync_queue SET attempted_at = $2
-             WHERE id IN (
+             WHERE status = 'pending' AND id IN (
                  SELECT id FROM sync_queue WHERE status = 'pending'
                  ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
              )
