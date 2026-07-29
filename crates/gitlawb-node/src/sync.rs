@@ -252,13 +252,26 @@ async fn process_batch(
         // the check then covers clone and fetch alike.
         let owner_dir = config.repos_dir.join(owner_short);
         if let Err(e) = std::fs::create_dir_all(&owner_dir) {
-            // Leave the row pending: a read-only or briefly unmounted repos_dir
-            // is transient, and marking failed is terminal (dequeue_pending_syncs
-            // only ever selects pending rows).
+            // Split by whether the error can ever clear. A read-only or briefly
+            // unmounted repos_dir is transient, so the row stays pending and is
+            // retried. A path that is simply not creatable never clears, and
+            // leaving it pending would re-pick it on every poll: since
+            // dequeue_pending_syncs is oldest-first with a fixed batch size, a
+            // handful of such rows hold the whole window and starve every
+            // healthy repo behind them.
+            let permanent = matches!(
+                e.kind(),
+                std::io::ErrorKind::InvalidFilename
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::NotADirectory
+            );
             error!(
                 id = %item.id, repo = %item.repo, path = %owner_dir.display(), err = %e,
-                "cannot create the owner directory for a mirror; leaving the sync row pending"
+                permanent, "cannot create the owner directory for a mirror"
             );
+            if permanent {
+                let _ = db.mark_sync_failed(&item.id).await;
+            }
             continue;
         }
         match crate::git::repo_store::path_within_root(&local_path, &config.repos_dir) {
@@ -1491,11 +1504,17 @@ mod tests {
         let owner_dir = repos_dir.join("z6Mkfoo");
         std::fs::create_dir_all(&owner_dir).unwrap();
         std::fs::set_permissions(&owner_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::symlink_metadata(owner_dir.join("hello.git")).is_ok() {
-            // Running with enough privilege to ignore the mode bits (root).
+        // Probe by trying to CREATE inside the unreadable directory. Probing with
+        // symlink_metadata on a child that was never created returns Err for
+        // every user (ENOENT unprivileged, ENOENT as root), so that branch could
+        // never fire and the guard it looks like was not there at all.
+        if std::fs::create_dir(owner_dir.join("probe")).is_ok() {
             std::fs::set_permissions(&owner_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-            eprintln!("skipping: permissions do not restrict this user");
-            return;
+            panic!(
+                "this test needs a user the mode bits actually restrict; it is the only \
+                 coverage for leaving the row pending on an I/O error, and passing it as \
+                 root would prove nothing. Run the suite unprivileged."
+            );
         }
 
         let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
@@ -1529,8 +1548,14 @@ mod tests {
         if std::fs::create_dir(repos_dir.join("probe")).is_ok() {
             std::fs::set_permissions(&repos_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
             std::fs::remove_dir(repos_dir.join("probe")).unwrap();
-            eprintln!("skipping: permissions do not restrict this user");
-            return;
+            // Fail rather than return: cargo swallows stderr for a passing test,
+            // so an early return here would report "ok" on a root runner while
+            // exercising nothing, and the pending-vs-failed contract would ship
+            // unverified from that point on.
+            panic!(
+                "this test needs a user the mode bits actually restrict; \
+                 run the suite unprivileged."
+            );
         }
 
         let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);

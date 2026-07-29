@@ -331,6 +331,15 @@ pub(crate) fn validate_repo_slug(slug: &str) -> Result<(&str, &str)> {
     if owner.starts_with('.') || owner.starts_with('-') {
         anyhow::bail!("repo slug owner must not start with '.' or '-'");
     }
+    // The owner half becomes one path component, so it is bounded by NAME_MAX
+    // (255), not by the DID column's 256. The two differ by exactly one, and
+    // that one length is the gap that matters: validate_owner_did accepts 256,
+    // create_dir_all then fails with ENAMETOOLONG on every attempt, and the
+    // worker leaves such a row pending, so it is re-picked forever. Rejecting
+    // it here means an undeliverable slug never enters the queue at all.
+    if owner.len() > 255 {
+        anyhow::bail!("repo slug owner exceeds 255 chars");
+    }
     validate_owner_did(owner)?;
     validate_repo_name(name)?;
     Ok((owner, name))
@@ -615,6 +624,20 @@ mod tests {
         let long_name = format!("z6Mkfoo/{}", "n".repeat(101));
         assert!(validate_repo_slug(&long_owner).is_err());
         assert!(validate_repo_slug(&long_name).is_err());
+    }
+
+    #[test]
+    fn slug_rejects_owner_half_at_the_filesystem_name_limit() {
+        // The owner half becomes a single path component, and Linux NAME_MAX is
+        // 255, so 256 is accepted by validate_owner_did (which bails only above
+        // 256) but can never be created on disk. That made the sync row
+        // permanently un-runnable: create_dir_all failed with ENAMETOOLONG on
+        // every pass and the worker left the row pending, so ten unsigned
+        // requests could hold the whole oldest-first batch forever.
+        assert!(validate_repo_slug(&format!("{}/hello", "z".repeat(256))).is_err());
+        // 255 is the largest creatable component and must still be accepted, so
+        // the bound is not quietly over-tightened.
+        assert!(validate_repo_slug(&format!("{}/hello", "z".repeat(255))).is_ok());
     }
 
     // ── canonical containment (#272) ───────────────────────────────────────
