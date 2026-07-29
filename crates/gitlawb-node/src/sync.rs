@@ -256,8 +256,11 @@ async fn process_batch(
             // Split by whether retrying could ever change the answer. A
             // read-only or briefly unmounted repos_dir is transient, so the row
             // stays pending and is retried. A path that is simply not creatable
-            // is not going to become creatable on the next poll, and leaving it
-            // pending re-picks it forever.
+            // is not going to become creatable on the next poll, so leaving it
+            // pending would retry it forever for nothing. `dequeue_pending_syncs`
+            // stamps what it hands out, so such a row rotates rather than pins
+            // the batch, but a row that can never succeed still should not sit
+            // in the queue consuming a slot every rotation.
             //
             // AlreadyExists is in this set because create_dir_all only reports
             // it when something that is not a directory occupies the path — a
@@ -299,12 +302,19 @@ async fn process_batch(
                 continue;
             }
             crate::git::repo_store::Containment::IoError(e) => {
-                // Pending, so it is retried when the condition clears. There is
-                // deliberately no attempt cap: bounding it needs an attempts
-                // column on sync_queue, which is a migration and belongs in its
-                // own change. The metric is what makes a queue stalled on an
-                // operator condition (an unmounted repos_dir) distinguishable
-                // from an idle one, which is the gap that actually hurts.
+                // Pending, so it is retried when the condition clears. This is
+                // the deferral the error-kind split above cannot reach: an
+                // owner directory that exists but denies traversal lets
+                // create_dir_all succeed and fails here instead, and it is
+                // per-repo rather than a whole-repos_dir outage.
+                //
+                // No stamping is needed at this branch. `dequeue_pending_syncs`
+                // stamps every row it hands out, so this row already sorts to
+                // the back and cannot hold the batch against healthy repos.
+                // There is still deliberately no attempt cap: bounding retries
+                // needs an attempts column, which is its own change. The metric
+                // is what makes a queue stalled on an operator condition
+                // distinguishable from an idle one.
                 error!(
                     id = %item.id, repo = %item.repo, path = %local_path.display(), err = %e,
                     "cannot resolve the mirror path against repos_dir; leaving the sync row pending"
@@ -1701,6 +1711,138 @@ mod tests {
         assert!(owner_path.is_symlink());
         assert!(!home.path().join("no-such-target").exists());
         assert!(mirrors_under(home.path()).is_empty());
+    }
+
+    /// Enqueue a row and pin its `enqueued_at`, so batch ordering in the
+    /// starvation tests is fixed rather than dependent on how fast the loop
+    /// runs. Two rows enqueued in the same microsecond would otherwise order
+    /// arbitrarily.
+    async fn enqueue_at(db: &Db, pool: &PgPool, repo: &str, did: &str, enqueued_at: &str) {
+        enqueue(db, repo, did).await;
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind(enqueued_at)
+            .bind(repo)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// An owner directory that exists but denies traversal. `create_dir_all`
+    /// returns Ok (mkdir gets EEXIST and `is_dir()` succeeds, since that stat
+    /// only needs +x on repos_dir), so this defers at `path_within_root`
+    /// instead — the stall path that survives the AlreadyExists
+    /// classification, which is what keeps the starvation tests load-bearing.
+    fn make_stuck_owner(repos_dir: &Path, owner: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = repos_dir.join(owner);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::create_dir(dir.join("probe")).is_ok() {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Fail rather than return: cargo swallows stderr for a passing
+            // test, so an early return would report "ok" on a root runner while
+            // exercising nothing, and the head-of-line contract would ship
+            // unverified from that point on.
+            panic!(
+                "this test needs a user the mode bits actually restrict; it is the only \
+                 coverage for a stuck batch yielding to a healthy row, and passing it as \
+                 root would prove nothing. Run the suite unprivileged."
+            );
+        }
+        dir
+    }
+
+    fn unstick(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[sqlx::test]
+    async fn a_full_batch_of_stuck_rows_does_not_starve_a_healthy_one(pool: PgPool) {
+        // Ten rows that defer forever, exactly filling the batch, with one
+        // healthy row queued behind them. Ordering by enqueued_at alone means
+        // the stuck ten are permanently the oldest and the healthy row is never
+        // dequeued at all, on any number of polls.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let stuck = make_stuck_owner(&repos_dir, "z6Mkstuck");
+
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkOrigin";
+        seed_local_peer(&pool, did, &peer_url).await;
+        for i in 0..10 {
+            enqueue_at(
+                &state.db,
+                &pool,
+                &format!("z6Mkstuck/r{i}"),
+                did,
+                &format!("2026-07-29T00:00:{i:02}Z"),
+            )
+            .await;
+        }
+        enqueue_at(
+            &state.db,
+            &pool,
+            "z6Mkfoo/hello",
+            did,
+            "2026-07-29T00:01:00Z",
+        )
+        .await;
+
+        run_batch(&state, &repos_dir).await;
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
+        assert!(repos_dir.join("z6Mkfoo").join("hello.git").is_dir());
+        // The stuck rows yielded their slot; they did not get retired for it.
+        assert_eq!(sync_status(&pool, "z6Mkstuck/r0").await, "pending");
+
+        unstick(&stuck);
+    }
+
+    #[sqlx::test]
+    async fn a_stuck_set_larger_than_the_batch_still_yields(pool: PgPool) {
+        // 25 stuck rows against a batch size of 10. The healthy row lands
+        // within ceil(26/10) = 3 polls, which is the bound the PR claims;
+        // the batch-sized case above is the easiest one and would pass under a
+        // fix that only rotated a single full window.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        let stuck = make_stuck_owner(&repos_dir, "z6Mkstuck");
+
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkOrigin";
+        seed_local_peer(&pool, did, &peer_url).await;
+        for i in 0..25 {
+            enqueue_at(
+                &state.db,
+                &pool,
+                &format!("z6Mkstuck/r{i}"),
+                did,
+                &format!("2026-07-29T00:00:{i:02}Z"),
+            )
+            .await;
+        }
+        enqueue_at(
+            &state.db,
+            &pool,
+            "z6Mkfoo/hello",
+            did,
+            "2026-07-29T00:01:00Z",
+        )
+        .await;
+
+        for _ in 0..3 {
+            run_batch(&state, &repos_dir).await;
+        }
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
+
+        unstick(&stuck);
     }
 
     #[sqlx::test]
