@@ -222,17 +222,23 @@ async fn process_batch(
             }
         };
 
-        // Derive local disk path matching repo_disk_path convention:
-        // {repos_dir}/{owner_slug}/{name}.git
-        // item.repo is "{short_owner}/{name}" — split on first '/'
-        let (owner_short, repo_name) = match item.repo.split_once('/') {
-            Some(pair) => pair,
-            None => {
-                warn!(repo = %item.repo, "sync item repo has no '/' separator — skipping");
+        // Validate the slug before deriving any path from it. The row may have
+        // been queued before this check existed, or by the gossip/trigger
+        // writers, so the worker does not trust it (issue #272). This has to run
+        // ahead of the repos_dir join: PathBuf::join does not normalize, and an
+        // absolute second component discards the root entirely, which put a
+        // mirror outside repos_dir.
+        let (owner_short, repo_name) = match crate::git::repo_store::validate_repo_slug(&item.repo)
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(id = %item.id, repo = %item.repo, err = %e, "sync item has an invalid repo slug, skipping");
                 let _ = db.mark_sync_failed(&item.id).await;
                 continue;
             }
         };
+        // Local disk path matching the repo_disk_path convention:
+        // {repos_dir}/{owner_slug}/{name}.git
         let local_path = config
             .repos_dir
             .join(owner_short)
@@ -691,6 +697,7 @@ async fn fetch_repo(local_path: &Path, remote_url: &str, mode: MirrorMode) -> an
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     use std::process::Command;
     use tempfile::TempDir;
 
@@ -1031,5 +1038,255 @@ mod tests {
     #[test]
     fn resolve_origin_url_returns_none_for_empty_peer_list() {
         assert_eq!(resolve_origin_url(&[], "did:key:a"), None);
+    }
+
+    // ── worker-side slug validation (issue #272) ─────────────────────────────
+
+    /// Build a rooted remote: one bare repo per entry in `rels`, each at
+    /// `root/{rel}`, and return the `file://` URL of `root` itself.
+    ///
+    /// `process_batch` composes the remote as `{peer_url}/{item.repo}`, so a
+    /// peer URL has to be a root under which the slug resolves to the bare
+    /// repo. `bare_remote` above returns a URL pointing straight at `bare.git`
+    /// and cannot serve as a peer URL as is.
+    ///
+    /// `root` sits two directories deep inside the tempdir so that a `rel`
+    /// carrying `..` (a hostile slug composed onto the root) still resolves
+    /// inside the tempdir instead of somewhere in the real filesystem.
+    fn rooted_remote(rels: &[&str]) -> (TempDir, String) {
+        let td = TempDir::new().unwrap();
+        let origin = td.path().join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::write(origin.join("a.txt"), b"hi\n").unwrap();
+        g(&["init", "-q"], &origin);
+        g(&["config", "user.email", "t@t"], &origin);
+        g(&["config", "user.name", "t"], &origin);
+        g(&["add", "."], &origin);
+        g(&["commit", "-qm", "init"], &origin);
+
+        let root = td.path().join("r1").join("r2").join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        for rel in rels {
+            let bare = root.join(rel);
+            std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+            g(
+                &[
+                    "clone",
+                    "-q",
+                    "--bare",
+                    origin.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                td.path(),
+            );
+        }
+        let url = format!("file://{}", root.display());
+        (td, url)
+    }
+
+    /// Insert a peer row directly.
+    ///
+    /// `Db::upsert_peer` runs the URL through `crate::api::peers::is_public_http_url`
+    /// and bails on anything that is not public http/https, which rules out both
+    /// `file://` and `http://127.0.0.1:PORT`. A worker test needs a locally
+    /// reachable origin, so the row goes in with the same column list
+    /// `upsert_peer` uses. Do not "fix" this back to the helper.
+    async fn seed_local_peer(pool: &PgPool, did: &str, http_url: &str) {
+        sqlx::query(
+            "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
+             VALUES ($1, $2, $3, FALSE, $3)",
+        )
+        .bind(did)
+        .bind(http_url)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn sync_status(pool: &PgPool, repo: &str) -> String {
+        let row: (String,) = sqlx::query_as("SELECT status FROM sync_queue WHERE repo = $1")
+            .bind(repo)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        row.0
+    }
+
+    async fn enqueue(db: &Db, repo: &str, did: &str) {
+        db.enqueue_sync(repo, did, "refs/heads/main", &"0".repeat(40), None)
+            .await
+            .unwrap();
+    }
+
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Run one `process_batch` against `repos_dir`, cloning the test config and
+    /// overriding only the repo root.
+    async fn run_batch(state: &crate::state::AppState, repos_dir: &Path) {
+        let mut cfg = (*state.config).clone();
+        cfg.repos_dir = repos_dir.to_path_buf();
+        process_batch(
+            &state.db,
+            &cfg,
+            &Keypair::generate(),
+            None,
+            &reqwest::Client::new(),
+        )
+        .await;
+    }
+
+    #[sqlx::test]
+    async fn process_batch_rejects_slug_escaping_repos_dir(pool: PgPool) {
+        // The verified escape from #272: `PathBuf::join` discards everything
+        // accumulated before an absolute component, so `repos_dir/a` joined with
+        // `/…/nest/escape.git` resolves to `/…/nest/escape.git`, outside the root.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        // `nest` does not exist yet, so both it and the mirror inside it are
+        // proof the write left repos_dir. git clone removes the destination it
+        // fails on but leaves the parent it created, so assert on both.
+        let outside = TempDir::new().unwrap();
+        let escape_dir = outside.path().join("nest");
+        let slug = format!("a/{}/escape", escape_dir.display());
+        let escape_target = escape_dir.join("escape.git");
+
+        // Serve the composed URL for real, so a run without the guard genuinely
+        // clones outside the root rather than merely failing at git.
+        let rel = format!("a{}/escape", escape_dir.display());
+        let (_remote, peer_url) = rooted_remote(&[&rel]);
+
+        let did = "did:key:z6MkAttacker";
+        seed_local_peer(&pool, did, &peer_url).await;
+        enqueue(&state.db, &slug, did).await;
+
+        run_batch(&state, &repos_dir).await;
+
+        assert!(
+            !escape_target.exists(),
+            "mirror written outside repos_dir at {}",
+            escape_target.display()
+        );
+        assert!(
+            !escape_dir.exists(),
+            "parent directory created outside repos_dir at {}",
+            escape_dir.display()
+        );
+        assert_eq!(sync_status(&pool, &slug).await, "failed");
+        assert!(
+            dir_entries(&repos_dir).is_empty(),
+            "repos_dir must stay empty"
+        );
+    }
+
+    #[sqlx::test]
+    async fn process_batch_rejects_malformed_slugs(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        // Every slug's composed remote URL is served as a real bare repo, so a
+        // run without the guard actually writes the mirror instead of dying at
+        // git. `demo` has no separator and is caught by the pre-existing arm.
+        let slugs = ["../hello", "./hello", "../../etc/evil", "a/../../x", "demo"];
+        let (_remote, peer_url) = rooted_remote(&slugs);
+
+        let did = "did:key:z6MkAttacker";
+        seed_local_peer(&pool, did, &peer_url).await;
+        for slug in slugs {
+            enqueue(&state.db, slug, did).await;
+        }
+
+        run_batch(&state, &repos_dir).await;
+
+        for slug in slugs {
+            assert_eq!(sync_status(&pool, slug).await, "failed", "slug {slug}");
+        }
+        // `./hello` lands inside repos_dir; the other three land beside it.
+        assert!(
+            dir_entries(&repos_dir).is_empty(),
+            "repos_dir must stay empty"
+        );
+        assert_eq!(dir_entries(home.path()), vec!["repos".to_string()]);
+    }
+
+    #[sqlx::test]
+    async fn process_batch_still_fails_row_without_a_peer(pool: PgPool) {
+        // The pre-existing no-peer arm still fires first. Without a peer row a
+        // slug test would be green before the guard exists and prove nothing.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        enqueue(&state.db, "z6Mkfoo/hello", "did:key:z6MkNoPeer").await;
+
+        run_batch(&state, &repos_dir).await;
+
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "failed");
+        assert!(dir_entries(&repos_dir).is_empty());
+    }
+
+    #[sqlx::test]
+    async fn process_batch_mirrors_a_valid_slug(pool: PgPool) {
+        // Must-not-break, and the control that keeps the rejection tests above
+        // from passing vacuously: this harness can mirror successfully.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkOrigin";
+        seed_local_peer(&pool, did, &peer_url).await;
+        enqueue(&state.db, "z6Mkfoo/hello", did).await;
+
+        run_batch(&state, &repos_dir).await;
+
+        let mirror = repos_dir.join("z6Mkfoo").join("hello.git");
+        assert!(mirror.is_dir(), "mirror missing at {}", mirror.display());
+        assert!(object_count(&mirror) > 0, "mirror has no objects");
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
+
+        let disk: (String,) = sqlx::query_as("SELECT disk_path FROM repos WHERE id = $1")
+            .bind("z6Mkfoo/hello")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(disk.0, mirror.to_str().unwrap());
+    }
+
+    #[sqlx::test]
+    async fn process_batch_does_not_repick_a_failed_row(pool: PgPool) {
+        // `mark_sync_failed` is terminal: `dequeue_pending_syncs` selects only
+        // pending rows, so a rejected slug never becomes a poison item.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        let (_remote, peer_url) = rooted_remote(&["../hello"]);
+        let did = "did:key:z6MkAttacker";
+        seed_local_peer(&pool, did, &peer_url).await;
+        enqueue(&state.db, "../hello", did).await;
+
+        run_batch(&state, &repos_dir).await;
+        assert_eq!(sync_status(&pool, "../hello").await, "failed");
+        assert!(state.db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+
+        run_batch(&state, &repos_dir).await;
+        assert_eq!(sync_status(&pool, "../hello").await, "failed");
+        assert_eq!(dir_entries(home.path()), vec!["repos".to_string()]);
     }
 }
