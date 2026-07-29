@@ -279,8 +279,15 @@ async fn main() -> Result<()> {
         None
     };
 
-    let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
+    // Advisory-lock connections come from their own pool: a write guard pins one
+    // for its whole lifetime, and sharing the application pool would let a push
+    // burst starve ordinary request handlers.
+    let lock_pool = db::Db::lock_pool(
+        &config.database_url,
+        config.db_lock_pool_max_connections,
+        std::time::Duration::from_secs(config.db_acquire_timeout_secs),
+    )?;
+    let repo_store = git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, lock_pool);
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.

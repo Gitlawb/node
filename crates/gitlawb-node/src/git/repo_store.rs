@@ -25,8 +25,12 @@ use super::tigris::TigrisClient;
 pub struct RepoStore {
     repos_dir: PathBuf,
     tigris: Option<TigrisClient>,
-    /// Shared Postgres pool for advisory locks.
-    pool: PgPool,
+    /// Dedicated Postgres pool that advisory-lock connections come from, kept
+    /// separate from the pool serving ordinary request handlers. Each write guard
+    /// pins one connection here for its whole lifetime, so a push burst consumes
+    /// this pool rather than starving application queries. Sized by
+    /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS`.
+    lock_pool: PgPool,
     /// Tracks repos already confirmed to exist in Tigris — avoids redundant
     /// HEAD checks and background uploads for repos we've already migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
@@ -34,20 +38,20 @@ pub struct RepoStore {
 
 impl RepoStore {
     #[cfg(test)]
-    pub fn for_testing(repos_dir: PathBuf, pool: PgPool) -> Self {
+    pub fn for_testing(repos_dir: PathBuf, lock_pool: PgPool) -> Self {
         Self {
             repos_dir,
             tigris: None,
-            pool,
+            lock_pool,
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
-    pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, pool: PgPool) -> Self {
+    pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, lock_pool: PgPool) -> Self {
         Self {
             repos_dir,
             tigris,
-            pool,
+            lock_pool,
             migrated: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -157,26 +161,54 @@ impl RepoStore {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
 
-        // Acquire Postgres advisory lock with retry using pg_try_advisory_lock
-        // to avoid blocking indefinitely on stale locks from crashed connections.
-        let mut acquired = false;
+        // Take the lock on a connection this guard will own for its whole
+        // lifetime, so the release runs on the same session. `pg_try_advisory_lock`
+        // with retry rather than a blocking acquire, so a stale lock from a crashed
+        // connection cannot wedge us indefinitely.
+        //
+        // Each attempt checks a connection out and, on failure, returns it BEFORE
+        // sleeping: a writer spinning on a contended repo must not pin a lock-pool
+        // slot through its backoff, or a handful of spinners would starve the pool
+        // for everyone else.
+        //
+        // Pool exhaustion is a DIFFERENT condition from "someone else holds the
+        // lock" and is not retried here. Retrying it would burn all 60 attempts
+        // against a pool that is full for reasons unrelated to this repo, and would
+        // report a capacity problem as lock contention. It surfaces immediately with
+        // its own message instead.
+        let mut lock_conn = None;
         for attempt in 0..60 {
-            let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-                .bind(lock_key)
-                .fetch_one(&self.pool)
+            let conn = self
+                .lock_pool
+                .acquire()
                 .await
-                .context("trying advisory lock")?;
-            if row.0 {
-                acquired = true;
+                .context("advisory-lock pool exhausted or unreachable")?;
+            let mut probe = LockProbe::new(conn);
+            if probe.try_lock(lock_key).await? {
+                lock_conn = probe.take_conn();
                 break;
             }
+            // Not acquired, and nothing is locked, so hand the connection back
+            // before the backoff rather than holding a slot while idle.
+            drop(probe);
             if attempt < 59 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         }
-        if !acquired {
-            anyhow::bail!("could not acquire advisory lock after 60s — possible stale lock for {owner_slug}/{repo_name}");
-        }
+        let Some(lock_conn) = lock_conn else {
+            anyhow::bail!("could not acquire advisory lock after 60 attempts — possible stale lock for {owner_slug}/{repo_name}");
+        };
+        // From here the lock is HELD. Any early return must not simply drop the
+        // connection back into the pool, so it is handed to the guard immediately
+        // below and every exit after this point goes through the guard.
+        let mut guard = RepoWriteGuard {
+            owner_slug: owner_slug.clone(),
+            repo_name: repo_name.to_string(),
+            local_path: local_path.clone(),
+            lock_key,
+            conn: Some(lock_conn),
+            tigris: self.tigris.clone(),
+        };
 
         // Always download the latest from Tigris before writing.
         // Local disk may be stale if another machine pushed since our last access.
@@ -197,14 +229,9 @@ impl RepoStore {
             }
         }
 
-        Ok(RepoWriteGuard {
-            owner_slug,
-            repo_name: repo_name.to_string(),
-            local_path,
-            lock_key,
-            pool: self.pool.clone(),
-            tigris: self.tigris.clone(),
-        })
+        // Silence the unused-mut lint until U6 needs the binding mutable.
+        let _ = &mut guard;
+        Ok(guard)
     }
 
     /// Initialize a new bare repo on local disk and upload to Tigris.
@@ -484,14 +511,10 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 /// rather than being set up front and cleared on success; "disarming" is
 /// `Option::take`, which is what `take_conn` does once an acquire is observed.
 /// This is the only place that issues `pg_try_advisory_lock`.
-// No production caller until U3 wires this into `acquire_write`; the attribute
-// comes off in that unit.
-#[allow(dead_code)]
 struct LockProbe {
     conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
 }
 
-#[allow(dead_code)] // ditto: U3 removes this with the wiring
 impl LockProbe {
     fn new(conn: sqlx::pool::PoolConnection<sqlx::Postgres>) -> Self {
         Self { conn: Some(conn) }
@@ -543,7 +566,11 @@ pub struct RepoWriteGuard {
     repo_name: String,
     pub local_path: PathBuf,
     lock_key: i64,
-    pool: PgPool,
+    /// The connection that TOOK the lock. Postgres advisory locks are
+    /// session-scoped, so only this session can release it; holding it here is
+    /// what makes `release` land on the right backend instead of an arbitrary
+    /// pooled one.
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
     tigris: Option<TigrisClient>,
 }
 
@@ -558,7 +585,7 @@ impl RepoWriteGuard {
     /// half-applied or otherwise inconsistent repo would propagate corruption to
     /// Tigris (and to every node that later downloads it). The lock is always
     /// released regardless, to avoid stale locks blocking future writes.
-    pub async fn release(self, success: bool) {
+    pub async fn release(mut self, success: bool) {
         // Upload to Tigris only on success.
         if success {
             if let Some(ref tigris) = self.tigris {
@@ -573,11 +600,15 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
-        // Release advisory lock
-        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(self.lock_key)
-            .execute(&self.pool)
-            .await;
+        // Release the advisory lock on the SAME session that took it, then let the
+        // connection return to the pool. Unlocking through the pool would land on an
+        // arbitrary backend, where the call is a silent no-op.
+        if let Some(mut conn) = self.conn.take() {
+            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(self.lock_key)
+                .execute(&mut *conn)
+                .await;
+        }
     }
 }
 
@@ -1143,5 +1174,77 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(still.0, 1, "the original holder must still own the key");
+    }
+
+    // ── U3: the #279 acceptance tests ──────────────────────────────────────
+
+    /// The store under test. Pre-U3 this ignores `opts` and shares the app pool,
+    /// which is exactly the broken shape; the wiring change swaps in a dedicated
+    /// no-reap lock pool without touching a single test body below.
+    async fn write_store(pool: &PgPool, opts: &sqlx::postgres::PgConnectOptions) -> RepoStore {
+        let _ = pool;
+        RepoStore::for_testing(
+            PathBuf::from("/tmp/gitlawb-u3"),
+            no_reap_pool(opts, 8).await,
+        )
+    }
+
+    fn advisory_locks_held(key: i64) -> String {
+        format!(
+            "SELECT count(*) FROM pg_locks WHERE locktype='advisory' \
+             AND ((classid::bigint<<32)|objid::bigint) = {key}"
+        )
+    }
+
+    /// ACCEPTANCE 1 (#279): two writers on one node and the same repo must not
+    /// both hold the lock. On the pre-fix shape the second acquire succeeds
+    /// because the pool hands it the very session holding the lock, where
+    /// pg_try_advisory_lock is reentrant.
+    #[sqlx::test]
+    async fn two_writers_on_the_same_repo_are_not_both_admitted(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let store = write_store(&pool, &opts).await;
+
+        let _first = store
+            .acquire_write("did:key:z6MkU3Excl", "same-repo")
+            .await
+            .expect("first writer acquires");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            store.acquire_write("did:key:z6MkU3Excl", "same-repo"),
+        )
+        .await;
+
+        assert!(
+            second.is_err(),
+            "second writer must NOT be admitted while the first holds the guard \
+             (it should still be retrying when the deadline hits)"
+        );
+    }
+
+    /// ACCEPTANCE 2 (#279): a completed write leaves no advisory lock behind.
+    /// On the pre-fix shape the unlock runs on a different pooled session and
+    /// returns false, so the lock leaks on essentially every write.
+    #[sqlx::test]
+    async fn completed_write_releases_its_advisory_lock(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let store = write_store(&pool, &opts).await;
+
+        let guard = store
+            .acquire_write("did:key:z6MkU3Rel", "leak-check")
+            .await
+            .expect("acquire");
+        guard.release(true).await;
+
+        let key = advisory_lock_key("did_key_z6MkU3Rel", "leak-check");
+        let held: (i64,) = sqlx::query_as(&advisory_locks_held(key))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            held.0, 0,
+            "a completed write must leave zero advisory locks for its key"
+        );
     }
 }
