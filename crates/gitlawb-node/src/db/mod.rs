@@ -2089,10 +2089,40 @@ impl Db {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
         }
         let now = Utc::now().to_rfc3339();
+        // A changed URL drops the reachability gate, so a repointed peer does
+        // not inherit a probe the previous host earned. In the DO UPDATE branch
+        // `peers.http_url` is the existing pre-update row (the proposed value is
+        // $2), and the comparison runs under the conflict row lock, so
+        // concurrent announces for one DID serialize instead of racing a
+        // read-then-write.
+        //
+        // Comparison is exact. http_url is stored as announced, so a cosmetic
+        // difference such as a trailing slash also clears the flag; the peer
+        // re-earns it on the next gossip round. Normalizing instead would mean
+        // canonicalizing the stored value, this comparison, and the existing
+        // trim_end_matches call sites.
+        //
+        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
+        // clear it by announcing a different URL, and until #248 lands can also
+        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
+        // writes mark_peer_ping from the stored URL's own probe response. Do not
+        // build a new consumer on this flag as if it were attacker-resistant.
+        //
+        // Four other http_url consumers never read the flag at all (sync.rs's
+        // origin resolve, the post-receive notify fan-out, trigger_sync, and the
+        // public resolve route), so this bounds the automatic inheritance rather
+        // than closing the rewrite. Binding a DID to its first-seen announcing
+        // key is what closes it: #273.
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
              VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET http_url = $2, last_seen = $3",
+             ON CONFLICT(did) DO UPDATE SET
+               http_url = $2,
+               last_seen = $3,
+               last_ping_ok = CASE
+                 WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
+                 ELSE peers.last_ping_ok
+               END",
         )
         .bind(did)
         .bind(http_url)
