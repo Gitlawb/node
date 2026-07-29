@@ -697,14 +697,47 @@ impl RepoWriteGuard {
             warn!(repo = %self.repo_name, "write failed — skipping tigris upload to avoid propagating an inconsistent repo");
         }
 
-        // Release the advisory lock on the SAME session that took it, then let the
-        // connection return to the pool. Unlocking through the pool would land on an
-        // arbitrary backend, where the call is a silent no-op.
-        if let Some(mut conn) = self.conn.take() {
-            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                .bind(self.lock_key)
-                .execute(&mut *conn)
-                .await;
+        // Release the advisory lock on the SAME session that took it. Unlocking
+        // through the pool would land on an arbitrary backend, where the call is a
+        // silent no-op.
+        //
+        // Read the boolean. `pg_advisory_unlock` reports "you did not hold this
+        // lock" as a false RETURN VALUE plus a server WARNING, never an error, so a
+        // discarded result cannot distinguish a real release from a no-op. A false
+        // here means this session's lock state is not what we believe it is, so the
+        // connection is left in `self.conn` for `Drop` to close rather than being
+        // handed back to the pool as clean. Only a confirmed unlock returns it.
+        let lock_key = self.lock_key;
+        let unlock = match self.conn.as_mut() {
+            Some(conn) => Some(
+                sqlx::query_as::<_, (bool,)>("SELECT pg_advisory_unlock($1)")
+                    .bind(lock_key)
+                    .fetch_one(&mut **conn)
+                    .await,
+            ),
+            None => None,
+        };
+        match unlock {
+            Some(Ok((true,))) => {
+                // Confirmed released: safe to return to the pool.
+                self.conn.take();
+            }
+            Some(Ok((false,))) => {
+                warn!(
+                    repo = %self.repo_name,
+                    lock_key,
+                    "advisory unlock reported the session did not hold this lock — closing the session instead of pooling it"
+                );
+            }
+            Some(Err(e)) => {
+                warn!(
+                    repo = %self.repo_name,
+                    lock_key,
+                    err = %e,
+                    "advisory unlock failed — closing the session so the lock cannot outlive it"
+                );
+            }
+            None => {}
         }
     }
 }
@@ -2128,5 +2161,58 @@ mod tests {
         // Shut the runtime down first, then drop the guard with no runtime alive.
         drop(rt);
         drop(guard);
+    }
+
+    // ── U5: the unlock's boolean result must be observed ────────────────────
+
+    /// `pg_advisory_unlock` reports "you did not hold this lock" as a `false`
+    /// RETURN VALUE plus a server WARNING, never an error, so a discarded result
+    /// cannot tell a real release from a no-op. A session that did not hold the
+    /// key must not be returned to the pool as if it were clean.
+    ///
+    /// The observable is the backend pid: on a one-connection pool, a session that
+    /// was closed forces the next acquire onto a fresh backend, while one returned
+    /// normally is handed straight back.
+    #[sqlx::test]
+    async fn release_that_did_not_hold_the_lock_closes_the_session(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 1).await;
+
+        let pid_before = {
+            let mut c = lock_pool.acquire().await.unwrap();
+            let pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+                .fetch_one(&mut *c)
+                .await
+                .unwrap();
+            pid.0
+        };
+
+        // A guard whose key was never locked: release()'s unlock returns false.
+        let guard = RepoWriteGuard {
+            owner_slug: "did_key_z6MkU5".to_string(),
+            repo_name: "never-locked".to_string(),
+            local_path: PathBuf::from("/tmp/gitlawb-u5"),
+            lock_key: 995_001,
+            conn: Some(lock_pool.acquire().await.unwrap()),
+            tigris: None,
+        };
+        guard.release(true).await;
+
+        // Give the spawned close a moment, then see which backend we land on.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let pid_after = {
+            let mut c = lock_pool.acquire().await.unwrap();
+            let pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+                .fetch_one(&mut *c)
+                .await
+                .unwrap();
+            pid.0
+        };
+
+        assert_ne!(
+            pid_before, pid_after,
+            "an unlock that returned false means the session's lock state is not \
+             what we think it is; that connection must be closed, not pooled"
+        );
     }
 }
