@@ -1823,6 +1823,34 @@ pub async fn git_receive_pack(
         app
     })?;
 
+    // #174 F2/U5: the post-receive replication tail runs in an independently owned
+    // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
+    // resolution), so leaving it in the request future means a client/proxy disconnect
+    // while parked silently drops this push's pins, recovery copy, and announcements.
+    //
+    // Spawned HERE, at the durability boundary, rather than at the end of the handler.
+    // This is the first point where the push is known to have landed: `guard.release()`
+    // above runs on failure too, so anchoring on it would spawn a tail that pins and
+    // announces a half-applied repo — the state release() deliberately refuses to
+    // upload, and one a hostile pusher can produce on demand by aborting a pack
+    // mid-transfer. Everything below (touch_repo, metrics, trust score, certificates,
+    // webhooks) stays in the cancellable handler, so a disconnect during that window no
+    // longer takes the tail with it.
+    //
+    // The tail now runs CONCURRENTLY with certificate issuance rather than after it, so
+    // a ref can be announced before its signed certificate exists. That window is
+    // accepted: cert issuance already fails open (errors are logged and skipped) and the
+    // gossip event carries `cert_id: None` regardless, so no announce consumer reads a
+    // certificate out of it. Each push owns its own tail, including its own
+    // always-spawned announce, so per-push announcements are never coalesced away.
+    tokio::spawn(post_receive_replication_tail(
+        state.clone(),
+        record.clone(),
+        ref_updates.clone(),
+        disk_path.clone(),
+        auth.0.to_string(),
+    ));
+
     // Update the repo's updated_at timestamp after a successful push
     let _ = state.db.touch_repo(&record.id).await;
 
@@ -1911,24 +1939,6 @@ pub async fn git_receive_pack(
             );
         }
     }
-
-    // #174 F2: move the whole post-receive replication tail into an independently owned
-    // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
-    // resolution), so leaving it in the request future means a client/proxy disconnect
-    // while parked silently drops this push's pins, recovery copy, and announcements —
-    // the residual `state.rs` documented, because the durable `try_begin` gate sat after
-    // the park. The request future now returns the git response immediately and the tail
-    // runs detached; a disconnect can no longer drop it. Each push owns its own tail,
-    // including its own always-spawned announce, so per-push announcements are never
-    // coalesced away (the announce spawn stays out of the per-repo encrypt coalescing).
-    let did = did.to_string();
-    tokio::spawn(post_receive_replication_tail(
-        state,
-        record,
-        ref_updates,
-        disk_path,
-        did,
-    ));
 
     Ok(result)
 }
@@ -2638,6 +2648,10 @@ pub async fn get_icaptcha_proof(
 
 // ── Pkt-line parsing ──────────────────────────────────────────────────────
 
+/// `Clone` so `git_receive_pack` can hand the parsed updates to the detached
+/// replication tail at the durability boundary while the certificate and webhook
+/// loops below still iterate their own copy (#174 U5).
+#[derive(Clone)]
 struct RefUpdate {
     old_sha: String,
     new_sha: String,

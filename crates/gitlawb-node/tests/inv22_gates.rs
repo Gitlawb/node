@@ -413,3 +413,59 @@ fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
          give any new blocking walk its own Arc::clone(&admission) and update this gate"
     );
 }
+
+/// #174 U5: the post-receive replication tail is spawned at the DURABILITY BOUNDARY,
+/// not at the end of the handler.
+///
+/// The tail owes this push its pins, recovery copy, and announcements. Spawned below
+/// the certificate and webhook work, a client disconnect anywhere in that window took
+/// the tail with it. Spawned above it, the tail is already detached and survives.
+///
+/// The lower bound matters just as much as the upper one: `guard.release()` runs on
+/// failure too, so a spawn anchored there would fire for a push git rejected, pinning
+/// and announcing a half-applied repo. The `?` on `receive_result` is the first point
+/// where the push is known to have landed, which is why the spawn must sit between
+/// that `?` and `touch_repo`.
+///
+/// This is an ordering check rather than a cancellation-race test on purpose: forcing
+/// a disconnect to land inside the cert/webhook window is timing-dependent and would
+/// be flaky, while the ordering is exactly what the fix changes. Same instrument the
+/// F3 gate above uses.
+///
+/// MUTATION (RED): move the `tokio::spawn(post_receive_replication_tail` call back
+/// below the webhook block and the ordering assertion fails; move it above the `?`
+/// and the failed-push assertion fails.
+#[test]
+fn inv22_replication_tail_spawns_at_the_durability_boundary() {
+    let repos = src("api/repos.rs");
+    // Production half only — the tests below name these identifiers too.
+    let production = repos
+        .split("#[cfg(test)]")
+        .next()
+        .expect("split always yields a first chunk");
+
+    let receive_ok = production
+        .find("let result = receive_result.map_err(")
+        .expect("U5 gate stale: git_receive_pack no longer maps receive_result with ?");
+    let spawn = production
+        .find("tokio::spawn(post_receive_replication_tail(")
+        .expect("U5 gate missing: the replication tail must be spawned by git_receive_pack");
+    let touch = production
+        .find("state.db.touch_repo(")
+        .expect("U5 gate stale: git_receive_pack no longer calls touch_repo");
+    let webhook = production
+        .find("webhooks::fire_event(")
+        .expect("U5 gate stale: git_receive_pack no longer fires push webhooks");
+
+    assert!(
+        receive_ok < spawn,
+        "U5 gate bypassed: the tail must be spawned AFTER the receive_result `?`, or a \
+         rejected push spawns a tail that pins and announces a half-applied repo"
+    );
+    assert!(
+        spawn < touch && spawn < webhook,
+        "U5 gate bypassed: the tail must be spawned BEFORE touch_repo and the webhook \
+         fan-out, so a disconnect in that window cannot drop this push's pins, \
+         recovery copy, and announcements"
+    );
+}
