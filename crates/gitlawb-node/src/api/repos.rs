@@ -8709,6 +8709,19 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+
+        // Not asserted here: that the same disconnect leaves the session advisory
+        // lock free. A handler-level "the next acquire_write succeeds" probe does not
+        // discriminate. It still passes with the `Drop` backstop disabled, because the
+        // guard's `PoolConnection` goes back to the pool when this future is dropped
+        // and `#[sqlx::test]` builds the pool with `idle_timeout(1s)`, so the session
+        // ends on its own a beat later and postgres frees the lock with no help from
+        // the code under test. Measured with the backstop disabled: held at the drop,
+        // free ~2s later, observed from a session outside the pool. `acquire_write`
+        // retries for far longer than that, so it waits the release out and reports
+        // success either way. `write_guard_release_cancelled_mid_unlock_frees_the_lock`
+        // is the real proof: it probes from a connection held OUT of the pool, 400ms
+        // after the drop, which is inside that window rather than past it.
     }
 
     /// The must-not direction of the same reorder. Moving the spawn above
