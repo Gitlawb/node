@@ -544,6 +544,70 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Owns a lock-pool connection across an in-flight `pg_try_advisory_lock`.
+///
+/// A cancelled `.await` does not cancel an already-sent SQL statement, so a
+/// try-lock whose future is dropped still takes the lock server-side while the
+/// caller abandons the result. Protection therefore has to exist *before* the
+/// statement goes out, which is what this type is: its `Drop` closes any
+/// connection still held, ending the session so Postgres frees the lock.
+///
+/// `close_on_drop()` is a one-way setter, so the arming lives here in `Drop`
+/// rather than being set up front and cleared on success; "disarming" is
+/// `Option::take`, which is what `take_conn` does once an acquire is observed.
+/// This is the only place that issues `pg_try_advisory_lock`.
+// No production caller until U3 wires this into `acquire_write`; the attribute
+// comes off in that unit.
+#[allow(dead_code)]
+struct LockProbe {
+    conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+}
+
+#[allow(dead_code)] // ditto: U3 removes this with the wiring
+impl LockProbe {
+    fn new(conn: sqlx::pool::PoolConnection<sqlx::Postgres>) -> Self {
+        Self { conn: Some(conn) }
+    }
+
+    /// Send the try-lock on the owned connection.
+    async fn try_lock(&mut self, key: i64) -> Result<bool> {
+        let conn = self
+            .conn
+            .as_mut()
+            .context("LockProbe::try_lock after the connection was taken")?;
+        let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut **conn)
+            .await
+            .context("trying advisory lock")?;
+        Ok(row.0)
+    }
+
+    /// Hand the lock-owning connection out, leaving `Drop` with nothing to close.
+    /// Only call this after `try_lock` returned true.
+    ///
+    /// Named `take_` rather than `into_` deliberately: clippy expects an `into_*`
+    /// method to consume `self`, which a type implementing `Drop` cannot do
+    /// without tripping E0509.
+    fn take_conn(&mut self) -> Option<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+        self.conn.take()
+    }
+}
+
+impl Drop for LockProbe {
+    fn drop(&mut self) {
+        if let Some(mut conn) = self.conn.take() {
+            // Still holding the connection here means the try-lock's future was
+            // dropped before `take_conn` ran, so the statement may well have
+            // completed server-side and taken the lock with nobody left to
+            // release it. Close the connection instead of returning it to the
+            // pool: ending the session is what makes Postgres free the lock.
+            warn!("advisory-lock probe dropped before handing off its connection — closing the session to free the lock");
+            conn.close_on_drop();
+        }
+    }
+}
+
 /// Guard returned by `acquire_write()`. Holds the Postgres advisory lock and
 /// uploads to Tigris + releases the lock on `release()`.
 pub struct RepoWriteGuard {
@@ -1839,5 +1903,151 @@ mod tests {
             .bind(key)
             .execute(&mut *checker)
             .await;
+    // ── U1: cancellation-safe lock probe ───────────────────────────────────
+
+    /// A pool with every reaping path disabled, so a leaked lock persists through
+    /// the observation window instead of being freed by ambient recycling.
+    async fn no_reap_pool(opts: &sqlx::postgres::PgConnectOptions, max: u32) -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .min_connections(0)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .test_before_acquire(false)
+            .connect_with(opts.clone())
+            .await
+            .expect("no-reap pool")
+    }
+
+    /// Poll a STANDALONE connection until the key is free, or the deadline passes.
+    ///
+    /// Standalone, never from the pool under test: pool reuse would hand the
+    /// observer the lock-holding session itself, where `pg_try_advisory_lock`
+    /// succeeds reentrantly and hides the very leak being measured. Polling rather
+    /// than asserting once because `PoolConnection::drop` spawns the close.
+    async fn poll_until_free(
+        opts: &sqlx::postgres::PgConnectOptions,
+        key: i64,
+        deadline: std::time::Duration,
+    ) -> bool {
+        use sqlx::Connection;
+        let start = std::time::Instant::now();
+        let mut observer = sqlx::PgConnection::connect_with(opts)
+            .await
+            .expect("standalone observer connection");
+        while start.elapsed() < deadline {
+            let got: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+                .bind(key)
+                .fetch_one(&mut observer)
+                .await
+                .expect("observer try-lock");
+            if got.0 {
+                let _: (bool,) = sqlx::query_as("SELECT pg_advisory_unlock($1)")
+                    .bind(key)
+                    .fetch_one(&mut observer)
+                    .await
+                    .expect("observer unlock");
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// THE COMMITTED GATE for the cancellation window (U1).
+    ///
+    /// Dropping the probe without taking its connection is exactly the state a
+    /// cancellation between the try-lock's send and the guard's construction
+    /// leaves behind. Deterministic on purpose: the timing sweep that first found
+    /// this window leaks about 1 in 600, which is not a signal a CI gate can rest
+    /// on. That sweep stays a local repro.
+    #[sqlx::test]
+    async fn lock_probe_dropped_without_taking_frees_the_lock(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 4).await;
+        let key: i64 = 990_001;
+
+        {
+            let mut probe = LockProbe::new(lock_pool.acquire().await.unwrap());
+            assert!(
+                probe.try_lock(key).await.unwrap(),
+                "probe should take a free key"
+            );
+            // dropped here WITHOUT take_conn(): the cancellation shape
+        }
+
+        assert!(
+            poll_until_free(&opts, key, std::time::Duration::from_secs(10)).await,
+            "lock must be freed after a probe is dropped without taking its connection"
+        );
+    }
+
+    /// Must-not: a successful acquire hands the connection out intact, so the
+    /// normal path does not pay a reconnect per write.
+    #[sqlx::test]
+    async fn lock_probe_take_conn_yields_a_usable_connection(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 4).await;
+        let key: i64 = 990_002;
+
+        let mut probe = LockProbe::new(lock_pool.acquire().await.unwrap());
+        assert!(probe.try_lock(key).await.unwrap());
+        let mut conn = probe
+            .take_conn()
+            .expect("connection after a successful acquire");
+        drop(probe);
+
+        let one: (i32,) = sqlx::query_as("SELECT 1")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("handed-out connection must still be usable");
+        assert_eq!(one.0, 1);
+
+        let released: (bool,) = sqlx::query_as("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(released.0, "the handed-out connection still owns the lock");
+    }
+
+    /// Must-not: a failed probe returns its connection without closing it. Nothing
+    /// was locked, so closing would be pure churn, and closing on every failed
+    /// probe would make a 60-attempt spinner tear down 60 backends.
+    #[sqlx::test]
+    async fn lock_probe_failed_acquire_does_not_hold_anything(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 4).await;
+        let key: i64 = 990_003;
+
+        // a standalone holder takes the key first
+        use sqlx::Connection;
+        let mut holder = sqlx::PgConnection::connect_with(&opts).await.unwrap();
+        let held: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut holder)
+            .await
+            .unwrap();
+        assert!(held.0);
+
+        {
+            let mut probe = LockProbe::new(lock_pool.acquire().await.unwrap());
+            assert!(
+                !probe.try_lock(key).await.unwrap(),
+                "probe must observe false for a key held elsewhere"
+            );
+        }
+
+        // the holder still owns it: the failed probe neither took nor released it
+        let still: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM pg_locks WHERE locktype='advisory' \
+             AND ((classid::bigint<<32)|objid::bigint) = $1",
+        )
+        .bind(key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still.0, 1, "the original holder must still own the key");
     }
 }
