@@ -883,8 +883,16 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
+    // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
+    // The runner keys the applied set on the integer alone, so a version another
+    // in-flight branch also claims is skipped in full on whichever side merges
+    // second — no error, no warning, and schema_migrations still reads healthy
+    // while the column is simply absent. Two open branches already claim into
+    // this range: #135/#173 holds through 14 (15 once it rebases past v11), and
+    // #253 took 16. 17 clears both. Gaps are harmless: the runner iterates the
+    // array and never requires contiguity.
     Migration {
-        version: 12,
+        version: 17,
         name: "sync_queue_attempted_at",
         stmts: &[
             // Scheduling key for dequeue_pending_syncs: when the row was last
@@ -3698,7 +3706,7 @@ mod migration_tests {
         db.migrate().await.unwrap();
     }
 
-    // ── sync_queue scheduling (attempted_at, v12) ────────────────────────────
+    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
 
     async fn enqueue_one(db: &super::Db, repo: &str) {
         db.enqueue_sync(
@@ -3721,7 +3729,7 @@ mod migration_tests {
     }
 
     /// Upgrade-path test: simulate a node already at v11 and let the real
-    /// migration entry point apply v12, rather than hand-copying its SQL.
+    /// migration entry point apply v17, rather than hand-copying its SQL.
     ///
     /// This is the test that catches the column being added to the v1
     /// statement array instead of a new migration. v1 never re-runs on an
@@ -3729,7 +3737,7 @@ mod migration_tests {
     /// while staying invisible to every other test here, since `#[sqlx::test]`
     /// hands out a fresh database that runs the whole chain.
     #[sqlx::test]
-    async fn migration_v12_adds_sync_queue_attempted_at(pool: sqlx::PgPool) {
+    async fn migration_v17_adds_sync_queue_attempted_at(pool: sqlx::PgPool) {
         let db = super::Db::for_testing(pool);
         db.migrate().await.unwrap();
 
@@ -3738,7 +3746,7 @@ mod migration_tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 12")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 17")
             .execute(&db.pool)
             .await
             .unwrap();
@@ -3760,11 +3768,11 @@ mod migration_tests {
         assert_eq!(col.1, "YES", "attempted_at must be nullable");
 
         let recorded: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 12")
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 17")
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-        assert_eq!(recorded.0, 1, "v12 must be recorded as applied");
+        assert_eq!(recorded.0, 1, "v17 must be recorded as applied");
 
         // The pre-existing row survives with a null key and is still dequeued.
         assert_eq!(attempted_at_of(&db, "z6Mkfoo/legacy").await, None);
