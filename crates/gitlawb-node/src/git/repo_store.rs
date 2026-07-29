@@ -11,6 +11,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
@@ -31,6 +32,8 @@ pub struct RepoStore {
     /// this pool rather than starving application queries. Sized by
     /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS`.
     lock_pool: PgPool,
+    /// Bound on any object-storage transfer that runs while the lock is HELD.
+    lock_held_transfer_timeout: Duration,
     /// Tracks repos already confirmed to exist in Tigris — avoids redundant
     /// HEAD checks and background uploads for repos we've already migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
@@ -43,15 +46,22 @@ impl RepoStore {
             repos_dir,
             tigris: None,
             lock_pool,
+            lock_held_transfer_timeout: Duration::from_secs(300),
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
-    pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, lock_pool: PgPool) -> Self {
+    pub fn new(
+        repos_dir: PathBuf,
+        tigris: Option<TigrisClient>,
+        lock_pool: PgPool,
+        lock_held_transfer_timeout: Duration,
+    ) -> Self {
         Self {
             repos_dir,
             tigris,
             lock_pool,
+            lock_held_transfer_timeout,
             migrated: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -208,6 +218,7 @@ impl RepoStore {
             lock_key,
             conn: Some(lock_conn),
             tigris: self.tigris.clone(),
+            lock_held_transfer_timeout: self.lock_held_transfer_timeout,
         };
 
         // Always download the latest from Tigris before writing.
@@ -215,7 +226,24 @@ impl RepoStore {
         if let Some(ref tigris) = self.tigris {
             if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
                 debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
+                // The lock is already HELD at this point and the guard owns a
+                // lock-pool slot, so this transfer is bounded: an unbounded stall
+                // here would hold both, and enough of them deny every write on the
+                // node. acquire_fresh's download is deliberately NOT bounded by
+                // this knob, because it runs before any lock is taken.
+                let downloaded = bounded_transfer(
+                    "acquire-download",
+                    repo_name,
+                    self.lock_held_transfer_timeout,
+                    tigris.download(&owner_slug, repo_name, &local_path),
+                )
+                .await
+                .unwrap_or_else(|| {
+                    Err(anyhow::anyhow!(
+                        "archive download exceeded the under-lock transfer bound"
+                    ))
+                });
+                if let Err(e) = downloaded {
                     // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
                     // Tigris archive must not block a write when a valid local copy
                     // exists — release(success) will re-upload a good archive.
@@ -572,6 +600,8 @@ pub struct RepoWriteGuard {
     /// pooled one.
     conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
     tigris: Option<TigrisClient>,
+    /// Bound on the release-side upload, which runs with the lock still held.
+    lock_held_transfer_timeout: Duration,
 }
 
 impl RepoWriteGuard {
@@ -605,11 +635,28 @@ impl RepoWriteGuard {
         // Upload to Tigris only on success.
         if success {
             if let Some(ref tigris) = self.tigris {
-                if let Err(e) = tigris
-                    .upload(&self.owner_slug, &self.repo_name, &self.local_path)
-                    .await
+                // Bounded for the same reason as the acquire-side download: this
+                // runs with the lock held and a lock-pool slot pinned.
+                match bounded_transfer(
+                    "release-upload",
+                    &self.repo_name,
+                    self.lock_held_transfer_timeout,
+                    tigris.upload(&self.owner_slug, &self.repo_name, &self.local_path),
+                )
+                .await
                 {
-                    warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+                    Some(Ok(())) => {}
+                    Some(Err(e)) => {
+                        warn!(repo = %self.repo_name, err = %e, "failed to upload repo to tigris after write");
+                    }
+                    None => {
+                        // Timed out is UNKNOWABLE, not failed: the PUT may well
+                        // have landed, so there is deliberately no compensating
+                        // action. The lock releases either way, so the repo is not
+                        // wedged behind a stalled transfer. The tradeoff is a narrow
+                        // last-writer-wins window if the slow PUT lands after
+                        // another writer takes the lock.
+                    }
                 }
             }
         } else {
@@ -691,6 +738,33 @@ impl Drop for RepoWriteGuard {
                 "write guard dropped with no runtime alive — leaking the connection handle so Drop cannot panic; the lock frees when the process exits"
             );
             std::mem::forget(conn);
+        }
+    }
+}
+
+/// Run a future under a wall-clock bound, returning `None` if it did not finish.
+///
+/// For the object-storage transfers that run while the per-repo advisory lock is
+/// held. Those were free before the lock's connection was pinned to the guard;
+/// now an unbounded transfer holds a lock-pool slot for as long as it stalls, and
+/// enough of them deny every write on the node.
+///
+/// A timed-out transfer is **unknowable**, not failed: it may well have landed.
+/// Callers must not compensate as though it definitely failed.
+async fn bounded_transfer<F, T>(label: &str, repo: &str, limit: Duration, fut: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::time::timeout(limit, fut).await {
+        Ok(v) => Some(v),
+        Err(_) => {
+            warn!(
+                repo = %repo,
+                transfer = label,
+                limit_secs = limit.as_secs(),
+                "object-storage transfer exceeded its under-lock bound — giving up so the advisory lock and its pool slot are not held longer"
+            );
+            None
         }
     }
 }
@@ -1069,7 +1143,12 @@ mod tests {
         // the pool or the network. Fabricate a pool reference via PgPool::connect_lazy
         // so we don't need a live DB.
         let pool = sqlx::PgPool::connect_lazy("postgres://invalid").unwrap();
-        RepoStore::new(PathBuf::from("/var/lib/gitlawb/repos"), None, pool)
+        RepoStore::new(
+            PathBuf::from("/var/lib/gitlawb/repos"),
+            None,
+            pool,
+            Duration::from_secs(300),
+        )
     }
 
     #[tokio::test]
@@ -1447,6 +1526,7 @@ mod tests {
             lock_key: 995_001,
             conn: Some(lock_pool.acquire().await.unwrap()),
             tigris: None,
+            lock_held_transfer_timeout: Duration::from_secs(300),
         };
         guard.release(true).await;
 
@@ -1465,6 +1545,40 @@ mod tests {
             pid_before, pid_after,
             "an unlock that returned false means the session's lock state is not \
              what we think it is; that connection must be closed, not pooled"
+        );
+    }
+
+    // ── U6: under-lock transfers are bounded ────────────────────────────────
+
+    /// The bound itself. Driving a real stalled transfer through `acquire_write`
+    /// would need either the object-store abstraction (out of scope here) or a
+    /// process-global `AWS_ENDPOINT_URL_S3` mutation, which would make the suite
+    /// order-dependent under the concurrent test runner. So this covers the
+    /// mechanism deterministically and the wiring is verified by reading, which is
+    /// recorded as a coverage gap rather than papered over.
+    #[tokio::test]
+    async fn bounded_transfer_gives_up_past_the_limit() {
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Ok::<(), anyhow::Error>(())
+        };
+        let out =
+            bounded_transfer("test", "repo", std::time::Duration::from_millis(50), slow).await;
+        assert!(
+            out.is_none(),
+            "a transfer past its limit must report None so the caller stops holding the lock"
+        );
+    }
+
+    /// Must-not: a transfer that finishes inside the limit is returned intact and
+    /// is not truncated by the bound.
+    #[tokio::test]
+    async fn bounded_transfer_passes_through_a_prompt_result() {
+        let quick = async { Ok::<u32, anyhow::Error>(7) };
+        let out = bounded_transfer("test", "repo", std::time::Duration::from_secs(30), quick).await;
+        assert!(
+            matches!(out, Some(Ok(7))),
+            "a prompt transfer must pass through untouched"
         );
     }
 }

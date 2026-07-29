@@ -213,6 +213,24 @@ pub struct Config {
     )]
     pub db_lock_pool_max_connections: u32,
 
+    /// Upper bound, in seconds, on any single object-storage transfer that runs
+    /// while the per-repo advisory lock is HELD.
+    ///
+    /// Two such transfers exist: the archive download in `acquire_write`, which
+    /// runs after the lock is taken and before the guard is constructed, and the
+    /// archive upload in `release`. Both used to be free, because the lock's
+    /// connection was returned to the pool immediately; now that a write guard
+    /// pins a lock-pool connection for its whole lifetime, an unbounded transfer
+    /// holds that slot, and enough stalled transfers deny every write on the node.
+    /// This is the bound that keeps a stall from becoming an outage.
+    #[arg(
+        long,
+        env = "GITLAWB_LOCK_HELD_TRANSFER_TIMEOUT_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub lock_held_transfer_timeout_secs: u64,
+
     /// Maximum time a request waits for a pool connection before failing with
     /// 503, in seconds. Bounds queueing when the database is slow or down.
     #[arg(
