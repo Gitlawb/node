@@ -869,17 +869,28 @@ async fn run_encrypt_pin_task(
     snapshot_rules: Option<Vec<crate::db::VisibilityRule>>,
     snapshot_is_public: bool,
 ) {
-    pin_and_encrypt_objects(&ctx, snapshot_objects, snapshot_rules, snapshot_is_public).await;
+    // The snapshot is this push's own work, resolved before spawn, so it belongs
+    // to the id captured at spawn.
+    pin_and_encrypt_objects(
+        &ctx,
+        &ctx.repo_id,
+        snapshot_objects,
+        snapshot_rules,
+        snapshot_is_public,
+    )
+    .await;
     let mut guard = guard;
     loop {
         match guard.finish_or_take_pending() {
             crate::state::FinishOutcome::Finished(_) => break,
             crate::state::FinishOutcome::Pending(g, pending) => {
                 guard = g;
-                if let Some((object_list, rules, is_public)) =
+                // `drain_repo_id`, not ctx.repo_id: see resolve_drain_object_list.
+                if let Some((drain_repo_id, object_list, rules, is_public)) =
                     resolve_drain_object_list(&ctx, pending).await
                 {
-                    pin_and_encrypt_objects(&ctx, object_list, rules, is_public).await;
+                    pin_and_encrypt_objects(&ctx, &drain_repo_id, object_list, rules, is_public)
+                        .await;
                 }
             }
         }
@@ -893,10 +904,19 @@ async fn run_encrypt_pin_task(
 /// re-read) pins nothing at all (`None`). Returns the filtered object list plus
 /// the fresh rules/is_public snapshot for the encrypt stage — the same
 /// resolution → withheld-filter pipeline the receive-pack tail runs.
+/// The returned `String` is the repo id the drain's encrypt/anchor writes must
+/// use: the id from the FRESH re-fetch, never `ctx.repo_id` frozen at task spawn.
+/// A delete+recreate under the same slug gives the row a new id, and metadata
+/// written against the dead id is invisible to readers on the live row (#174 U3).
 async fn resolve_drain_object_list(
     ctx: &EncryptTaskCtx,
     pending: crate::state::PendingWork,
-) -> Option<(Vec<String>, Option<Vec<crate::db::VisibilityRule>>, bool)> {
+) -> Option<(
+    String,
+    Vec<String>,
+    Option<Vec<crate::db::VisibilityRule>>,
+    bool,
+)> {
     let record = match ctx.db.get_repo(&ctx.owner_did, &ctx.repo_name).await {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -985,7 +1005,10 @@ async fn resolve_drain_object_list(
     } else {
         crate::git::visibility_pack::replicable_objects(pin_set.candidates, &withheld_set)
     };
-    Some((object_list, rules_opt, record.is_public))
+    // record.id, never ctx.repo_id: the record above is re-fetched fresh by
+    // owner/name, and a delete+re-create between spawn and drain gives the row a
+    // NEW id. This is the same rule the rules read a few lines up already follows.
+    Some((record.id, object_list, rules_opt, record.is_public))
 }
 
 /// Re-derive the Pinata replication object set for a push from its ref-update
@@ -1117,8 +1140,13 @@ async fn pin_new_objects_gated(
     crate::ipfs_pin::pin_new_objects(ipfs_api, repo_path, object_list, db).await
 }
 
+/// `repo_id` is passed explicitly rather than read from `ctx` so the two callers
+/// stay honest about which id they mean: the snapshot iteration passes
+/// `ctx.repo_id` (its own push's row), while a coalesced drain passes the id from
+/// its fresh re-fetch, which differs after a delete+recreate (#174 U3).
 async fn pin_and_encrypt_objects(
     ctx: &EncryptTaskCtx,
+    repo_id: &str,
     object_list: Vec<String>,
     rules: Option<Vec<crate::db::VisibilityRule>>,
     is_public: bool,
@@ -1163,7 +1191,7 @@ async fn pin_and_encrypt_objects(
                 &ctx.ipfs_api,
                 &ctx.repo_path,
                 &ctx.db,
-                &ctx.repo_id,
+                repo_id,
                 &node_seed,
                 &recipients,
             )
@@ -6316,6 +6344,78 @@ mod tests {
         }
     }
 
+    /// #174 U3: a coalesced drain that runs after the repo row was deleted and
+    /// recreated under the same owner/name must resolve the LIVE row's id, not the
+    /// id frozen into the task ctx at spawn. Encrypted-pin metadata written under
+    /// the dead id is invisible to authorized readers on the live row.
+    ///
+    /// `resolve_drain_object_list` already re-fetches by owner/name and uses
+    /// `record.id` for the visibility-rule read; this binds the same id to the
+    /// encrypt write, which was still taking `ctx.repo_id`.
+    #[sqlx::test]
+    async fn u3_drain_resolves_the_refetched_repo_id_after_an_id_rotation(pool: sqlx::PgPool) {
+        let raw = pool.clone();
+        let state = crate::test_support::test_state(pool).await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        u5_init_repo(tmp.path());
+        let c1 = u5_commit_file(tmp.path(), "a.txt", "one\n");
+
+        state
+            .db
+            .upsert_mirror_repo("z6u3rot", "r", "/u3-rotation", None, false)
+            .await
+            .unwrap();
+        let before = state.db.get_repo("z6u3rot", "r").await.unwrap().unwrap();
+        let ctx = u5_ctx(
+            &state,
+            &before,
+            tmp.path().to_path_buf(),
+            "git",
+            std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+        );
+        assert_eq!(ctx.repo_id, before.id, "ctx captures the spawn-time id");
+
+        // Delete + recreate under the SAME owner/name. This is the rotation: a new
+        // row id over the same on-disk bare repo.
+        sqlx::query("DELETE FROM repos WHERE id = $1")
+            .bind(&before.id)
+            .execute(&raw)
+            .await
+            .unwrap();
+        let after = crate::db::RepoRecord {
+            id: Uuid::new_v4().to_string(),
+            name: before.name.clone(),
+            owner_did: before.owner_did.clone(),
+            description: None,
+            is_public: true,
+            default_branch: "main".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            disk_path: before.disk_path.clone(),
+            forked_from: None,
+            machine_id: None,
+        };
+        state.db.create_repo(&after).await.unwrap();
+        assert_ne!(after.id, before.id, "the recreate really did rotate the id");
+
+        let (drain_id, _list, _rules, _pub) = resolve_drain_object_list(
+            &ctx,
+            crate::state::PendingWork::Tips(vec![(ZERO_SHA.to_string(), c1.clone())]),
+        )
+        .await
+        .expect("a public repo drains to a pin list");
+
+        assert_eq!(
+            drain_id, after.id,
+            "the drain must write its encrypted-pin metadata under the LIVE row id"
+        );
+        assert_ne!(
+            drain_id, ctx.repo_id,
+            "the spawn-time id is the deleted row; metadata written there is \
+             unreachable from the live repo"
+        );
+    }
+
     /// The drain resolves a coalesced push's tip pair to exactly that push's
     /// introduced objects (delta semantics — the F5 observable: push B's pins are
     /// recorded by the drain, and pre-existing objects are not re-listed).
@@ -6341,7 +6441,7 @@ mod tests {
         );
 
         // Push B advanced main c1 -> c2 and lost try_begin; its pair was coalesced.
-        let (list, _rules, is_public) = resolve_drain_object_list(
+        let (_drain_id, list, _rules, is_public) = resolve_drain_object_list(
             &ctx,
             crate::state::PendingWork::Tips(vec![(c1.clone(), c2.clone())]),
         )
@@ -6385,7 +6485,7 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
         );
 
-        let (list, _rules, _pub) =
+        let (_drain_id, list, _rules, _pub) =
             resolve_drain_object_list(&ctx, crate::state::PendingWork::FullScan)
                 .await
                 .expect("a public repo drains to a pin list");
@@ -6441,7 +6541,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (list, _rules, _pub) = resolve_drain_object_list(&ctx, pending())
+        let (_drain_id, list, _rules, _pub) = resolve_drain_object_list(&ctx, pending())
             .await
             .expect("still announceable at root");
         let got: std::collections::HashSet<String> = list.into_iter().collect();
