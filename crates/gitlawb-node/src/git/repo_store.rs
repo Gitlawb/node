@@ -31,6 +31,12 @@ pub struct RepoStore {
     /// Tracks repos already confirmed to exist in Tigris — avoids redundant
     /// HEAD checks and background uploads for repos we've already migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
+    /// Test-only seam: armed here, copied into every `RepoWriteGuard` this store
+    /// hands out, so a test that only holds the `AppState` (not the guard) can
+    /// still park `release` at its pre-unlock point. See
+    /// `RepoWriteGuard::test_pre_unlock_gate`. Never set outside tests.
+    #[cfg(test)]
+    pre_unlock_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RepoStore {
@@ -41,7 +47,17 @@ impl RepoStore {
             tigris: None,
             pool,
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
+            pre_unlock_gate: None,
         }
+    }
+
+    /// Test-only: every guard from this store parks in `release` right before the
+    /// `pg_advisory_unlock` await, until `gate` is notified. Dropping the future
+    /// while it is parked reproduces a client disconnect inside `release`.
+    #[cfg(test)]
+    pub fn with_pre_unlock_gate(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+        self.pre_unlock_gate = Some(gate);
+        self
     }
 
     pub fn new(repos_dir: PathBuf, tigris: Option<TigrisClient>, pool: PgPool) -> Self {
@@ -50,6 +66,8 @@ impl RepoStore {
             tigris,
             pool,
             migrated: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            pre_unlock_gate: None,
         }
     }
 
@@ -181,7 +199,7 @@ impl RepoStore {
             released: false,
             tigris: self.tigris.clone(),
             #[cfg(test)]
-            test_pre_unlock_gate: None,
+            test_pre_unlock_gate: self.pre_unlock_gate.clone(),
         };
 
         // Acquire the advisory lock with retry, through the guard's OWN connection,

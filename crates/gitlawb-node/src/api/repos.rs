@@ -1800,10 +1800,50 @@ pub async fn git_receive_pack(
     )
     .await;
 
+    // #174 F2/U5: the post-receive replication tail runs in an independently owned
+    // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
+    // resolution), so leaving it in the request future means a client/proxy disconnect
+    // while parked silently drops this push's pins, recovery copy, and announcements.
+    //
+    // Spawned HERE, ABOVE `guard.release()`, because `release` is itself cancellable:
+    // on success it awaits the Tigris upload and then the advisory unlock, both while
+    // this future is still tied to the client connection, and the pack has ALREADY
+    // landed on disk by then. Spawning below `release` left exactly that window open,
+    // where a disconnect meant a durable push with no tail (the same class F2 closed,
+    // one step earlier).
+    //
+    // The success gate is explicit rather than the `?` below, because that `?` now
+    // sits under this spawn: `release` runs on failure too, so anchoring the tail on
+    // it would pin and announce a half-applied repo, the state `release(false)`
+    // deliberately refuses to upload and one a hostile pusher can produce on demand
+    // by aborting a pack mid-transfer.
+    //
+    // The tail is read-only on `disk_path` (walk plus plumbing) and takes neither the
+    // write lease nor the advisory lock, so running it concurrently with the upload
+    // below waits on nothing this handler still holds. Everything after (touch_repo,
+    // metrics, trust score, certificates, webhooks) stays in the cancellable handler.
+    //
+    // The tail also runs CONCURRENTLY with certificate issuance rather than after it,
+    // so a ref can be announced before its signed certificate exists. That window is
+    // accepted: cert issuance already fails open (errors are logged and skipped) and
+    // the gossip event carries `cert_id: None` regardless, so no announce consumer
+    // reads a certificate out of it. Each push owns its own tail, including its own
+    // always-spawned announce, so per-push announcements are never coalesced away.
+    let push_succeeded = receive_result.is_ok();
+    if push_succeeded {
+        tokio::spawn(post_receive_replication_tail(
+            state.clone(),
+            record.clone(),
+            ref_updates.clone(),
+            disk_path.clone(),
+            auth.0.to_string(),
+        ));
+    }
+
     // Always release the advisory lock — even on error — to prevent stale locks
     // from blocking subsequent pushes. Only upload to Tigris when the push
     // succeeded; uploading a half-applied repo would propagate corruption.
-    guard.release(receive_result.is_ok()).await;
+    guard.release(push_succeeded).await;
     // Clean path: clone (a) already dropped inside run_git_service when the receive-pack
     // group was reaped; clone (b) held here spanned the success-only Tigris upload that
     // ran inside release() above. Drop it now so a second same-repo push proceeds the
@@ -1822,34 +1862,6 @@ pub async fn git_receive_pack(
         }
         app
     })?;
-
-    // #174 F2/U5: the post-receive replication tail runs in an independently owned
-    // task. It parks on `git_encrypt_semaphore` (withheld / candidate / full-scan
-    // resolution), so leaving it in the request future means a client/proxy disconnect
-    // while parked silently drops this push's pins, recovery copy, and announcements.
-    //
-    // Spawned HERE, at the durability boundary, rather than at the end of the handler.
-    // This is the first point where the push is known to have landed: `guard.release()`
-    // above runs on failure too, so anchoring on it would spawn a tail that pins and
-    // announces a half-applied repo — the state release() deliberately refuses to
-    // upload, and one a hostile pusher can produce on demand by aborting a pack
-    // mid-transfer. Everything below (touch_repo, metrics, trust score, certificates,
-    // webhooks) stays in the cancellable handler, so a disconnect during that window no
-    // longer takes the tail with it.
-    //
-    // The tail now runs CONCURRENTLY with certificate issuance rather than after it, so
-    // a ref can be announced before its signed certificate exists. That window is
-    // accepted: cert issuance already fails open (errors are logged and skipped) and the
-    // gossip event carries `cert_id: None` regardless, so no announce consumer reads a
-    // certificate out of it. Each push owns its own tail, including its own
-    // always-spawned announce, so per-push announcements are never coalesced away.
-    tokio::spawn(post_receive_replication_tail(
-        state.clone(),
-        record.clone(),
-        ref_updates.clone(),
-        disk_path.clone(),
-        auth.0.to_string(),
-    ));
 
     // Update the repo's updated_at timestamp after a successful push
     let _ = state.db.touch_repo(&record.id).await;
@@ -8561,6 +8573,195 @@ mod tests {
             .expect("a coalesced push still fires its own announce");
         assert_eq!(broadcast.new_sha, c2);
         assert_eq!(broadcast.ref_name, "refs/heads/main");
+    }
+
+    /// A push handler whose `release` parks at its pre-unlock point, so a test can
+    /// drop the future from inside the cancellable post-receive window. Returns the
+    /// state, the seeded record and the git-invocation log.
+    ///
+    /// Path-scoped on purpose: the tail's withheld walk is the observable, and
+    /// without a path-scoped rule `replication_withheld_set` takes the no-walk
+    /// shortcut and spawns no git at all.
+    #[cfg(unix)]
+    async fn p2_parked_release_state(
+        pool: sqlx::PgPool,
+        tmp: &std::path::Path,
+        owner: &str,
+        name: &str,
+        git_body: Option<&str>,
+    ) -> (AppState, std::path::PathBuf) {
+        let log = tmp.join("git.log");
+        let git_bin = match git_body {
+            Some(body) => write_fake_git(tmp, body),
+            None => f2a_logging_git(tmp, &log),
+        };
+        let repos_dir = tmp.join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        state.git_bin = git_bin;
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // Armed and never notified: every guard this store hands out parks in
+        // `release` right before the advisory unlock, which is inside the window a
+        // client disconnect can hit.
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool.clone())
+            .with_pre_unlock_gate(std::sync::Arc::new(tokio::sync::Notify::new()));
+        state
+            .db
+            .upsert_mirror_repo(owner, name, &format!("/unused-{owner}-{name}"), None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &["did:key:z6MkP2TailReaderAAAAAAAAAAAAAAAAAAAAAA".to_string()],
+                &rec.owner_did,
+            )
+            .await
+            .unwrap();
+        state
+            .repo_store
+            .init(&rec.owner_did, &rec.name)
+            .await
+            .unwrap();
+        (state, log)
+    }
+
+    const P2_PUSHER: &str = "did:key:z6MkP2TailPusherAAAAAAAAAAAAAAAAAAAAAA";
+
+    fn p2_push(
+        state: &AppState,
+        owner: &str,
+        name: &str,
+    ) -> impl std::future::Future<Output = Result<axum::response::Response>> {
+        use axum::extract::{Path, State};
+        use axum::Extension;
+        use std::net::SocketAddr;
+        git_receive_pack(
+            State(state.clone()),
+            Path((owner.to_string(), name.to_string())),
+            Extension(crate::auth::AuthenticatedDid(P2_PUSHER.to_string())),
+            crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from_static(b"0000"),
+        )
+    }
+
+    fn p2_logged(log: &std::path::Path, prefix: &str) -> bool {
+        f2a_log(log).lines().any(|l| l.starts_with(prefix))
+    }
+
+    /// #174 (jatmn P2, RED-before/GREEN-after): a client disconnect DURING
+    /// `guard.release()` must not take the replication tail with it. On a
+    /// successful push `release` awaits the Tigris upload and then the advisory
+    /// unlock, both cancellation points, while the pack has already landed on disk.
+    /// Spawning the tail below `release` means a disconnect in that window drops
+    /// this push's pins, recovery copy and announce: the F2 dropped-tail class, one
+    /// step earlier in the handler.
+    ///
+    /// Load-bearing: with the spawn below `release` the walk's `for-each-ref` never
+    /// appears after the disconnect (RED). With it above, gated on
+    /// `receive_result.is_ok()`, it does (GREEN).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_tail_survives_a_disconnect_during_release(pool: sqlx::PgPool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (state, log) = p2_parked_release_state(pool, tmp.path(), "z6p2tail", "t1", None).await;
+
+        let mut fut = Box::pin(p2_push(&state, "z6p2tail", "t1"));
+
+        // Drive until receive-pack has run. Nothing between it and `release` awaits,
+        // so a future that stops completing after that point is parked on the gate.
+        let mut ran = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            assert!(
+                step.is_err(),
+                "the handler must park inside release, not return"
+            );
+            if p2_logged(&log, "receive-pack") {
+                ran = true;
+                break;
+            }
+        }
+        assert!(ran, "the push must reach receive-pack");
+        // Settle into the parked state. Whether the tail's walk has already started
+        // by now is immaterial: pre-fix no tail is ever spawned, because `release`
+        // never returns, so the marker below can only come from a spawn above it.
+        for _ in 0..5 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+        }
+
+        // The disconnect: drop the handler future while `release` is still awaiting.
+        drop(fut);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !p2_logged(&log, "for-each-ref") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "RED: the pack landed but its replication tail never ran. A disconnect \
+                 during guard.release() took the tail with the handler future — spawn it \
+                 above release, gated on receive_result.is_ok()"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The must-not direction of the same reorder. Moving the spawn above
+    /// `release` moves it above the `?` that used to gate it, so the success check
+    /// has to be explicit: a FAILED receive-pack must still spawn no tail, or a
+    /// pusher who aborts a pack mid-transfer gets a half-applied repo pinned and
+    /// announced on demand.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn receive_pack_failure_spawns_no_tail_even_when_the_client_disconnects(
+        pool: sqlx::PgPool,
+    ) {
+        // receive-pack fails; everything else the handler or a tail might run is
+        // logged, so any walk child would show up.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let log = tmp.path().join("git.log");
+        let body = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"{}\"\n\
+             case \"$1\" in receive-pack) cat >/dev/null 2>/dev/null; exit 1 ;; esac\n\
+             exec git \"$@\"\n",
+            log.display()
+        );
+        let (state, log) =
+            p2_parked_release_state(pool, tmp.path(), "z6p2fail", "t1", Some(&body)).await;
+
+        let mut fut = Box::pin(p2_push(&state, "z6p2fail", "t1"));
+        let mut ran = false;
+        for _ in 0..1000 {
+            let step = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+            if p2_logged(&log, "receive-pack") {
+                ran = true;
+                // A failed push still parks in `release` (the lock is freed on
+                // failure too); drop it there, the same disconnect as above.
+                assert!(
+                    step.is_err(),
+                    "the failed push must still park inside release"
+                );
+                break;
+            }
+        }
+        assert!(ran, "the push must reach receive-pack");
+        for _ in 0..5 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut).await;
+        }
+        drop(fut);
+
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        assert!(
+            !p2_logged(&log, "for-each-ref"),
+            "a failed receive-pack must spawn no replication tail: pinning and \
+             announcing a half-applied repo is exactly what release(false) refuses \
+             to upload"
+        );
     }
 
     /// Scenario 5 (trap 3, fail-closed). On a repo whose withheld walk is failing, a

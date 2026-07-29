@@ -415,26 +415,30 @@ fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
 }
 
 /// #174 U5: the post-receive replication tail is spawned at the DURABILITY BOUNDARY,
-/// not at the end of the handler.
+/// which is the moment receive-pack returns success, not the end of the handler and
+/// not after `guard.release()`.
 ///
-/// The tail owes this push its pins, recovery copy, and announcements. Spawned below
-/// the certificate and webhook work, a client disconnect anywhere in that window took
-/// the tail with it. Spawned above it, the tail is already detached and survives.
+/// The tail owes this push its pins, recovery copy, and announcements. Everything
+/// below the spawn stays in the cancellable request future, so anything the tail is
+/// spawned after is a window where a client disconnect drops that work while the pack
+/// is already durable on disk. `guard.release()` is such a window: on success it
+/// awaits the Tigris upload and then the advisory unlock.
 ///
-/// The lower bound matters just as much as the upper one: `guard.release()` runs on
-/// failure too, so a spawn anchored there would fire for a push git rejected, pinning
-/// and announcing a half-applied repo. The `?` on `receive_result` is the first point
-/// where the push is known to have landed, which is why the spawn must sit between
-/// that `?` and `touch_repo`.
+/// The lower bound matters just as much as the upper one: `release` runs on failure
+/// too, so an ungated spawn would fire for a push git rejected, pinning and announcing
+/// a half-applied repo. Above `release` the `?` on `receive_result` can no longer be
+/// what gates it, so the success check is explicit and this gate binds it: the spawn
+/// must sit inside `if push_succeeded`, and `release` must consume the same flag so
+/// the two cannot drift apart.
 ///
-/// This is an ordering check rather than a cancellation-race test on purpose: forcing
-/// a disconnect to land inside the cert/webhook window is timing-dependent and would
-/// be flaky, while the ordering is exactly what the fix changes. Same instrument the
-/// F3 gate above uses.
+/// This is an ordering check rather than a cancellation-race test on purpose: it is
+/// the companion to `receive_pack_tail_survives_a_disconnect_during_release`, which
+/// drives the actual disconnect through a parked `release`. Same instrument the F3
+/// gate above uses.
 ///
-/// MUTATION (RED): move the `tokio::spawn(post_receive_replication_tail` call back
-/// below the webhook block and the ordering assertion fails; move it above the `?`
-/// and the failed-push assertion fails.
+/// MUTATION (RED): move the `tokio::spawn(post_receive_replication_tail` call below
+/// `guard.release(` and the ordering assertion fails; take it out of the
+/// `if push_succeeded` block and the failed-push assertion fails.
 #[test]
 fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     let repos = src("api/repos.rs");
@@ -444,12 +448,20 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .next()
         .expect("split always yields a first chunk");
 
-    let receive_ok = production
-        .find("let result = receive_result.map_err(")
-        .expect("U5 gate stale: git_receive_pack no longer maps receive_result with ?");
+    let success_flag = production
+        .find("let push_succeeded = receive_result.is_ok();")
+        .expect(
+            "U5 gate missing: the tail's success gate must be bound from receive_result.is_ok()",
+        );
+    let gate_open = production
+        .find("if push_succeeded {")
+        .expect("U5 gate missing: the tail spawn must be gated on the push having succeeded");
     let spawn = production
         .find("tokio::spawn(post_receive_replication_tail(")
         .expect("U5 gate missing: the replication tail must be spawned by git_receive_pack");
+    let release = production
+        .find("guard.release(push_succeeded)")
+        .expect("U5 gate stale: release must consume the same success flag as the tail gate");
     let touch = production
         .find("state.db.touch_repo(")
         .expect("U5 gate stale: git_receive_pack no longer calls touch_repo");
@@ -458,14 +470,20 @@ fn inv22_replication_tail_spawns_at_the_durability_boundary() {
         .expect("U5 gate stale: git_receive_pack no longer fires push webhooks");
 
     assert!(
-        receive_ok < spawn,
-        "U5 gate bypassed: the tail must be spawned AFTER the receive_result `?`, or a \
+        success_flag < gate_open && gate_open < spawn,
+        "U5 gate bypassed: the tail must be spawned inside `if push_succeeded`, or a \
          rejected push spawns a tail that pins and announces a half-applied repo"
     );
+    // Still inside that block: no `}` may close it between the gate and the spawn.
     assert!(
-        spawn < touch && spawn < webhook,
-        "U5 gate bypassed: the tail must be spawned BEFORE touch_repo and the webhook \
-         fan-out, so a disconnect in that window cannot drop this push's pins, \
-         recovery copy, and announcements"
+        !production[gate_open + "if push_succeeded {".len()..spawn].contains('}'),
+        "U5 gate bypassed: the tail spawn left the `if push_succeeded` block, so a \
+         rejected push now spawns a tail"
+    );
+    assert!(
+        spawn < release && spawn < touch && spawn < webhook,
+        "U5 gate bypassed: the tail must be spawned BEFORE guard.release, touch_repo \
+         and the webhook fan-out, so a disconnect in any of those windows cannot drop \
+         this push's pins, recovery copy, and announcements"
     );
 }
