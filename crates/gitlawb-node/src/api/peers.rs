@@ -1068,6 +1068,74 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn unsigned_announce_then_notify_cannot_queue_a_repos_dir_escape(pool: PgPool) {
+        // The reachability case for #272, committed in its attack form. Two
+        // unsigned requests through the shipped router, no signature and no
+        // config change: announce the attacker's own DID (which is what makes
+        // them a "known peer"), then notify with `a/<abs>/gitlawb-probe`. That
+        // slug used to reach PathBuf::join in the sync worker, where the
+        // absolute second component discarded repos_dir and planted a mirror at
+        // /<abs>/gitlawb-probe.git. The notify must now be refused outright.
+        //
+        // This has to run over crate::server::build_router rather than a
+        // directly mounted handler: the point of the test is that the default
+        // layer stack (optional_signature, not require_signature) leaves the
+        // route open, so mounting the handler alone would assert nothing about
+        // reachability.
+        let state = test_state(pool).await;
+        let db = state.db.clone();
+        let attacker = Keypair::generate().did().to_string();
+        let router = crate::server::build_router(state);
+
+        let announce =
+            format!(r#"{{"did":"{attacker}","http_url":"https://attacker.example.com"}}"#);
+        let resp = router
+            .clone()
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce,
+                "198.51.100.40:5000",
+            ))
+            .await
+            .unwrap();
+        // Asserted, not assumed: this plan does not change announce, and the
+        // whole attack rests on an unsigned announce still succeeding.
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "unsigned announce still admits an attacker-generated DID"
+        );
+
+        let outside = tempfile::TempDir::new().unwrap();
+        let escape_dir = outside.path().join("gitlawb-probe");
+        let slug = format!("a/{}", escape_dir.display());
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body(&slug, &attacker),
+                "198.51.100.41:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "notify must refuse the escaping slug {slug:?}"
+        );
+
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert!(
+            queued.is_empty(),
+            "sync_queue must stay empty, got {:?}",
+            queued.iter().map(|q| &q.repo).collect::<Vec<_>>()
+        );
+        assert!(
+            !escape_dir.with_extension("git").exists(),
+            "nothing may be written at the escape target"
+        );
+    }
+
+    #[sqlx::test]
     async fn announce_still_accepts_unsigned_in_default_mode(pool: PgPool) {
         // must-not-over-reach: adding the brake must not tighten announce's
         // rolling-upgrade behavior — an unsigned announce with a public URL still

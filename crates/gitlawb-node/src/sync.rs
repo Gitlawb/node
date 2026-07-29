@@ -1570,4 +1570,110 @@ mod tests {
         assert_eq!(sync_status(&pool, "../hello").await, "failed");
         assert_eq!(dir_entries(home.path()), vec!["repos".to_string()]);
     }
+
+    // ── committed attack probes from the #272 investigation ──────────────────
+
+    #[sqlx::test]
+    async fn queued_escape_slug_cannot_plant_a_mirror_outside_repos_dir(pool: PgPool) {
+        // The worker half of #272, committed in its attack form. The row goes
+        // into sync_queue directly rather than through notify, because that is
+        // the case the boundary check cannot cover: rows queued before the fix
+        // existed, plus the gossip and trigger writers, which also enqueue a
+        // peer-controlled slug. `a/<abs>/gitlawb-probe` used to reach
+        // PathBuf::join, whose absolute second component discards repos_dir and
+        // puts the mirror at /<abs>/gitlawb-probe.git.
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        let outside = TempDir::new().unwrap();
+        let escape_dir = outside.path().join("nest");
+        let slug = format!("a/{}/gitlawb-probe", escape_dir.display());
+        let escape_target = escape_dir.join("gitlawb-probe.git");
+
+        // Two things this fixture must get right or the test is green for the
+        // wrong reason. The peer row is mandatory: process_batch resolves the
+        // origin URL before it looks at the slug, so an unseeded row dies at the
+        // no-peer arm and would pass with the worker guard reverted. And the
+        // composed remote {peer_url}/{slug} is served as a real bare repo, so a
+        // run without the guard genuinely clones outside the root instead of
+        // just failing at git. Db::upsert_peer cannot seed this row: it gates on
+        // is_public_http_url, which rejects file://.
+        let rel = format!("a{}/gitlawb-probe", escape_dir.display());
+        let (_remote, peer_url) = rooted_remote(&[&rel]);
+        let did = "did:key:z6MkAttacker";
+        seed_local_peer(&pool, did, &peer_url).await;
+        enqueue(&state.db, &slug, did).await;
+
+        run_batch(&state, &repos_dir).await;
+
+        assert!(
+            !escape_target.exists(),
+            "mirror written outside repos_dir at {}",
+            escape_target.display()
+        );
+        // git clone removes the destination when the clone fails but leaves the
+        // parent it created, so the .git path alone can pass vacuously.
+        assert!(
+            !escape_dir.exists(),
+            "parent directory created outside repos_dir at {}",
+            escape_dir.display()
+        );
+        assert!(
+            dir_entries(&repos_dir).is_empty(),
+            "repos_dir must stay empty"
+        );
+        assert_eq!(sync_status(&pool, &slug).await, "failed");
+    }
+
+    #[sqlx::test]
+    async fn notify_to_mirror_still_works_end_to_end_for_a_valid_slug(pool: PgPool) {
+        // Positive control for the two #272 attack tests: the same unsigned
+        // notify route an attacker reaches still carries a well-formed slug all
+        // the way to a mirror on disk. Without it, both attack tests could be
+        // green because the chain is broken rather than because the guards hold.
+        use tower::ServiceExt as _;
+
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let home = TempDir::new().unwrap();
+        let repos_dir = home.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+
+        let (_remote, peer_url) = rooted_remote(&["z6Mkfoo/hello"]);
+        let did = "did:key:z6MkOrigin";
+        // Direct insert for the same reason as above: upsert_peer rejects file://.
+        seed_local_peer(&pool, did, &peer_url).await;
+
+        let body = serde_json::json!({
+            "repo": "z6Mkfoo/hello",
+            "ref_name": "refs/heads/main",
+            "new_sha": "0".repeat(40),
+            "node_did": did,
+        })
+        .to_string();
+        let mut req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/sync/notify")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(axum::extract::ConnectInfo(
+            "198.51.100.50:5000"
+                .parse::<std::net::SocketAddr>()
+                .unwrap(),
+        ));
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        run_batch(&state, &repos_dir).await;
+
+        let mirror = repos_dir.join("z6Mkfoo").join("hello.git");
+        assert!(mirror.is_dir(), "mirror missing at {}", mirror.display());
+        assert!(object_count(&mirror) > 0, "mirror has no objects");
+        assert_eq!(sync_status(&pool, "z6Mkfoo/hello").await, "done");
+    }
 }
