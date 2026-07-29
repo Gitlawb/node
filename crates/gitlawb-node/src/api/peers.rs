@@ -381,6 +381,14 @@ pub async fn notify_sync(
         )));
     }
 
+    // #272: the slug reaches a PathBuf::join in the sync worker, where an extra
+    // separator or a traversal segment places the mirror outside repos_dir. Reject
+    // it here, before the queue row and the ref-update row are written. The message
+    // names the field and nothing about where repos live on disk.
+    if let Err(e) = crate::git::repo_store::validate_repo_slug(&req.repo) {
+        return Err(AppError::BadRequest(format!("invalid repo field: {e}")));
+    }
+
     state
         .db
         .enqueue_sync(&req.repo, &req.node_did, &req.ref_name, &req.new_sha, None)
@@ -584,7 +592,9 @@ mod tests {
         state.config = Arc::new(cfg);
     }
 
-    const NOTIFY_BODY: &str = r#"{"repo":"demo","ref_name":"refs/heads/main","new_sha":"0000000000000000000000000000000000000000","node_did":"PEER_DID"}"#;
+    // The slug must be a well-formed owner/name (#272); these brake tests are about
+    // the rate limiter, so the body carries a valid slug and reaches the brake.
+    const NOTIFY_BODY: &str = r#"{"repo":"z6Mkfoo/hello","ref_name":"refs/heads/main","new_sha":"0000000000000000000000000000000000000000","node_did":"PEER_DID"}"#;
 
     // ── trigger: mandatory signature ──────────────────────────────────────────
 
@@ -863,6 +873,197 @@ mod tests {
             trigger.status(),
             StatusCode::UNAUTHORIZED,
             "trigger must hit its own bucket (401 from the sig gate), not the drained peer_write bucket (429)"
+        );
+    }
+
+    // ── notify: repo slug validation (#272) ───────────────────────────────────
+    //
+    // An unsigned caller who has announced their own DID is a "known peer", so
+    // the slug they send reaches the sync worker's path join. `a//tmp/probe`
+    // resolved to /tmp/probe.git, outside repos_dir entirely. notify must reject
+    // anything that is not a well-formed owner/name slug before it is queued.
+
+    /// Every slug shape the boundary must refuse. `a//tmp/gitlawb-probe` is the
+    /// verified escape; the rest are the traversal and empty-half neighbours.
+    const MALFORMED_SLUGS: [&str; 9] = [
+        "a//tmp/gitlawb-probe",
+        "../hello",
+        "./hello",
+        "../../etc/evil",
+        "a/../../x",
+        "..",
+        "demo",
+        "/hello",
+        "z6Mkfoo/",
+    ];
+
+    fn notify_body(repo: &str, peer_did: &str) -> String {
+        serde_json::json!({
+            "repo": repo,
+            "ref_name": "refs/heads/main",
+            "new_sha": "0000000000000000000000000000000000000000",
+            "node_did": peer_did,
+        })
+        .to_string()
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejects_malformed_repo_slugs(pool: PgPool) {
+        let state = test_state(pool).await;
+        let db = state.db.clone();
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        for (i, slug) in MALFORMED_SLUGS.iter().enumerate() {
+            // Distinct source IPs so the per-IP brake never masks the 400.
+            let ip = format!("198.51.100.{}:5000", i + 1);
+            let resp = router
+                .clone()
+                .oneshot(unsigned_post(
+                    "/api/v1/sync/notify",
+                    &notify_body(slug, &peer_did),
+                    &ip,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "slug {slug:?} must be rejected"
+            );
+        }
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert!(
+            queued.is_empty(),
+            "no malformed slug may be queued, got {:?}",
+            queued.iter().map(|q| &q.repo).collect::<Vec<_>>()
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejection_body_names_field_not_path(pool: PgPool) {
+        // R3: the client learns which field was bad, never where repos live on
+        // disk. A message carrying the resolved path would hand an unsigned
+        // caller the server's layout.
+        let state = test_state(pool).await;
+        let repos_dir = state.config.repos_dir.display().to_string();
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("a//tmp/gitlawb-probe", &peer_did),
+                "198.51.100.20:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("repo"), "body must name the field: {body}");
+        assert!(
+            !body.contains(&repos_dir),
+            "body must not leak repos_dir ({repos_dir}): {body}"
+        );
+        for trimmed in repos_dir.trim_start_matches("./").split('/') {
+            assert!(
+                trimmed.is_empty() || !body.contains(trimmed),
+                "body must not leak a repos_dir segment ({trimmed}): {body}"
+            );
+        }
+        // A rooted path is a leading '/' with something after it. A bare quoted
+        // '/' is the separator the message is allowed to talk about.
+        assert!(
+            !body
+                .split(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .any(|tok| tok.starts_with('/') && tok.len() > 1),
+            "body must not contain a rooted filesystem path: {body}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_rejection_writes_no_ref_update(pool: PgPool) {
+        // The second half of R1: the ref-update feed row sits after enqueue_sync,
+        // so the early return must skip it too. Asserted, not argued.
+        let state = test_state(pool.clone()).await;
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("a//tmp/gitlawb-probe", &peer_did),
+                "198.51.100.21:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "a rejected notify must not seed the ref-update feed"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_accepts_valid_slug_and_records_ref_update(pool: PgPool) {
+        // must-not-break, and the control that keeps the two negative assertions
+        // above from being vacuous: a well-formed slug still queues and still
+        // writes its ref-update row.
+        let state = test_state(pool.clone()).await;
+        let db = state.db.clone();
+        let peer_did = seed_peer(&state).await;
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("z6Mkfoo/hello", &peer_did),
+                "198.51.100.22:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let queued = db.dequeue_pending_syncs(100).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].repo, "z6Mkfoo/hello");
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM received_ref_updates WHERE repo = $1")
+                .bind("z6Mkfoo/hello")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            count, 1,
+            "the valid path must still write the ref-update row"
+        );
+    }
+
+    #[sqlx::test]
+    async fn sync_notify_unknown_peer_wins_over_malformed_slug(pool: PgPool) {
+        // Ordering: the slug check sits after the peer gate, so an unknown peer
+        // still gets the unknown-peer message rather than a slug complaint.
+        let state = test_state(pool).await;
+        let stranger = Keypair::generate().did().to_string();
+        let router = crate::server::build_router(state);
+        let resp = router
+            .oneshot(unsigned_post(
+                "/api/v1/sync/notify",
+                &notify_body("a//tmp/gitlawb-probe", &stranger),
+                "198.51.100.23:5000",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("unknown peer DID"),
+            "peer gate must still fire first: {body}"
         );
     }
 
