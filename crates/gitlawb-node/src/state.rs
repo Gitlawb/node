@@ -521,9 +521,9 @@ pub struct RepoWriteLeases {
 /// - The separator is `/`, which cannot occur in the owner slug by construction
 ///   (`replace([':', '/'], "_")` removes it) and mirrors the shape of the disk
 ///   path this key exists to reproduce. A plain join would collide (owner `a` +
-///   name `b_c` against owner `a_b` + name `c`), letting one repo's push park
-///   another's. It must stay PRINTABLE: this key is logged as the `repo` field
-///   on the lease shed and steal-bound warnings below, and an unprintable
+///   name `bc` against owner `ab` + name `c`, both `abc`), letting one repo's
+///   push park another's. It must stay PRINTABLE: this key is logged as the
+///   `repo` field on the lease shed and steal-bound warnings below, and an unprintable
 ///   separator (a NUL, a unit separator) truncates at a NUL-hostile log sink and
 ///   renders two different repos' warnings identically.
 /// - Callers pass `record.owner_did` / `record.name`, never the request's path
@@ -903,13 +903,14 @@ mod repo_identity_key_tests {
         );
     }
 
-    /// The `\0` separator is what stops one repo's push parking another's. With a
-    /// plain join these two pairs would produce a single key.
+    /// The `/` separator is what stops one repo's push parking another's. These
+    /// two pairs both concatenate to `abc`, so with a plain join they would
+    /// produce a single key.
     #[test]
     fn separator_prevents_the_owner_name_boundary_collision() {
         assert_ne!(
-            repo_identity_key("a", "b_c"),
-            repo_identity_key("a_b", "c"),
+            repo_identity_key("a", "bc"),
+            repo_identity_key("ab", "c"),
             "owner/name boundary must not be ambiguous"
         );
     }
