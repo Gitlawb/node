@@ -34,6 +34,9 @@ pub struct RepoStore {
     lock_pool: PgPool,
     /// Bound on any object-storage transfer that runs while the lock is HELD.
     lock_held_transfer_timeout: Duration,
+    /// Wall-clock cap on WAITING for the lock. A field rather than a bare const so
+    /// the busy path can be driven in a test without a 90s wait.
+    lock_acquire_deadline: Duration,
     /// Tracks repos already confirmed to exist in Tigris — avoids redundant
     /// HEAD checks and background uploads for repos we've already migrated.
     migrated: Arc<Mutex<HashSet<String>>>,
@@ -47,8 +50,17 @@ impl RepoStore {
             tigris: None,
             lock_pool,
             lock_held_transfer_timeout: Duration::from_secs(300),
+            lock_acquire_deadline: LOCK_ACQUIRE_DEADLINE,
             migrated: Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new())),
         }
+    }
+
+    /// Shorten the lock-acquire deadline so the busy path is reachable in a test
+    /// without waiting out the production default.
+    #[cfg(test)]
+    pub fn with_lock_acquire_deadline(mut self, deadline: Duration) -> Self {
+        self.lock_acquire_deadline = deadline;
+        self
     }
 
     pub fn new(
@@ -62,6 +74,7 @@ impl RepoStore {
             tigris,
             lock_pool,
             lock_held_transfer_timeout,
+            lock_acquire_deadline: LOCK_ACQUIRE_DEADLINE,
             migrated: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -186,16 +199,19 @@ impl RepoStore {
         // against a pool that is full for reasons unrelated to this repo, and would
         // report a capacity problem as lock contention. It surfaces immediately with
         // its own message instead.
-        // Cap the WALL CLOCK, not just the attempt count. 60 attempts each pay a
-        // pool acquire (up to db_acquire_timeout_secs) plus a 1s sleep, so an
-        // attempt-only bound reaches ~360s — far past the 120s proxy idle timeout
-        // that was deliberately lowered from 600s after held connection slots
-        // caused a production outage. A caller must not be able to sit here longer
-        // than the proxy will hold its connection.
-        let deadline = std::time::Instant::now() + LOCK_ACQUIRE_DEADLINE;
+        // Cap the WALL CLOCK of the WAIT, not just the attempt count. 60 attempts
+        // each pay a pool acquire (up to db_acquire_timeout_secs) plus a 1s sleep,
+        // so an attempt-only bound reaches ~360s. This bounds the wait only; the
+        // under-lock refresh below carries its own separate bound, so do not read
+        // this as a total for `acquire_write` (see LOCK_ACQUIRE_DEADLINE).
+        let deadline_budget = self.lock_acquire_deadline;
+        let deadline = std::time::Instant::now() + deadline_budget;
         let mut lock_conn = None;
         for attempt in 0..60 {
-            if std::time::Instant::now() >= deadline {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            if left.is_zero() {
                 break;
             }
             let conn = match self.lock_pool.acquire().await {
@@ -234,15 +250,28 @@ impl RepoStore {
             // Not acquired, and nothing is locked, so hand the connection back
             // before the backoff rather than holding a slot while idle.
             drop(probe);
+            // Clamp the backoff to what is left of the budget: sleeping a full
+            // second past the deadline would turn a short deadline into a longer
+            // wait than the caller was promised.
             if attempt < 59 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                tokio::time::sleep(left.min(std::time::Duration::from_secs(1))).await;
             }
         }
         let Some(lock_conn) = lock_conn else {
-            anyhow::bail!(
-                "could not acquire advisory lock within {}s — possible stale lock for {owner_slug}/{repo_name}",
-                LOCK_ACQUIRE_DEADLINE.as_secs()
+            // Contention is transient, so this must NOT land as a 500. The detail
+            // (which repo, which key, how long) goes to the log; the client gets a
+            // retryable 503 with a fixed body via the `RepoBusy` downcast.
+            warn!(
+                repo = %repo_name,
+                owner = %owner_slug,
+                lock_key,
+                waited_secs = deadline_budget.as_secs(),
+                "advisory lock not acquired within the deadline — shedding the write as busy"
             );
+            return Err(anyhow::Error::new(RepoBusy).context(format!(
+                "could not acquire advisory lock within {}s for {owner_slug}/{repo_name}",
+                deadline_budget.as_secs()
+            )));
         };
         // From here the lock is HELD. Any early return must not simply drop the
         // connection back into the pool, so it is handed to the guard immediately
@@ -270,11 +299,25 @@ impl RepoStore {
                 repo_name,
                 self.lock_held_transfer_timeout,
                 async {
-                    if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                        debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                        tigris.download(&owner_slug, repo_name, &local_path).await
-                    } else {
-                        Ok(())
+                    // The HEAD and the download fail for epistemically DIFFERENT
+                    // reasons, so they are kept apart rather than collapsed into one
+                    // `Result`. A failed HEAD leaves us not knowing whether an archive
+                    // exists at all, which is the same state a timeout leaves us in;
+                    // a failed download after a successful HEAD tells us an archive is
+                    // there and unreadable. Only the second licenses the local
+                    // fallback. Collapsing them (the `unwrap_or(false)` this replaced
+                    // read a HEAD error as "no archive") skipped the refresh silently
+                    // and then re-uploaded over a possibly-newer archive.
+                    match tigris.exists(&owner_slug, repo_name).await {
+                        Ok(true) => {
+                            debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
+                            tigris
+                                .download(&owner_slug, repo_name, &local_path)
+                                .await
+                                .map_err(RefreshFailure::Download)
+                        }
+                        Ok(false) => Ok(()),
+                        Err(e) => Err(RefreshFailure::Unknown(e)),
                     }
                 },
             )
@@ -282,7 +325,7 @@ impl RepoStore {
 
             match refreshed {
                 Some(Ok(())) => {}
-                Some(Err(e)) => {
+                Some(Err(RefreshFailure::Download(e))) => {
                     // The archive is present but unreadable: a corrupt or partial
                     // upload, or a transient GET failure. We KNOW the fetch failed,
                     // so falling back to a valid local copy is sound and
@@ -294,6 +337,18 @@ impl RepoStore {
                     } else {
                         return Err(e).context("downloading repo from tigris for write");
                     }
+                }
+                Some(Err(RefreshFailure::Unknown(e))) => {
+                    // The HEAD itself failed, so we do not know whether a newer
+                    // archive exists. Refuse for the same reason the timeout arm
+                    // below refuses: proceeding would write against a possibly-stale
+                    // tree and then re-upload over another node's newer archive. A
+                    // transient object-storage blip costs a retryable refusal here,
+                    // which is the cheaper failure than silent overwrite.
+                    warn!(repo = %repo_name, err = %e,
+                        "write acquire: tigris HEAD failed — refusing the write rather than \
+                         guessing the archive is absent");
+                    return Err(e).context("checking tigris for the repo archive before a write");
                 }
                 None => {
                     // TIMED OUT, which is NOT the same as failed, and must not reach
@@ -624,6 +679,12 @@ impl LockProbe {
             .conn
             .as_mut()
             .context("LockProbe::try_lock after the connection was taken")?;
+        // Cleared BEFORE the statement is sent, not after it answers. Once the
+        // statement is in flight this session may hold the lock, and an error or a
+        // cancellation gives us no way to find out, so the connection must not be
+        // returned to the pool on any path but a positive `false`. Assigning only on
+        // success would leave a previous `true`-derived value standing.
+        self.lock_not_taken = false;
         let row: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
             .bind(key)
             .fetch_one(&mut **conn)
@@ -832,13 +893,45 @@ impl Drop for RepoWriteGuard {
     }
 }
 
-/// Overall wall-clock cap on acquiring the per-repo advisory lock.
+/// Default wall-clock cap on WAITING for the per-repo advisory lock.
 ///
-/// Deliberately under the 120s proxy idle timeout (`infra/fly/fly.toml`), which was
-/// itself lowered from 600s after long-held connection slots caused a production
-/// outage. An attempt-count bound alone is not enough: 60 attempts each paying a
-/// pool acquire plus a 1s sleep reach roughly 360s.
+/// An attempt-count bound alone is not enough: 60 attempts each paying a pool
+/// acquire plus a 1s sleep reach roughly 360s.
+///
+/// This bounds the wait only, NOT the whole of `acquire_write`. The under-lock
+/// refresh carries its own separate bound (`lock_held_transfer_timeout`, default
+/// 300s), so the two compose rather than nest and a caller can legitimately spend
+/// this deadline waiting and then that bound refreshing. Do not read 90s as a
+/// promise that `acquire_write` returns inside the 120s proxy idle timeout in
+/// `infra/fly/fly.toml`; it is not, and reconciling the two is tracked separately.
 const LOCK_ACQUIRE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Why an under-lock refresh did not complete, split by what it leaves us knowing.
+///
+/// `Unknown` (the existence check failed) and `Download` (the archive is there and
+/// unreadable) must not share a branch: only the second establishes that the local
+/// copy is a sound thing to fall back to and re-upload.
+enum RefreshFailure {
+    Unknown(anyhow::Error),
+    Download(anyhow::Error),
+}
+
+/// The per-repo advisory lock was not obtained within the acquire deadline.
+///
+/// A distinct type rather than a bare `anyhow` string so the handler layer can map
+/// it to a retryable 503 with a FIXED body. Contention is transient and ordinary,
+/// and the internal message names the owner slug and repo, which must stay in the
+/// log rather than reaching the client.
+#[derive(Debug)]
+pub struct RepoBusy;
+
+impl std::fmt::Display for RepoBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("repository is busy")
+    }
+}
+
+impl std::error::Error for RepoBusy {}
 
 /// Run a future under a wall-clock bound, returning `None` if it did not finish.
 ///
@@ -1752,16 +1845,36 @@ mod tests {
             );
         }
 
-        // The lock pool is now exhausted: a further checkout must time out.
-        let starved =
-            tokio::time::timeout(std::time::Duration::from_secs(8), lock_pool.acquire()).await;
-        assert!(
-            matches!(starved, Ok(Err(_)) | Err(_)),
-            "with N guards held, an N+1th lock-pool checkout must not succeed"
+        // Every slot is accounted for by a guard, so the pool really is exhausted
+        // rather than merely slow. Asserted directly, because the starvation check
+        // below cannot tell the two apart on its own.
+        assert_eq!(
+            lock_pool.size() as usize - lock_pool.num_idle(),
+            N as usize,
+            "all N slots must be checked out by the guards"
         );
 
+        // An N+1th checkout must be refused BY THE POOL. The specific error matters:
+        // `Ok(Err(_)) | Err(_)` would also be satisfied by the outer tokio timeout
+        // firing for an unrelated reason, which would let this pass without the pool
+        // ever having refused anything.
+        let starved =
+            tokio::time::timeout(std::time::Duration::from_secs(8), lock_pool.acquire()).await;
+        match starved {
+            Ok(Err(sqlx::Error::PoolTimedOut)) => {}
+            Ok(Err(e)) => panic!("expected the pool's own timeout, got {e:?}"),
+            Ok(Ok(_)) => panic!("with N guards held, an N+1th lock-pool checkout must not succeed"),
+            Err(_) => panic!(
+                "the pool must refuse the checkout itself within its acquire_timeout; \
+                 the outer timeout firing means it never did"
+            ),
+        }
+
         // ...while the APP pool still serves queries. This is the whole point of
-        // the split: write pressure must not deny ordinary reads.
+        // the split: write pressure must not deny ordinary reads. Weak on its own (it
+        // is a different pool object, so it would serve regardless), so it is the
+        // exhaustion assertions above that carry the isolation claim; this only
+        // confirms the reads are actually reachable in that state.
         let alive: (i32,) = sqlx::query_as("SELECT 1")
             .fetch_one(&pool)
             .await
@@ -1773,15 +1886,23 @@ mod tests {
         }
     }
 
-    /// A waiter spinning on a contended repo must not block a write to an
-    /// unrelated repo (R5's user-visible half).
+    /// A waiter spinning on a contended repo must hand its pool slot back for the
+    /// duration of each backoff, and must not block a write to an unrelated repo
+    /// (R5, both halves).
+    ///
+    /// The pool-counter sampling is the load-bearing half. A second `acquire_write`
+    /// succeeding proves only that two different lock keys do not collide, which is
+    /// true whether or not the spinner released anything: with the slot held through
+    /// the sleep, a pool of 3 still has room for it. So this samples what the
+    /// spinner actually occupies across more than two backoff cycles. Moving
+    /// `drop(probe)` after the backoff sleep turns it red.
     #[sqlx::test]
     async fn waiter_on_one_repo_does_not_block_another(pool: PgPool) {
         let opts = (*pool.connect_options()).clone();
         let lock_pool = no_reap_pool(&opts, 3).await;
         let store = std::sync::Arc::new(RepoStore::for_testing(
             PathBuf::from("/tmp/gitlawb-f5b"),
-            lock_pool,
+            lock_pool.clone(),
         ));
 
         let held = store
@@ -1793,7 +1914,25 @@ mod tests {
             let s = store.clone();
             tokio::spawn(async move { s.acquire_write("did:key:z6MkF5Cont", "contended").await })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        // Sample across >2 backoff cycles. `held` accounts for exactly one
+        // checked-out connection throughout, so every sample above that is the
+        // spinner sitting on a slot it is not using.
+        let mut spinner_idle = 0;
+        let mut samples = 0;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let checked_out = lock_pool.size() as usize - lock_pool.num_idle();
+            if checked_out == 1 {
+                spinner_idle += 1;
+            }
+            samples += 1;
+        }
+        assert!(
+            spinner_idle * 10 >= samples * 7,
+            "a spinner must hold no lock-pool slot through its backoff: only {spinner_idle}/{samples} \
+             samples showed just the held guard checked out"
+        );
 
         let unrelated = tokio::time::timeout(
             std::time::Duration::from_secs(8),
@@ -1805,6 +1944,59 @@ mod tests {
         unrelated.release(true).await;
 
         spinner.abort();
+        held.release(true).await;
+    }
+
+    /// Lock contention that runs out the acquire deadline must surface as a
+    /// retryable 503 with a fixed body, not a 500 carrying the owner slug and repo
+    /// name. The deadline is a field so this does not wait out the 90s default.
+    #[sqlx::test]
+    async fn contended_acquire_sheds_as_repo_busy_not_internal_error(pool: PgPool) {
+        use axum::response::IntoResponse;
+
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 4).await;
+        let store = RepoStore::for_testing(PathBuf::from("/tmp/gitlawb-busy"), lock_pool)
+            .with_lock_acquire_deadline(std::time::Duration::from_millis(300));
+
+        let held = store
+            .acquire_write("did:key:z6MkBusyOwner", "busyrepo")
+            .await
+            .expect("first writer acquires");
+
+        // Not `expect_err`: the guard is not Debug, and a guard obtained here must be
+        // released rather than dropped on a panic path.
+        let err = match store.acquire_write("did:key:z6MkBusyOwner", "busyrepo").await {
+            Err(e) => e,
+            Ok(second) => {
+                second.release(false).await;
+                panic!("a second writer must be shed once the deadline expires");
+            }
+        };
+
+        // The internal chain keeps the operator detail...
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("busyrepo"),
+            "the log-side error must name the repo, got {chain}"
+        );
+
+        // ...and the client-visible mapping must carry neither it nor a 500.
+        let resp = crate::error::AppError::from(err).into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "contention is transient and must be retryable"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("repo_busy") && !body.contains("busyrepo"),
+            "the 503 body must be fixed and must not name the repo, got {body}"
+        );
+
         held.release(true).await;
     }
 

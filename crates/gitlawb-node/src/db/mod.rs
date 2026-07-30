@@ -317,6 +317,14 @@ impl Db {
         );
         PgPoolOptions::new()
             .max_connections(max_connections)
+            // Explicit, and load-bearing rather than cosmetic: `RepoWriteGuard::Drop`
+            // has a no-runtime branch that calls `PoolConnection::leak()` and relies
+            // on the husk's own drop doing nothing. With `min_connections > 0` that
+            // drop still spawns a pool-replenish task, and spawning without a runtime
+            // panics inside Drop, which aborts the process during unwind. It is 0 by
+            // default, so this line exists to keep a future tuning change from
+            // silently re-arming that panic.
+            .min_connections(0)
             .acquire_timeout(acquire_timeout)
             .connect_lazy(database_url)
             .context("creating advisory-lock pool")
