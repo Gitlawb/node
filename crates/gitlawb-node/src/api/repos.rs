@@ -1379,8 +1379,16 @@ pub async fn git_upload_pack(
             let caller_owned = caller.map(str::to_string);
             let is_public = record.is_public;
             let git_bin = state.git_bin.clone();
-            let walk_budget = deadline.saturating_duration_since(std::time::Instant::now());
             tokio::task::spawn_blocking(move || {
+                // Derive the walk's budget from the shared deadline HERE, inside the
+                // closure, not on the async side before the task is queued. The walk
+                // starts its own clock when it runs, so a budget computed at queue time
+                // would hand it a full budget measured from whenever the blocking pool
+                // got to it, leaving the permit held for queue-delay PLUS the budget.
+                // Computing it at task start charges that queue delay against the
+                // shared deadline, which is what makes the ~1x bound true rather than
+                // approximate.
+                let walk_budget = deadline.saturating_duration_since(std::time::Instant::now());
                 let withheld = visibility_pack::withheld_blob_oids_bounded(
                     &path,
                     &git_bin,
