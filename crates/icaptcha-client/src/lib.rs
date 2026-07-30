@@ -550,4 +550,174 @@ mod tests {
         );
         assert!(key_trusted, "key stays trusted with operator origin");
     }
+
+    #[test]
+    fn new_withholds_key_from_untrusted_origin_but_attaches_for_operator() {
+        let guard = ICAPTCHA_ENV_LOCK.lock().unwrap();
+        let prev_key = std::env::var_os("GITLAWB_ICAPTCHA_API_KEY");
+        let prev_op = std::env::var_os("GITLAWB_ICAPTCHA_URL");
+        std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", "secret-bearer");
+
+        // Arm 1: No operator configured, node advertises an attacker origin.
+        // The key has no trusted destination; the advert is rejected.
+        std::env::remove_var("GITLAWB_ICAPTCHA_URL");
+        let untrusted =
+            IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
+
+        // Arm 1b: No operator configured, no URL advertised. The fallback goes
+        // to the default public origin, and with no operator to trust, the key
+        // must not ride.
+        let no_operator_no_advert = IcaptchaCfg::new("did:key:zTEST", None, None);
+
+        // Arm 2: Operator origin configured and advertised — key attached.
+        std::env::set_var("GITLAWB_ICAPTCHA_URL", "https://icap.mynode.example");
+        let operator_match = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icap.mynode.example/v1".into()),
+            None,
+        );
+
+        // Arm 3: Operator configured, default host advertised. The default host
+        // is allowlisted and selected, but its origin differs from the
+        // operator's, so key must not ride.
+        let default_advert = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icaptcha.gitlawb.com/v2".into()),
+            None,
+        );
+
+        // Arm 4: Operator configured, no URL advertised (the node sent only
+        // x-icaptcha-level, not x-icaptcha-url). resolve_solver_url falls back
+        // to the operator origin and marks the key trusted. This is the common
+        // API-key deployment path — a regression that additionally required
+        // url.is_some() for key attachment would leave all current tests green
+        // but make these fallback challenge/answer requests omit Authorization
+        // and fail against the protected operator service.
+        let operator_fallback = IcaptchaCfg::new("did:key:zTEST", None, Some(3));
+
+        // Arm 5: Operator configured, node advertises an attacker origin.
+        // The advert is rejected and the solver falls back to the operator's
+        // own origin, which keeps the key trusted — this is the exfiltration
+        // scenario the test name describes (withhold key from *untrusted*
+        // origin, not from the operator's fallback).
+        let operator_hostile_advert =
+            IcaptchaCfg::new("did:key:zTEST", Some("https://evil.example".into()), None);
+
+        // Arm 6: Operator configured, same host but different port.
+        // origin_key includes the port, so :8443 must not match the
+        // operator origin at the default :443 — the advert is rejected
+        // and the solver falls back to the operator origin.
+        let operator_diff_port = IcaptchaCfg::new(
+            "did:key:zTEST",
+            Some("https://icap.mynode.example:8443/evil".into()),
+            None,
+        );
+
+        // Restore env and release the lock BEFORE asserting, so a failing
+        // assertion can't poison the shared lock or cascade into a sibling.
+        match prev_key {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_API_KEY", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_API_KEY"),
+        }
+        match prev_op {
+            Some(v) => std::env::set_var("GITLAWB_ICAPTCHA_URL", v),
+            None => std::env::remove_var("GITLAWB_ICAPTCHA_URL"),
+        }
+        drop(guard);
+
+        let mut failures: Vec<String> = Vec::new();
+
+        if untrusted.api_key.is_some() {
+            failures.push(format!(
+                "arm 1 (no operator, attacker advert): expected api_key=None, got {:?}",
+                untrusted.api_key
+            ));
+        }
+        if untrusted.url != DEFAULT_URL {
+            failures.push(format!(
+                "arm 1 (no operator, attacker advert): expected url={DEFAULT_URL}, got {}",
+                untrusted.url
+            ));
+        }
+
+        if no_operator_no_advert.api_key.is_some() {
+            failures.push(format!(
+                "arm 1b (no operator, no advert): expected api_key=None, got {:?}",
+                no_operator_no_advert.api_key
+            ));
+        }
+        if no_operator_no_advert.url != DEFAULT_URL {
+            failures.push(format!(
+                "arm 1b (no operator, no advert): expected url={DEFAULT_URL}, got {}",
+                no_operator_no_advert.url
+            ));
+        }
+
+        if operator_match.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 2 (operator match): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_match.api_key
+            ));
+        }
+        if operator_match.url != "https://icap.mynode.example/v1" {
+            failures.push(format!(
+                "arm 2 (operator match): expected url=https://icap.mynode.example/v1, got {}",
+                operator_match.url
+            ));
+        }
+
+        if default_advert.api_key.is_some() {
+            failures.push(format!(
+                "arm 3 (operator + default advert): expected api_key=None, got {:?}",
+                default_advert.api_key
+            ));
+        }
+        if default_advert.url != "https://icaptcha.gitlawb.com/v2" {
+            failures.push(format!(
+                "arm 3 (operator + default advert): expected url=https://icaptcha.gitlawb.com/v2, got {}",
+                default_advert.url
+            ));
+        }
+
+        if operator_fallback.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 4 (operator fallback, no advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_fallback.api_key
+            ));
+        }
+        if operator_fallback.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 4 (operator fallback, no advert): expected url=https://icap.mynode.example, got {}",
+                operator_fallback.url
+            ));
+        }
+
+        if operator_hostile_advert.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 5 (operator + hostile advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_hostile_advert.api_key
+            ));
+        }
+        if operator_hostile_advert.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 5 (operator + hostile advert): expected url=https://icap.mynode.example, got {}",
+                operator_hostile_advert.url
+            ));
+        }
+
+        if operator_diff_port.api_key.as_deref() != Some("secret-bearer") {
+            failures.push(format!(
+                "arm 6 (operator + different port advert): expected api_key=Some(\"secret-bearer\"), got {:?}",
+                operator_diff_port.api_key
+            ));
+        }
+        if operator_diff_port.url != "https://icap.mynode.example" {
+            failures.push(format!(
+                "arm 6 (operator + different port advert): expected url=https://icap.mynode.example, got {}",
+                operator_diff_port.url
+            ));
+        }
+
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
 }
