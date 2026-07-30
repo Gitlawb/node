@@ -438,6 +438,7 @@ pub fn object_type_bounded(
     sha256_hex: &str,
     deadline: std::time::Instant,
 ) -> std::result::Result<Option<String>, ProbeError> {
+    let probe_started = std::time::Instant::now();
     match batch_check_probe(git_bin, repo_path, sha256_hex, deadline)? {
         BatchProbe::Present(ty) => Ok(Some(ty)),
         BatchProbe::Fault(detail) => Err(classify_store_fault(repo_path, detail)),
@@ -453,11 +454,27 @@ pub fn object_type_bounded(
                     repo_path.display()
                 )));
             }
-            // Store readable: re-probe once. Still `missing` on a confirmed-readable
-            // store is very likely truly absent (Ok(None)); a mid-repack race that
-            // resolved returns the type. This narrows, but cannot fully close, the
-            // concurrent-repack window (the readability check samples a different
-            // instant than the failing probe).
+            // Only re-probe if the budget can actually pay for it. The re-probe runs the
+            // SAME command, so it needs roughly what the first probe took; with less than
+            // that left, the child is spawned only to be reaped, and the watchdog's
+            // SIGTERM grace plus SIGKILL settle carries this call well past `deadline`
+            // (measured ~2x a 1s budget before this check existed). `/ipfs/{cid}` is
+            // anon-reachable and an absent CID drives this branch once per repo, so an
+            // unaffordable re-probe is pure overshoot on a permissionless path. An
+            // inconclusive disambiguation is NOT an absence verdict, so taint to a
+            // retryable Transient rather than spawn or return a false Ok(None).
+            let first_probe_took = probe_started.elapsed();
+            if deadline.saturating_duration_since(std::time::Instant::now()) < first_probe_took {
+                return Err(ProbeError::Transient(anyhow::anyhow!(
+                    "git cat-file inconclusive: no budget left for the confirming re-probe at {} (not an absence verdict)",
+                    repo_path.display()
+                )));
+            }
+            // Store readable and budget available: re-probe once. Still `missing` on a
+            // confirmed-readable store is very likely truly absent (Ok(None)); a
+            // mid-repack race that resolved returns the type. This narrows, but cannot
+            // fully close, the concurrent-repack window (the readability check samples a
+            // different instant than the failing probe).
             match batch_check_probe(git_bin, repo_path, sha256_hex, deadline)? {
                 BatchProbe::Present(ty) => Ok(Some(ty)),
                 BatchProbe::Fault(detail) => Err(classify_store_fault(repo_path, detail)),
@@ -1019,6 +1036,106 @@ mod tests {
             res.is_err(),
             "a corrupt loose object (error: on stderr, `missing` on stdout) must be Err, \
              never a false Ok(None) 404; got {res:?}"
+        );
+    }
+
+    /// #174 U1 follow-up (RED-before/GREEN-after): the absent-CID path must not spawn a
+    /// confirming re-probe it cannot afford. `object_type_bounded` disambiguates a clean
+    /// `missing` by re-running the probe, but the re-probe took the SAME deadline with no
+    /// check that any budget was left, so a first probe that nearly exhausted the budget
+    /// still spawned a second child that could only be reaped. The watchdog's SIGTERM
+    /// grace plus SIGKILL settle then carried the whole call to ~2x the budget, on a
+    /// route an unauthenticated caller drives for every repo by spraying absent CIDs.
+    ///
+    /// Load-bearing: remove the affordability check and this goes RED on both assertions
+    /// (a second spawn appears, and elapsed crosses 2x the budget). Measured before the
+    /// fix: spawns=2, elapsed 2021ms against a 1000ms budget.
+    #[cfg(unix)]
+    #[test]
+    fn absent_probe_skips_a_reprobe_it_cannot_afford() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
+        let log = td.path().join("spawns.log");
+        let fake = td.path().join("fakegit");
+        // Burns 0.9s of a 1s budget, then reports the structured absence token cleanly.
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho call >> {}\nsleep 0.9\necho 'deadbeef missing'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let budget = std::time::Duration::from_millis(1000);
+        let deadline = std::time::Instant::now() + budget;
+        let started = std::time::Instant::now();
+        let res = super::object_type_bounded(fake.to_str().unwrap(), &bare, "deadbeef", deadline);
+        let elapsed = started.elapsed();
+        let spawns = std::fs::read_to_string(&log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+
+        assert_eq!(
+            spawns, 1,
+            "a re-probe with no remaining budget must not be spawned at all; a second \
+             spawn here is a child created only to be reaped, and its teardown grace is \
+             what pushes this call past the deadline"
+        );
+        assert!(
+            elapsed < budget + std::time::Duration::from_millis(400),
+            "the call must not overshoot its deadline by the reap grace; got {elapsed:?} \
+             against a {budget:?} budget (pre-fix this was ~2x the budget)"
+        );
+        assert!(
+            matches!(res, Err(super::ProbeError::Transient(_))),
+            "an unaffordable disambiguation is NOT an absence verdict: it must taint to \
+             a retryable Transient, never a false Ok(None) 404; got {res:?}"
+        );
+    }
+
+    /// Companion must-not-regress case for the affordability check above: with an ample
+    /// budget the confirming re-probe MUST still run, so the #174 F5 disambiguation is
+    /// intact and the check did not simply disable it. Two spawns, and a clean absence.
+    #[cfg(unix)]
+    #[test]
+    fn absent_probe_still_reprobes_when_the_budget_allows() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
+        let log = td.path().join("spawns.log");
+        let fake = td.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho call >> {}\necho 'deadbeef missing'\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let res = super::object_type_bounded(fake.to_str().unwrap(), &bare, "deadbeef", deadline);
+        let spawns = std::fs::read_to_string(&log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            spawns, 2,
+            "with budget to spare the confirming re-probe must still run, or the \
+             absence-vs-unreadable-pack disambiguation is gone"
+        );
+        assert!(
+            matches!(res, Ok(None)),
+            "a clean `missing` twice on a readable store is a genuine absence; got {res:?}"
         );
     }
 }
