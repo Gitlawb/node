@@ -503,7 +503,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::CONFLICT,
+            StatusCode::FORBIDDEN,
             "stranger must not steal a pre-assigned task, got {}",
             resp.status()
         );
@@ -581,6 +581,105 @@ mod tests {
         let got = state.db.get_task("task-open").await.unwrap().unwrap();
         assert_eq!(got.status, "claimed");
         assert_eq!(got.assignee_did.as_deref(), Some(claimer));
+    }
+
+    /// Blank `assignee_did` must be treated as open, not permanently reserved.
+    #[sqlx::test]
+    async fn claim_task_blank_reservation_is_open(pool: PgPool) {
+        let delegator = "did:key:zBLANKDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let claimer = "did:key:zBLANKCLAIMERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+        let mut task = seed_task("task-blank", delegator);
+        task.assignee_did = Some(String::new());
+        state.db.create_task(&task).await.expect("seed");
+
+        let claimed = state
+            .db
+            .claim_task("task-blank", claimer)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.status, "claimed");
+        assert_eq!(claimed.assignee_did.as_deref(), Some(claimer));
+    }
+
+    /// Claiming a reserved task must keep the stored DID form so exact-match
+    /// list filters still find it.
+    #[sqlx::test]
+    async fn claim_task_keeps_stored_assignee_did_form(pool: PgPool) {
+        let delegator = "did:key:zFORMDELEGATORAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let bare = "zFORMRESERVEDBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let full = format!("did:key:{bare}");
+        let state = test_state(pool).await;
+        let mut task = seed_task("task-form", delegator);
+        task.assignee_did = Some(bare.to_string());
+        state.db.create_task(&task).await.expect("seed");
+
+        let claimed = state
+            .db
+            .claim_task("task-form", &full)
+            .await
+            .expect("claim with full DID");
+        assert_eq!(
+            claimed.assignee_did.as_deref(),
+            Some(bare),
+            "reserved claim must keep the stored bare-key form"
+        );
+        let listed = state
+            .db
+            .list_tasks(Some("claimed"), Some(bare), 10)
+            .await
+            .unwrap();
+        assert!(
+            listed.iter().any(|t| t.id == "task-form"),
+            "delegator filtering by bare key must still find the task"
+        );
+    }
+
+    /// Direct coverage for the DB-layer finish_task assignee bind (handlers
+    /// 403 before calling in, so HTTP tests alone leave this unproven).
+    #[sqlx::test]
+    async fn finish_task_rejects_non_assignee_at_db(pool: PgPool) {
+        let delegator = "did:key:zFINISHDELEGATORAAAAAAAAAAAAAAAAAAAAAAAA";
+        let assignee = "did:key:zFINISHASSIGNEEBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zFINISHSTRANGERCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_task(&seed_task("task-finish-gate", delegator))
+            .await
+            .expect("seed");
+        state
+            .db
+            .claim_task("task-finish-gate", assignee)
+            .await
+            .expect("claim");
+
+        let err = state
+            .db
+            .finish_task("task-finish-gate", "completed", None, stranger)
+            .await
+            .expect_err("stranger must not finish");
+        assert!(
+            err.to_string().contains("assignee") || err.to_string().contains("finishable"),
+            "expected assignee denial, got {err}"
+        );
+        let still = state
+            .db
+            .get_task("task-finish-gate")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            still.status, "claimed",
+            "row must stay claimed after denial"
+        );
+
+        let done = state
+            .db
+            .finish_task("task-finish-gate", "completed", None, assignee)
+            .await
+            .expect("assignee finishes");
+        assert_eq!(done.status, "completed");
     }
 
     /// Adversarial-review GATE-2 (create_pr): opening a PR requires read access.

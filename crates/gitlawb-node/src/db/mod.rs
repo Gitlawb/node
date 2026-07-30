@@ -2525,6 +2525,12 @@ impl Db {
 
 // ── Agent Tasks ───────────────────────────────────────────────────────────────
 
+/// Permanent authorization denial: the task is reserved for a different assignee.
+/// Handlers downcast this to return 403 (vs 409 for a lost claim race).
+#[derive(Debug, thiserror::Error)]
+#[error("task not claimable: reserved for another assignee")]
+pub struct TaskReservedForOtherAssignee;
+
 impl Db {
     pub async fn create_task(&self, task: &AgentTask) -> Result<()> {
         sqlx::query(
@@ -2605,37 +2611,45 @@ impl Db {
 
     /// Claim a pending task for `assignee_did`.
     ///
-    /// If the task was created with a pre-set `assignee_did`, only that agent
-    /// (DID-normalized via [`crate::api::did_matches`]) may claim it. Open
-    /// tasks (`assignee_did IS NULL`) remain first-claimer-wins. The UPDATE
-    /// re-checks the assignee slot so a concurrent stranger cannot race past
-    /// the Rust gate and steal a reserved task (and its `ucan_token`).
+    /// If the task was created with a non-blank pre-set `assignee_did`, only that
+    /// agent (DID-normalized via [`crate::api::did_matches`]) may claim it. Open
+    /// tasks (`NULL` / blank) remain first-claimer-wins. A reserved claim keeps
+    /// the stored DID form (`COALESCE`) so exact-match list filters still work.
+    /// The UPDATE also re-checks the assignee slot as defense-in-depth against a
+    /// future writer racing the pre-check.
     pub async fn claim_task(&self, id: &str, assignee_did: &str) -> Result<AgentTask> {
         let now = Utc::now().to_rfc3339();
-        let existing = self
-            .get_task(id)
+        // Denial path only needs status + assignee — do not load payload/UCAN
+        // for a permissionless caller who will be rejected.
+        let row = sqlx::query("SELECT status, assignee_did FROM agent_tasks WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| anyhow::anyhow!("task not claimable: not found or already claimed"))?;
-        if existing.status != "pending" {
+        let status: String = row.get("status");
+        if status != "pending" {
             return Err(anyhow::anyhow!(
                 "task not claimable: not found or already claimed"
             ));
         }
-        if let Some(ref reserved) = existing.assignee_did {
-            if !crate::api::did_matches(assignee_did, reserved) {
-                return Err(anyhow::anyhow!(
-                    "task not claimable: reserved for another assignee"
-                ));
+        let stored: Option<String> = row.get("assignee_did");
+        // Blank reservations are treated as open (create_task does not validate).
+        // Keep the exact stored string for the UPDATE equality check.
+        let reserved_exact = stored.as_deref().filter(|r| !r.trim().is_empty());
+        if let Some(reserved) = reserved_exact {
+            if !crate::api::did_matches(assignee_did, reserved.trim()) {
+                return Err(TaskReservedForOtherAssignee.into());
             }
         }
-        // Bind the exact stored assignee (or NULL) so the race window cannot
-        // flip the slot after we authorized the caller.
-        let reserved_exact = existing.assignee_did.as_deref();
+        // Keep the stored form when reserved; only fill assignee on open claims.
+        // Treat blank stored values as open for the SQL slot check.
         let row = sqlx::query(
-            "UPDATE agent_tasks SET status='claimed', assignee_did=$2, updated_at=$3
+            "UPDATE agent_tasks SET status='claimed',
+                 assignee_did = COALESCE(NULLIF(BTRIM(assignee_did), ''), $2),
+                 updated_at=$3
              WHERE id=$1 AND status='pending'
                AND (
-                 ($4::text IS NULL AND assignee_did IS NULL)
+                 ($4::text IS NULL AND (assignee_did IS NULL OR BTRIM(assignee_did) = ''))
                  OR assignee_did = $4
                )
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",

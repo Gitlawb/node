@@ -175,6 +175,11 @@ pub async fn claim_task(
         return Err(forbidden("assignee_did must be the authenticated signer"));
     }
     let task = state.db.claim_task(&id, &auth.0).await.map_err(|e| {
+        if e.downcast_ref::<crate::db::TaskReservedForOtherAssignee>()
+            .is_some()
+        {
+            return forbidden("task not claimable: reserved for another assignee");
+        }
         (
             StatusCode::CONFLICT,
             Json(json!({ "error": e.to_string() })),
