@@ -1729,8 +1729,19 @@ pub async fn git_receive_pack(
     // bound — on the non-disconnect path the retained pg advisory lock still serializes
     // the stealer at acquire_write (a spurious 503, not a race); the only corruption-capable
     // overlap is the ~4s disconnect/reap window, which the reaper-carried clone (a) covers.
-    let lease_steal_after =
-        std::time::Duration::from_secs(state.config.git_service_timeout_secs * 2 + 60);
+    // Saturating, not unchecked: `git_service_timeout_secs` accepts every positive u64 and
+    // its help text explicitly permits setting it very large to disable the service bound,
+    // so `* 2 + 60` overflows across the top of the accepted range — a debug panic on every
+    // push, and in release a WRAPPED bound short enough for a waiter to steal a live push's
+    // lease. Saturating keeps the documented semantic intact: a timeout that large means no
+    // steal, which is what an effectively-disabled service bound implies.
+    let lease_steal_after = std::time::Duration::from_secs(
+        state
+            .config
+            .git_service_timeout_secs
+            .saturating_mul(2)
+            .saturating_add(60),
+    );
 
     // Parked waiters are bounded INSIDE the lease, not by an admission permit taken above
     // it. `body: Bytes` means axum has already buffered the whole pack before this handler
@@ -7931,6 +7942,62 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    /// #174 (RED-before/GREEN-after): a large-but-valid `GITLAWB_GIT_SERVICE_TIMEOUT_SECS`
+    /// must not overflow the lease steal bound derived from it. The config help explicitly
+    /// permits setting the timeout very large to disable the bound and clap accepts every
+    /// positive `u64`, so an unchecked `* 2 + 60` panics the push in a debug build and
+    /// wraps to a short `Duration` in release — a wrapped bound would let a waiter steal
+    /// the lease out from under a live push. Drives the handler rather than the
+    /// arithmetic, so the call-site wiring is what is under test.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn push_survives_a_git_service_timeout_that_overflows_the_lease_bound(
+        pool: sqlx::PgPool,
+    ) {
+        use axum::extract::{Path, State};
+        use axum::response::IntoResponse;
+        use axum::Extension;
+        use std::net::SocketAddr;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let git_bin = write_fake_git(
+            tmp.path(),
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               receive-pack) cat > /dev/null 2>/dev/null ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+        );
+        let mut state =
+            f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6ovflow", "o1", false).await;
+        // The largest value clap accepts. Any value above (u64::MAX - 60) / 2 overflows the
+        // derived bound, so this is the whole tail of the accepted range, not a corner.
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = u64::MAX;
+        state.config = std::sync::Arc::new(cfg);
+
+        let resp = git_receive_pack(
+            State(state),
+            Path(("z6ovflow".to_string(), "o1".to_string())),
+            Extension(crate::auth::AuthenticatedDid(
+                "did:key:z6MkOverflowPusherAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            )),
+            crate::rate_limit::PeerAddr(Some("203.0.113.90:5000".parse::<SocketAddr>().unwrap())),
+            axum::http::HeaderMap::new(),
+            ref_update_body("1111111111111111111111111111111111111111"),
+        )
+        .await
+        .expect("push must succeed under a maximal git_service_timeout_secs")
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            200,
+            "a maximal service timeout must disable the steal bound, not break the push"
+        );
     }
 
     /// #174 U1 scenario 1 (RED-before/GREEN-after): parked pushes on one repo's write
