@@ -1361,6 +1361,16 @@ pub async fn git_upload_pack(
         // task hands the permits back so the serve phase below keeps them; on a
         // dropped future the returned tuple (with the permits) is discarded only when
         // the blocking task completes, so admission tracks the real git work.
+        // ONE deadline spans the walk AND the serve below (#174 U1 follow-up). A fresh
+        // `git_timeout` for the serve let a slow-but-successful walk plus a full serve
+        // hold this read permit ~2x the configured budget. Sharing the deadline caps
+        // that at ~1x: the walk runs against the remaining budget, and if it consumes
+        // the budget the serve gets what is left and is reaped rather than over-holding
+        // — the safe direction, same tradeoff as `fail_closed_full_scan_objects` and
+        // `build_filtered_pack`. The cost is honest: a genuinely slow walk on a large
+        // repo 504s this clone instead of silently holding the pool for ~2x, so size
+        // `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` so both phases normally fit.
+        let deadline = std::time::Instant::now() + git_timeout;
         let (withheld, _permit, _caller_permit) = {
             let path = disk_path.clone();
             let rules = rules.clone();
@@ -1368,11 +1378,12 @@ pub async fn git_upload_pack(
             let caller_owned = caller.map(str::to_string);
             let is_public = record.is_public;
             let git_bin = state.git_bin.clone();
+            let walk_budget = deadline.saturating_duration_since(std::time::Instant::now());
             tokio::task::spawn_blocking(move || {
                 let withheld = visibility_pack::withheld_blob_oids_bounded(
                     &path,
                     &git_bin,
-                    git_timeout,
+                    walk_budget,
                     &rules,
                     is_public,
                     &owner_did,
@@ -1393,10 +1404,22 @@ pub async fn git_upload_pack(
         // The handler keeps no copy (F1: handler-local permits would drop the
         // instant a disconnect drops this future, mid-reap).
         let admission = smart_http::AdmissionGuard::new(_permit, _caller_permit);
+        // Computed AFTER the walk's await, so the serve gets what the walk left, not a
+        // second full budget. A walk that consumed the whole budget saturates this to
+        // zero, which the serve surfaces as GitServiceTimeout -> 504 rather than
+        // running unbounded.
+        let serve_budget = deadline.saturating_duration_since(std::time::Instant::now());
         if withheld.is_empty() {
             // No blobs to withhold: serve the plain pack (the walk already held the
             // permits per be0cdd6; the guard hands them to the serve).
-            smart_http::upload_pack(&state.git_bin, &disk_path, body, git_timeout, Some(admission)).await
+            smart_http::upload_pack(
+                &state.git_bin,
+                &disk_path,
+                body,
+                serve_budget,
+                Some(admission),
+            )
+            .await
         } else {
             tracing::info!(repo = %name, caller = ?caller, withheld = withheld.len(), "serving filtered pack");
             // The guard threads through both filtered-pack stages (rev-list, then
@@ -1407,7 +1430,7 @@ pub async fn git_upload_pack(
                 &disk_path,
                 body,
                 &withheld,
-                git_timeout,
+                serve_budget,
                 Some(admission),
             )
             .await
@@ -3329,6 +3352,169 @@ mod tests {
             status,
             StatusCode::GATEWAY_TIMEOUT,
             "a hung withheld-blob walk must surface as 504, not a generic 500"
+        );
+    }
+
+    /// #174 U1 follow-up (RED-before/GREEN-after): the path-scoped upload-pack branch
+    /// shares ONE deadline across the withheld-blob walk and the pack serve, so one
+    /// clone cannot hold a read permit for ~2x `git_service_timeout_secs`. A walk that
+    /// consumes most of the budget must leave the serve only the REMAINDER, so the
+    /// serve is reaped and the request is a 504.
+    ///
+    /// Load-bearing: give the serve a fresh `git_timeout` instead of the remainder and
+    /// the fake `upload-pack` (1.2s) fits inside a fresh 2s budget, completes, and the
+    /// status is no longer 504 (RED). This is the ~2x-budget hold the unit removes.
+    ///
+    /// Plain-serve arm: the fake git lists no refs and fails `rev-parse`, so the walk
+    /// yields an empty withheld set and the branch takes `upload_pack`. `rev-list`
+    /// carries the walk's cost.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn upload_pack_shares_one_deadline_across_walk_and_plain_serve(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Walk: no refs (for-each-ref empty), HEAD does not resolve (rev-parse exit 1),
+        // rev-list burns 1.2s of the 2s budget and lists no commits -> empty withheld.
+        // Serve: upload-pack needs 1.2s, which does NOT fit the ~0.8s remainder but
+        // WOULD fit a fresh 2s budget.
+        let body = "#!/bin/sh\ncase \"$1\" in\n  rev-parse) exit 1 ;;\n  rev-list) sleep 1.2 ;;\n  upload-pack) sleep 1.2 ;;\n  *) : ;;\nesac\nexit 0\n";
+        let fake = write_fake_git(tmp.path(), body);
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_bin = fake;
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = 2;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo("z6shared1", "sv", "/tmp/z6shared1-sv", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6shared1", "sv").await.unwrap().unwrap();
+        // Path-scoped rule so has_path_scoped_rule() is true and the walk runs.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[],
+                OWNER_DID,
+            )
+            .await
+            .unwrap();
+        let disk = std::path::Path::new("/tmp/z6shared1/sv.git");
+        std::fs::create_dir_all(disk).unwrap();
+
+        let peer: SocketAddr = "203.0.113.92:7000".parse().unwrap();
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/z6shared1/sv/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let status = router.oneshot(req).await.unwrap().status();
+        let _ = std::fs::remove_dir_all("/tmp/z6shared1");
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "the walk and the serve must share ONE deadline, so a walk that burns most \
+             of the budget leaves the serve only the remainder and the serve is reaped; \
+             a non-504 here means the serve got a fresh full budget (the ~2x hold)"
+        );
+    }
+
+    /// #174 U1 follow-up, FILTERED arm (RED-before/GREEN-after): the shared deadline
+    /// must reach `upload_pack_excluding` too, not just the plain `upload_pack`. Same
+    /// property as the plain-arm test, different serve function, because the branch
+    /// threads the remainder into both arms and a fix that missed one would leave the
+    /// ~2x hold reachable by any clone of a repo that actually withholds something.
+    ///
+    /// The fake git yields a NON-EMPTY withheld set: one ref peeling to a commit, a
+    /// resolvable HEAD, one commit, and an `ls-tree -rz` record placing a blob under
+    /// `/secret/`, which the path-scoped rule denies to an anonymous caller. `ls-tree`
+    /// carries the walk's cost (walk-only), and `pack-objects` carries the serve's, so
+    /// the two phases are independently attributable.
+    ///
+    /// Load-bearing: hand the serve a fresh `git_timeout` and `pack-objects` (1.2s)
+    /// fits a fresh 2s budget, completes, and the status is no longer 504 (RED).
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn upload_pack_shares_one_deadline_across_walk_and_filtered_serve(pool: sqlx::PgPool) {
+        use axum::body::Body;
+        use axum::extract::ConnectInfo;
+        use axum::http::{Method, Request, StatusCode};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let blob = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // for-each-ref lists one ref; cat-file peels it to a commit (the fail-closed
+        // ref check); rev-parse resolves HEAD; rev-list lists the one commit; ls-tree
+        // emits "<mode> blob <oid>\t<path>" (NUL-delimited) under secret/ and burns
+        // 1.2s of the 2s budget; pack-objects is the serve's 1.2s cost.
+        let body = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  \
+             for-each-ref) echo refs/heads/main ;;\n  \
+             cat-file) echo commit ;;\n  \
+             rev-parse) echo {commit} ;;\n  \
+             rev-list) echo {commit} ;;\n  \
+             ls-tree) printf '100644 blob {blob}\\tsecret/f.txt' ; sleep 1.2 ;;\n  \
+             pack-objects) sleep 1.2 ;;\n  \
+             *) : ;;\nesac\nexit 0\n"
+        );
+        let fake = write_fake_git(tmp.path(), &body);
+
+        let mut state = crate::test_support::test_state(pool).await;
+        state.git_bin = fake;
+        let mut cfg = (*state.config).clone();
+        cfg.git_service_timeout_secs = 2;
+        state.config = std::sync::Arc::new(cfg);
+        state
+            .db
+            .upsert_mirror_repo("z6shared2", "sv", "/tmp/z6shared2-sv", None, false)
+            .await
+            .unwrap();
+        let rec = state.db.get_repo("z6shared2", "sv").await.unwrap().unwrap();
+        // Denies /secret/** to an anonymous caller, so the blob above is withheld and
+        // the branch takes upload_pack_excluding rather than the plain serve.
+        state
+            .db
+            .set_visibility_rule(
+                &rec.id,
+                "/secret/**",
+                crate::db::VisibilityMode::B,
+                &[],
+                OWNER_DID,
+            )
+            .await
+            .unwrap();
+        let disk = std::path::Path::new("/tmp/z6shared2/sv.git");
+        std::fs::create_dir_all(disk).unwrap();
+
+        let peer: SocketAddr = "203.0.113.93:7000".parse().unwrap();
+        let router = crate::server::build_router(state);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/z6shared2/sv/git-upload-pack")
+            .body(Body::from(&b"0000"[..]))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let status = router.oneshot(req).await.unwrap().status();
+        let _ = std::fs::remove_dir_all("/tmp/z6shared2");
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "the FILTERED serve must also take the shared deadline's remainder; a \
+             non-504 here means upload_pack_excluding got a fresh full budget and the \
+             ~2x hold is still reachable whenever a repo withholds a blob"
         );
     }
 
