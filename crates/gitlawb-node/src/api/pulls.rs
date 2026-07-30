@@ -212,8 +212,7 @@ pub async fn merge_pr(
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .await?;
     let disk_path = guard.path().to_path_buf();
     let merger_did = auth.0;
     let merge_result = store::merge_branch(

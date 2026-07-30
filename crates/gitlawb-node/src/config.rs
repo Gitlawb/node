@@ -271,9 +271,12 @@ pub struct Config {
     /// Upper bound, in seconds, on any single object-storage transfer that runs
     /// while the per-repo advisory lock is HELD.
     ///
-    /// Two such transfers exist: the archive download in `acquire_write`, which
-    /// runs after the lock is taken and before the guard is constructed, and the
-    /// archive upload in `release`. Both used to be free, because the lock's
+    /// Two bounded spans exist, and the bound applies per span. The acquire-side
+    /// refresh in `acquire_write` covers the existence HEAD and the download
+    /// together under ONE budget (it runs after the lock is taken and before the
+    /// guard is constructed), and the archive upload in `release` gets its own.
+    /// Worst-case slot occupancy is therefore about twice this value plus the git
+    /// work between them, not one times this value. Both used to be free, because the lock's
     /// connection was returned to the pool immediately; now that a write guard
     /// pins a lock-pool connection for its whole lifetime, an unbounded transfer
     /// holds that slot, and enough stalled transfers deny every write on the node.
