@@ -3,7 +3,10 @@
 # Used by scripts/build-bins.sh — not used for node deployment.
 ARG TARGET=x86_64-unknown-linux-musl
 
-FROM rust:1.85-bookworm AS builder
+# Must stay at or above the workspace `rust-version` in Cargo.toml. An unmet
+# MSRV is a hard cargo error, and nothing in CI builds this file, so a stale
+# base image here fails only when someone runs scripts/build-bins.sh.
+FROM rust:1.91-bookworm AS builder
 ARG TARGET
 
 WORKDIR /build
