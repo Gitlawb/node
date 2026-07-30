@@ -674,8 +674,8 @@ impl Drop for RepoWriteGuard {
     /// error: that case is closed inside `release` by disposing of the connection,
     /// because `Drop` early-returns on `conn == None` and the two mechanisms cannot
     /// both apply (#174 F3b). `Drop` cannot await, so spawn a detached unlock — it runs on the
-    /// same session (connection-affine). An off-runtime drop falls back to a log;
-    /// the ~60s stale-lock retry loop in `acquire_write` reclaims it. On runtime
+    /// same session (connection-affine). An off-runtime drop has nothing to spawn onto,
+    /// so it disposes of the connection instead. On runtime
     /// SHUTDOWN the spawned unlock task may be dropped before it polls, so the unlock
     /// may not run — but shutdown tears down the pool, and closing the connection
     /// releases the session-level advisory lock server-side, so this too is bounded.
@@ -691,20 +691,38 @@ impl Drop for RepoWriteGuard {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+                    let unlock = sqlx::query("SELECT pg_advisory_unlock($1)")
                         .bind(lock_key)
                         .execute(&mut *conn)
-                        .await
-                    {
-                        warn!(repo = %repo_name, err = %e, "detached advisory-unlock on write-guard drop failed");
+                        .await;
+                    // Same failure as `release`'s (#174 F3b), one level down: the await
+                    // RESOLVED with an error, so the session is alive and still holds
+                    // the lock. Letting this async block end here would drop `conn` and
+                    // RETURN it to the pool, handing the next caller a connection
+                    // holding a lock nobody tracks. Close it instead, which both keeps
+                    // it out of the pool and ends the session that holds the lock.
+                    if let Err(e) = unlock {
+                        warn!(repo = %repo_name, err = %e, "detached advisory-unlock on write-guard drop failed, closing the connection so the session ends and postgres drops the lock");
+                        close_conn_bounded(&repo_name, conn.close()).await;
                     }
                 });
             }
             Err(_) => {
+                // No runtime to spawn the unlock onto, and the connection is already
+                // out of the guard, so there is no path that unlocks on this session.
+                // Returning it to the pool would hand the next caller a connection
+                // still holding the lock. `PoolConnection`'s own drop also spawns its
+                // return-to-pool task, which panics with no runtime. `detach` gives up
+                // the pool slot and yields a plain `PgConnection`; dropping that closes
+                // the socket, which ends the session and is what frees the lock
+                // server-side. `Drop` cannot await, so this is the whole disposal:
+                // `close_conn_bounded` is not available here.
+                drop(conn.detach());
                 warn!(
                     repo = %repo_name,
-                    "RepoWriteGuard dropped off a Tokio runtime; advisory lock not released \
-                     synchronously — the stale-lock retry loop will reclaim it"
+                    "RepoWriteGuard dropped off a Tokio runtime; no detached unlock is \
+                     possible, so the pinned connection is disposed of instead: ending \
+                     the session is what releases the advisory lock"
                 );
             }
         }
@@ -1538,6 +1556,160 @@ mod tests {
             .await
             .unwrap();
         assert!(free, "the success path must still free the lock");
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *checker)
+            .await;
+    }
+
+    // ── the Drop backstop disposes its connection too (#174 U8) ─────────────
+
+    /// U8 (P2): the `Drop` backstop carries the same hazard F3b closed in `release`.
+    /// When the detached `pg_advisory_unlock` ERRORS on a live session, the async
+    /// block ends and drops the moved `PoolConnection`, which RETURNS it to the pool
+    /// while that session may still hold the lock, handing the next caller a
+    /// connection holding a lock nobody tracks. The errored connection must be closed
+    /// instead: that keeps it out of the pool and ends the session, which is what
+    /// frees the lock server-side.
+    ///
+    /// Run against a pool with the idle reaper disabled, for the reason spelled out on
+    /// `pool_without_idle_reaper`: with the reaper in play the session dies on its own
+    /// about a second later and the assertion stops measuring the disposal.
+    ///
+    /// Load-bearing: RED before the fix (the connection goes back to the pool, so the
+    /// size never drops and this times out), GREEN after.
+    #[sqlx::test]
+    async fn write_guard_drop_with_failing_unlock_does_not_return_the_connection(
+        pool: sqlx::PgPool,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_pool = pool_without_idle_reaper(&pool).await;
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), store_pool.clone());
+        let owner = "did:key:z6MkDropUnlockErrProofIIIIIIIIIIIIIIIIIIII";
+        let name = "dropunlockerrtest";
+        let slug = owner.replace([':', '/'], "_");
+        let key = advisory_lock_key(&slug, name);
+
+        // Distinct session for the probe, held out of the store's pool entirely.
+        let mut checker = pool.acquire().await.expect("checker connection");
+
+        let mut guard = store.acquire_write(owner, name).await.expect("acquire");
+        poison_guard_connection(&mut guard).await;
+        let size_before = store_pool.size();
+        assert!(size_before > 0, "the pool owns the guard's connection");
+
+        // The backstop shape: dropped without release(), with an unlock that errors.
+        drop(guard);
+
+        wait_until(
+            || store_pool.size() == size_before - 1,
+            "the connection whose detached unlock errored to be closed rather than \
+             returned to the pool still holding the session lock",
+        )
+        .await;
+        wait_until_lock_free(
+            &mut checker,
+            key,
+            "an errored detached unlock must not leave the lock held: Drop must dispose \
+             of the connection so the session ends",
+        )
+        .await;
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *checker)
+            .await;
+    }
+
+    /// U8 regression guard on the success path: a detached unlock that SUCCEEDS must
+    /// still return the connection to the pool. Without this, "close the connection on
+    /// Drop" could be widened to "always close" and the test above would not notice.
+    #[sqlx::test]
+    async fn write_guard_drop_with_successful_unlock_keeps_the_connection(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_pool = pool_without_idle_reaper(&pool).await;
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), store_pool.clone());
+        let owner = "did:key:z6MkDropUnlockOkProofJJJJJJJJJJJJJJJJJJJJ";
+        let name = "dropunlockoktest";
+        let slug = owner.replace([':', '/'], "_");
+        let key = advisory_lock_key(&slug, name);
+
+        let mut checker = pool.acquire().await.expect("checker connection");
+        let guard = store.acquire_write(owner, name).await.expect("acquire");
+        let size_before = store_pool.size();
+        assert!(size_before > 0, "the pool owns the guard's connection");
+
+        drop(guard);
+
+        // The connection goes back only once the detached unlock task has finished.
+        wait_until(
+            || store_pool.num_idle() > 0,
+            "the detached unlock to finish and hand the connection back",
+        )
+        .await;
+        assert_eq!(
+            store_pool.size(),
+            size_before,
+            "a successful detached unlock must leave the connection in the pool"
+        );
+        wait_until_lock_free(
+            &mut checker,
+            key,
+            "the Drop backstop's successful unlock to free the lock",
+        )
+        .await;
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *checker)
+            .await;
+    }
+
+    /// U8, the off-runtime arm: with no Tokio runtime there is nothing to spawn the
+    /// unlock onto, and the connection has already been taken out of the guard, so the
+    /// old code dropped it with no unlock attempted at all, back to the pool, session
+    /// lock still held. Dropping a `PoolConnection` off a runtime is worse than that:
+    /// sqlx's return-to-pool path spawns, and its no-runtime fallback panics, so the
+    /// old arm also panicked in a destructor.
+    ///
+    /// Reached by dropping the guard on a plain `std::thread`, where
+    /// `Handle::try_current()` fails.
+    ///
+    /// Load-bearing: RED before the fix (the join sees the "requires a Tokio context"
+    /// panic from sqlx's return-to-pool spawn), GREEN after (`detach` gives up the
+    /// pool slot, so nothing is spawned and dropping the detached connection closes
+    /// the socket, which ends the session and frees the lock).
+    #[sqlx::test]
+    async fn write_guard_dropped_off_runtime_disposes_the_connection(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_pool = pool_without_idle_reaper(&pool).await;
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), store_pool.clone());
+        let owner = "did:key:z6MkDropOffRuntimeProofKKKKKKKKKKKKKKKKKK";
+        let name = "dropoffruntimetest";
+        let slug = owner.replace([':', '/'], "_");
+        let key = advisory_lock_key(&slug, name);
+
+        let mut checker = pool.acquire().await.expect("checker connection");
+        let guard = store.acquire_write(owner, name).await.expect("acquire");
+        let size_before = store_pool.size();
+        assert!(size_before > 0, "the pool owns the guard's connection");
+
+        let dropped = std::thread::spawn(move || drop(guard)).join();
+        assert!(
+            dropped.is_ok(),
+            "dropping a write guard off a Tokio runtime must not panic"
+        );
+
+        wait_until(
+            || store_pool.size() == size_before - 1,
+            "the connection of a guard dropped off a runtime to be disposed of rather \
+             than returned to the pool with no unlock attempted",
+        )
+        .await;
+        wait_until_lock_free(
+            &mut checker,
+            key,
+            "a guard dropped off a runtime to end its session so postgres drops the lock",
+        )
+        .await;
         let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(key)
             .execute(&mut *checker)
