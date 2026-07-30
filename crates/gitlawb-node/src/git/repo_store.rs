@@ -1966,7 +1966,10 @@ mod tests {
 
         // Not `expect_err`: the guard is not Debug, and a guard obtained here must be
         // released rather than dropped on a panic path.
-        let err = match store.acquire_write("did:key:z6MkBusyOwner", "busyrepo").await {
+        let err = match store
+            .acquire_write("did:key:z6MkBusyOwner", "busyrepo")
+            .await
+        {
             Err(e) => e,
             Ok(second) => {
                 second.release(false).await;
