@@ -235,11 +235,34 @@ impl RepoStore {
             if std::time::Instant::now() >= deadline {
                 break;
             }
-            let conn = self
-                .lock_pool
-                .acquire()
-                .await
-                .context("advisory-lock pool exhausted or unreachable")?;
+            let conn = match self.lock_pool.acquire().await {
+                Ok(c) => c,
+                Err(e) => {
+                    // Saturation is surfaced HERE, in the request path, and
+                    // deliberately not through /ready. Failing readiness on a full
+                    // pool would pull this node out of routing, taking its reads
+                    // with it and pushing its write load onto peers carrying the
+                    // same load — the documented downward spiral. So the signals
+                    // are: a retryable 503 to the caller (via the sqlx downcast on
+                    // this error) and this log line for the operator.
+                    //
+                    // Logged at warn with the pool's own counters so an incident can
+                    // tell "the pool is full" from "the database is gone" without
+                    // reproducing it. Once per failed acquire, and a failed acquire
+                    // already costs a multi-second timeout, so this cannot itself
+                    // become a log flood.
+                    warn!(
+                        repo = %repo_name,
+                        owner = %owner_slug,
+                        pool_size = self.lock_pool.size(),
+                        pool_idle = self.lock_pool.num_idle(),
+                        err = %e,
+                        "advisory-lock pool acquire failed — writes are being shed; \
+                         raise GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS or investigate long-held write locks"
+                    );
+                    return Err(e).context("advisory-lock pool exhausted or unreachable");
+                }
+            };
             let mut probe = LockProbe::new(conn);
             if probe.try_lock(lock_key).await? {
                 lock_conn = probe.take_conn();
