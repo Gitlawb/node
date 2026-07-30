@@ -71,9 +71,16 @@ use crate::visibility::{visibility_check, Decision};
 /// Request budget (F3): one absolute clock (`ipfs_request_budget_secs`) spans
 /// the whole admitted request. No stage (acquire, probe, walk, content read)
 /// starts once it is exhausted, and the acquire wait and walk deadline are
-/// clamped to the remainder. The probe and content-read subprocesses have no
-/// duration bound of their own past their pre-start budget check, so a hung
-/// git probe holds the request's walk slot for the full duration of the hang.
+/// clamped to the remainder. The probe and content-read subprocesses each ALSO
+/// run under their own deadline, the lesser of `git_service_timeout_secs` and the
+/// remaining budget, reaped by process-group teardown at that deadline, so a hung
+/// `cat-file` cannot hold the request's walk slot past it.
+///
+/// Residual, still true: the probe's object-store readability check
+/// (`store::object_store_readable`, reached on the `missing` branch that a
+/// random-CID spray drives) is a synchronous `read_dir` + `File::open` sweep with
+/// no deadline and nothing to reap, so a wedged filesystem can still hold the
+/// walk slot past the deadline. Same class as the D-state git survivor residual.
 ///
 /// Scope: this closes the direct unauthenticated scan, including the dangling
 /// case. A stale-public mirror row still serves withheld content (tracked
@@ -274,10 +281,10 @@ pub async fn get_by_cid(
     // knob and tainting "budget"; the call site only breaks (the scan STOPS,
     // leaving this and every later candidate unproven, never a false 404). A
     // stage is never started with zero remaining; the probe and read
-    // subprocesses carry no internal duration clamp, so this pre-start check is
-    // their entire bound (a hung one holds the request's walk slot for the
-    // duration of the hang). The acquire and walk stages clamp their deadlines
-    // to the returned remainder.
+    // subprocesses additionally carry their own deadline (the lesser of
+    // git_service_timeout_secs and the remainder, reaped by process-group
+    // teardown), so this pre-start check is a gate, not their entire bound. The
+    // acquire and walk stages clamp their deadlines to the returned remainder.
     fn budget_gate(
         truncated_by: &mut Vec<&'static str>,
         deadline: std::time::Instant,

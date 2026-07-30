@@ -420,9 +420,11 @@ async fn main() -> Result<()> {
             config.max_concurrent_reads_per_caller,
         ),
         // Per-source cap on the receive-pack advertisement, sized to an eighth of the
-        // write pool (min 1): a single source can hold at most this many write-pool
-        // slots via the anon advertisement, so saturating the pool takes ~8 distinct
-        // source IPs, each also rate-limited (#174).
+        // write pool (min 1): a single source can hold at most this many slots in the
+        // DEDICATED advert pool (git_push_advert_semaphore, disjoint from the write
+        // pool), so saturating that pool takes ~8 distinct source IPs, each also
+        // rate-limited (#174). Sized off the write pool only because the advert pool
+        // is created at the same size; an advert flood cannot touch a write permit.
         git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             (config.max_concurrent_git_pushes / 8).max(1),
         ),

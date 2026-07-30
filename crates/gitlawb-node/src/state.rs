@@ -169,11 +169,14 @@ pub struct AppState {
     /// advertisement.
     pub git_read_per_caller: crate::rate_limit::PerCallerConcurrency,
     /// Per-source concurrency sub-cap on the anon-reachable receive-pack `info/refs`
-    /// advertisement: each source IP may hold at most a small share of the write
-    /// pool, so a multi-source flood of push-handshake advertisements cannot
-    /// saturate `git_write_semaphore` and shed authenticated pushes (#174). Sized as
-    /// a fraction of `max_concurrent_git_pushes`, so filling the write pool takes many
-    /// distinct source IPs (each also braked by the per-IP push rate limiter).
+    /// advertisement: each source IP may hold at most a small share of the DEDICATED
+    /// advert pool (`git_push_advert_semaphore`), so a multi-source flood of
+    /// push-handshake advertisements cannot saturate that pool and shed other sources'
+    /// advertisements (#174). An advert flood cannot reach `git_write_semaphore` at
+    /// all, since the two pools are disjoint. Sized as a fraction of
+    /// `max_concurrent_git_pushes` because the advert pool is created at the same size,
+    /// so filling it takes many distinct source IPs (each also braked by the per-IP
+    /// push rate limiter).
     pub git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency,
     /// Per-source concurrency sub-cap on the authenticated `git-receive-pack` POST:
     /// each source IP may hold at most a small share of `git_write_semaphore`, so one

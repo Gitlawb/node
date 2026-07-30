@@ -801,7 +801,10 @@ mod tests {
         assert!(
             err.downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
                 .is_some(),
-            "a hung walk must abort with GitServiceTimeout (mapped to 504), got: {err}"
+            // `{err:#}` prints the whole anyhow chain. Plain `{err}` shows only the top
+            // context ("failed to spawn git for-each-ref") and drops the underlying io
+            // error, which left a real beta-lane CI failure undiagnosable.
+            "a hung walk must abort with GitServiceTimeout (mapped to 504), got: {err:#}"
         );
 
         // The recorded process-group leader must be gone: the watchdog reaps the

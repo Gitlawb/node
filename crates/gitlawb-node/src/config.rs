@@ -470,9 +470,12 @@ pub struct Config {
     /// only the acquire and walk stages (overshoot there is the walk watchdog's
     /// SIGTERM grace + SIGKILL settle); the `object_type` /
     /// `read_object_content` probe subprocesses are budget-checked before they
-    /// start but have NO duration bound of their own, so a hung git probe
-    /// (corrupt pack, stuck filesystem) holds the request's walk slot for the
-    /// full duration of the hang.
+    /// start AND each run under their own deadline (the lesser of
+    /// `git_service_timeout_secs` and the remaining budget), reaped by
+    /// process-group teardown, so a hung `cat-file` cannot hold the request's walk
+    /// slot past it. Still unbounded: the probe's `object_store_readable` check is a
+    /// synchronous filesystem sweep with nothing to reap, so a wedged filesystem can
+    /// hold the slot past the deadline.
     /// Must be positive. Default: 600s (10 min), matching
     /// `git_service_timeout_secs` so a single full-length walk still fits.
     #[arg(

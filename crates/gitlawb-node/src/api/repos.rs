@@ -647,11 +647,12 @@ pub async fn git_info_refs(
     // acquired AFTER the visibility + push-rate gates (KTD7) so a denied or
     // rate-limited request never consumes a slot; held for the whole op. The
     // upload-pack advertisement is bounded on the read pool (git_read_per_caller).
-    // The receive-pack advertisement draws from the write pool, so it is bounded per
-    // source (git_push_advert_per_caller) instead: without this, an anonymous
-    // multi-source flood of push-handshake advertisements could hold the write pool's
-    // slots across acquire_fresh and shed authenticated pushes, since the per-IP push
-    // rate limiter caps rate, not concurrency (#174 review fix).
+    // The receive-pack advertisement draws from its own dedicated advert pool
+    // (git_push_advert_semaphore, see the _permit block below), so it is bounded per
+    // source by git_push_advert_per_caller instead: without this, an anonymous
+    // multi-source flood of push-handshake advertisements could hold every advert-pool
+    // slot across acquire_fresh and shed other sources' advertisements, since the
+    // per-IP push rate limiter caps rate, not concurrency (#174 review fix).
     let caller_key = read_caller_key(&headers, peer, state.push_limiter_trust);
     let _caller_permit = if service == "git-receive-pack" {
         acquire_read_caller_permit(
@@ -4316,10 +4317,10 @@ mod tests {
         );
     }
 
-    /// #174 (review fix): the anon-reachable receive-pack advertisement draws from
-    /// the write pool, so it is bounded per source by `git_push_advert_per_caller` to
-    /// stop one source from monopolizing the write pool and shedding authenticated
-    /// pushes. Fill one source IP's advert slot; its next receive-pack advertisement
+    /// #174 (review fix): the anon-reachable receive-pack advertisement draws from its
+    /// own dedicated advert pool, so it is bounded per source by
+    /// `git_push_advert_per_caller` to stop one source from monopolizing that pool and
+    /// shedding other sources' advertisements. Fill one source IP's advert slot; its next receive-pack advertisement
     /// sheds 503, while a different source and the upload-pack advertisement are
     /// unaffected. Remove the advert-cap acquisition and the same-source assertion
     /// goes green-not-503.
@@ -4358,7 +4359,7 @@ mod tests {
         assert_eq!(
             router.oneshot(req).await.unwrap().status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a source at its receive-pack advertisement cap must shed 503, so it cannot monopolize the write pool"
+            "a source at its receive-pack advertisement cap must shed 503, so it cannot monopolize the advert pool"
         );
 
         // A DIFFERENT source keeps its own advert budget -> not shed.
