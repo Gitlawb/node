@@ -426,14 +426,14 @@ async fn main() -> Result<()> {
         // rate-limited (#174). Sized off the write pool only because the advert pool
         // is created at the same size; an advert flood cannot touch a write permit.
         git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
-            (config.max_concurrent_git_pushes / 8).max(1),
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
         ),
         // Per-source cap on the authenticated receive-pack POST, sized like the advert
         // cap: one source IP can hold at most this many write-pool slots, so
         // monopolizing the pool takes ~8 distinct source IPs, each also rate-limited
         // (#174 P1-d).
         git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
-            (config.max_concurrent_git_pushes / 8).max(1),
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
         ),
         // Bounds concurrent /ipfs visibility walks — a distinct public cost center, so
         // its own pool + per-source sub-cap + per-IP rate limiter, never a git pool

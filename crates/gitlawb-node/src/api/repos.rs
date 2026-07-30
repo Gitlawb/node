@@ -3535,12 +3535,13 @@ mod tests {
     }
 
     /// #174 (F2 sizing edge, vetted by execution): the receive-pack advertisement
-    /// per-source cap is derived in main.rs as `(max_concurrent_git_pushes / 8).max(1)`,
-    /// so it is never 0 even at the minimum write-pool size (1). A 0 cap would make
-    /// PerCallerConcurrency shed EVERY receive-pack advertisement and break all pushes.
+    /// per-source cap comes from `rate_limit::per_source_push_cap`, the same helper
+    /// both main.rs derivation sites call, so it is never 0 even at the minimum
+    /// write-pool size (1). A 0 cap would make PerCallerConcurrency shed EVERY
+    /// receive-pack advertisement and break all pushes.
     #[test]
     fn advert_per_caller_cap_sizing_is_never_zero() {
-        let cap = |pushes: usize| (pushes / 8).max(1);
+        let cap = crate::rate_limit::per_source_push_cap;
         for pushes in [1usize, 4, 8, 32, 256] {
             assert!(
                 cap(pushes) >= 1,

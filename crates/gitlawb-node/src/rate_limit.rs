@@ -139,6 +139,16 @@ impl RateLimiter {
     }
 }
 
+/// Per-source concurrency cap derived from the write-pool size: one source may hold
+/// at most an eighth of the pool, so saturating it takes ~8 distinct source IPs.
+///
+/// Floored at 1 because the value feeds [`PerCallerConcurrency`], where a cap of 0
+/// would shed EVERY receive-pack advertisement and break all pushes. The floor is
+/// load-bearing at the minimum write-pool size (1), which integer-divides to 0.
+pub(crate) fn per_source_push_cap(max_concurrent_git_pushes: usize) -> usize {
+    (max_concurrent_git_pushes / 8).max(1)
+}
+
 /// A bounded per-caller CONCURRENCY limiter — distinct from [`RateLimiter`], which
 /// caps request RATE. Each caller key may hold at most `per_caller` in-flight
 /// permits at once; beyond that [`try_acquire`](Self::try_acquire) returns `None`
