@@ -883,6 +883,24 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
+    // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
+    // The runner keys the applied set on the integer alone, so a version another
+    // in-flight branch also claims is skipped in full on whichever side merges
+    // second — no error, no warning, and schema_migrations still reads healthy
+    // while the column is simply absent. Two open branches already claim into
+    // this range: #135/#173 holds through 14 (15 once it rebases past v11), and
+    // #253 took 16. 17 clears both. Gaps are harmless: the runner iterates the
+    // array and never requires contiguity.
+    Migration {
+        version: 17,
+        name: "sync_queue_attempted_at",
+        stmts: &[
+            // Scheduling key for dequeue_pending_syncs: when the row was last
+            // handed to a worker. Null until first dequeued, which is why the
+            // ordering coalesces onto enqueued_at.
+            "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1637,13 +1655,46 @@ impl Db {
         Ok(())
     }
 
+    /// Take up to `limit` pending syncs — the least recently attempted ones —
+    /// and stamp each with the time it was handed out.
+    ///
+    /// Selecting and stamping in one statement is deliberate. A row the worker
+    /// cannot make progress on stays `pending` so it is retried, and if its
+    /// ordering key never moved it would remain among the oldest rows forever,
+    /// holding a fixed-size window against every healthy repo behind it.
+    /// Stamping on the way out makes the key "least recently handed out", so a
+    /// stuck row rotates to the back instead. Doing it here rather than at each
+    /// deferral branch in the worker is what makes that hold by construction:
+    /// no call site can forget it, and a batch that dies mid-loop still leaves
+    /// its rows stamped. `enqueued_at` is left alone so backlog age stays
+    /// measurable.
+    ///
+    /// Two things this deliberately does not promise. The returned rows are the
+    /// right *set*, in no particular order — `RETURNING` does not sort, and
+    /// nothing in `process_batch` depends on the order within a batch. And this
+    /// is not a claim: the rows stay `pending` with no row lock held past the
+    /// statement, so two workers against one database can still be handed the
+    /// same batch. Single-worker deployment is the existing assumption;
+    /// `FOR UPDATE SKIP LOCKED` is what would change that, and it is not here.
+    ///
+    /// Errors surface to the caller, which logs and skips the poll. That is
+    /// worth knowing now that this writes: it can fail for reasons a plain
+    /// SELECT could not, such as a read-only transaction or a lock timeout.
     pub async fn dequeue_pending_syncs(&self, limit: i64) -> Result<Vec<SyncQueueItem>> {
         let rows = sqlx::query(
-            "SELECT id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at
-             FROM sync_queue WHERE status = 'pending'
-             ORDER BY enqueued_at ASC LIMIT $1",
+            // The outer `status = 'pending'` is not redundant with the
+            // subquery's: between the two, a concurrent worker can settle a row,
+            // and without it the UPDATE would still stamp and return a row that
+            // had already left the pending set.
+            "UPDATE sync_queue SET attempted_at = $2
+             WHERE status = 'pending' AND id IN (
+                 SELECT id FROM sync_queue WHERE status = 'pending'
+                 ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
+             )
+             RETURNING id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at",
         )
         .bind(limit)
+        .bind(Utc::now().to_rfc3339())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -3653,6 +3704,186 @@ mod migration_tests {
 
         // (d) Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
         db.migrate().await.unwrap();
+    }
+
+    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
+
+    async fn enqueue_one(db: &super::Db, repo: &str) {
+        db.enqueue_sync(
+            repo,
+            "did:key:zPEER",
+            "refs/heads/main",
+            &"0".repeat(40),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn attempted_at_of(db: &super::Db, repo: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT attempted_at FROM sync_queue WHERE repo = $1")
+            .bind(repo)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Upgrade-path test: simulate a node already at v11 and let the real
+    /// migration entry point apply v17, rather than hand-copying its SQL.
+    ///
+    /// This is the test that catches the column being added to the v1
+    /// statement array instead of a new migration. v1 never re-runs on an
+    /// existing install, so that mistake breaks every deployed node's dequeue
+    /// while staying invisible to every other test here, since `#[sqlx::test]`
+    /// hands out a fresh database that runs the whole chain.
+    #[sqlx::test]
+    async fn migration_v17_adds_sync_queue_attempted_at(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll back to v11: drop the column and forget the version.
+        sqlx::query("ALTER TABLE sync_queue DROP COLUMN attempted_at")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 17")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // A row written by the old node, before the column existed.
+        enqueue_one(&db, "z6Mkfoo/legacy").await;
+
+        db.migrate().await.unwrap();
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'sync_queue' AND column_name = 'attempted_at'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "attempted_at must be nullable");
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 17")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v17 must be recorded as applied");
+
+        // The pre-existing row survives with a null key and is still dequeued.
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/legacy").await, None);
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].repo, "z6Mkfoo/legacy");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn dequeue_stamps_attempted_at_on_every_row_it_hands_out(pool: sqlx::PgPool) {
+        // The stamp is what stops a deferred row from holding the window, and
+        // it happens here rather than at the deferral branches so no call site
+        // can forget it.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        assert_eq!(
+            attempted_at_of(&db, "z6Mkfoo/a").await,
+            None,
+            "a freshly enqueued row has no attempt yet"
+        );
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            attempted_at_of(&db, "z6Mkfoo/a").await.is_some(),
+            "dequeue must stamp the row it returns, whatever the worker does next"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_orders_by_last_attempt_then_enqueue_time(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/older").await;
+        enqueue_one(&db, "z6Mkfoo/newer").await;
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:00Z")
+            .bind("z6Mkfoo/older")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:01Z")
+            .bind("z6Mkfoo/newer")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Never-attempted rows fall back to enqueue order.
+        let first = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(first[0].repo, "z6Mkfoo/older");
+
+        // Having been attempted, it now sorts behind the untried row.
+        let second = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(
+            second[0].repo, "z6Mkfoo/newer",
+            "an attempted row must yield to one that has never been tried"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_leaves_enqueued_at_untouched(pool: sqlx::PgPool) {
+        // enqueued_at keeps meaning enqueue time, so backlog age stays
+        // measurable; that is the reason attempted_at is a separate column.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        let before: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+
+        db.dequeue_pending_syncs(10).await.unwrap();
+
+        let after: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[sqlx::test]
+    async fn dequeue_does_not_touch_settled_rows(pool: sqlx::PgPool) {
+        // The stamping UPDATE must not reach a row that already left the
+        // pending set, or a terminal row could be dragged back into rotation.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/failed").await;
+        enqueue_one(&db, "z6Mkfoo/done").await;
+        let ids: Vec<(String, String)> =
+            sqlx::query_as("SELECT repo, id FROM sync_queue ORDER BY repo")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        for (repo, id) in &ids {
+            if repo.ends_with("failed") {
+                db.mark_sync_failed(id).await.unwrap();
+            } else {
+                db.mark_sync_done(id).await.unwrap();
+            }
+        }
+
+        assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
     }
 }
 
