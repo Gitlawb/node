@@ -59,6 +59,9 @@ pub enum AppError {
     #[error("server overloaded: {0}")]
     Overloaded(String),
 
+    #[error("repository is busy")]
+    RepoBusy,
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -100,7 +103,14 @@ impl From<anyhow::Error> for AppError {
     fn from(err: anyhow::Error) -> Self {
         match err.downcast::<sqlx::Error>() {
             Ok(sql) => AppError::Db(sql),
-            Err(err) => AppError::Internal(err),
+            // Lock contention is transient and ordinary, so it must not land as a
+            // 500. The internal message names the owner slug and repo, so the
+            // variant carries nothing: the detail stays in the log at the raise
+            // site and the client gets a fixed retryable body.
+            Err(err) => match err.downcast::<crate::git::repo_store::RepoBusy>() {
+                Ok(_) => AppError::RepoBusy,
+                Err(err) => AppError::Internal(err),
+            },
         }
     }
 }
@@ -165,6 +175,13 @@ impl IntoResponse for AppError {
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
             AppError::Timeout(msg) => (StatusCode::GATEWAY_TIMEOUT, "git_timeout", msg.clone()),
+            // 503 with a FIXED body: the caller should retry, and must not be told
+            // which repo is contended or for how long.
+            AppError::RepoBusy => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_busy",
+                "repository is busy — retry".into(),
+            ),
             AppError::Db(e) if db_unavailable(e) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 DB_UNAVAILABLE_CODE,
