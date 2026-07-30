@@ -42,9 +42,10 @@ use crate::visibility::{visibility_check, Decision};
 /// — `get_repo`'s fuzzy match could otherwise authorize a different physical
 /// row than the one read (KTD2a). Quarantine is fail-closed in two layers:
 /// `list_all_repos` drops rows with `quarantined = TRUE`, and a logical-repo
-/// fold (same class as the feed collector in `events.rs`) drops any surviving
-/// twin that shares owner+name with a quarantined row — so a public mirror
-/// cannot serve while its canonical twin is quarantined. We check object
+/// fold drops any surviving twin that shares owner+name with a quarantined
+/// *canonical* (UUID) row — so a public mirror cannot serve while its
+/// canonical twin is quarantined, without letting a quarantined mirror
+/// suppress a healthy canonical (`get_repo` prefers canonical). We check object
 /// existence via `store::object_type` *before* the expensive reachability walk
 /// so random-CID spray cannot trigger full-history git walks on repos that
 /// don't carry the object. When the row carries path-scoped rules (KTD4) the
@@ -86,16 +87,19 @@ pub async fn get_by_cid(
         .list_all_repos()
         .await
         .map_err(AppError::Internal)?;
-    // Logical-repo quarantine fold: when a canonical UUID row is quarantined
+    // Logical-repo quarantine fold: when a *canonical* UUID row is quarantined
     // but a public mirror twin (`owner/name`) survives `list_all_repos`, slug
     // routes 404 via `authorize_repo_read` (prefers canonical) while CID serve
-    // would otherwise still hit the mirror. Drop any candidate that names the
-    // same logical repo as a quarantined row (feed collector pattern).
+    // would otherwise still hit the mirror. Drop candidates that share
+    // owner+name with a quarantined *canonical* only — a quarantined mirror
+    // must not suppress a healthy canonical (same preference as get_repo).
     let quarantined = state
         .db
         .list_quarantined_repos()
         .await
         .map_err(AppError::Internal)?;
+    let quarantined_canonical: Vec<_> =
+        quarantined.iter().filter(|q| !q.id.contains('/')).collect();
 
     // Fetch every repo's visibility rules in one query rather than one per row
     // (the gate runs each row against its OWN rules — KTD2a). A row absent from
@@ -119,7 +123,7 @@ pub async fn get_by_cid(
     let mut allowed_memo: HashMap<String, HashSet<String>> = HashMap::new();
 
     for repo in &repos {
-        if quarantined
+        if quarantined_canonical
             .iter()
             .any(|q| q.name == repo.name && crate::api::did_matches(&q.owner_did, &repo.owner_did))
         {

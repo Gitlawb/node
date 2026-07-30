@@ -173,11 +173,10 @@ pub async fn list_visibility(
 ) -> Result<Json<serde_json::Value>> {
     // Quarantine first (via authorize_repo_read), then owner — a quarantined
     // mirror must be opaque even to a caller matching owner_did.
-    let (record, _rules) =
+    let (record, rules) =
         crate::api::authorize_repo_read(&state, &owner, &repo, Some(&auth.0), "/").await?;
     require_owner(&record, &auth.0)?;
 
-    let rules = state.db.list_visibility_rules(&record.id).await?;
     let rules_json: Vec<_> = rules
         .into_iter()
         .map(|r| {

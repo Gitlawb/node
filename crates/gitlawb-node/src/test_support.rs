@@ -4577,6 +4577,40 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Reverse dual-row: quarantined *mirror* must not suppress a healthy
+    /// canonical under the same owner+name (authorize_repo_read prefers
+    /// canonical; CID fold must match).
+    #[sqlx::test]
+    async fn get_by_cid_serves_canonical_when_only_mirror_quarantined(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCIDREVOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        let slug = owner.replace([':', '/'], "_");
+        let fx = seed_cid_repos(&slug, short, &["rev-quar"]);
+
+        let mut canonical = seed_repo(owner, "rev-quar");
+        canonical.is_public = true;
+        state.db.create_repo(&canonical).await.unwrap();
+        // Quarantined mirror twin only.
+        state
+            .db
+            .upsert_mirror_repo(short, "rev-quar", "/tmp/rev-quar-unused.git", None, true)
+            .await
+            .unwrap();
+
+        let cid = cid_for_oid(&fx.public_oid);
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "healthy canonical must still serve CID when only the mirror is quarantined: {body}"
+        );
+        assert!(
+            body.contains("public bytes"),
+            "expected public blob from canonical: {body}"
+        );
+    }
+
     #[sqlx::test]
     async fn repo_gate_public_repo_anon_read_admitted(pool: PgPool) {
         struct DirGuard(std::path::PathBuf);
