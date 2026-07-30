@@ -129,6 +129,25 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
         .expect("request builder")
 }
 
+/// A local endpoint whose TCP accept succeeds instantly but that never writes an
+/// HTTP response, so any request against it stalls deterministically until the
+/// caller's own timeout. (A non-routable address hangs only if the network
+/// blackholes the SYN — a fast RST would end the stall early and make a timeout
+/// test pass for the wrong reason.) The accepted sockets are parked in the
+/// spawned task, which dies with the test's runtime, so the peer never sees a
+/// close mid-test.
+pub(crate) async fn silent_http_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    endpoint
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1148,7 +1148,14 @@ async fn pin_new_objects_gated(
         .acquire_owned()
         .await
         .expect("pin_semaphore is never closed");
-    crate::ipfs_pin::pin_new_objects(ipfs_api, repo_path, object_list, db).await
+    crate::ipfs_pin::pin_new_objects(
+        ipfs_api,
+        repo_path,
+        object_list,
+        db,
+        crate::ipfs_pin::PIN_BATCH_BUDGET,
+    )
+    .await
 }
 
 /// `repo_id` is passed explicitly rather than read from `ctx` so the two callers

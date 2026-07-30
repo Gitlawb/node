@@ -605,7 +605,7 @@ async fn replicate_encrypted_blobs(
                 continue;
             }
         };
-        match crate::ipfs_pin::pin_git_object(ipfs_api, &blob.oid, &envelope).await {
+        match crate::ipfs_pin::pin_git_object(ipfs_api, &blob.oid, &envelope, None).await {
             Ok(cid) if !cid.is_empty() => {
                 if cid != blob.cid {
                     warn!(oid = %blob.oid, expected = %blob.cid, got = %cid, "replicated envelope CID mismatch; skipping record");

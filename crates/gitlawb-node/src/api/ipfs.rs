@@ -804,24 +804,6 @@ mod tests {
             .to_string()
     }
 
-    /// A local endpoint whose TCP accept succeeds instantly but that never writes
-    /// an HTTP response, so a Tigris HEAD against it stalls deterministically
-    /// until the caller's timeout. (A non-routable address hangs only if the
-    /// network blackholes the SYN — a fast RST would end the stall early.) The
-    /// accepted sockets are parked in the spawned task, which dies with the
-    /// test's runtime, so the peer never sees a close mid-test.
-    async fn silent_tigris_endpoint() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((sock, _)) = listener.accept().await {
-                held.push(sock);
-            }
-        });
-        endpoint
-    }
-
     /// Fake git for the WALK only (`state.git_bin`): empty refs, `rev-parse`
     /// resolves, and each `rev-list` appends one line to `log` and prints nothing —
     /// every walked repo yields an EMPTY allowed-set (path-gate deny verdict) and
@@ -1090,7 +1072,7 @@ mod tests {
         // Endpoint-pinned test client (no AWS_* env reads — env is racy under a
         // parallel test run); the silent local endpoint stalls the HEAD
         // deterministically.
-        let endpoint = silent_tigris_endpoint().await;
+        let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
             crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
                 .await;
@@ -1154,7 +1136,7 @@ mod tests {
         // repo stays a fast local hit) and add a NEWER ghost row with no local
         // copy: its acquire consults the silent local endpoint and stalls to the
         // 1s timeout (endpoint-pinned test client, no AWS_* env reads).
-        let endpoint = silent_tigris_endpoint().await;
+        let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
             crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
                 .await;
@@ -1679,7 +1661,7 @@ mod tests {
         // repo stays a fast local hit) and add a NEWER ghost row with no local
         // copy: its acquire consults the silent local endpoint and stalls past
         // the budget (endpoint-pinned test client, no AWS_* env reads).
-        let endpoint = silent_tigris_endpoint().await;
+        let endpoint = crate::test_support::silent_http_endpoint().await;
         let tigris =
             crate::git::tigris::TigrisClient::for_testing_with_endpoint("test-bucket", &endpoint)
                 .await;
