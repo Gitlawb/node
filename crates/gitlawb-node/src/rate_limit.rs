@@ -139,8 +139,12 @@ impl RateLimiter {
     }
 }
 
-/// Per-source concurrency cap derived from the write-pool size: one source may hold
-/// at most an eighth of the pool, so saturating it takes ~8 distinct source IPs.
+/// Per-source concurrency cap derived from the write-pool size: one resolved client
+/// key (see [`client_key`]) may hold at most an eighth of the pool, so saturating it
+/// takes ~8 distinct keys. Real for an IPv4 or single-address caller; a caller with a
+/// routed IPv6 /64 has 2^64 keys, because `client_key` returns the full address with
+/// no prefix folding. Narrowing that keying is a deferred decision, so this cap is a
+/// bound per key, not a bound per operator.
 ///
 /// Floored at 1 because the value feeds [`PerCallerConcurrency`], where a cap of 0
 /// would shed EVERY receive-pack advertisement and break all pushes. The floor is

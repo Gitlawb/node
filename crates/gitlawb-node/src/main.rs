@@ -420,18 +420,22 @@ async fn main() -> Result<()> {
             config.max_concurrent_reads_per_caller,
         ),
         // Per-source cap on the receive-pack advertisement, sized to an eighth of the
-        // write pool (min 1): a single source can hold at most this many slots in the
-        // DEDICATED advert pool (git_push_advert_semaphore, disjoint from the write
-        // pool), so saturating that pool takes ~8 distinct source IPs, each also
-        // rate-limited (#174). Sized off the write pool only because the advert pool
-        // is created at the same size; an advert flood cannot touch a write permit.
+        // write pool (min 1): one resolved client key (rate_limit::client_key) can hold
+        // at most this many slots in the DEDICATED advert pool (git_push_advert_semaphore,
+        // disjoint from the write pool), so saturating that pool takes ~8 distinct keys
+        // (#174). That bounds an IPv4 or single-address caller; a caller controlling many
+        // addresses (an IPv6 /64 is 2^64 keys) still gets one cap per address, since
+        // client_key uses the full IP with no prefix folding. Narrowing the keying is a
+        // deferred design call, not something these caps claim to solve. Sized off the
+        // write pool only because the advert pool is created at the same size; an advert
+        // flood cannot touch a write permit.
         git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
         ),
         // Per-source cap on the authenticated receive-pack POST, sized like the advert
-        // cap: one source IP can hold at most this many write-pool slots, so
-        // monopolizing the pool takes ~8 distinct source IPs, each also rate-limited
-        // (#174 P1-d).
+        // cap: one resolved client key can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct keys (#174 P1-d). Same residual as
+        // above: keys are full IPs, so a caller with many addresses has many caps.
         git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
         ),
