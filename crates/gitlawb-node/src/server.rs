@@ -55,18 +55,50 @@ fn add_auth_layers(router: Router<AppState>, state: AppState) -> Router<AppState
         .layer(middleware::from_fn(auth::require_signature))
 }
 
+/// Attach the shared per-IP write brake to an authenticated write-route group,
+/// outermost so a flood is rejected before signature verification. Every
+/// authenticated non-creation write group MUST call this or it silently ships
+/// unbraked with no compile error. Deliberately a separate call, NOT folded into
+/// `add_auth_layers`: the creation routes use a different bucket
+/// (`create_ip_rate_limiter`) and the graphql group is not built through
+/// `add_auth_layers`, so a helper keyed on auth would attach the wrong limiter.
+trait WriteBraked {
+    fn write_braked(self, limiter: &rate_limit::IpRateLimiter) -> Self;
+}
+
+impl WriteBraked for Router<AppState> {
+    fn write_braked(self, limiter: &rate_limit::IpRateLimiter) -> Self {
+        self.layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+            .layer(axum::Extension(limiter.clone()))
+    }
+}
+
 pub fn build_router(state: AppState) -> Router {
     // ── GraphQL routes ─────────────────────────────────────────────────────
     let schema = state.graphql_schema.as_ref().clone();
+
+    // Per-IP write brake, shared across every authenticated non-creation write
+    // group (see `AppState::write_rate_limiter`). Built once here so each group
+    // clones the same bucket; attached outermost on each group so a flood is
+    // rejected before auth runs. Separate bucket from the creation brake.
+    let write_ip_limiter = rate_limit::IpRateLimiter {
+        limiter: state.write_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    };
+
     let graphql_routes = Router::new()
         .route("/graphql", get(graphql_playground).post(graphql_handler))
         // Attach the verified DID to /graphql when a signature is present. The
         // layer covers only routes added before it, so /graphql/ws (added after,
-        // read-only subscriptions) stays open.
+        // read-only subscriptions) stays open. The per-IP write brake covers the
+        // same /graphql (KTD-5: an HTTP-layer brake cannot tell a query POST from
+        // a mutation POST, so it counts every /graphql request — acceptable, both
+        // cost work); /graphql/ws subscriptions stay unbraked.
         .layer(middleware::from_fn(auth::optional_signature))
+        .write_braked(&write_ip_limiter)
         .route_service("/graphql/ws", GraphQLSubscription::new(schema));
 
-    // ── Task routes (write — require HTTP Signature) ───────────────────────
+    // ── Task routes (write — require HTTP Signature + per-IP write brake) ──
     let task_write_routes = add_auth_layers(
         Router::new()
             .route("/api/v1/tasks", post(tasks::create_task))
@@ -74,7 +106,8 @@ pub fn build_router(state: AppState) -> Router {
             .route("/api/v1/tasks/{id}/complete", post(tasks::complete_task))
             .route("/api/v1/tasks/{id}/fail", post(tasks::fail_task)),
         state.clone(),
-    );
+    )
+    .write_braked(&write_ip_limiter);
 
     // ── Task routes (read — open) ──────────────────────────────────────────
     let task_read_routes = Router::new()
@@ -111,7 +144,13 @@ pub fn build_router(state: AppState) -> Router {
     .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
     .layer(axum::Extension(create_ip_limiter));
 
-    // ── Write routes — require HTTP Signature (no rate limit) ─────────────
+    // ── Write routes — require HTTP Signature + per-IP write brake ────────
+    // Same per-IP flood defense as the creation routes, on its own `write`
+    // bucket (see `AppState::write_rate_limiter`). Per-DID is deliberately not
+    // paired (a DID farm never trips it; busy legitimate agents would false-
+    // positive). The bundled visibility GET is a read that also draws from the
+    // write bucket — harmless, since the bucket is sized far above any legit
+    // per-IP read rate.
     let write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -181,7 +220,8 @@ pub fn build_router(state: AppState) -> Router {
                 axum::routing::delete(agents::deregister_agent),
             ),
         state.clone(),
-    );
+    )
+    .write_braked(&write_ip_limiter);
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.
@@ -247,7 +287,8 @@ pub fn build_router(state: AppState) -> Router {
                 post(bounties::dispute_bounty),
             ),
         state.clone(),
-    );
+    )
+    .write_braked(&write_ip_limiter);
 
     // ── Bounty routes (read — open) ──────────────────────────────────────
     let bounty_read_routes = Router::new()
@@ -268,9 +309,10 @@ pub fn build_router(state: AppState) -> Router {
     let profile_write_routes = add_auth_layers(
         Router::new().route("/api/v1/profile", axum::routing::put(profiles::set_profile)),
         state.clone(),
-    );
+    )
+    .write_braked(&write_ip_limiter);
 
-    // ── Issue routes (write — require HTTP Signature, no rate limit) ─────
+    // ── Issue routes (write — require HTTP Signature + per-IP write brake) ─
     let issue_write_routes = add_auth_layers(
         Router::new()
             .route(
@@ -282,7 +324,8 @@ pub fn build_router(state: AppState) -> Router {
                 post(issues::create_issue_comment),
             ),
         state.clone(),
-    );
+    )
+    .write_braked(&write_ip_limiter);
 
     // ── Peer discovery routes ─────────────────────────────────────────────
     // Peer writes accept signatures when present and can require them after a

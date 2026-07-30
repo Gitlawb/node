@@ -1,3 +1,4 @@
+mod admin;
 mod api;
 mod arweave;
 mod auth;
@@ -69,6 +70,12 @@ async fn main() -> Result<()> {
         .init();
 
     let mut config = Config::parse();
+
+    // Admin subcommands run out-of-band and exit, never starting the node. The
+    // no-subcommand path below is the unchanged daemon startup.
+    if let Some(command) = config.command.clone() {
+        return run_admin_command(command, &config).await;
+    }
 
     // Merge the embedded seed list of public network nodes into the runtime
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
@@ -279,8 +286,22 @@ async fn main() -> Result<()> {
         None
     };
 
+    let object_store =
+        tigris.map(|t| std::sync::Arc::new(t) as std::sync::Arc<dyn git::tigris::ObjectStore>);
+    // Advisory-lock guards get their own pool, separate from the app pool
+    // (db.pool()) that serves normal handlers, so a concurrent-push burst pins
+    // lock connections here instead of starving request handlers. Sized to peak
+    // writers via GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS.
+    let lock_pool_acquire_timeout = std::time::Duration::from_secs(config.db_acquire_timeout_secs);
+    let lock_pool = Db::connect_lock_pool(
+        &config.database_url,
+        config.db_lock_pool_max_connections,
+        lock_pool_acquire_timeout,
+    )
+    .await
+    .context("connecting advisory-lock pool")?;
     let repo_store =
-        git::repo_store::RepoStore::new(config.repos_dir.clone(), tigris, db.pool().clone());
+        git::repo_store::RepoStore::new(config.repos_dir.clone(), object_store, lock_pool);
 
     // Per-DID limiter for the creation endpoints. Keyed on the authenticated
     // DID (attacker-varied), so bound its key set to cap memory.
@@ -294,36 +315,24 @@ async fn main() -> Result<()> {
     // capped regardless of how many identities it mints. Sized well above any
     // legitimate per-IP creation rate; GITLAWB_CREATE_RATE_LIMIT overrides, 0
     // disables. Bounded key set — the key is a client-influenced IP.
-    let create_limit = std::env::var("GITLAWB_CREATE_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(120);
-    let create_ip_rate_limiter = rate_limit::RateLimiter::new_bounded(
-        create_limit,
-        std::time::Duration::from_secs(3600),
-        200_000,
-    );
-    if create_limit == 0 {
-        tracing::warn!("GITLAWB_CREATE_RATE_LIMIT=0 — per-IP creation rate limiting disabled");
-    }
+    let create_ip_rate_limiter = build_ip_limiter("GITLAWB_CREATE_RATE_LIMIT", 120, "creation");
+
+    // Per-IP brake for the authenticated non-creation write surface (issue/PR
+    // comments, labels, stars, merges, protect, replicas, visibility, tasks,
+    // bounties, profile, GraphQL mutations). Its own bucket, separate from the
+    // creation brake, so a write flood cannot drain the creation budget and vice
+    // versa (same rationale as the sync_trigger / peer_write split). Sized above
+    // any legitimate per-IP write rate — real agent automation makes many small
+    // writes per hour. GITLAWB_WRITE_RATE_LIMIT overrides; 0 disables. Bounded
+    // key set — the key is a client-influenced IP.
+    let write_rate_limiter = build_ip_limiter("GITLAWB_WRITE_RATE_LIMIT", 600, "write");
 
     // Push-path flood brake: max git-receive-pack requests per client IP per
     // hour (counts both the info/refs advertisement and the push POST). Sized
     // for heavy agent automation while still stopping flood traffic (the June
     // 2026 attack pushed several times per second per IP). GITLAWB_PUSH_RATE_LIMIT
     // overrides; 0 disables. Bounded key set — the key is a client-influenced IP.
-    let push_limit = std::env::var("GITLAWB_PUSH_RATE_LIMIT")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(600);
-    let push_rate_limiter = rate_limit::RateLimiter::new_bounded(
-        push_limit,
-        std::time::Duration::from_secs(3600),
-        200_000,
-    );
-    if push_limit == 0 {
-        tracing::warn!("GITLAWB_PUSH_RATE_LIMIT=0 — per-IP push rate limiting disabled");
-    }
+    let push_rate_limiter = build_ip_limiter("GITLAWB_PUSH_RATE_LIMIT", 600, "push");
 
     // Which forwarded header the edge is trusted to set. Default None (trust
     // nothing, key on the socket peer). Fly nodes set GITLAWB_TRUSTED_PROXY=fly;
@@ -331,7 +340,7 @@ async fn main() -> Result<()> {
     let push_limiter_trust = rate_limit::TrustedProxy::from_env_value(
         &std::env::var("GITLAWB_TRUSTED_PROXY").unwrap_or_default(),
     );
-    tracing::info!(trust = ?push_limiter_trust, push_limit, "push rate limiter configured");
+    tracing::info!(trust = ?push_limiter_trust, "push rate limiter trust configured");
 
     // Peer-sync flood brakes, keyed on the resolved client IP (per-DID is useless
     // here — a did:key farm self-registers). Two buckets so an unsigned notify
@@ -373,6 +382,7 @@ async fn main() -> Result<()> {
         repo_store,
         rate_limiter,
         create_ip_rate_limiter,
+        write_rate_limiter,
         push_rate_limiter,
         push_limiter_trust,
         sync_trigger_rate_limiter,
@@ -408,22 +418,17 @@ async fn main() -> Result<()> {
 
     // Periodic cleanup of expired rate limit entries + consumed-proof ledger
     {
-        let rl = state.rate_limiter.clone();
-        let create_ip_rl = state.create_ip_rate_limiter.clone();
-        let push_rl = state.push_rate_limiter.clone();
-        let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
-        let peer_write_rl = state.peer_write_rate_limiter.clone();
+        // Clone the whole state so the sweep uses AppState::cleanup_rate_limiters
+        // (the single source of truth that reaps EVERY limiter, including
+        // write_rate_limiter) rather than a hand-maintained list that can omit one.
+        let state = state.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                        rl.cleanup().await;
-                        create_ip_rl.cleanup().await;
-                        push_rl.cleanup().await;
-                        sync_trigger_rl.cleanup().await;
-                        peer_write_rl.cleanup().await;
+                        state.cleanup_rate_limiters().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
@@ -562,6 +567,110 @@ async fn main() -> Result<()> {
     serve_result?;
     info!("clean exit");
     Ok(())
+}
+
+/// Pure resolver for a usize rate-limit env value. Returns `(resolved, invalid)`:
+/// an absent or empty value resolves to `default` and is NOT invalid; a non-empty
+/// value that fails to parse resolves to `default` and IS invalid (so the caller
+/// warns rather than silently disabling the intended, usually stricter, brake).
+fn resolve_rate_limit(raw: Option<&str>, default: usize) -> (usize, bool) {
+    match raw.map(str::trim) {
+        None | Some("") => (default, false),
+        Some(t) => match t.parse::<usize>() {
+            Ok(n) => (n, false),
+            Err(_) => (default, true),
+        },
+    }
+}
+
+/// Read a rate-limit env var, warning on a present-but-unparseable value. A typo
+/// like `GITLAWB_WRITE_RATE_LIMIT=5O` must not silently revert to the default and
+/// leave the operator believing a stricter cap is in force.
+fn rate_limit_from_env(var: &str, default: usize) -> usize {
+    let raw = std::env::var(var).ok();
+    let (value, invalid) = resolve_rate_limit(raw.as_deref(), default);
+    if invalid {
+        tracing::warn!(
+            var,
+            value = raw.as_deref().unwrap_or(""),
+            default,
+            "invalid rate-limit value — using default; the intended brake is NOT applied"
+        );
+    }
+    value
+}
+
+/// Build a bounded per-client-IP rate limiter from an env var: resolve the limit
+/// (honoring the present-but-unparseable warning in `rate_limit_from_env`), build
+/// the limiter with the shared 1-hour window and 200k-key cap, and warn when the
+/// limit is 0 (disabled). Collapses the identical create/write/push setup.
+fn build_ip_limiter(var: &str, default: usize, label: &str) -> rate_limit::RateLimiter {
+    let limit = rate_limit_from_env(var, default);
+    let limiter =
+        rate_limit::RateLimiter::new_bounded(limit, std::time::Duration::from_secs(3600), 200_000);
+    if limit == 0 {
+        tracing::warn!("{var}=0 — per-IP {label} rate limiting disabled");
+    } else {
+        tracing::info!(%var, limit, "per-IP {label} rate limiter configured");
+    }
+    limiter
+}
+
+/// Dispatch an admin subcommand. Connects the database directly (no server, no
+/// p2p, no metrics) and runs the requested tool to completion, then exits.
+async fn run_admin_command(command: config::Command, config: &Config) -> Result<()> {
+    match command {
+        config::Command::PurgeSpam { execute } => {
+            let acquire_timeout = std::time::Duration::from_secs(config.db_acquire_timeout_secs);
+            let db = Db::connect(
+                &config.database_url,
+                config.db_max_connections,
+                acquire_timeout,
+            )
+            .await
+            .context("connecting to database for purge-spam")?;
+            // Build the object store so purge is authoritative against remote
+            // state: the emptiness recheck consults the archive (not just
+            // possibly-stale local disk) and a successful purge deletes the
+            // archive too. When no bucket is configured this stays None and purge
+            // is local-only, exactly as before.
+            let object_store: Option<std::sync::Arc<dyn git::tigris::ObjectStore>> = if config
+                .tigris_bucket
+                .is_empty()
+            {
+                None
+            } else {
+                match git::tigris::TigrisClient::new(&config.tigris_bucket).await {
+                    Ok(client) => Some(std::sync::Arc::new(client)),
+                    Err(e) => {
+                        // Fail closed: without the configured store we cannot
+                        // do the authoritative recheck, and a local-only purge
+                        // on a Tigris deployment is the stale-view delete this
+                        // guards against. Refuse to run rather than fall back.
+                        anyhow::bail!(
+                                "purge-spam: GITLAWB_TIGRIS_BUCKET is set but the object-store client failed to initialize ({e}); refusing to run a local-only purge on a Tigris deployment"
+                            );
+                    }
+                }
+            };
+            // Give the purge-spam store a dedicated advisory-lock pool, separate
+            // from `db`'s app pool. The guard then holds a lock-pool connection
+            // while `delete_repo_by_id` runs on the app pool, so a purge at
+            // GITLAWB_DB_MAX_CONNECTIONS=1 does not self-deadlock (KTD3).
+            let lock_pool = Db::connect_lock_pool(
+                &config.database_url,
+                config.db_lock_pool_max_connections,
+                acquire_timeout,
+            )
+            .await
+            .context("connecting advisory-lock pool for purge-spam")?;
+            let repo_store =
+                git::repo_store::RepoStore::new(config.repos_dir.clone(), object_store, lock_pool);
+            admin::run_purge_spam(&db, &repo_store, &config.repos_dir, execute)
+                .await
+                .map(|_| ())
+        }
+    }
 }
 
 fn spawn_shutdown_signal(tx: watch::Sender<bool>) {
@@ -1021,6 +1130,40 @@ fn load_or_create_keypair(config: &Config) -> Result<Keypair> {
 
         info!(path = %key_path.display(), did = %kp.did(), "generated new node identity");
         Ok(kp)
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_env_tests {
+    use super::resolve_rate_limit;
+
+    #[test]
+    fn absent_uses_default_without_warning() {
+        assert_eq!(resolve_rate_limit(None, 600), (600, false));
+    }
+
+    #[test]
+    fn empty_or_whitespace_uses_default_without_warning() {
+        assert_eq!(resolve_rate_limit(Some(""), 600), (600, false));
+        assert_eq!(resolve_rate_limit(Some("   "), 600), (600, false));
+    }
+
+    #[test]
+    fn valid_value_parses() {
+        assert_eq!(resolve_rate_limit(Some("50"), 600), (50, false));
+        assert_eq!(resolve_rate_limit(Some(" 50 "), 600), (50, false));
+        // 0 is a VALID value (disables the brake); the ==0 warning is handled
+        // separately at the call site. It must NOT be flagged invalid here.
+        assert_eq!(resolve_rate_limit(Some("0"), 600), (0, false));
+    }
+
+    #[test]
+    fn present_but_unparseable_defaults_and_flags_invalid() {
+        // The L8 case: a fat-fingered stricter cap ("5O", letter O) must default
+        // AND be flagged so the caller warns, not silently disable the brake.
+        assert_eq!(resolve_rate_limit(Some("5O"), 600), (600, true));
+        assert_eq!(resolve_rate_limit(Some("abc"), 600), (600, true));
+        assert_eq!(resolve_rate_limit(Some("-1"), 600), (600, true));
     }
 }
 

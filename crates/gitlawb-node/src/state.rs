@@ -62,6 +62,16 @@ pub struct AppState {
     /// resolved client IP is what actually stops a single-source flood (same
     /// rationale as `push_rate_limiter`). Keyed by `push_limiter_trust`.
     pub create_ip_rate_limiter: RateLimiter,
+    /// Per-client-IP rate limiter for the authenticated write surface that is
+    /// not repo/agent creation: issue/PR comments, labels, stars, merges,
+    /// protect/unprotect, replicas, visibility, tasks, bounties, profile, and
+    /// the GraphQL `MutationRoot`. Separate bucket from `create_ip_rate_limiter`
+    /// (its own budget, per the `sync_trigger`/`peer_write` precedent) so a
+    /// write flood cannot drain the creation budget and vice versa. Per-DID is
+    /// deliberately NOT paired here: a DID farm never trips it, and busy
+    /// legitimate agents would false-positive. `GITLAWB_WRITE_RATE_LIMIT`
+    /// overrides the default, 0 disables. Keyed by `push_limiter_trust`.
+    pub write_rate_limiter: RateLimiter,
     /// Per-client-IP rate limiter for git-receive-pack. Per-DID limits cannot
     /// brake a push flood from a DID farm (one throwaway DID per repo), so the
     /// push path throttles on the resolved client IP instead.
@@ -117,5 +127,49 @@ impl AppState {
     #[allow(dead_code)] // used by tests and any future handler that wants to short-circuit
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
+    }
+
+    /// Reclaim expired entries from EVERY rate limiter. Single source of truth for
+    /// the periodic cleanup loop (main.rs), co-located with the limiter fields so a
+    /// newly-added limiter is cleaned here rather than silently omitted from a
+    /// hand-maintained list in main() (H2: `write_rate_limiter` was the omitted
+    /// one). Every limiter field above MUST be swept here; the guard test
+    /// `cleanup_rate_limiters_reaps_the_write_limiter` fails if it is not.
+    pub(crate) async fn cleanup_rate_limiters(&self) {
+        self.rate_limiter.cleanup().await;
+        self.create_ip_rate_limiter.cleanup().await;
+        self.write_rate_limiter.cleanup().await;
+        self.push_rate_limiter.cleanup().await;
+        self.sync_trigger_rate_limiter.cleanup().await;
+        self.peer_write_rate_limiter.cleanup().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// H2 guard: the write-surface limiter must be reaped by the shared cleanup
+    /// routine. Seeds a reclaimable entry into `write_rate_limiter` and asserts
+    /// `cleanup_rate_limiters` removes it. Goes RED if `write_rate_limiter` is
+    /// dropped from `cleanup_rate_limiters` — the exact H2 omission, now guarded.
+    #[tokio::test]
+    async fn cleanup_rate_limiters_reaps_the_write_limiter() {
+        let state = crate::test_support::test_state_lazy();
+        state
+            .write_rate_limiter
+            .insert_reclaimable_for_test("some-ip")
+            .await;
+        assert_eq!(
+            state.write_rate_limiter.tracked_keys().await,
+            1,
+            "precondition: the reclaimable entry is tracked"
+        );
+
+        state.cleanup_rate_limiters().await;
+
+        assert_eq!(
+            state.write_rate_limiter.tracked_keys().await,
+            0,
+            "write_rate_limiter must be reaped by cleanup_rate_limiters (H2)"
+        );
     }
 }

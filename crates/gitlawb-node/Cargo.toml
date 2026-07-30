@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 gitlawb-core = { path = "../gitlawb-core" }
+async-trait = "0.1"
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 tokio = { workspace = true }
