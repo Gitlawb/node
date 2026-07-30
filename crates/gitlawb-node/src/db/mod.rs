@@ -883,6 +883,24 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
+    // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
+    // The runner keys the applied set on the integer alone, so a version another
+    // in-flight branch also claims is skipped in full on whichever side merges
+    // second — no error, no warning, and schema_migrations still reads healthy
+    // while the column is simply absent. Two open branches already claim into
+    // this range: #135/#173 holds through 14 (15 once it rebases past v11), and
+    // #253 took 16. 17 clears both. Gaps are harmless: the runner iterates the
+    // array and never requires contiguity.
+    Migration {
+        version: 17,
+        name: "sync_queue_attempted_at",
+        stmts: &[
+            // Scheduling key for dequeue_pending_syncs: when the row was last
+            // handed to a worker. Null until first dequeued, which is why the
+            // ordering coalesces onto enqueued_at.
+            "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -1637,13 +1655,46 @@ impl Db {
         Ok(())
     }
 
+    /// Take up to `limit` pending syncs — the least recently attempted ones —
+    /// and stamp each with the time it was handed out.
+    ///
+    /// Selecting and stamping in one statement is deliberate. A row the worker
+    /// cannot make progress on stays `pending` so it is retried, and if its
+    /// ordering key never moved it would remain among the oldest rows forever,
+    /// holding a fixed-size window against every healthy repo behind it.
+    /// Stamping on the way out makes the key "least recently handed out", so a
+    /// stuck row rotates to the back instead. Doing it here rather than at each
+    /// deferral branch in the worker is what makes that hold by construction:
+    /// no call site can forget it, and a batch that dies mid-loop still leaves
+    /// its rows stamped. `enqueued_at` is left alone so backlog age stays
+    /// measurable.
+    ///
+    /// Two things this deliberately does not promise. The returned rows are the
+    /// right *set*, in no particular order — `RETURNING` does not sort, and
+    /// nothing in `process_batch` depends on the order within a batch. And this
+    /// is not a claim: the rows stay `pending` with no row lock held past the
+    /// statement, so two workers against one database can still be handed the
+    /// same batch. Single-worker deployment is the existing assumption;
+    /// `FOR UPDATE SKIP LOCKED` is what would change that, and it is not here.
+    ///
+    /// Errors surface to the caller, which logs and skips the poll. That is
+    /// worth knowing now that this writes: it can fail for reasons a plain
+    /// SELECT could not, such as a read-only transaction or a lock timeout.
     pub async fn dequeue_pending_syncs(&self, limit: i64) -> Result<Vec<SyncQueueItem>> {
         let rows = sqlx::query(
-            "SELECT id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at
-             FROM sync_queue WHERE status = 'pending'
-             ORDER BY enqueued_at ASC LIMIT $1",
+            // The outer `status = 'pending'` is not redundant with the
+            // subquery's: between the two, a concurrent worker can settle a row,
+            // and without it the UPDATE would still stamp and return a row that
+            // had already left the pending set.
+            "UPDATE sync_queue SET attempted_at = $2
+             WHERE status = 'pending' AND id IN (
+                 SELECT id FROM sync_queue WHERE status = 'pending'
+                 ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
+             )
+             RETURNING id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at",
         )
         .bind(limit)
+        .bind(Utc::now().to_rfc3339())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -2089,10 +2140,46 @@ impl Db {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
         }
         let now = Utc::now().to_rfc3339();
+        // A changed URL drops the reachability gate, so a repointed peer does
+        // not inherit a probe the previous host earned. In the DO UPDATE branch
+        // `peers.http_url` is the existing pre-update row (the proposed value is
+        // $2), and the comparison runs under the conflict row lock, so
+        // concurrent announces for one DID serialize instead of racing a
+        // read-then-write. That orders announces against each other and nothing
+        // more: mark_peer_ping writes by DID with no http_url predicate, so a
+        // probe of the previous URL that lands after a reset can still re-grant
+        // the flag until the next round.
+        //
+        // Comparison is exact. http_url is stored as announced, so a cosmetic
+        // difference such as a trailing slash also clears the flag; the peer
+        // re-earns it on a later gossip round, provided no further announce
+        // lands first. Normalizing instead would mean canonicalizing the stored
+        // value, this comparison, and the existing trim_end_matches call sites.
+        //
+        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
+        // clear it by announcing a different URL, and until #248 lands can also
+        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
+        // writes mark_peer_ping from the stored URL's own probe response. Do not
+        // build a new consumer on this flag as if it were attacker-resistant.
+        //
+        // Only the federated repo fan-out in api/repos.rs gates on this flag.
+        // Four consumers act on a repointed http_url regardless of it (sync.rs's
+        // origin resolve, the post-receive notify fan-out, trigger_sync, and the
+        // public resolve route), and two read surfaces republish it as
+        // `reachable` (api/resolve.rs, api/peers.rs), which is where a reset
+        // becomes externally visible. So this bounds the automatic inheritance
+        // rather than closing the rewrite. Binding a DID to its first-seen
+        // announcing key is what closes it: #273.
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
              VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET http_url = $2, last_seen = $3",
+             ON CONFLICT(did) DO UPDATE SET
+               http_url = $2,
+               last_seen = $3,
+               last_ping_ok = CASE
+                 WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
+                 ELSE peers.last_ping_ok
+               END",
         )
         .bind(did)
         .bind(http_url)
@@ -3653,6 +3740,186 @@ mod migration_tests {
 
         // (d) Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
         db.migrate().await.unwrap();
+    }
+
+    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
+
+    async fn enqueue_one(db: &super::Db, repo: &str) {
+        db.enqueue_sync(
+            repo,
+            "did:key:zPEER",
+            "refs/heads/main",
+            &"0".repeat(40),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn attempted_at_of(db: &super::Db, repo: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT attempted_at FROM sync_queue WHERE repo = $1")
+            .bind(repo)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Upgrade-path test: simulate a node already at v11 and let the real
+    /// migration entry point apply v17, rather than hand-copying its SQL.
+    ///
+    /// This is the test that catches the column being added to the v1
+    /// statement array instead of a new migration. v1 never re-runs on an
+    /// existing install, so that mistake breaks every deployed node's dequeue
+    /// while staying invisible to every other test here, since `#[sqlx::test]`
+    /// hands out a fresh database that runs the whole chain.
+    #[sqlx::test]
+    async fn migration_v17_adds_sync_queue_attempted_at(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll back to v11: drop the column and forget the version.
+        sqlx::query("ALTER TABLE sync_queue DROP COLUMN attempted_at")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 17")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // A row written by the old node, before the column existed.
+        enqueue_one(&db, "z6Mkfoo/legacy").await;
+
+        db.migrate().await.unwrap();
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'sync_queue' AND column_name = 'attempted_at'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "attempted_at must be nullable");
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 17")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v17 must be recorded as applied");
+
+        // The pre-existing row survives with a null key and is still dequeued.
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/legacy").await, None);
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].repo, "z6Mkfoo/legacy");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn dequeue_stamps_attempted_at_on_every_row_it_hands_out(pool: sqlx::PgPool) {
+        // The stamp is what stops a deferred row from holding the window, and
+        // it happens here rather than at the deferral branches so no call site
+        // can forget it.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        assert_eq!(
+            attempted_at_of(&db, "z6Mkfoo/a").await,
+            None,
+            "a freshly enqueued row has no attempt yet"
+        );
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            attempted_at_of(&db, "z6Mkfoo/a").await.is_some(),
+            "dequeue must stamp the row it returns, whatever the worker does next"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_orders_by_last_attempt_then_enqueue_time(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/older").await;
+        enqueue_one(&db, "z6Mkfoo/newer").await;
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:00Z")
+            .bind("z6Mkfoo/older")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:01Z")
+            .bind("z6Mkfoo/newer")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Never-attempted rows fall back to enqueue order.
+        let first = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(first[0].repo, "z6Mkfoo/older");
+
+        // Having been attempted, it now sorts behind the untried row.
+        let second = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(
+            second[0].repo, "z6Mkfoo/newer",
+            "an attempted row must yield to one that has never been tried"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_leaves_enqueued_at_untouched(pool: sqlx::PgPool) {
+        // enqueued_at keeps meaning enqueue time, so backlog age stays
+        // measurable; that is the reason attempted_at is a separate column.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        let before: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+
+        db.dequeue_pending_syncs(10).await.unwrap();
+
+        let after: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[sqlx::test]
+    async fn dequeue_does_not_touch_settled_rows(pool: sqlx::PgPool) {
+        // The stamping UPDATE must not reach a row that already left the
+        // pending set, or a terminal row could be dragged back into rotation.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/failed").await;
+        enqueue_one(&db, "z6Mkfoo/done").await;
+        let ids: Vec<(String, String)> =
+            sqlx::query_as("SELECT repo, id FROM sync_queue ORDER BY repo")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        for (repo, id) in &ids {
+            if repo.ends_with("failed") {
+                db.mark_sync_failed(id).await.unwrap();
+            } else {
+                db.mark_sync_done(id).await.unwrap();
+            }
+        }
+
+        assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
     }
 }
 
@@ -5679,5 +5946,172 @@ mod ref_update_db_tests {
         let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].new_sha, "gggg");
+    }
+}
+
+#[cfg(test)]
+mod peer_reachability_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    const VICTIM_DID: &str = "did:key:z6MkvictimPeerFixture";
+    const HONEST_URL: &str = "https://honest-peer.example.com";
+    const ATTACKER_URL: &str = "https://attacker.example.com";
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// Read the row back through `list_peers`, the same surface the federated
+    /// fan-out filters on, rather than issuing raw SQL from the test.
+    async fn peer(db: &Db, did: &str) -> (String, bool) {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        (row.http_url, row.last_ping_ok)
+    }
+
+    /// Parsed rather than string-compared, so the ordering assertion does not
+    /// depend on the stored timestamp's textual precision.
+    async fn last_seen(db: &Db, did: &str) -> chrono::DateTime<chrono::Utc> {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        chrono::DateTime::parse_from_rfc3339(&row.last_seen.expect("last_seen is set by upsert"))
+            .expect("last_seen is rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Seed a peer that has earned reachability, asserting the seed took so a
+    /// later case cannot pass vacuously on a row that was never written.
+    async fn seed_reachable(db: &Db) {
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
+        assert_eq!(
+            peer(db, VICTIM_DID).await,
+            (HONEST_URL.to_string(), true),
+            "seed did not take"
+        );
+    }
+
+    /// Repointing an existing peer's URL must drop the reachability gate: the
+    /// new host has not been probed, so it cannot inherit the old host's
+    /// earned `last_ping_ok`.
+    #[sqlx::test]
+    async fn url_change_clears_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, ATTACKER_URL).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, ATTACKER_URL, "the URL should still be rewritten");
+        assert!(
+            !reachable,
+            "a repointed peer must re-earn reachability, not inherit it"
+        );
+    }
+
+    /// A plain liveness re-announce carries the same URL and must not cost an
+    /// honest peer its place in the federated fan-out. Guards against a fix
+    /// that clears the flag on every conflict instead of only on a change.
+    #[sqlx::test]
+    async fn same_url_reannounce_keeps_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, HONEST_URL);
+        assert!(
+            reachable,
+            "an unchanged-URL re-announce must not drop the gate"
+        );
+    }
+
+    /// The must-not-grant direction. An unchanged URL preserves the flag as it
+    /// stands, which means FALSE stays FALSE: reachability is earned by a probe,
+    /// never by announcing. This is the only case that fails if the conditional
+    /// is flattened to `last_ping_ok = (peers.http_url IS NOT DISTINCT FROM $2)`,
+    /// which would let any unsigned same-URL re-announce set the flag TRUE.
+    #[sqlx::test]
+    async fn same_url_reannounce_does_not_grant_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        assert_eq!(peer(&db, VICTIM_DID).await, (HONEST_URL.to_string(), false));
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let (_, reachable) = peer(&db, VICTIM_DID).await;
+        assert!(
+            !reachable,
+            "announcing must never grant reachability without a probe"
+        );
+    }
+
+    /// A first insert stays out of the fan-out until a probe confirms it. Guards
+    /// against the conditional leaking into the INSERT branch.
+    #[sqlx::test]
+    async fn fresh_peer_inserts_unreachable(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer("did:key:z6MkfreshPeerFixture", HONEST_URL)
+            .await
+            .unwrap();
+
+        let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// Comparison is exact, by decision: http_url is stored as announced and
+    /// nothing normalizes it, so a trailing slash is a different remote as far
+    /// as this row is concerned and clears the gate. Pins that decision against
+    /// a future normalizing comparison, which every other case here would pass
+    /// because they only ever compare identical or wholly different hosts.
+    #[sqlx::test]
+    async fn cosmetic_url_difference_counts_as_a_change(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        let with_slash = format!("{HONEST_URL}/");
+        db.upsert_peer(VICTIM_DID, &with_slash).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, with_slash);
+        assert!(
+            !reachable,
+            "comparison is exact, so a cosmetic difference clears the gate too"
+        );
+    }
+
+    /// The reset must ride the existing UPDATE, not gate it. Hoisting the
+    /// condition to a statement-level WHERE would leave every case above green
+    /// while silently skipping the whole update on a same-URL re-announce, so
+    /// liveness would stop advancing and the peer would age out on last_seen.
+    #[sqlx::test]
+    async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        let first = last_seen(&db, VICTIM_DID).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let second = last_seen(&db, VICTIM_DID).await;
+        assert!(
+            second > first,
+            "a same-URL re-announce is a liveness signal and must still \
+             advance last_seen: {first} then {second}"
+        );
     }
 }

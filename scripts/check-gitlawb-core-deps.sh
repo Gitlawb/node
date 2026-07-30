@@ -23,11 +23,15 @@ if [ ! -f "$ALLOW" ]; then
   exit 1
 fi
 
-# `cargo tree` resolves like the build/test jobs (no --locked): the committed
-# Cargo.lock can lag the manifests, and --locked would red this gate for
-# lock-staleness reasons unrelated to gitlawb-core's dependencies. Resolving can
-# refresh Cargo.lock as a side effect, so snapshot and restore it — this check
-# must never leave the working tree dirty when run locally.
+# `cargo tree` resolves WITHOUT --locked on purpose, unlike the blocking cargo
+# jobs in pr-checks. This gate answers one question, whether gitlawb-core's
+# dependency closure gained something unallowlisted, and a stale Cargo.lock
+# would red it for a reason that has nothing to do with that closure. Lock
+# staleness is already caught by the --locked cargo jobs, so it does not need a
+# second gate here.
+#
+# Resolving can refresh Cargo.lock as a side effect, so snapshot and restore
+# it: this check must never leave the working tree dirty when run locally.
 lock_backup="$(mktemp)"
 cp "$ROOT/Cargo.lock" "$lock_backup"
 restore_lock() { cp "$lock_backup" "$ROOT/Cargo.lock"; rm -f "$lock_backup"; }
