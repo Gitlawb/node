@@ -94,6 +94,18 @@ impl NodeClient {
         self.send_signed("POST", path, body).await
     }
 
+    /// POST with JSON body + RFC 9421 signing and an optional user-provided
+    /// iCaptcha proof, sent on the initial request.
+    pub async fn post_with_proof(
+        &self,
+        path: &str,
+        body: &[u8],
+        initial_proof: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        self.send_signed_with_proof("POST", path, body, initial_proof)
+            .await
+    }
+
     /// PUT with RFC 9421 signing + transparent iCaptcha solve/retry.
     pub async fn put(&self, path: &str, body: &[u8]) -> Result<reqwest::Response> {
         self.send_signed("PUT", path, body).await
@@ -108,16 +120,32 @@ impl NodeClient {
     /// `x-icaptcha-*` headers) solve it and retry the same signed request with
     /// the proof header, up to [`MAX_ICAPTCHA_RETRIES`]. Emits an actionable
     /// hint on a 401 "not an agent" (the old-CLI / unregistered failure mode).
+    /// Existing call path: no user-supplied proof on the first request.
     async fn send_signed(
         &self,
         method: &str,
         path: &str,
         body: &[u8],
     ) -> Result<reqwest::Response> {
-        let mut proof: Option<String> = None;
+        self.send_signed_with_proof(method, path, body, None).await
+    }
+
+    /// Sign + send a write. `initial_proof`, if provided, is attached to the
+    /// first request. On a 403 iCaptcha challenge advertised via
+    /// `x-icaptcha-*` headers, solve and retry up to MAX_ICAPTCHA_RETRIES.
+    async fn send_signed_with_proof(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        initial_proof: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let mut proof = initial_proof.map(str::to_owned);
         let mut attempts = 0;
+
         loop {
             let resp = self.send_once(method, path, body, proof.as_deref()).await?;
+
             let status = resp.status();
 
             if status == reqwest::StatusCode::UNAUTHORIZED
@@ -141,6 +169,7 @@ impl NodeClient {
                     continue;
                 }
             }
+
             return Ok(resp);
         }
     }
