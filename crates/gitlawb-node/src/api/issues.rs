@@ -243,9 +243,12 @@ pub async fn close_issue(
         // is immutable — it is not: `refs/gitlawb/**` is pushable, so a forged
         // author blob can be pushed (tracked separately; it is what makes this
         // fallback only as trustworthy as push authorization). The justification is
-        // that this read is a PRE-CHECK: it decides whether to take the lock at all,
-        // and the mutation below re-reads under the guard, so a change landing
-        // between the two cannot cause a write against state we never looked at.
+        // that this read is only a PRE-CHECK, deciding whether to take the lock at
+        // all. It is NOT the authorization decision: `acquire_write` re-downloads the
+        // archive after locking, so the tree that gets mutated is routinely not this
+        // one, and the authoritative owner-or-author check runs again under the guard
+        // below. Refusing here early just keeps a caller who is already visibly
+        // unauthorized from reaching the lock.
         //
         // `acquire_fresh`, not `acquire`: acquire's fast path returns as soon as the
         // directory exists and never contacts object storage, so on a node with a
@@ -285,13 +288,39 @@ pub async fn close_issue(
         .await?;
     let disk_path = guard.path().to_path_buf();
 
-    // Re-read under the guard so the mutation acts on current state, and keep the
-    // owner's existing 404-for-a-missing-issue behavior.
+    // Re-read under the guard and RE-AUTHORIZE against what we read, rather than
+    // only confirming the issue still exists. The pre-lock read decided whether to
+    // take the lock; it cannot be the authorization decision, because acquire_write
+    // re-downloads the archive after locking, so this is frequently a different tree
+    // than the one the author was read from. Checking existence alone would leave the
+    // whole decision resting on the earlier read of a tree we are no longer looking
+    // at. The blob is already in hand here, so this costs a deserialize.
     match git_issues::get_issue(&disk_path, &issue_id) {
-        Ok(Some(_)) => {}
+        Ok(Some(raw)) => {
+            let author_now: Option<String> = serde_json::from_str::<IssueRecord>(&raw)
+                .ok()
+                .and_then(|i| i.author);
+            let is_author_now = author_now
+                .as_deref()
+                .is_some_and(|a| crate::api::did_matches(&auth.0, a));
+            if !is_owner && !is_author_now {
+                guard.release(false).await;
+                return Err(AppError::Forbidden(
+                    "only the repo owner or the issue author can close this issue".into(),
+                ));
+            }
+        }
         Ok(None) => {
             guard.release(false).await;
-            return Err(AppError::NotFound(format!("issue {issue_id} not found")));
+            // The owner keeps the informative 404; a non-owner must not learn from
+            // this route whether the issue exists, matching the pre-check above.
+            return Err(if is_owner {
+                AppError::NotFound(format!("issue {issue_id} not found"))
+            } else {
+                AppError::Forbidden(
+                    "only the repo owner or the issue author can close this issue".into(),
+                )
+            });
         }
         Err(e) => {
             guard.release(false).await;
@@ -447,11 +476,24 @@ mod tests {
     /// INV-21(c) positive twin 1: the OWNER can still close. The reorder moved the
     /// owner check above the lock, so this is the arm most likely to have broken,
     /// and the deny test alone could not see it.
+    ///
+    /// The issue is seeded with a THIRD party as its author, deliberately. Seeding
+    /// the owner as their own author made this test unable to fail: with the owner
+    /// check disabled, the author fallback granted the close anyway and the test
+    /// stayed green. Only the owner arm can grant here now.
     #[sqlx::test]
     async fn owner_can_still_close_after_the_reorder(pool: PgPool) {
         let state = crate::test_support::test_state(pool.clone()).await;
         let owner_did = "did:key:z6MkT1Owner";
-        seed_repo_with_issue(&state, "z6MkT1Owner", owner_did, "t1repo", "1", owner_did).await;
+        seed_repo_with_issue(
+            &state,
+            "z6MkT1Owner",
+            owner_did,
+            "t1repo",
+            "1",
+            "did:key:z6MkT1Stranger",
+        )
+        .await;
 
         let res = close_issue(
             axum::extract::State(state.clone()),
@@ -470,8 +512,15 @@ mod tests {
         );
     }
 
-    /// INV-21(c) positive twin 2: the non-owner AUTHOR can still close. This is the
-    /// arm the acquire-vs-acquire_fresh regression broke, and nothing caught it.
+    /// INV-21(c) positive twin 2: the non-owner AUTHOR can still close, through both
+    /// the pre-lock check and the re-assertion under the guard.
+    ///
+    /// It does NOT cover the acquire-vs-acquire_fresh distinction, despite that being
+    /// the reason the call changed. `RepoStore::for_testing` hardcodes `tigris: None`,
+    /// which makes `acquire` and `acquire_fresh` identical in every test here, so
+    /// reverting that line leaves this green. Separating them needs an object-storage
+    /// seam, which is out of scope for this change and tracked separately. Claiming
+    /// the coverage here would be worse than admitting the gap.
     #[sqlx::test]
     async fn issue_author_who_is_not_the_owner_can_still_close(pool: PgPool) {
         let state = crate::test_support::test_state(pool.clone()).await;
