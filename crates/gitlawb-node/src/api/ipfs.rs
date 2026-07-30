@@ -460,7 +460,7 @@ pub async fn get_by_cid(
                 // started walk runs its git children under a deadline clamped
                 // to the remainder (the min below), so a walk can never
                 // complete past the budget.
-                let Some(budget_left) = budget_gate(
+                let Some(_budget_left) = budget_gate(
                     &mut truncated_by,
                     request_deadline,
                     state.config.ipfs_request_budget_secs,
@@ -490,10 +490,9 @@ pub async fn get_by_cid(
                 let owner = repo.owner_did.clone();
                 let caller_for_walk = caller_owned.clone();
                 let git_bin = state.git_bin.clone();
-                let walk_timeout = std::cmp::min(
-                    std::time::Duration::from_secs(state.config.git_service_timeout_secs),
-                    budget_left,
-                );
+                let git_service_timeout =
+                    std::time::Duration::from_secs(state.config.git_service_timeout_secs);
+                let walk_deadline = request_deadline;
                 // Full-history walk shells out to git — keep it off the async runtime,
                 // bounded and reaped like the served-git ops (#174).
                 let walk_admission = std::sync::Arc::clone(&admission);
@@ -501,6 +500,24 @@ pub async fn get_by_cid(
                     // Admission clone (#174 U1): the slot stays taken until this blocking
                     // work returns, even if the handler future was dropped or this closure panics.
                     let _admission = walk_admission;
+                    // Derive the walk's budget from the request deadline HERE, inside the
+                    // closure, not on the async side before the task is queued. The walk
+                    // starts its own clock when it runs, so a budget computed at queue time
+                    // would hand it the full remainder measured from whenever the blocking
+                    // pool got to it — the queue delay would go uncharged and the walk could
+                    // finish past the request budget. Computing it at task start charges the
+                    // delay against the deadline; a queue delay that eats the whole remainder
+                    // saturates this to zero and the walk fails closed (no verdict, taint),
+                    // which is the safe direction. Same fix as the upload-pack walk in
+                    // `api/repos.rs`, and this route is anonymously reachable.
+                    // TESTING GAP: the queue-delay path is reasoned, not executed. Observing
+                    // it needs a runtime with the blocking pool pinned and parked, and the
+                    // `#[sqlx::test]` harness gives no seam for that (the sibling fix,
+                    // 28a6ca4, shipped with the same gap for the same reason).
+                    let walk_timeout = std::cmp::min(
+                        git_service_timeout,
+                        walk_deadline.saturating_duration_since(std::time::Instant::now()),
+                    );
                     allowed_blob_set_for_caller_bounded(
                         &rp,
                         &git_bin,
