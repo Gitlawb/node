@@ -1047,10 +1047,10 @@ async fn resolve_drain_object_list(
 /// and the filter always fails closed (a newly-withheld blob is not pinned; a
 /// no-longer-announceable repo pins nothing). A tightening AFTER tail-start — before
 /// a slow re-derivation runs — is not reflected, matching the old retained-list
-/// behavior; the reconciliation sweep is the backstop. Every git child runs
-/// through the same INV-22 bounded, process-group-reaped helpers the sibling
-/// post-receive scans use (`replication_withheld_set`,
-/// `resolve_candidates_for_push`, `fail_closed_full_scan_objects`).
+/// behavior. Every git child runs through the same INV-22 bounded,
+/// process-group-reaped helpers the sibling post-receive scans use
+/// (`replication_withheld_set`, `resolve_candidates_for_push`,
+/// `fail_closed_full_scan_objects`).
 #[allow(clippy::too_many_arguments)]
 async fn pinata_object_list_for_refs(
     encrypt_sem: Arc<tokio::sync::Semaphore>,
