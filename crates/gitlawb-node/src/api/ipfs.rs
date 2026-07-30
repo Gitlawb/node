@@ -40,13 +40,16 @@ use crate::visibility::{visibility_check, Decision};
 /// caller passes. For each iterated row we gate against that row's OWN rules
 /// (`visibility_check` at `"/"`), never re-resolving via `authorize_repo_read`
 /// — `get_repo`'s fuzzy match could otherwise authorize a different physical
-/// row than the one read (KTD2a). Quarantined rows are excluded upstream by
-/// `list_all_repos` (same fail-closed posture as `authorize_repo_read`). We
-/// check object existence via `store::object_type` *before* the expensive
-/// reachability walk so random-CID spray cannot trigger full-history git walks
-/// on repos that don't carry the object. When the row carries path-scoped
-/// rules (KTD4) the served object must be either a non-blob (trees/commits are
-/// structural; KTD3) OR a blob in the caller's *reachable* allowed-set
+/// row than the one read (KTD2a). Quarantine is fail-closed in two layers:
+/// `list_all_repos` drops rows with `quarantined = TRUE`, and a logical-repo
+/// fold (same class as the feed collector in `events.rs`) drops any surviving
+/// twin that shares owner+name with a quarantined row — so a public mirror
+/// cannot serve while its canonical twin is quarantined. We check object
+/// existence via `store::object_type` *before* the expensive reachability walk
+/// so random-CID spray cannot trigger full-history git walks on repos that
+/// don't carry the object. When the row carries path-scoped rules (KTD4) the
+/// served object must be either a non-blob (trees/commits are structural;
+/// KTD3) OR a blob in the caller's *reachable* allowed-set
 /// (`allowed_blob_set_for_caller`). The reachable allowed-set excludes dangling
 /// blobs — a blob written via `git hash-object -w` and never committed has no
 /// path to gate, so it is fail-closed 404'd under path-scoped rules (#126).
@@ -83,6 +86,16 @@ pub async fn get_by_cid(
         .list_all_repos()
         .await
         .map_err(AppError::Internal)?;
+    // Logical-repo quarantine fold: when a canonical UUID row is quarantined
+    // but a public mirror twin (`owner/name`) survives `list_all_repos`, slug
+    // routes 404 via `authorize_repo_read` (prefers canonical) while CID serve
+    // would otherwise still hit the mirror. Drop any candidate that names the
+    // same logical repo as a quarantined row (feed collector pattern).
+    let quarantined = state
+        .db
+        .list_quarantined_repos()
+        .await
+        .map_err(AppError::Internal)?;
 
     // Fetch every repo's visibility rules in one query rather than one per row
     // (the gate runs each row against its OWN rules — KTD2a). A row absent from
@@ -106,6 +119,13 @@ pub async fn get_by_cid(
     let mut allowed_memo: HashMap<String, HashSet<String>> = HashMap::new();
 
     for repo in &repos {
+        if quarantined
+            .iter()
+            .any(|q| q.name == repo.name && crate::api::did_matches(&q.owner_did, &repo.owner_did))
+        {
+            continue;
+        }
+
         // Repo-level read gate against THIS row's own rules (KTD2a).
         let rules: &[crate::db::VisibilityRule] = rules_by_repo
             .get(&repo.id)

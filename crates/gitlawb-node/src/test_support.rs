@@ -4268,18 +4268,181 @@ mod tests {
             );
         }
 
-        // Control: clear quarantine → discovery admits and returns the CID.
+        // Owner (full did:key and bare key) must also 404 — quarantine is not a
+        // visibility deny that the owner short-circuit can bypass.
+        for caller in [owner, short] {
+            let path = format!("/api/v1/repos/{short}/enc-quar/encrypted-blobs");
+            let resp = Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/encrypted-blobs",
+                    axum::routing::get(crate::api::encrypted::list_encrypted_blobs),
+                )
+                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .with_state(state.clone())
+                .oneshot(signed_request_as(caller, Method::GET, &path, Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "owner form {caller} must not read quarantined encrypted-blobs"
+            );
+        }
+
+        // Control: clear quarantine → all three discovery surfaces admit again.
+        // `encrypted-blob/{oid}` may 500 without a live IPFS node after the gate
+        // opens; assert it is not the quarantine 404.
         state.db.set_repo_quarantine(&repo_id, false).await.unwrap();
-        let path = format!("/api/v1/repos/{short}/enc-quar/encrypted-blobs");
+        for suffix in ["encrypted-blobs", "encrypted-blobs/replicate"] {
+            let path = format!("/api/v1/repos/{short}/enc-quar/{suffix}");
+            let resp = router.clone().oneshot(anon_get(&path)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "released must admit {path}");
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                text.contains("bafybeiquarantinedcid"),
+                "released repo must expose blob index on {path}: {text}"
+            );
+        }
+        let get_path = format!("/api/v1/repos/{short}/enc-quar/encrypted-blob/deadbeef");
+        let resp = router.oneshot(anon_get(&get_path)).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "released get must clear the quarantine 404 (may 5xx without IPFS)"
+        );
+    }
+
+    /// Mirror-admission path (`upsert_mirror_repo` + slash-form id) must also
+    /// opaque-404 encrypted discovery while quarantined.
+    #[sqlx::test]
+    async fn encrypted_blobs_quarantined_mirror_admission_opaque_404(pool: PgPool) {
+        let state = test_state(pool).await;
+        let short = "z6MkEncMirrorAdmitAAAAAAAAAAAAAAAAAAAA";
+        state
+            .db
+            .upsert_mirror_repo(short, "enc-mirror", "/tmp/enc-mirror", None, true)
+            .await
+            .unwrap();
+        let repo_id = format!("{short}/enc-mirror");
+        state
+            .db
+            .record_encrypted_blob(&repo_id, "aabbccdd", "bafybeimirrorcid", "")
+            .await
+            .unwrap();
+
+        let router = crate::server::build_router(state.clone());
+        let path = format!("/api/v1/repos/{short}/enc-mirror/encrypted-blobs");
+        let resp = router.clone().oneshot(anon_get(&path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/encrypted-blobs",
+                axum::routing::get(crate::api::encrypted::list_encrypted_blobs),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state.clone())
+            .oneshot(signed_request_as(short, Method::GET, &path, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "bare-key mirror owner must not read quarantined encrypted-blobs"
+        );
+
+        state.db.set_repo_quarantine(&repo_id, false).await.unwrap();
         let resp = router.oneshot(anon_get(&path)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// `withheld-paths` and `list_visibility` must share the quarantine gate.
+    #[sqlx::test]
+    async fn withheld_paths_and_list_visibility_quarantine_opaque(pool: PgPool) {
+        use crate::db::VisibilityMode;
+
+        let state = test_state(pool).await;
+        let owner = "did:key:zVISQUAROWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        let mut repo = seed_private_repo(owner, "vis-quar");
+        repo.is_public = true;
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+        state
+            .db
+            .set_visibility_rule(&repo_id, "/secret/**", VisibilityMode::B, &[], owner)
+            .await
+            .unwrap();
+        state.db.set_repo_quarantine(&repo_id, true).await.unwrap();
+
+        let router = crate::server::build_router(state.clone());
+        let withheld = format!("/api/v1/repos/{short}/vis-quar/withheld-paths");
+        let resp = router.clone().oneshot(anon_get(&withheld)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "anon withheld-paths must 404 while quarantined"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("/secret"),
+            "withheld layout must not leak: {text}"
+        );
+
+        for caller in [owner, short] {
+            let resp = Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/withheld-paths",
+                    axum::routing::get(crate::api::visibility::withheld_paths),
+                )
+                .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+                .with_state(state.clone())
+                .oneshot(signed_request_as(
+                    caller,
+                    Method::GET,
+                    &withheld,
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "owner form {caller} withheld-paths must 404 while quarantined"
+            );
+
+            let vis = format!("/api/v1/repos/{short}/vis-quar/visibility");
+            let resp = Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/visibility",
+                    axum::routing::get(crate::api::visibility::list_visibility),
+                )
+                .with_state(state.clone())
+                .oneshot(signed_request_as(caller, Method::GET, &vis, Body::empty()))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "owner form {caller} list_visibility must 404 while quarantined"
+            );
+        }
+
+        state.db.set_repo_quarantine(&repo_id, false).await.unwrap();
+        let resp = router.oneshot(anon_get(&withheld)).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let text = String::from_utf8_lossy(&body);
         assert!(
-            text.contains("bafybeiquarantinedcid"),
-            "released repo must expose blob index: {text}"
+            text.contains("/secret"),
+            "released withheld-paths must return globs: {text}"
         );
     }
 
@@ -4311,6 +4474,28 @@ mod tests {
             "object bytes must not leak: {body}"
         );
 
+        // Owner (full + bare) must also 404 — proves quarantine is not owner-bypassable.
+        for caller in [owner, short] {
+            let (st, body) = cid_parts(
+                cid_router(&state)
+                    .oneshot(signed_request_as(
+                        caller,
+                        Method::GET,
+                        &format!("/ipfs/{cid}"),
+                        Body::empty(),
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                st,
+                StatusCode::NOT_FOUND,
+                "owner form {caller} must not read quarantined CID: {body}"
+            );
+            assert!(!body.contains("public bytes"));
+        }
+
         // Control: release quarantine → same CID serves.
         state.db.set_repo_quarantine(&repo_id, false).await.unwrap();
         let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
@@ -4319,6 +4504,77 @@ mod tests {
             body.contains("public bytes"),
             "expected public blob content: {body}"
         );
+    }
+
+    /// Dual-row: quarantined canonical + unquarantined public mirror twin.
+    /// Slug routes prefer the canonical (404); CID serve must not leak via the
+    /// surviving mirror row.
+    #[sqlx::test]
+    async fn get_by_cid_skips_mirror_twin_of_quarantined_canonical(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zCIDDUALOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let short = owner.split(':').next_back().unwrap();
+        let slug = owner.replace([':', '/'], "_");
+        let fx = seed_cid_repos(&slug, short, &["dual-quar"]);
+
+        // Canonical UUID row (full DID), then quarantine it.
+        let mut canonical = seed_repo(owner, "dual-quar");
+        canonical.is_public = true;
+        let canonical_id = canonical.id.clone();
+        state.db.create_repo(&canonical).await.unwrap();
+        state
+            .db
+            .set_repo_quarantine(&canonical_id, true)
+            .await
+            .unwrap();
+
+        // Public mirror twin (bare owner, slash id) — not quarantined on insert
+        // because get_repo already finds the canonical and sync would pass
+        // quarantined=false; here we insert the twin directly as unquarantined.
+        state
+            .db
+            .upsert_mirror_repo(
+                short,
+                "dual-quar",
+                &format!("/tmp/{slug}/dual-quar.git"),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Sanity: list_all_repos still sees the mirror (not quarantined itself).
+        let listed: Vec<_> = state
+            .db
+            .list_all_repos()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(
+            listed
+                .iter()
+                .any(|id| id.contains("dual-quar") || id == &format!("{short}/dual-quar")),
+            "unquarantined mirror twin must still be in list_all_repos: {listed:?}"
+        );
+
+        let cid = cid_for_oid(&fx.public_oid);
+        let (st, body) = cid_parts(cid_router(&state).oneshot(cid_anon(&cid)).await.unwrap()).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "CID must not serve via mirror twin of quarantined canonical: {body}"
+        );
+        assert!(!body.contains("public bytes"));
+
+        // Slug encrypted path also 404s (authorize_repo_read prefers canonical).
+        let enc = format!("/api/v1/repos/{short}/dual-quar/encrypted-blobs");
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(anon_get(&enc))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[sqlx::test]
