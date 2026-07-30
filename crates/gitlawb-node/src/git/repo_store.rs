@@ -186,8 +186,18 @@ impl RepoStore {
         // against a pool that is full for reasons unrelated to this repo, and would
         // report a capacity problem as lock contention. It surfaces immediately with
         // its own message instead.
+        // Cap the WALL CLOCK, not just the attempt count. 60 attempts each pay a
+        // pool acquire (up to db_acquire_timeout_secs) plus a 1s sleep, so an
+        // attempt-only bound reaches ~360s — far past the 120s proxy idle timeout
+        // that was deliberately lowered from 600s after held connection slots
+        // caused a production outage. A caller must not be able to sit here longer
+        // than the proxy will hold its connection.
+        let deadline = std::time::Instant::now() + LOCK_ACQUIRE_DEADLINE;
         let mut lock_conn = None;
         for attempt in 0..60 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             let conn = self
                 .lock_pool
                 .acquire()
@@ -206,12 +216,15 @@ impl RepoStore {
             }
         }
         let Some(lock_conn) = lock_conn else {
-            anyhow::bail!("could not acquire advisory lock after 60 attempts — possible stale lock for {owner_slug}/{repo_name}");
+            anyhow::bail!(
+                "could not acquire advisory lock within {}s — possible stale lock for {owner_slug}/{repo_name}",
+                LOCK_ACQUIRE_DEADLINE.as_secs()
+            );
         };
         // From here the lock is HELD. Any early return must not simply drop the
         // connection back into the pool, so it is handed to the guard immediately
         // below and every exit after this point goes through the guard.
-        let mut guard = RepoWriteGuard {
+        let guard = RepoWriteGuard {
             owner_slug: owner_slug.clone(),
             repo_name: repo_name.to_string(),
             local_path: local_path.clone(),
@@ -224,41 +237,62 @@ impl RepoStore {
         // Always download the latest from Tigris before writing.
         // Local disk may be stale if another machine pushed since our last access.
         if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
-                // The lock is already HELD at this point and the guard owns a
-                // lock-pool slot, so this transfer is bounded: an unbounded stall
-                // here would hold both, and enough of them deny every write on the
-                // node. acquire_fresh's download is deliberately NOT bounded by
-                // this knob, because it runs before any lock is taken.
-                let downloaded = bounded_transfer(
-                    "acquire-download",
-                    repo_name,
-                    self.lock_held_transfer_timeout,
-                    tigris.download(&owner_slug, repo_name, &local_path),
-                )
-                .await
-                .unwrap_or_else(|| {
-                    Err(anyhow::anyhow!(
-                        "archive download exceeded the under-lock transfer bound"
-                    ))
-                });
-                if let Err(e) = downloaded {
-                    // Same self-healing fallback as acquire_fresh: a corrupt/unreadable
-                    // Tigris archive must not block a write when a valid local copy
-                    // exists — release(success) will re-upload a good archive.
+            // ONE budget for the whole refresh, covering the HEAD and the download
+            // together. Both run with the lock held and a lock-pool slot pinned, so
+            // bounding only the download would leave a mute endpoint able to hold
+            // both indefinitely on the HEAD, and bounding them separately would make
+            // worst-case occupancy two budgets instead of one.
+            let refreshed = bounded_transfer(
+                "acquire-refresh",
+                repo_name,
+                self.lock_held_transfer_timeout,
+                async {
+                    if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
+                        debug!(repo = %repo_name, "write acquire: downloading latest from tigris");
+                        tigris.download(&owner_slug, repo_name, &local_path).await
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await;
+
+            match refreshed {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    // The archive is present but unreadable: a corrupt or partial
+                    // upload, or a transient GET failure. We KNOW the fetch failed,
+                    // so falling back to a valid local copy is sound and
+                    // release(success) re-uploads a good archive. Only hard-fail
+                    // when there is no local copy to fall back to.
                     if local_path.exists() {
                         warn!(repo = %repo_name, err = %e,
-                            "write acquire: tigris download failed — falling back to local copy");
+                            "write acquire: tigris refresh failed — falling back to local copy");
                     } else {
                         return Err(e).context("downloading repo from tigris for write");
                     }
                 }
+                None => {
+                    // TIMED OUT, which is NOT the same as failed, and must not reach
+                    // the fallback above. Two reasons. We do not know whether we have
+                    // the latest tree, so writing against the local copy and then
+                    // re-uploading can silently overwrite another node's newer
+                    // archive. Worse, the abandoned download's extraction runs in an
+                    // uncancellable spawn_blocking that ends in remove_dir_all +
+                    // rename over local_path, so proceeding would run git against a
+                    // directory that a background task is about to delete.
+                    //
+                    // Refuse the acquire. Returning here drops the guard, whose Drop
+                    // frees the lock and its pool slot.
+                    return Err(anyhow::anyhow!(
+                        "tigris refresh exceeded the {}s under-lock bound for {owner_slug}/{repo_name}; \
+                         refusing the write rather than proceeding against a possibly-stale tree",
+                        self.lock_held_transfer_timeout.as_secs()
+                    ));
+                }
             }
         }
 
-        // Silence the unused-mut lint until U6 needs the binding mutable.
-        let _ = &mut guard;
         Ok(guard)
     }
 
@@ -541,11 +575,24 @@ fn validate_repo_name(repo_name: &str) -> Result<()> {
 /// This is the only place that issues `pg_try_advisory_lock`.
 struct LockProbe {
     conn: Option<sqlx::pool::PoolConnection<sqlx::Postgres>>,
+    /// True only when we have POSITIVELY established that this session does not
+    /// hold the lock, i.e. `try_lock` came back `false`.
+    ///
+    /// The predicate has to be "we know nothing was acquired," not "we saw an
+    /// answer." A `true` answer means the lock IS held, so dropping without handing
+    /// the connection to a guard leaks it exactly as a cancellation would; an
+    /// earlier version of this flag meant "settled" and reopened that leak. Default
+    /// false so both the cancelled-mid-flight and lock-acquired cases close, and
+    /// only ordinary contention returns the connection.
+    lock_not_taken: bool,
 }
 
 impl LockProbe {
     fn new(conn: sqlx::pool::PoolConnection<sqlx::Postgres>) -> Self {
-        Self { conn: Some(conn) }
+        Self {
+            conn: Some(conn),
+            lock_not_taken: false,
+        }
     }
 
     /// Send the try-lock on the owned connection.
@@ -559,6 +606,11 @@ impl LockProbe {
             .fetch_one(&mut **conn)
             .await
             .context("trying advisory lock")?;
+        // Only a false answer licenses returning the connection: it means the
+        // statement completed and took nothing. A true answer means this session
+        // now holds the lock, so Drop must still close unless `take_conn` hands it
+        // to a guard.
+        self.lock_not_taken = !row.0;
         Ok(row.0)
     }
 
@@ -575,15 +627,23 @@ impl LockProbe {
 
 impl Drop for LockProbe {
     fn drop(&mut self) {
-        if let Some(mut conn) = self.conn.take() {
-            // Still holding the connection here means the try-lock's future was
-            // dropped before `take_conn` ran, so the statement may well have
-            // completed server-side and taken the lock with nobody left to
-            // release it. Close the connection instead of returning it to the
-            // pool: ending the session is what makes Postgres free the lock.
-            warn!("advisory-lock probe dropped before handing off its connection — closing the session to free the lock");
-            conn.close_on_drop();
+        let Some(mut conn) = self.conn.take() else {
+            // take_conn already handed the connection to the guard.
+            return;
+        };
+        if self.lock_not_taken {
+            // The probe ran and reported that someone else holds the key, so nothing
+            // was acquired here. Return the connection to the pool: closing would
+            // make a 60-attempt spinner tear down 60 backends for ordinary
+            // contention. Dropping `conn` unarmed does exactly that.
+            return;
         }
+        // Either the future was dropped before we saw an answer, or the answer was
+        // that we DID take the lock and nobody took the connection off us. Both mean
+        // a session may be holding the lock with no one to release it, so end the
+        // session — which is what makes Postgres free it.
+        warn!("advisory-lock probe dropped while its session may hold the lock — closing the session to free it");
+        conn.close_on_drop();
     }
 }
 
@@ -735,12 +795,27 @@ impl Drop for RepoWriteGuard {
         } else {
             warn!(
                 repo = %self.repo_name,
-                "write guard dropped with no runtime alive — leaking the connection handle so Drop cannot panic; the lock frees when the process exits"
+                "write guard dropped with no runtime alive — detaching the connection so Drop cannot panic"
             );
-            std::mem::forget(conn);
+            // `PoolConnection::drop` spawns onto the runtime for BOTH closing and
+            // returning, and panics without a handle; a panic inside Drop aborts the
+            // process during unwind. `leak()` detaches the raw `PgConnection`, which
+            // has no Drop impl of its own, so dropping it closes the socket
+            // synchronously with no runtime involved. That frees the lock
+            // immediately rather than at process exit, and leaks no fd — strictly
+            // better than the mem::forget this replaced.
+            drop(conn.leak());
         }
     }
 }
+
+/// Overall wall-clock cap on acquiring the per-repo advisory lock.
+///
+/// Deliberately under the 120s proxy idle timeout (`infra/fly/fly.toml`), which was
+/// itself lowered from 600s after long-held connection slots caused a production
+/// outage. An attempt-count bound alone is not enough: 60 attempts each paying a
+/// pool acquire plus a 1s sleep reach roughly 360s.
+const LOCK_ACQUIRE_DEADLINE: Duration = Duration::from_secs(90);
 
 /// Run a future under a wall-clock bound, returning `None` if it did not finish.
 ///
@@ -1479,10 +1554,12 @@ mod tests {
     /// body, so this asserts no-panic rather than lock release.
     #[test]
     fn guard_dropped_at_runtime_teardown_does_not_panic() {
-        let url = match std::env::var("DATABASE_URL") {
-            Ok(u) => u,
-            Err(_) => return, // no database configured; nothing to assert
-        };
+        // No silent skip: a test that returns green when its precondition is
+        // absent is worse than one that fails, because it reports coverage it does
+        // not have. CI provisions Postgres, so an absent DATABASE_URL is a broken
+        // environment rather than an expected one.
+        let url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must be set; this test cannot pass vacuously");
         let rt = tokio::runtime::Runtime::new().unwrap();
         let guard = rt.block_on(async {
             let lock_pool = sqlx::postgres::PgPoolOptions::new()
@@ -1587,5 +1664,141 @@ mod tests {
             matches!(out, Some(Ok(7))),
             "a prompt transfer must pass through untouched"
         );
+    }
+
+    /// F2 regression: an ordinary failed probe must RETURN its connection, not
+    /// close it. The old test asserted the holder's pg_locks count, which cannot
+    /// see what happened to the probe's own connection — so it passed while a
+    /// 60-attempt spinner tore down 60 backends. The observable that discriminates
+    /// is the backend pid on a one-connection pool.
+    #[sqlx::test]
+    async fn failed_probe_returns_its_connection_to_the_pool(pool: PgPool) {
+        use sqlx::Connection;
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 1).await;
+        let key: i64 = 991_100;
+
+        // someone else holds the key, from an independent session
+        let mut holder = sqlx::PgConnection::connect_with(&opts).await.unwrap();
+        let held: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&mut holder)
+            .await
+            .unwrap();
+        assert!(held.0);
+
+        let mut pids = Vec::new();
+        for _ in 0..3 {
+            let mut probe = LockProbe::new(lock_pool.acquire().await.unwrap());
+            let pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+                .fetch_one(&mut **probe.conn.as_mut().unwrap())
+                .await
+                .unwrap();
+            pids.push(pid.0);
+            assert!(!probe.try_lock(key).await.unwrap(), "key is held elsewhere");
+            drop(probe);
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+        assert!(
+            pids.windows(2).all(|w| w[0] == w[1]),
+            "a failed probe must return its connection so a spinner does not churn \
+             backends; saw {pids:?}"
+        );
+    }
+
+    // ── F5: the tests the plan required and the first pass never wrote ────────
+
+    /// R4, the test the plan named as proving the pool split and the one that would
+    /// have caught PR #215's node-wide two-write ceiling. Holding N guards on
+    /// DISTINCT repos must pin N lock-pool connections while leaving the app pool
+    /// free to serve ordinary queries.
+    #[sqlx::test]
+    async fn lock_pool_exhaustion_does_not_starve_the_app_pool(pool: PgPool) {
+        const N: u32 = 3;
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, N).await;
+        let store = RepoStore::for_testing(PathBuf::from("/tmp/gitlawb-f5"), lock_pool.clone());
+
+        let mut guards = Vec::new();
+        for i in 0..N {
+            guards.push(
+                store
+                    .acquire_write(&format!("did:key:z6MkF5Iso{i}"), "iso")
+                    .await
+                    .expect("distinct repos each acquire"),
+            );
+        }
+
+        // The lock pool is now exhausted: a further checkout must time out.
+        let starved =
+            tokio::time::timeout(std::time::Duration::from_secs(8), lock_pool.acquire()).await;
+        assert!(
+            matches!(starved, Ok(Err(_)) | Err(_)),
+            "with N guards held, an N+1th lock-pool checkout must not succeed"
+        );
+
+        // ...while the APP pool still serves queries. This is the whole point of
+        // the split: write pressure must not deny ordinary reads.
+        let alive: (i32,) = sqlx::query_as("SELECT 1")
+            .fetch_one(&pool)
+            .await
+            .expect("app pool must remain usable while the lock pool is exhausted");
+        assert_eq!(alive.0, 1);
+
+        for g in guards.drain(..) {
+            g.release(true).await;
+        }
+    }
+
+    /// A waiter spinning on a contended repo must not block a write to an
+    /// unrelated repo (R5's user-visible half).
+    #[sqlx::test]
+    async fn waiter_on_one_repo_does_not_block_another(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 3).await;
+        let store = std::sync::Arc::new(RepoStore::for_testing(
+            PathBuf::from("/tmp/gitlawb-f5b"),
+            lock_pool,
+        ));
+
+        let held = store
+            .acquire_write("did:key:z6MkF5Cont", "contended")
+            .await
+            .unwrap();
+
+        let spinner = {
+            let s = store.clone();
+            tokio::spawn(async move { s.acquire_write("did:key:z6MkF5Cont", "contended").await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        let unrelated = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            store.acquire_write("did:key:z6MkF5Other", "innocent"),
+        )
+        .await
+        .expect("an unrelated repo must not wait on someone else's contention")
+        .expect("and must acquire");
+        unrelated.release(true).await;
+
+        spinner.abort();
+        held.release(true).await;
+    }
+
+    /// The transfer bound is a knob, so it gets the same parse/default/reject-zero
+    /// coverage its sibling lock-pool-size knob has.
+    #[test]
+    fn lock_held_transfer_timeout_defaults_and_rejects_zero() {
+        use clap::Parser;
+        assert_eq!(
+            crate::config::Config::parse_from(["gitlawb-node"]).lock_held_transfer_timeout_secs,
+            300
+        );
+        assert!(crate::config::Config::try_parse_from([
+            "gitlawb-node",
+            "--lock-held-transfer-timeout-secs",
+            "0"
+        ])
+        .is_err());
     }
 }

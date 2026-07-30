@@ -64,8 +64,7 @@ pub async fn create_issue(
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .await?;
     let disk_path = guard.path().to_path_buf();
 
     let create_result = git_issues::create_issue(&disk_path, &issue_id, &json_str);
@@ -238,15 +237,25 @@ pub async fn close_issue(
     let is_owner = crate::api::require_repo_owner(&record, &auth.0).is_ok();
     if !is_owner {
         // Not the owner, so the author fallback decides it, and the author lives in
-        // the issue's git-JSON blob rather than a DB column. Read it WITHOUT the
-        // write lock: an issue's author is set at creation and never changes, so
-        // reading it outside the lock races nothing. `acquire` ensures the repo is
-        // on disk without taking the lock.
+        // the issue's git-JSON blob rather than a DB column.
+        //
+        // Read it WITHOUT the write lock. The justification is NOT that authorship
+        // is immutable — it is not: `refs/gitlawb/**` is pushable, so a forged
+        // author blob can be pushed (tracked separately; it is what makes this
+        // fallback only as trustworthy as push authorization). The justification is
+        // that this read is a PRE-CHECK: it decides whether to take the lock at all,
+        // and the mutation below re-reads under the guard, so a change landing
+        // between the two cannot cause a write against state we never looked at.
+        //
+        // `acquire_fresh`, not `acquire`: acquire's fast path returns as soon as the
+        // directory exists and never contacts object storage, so on a node with a
+        // stale copy the author's own issue would be invisible and the
+        // cannot-establish-authorship arm below would 403 a legitimate author.
+        // acquire_fresh refreshes first and still takes no lock.
         let disk_path = state
             .repo_store
-            .acquire(&record.owner_did, &record.name)
-            .await
-            .map_err(|e| AppError::Git(e.to_string()))?;
+            .acquire_fresh(&record.owner_did, &record.name)
+            .await?;
         let author_did: Option<String> = match git_issues::get_issue(&disk_path, &issue_id) {
             Ok(Some(raw)) => serde_json::from_str::<IssueRecord>(&raw)
                 .ok()
@@ -267,11 +276,13 @@ pub async fn close_issue(
     }
 
     // Authorized. Only now is the lock taken.
+    // Propagate rather than stringify: AppError's From<anyhow::Error> downcasts to
+    // sqlx::Error so a pool timeout or a database outage surfaces as a retryable
+    // 503. Calling .to_string() first destroys that and reports both as a 500.
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
-        .await
-        .map_err(|e| AppError::Git(e.to_string()))?;
+        .await?;
     let disk_path = guard.path().to_path_buf();
 
     // Re-read under the guard so the mutation acts on current state, and keep the
@@ -380,6 +391,108 @@ mod tests {
             matches!(refused, Err(AppError::Forbidden(_))),
             "expected 403 Forbidden for a stranger, got {:?}",
             refused.err().map(|e| format!("{e:?}"))
+        );
+    }
+
+    /// Seed a real bare repo with one issue blob whose author is `author_did`, at
+    /// the on-disk path the store will resolve for (owner_did, repo).
+    async fn seed_repo_with_issue(
+        state: &crate::state::AppState,
+        owner_slug: &str,
+        owner_did: &str,
+        repo: &str,
+        issue_id: &str,
+        author_did: &str,
+    ) -> std::path::PathBuf {
+        state
+            .db
+            .upsert_mirror_repo(owner_slug, repo, "/unused", None, true)
+            .await
+            .expect("seed repo row");
+        // Seed at the path the HANDLER will resolve. upsert_mirror_repo stores the
+        // bare slug in owner_did, and close_issue resolves from record.owner_did, so
+        // seeding from the full did:key would create the repo in a different
+        // directory and the handler would find nothing.
+        let record = state
+            .db
+            .get_repo(owner_slug, repo)
+            .await
+            .expect("get_repo")
+            .expect("seeded repo exists");
+        let _ = owner_did;
+        let path = state
+            .repo_store
+            .acquire(&record.owner_did, &record.name)
+            .await
+            .expect("resolve disk path");
+        let _ = std::fs::remove_dir_all(&path);
+        crate::git::store::init_bare(&path).expect("init bare repo");
+        // Must deserialize as a real IssueRecord: `created_at` and `status` are
+        // required, and a parse failure would silently drop the author (the
+        // `.ok()` on from_str), which reads as a 403 rather than as a broken fixture.
+        let json = serde_json::to_string(&IssueRecord {
+            id: issue_id.to_string(),
+            title: "seeded".to_string(),
+            body: Some(String::new()),
+            author: Some(author_did.to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: "open".to_string(),
+            signed_payload: None,
+        })
+        .expect("serialize seeded issue");
+        crate::git::issues::create_issue(&path, issue_id, &json).expect("seed issue blob");
+        path
+    }
+
+    /// INV-21(c) positive twin 1: the OWNER can still close. The reorder moved the
+    /// owner check above the lock, so this is the arm most likely to have broken,
+    /// and the deny test alone could not see it.
+    #[sqlx::test]
+    async fn owner_can_still_close_after_the_reorder(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let owner_did = "did:key:z6MkT1Owner";
+        seed_repo_with_issue(&state, "z6MkT1Owner", owner_did, "t1repo", "1", owner_did).await;
+
+        let res = close_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::AuthenticatedDid(owner_did.to_string())),
+            axum::extract::Path((
+                "z6MkT1Owner".to_string(),
+                "t1repo".to_string(),
+                "1".to_string(),
+            )),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "the owner must still be able to close: {:?}",
+            res.err().map(|e| format!("{e:?}"))
+        );
+    }
+
+    /// INV-21(c) positive twin 2: the non-owner AUTHOR can still close. This is the
+    /// arm the acquire-vs-acquire_fresh regression broke, and nothing caught it.
+    #[sqlx::test]
+    async fn issue_author_who_is_not_the_owner_can_still_close(pool: PgPool) {
+        let state = crate::test_support::test_state(pool.clone()).await;
+        let owner_did = "did:key:z6MkT2Owner";
+        let author_did = "did:key:z6MkT2Author";
+        seed_repo_with_issue(&state, "z6MkT2Owner", owner_did, "t2repo", "1", author_did).await;
+
+        let res = close_issue(
+            axum::extract::State(state.clone()),
+            axum::Extension(crate::auth::AuthenticatedDid(author_did.to_string())),
+            axum::extract::Path((
+                "z6MkT2Owner".to_string(),
+                "t2repo".to_string(),
+                "1".to_string(),
+            )),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "the issue author, who is NOT the repo owner, must still be able to close: {:?}",
+            res.err().map(|e| format!("{e:?}"))
         );
     }
 }

@@ -928,13 +928,16 @@ pub async fn git_receive_pack(
     }
 
     tracing::debug!(repo = %name, "acquiring write lock");
+    // Log, then propagate rather than stringify: AppError's From<anyhow::Error>
+    // downcasts to sqlx::Error, so a lock-pool timeout or a database outage
+    // surfaces as a retryable 503. Converting to a string here would collapse both
+    // into a 500 and tell a client not to retry something that is transient.
     let guard = state
         .repo_store
         .acquire_write(&record.owner_did, &record.name)
         .await
-        .map_err(|e| {
+        .inspect_err(|e| {
             tracing::error!(repo = %name, err = %e, "acquire_write failed");
-            AppError::Git(e.to_string())
         })?;
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
