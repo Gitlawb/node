@@ -1,7 +1,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-/// Upper bound on `git_service_timeout_secs`, in seconds (365 days).
+/// Upper bound on `git_service_timeout_secs`, in seconds (100 years).
 ///
 /// The knob is not just stored, it is arithmetic input: the write path derives the
 /// per-repo lease steal bound from it (`* 2 + 60`), and #174 routed it into
@@ -11,9 +11,16 @@ use std::path::PathBuf;
 /// serve-path crash rather than a very long timeout. Bounding at parse time keeps every
 /// derived duration in range at once, instead of hardening each site as it is found.
 ///
-/// A year is many orders of magnitude above any real clone or push, so this remains the
-/// practical way to disable the bound.
-pub const GIT_SERVICE_TIMEOUT_SECS_MAX: u64 = 365 * 24 * 60 * 60;
+/// The ceiling is representability, NOT a policy view of a sane timeout, and that
+/// distinction is what sets the number. The help text has always told operators to set
+/// this very large to disable the bound, so values like `999999999` (~31 years) are
+/// working production "off" settings; a tighter, tidier cap would fail those nodes at
+/// boot on upgrade over a value that was never the defect. 100 years clears every such
+/// setting while staying an order of magnitude under the ~584-year ceiling of a
+/// `u64`-nanosecond `Instant`, which is the tightest representation on any platform we
+/// build for. Every value that worked before still parses; only the ones that would have
+/// panicked are rejected.
+pub const GIT_SERVICE_TIMEOUT_SECS_MAX: u64 = 100 * 365 * 24 * 60 * 60;
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gitlawb-node", about = "gitlawb node daemon", version)]
@@ -185,9 +192,10 @@ pub struct Config {
     /// receive-pack through `run_git_service`) may run before it is aborted and
     /// its process group torn down, in seconds. Bounds a git that neither
     /// finishes nor disconnects. Must be positive and at most
-    /// [`GIT_SERVICE_TIMEOUT_SECS_MAX`] (365 days), which is far above any real git
-    /// operation and is the practical way to disable the bound. Default: 600s
-    /// (10 min), generous for large clones. Also bounds the ref advertisement
+    /// [`GIT_SERVICE_TIMEOUT_SECS_MAX`] (100 years, the largest value every derived
+    /// deadline can represent); setting it very large is still the way to disable the
+    /// bound. Default: 600s (10 min), generous for large clones. Also bounds the ref
+    /// advertisement
     /// (`info/refs`) and the withheld-blob pack build (`upload_pack_excluding`'s
     /// pack-objects stage), which now share the same timeout + process-group
     /// teardown (#174).
@@ -585,15 +593,34 @@ mod tests {
     /// `build_filtered_pack` / `blob_paths` on the serve path, which panic on overflow in
     /// release builds too. Checked at parse time so no reachable configuration can carry a
     /// value those sites cannot represent.
+    ///
+    /// The pre-existing "set it very large to disable the bound" settings are asserted
+    /// alongside the rejections on purpose. The bound exists to exclude unrepresentable
+    /// values, not to impose a view of a reasonable timeout, so a node that has been
+    /// running on ~31 years must not start failing at boot on upgrade.
     #[test]
     fn git_service_timeout_rejects_values_no_derived_duration_can_represent() {
-        // At the bound: accepted, and every derived duration still fits.
-        let at_max = Config::try_parse_from([
-            "gitlawb-node",
-            "--git-service-timeout-secs",
-            &GIT_SERVICE_TIMEOUT_SECS_MAX.to_string(),
-        ])
-        .expect("the documented maximum must parse");
+        let parse = |secs: u64| {
+            Config::try_parse_from([
+                "gitlawb-node",
+                "--git-service-timeout-secs",
+                &secs.to_string(),
+            ])
+        };
+
+        // Large "disable the bound" values that predate the ceiling still parse.
+        for disable in [1_000_000_000, 999_999_999] {
+            assert_eq!(
+                parse(disable)
+                    .unwrap_or_else(|e| panic!("{disable} was a working setting: {e}"))
+                    .git_service_timeout_secs,
+                disable
+            );
+        }
+
+        // At the ceiling: accepted, and every derived duration still fits.
+        let at_max =
+            parse(GIT_SERVICE_TIMEOUT_SECS_MAX).expect("the documented maximum must parse");
         assert_eq!(
             at_max.git_service_timeout_secs,
             GIT_SERVICE_TIMEOUT_SECS_MAX
@@ -609,18 +636,17 @@ mod tests {
             ))
             .is_some());
 
-        // One past the bound, and the top of the u64 range clap used to accept.
+        // Past the ceiling, and the top of the u64 range clap used to accept — the value
+        // that panics `Instant::now() + Duration::from_secs(..)` outright.
         for over in [GIT_SERVICE_TIMEOUT_SECS_MAX + 1, u64::MAX] {
             assert!(
-                Config::try_parse_from([
-                    "gitlawb-node",
-                    "--git-service-timeout-secs",
-                    &over.to_string(),
-                ])
-                .is_err(),
-                "{over} exceeds the derivable range and must be rejected at parse time"
+                parse(over).is_err(),
+                "{over} is past the representable ceiling and must be rejected at parse time"
             );
         }
+        assert!(std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(u64::MAX))
+            .is_none());
     }
 
     #[test]

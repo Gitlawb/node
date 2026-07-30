@@ -1729,12 +1729,14 @@ pub async fn git_receive_pack(
     // bound — on the non-disconnect path the retained pg advisory lock still serializes
     // the stealer at acquire_write (a spurious 503, not a race); the only corruption-capable
     // overlap is the ~4s disconnect/reap window, which the reaper-carried clone (a) covers.
-    // Saturating, not unchecked: `git_service_timeout_secs` accepts every positive u64 and
-    // its help text explicitly permits setting it very large to disable the service bound,
-    // so `* 2 + 60` overflows across the top of the accepted range — a debug panic on every
-    // push, and in release a WRAPPED bound short enough for a waiter to steal a live push's
-    // lease. Saturating keeps the documented semantic intact: a timeout that large means no
-    // steal, which is what an effectively-disabled service bound implies.
+    // Saturating, not unchecked. `GIT_SERVICE_TIMEOUT_SECS_MAX` now keeps every parsed
+    // value inside this arithmetic, so on the configured path this cannot overflow; it is
+    // deliberate defense in depth for the construction paths clap does not cover (tests
+    // build `Config` by mutation, and nothing stops a future caller doing the same). The
+    // failure it holds off is not cosmetic: unchecked, `* 2 + 60` panics the push in debug
+    // and in release WRAPS to a bound short enough for a waiter to steal a live push's
+    // lease. Saturating also states the intent — a timeout that large means no steal, which
+    // is what an effectively-disabled service bound implies.
     let lease_steal_after = std::time::Duration::from_secs(
         state
             .config
@@ -7944,13 +7946,18 @@ mod tests {
         handle.abort();
     }
 
-    /// #174 (RED-before/GREEN-after): a large-but-valid `GITLAWB_GIT_SERVICE_TIMEOUT_SECS`
-    /// must not overflow the lease steal bound derived from it. The config help explicitly
-    /// permits setting the timeout very large to disable the bound and clap accepts every
-    /// positive `u64`, so an unchecked `* 2 + 60` panics the push in a debug build and
-    /// wraps to a short `Duration` in release — a wrapped bound would let a waiter steal
-    /// the lease out from under a live push. Drives the handler rather than the
-    /// arithmetic, so the call-site wiring is what is under test.
+    /// #174 (RED-before/GREEN-after): the lease steal bound derived from
+    /// `git_service_timeout_secs` must not overflow. Unchecked, `* 2 + 60` panics the push
+    /// in a debug build and wraps to a short `Duration` in release, and a wrapped bound
+    /// would let a waiter steal the lease out from under a live push. Drives the handler
+    /// rather than the arithmetic, so the call-site wiring is what is under test.
+    ///
+    /// `GIT_SERVICE_TIMEOUT_SECS_MAX` means clap no longer admits a value this large, and
+    /// the test keeps `u64::MAX` anyway rather than moving to the ceiling. Two reasons, and
+    /// the second is the load-bearing one: `Config` is reachable by direct construction,
+    /// which is how this test and every other one build it; and at the ceiling the
+    /// arithmetic does not overflow, so a test pinned there would pass with the saturation
+    /// removed and prove nothing about this line.
     #[cfg(unix)]
     #[sqlx::test]
     async fn push_survives_a_git_service_timeout_that_overflows_the_lease_bound(
@@ -7974,8 +7981,8 @@ mod tests {
         );
         let mut state =
             f4_state_with_repo(pool.clone(), tmp.path(), &git_bin, "z6ovflow", "o1", false).await;
-        // The largest value clap accepts. Any value above (u64::MAX - 60) / 2 overflows the
-        // derived bound, so this is the whole tail of the accepted range, not a corner.
+        // Every value above (u64::MAX - 60) / 2 overflows the derived bound; u64::MAX is
+        // the top of that tail, and the value clap accepted before the ceiling landed.
         let mut cfg = (*state.config).clone();
         cfg.git_service_timeout_secs = u64::MAX;
         state.config = std::sync::Arc::new(cfg);
