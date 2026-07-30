@@ -2140,10 +2140,46 @@ impl Db {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
         }
         let now = Utc::now().to_rfc3339();
+        // A changed URL drops the reachability gate, so a repointed peer does
+        // not inherit a probe the previous host earned. In the DO UPDATE branch
+        // `peers.http_url` is the existing pre-update row (the proposed value is
+        // $2), and the comparison runs under the conflict row lock, so
+        // concurrent announces for one DID serialize instead of racing a
+        // read-then-write. That orders announces against each other and nothing
+        // more: mark_peer_ping writes by DID with no http_url predicate, so a
+        // probe of the previous URL that lands after a reset can still re-grant
+        // the flag until the next round.
+        //
+        // Comparison is exact. http_url is stored as announced, so a cosmetic
+        // difference such as a trailing slash also clears the flag; the peer
+        // re-earns it on a later gossip round, provided no further announce
+        // lands first. Normalizing instead would mean canonicalizing the stored
+        // value, this comparison, and the existing trim_end_matches call sites.
+        //
+        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
+        // clear it by announcing a different URL, and until #248 lands can also
+        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
+        // writes mark_peer_ping from the stored URL's own probe response. Do not
+        // build a new consumer on this flag as if it were attacker-resistant.
+        //
+        // Only the federated repo fan-out in api/repos.rs gates on this flag.
+        // Four consumers act on a repointed http_url regardless of it (sync.rs's
+        // origin resolve, the post-receive notify fan-out, trigger_sync, and the
+        // public resolve route), and two read surfaces republish it as
+        // `reachable` (api/resolve.rs, api/peers.rs), which is where a reset
+        // becomes externally visible. So this bounds the automatic inheritance
+        // rather than closing the rewrite. Binding a DID to its first-seen
+        // announcing key is what closes it: #273.
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
              VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET http_url = $2, last_seen = $3",
+             ON CONFLICT(did) DO UPDATE SET
+               http_url = $2,
+               last_seen = $3,
+               last_ping_ok = CASE
+                 WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
+                 ELSE peers.last_ping_ok
+               END",
         )
         .bind(did)
         .bind(http_url)
@@ -5910,5 +5946,172 @@ mod ref_update_db_tests {
         let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].new_sha, "gggg");
+    }
+}
+
+#[cfg(test)]
+mod peer_reachability_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    const VICTIM_DID: &str = "did:key:z6MkvictimPeerFixture";
+    const HONEST_URL: &str = "https://honest-peer.example.com";
+    const ATTACKER_URL: &str = "https://attacker.example.com";
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// Read the row back through `list_peers`, the same surface the federated
+    /// fan-out filters on, rather than issuing raw SQL from the test.
+    async fn peer(db: &Db, did: &str) -> (String, bool) {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        (row.http_url, row.last_ping_ok)
+    }
+
+    /// Parsed rather than string-compared, so the ordering assertion does not
+    /// depend on the stored timestamp's textual precision.
+    async fn last_seen(db: &Db, did: &str) -> chrono::DateTime<chrono::Utc> {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        chrono::DateTime::parse_from_rfc3339(&row.last_seen.expect("last_seen is set by upsert"))
+            .expect("last_seen is rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Seed a peer that has earned reachability, asserting the seed took so a
+    /// later case cannot pass vacuously on a row that was never written.
+    async fn seed_reachable(db: &Db) {
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
+        assert_eq!(
+            peer(db, VICTIM_DID).await,
+            (HONEST_URL.to_string(), true),
+            "seed did not take"
+        );
+    }
+
+    /// Repointing an existing peer's URL must drop the reachability gate: the
+    /// new host has not been probed, so it cannot inherit the old host's
+    /// earned `last_ping_ok`.
+    #[sqlx::test]
+    async fn url_change_clears_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, ATTACKER_URL).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, ATTACKER_URL, "the URL should still be rewritten");
+        assert!(
+            !reachable,
+            "a repointed peer must re-earn reachability, not inherit it"
+        );
+    }
+
+    /// A plain liveness re-announce carries the same URL and must not cost an
+    /// honest peer its place in the federated fan-out. Guards against a fix
+    /// that clears the flag on every conflict instead of only on a change.
+    #[sqlx::test]
+    async fn same_url_reannounce_keeps_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, HONEST_URL);
+        assert!(
+            reachable,
+            "an unchanged-URL re-announce must not drop the gate"
+        );
+    }
+
+    /// The must-not-grant direction. An unchanged URL preserves the flag as it
+    /// stands, which means FALSE stays FALSE: reachability is earned by a probe,
+    /// never by announcing. This is the only case that fails if the conditional
+    /// is flattened to `last_ping_ok = (peers.http_url IS NOT DISTINCT FROM $2)`,
+    /// which would let any unsigned same-URL re-announce set the flag TRUE.
+    #[sqlx::test]
+    async fn same_url_reannounce_does_not_grant_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        assert_eq!(peer(&db, VICTIM_DID).await, (HONEST_URL.to_string(), false));
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let (_, reachable) = peer(&db, VICTIM_DID).await;
+        assert!(
+            !reachable,
+            "announcing must never grant reachability without a probe"
+        );
+    }
+
+    /// A first insert stays out of the fan-out until a probe confirms it. Guards
+    /// against the conditional leaking into the INSERT branch.
+    #[sqlx::test]
+    async fn fresh_peer_inserts_unreachable(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer("did:key:z6MkfreshPeerFixture", HONEST_URL)
+            .await
+            .unwrap();
+
+        let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// Comparison is exact, by decision: http_url is stored as announced and
+    /// nothing normalizes it, so a trailing slash is a different remote as far
+    /// as this row is concerned and clears the gate. Pins that decision against
+    /// a future normalizing comparison, which every other case here would pass
+    /// because they only ever compare identical or wholly different hosts.
+    #[sqlx::test]
+    async fn cosmetic_url_difference_counts_as_a_change(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        let with_slash = format!("{HONEST_URL}/");
+        db.upsert_peer(VICTIM_DID, &with_slash).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, with_slash);
+        assert!(
+            !reachable,
+            "comparison is exact, so a cosmetic difference clears the gate too"
+        );
+    }
+
+    /// The reset must ride the existing UPDATE, not gate it. Hoisting the
+    /// condition to a statement-level WHERE would leave every case above green
+    /// while silently skipping the whole update on a same-URL re-announce, so
+    /// liveness would stop advancing and the peer would age out on last_seen.
+    #[sqlx::test]
+    async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        let first = last_seen(&db, VICTIM_DID).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let second = last_seen(&db, VICTIM_DID).await;
+        assert!(
+            second > first,
+            "a same-URL re-announce is a liveness signal and must still \
+             advance last_seen: {first} then {second}"
+        );
     }
 }
