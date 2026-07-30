@@ -1,6 +1,20 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+/// Upper bound on `git_service_timeout_secs`, in seconds (365 days).
+///
+/// The knob is not just stored, it is arithmetic input: the write path derives the
+/// per-repo lease steal bound from it (`* 2 + 60`), and #174 routed it into
+/// `build_filtered_pack` and `blob_paths`, which each build a deadline as
+/// `Instant::now() + Duration::from_secs(this)`. That addition panics on overflow in
+/// RELEASE as well as debug, so an unbounded `u64` here turns an operator typo into a
+/// serve-path crash rather than a very long timeout. Bounding at parse time keeps every
+/// derived duration in range at once, instead of hardening each site as it is found.
+///
+/// A year is many orders of magnitude above any real clone or push, so this remains the
+/// practical way to disable the bound.
+pub const GIT_SERVICE_TIMEOUT_SECS_MAX: u64 = 365 * 24 * 60 * 60;
+
 #[derive(Parser, Debug, Clone)]
 #[command(name = "gitlawb-node", about = "gitlawb node daemon", version)]
 pub struct Config {
@@ -170,16 +184,18 @@ pub struct Config {
     /// Maximum wall-clock time a single served git operation (upload-pack /
     /// receive-pack through `run_git_service`) may run before it is aborted and
     /// its process group torn down, in seconds. Bounds a git that neither
-    /// finishes nor disconnects. Must be positive; set it very large to
-    /// effectively disable the bound. Default: 600s (10 min), generous for large
-    /// clones. Also bounds the ref advertisement (`info/refs`) and the withheld-blob
-    /// pack build (`upload_pack_excluding`'s pack-objects stage), which now share the
-    /// same timeout + process-group teardown (#174).
+    /// finishes nor disconnects. Must be positive and at most
+    /// [`GIT_SERVICE_TIMEOUT_SECS_MAX`] (365 days), which is far above any real git
+    /// operation and is the practical way to disable the bound. Default: 600s
+    /// (10 min), generous for large clones. Also bounds the ref advertisement
+    /// (`info/refs`) and the withheld-blob pack build (`upload_pack_excluding`'s
+    /// pack-objects stage), which now share the same timeout + process-group
+    /// teardown (#174).
     #[arg(
         long,
         env = "GITLAWB_GIT_SERVICE_TIMEOUT_SECS",
         default_value_t = 600,
-        value_parser = clap::value_parser!(u64).range(1..)
+        value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
     )]
     pub git_service_timeout_secs: u64,
 
@@ -561,6 +577,50 @@ mod tests {
         assert!(
             Config::try_parse_from(["gitlawb-node", "--git-service-timeout-secs", "0"]).is_err()
         );
+    }
+
+    /// #174 (RED-before/GREEN-after): the upper bound is what keeps every duration
+    /// derived from this knob in range — the lease steal bound's `* 2 + 60` on the write
+    /// path, and the `Instant::now() + Duration::from_secs(..)` deadlines in
+    /// `build_filtered_pack` / `blob_paths` on the serve path, which panic on overflow in
+    /// release builds too. Checked at parse time so no reachable configuration can carry a
+    /// value those sites cannot represent.
+    #[test]
+    fn git_service_timeout_rejects_values_no_derived_duration_can_represent() {
+        // At the bound: accepted, and every derived duration still fits.
+        let at_max = Config::try_parse_from([
+            "gitlawb-node",
+            "--git-service-timeout-secs",
+            &GIT_SERVICE_TIMEOUT_SECS_MAX.to_string(),
+        ])
+        .expect("the documented maximum must parse");
+        assert_eq!(
+            at_max.git_service_timeout_secs,
+            GIT_SERVICE_TIMEOUT_SECS_MAX
+        );
+        assert!(at_max
+            .git_service_timeout_secs
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(60))
+            .is_some());
+        assert!(std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(
+                at_max.git_service_timeout_secs
+            ))
+            .is_some());
+
+        // One past the bound, and the top of the u64 range clap used to accept.
+        for over in [GIT_SERVICE_TIMEOUT_SECS_MAX + 1, u64::MAX] {
+            assert!(
+                Config::try_parse_from([
+                    "gitlawb-node",
+                    "--git-service-timeout-secs",
+                    &over.to_string(),
+                ])
+                .is_err(),
+                "{over} exceeds the derivable range and must be rejected at parse time"
+            );
+        }
     }
 
     #[test]
