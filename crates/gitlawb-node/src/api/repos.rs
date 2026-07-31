@@ -567,12 +567,16 @@ pub async fn git_info_refs(
             "unsupported git service: {service}"
         )));
     }
-    // #62 cheap pre-DB load shed: if the pool this service draws from is already
-    // saturated, shed with 503 before any DB/disk work. Best-effort (holds no
-    // permit); the authoritative hold is `git_permit` below, after the per-source
-    // cap. Restores the shed-before-DB property the reordered held acquire alone
-    // would drop, while the reorder still prevents one source from occupying global
-    // slots during the DB/visibility window.
+    // #62 cheap load shed: if the pool this service draws from is ALREADY saturated,
+    // shed this request with a 503 before it does any DB/disk work. Best-effort and
+    // permit-less, so it is a snapshot, not admission: it spares THIS request's DB
+    // work once the pool has filled, and nothing more. It is NOT a bound on the DB
+    // window. Permits are only held from `git_permit` below, after the visibility and
+    // rate gates, so a burst arriving while permits are free all proceeds into the DB
+    // and none of it sheds here. That ordering is deliberate (a denied or rate-limited
+    // request must consume no slot, and one source must not hold global slots through
+    // the DB/visibility window); bounding the DB window itself would need an admission
+    // mechanism this peek is not.
     {
         // The receive-pack advertisement peeks its DEDICATED advert pool, not the
         // write pool the authenticated POST uses (#174) — matching the held acquire
@@ -1291,9 +1295,10 @@ pub async fn git_upload_pack(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
-    // #62 cheap pre-DB load shed (see git_info_refs): shed before DB when the read
-    // pool is saturated; the authoritative hold is `git_permit` below, after the
-    // per-source cap.
+    // #62 cheap load shed (see git_info_refs for the full contract): spares THIS
+    // request's DB work when the read pool is ALREADY saturated. Permit-less snapshot,
+    // not admission, so it does not bound the DB window; the authoritative hold is
+    // `git_permit` below, after the per-source cap.
     if state.git_read_semaphore.available_permits() == 0 {
         tracing::warn!("served-git concurrency cap reached; shedding request with 503 (pre-DB)");
         return Err(AppError::Overloaded(
@@ -1642,11 +1647,13 @@ pub async fn git_receive_pack(
     body: Bytes,
 ) -> Result<Response> {
     let name = smart_http_repo_name(&repo)?;
-    // Fast-path shed BEFORE the DB lookup when the write pool is saturated, so a push
-    // flood on a full pool does not hit Postgres per request. Best-effort (racy) and
-    // NON-holding: the authoritative, held permit is taken after the per-repo lease below
-    // (so a lease-blocked waiter pins no write slot — #174 F3 review). This peek only
-    // restores the cheap pre-DB shed the permit reorder would otherwise have lost.
+    // Fast-path shed before the DB lookup when the write pool is ALREADY saturated, so a
+    // push flood against a full pool does not hit Postgres per request. Best-effort
+    // (racy) and NON-holding: a snapshot, not admission. It spares this request's DB
+    // work once the pool has filled; pushes arriving while permits are free all proceed
+    // into the DB, so it does not bound that window. The authoritative, held permit is
+    // taken after the per-repo lease below (so a lease-blocked waiter pins no write slot
+    // — #174 F3 review).
     if state.git_write_semaphore.available_permits() == 0 {
         return Err(AppError::Overloaded(
             "git service at capacity, retry shortly".into(),

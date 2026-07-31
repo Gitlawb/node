@@ -228,10 +228,12 @@ mod tests {
 
     /// PR3 (#62): the served-git concurrency cap sheds at the HTTP layer before the
     /// DB. The held `git_permit` acquire now sits after the per-source cap, so the
-    /// shed-before-DB property is carried by an explicit `available_permits() == 0`
-    /// early check at the top of the handler (the held permit remains the
-    /// authoritative bound further down). DB-free: an exhausted semaphore sheds
-    /// before any DB/disk access, so a lazy state works. Remove the early-shed block
+    /// cheap early shed is carried by an explicit `available_permits() == 0` check at
+    /// the top of the handler (the held permit remains the authoritative bound further
+    /// down). That check is a permit-less snapshot: it spares a request's DB work once
+    /// the pool is ALREADY saturated, which is the case this test drives, and it does
+    /// not bound the DB window in general. DB-free here because an exhausted semaphore
+    /// sheds before any DB/disk access, so a lazy state works. Remove the early-shed block
     /// from git_info_refs and this goes red (the request falls through to the DB and
     /// returns something other than 503).
     #[tokio::test]
@@ -267,10 +269,11 @@ mod tests {
     }
 
     /// PR3 (#62) sibling of the info/refs shed test: git-upload-pack carries the same
-    /// explicit `available_permits() == 0` early-shed check at the top, so an
-    /// exhausted semaphore must shed it with a 503 before any DB/disk work.
-    /// Anonymous-reachable, so no auth injection is needed. Remove the early-shed
-    /// block from git_upload_pack and this goes red.
+    /// explicit `available_permits() == 0` early check at the top, so an ALREADY
+    /// exhausted semaphore must shed the request with a 503 before its DB/disk work.
+    /// That is the case the permit-less snapshot does deliver; it is not an admission
+    /// bound on the DB window. Anonymous-reachable, so no auth injection is needed.
+    /// Remove the early-shed block from git_upload_pack and this goes red.
     #[tokio::test]
     async fn git_upload_pack_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
@@ -305,8 +308,10 @@ mod tests {
 
     /// PR3 (#62) receive-pack sibling of the info/refs shed test: the early shed
     /// selects the dedicated ADVERT pool for a git-receive-pack advertisement (#174),
-    /// so an exhausted advert pool sheds the advert with 503 before any DB/disk work
-    /// — while the write pool (reserved for authenticated POSTs) is left free here.
+    /// so an ALREADY exhausted advert pool sheds the advert with 503 before its DB/disk
+    /// work (the case the permit-less snapshot delivers, not an admission bound on the
+    /// DB window) — while the write pool (reserved for authenticated POSTs) is left
+    /// free here.
     /// Flip the pool selection back to the write pool, or remove the early-shed
     /// block, and this goes red.
     #[tokio::test]
@@ -344,9 +349,12 @@ mod tests {
     /// PR3 (#62) sibling for the push path: git-receive-pack requires an
     /// AuthenticatedDid extension (production: require_signature injects it), so the
     /// request carries one via signed_request_as — without it the Extension
-    /// extractor 500s before the handler body reaches git_permit. The permit is the
-    /// first statement, so an exhausted semaphore still sheds 503 before any DB
-    /// work. Remove the permit line from git_receive_pack and this goes red.
+    /// extractor 500s before the handler body reaches the shed. What sits at the top of
+    /// the handler is a permit-less `available_permits() == 0` peek, NOT the permit
+    /// itself: the authoritative held acquire is taken after the per-repo lease, so a
+    /// lease-blocked waiter pins no write slot. An ALREADY exhausted pool is the case
+    /// the peek delivers, so the request sheds 503 before its DB work here. Remove the
+    /// early-shed block from git_receive_pack and this goes red.
     #[tokio::test]
     async fn git_receive_pack_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
