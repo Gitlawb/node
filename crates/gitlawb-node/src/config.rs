@@ -22,7 +22,7 @@ use std::path::PathBuf;
 /// this very large to disable the bound, so values like `999999999` (~31 years) are
 /// working production "off" settings; a tighter, tidier cap would fail those nodes at
 /// boot on upgrade over a value that was never the defect. 100 years clears every such
-/// setting while staying an order of magnitude under the ~584-year ceiling of a
+/// setting while staying a factor of about 5.85 under the ~584-year ceiling of a
 /// `u64`-nanosecond `Instant`, which is the tightest representation on any platform we
 /// build for. Every value that worked before still parses; only the ones that would have
 /// panicked are rejected.
@@ -515,8 +515,8 @@ pub struct Config {
     /// request deadline as `Instant::now() + Duration::from_secs(this)`, and that addition
     /// is an explicit overflow check rather than a debug-only one, so a value near the top
     /// of the `u64` range aborts every `/ipfs/{cid}` request in a release build instead of
-    /// setting a very long budget. The ceiling sits an order of magnitude below where that
-    /// starts (see the constant's own note), so it is a conservative margin rather than the
+    /// setting a very long budget. The ceiling sits well below where that starts, about a
+    /// factor of 5.85 (see the constant's own note), so it is a conservative margin rather than the
     /// exact overflow point; rejecting at parse time keeps the unrepresentable values out
     /// of every reachable configuration. Setting it very large is still the way to
     /// effectively disable the budget, and the documented sentinels (`999999999`,
