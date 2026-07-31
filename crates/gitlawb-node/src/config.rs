@@ -500,13 +500,21 @@ pub struct Config {
     /// slot past it. Still unbounded: the probe's `object_store_readable` check is a
     /// synchronous filesystem sweep with nothing to reap, so a wedged filesystem can
     /// hold the slot past the deadline.
-    /// Must be positive. Default: 600s (10 min), matching
-    /// `git_service_timeout_secs` so a single full-length walk still fits.
+    /// Must be positive, and no larger than `GIT_SERVICE_TIMEOUT_SECS_MAX`. The ceiling is
+    /// representability, NOT a policy view of a sane budget: `get_by_cid` derives the
+    /// request deadline as `Instant::now() + Duration::from_secs(this)`, and that addition
+    /// is an explicit overflow check rather than a debug-only one, so a value past the
+    /// ceiling aborts every `/ipfs/{cid}` request in a release build instead of setting a
+    /// very long budget. Rejecting at parse time keeps that value out of every reachable
+    /// configuration. Setting it very large is still the way to effectively disable the
+    /// budget; the ceiling clears every such setting (see the constant's own note).
+    /// Default: 600s (10 min), matching `git_service_timeout_secs` so a single full-length
+    /// walk still fits.
     #[arg(
         long,
         env = "GITLAWB_IPFS_REQUEST_BUDGET_SECS",
         default_value_t = 600,
-        value_parser = clap::value_parser!(u64).range(1..)
+        value_parser = clap::value_parser!(u64).range(1..=GIT_SERVICE_TIMEOUT_SECS_MAX)
     )]
     pub ipfs_request_budget_secs: u64,
 
@@ -817,6 +825,68 @@ mod tests {
         assert!(
             Config::try_parse_from(["gitlawb-node", "--ipfs-request-budget-secs", "0"]).is_err()
         );
+    }
+
+    /// #174 (RED-before/GREEN-after): the upper bound is what keeps the deadline derived
+    /// from this knob in range. `get_by_cid` builds the request budget as
+    /// `Instant::now() + Duration::from_secs(this)` (api/ipfs.rs), and that addition is an
+    /// explicit overflow check rather than a debug-only one, so an oversized value aborts
+    /// every `/ipfs/{cid}` request in a release build instead of setting a very long budget.
+    /// The route is anon-reachable, so the failure is operator-triggered but publicly felt.
+    /// Checked at parse time so no reachable configuration can carry a value the deadline
+    /// cannot represent.
+    ///
+    /// The large "disable the bound" settings are asserted alongside the rejections on
+    /// purpose, the same way the `git_service_timeout_secs` sibling does it. The ceiling
+    /// exists to exclude unrepresentable values, not to impose a view of a reasonable
+    /// budget, so a node already running on such a value must not start failing at boot on
+    /// upgrade. A test that only checked the boundary would pass with a far tighter cap.
+    #[test]
+    fn ipfs_request_budget_rejects_values_no_derived_duration_can_represent() {
+        let parse = |secs: u64| {
+            Config::try_parse_from([
+                "gitlawb-node",
+                "--ipfs-request-budget-secs",
+                &secs.to_string(),
+            ])
+        };
+
+        // Large "disable the bound" values that predate the ceiling still parse.
+        for disable in [1_000_000_000, 999_999_999] {
+            assert_eq!(
+                parse(disable)
+                    .unwrap_or_else(|e| panic!("{disable} was a working setting: {e}"))
+                    .ipfs_request_budget_secs,
+                disable
+            );
+        }
+
+        // At the ceiling: accepted, and the derived deadline still fits. This knob feeds
+        // only the `Instant` addition (no multiply derivation like the lease steal bound),
+        // so there is no `checked_mul` clause to carry over from the sibling test.
+        let at_max =
+            parse(GIT_SERVICE_TIMEOUT_SECS_MAX).expect("the documented maximum must parse");
+        assert_eq!(
+            at_max.ipfs_request_budget_secs,
+            GIT_SERVICE_TIMEOUT_SECS_MAX
+        );
+        assert!(std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(
+                at_max.ipfs_request_budget_secs
+            ))
+            .is_some());
+
+        // Past the ceiling, and the top of the u64 range clap used to accept — the value
+        // that panics `Instant::now() + Duration::from_secs(..)` outright.
+        for over in [GIT_SERVICE_TIMEOUT_SECS_MAX + 1, u64::MAX] {
+            assert!(
+                parse(over).is_err(),
+                "{over} is past the representable ceiling and must be rejected at parse time"
+            );
+        }
+        assert!(std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(u64::MAX))
+            .is_none());
     }
 
     #[test]
