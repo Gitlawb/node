@@ -52,7 +52,8 @@ impl MutationRoot {
             updated_at: now,
             deadline: input.deadline,
         };
-        db.create_task(&task)
+        let task = db
+            .create_task(&task)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(AgentTaskType::from(task))
@@ -73,14 +74,18 @@ impl MutationRoot {
         let assignee_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
         let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
-        let task = db
-            .claim_task(&id, &assignee_did)
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        let by_did = task
-            .assignee_did
-            .clone()
-            .unwrap_or(assignee_did);
+        let task = db.claim_task(&id, &assignee_did).await.map_err(|e| {
+            if e.downcast_ref::<crate::db::TaskReservedForOtherAssignee>()
+                .is_some()
+            {
+                // Distinct from a lost race so clients can stop retrying.
+                return async_graphql::Error::new(
+                    "task not claimable: reserved for another assignee",
+                );
+            }
+            async_graphql::Error::new(e.to_string())
+        })?;
+        let by_did = task.assignee_did.clone().unwrap_or(assignee_did);
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "pending".to_string(),
@@ -116,11 +121,7 @@ impl MutationRoot {
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         if !crate::api::did_matches(
             caller,
-            existing
-                .assignee_did
-                .as_deref()
-                .unwrap_or_default()
-                .trim(),
+            crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
         ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can complete it",
@@ -165,11 +166,7 @@ impl MutationRoot {
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
         if !crate::api::did_matches(
             caller,
-            existing
-                .assignee_did
-                .as_deref()
-                .unwrap_or_default()
-                .trim(),
+            crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
         ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can fail it",
@@ -348,8 +345,8 @@ mod tests {
             .await;
         let errs = errors(&resp);
         assert!(
-            errs.contains("reserved") || errs.contains("not claimable"),
-            "stranger claim must fail: {errs}"
+            errs.contains("reserved"),
+            "stranger claim must surface reserved deny distinctly: {errs}"
         );
         assert!(
             !errs.contains("gql-ucan-secret"),
@@ -369,7 +366,10 @@ mod tests {
             .await
             .expect("get")
             .expect("task exists");
-        assert_eq!(still.status, "pending", "status must stay pending after steal");
+        assert_eq!(
+            still.status, "pending",
+            "status must stay pending after steal"
+        );
         assert_eq!(
             still.assignee_did.as_deref(),
             Some(reserved),
