@@ -145,10 +145,8 @@ pub struct AppState {
     /// tasks; the cross-repo residual (an authenticated actor pushing to many repos
     /// leaves many parked tasks) is throttled by auth plus the per-IP/per-DID rate
     /// limits. Its real cost, the MB-scale per-push object-id list each parked task
-    /// holds, is NOT bounded by `pin_semaphore` either: on the local IPFS path the list
-    /// is materialized before that permit is acquired, so a task parked on the pin pool
-    /// still holds one. That pool bounds concurrent pin loops, not parked retention, so
-    /// nothing currently bounds this memory across repos. `git_encrypt_semaphore` caps
+    /// holds, is NOT bounded by `pin_semaphore` either; see that field's doc above for
+    /// why. Nothing currently bounds this memory across repos. `git_encrypt_semaphore` caps
     /// *active* walks; this caps duplicate SPAWNS per repo. Before spawning a per-push
     /// encryption task, the receive-pack handler consults this set: if the repo already
     /// has a task in flight it coalesces (skips the duplicate spawn) rather than parking

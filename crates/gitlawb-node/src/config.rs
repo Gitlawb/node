@@ -1,7 +1,13 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-/// Upper bound on `git_service_timeout_secs`, in seconds (100 years).
+/// Upper bound on `git_service_timeout_secs` and `ipfs_request_budget_secs`, in seconds
+/// (100 years).
+///
+/// Two consumers now, so a future tightening moves both. `ipfs_request_budget_secs`
+/// derives only the `Instant` addition in `get_by_cid`, not the lease-steal multiply
+/// below, but it shares this ceiling because the defect class and the "set it very large
+/// to disable" contract are the same.
 ///
 /// The knob is not just stored, it is arithmetic input: the write path derives the
 /// per-repo lease steal bound from it (`* 2 + 60`), and #174 routed it into
@@ -372,8 +378,8 @@ pub struct Config {
     /// pin-task COUNT to one per repo, but each pin loop holds a full per-push
     /// object-id list (up to `git_max_pack_bytes` worth of OIDs) while it walks it,
     /// so N distinct repos could hold N such lists at once. This caps how many run
-    /// concurrently (#174 F6). Beyond it a pin loop DEFERS (waits), never drops — a
-    /// dropped pin would lose the object's replication copy.
+    /// concurrently (#174 F6). Beyond it a pin loop DEFERS (waits) and never drops,
+    /// since a dropped pin would lose the object's replication copy.
     ///
     /// It does not cap the memory itself: the local IPFS path builds its list before
     /// taking a permit, so tasks parked on this pool still hold theirs, and how many
@@ -507,11 +513,14 @@ pub struct Config {
     /// Must be positive, and no larger than `GIT_SERVICE_TIMEOUT_SECS_MAX`. The ceiling is
     /// representability, NOT a policy view of a sane budget: `get_by_cid` derives the
     /// request deadline as `Instant::now() + Duration::from_secs(this)`, and that addition
-    /// is an explicit overflow check rather than a debug-only one, so a value past the
-    /// ceiling aborts every `/ipfs/{cid}` request in a release build instead of setting a
-    /// very long budget. Rejecting at parse time keeps that value out of every reachable
-    /// configuration. Setting it very large is still the way to effectively disable the
-    /// budget; the ceiling clears every such setting (see the constant's own note).
+    /// is an explicit overflow check rather than a debug-only one, so a value near the top
+    /// of the `u64` range aborts every `/ipfs/{cid}` request in a release build instead of
+    /// setting a very long budget. The ceiling sits an order of magnitude below where that
+    /// starts (see the constant's own note), so it is a conservative margin rather than the
+    /// exact overflow point; rejecting at parse time keeps the unrepresentable values out
+    /// of every reachable configuration. Setting it very large is still the way to
+    /// effectively disable the budget, and the documented sentinels (`999999999`,
+    /// `1000000000`) are well inside the range.
     /// Default: 600s (10 min), matching `git_service_timeout_secs` so a single full-length
     /// walk still fits.
     #[arg(
@@ -880,8 +889,9 @@ mod tests {
             ))
             .is_some());
 
-        // Past the ceiling, and the top of the u64 range clap used to accept — the value
-        // that panics `Instant::now() + Duration::from_secs(..)` outright.
+        // Past the ceiling, and the top of the u64 range clap used to accept. Only the
+        // latter actually panics `Instant::now() + Duration::from_secs(..)`; the ceiling
+        // sits well below that, which is the conservative margin the constant documents.
         for over in [GIT_SERVICE_TIMEOUT_SECS_MAX + 1, u64::MAX] {
             assert!(
                 parse(over).is_err(),

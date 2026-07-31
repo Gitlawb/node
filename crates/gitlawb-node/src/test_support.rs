@@ -310,7 +310,7 @@ mod tests {
     /// selects the dedicated ADVERT pool for a git-receive-pack advertisement (#174),
     /// so an ALREADY exhausted advert pool sheds the advert with 503 before its DB/disk
     /// work (the case the permit-less snapshot delivers, not an admission bound on the
-    /// DB window) — while the write pool (reserved for authenticated POSTs) is left
+    /// DB window), while the write pool (reserved for authenticated POSTs) is left
     /// free here.
     /// Flip the pool selection back to the write pool, or remove the early-shed
     /// block, and this goes red.

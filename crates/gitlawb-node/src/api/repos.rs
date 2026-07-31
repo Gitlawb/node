@@ -1131,8 +1131,8 @@ async fn pinata_object_list_for_refs(
 /// (#174 F6). `EncryptInflight` bounds the pin-task COUNT to one per repo, but each
 /// pin loop holds a full per-push object-id list while walking it; this permit bounds
 /// how many pin loops RUN CONCURRENTLY, and therefore how many such MB-scale lists are
-/// held WHILE BEING PINNED. DEFERS (waits) when the pool is full — never drops, since a
-/// dropped pin loses the replication copy.
+/// held WHILE BEING PINNED. DEFERS (waits) when the pool is full and never drops, since
+/// a dropped pin loses the replication copy.
 ///
 /// What it does NOT bound, stated plainly rather than implied closed: on this path the
 /// caller materializes `object_list` BEFORE this function acquires, so a task that is
@@ -1295,10 +1295,9 @@ pub async fn git_upload_pack(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response> {
-    // #62 cheap load shed (see git_info_refs for the full contract): spares THIS
-    // request's DB work when the read pool is ALREADY saturated. Permit-less snapshot,
-    // not admission, so it does not bound the DB window; the authoritative hold is
-    // `git_permit` below, after the per-source cap.
+    // #62 cheap load shed. Permit-less snapshot, not admission; see git_info_refs for
+    // what it does and does not bound. The authoritative hold is `git_permit` below,
+    // after the per-source cap.
     if state.git_read_semaphore.available_permits() == 0 {
         tracing::warn!("served-git concurrency cap reached; shedding request with 503 (pre-DB)");
         return Err(AppError::Overloaded(
@@ -1652,8 +1651,8 @@ pub async fn git_receive_pack(
     // (racy) and NON-holding: a snapshot, not admission. It spares this request's DB
     // work once the pool has filled; pushes arriving while permits are free all proceed
     // into the DB, so it does not bound that window. The authoritative, held permit is
-    // taken after the per-repo lease below (so a lease-blocked waiter pins no write slot
-    // — #174 F3 review).
+    // taken after the per-repo lease below, so a lease-blocked waiter pins no write slot
+    // (#174 F3 review).
     if state.git_write_semaphore.available_permits() == 0 {
         return Err(AppError::Overloaded(
             "git service at capacity, retry shortly".into(),
