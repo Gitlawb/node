@@ -372,9 +372,13 @@ pub struct Config {
     /// pin-task COUNT to one per repo, but each pin loop holds a full per-push
     /// object-id list (up to `git_max_pack_bytes` worth of OIDs) while it walks it,
     /// so N distinct repos could hold N such lists at once. This caps how many run
-    /// concurrently, bounding that MB-scale memory regardless of how many repos an
-    /// authenticated actor pushes to (#174 F6). Beyond it a pin loop DEFERS (waits),
-    /// never drops — a dropped pin would lose the object's replication copy.
+    /// concurrently (#174 F6). Beyond it a pin loop DEFERS (waits), never drops — a
+    /// dropped pin would lose the object's replication copy.
+    ///
+    /// It does not cap the memory itself: the local IPFS path builds its list before
+    /// taking a permit, so tasks parked on this pool still hold theirs, and how many
+    /// park is capped only per repo. Lowering this knob bounds concurrent pinning, not
+    /// how much an actor pushing to many repos can retain.
     ///
     /// Default: 8. Must be between 1 and 1_048_576.
     #[arg(

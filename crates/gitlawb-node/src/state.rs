@@ -133,13 +133,22 @@ pub struct AppState {
     /// per repo, but each pin loop holds a full per-push object-id list while walking
     /// it, so N distinct repos could hold N such MB-scale lists at once. This caps how
     /// many run concurrently; a loop DEFERS (waits) when the pool is full, never drops.
+    ///
+    /// It does NOT bound the lists held by tasks PARKED on it. The local IPFS path
+    /// materializes its list before acquiring, so a parked task still holds one, and the
+    /// parked-task count is capped only per repo by `encrypt_inflight`. Cross-repo
+    /// retained memory is therefore not bounded by this pool. The Pinata twin acquires
+    /// before it derives and does not carry that residual.
     pub pin_semaphore: Arc<tokio::sync::Semaphore>,
     /// Bounds the outstanding post-push encryption-task set to at most one PER REPO by
     /// coalescing (#174 P2-2). This is NOT a global cap: N distinct repos still admit N
     /// tasks; the cross-repo residual (an authenticated actor pushing to many repos
     /// leaves many parked tasks) is throttled by auth plus the per-IP/per-DID rate
-    /// limits, and its real cost — the MB-scale per-push object-id list each pin loop
-    /// holds — is bounded by `pin_semaphore`, not this. `git_encrypt_semaphore` caps
+    /// limits. Its real cost, the MB-scale per-push object-id list each parked task
+    /// holds, is NOT bounded by `pin_semaphore` either: on the local IPFS path the list
+    /// is materialized before that permit is acquired, so a task parked on the pin pool
+    /// still holds one. That pool bounds concurrent pin loops, not parked retention, so
+    /// nothing currently bounds this memory across repos. `git_encrypt_semaphore` caps
     /// *active* walks; this caps duplicate SPAWNS per repo. Before spawning a per-push
     /// encryption task, the receive-pack handler consults this set: if the repo already
     /// has a task in flight it coalesces (skips the duplicate spawn) rather than parking

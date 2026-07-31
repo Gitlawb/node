@@ -1126,8 +1126,17 @@ async fn pinata_object_list_for_refs(
 /// Pin `object_list` to the local IPFS node under the global pin-admission permit
 /// (#174 F6). `EncryptInflight` bounds the pin-task COUNT to one per repo, but each
 /// pin loop holds a full per-push object-id list while walking it; this permit bounds
-/// how many such MB-scale lists are held at once across all repos. DEFERS (waits) when
-/// the pool is full — never drops, since a dropped pin loses the replication copy.
+/// how many pin loops RUN CONCURRENTLY, and therefore how many such MB-scale lists are
+/// held WHILE BEING PINNED. DEFERS (waits) when the pool is full — never drops, since a
+/// dropped pin loses the replication copy.
+///
+/// What it does NOT bound, stated plainly rather than implied closed: on this path the
+/// caller materializes `object_list` BEFORE this function acquires, so a task that is
+/// parked here waiting for a permit is still holding its full list. The parked-task
+/// count is capped only per repo by `EncryptInflight`, so across distinct repos the
+/// retained list memory is not bounded by this pool. Bounding that is a real change to
+/// the capture shape and is deliberately not attempted here; the Pinata twin below
+/// avoids it by acquiring BEFORE it derives its list.
 async fn pin_new_objects_gated(
     pin_sem: &Arc<tokio::sync::Semaphore>,
     ipfs_api: &str,
@@ -1136,8 +1145,8 @@ async fn pin_new_objects_gated(
     db: &Arc<crate::db::Db>,
 ) -> Vec<(String, String)> {
     // Nothing to pin: answer before taking a permit (#174 F2b). The permit bounds how
-    // many MB-scale object lists are held at once and an empty list holds none, so
-    // parking here would spend a global pin slot on no work. The pool DEFERS rather
+    // many pin loops run concurrently, and an empty list does no pinning, so parking
+    // here would spend a global pin slot on no work. The pool DEFERS rather
     // than sheds, so those calls stall pins for every other repo. Empty is the normal
     // shape for a push whose walk failed or that may replicate nothing.
     if object_list.is_empty() {
@@ -5939,11 +5948,11 @@ mod tests {
         assert!(out.is_empty(), "an empty ipfs_api pins nothing");
     }
 
-    /// #174 F2b: the pin permit bounds how many MB-scale object lists are held at once,
-    /// so a call with NOTHING to pin must not take one. It otherwise spends a global pin
-    /// slot on no work, and the pool DEFERS rather than sheds, so those calls stall pins
-    /// for every other repo. The empty case is the normal shape for a push whose walk
-    /// failed or that may replicate nothing.
+    /// #174 F2b: the pin permit bounds how many pin loops run concurrently, so a call
+    /// with NOTHING to pin must not take one. It otherwise spends a global pin slot on no
+    /// work, and the pool DEFERS rather than sheds, so those calls stall pins for every
+    /// other repo. The empty case is the normal shape for a push whose walk failed or
+    /// that may replicate nothing.
     ///
     /// Load-bearing: without the guard this call parks on the exhausted pool exactly like
     /// the non-empty one above, and the completion assertion fails.
