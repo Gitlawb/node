@@ -185,11 +185,15 @@ pub async fn claim_task(
             Json(json!({ "error": e.to_string() })),
         )
     })?;
+    let by_did = task
+        .assignee_did
+        .clone()
+        .unwrap_or_else(|| auth.0.clone());
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "pending".to_string(),
         new_status: "claimed".to_string(),
-        by_did: auth.0,
+        by_did,
         at: Utc::now().to_rfc3339(),
     });
     Ok(Json(task_to_json(&task)))
@@ -239,6 +243,7 @@ pub async fn complete_task(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
+    let by_did = task.assignee_did.clone().unwrap_or(by_did);
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "claimed".to_string(),
@@ -293,6 +298,7 @@ pub async fn fail_task(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
+    let by_did = task.assignee_did.clone().unwrap_or(by_did);
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "claimed".to_string(),

@@ -77,11 +77,15 @@ impl MutationRoot {
             .claim_task(&id, &assignee_did)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let by_did = task
+            .assignee_did
+            .clone()
+            .unwrap_or(assignee_did);
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "pending".to_string(),
             new_status: "claimed".to_string(),
-            by_did: assignee_did,
+            by_did,
             at: Utc::now().to_rfc3339(),
         });
         Ok(AgentTaskType::from(task))
@@ -110,7 +114,14 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
-        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+        if !crate::api::did_matches(
+            caller,
+            existing
+                .assignee_did
+                .as_deref()
+                .unwrap_or_default()
+                .trim(),
+        ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can complete it",
             ));
@@ -119,6 +130,7 @@ impl MutationRoot {
             .finish_task(&id, "completed", input.result.as_deref(), &by_did)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let by_did = task.assignee_did.clone().unwrap_or(by_did);
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -151,7 +163,14 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
-        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+        if !crate::api::did_matches(
+            caller,
+            existing
+                .assignee_did
+                .as_deref()
+                .unwrap_or_default()
+                .trim(),
+        ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can fail it",
             ));
@@ -161,6 +180,7 @@ impl MutationRoot {
             .finish_task(&id, "failed", Some(&reason), &by_did)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let by_did = task.assignee_did.clone().unwrap_or(by_did);
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -342,6 +362,19 @@ mod tests {
                 "UCAN must not leak in GraphQL data on failed claim: {s}"
             );
         }
+        // Parity with REST: failed steal must leave the row untouched.
+        let still = state
+            .db
+            .get_task("task-gql-reserved")
+            .await
+            .expect("get")
+            .expect("task exists");
+        assert_eq!(still.status, "pending", "status must stay pending after steal");
+        assert_eq!(
+            still.assignee_did.as_deref(),
+            Some(reserved),
+            "assignee_did must stay reserved after steal"
+        );
 
         let resp = schema
             .execute(Request::new(q(reserved)).data(AuthenticatedDid(reserved.into())))

@@ -2531,8 +2531,21 @@ impl Db {
 #[error("task not claimable: reserved for another assignee")]
 pub struct TaskReservedForOtherAssignee;
 
+/// ASCII whitespace treated as blank for assignee slots — must stay in sync with
+/// `BTRIM(assignee_did, E' \t\n\r')` in `claim_task`'s SQL.
+const ASSIGNEE_BLANK: &[char] = &[' ', '\t', '\n', '\r'];
+
+fn assignee_slot_blank(s: &str) -> bool {
+    s.trim_matches(ASSIGNEE_BLANK).is_empty()
+}
+
 impl Db {
     pub async fn create_task(&self, task: &AgentTask) -> Result<()> {
+        // Normalize whitespace-only assignee to NULL so claim/SQL agree.
+        let assignee_did = task
+            .assignee_did
+            .as_deref()
+            .filter(|s| !assignee_slot_blank(s));
         sqlx::query(
             "INSERT INTO agent_tasks (id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
@@ -2542,7 +2555,7 @@ impl Db {
         .bind(&task.kind)
         .bind(&task.status)
         .bind(&task.delegator_did)
-        .bind(&task.assignee_did)
+        .bind(assignee_did)
         .bind(&task.capability)
         .bind(&task.ucan_token)
         .bind(&task.payload)
@@ -2635,9 +2648,12 @@ impl Db {
         let stored: Option<String> = row.get("assignee_did");
         // Blank reservations are treated as open (create_task does not validate).
         // Keep the exact stored string for the UPDATE equality check.
-        let reserved_exact = stored.as_deref().filter(|r| !r.trim().is_empty());
+        // Blank definition matches SQL `BTRIM(..., E' \t\n\r')` (not space-only).
+        let reserved_exact = stored
+            .as_deref()
+            .filter(|r| !assignee_slot_blank(r));
         if let Some(reserved) = reserved_exact {
-            if !crate::api::did_matches(assignee_did, reserved.trim()) {
+            if !crate::api::did_matches(assignee_did, reserved.trim_matches(ASSIGNEE_BLANK)) {
                 return Err(TaskReservedForOtherAssignee.into());
             }
         }
@@ -2645,11 +2661,11 @@ impl Db {
         // Treat blank stored values as open for the SQL slot check.
         let row = sqlx::query(
             "UPDATE agent_tasks SET status='claimed',
-                 assignee_did = COALESCE(NULLIF(BTRIM(assignee_did), ''), $2),
+                 assignee_did = COALESCE(NULLIF(BTRIM(assignee_did, E' \t\n\r'), ''), $2),
                  updated_at=$3
              WHERE id=$1 AND status='pending'
                AND (
-                 ($4::text IS NULL AND (assignee_did IS NULL OR BTRIM(assignee_did) = ''))
+                 ($4::text IS NULL AND (assignee_did IS NULL OR BTRIM(assignee_did, E' \t\n\r') = ''))
                  OR assignee_did = $4
                )
              RETURNING id, repo_id, kind, status, delegator_did, assignee_did, capability, ucan_token, payload, result, created_at, updated_at, deadline",
@@ -2687,7 +2703,8 @@ impl Db {
         let Some(ref assigned) = existing.assignee_did else {
             return Err(anyhow::anyhow!("task not found or not in claimed state"));
         };
-        if !crate::api::did_matches(actor_did, assigned) {
+        // Trim matches claim_task so tab-padded stored values can finish.
+        if !crate::api::did_matches(actor_did, assigned.trim_matches(ASSIGNEE_BLANK)) {
             return Err(anyhow::anyhow!(
                 "task not finishable: only the assignee may finish it"
             ));
