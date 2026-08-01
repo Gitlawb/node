@@ -917,6 +917,10 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
 /// drift apart. If you change `normalize_owner_key`, update this const too.
 const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
 
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `did` (like in agent_profiles) instead of `owner_did`.
+const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
+
 #[cfg(test)]
 mod normalize_owner_key_tests {
     use super::normalize_owner_key;
@@ -3511,14 +3515,20 @@ impl Db {
     }
 
     pub async fn get_profile(&self, did: &str) -> Result<Option<ProfileRecord>> {
-        let row = sqlx::query(
+        // Same owner-key contract as get_repo: strip `did:key:` only when the
+        // remainder is a bare key id. The old `LIKE '%:' || $1` matched any DID
+        // method that shared a suffix and could resolve the wrong profile.
+        let did_key = normalize_owner_key(did);
+        let sql = format!(
             "SELECT did, display_name, bio, avatar_url, website, socials, profile_cid, created_at, updated_at
              FROM agent_profiles
-             WHERE did = $1 OR did LIKE '%:' || $1",
-        )
-        .bind(did)
-        .fetch_optional(&self.pool)
-        .await?;
+             WHERE ({key}) = $1",
+            key = PROFILE_DID_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(did_key)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|r| ProfileRecord {
             did: r.get("did"),
@@ -4669,6 +4679,52 @@ mod dedup_db_tests {
             "must return the non-key canonical row (UUID id)"
         );
         assert!(!got.is_public, "non-key row's is_public must be preserved");
+    }
+
+    /// get_profile must not resolve a non-key DID (e.g. did:gitlawb:) when
+    /// queried with the bare short id. The old `LIKE '%:' || $1` clause was too
+    /// broad and could return the wrong profile row.
+    #[sqlx::test]
+    async fn get_profile_does_not_match_non_key_did(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkprof1";
+
+        db.upsert_profile(short, Some("canonical"), None, None, None, None)
+            .await
+            .unwrap();
+        db.upsert_profile(
+            &format!("did:gitlawb:{short}"),
+            Some("other-method"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let got = db
+            .get_profile(short)
+            .await
+            .unwrap()
+            .expect("bare short id should resolve the key-form profile");
+        assert_eq!(got.did, short);
+        assert_eq!(got.display_name.as_deref(), Some("canonical"));
+
+        let got = db
+            .get_profile(&format!("did:key:{short}"))
+            .await
+            .unwrap()
+            .expect("did:key form should also resolve the key-form profile");
+        assert_eq!(got.did, short);
+
+        let got = db
+            .get_profile(&format!("did:gitlawb:{short}"))
+            .await
+            .unwrap()
+            .expect("full non-key DID should resolve its own profile");
+        assert_eq!(got.did, format!("did:gitlawb:{short}"));
+        assert_eq!(got.display_name.as_deref(), Some("other-method"));
     }
 
     /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
