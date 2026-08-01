@@ -1,7 +1,7 @@
 {
   "$comment": "Canonical seed list for the Gitlawb network. Merged with GITLAWB_BOOTSTRAP_PEERS at startup. PRs to add public nodes welcome.",
   "version": 1,
-  "updated": "2026-06-30",
+  "updated": "2026-08-01",
   "peers": [
     {
       "name": "gitlawb",
@@ -42,6 +42,14 @@
       "http_url": "https://rapybus-gitlawb.com",
       "p2p_multiaddr": null,
       "added": "2026-05-16"
+    },
+    {
+      "name": "pocketlawb",
+      "operator": "pocketlawb",
+      "did": "did:key:z6MkiKcvf32z2tcNCGKscxmtszZqpBUrVFa82FTvPnfAhDNF",
+      "http_url": "https://node.pocketlawb.com",
+      "p2p_multiaddr": "/dns4/node.pocketlawb.com/udp/7546/quic-v1/p2p/12D3KooWMGuHkbfJ9gTHL7dFozefF3PruxGMvRopE8prPC7eScNH",
+      "added": "2026-08-01"
     }
   ]
 }
