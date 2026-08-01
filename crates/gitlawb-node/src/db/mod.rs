@@ -4699,9 +4699,8 @@ mod dedup_db_tests {
         let db = db(pool).await;
         let short = "z6Mkprof1";
 
-        db.upsert_profile(short, Some("canonical"), None, None, None, None)
-            .await
-            .unwrap();
+        // Seed only a non-key DID row first. When queried with the bare short ID,
+        // get_profile must return None (lone non-key fixture test).
         db.upsert_profile(
             &format!("did:gitlawb:{short}"),
             Some("other-method"),
@@ -4712,6 +4711,17 @@ mod dedup_db_tests {
         )
         .await
         .unwrap();
+
+        let got = db.get_profile(short).await.unwrap();
+        assert!(
+            got.is_none(),
+            "bare short id must not resolve a lone non-key DID profile"
+        );
+
+        // Now seed the canonical bare key profile row as well.
+        db.upsert_profile(short, Some("canonical"), None, None, None, None)
+            .await
+            .unwrap();
 
         let got = db
             .get_profile(short)
@@ -4824,6 +4834,49 @@ mod dedup_db_tests {
             assert_eq!(
                 sql_result, rust_result,
                 "normalize_owner_key(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
+
+    /// Verify that `PROFILE_DID_CASE_SQL` (which aliases the column `did`) also
+    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
+    #[sqlx::test]
+    async fn profile_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(did) AS (VALUES {values_sql})
+             SELECT did, ({key}) AS normalized FROM data ORDER BY did",
+            key = super::PROFILE_DID_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
             );
         }
     }
