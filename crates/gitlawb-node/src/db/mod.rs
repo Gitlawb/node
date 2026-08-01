@@ -3458,6 +3458,9 @@ impl Db {
             let new_website = website.or(existing.website.as_deref());
             let new_socials = socials.or(existing.socials.as_deref());
 
+            // get_profile equates bare short ids with did:key:<id>. UPDATE must target
+            // the stored row identity (existing.did), not the caller's raw input form,
+            // or a did:key: alias against a bare-stored profile updates zero rows.
             sqlx::query(
                 "UPDATE agent_profiles
                  SET display_name=$1, bio=$2, avatar_url=$3, website=$4, socials=$5, updated_at=$6
@@ -3469,12 +3472,12 @@ impl Db {
             .bind(new_website)
             .bind(new_socials)
             .bind(&now)
-            .bind(did)
+            .bind(&existing.did)
             .execute(&self.pool)
             .await?;
 
             Ok(ProfileRecord {
-                did: did.to_string(),
+                did: existing.did,
                 display_name: new_name.map(String::from),
                 bio: new_bio.map(String::from),
                 avatar_url: new_avatar.map(String::from),
@@ -3544,10 +3547,17 @@ impl Db {
     }
 
     pub async fn set_profile_cid(&self, did: &str, cid: &str) -> Result<()> {
-        sqlx::query("UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE did = $3")
+        // Same did:key / bare equivalence as get_profile so a full did:key: form
+        // updates a profile stored under the bare short id.
+        let did_key = normalize_owner_key(did);
+        let sql = format!(
+            "UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE ({key}) = $3",
+            key = PROFILE_DID_CASE_SQL
+        );
+        sqlx::query(&sql)
             .bind(cid)
             .bind(Utc::now().to_rfc3339())
-            .bind(did)
+            .bind(did_key)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -4725,6 +4735,47 @@ mod dedup_db_tests {
             .expect("full non-key DID should resolve its own profile");
         assert_eq!(got.did, format!("did:gitlawb:{short}"));
         assert_eq!(got.display_name.as_deref(), Some("other-method"));
+    }
+
+    /// upsert_profile must update a bare-stored profile when called with the
+    /// full did:key: form. get_profile equates the two, so the UPDATE has to
+    /// target existing.did rather than the raw input.
+    #[sqlx::test]
+    async fn upsert_profile_updates_via_did_key_alias(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkprof2";
+
+        db.upsert_profile(short, Some("before"), None, None, None, None)
+            .await
+            .unwrap();
+
+        let updated = db
+            .upsert_profile(
+                &format!("did:key:{short}"),
+                Some("after"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.did, short, "preserve the stored did form on update");
+        assert_eq!(updated.display_name.as_deref(), Some("after"));
+
+        let got = db
+            .get_profile(short)
+            .await
+            .unwrap()
+            .expect("profile should still resolve by bare short id");
+        assert_eq!(got.did, short);
+        assert_eq!(got.display_name.as_deref(), Some("after"));
+
+        db.set_profile_cid(&format!("did:key:{short}"), "bafytestcid")
+            .await
+            .unwrap();
+        let got = db.get_profile(short).await.unwrap().unwrap();
+        assert_eq!(got.profile_cid.as_deref(), Some("bafytestcid"));
     }
 
     /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
