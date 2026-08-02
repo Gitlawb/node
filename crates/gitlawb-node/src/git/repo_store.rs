@@ -2015,6 +2015,101 @@ mod tests {
         }
     }
 
+    /// F3c (P2): the connection teardown on the failing-unlock path must be BOUNDED.
+    /// `release` awaits it inline while the global write permit, the per-source permit
+    /// and the write lease are all still held, and sqlx's `close()` carries no deadline
+    /// of its own, so a blackholed socket would park every later push to that repo
+    /// behind three pinned admission resources.
+    ///
+    /// What this covers: the deadline itself. A close that never resolves still lets
+    /// `close_conn_bounded` return, which is the property `release` depends on. What it
+    /// does NOT cover, and is reasoned rather than run: that sqlx's own `close()` is
+    /// what stalls in production. Making a real `PgConnection::close` hang needs a
+    /// blackholed TCP path to Postgres, and the flip has to land after the unlock
+    /// statement round-trips but before the Terminate write, which is not a seam this
+    /// module exposes. A never-resolving future is the faithful stand-in for that
+    /// close, and the F3b tests above already cover that `release` really routes its
+    /// close through here.
+    ///
+    /// Time is paused, so nothing here depends on wall clock: the runtime auto-advances
+    /// to the next timer, and the assertion is on which timer fired, not on elapsed
+    /// time. The outer bound is what turns a removed deadline into a failure rather
+    /// than a hung suite.
+    ///
+    /// Load-bearing: drop the `tokio::time::timeout` in `close_conn_bounded` and the
+    /// inner future never resolves, so the outer bound fires and this fails.
+    #[tokio::test(start_paused = true)]
+    async fn unlock_error_connection_close_is_bounded() {
+        let hanging = std::future::pending::<Result<(), sqlx::Error>>();
+        let outcome = tokio::time::timeout(
+            UNLOCK_ERROR_CLOSE_TIMEOUT * 4,
+            close_conn_bounded("boundedclosetest", hanging),
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "a connection close that never completes must not hold the write lease and \
+             both admission permits open-endedly: close_conn_bounded must give up and \
+             drop the connection"
+        );
+    }
+
+    /// U8, the off-runtime arm: with no Tokio runtime there is nothing to spawn the
+    /// unlock onto, and the connection has already been taken out of the guard, so
+    /// dropping it with no unlock attempted returns it to the pool with the session
+    /// lock still held. Dropping a `PoolConnection` off a runtime is worse than that:
+    /// sqlx's return-to-pool path spawns, and its no-runtime fallback panics, so that
+    /// arm also panics in a destructor.
+    ///
+    /// Reached by dropping the guard on a plain `std::thread`, where
+    /// `Handle::try_current()` fails.
+    ///
+    /// Load-bearing: replace the `detach` arm with a plain `drop(conn)` and the join
+    /// sees sqlx's "requires a Tokio context" panic; `detach` gives up the pool slot,
+    /// so nothing is spawned and dropping the detached connection closes the socket,
+    /// which ends the session and frees the lock.
+    #[sqlx::test]
+    async fn write_guard_dropped_off_runtime_disposes_the_connection(pool: sqlx::PgPool) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_pool = pool_without_idle_reaper(&pool).await;
+        let store = RepoStore::for_testing(dir.path().to_path_buf(), store_pool.clone());
+        let owner = "did:key:z6MkDropOffRuntimeProofKKKKKKKKKKKKKKKKKK";
+        let name = "dropoffruntimetest";
+        let slug = owner.replace([':', '/'], "_");
+        let key = advisory_lock_key(&slug, name);
+
+        let mut checker = pool.acquire().await.expect("checker connection");
+        let guard = store.acquire_write(owner, name).await.expect("acquire");
+        // The guard's connection lives in the store's DERIVED lock pool, not the pool
+        // handed to `for_testing`; see `RepoStore::lock_pool`.
+        let lock_pool = store.lock_pool().clone();
+        let size_before = lock_pool.size();
+        assert!(size_before > 0, "the lock pool owns the guard's connection");
+
+        let dropped = std::thread::spawn(move || drop(guard)).join();
+        assert!(
+            dropped.is_ok(),
+            "dropping a write guard off a Tokio runtime must not panic"
+        );
+
+        wait_until(
+            || lock_pool.size() == size_before - 1,
+            "the connection of a guard dropped off a runtime to be disposed of rather \
+             than returned to the pool with no unlock attempted",
+        )
+        .await;
+        wait_until_lock_free(
+            &mut checker,
+            key,
+            "a guard dropped off a runtime to end its session so postgres drops the lock",
+        )
+        .await;
+        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(key)
+            .execute(&mut *checker)
+            .await;
+    }
+
     /// A second pool over the same test database with the idle reaper DISABLED.
     ///
     /// `#[sqlx::test]`'s own pool sets `idle_timeout(1s)`, so a connection returned to

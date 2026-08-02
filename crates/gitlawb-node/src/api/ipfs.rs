@@ -3263,6 +3263,178 @@ mod tests {
         );
     }
 
+    /// Loop bound (cap N) + F2 truncation verdict: one `/ipfs/{cid}` request against a
+    /// CID present in many path-scoped repos must not serialize an unbounded number of
+    /// full-history walks — and cutting a candidate WITHOUT a verdict must not report
+    /// the object absent. With `ipfs_max_repos_walked = 1` and TWO public, path-scoped
+    /// repos both carrying the blob, the first candidate is walked (empty allowed-set →
+    /// a deny VERDICT) and the second is cut by the cap (no verdict), so the fake git's
+    /// `rev-list` runs exactly once and the request sheds a retryable 503 + Retry-After
+    /// — never the old false 404 (the blob genuinely sits in the second repo).
+    /// This drives the GITLAWB_IPFS_MAX_REPOS_WALKED knob specifically. The merge left
+    /// two walk caps in play, this one and the branch's own history-walk ceiling, and
+    /// the gate takes the tighter of the two; setting this knob to 1 is what makes it
+    /// the binding one here. A sibling case covers the ceiling.
+    ///
+    /// MUTATION (RED): drop `config.ipfs_max_repos_walked` from the `min()` in the walk
+    /// gate and both repos are walked (count 2); drop the truncation taint on the skip
+    /// and the 503 decays to a 404.
+    #[cfg(unix)]
+    #[sqlx::test]
+    async fn get_by_cid_caps_repos_walked_knob_bounds_the_walks(pool: sqlx::PgPool) {
+        use std::process::Command;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let walk_log = tmp.path().join("walks.log");
+        // Fake git for the WALK: empty refs, `rev-parse` resolves, and each `rev-list`
+        // appends one line to a log (so the number of walks == the line count) and exits
+        // with EMPTY output (the allowed-set is empty, so every repo path-gates to a
+        // `continue` and the request 404s after walking). object_type uses the REAL git,
+        // so the seeded blob below must genuinely exist.
+        let body = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+               for-each-ref) : ;;\n\
+               rev-parse) echo deadbeef ;;\n\
+               rev-list) echo walk >> \"{}\" ;;\n\
+               *) : ;;\n\
+             esac\n\
+             exit 0\n",
+            walk_log.display()
+        );
+        let git_path = tmp.path().join("fakegit");
+        std::fs::write(&git_path, &body).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&git_path).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&git_path, perm).unwrap();
+        }
+
+        let mut state = crate::test_support::test_state(pool.clone()).await;
+        let repos_dir = tmp.path().join("repos");
+        std::fs::create_dir_all(&repos_dir).unwrap();
+        state.repo_store = crate::git::repo_store::RepoStore::for_testing(repos_dir, pool);
+        state.git_bin = git_path.to_str().unwrap().to_string();
+        state.push_limiter_trust = crate::rate_limit::TrustedProxy::None;
+        // The bound under test: walk at most one candidate repo per request.
+        let mut cfg = (*state.config).clone();
+        cfg.ipfs_max_repos_walked = 1;
+        state.config = Arc::new(cfg);
+
+        // Seed TWO public repos, each with the SAME blob (same content -> same sha256 OID
+        // -> same CID) under a path-scoped rule, so both are walk candidates for one CID.
+        let run = |args: &[&str], cwd: &std::path::Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let mut oid = String::new();
+        for (i, name) in ["ipa", "ipb"].iter().enumerate() {
+            let owner = "z6ipfsN";
+            state
+                .db
+                .upsert_mirror_repo(owner, name, &format!("/unused-{name}"), None, false)
+                .await
+                .unwrap();
+            let rec = state.db.get_repo(owner, name).await.unwrap().unwrap();
+            let bare = state
+                .repo_store
+                .acquire(&rec.owner_did, &rec.name)
+                .await
+                .unwrap();
+            let _ = std::fs::remove_dir_all(&bare);
+            std::fs::create_dir_all(&bare).unwrap();
+            let work = tmp.path().join(format!("work{i}"));
+            std::fs::create_dir_all(work.join("src")).unwrap();
+            // Identical content in both repos -> identical sha256 blob OID -> one CID.
+            std::fs::write(work.join("src/secret.txt"), b"loop bound proof\n").unwrap();
+            run(
+                &["init", "-q", "--object-format=sha256", "-b", "main"],
+                &work,
+            );
+            run(&["config", "user.email", "t@t"], &work);
+            run(&["config", "user.name", "t"], &work);
+            run(&["add", "src/secret.txt"], &work);
+            run(&["commit", "-q", "-m", "seed"], &work);
+            run(
+                &[
+                    "clone",
+                    "--bare",
+                    "-q",
+                    work.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                tmp.path(),
+            );
+            if oid.is_empty() {
+                let out = Command::new("git")
+                    .args(["rev-parse", "HEAD:src/secret.txt"])
+                    .current_dir(&work)
+                    .output()
+                    .expect("git rev-parse runs");
+                oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+            state
+                .db
+                .set_visibility_rule(
+                    &rec.id,
+                    "src/**",
+                    crate::db::VisibilityMode::B,
+                    &["did:key:z6MkU3IpfsReaderBBBBBBBBBBBBBBBBBBBBBBBB".to_string()],
+                    &rec.owner_did,
+                )
+                .await
+                .unwrap();
+        }
+        // The resolver maps a requested CID back to an oid through the CID index, so a
+        // bare digest-as-oid CID resolves to nothing and 404s before any repo is
+        // visited. Register a legacy NULL-provenance row, which is also what routes the
+        // request to the bounded legacy scan this cap governs. Neither repo serves, so
+        // the key need not be the content CID.
+        let cid = seed_legacy_pin(&state, &oid).await;
+
+        let peer: SocketAddr = "203.0.113.90:5000".parse().unwrap();
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/ipfs/{cid}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let resp = ipfs_router(state).oneshot(req).await.unwrap();
+        // The first repo's walk yields the empty allowed-set (deny verdict); the second
+        // repo NEEDS a walk the cap forbids, so the scan is truncated without a verdict
+        // on it: retryable 503, never a false 404 for the blob it genuinely carries.
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a walk-cap truncation must shed a retryable 503, not report the object absent"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok()),
+            Some("1"),
+            "the truncation 503 must carry Retry-After"
+        );
+
+        let walks = std::fs::read_to_string(&walk_log)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(
+            walks, 1,
+            "with the per-request repo-walk cap at 1, only the first candidate repo is \
+             walked (the second is cut by the cap), so exactly one walk runs; got {walks}"
+        );
+    }
+
     /// Route rate limit is WIRED (not a silent no-op): the production `build_router`
     /// attaches an `IpRateLimiter` extension to the `/ipfs/{cid}` route, so a per-IP
     /// flood is braked with 429. A bare `rate_limit_by_ip` layer with no extension does
