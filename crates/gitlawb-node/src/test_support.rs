@@ -10914,4 +10914,366 @@ mod tests {
             "result includes the deep cert matching the prefix"
         );
     }
+
+    /// Coalesced-drain behavior of the detached post-push encrypt/pin task.
+    ///
+    /// A push arriving while a task is in flight does not spawn a second task; its
+    /// (old_sha, new_sha) tip pairs are merged into the in-flight key's pending slot
+    /// and the task loop-drains them before releasing the key. These tests drive the
+    /// real task through `run_encrypt_pin_task_for_test` and assert on the WORK
+    /// PERFORMED (what is pinned, what is sealed, whether the key is released), not
+    /// on control flow. The drain re-reads repo state FRESH, so a rule tightened
+    /// between the coalesced push and its drain must be honored, fail closed.
+    mod u3_requeue {
+        use super::*;
+        use crate::db::VisibilityMode;
+        use crate::state::{BeginOutcome, PendingWork};
+        use std::path::{Path, PathBuf};
+        use std::process::Command;
+
+        fn git(args: &[&str], dir: &Path) {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+        fn oid(rev: &str, dir: &Path) -> String {
+            let out = Command::new("git")
+                .args(["rev-parse", rev])
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "rev-parse {rev}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        struct Repo {
+            _td: tempfile::TempDir,
+            path: PathBuf,
+        }
+        fn init_repo() -> Repo {
+            let td = tempfile::TempDir::new().unwrap();
+            let path = td.path().to_path_buf();
+            git(&["init", "-q"], &path);
+            git(&["config", "user.email", "t@t"], &path);
+            git(&["config", "user.name", "t"], &path);
+            Repo { _td: td, path }
+        }
+        /// Commit `content` at `rel`, return the blob oid.
+        fn commit(repo: &Path, rel: &str, content: &str) -> String {
+            let full = repo.join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, content).unwrap();
+            git(&["add", "."], repo);
+            git(&["commit", "-qm", rel], repo);
+            oid(&format!("HEAD:{rel}"), repo)
+        }
+        /// Write a loose, UNREACHABLE blob (dangling object).
+        fn write_dangling_blob(repo: &Path, content: &str) -> String {
+            let out = Command::new("git")
+                .args(["hash-object", "-w", "--stdin"])
+                .current_dir(repo)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            out.stdin
+                .as_ref()
+                .unwrap()
+                .write_all(content.as_bytes())
+                .unwrap();
+            let o = out.wait_with_output().unwrap();
+            assert!(o.status.success());
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        fn new_did() -> String {
+            Keypair::generate().did().to_string()
+        }
+        /// Admit push A on the in-flight key, or fail the test.
+        fn admit(state: &AppState, key: &str) -> crate::state::EncryptInflightGuard {
+            match state.encrypt_inflight.try_begin(key, Vec::new()) {
+                BeginOutcome::Admitted(g) => g,
+                BeginOutcome::Coalesced => panic!("push A must be admitted, nothing is in flight"),
+            }
+        }
+        /// Coalesce push B's tip pairs into the in-flight key, or fail the test.
+        fn coalesce(state: &AppState, key: &str, pairs: Vec<(String, String)>) {
+            match state.encrypt_inflight.try_begin(key, pairs) {
+                BeginOutcome::Coalesced => {}
+                BeginOutcome::Admitted(_) => {
+                    panic!("push B must coalesce, a task is already in flight")
+                }
+            }
+        }
+
+        /// SCENARIO 2 + 5 (pin half, TAIL-PLACEMENT guard). A coalesced push on a PUBLIC
+        /// repo with NO path-scoped rule must still drain its pin half: the second
+        /// push's new object is pinned after the task. RED without the drain (the stale
+        /// spawn object_list never lists obj2), and RED if the drain sits inside the
+        /// `has_path_scoped_rule` block (a rules-free repo would never reach it).
+        #[sqlx::test]
+        async fn u3_rules_free_public_repo_requeues_pin_half(pool: PgPool) {
+            let state = test_state(pool).await;
+            let owner = new_did();
+            let repo = seed_repo(&owner, "u3-pin");
+            state.db.create_repo(&repo).await.expect("seed repo");
+            let key = crate::state::repo_identity_key(&owner, &repo.name);
+            let git_repo = init_repo();
+            let obj1 = commit(&git_repo.path, "a.txt", "one\n");
+            let tip_a = oid("HEAD", &git_repo.path);
+            // The coalesced push B adds obj2 (present at drain time, NOT in the stale
+            // push-A spawn object_list).
+            let obj2 = commit(&git_repo.path, "b.txt", "two\n");
+            let tip_b = oid("HEAD", &git_repo.path);
+
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                .with_status(200)
+                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .expect_at_least(1)
+                .create_async()
+                .await;
+
+            // Push A admits (guard); push B coalesces its tip pair into the slot.
+            let guard = admit(&state, &key);
+            coalesce(&state, &key, vec![(tip_a, tip_b)]);
+
+            // Spawn-time (push A) captures are STALE: object_list lists only obj1, no rule.
+            crate::api::repos::run_encrypt_pin_task_for_test(
+                &state,
+                guard,
+                git_repo.path.clone(),
+                repo.id.clone(),
+                owner.clone(),
+                repo.name.clone(),
+                server.url(),
+                vec![obj1.clone()],
+                Some(vec![]),
+                true,
+            )
+            .await;
+
+            assert!(
+                state.db.is_pinned(&obj1).await.unwrap(),
+                "push A's object is pinned on the first pass"
+            );
+            assert!(
+                state.db.is_pinned(&obj2).await.unwrap(),
+                "the coalesced push's new object is pinned by the DRAIN lap (RED without \
+                 the drain, or if the drain sits inside the encrypt gate)"
+            );
+            assert!(
+                state.encrypt_inflight.is_empty(),
+                "the guard key is released once the task exits clean"
+            );
+        }
+
+        /// SCENARIO 1 + 3 (encrypt half, FRESH re-read). A coalesced push adds a
+        /// path-scoped rule withholding a blob. The task must re-read rules FRESH on
+        /// the drain lap and seal the newly-withheld blob's recovery copy. RED without
+        /// the fresh read (pass one's stale empty rule set seals nothing).
+        #[sqlx::test]
+        async fn u3_requeue_seals_blob_withheld_by_coalesced_rule_change(pool: PgPool) {
+            let state = test_state(pool).await;
+            let owner = new_did();
+            let reader = new_did();
+            let repo = seed_repo(&owner, "u3-enc");
+            state.db.create_repo(&repo).await.expect("seed repo");
+            let key = crate::state::repo_identity_key(&owner, &repo.name);
+            let git_repo = init_repo();
+            let _pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
+            let tip_a = oid("HEAD", &git_repo.path);
+            let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
+            let tip_b = oid("HEAD", &git_repo.path);
+
+            // Coalesced push B changes .gitlawb: withhold /secret/** from anon, grant reader.
+            state
+                .db
+                .set_visibility_rule(&repo.id, "/secret/**", VisibilityMode::B, &[reader], &owner)
+                .await
+                .expect("set rule");
+
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                .with_status(200)
+                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .expect_at_least(1)
+                .create_async()
+                .await;
+
+            let guard = admit(&state, &key);
+            coalesce(&state, &key, vec![(tip_a, tip_b)]);
+
+            // Push A captures are STALE: no rule, public repo.
+            crate::api::repos::run_encrypt_pin_task_for_test(
+                &state,
+                guard,
+                git_repo.path.clone(),
+                repo.id.clone(),
+                owner.clone(),
+                repo.name.clone(),
+                server.url(),
+                vec![],
+                Some(vec![]),
+                true,
+            )
+            .await;
+
+            assert!(
+                state
+                    .db
+                    .encrypted_blob_recipients_tag(&repo.id, &secret_oid)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "the coalesced push's newly-withheld blob is sealed after the DRAIN re-read \
+                 (RED without the fresh read: pass one's stale empty rules seal nothing)"
+            );
+            assert!(state.encrypt_inflight.is_empty(), "guard key released");
+        }
+
+        /// SCENARIO 4 (visibility-leak negative). The drain's full scan must feed
+        /// `list_all_objects` through the fail-closed filter, never pin it bare: a
+        /// withheld secret blob and a dangling blob must NOT land in the public pin set.
+        ///
+        /// The full scan is forced through the public API: one coalescing push carrying
+        /// more than the pending tip-pair cap degrades the slot to `PendingWork::FullScan`,
+        /// which is also the overflow path itself.
+        #[sqlx::test]
+        async fn u3_requeue_full_scan_does_not_publicly_pin_withheld_or_dangling(pool: PgPool) {
+            let state = test_state(pool).await;
+            let owner = new_did();
+            let reader = new_did();
+            let repo = seed_repo(&owner, "u3-leak");
+            state.db.create_repo(&repo).await.expect("seed repo");
+            let key = crate::state::repo_identity_key(&owner, &repo.name);
+            let git_repo = init_repo();
+            let pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
+            let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
+            state
+                .db
+                .set_visibility_rule(&repo.id, "/secret/**", VisibilityMode::B, &[reader], &owner)
+                .await
+                .expect("set rule");
+            // Coalesced push adds a new public object and a dangling blob.
+            let new_pub_oid = commit(&git_repo.path, "public/c.txt", "more public\n");
+            let tip = oid("HEAD", &git_repo.path);
+            let dangling_oid = write_dangling_blob(&git_repo.path, "orphan bytes\n");
+
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                .with_status(200)
+                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .expect_at_least(1)
+                .create_async()
+                .await;
+
+            let rules = state.db.list_visibility_rules(&repo.id).await.unwrap();
+
+            let guard = admit(&state, &key);
+            // 1025 pairs is one past the pending cap, so the slot degrades to FullScan.
+            coalesce(&state, &key, vec![(tip.clone(), tip.clone()); 1025]);
+            assert_eq!(
+                state.encrypt_inflight.pending_for(&key),
+                Some(PendingWork::FullScan),
+                "an overflowing coalesce degrades the pending slot to a forced full scan"
+            );
+
+            crate::api::repos::run_encrypt_pin_task_for_test(
+                &state,
+                guard,
+                git_repo.path.clone(),
+                repo.id.clone(),
+                owner.clone(),
+                repo.name.clone(),
+                server.url(),
+                vec![pub_oid.clone()],
+                Some(rules),
+                true,
+            )
+            .await;
+
+            assert!(
+                state.db.is_pinned(&new_pub_oid).await.unwrap(),
+                "the coalesced push's new PUBLIC object is pinned by the drain full scan"
+            );
+            assert!(
+                !state.db.is_pinned(&secret_oid).await.unwrap(),
+                "a WITHHELD blob is never publicly pinned by the drain enumeration (leak guard)"
+            );
+            assert!(
+                !state.db.is_pinned(&dangling_oid).await.unwrap(),
+                "a DANGLING blob is never publicly pinned by the drain enumeration (leak guard)"
+            );
+            // The withheld blob still gets its ENCRYPTED recovery copy (not a public pin).
+            assert!(
+                state
+                    .db
+                    .encrypted_blob_recipients_tag(&repo.id, &secret_oid)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "withheld blob is sealed as an encrypted recovery copy, not pinned in the clear"
+            );
+        }
+
+        /// SCENARIO 8 (no-coalesce happy path). A single push with no coalesced follower
+        /// runs exactly one pass, pins its object, and releases the key. No drain lap.
+        #[sqlx::test]
+        async fn u3_no_coalesce_single_pass_pins_and_releases(pool: PgPool) {
+            let state = test_state(pool).await;
+            let owner = new_did();
+            let repo = seed_repo(&owner, "u3-happy");
+            state.db.create_repo(&repo).await.expect("seed repo");
+            let key = crate::state::repo_identity_key(&owner, &repo.name);
+            let git_repo = init_repo();
+            let obj1 = commit(&git_repo.path, "a.txt", "one\n");
+
+            let mut server = mockito::Server::new_async().await;
+            let _m = server
+                .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                .with_status(200)
+                .with_body(r#"{"Hash":"bafyprovider"}"#)
+                .expect_at_least(1)
+                .create_async()
+                .await;
+
+            // No second try_begin: nothing is ever merged into the pending slot.
+            let guard = admit(&state, &key);
+            assert_eq!(
+                state.encrypt_inflight.pending_for(&key),
+                Some(PendingWork::Tips(vec![])),
+                "clean, no coalesce"
+            );
+
+            crate::api::repos::run_encrypt_pin_task_for_test(
+                &state,
+                guard,
+                git_repo.path.clone(),
+                repo.id.clone(),
+                owner.clone(),
+                repo.name.clone(),
+                server.url(),
+                vec![obj1.clone()],
+                Some(vec![]),
+                true,
+            )
+            .await;
+
+            assert!(
+                state.db.is_pinned(&obj1).await.unwrap(),
+                "the single push's object is pinned"
+            );
+            assert!(
+                state.encrypt_inflight.is_empty(),
+                "the key is released after one pass"
+            );
+        }
+    }
 }

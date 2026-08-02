@@ -912,6 +912,54 @@ async fn run_encrypt_pin_task(
     }
 }
 
+/// Test-only entry point: build an [`EncryptTaskCtx`] from a test `AppState` (with
+/// an overridable `ipfs_api` for a mock Kubo server and an explicit `disk_path` for
+/// the fixture repo) and run the real drain task. Keeps `EncryptTaskCtx` and
+/// `run_encrypt_pin_task` private to this module.
+///
+/// `owner_did` and `repo_name` must name the real seeded row: the drain re-fetches
+/// the record by owner/name every lap, so a blank name resolves `Gone` and every
+/// lap would pin nothing.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_encrypt_pin_task_for_test(
+    state: &AppState,
+    guard: crate::state::EncryptInflightGuard,
+    disk_path: std::path::PathBuf,
+    repo_id: String,
+    owner_did: String,
+    repo_name: String,
+    ipfs_api: String,
+    snapshot_objects: Vec<String>,
+    snapshot_rules: Option<Vec<crate::db::VisibilityRule>>,
+    snapshot_is_public: bool,
+) {
+    let ctx = EncryptTaskCtx {
+        ipfs_api,
+        repo_path: disk_path,
+        db: state.db.clone(),
+        repo_id,
+        owner_did,
+        repo_name,
+        irys_url: String::new(),
+        http_client: std::sync::Arc::clone(&state.http_client),
+        node_did: state.node_did.to_string(),
+        node_keypair: std::sync::Arc::clone(&state.node_keypair),
+        git_bin: state.git_bin.clone(),
+        git_timeout: std::time::Duration::from_secs(state.config.git_service_timeout_secs),
+        encrypt_sem: state.git_encrypt_semaphore.clone(),
+        pin_sem: state.pin_semaphore.clone(),
+    };
+    run_encrypt_pin_task(
+        ctx,
+        guard,
+        snapshot_objects,
+        snapshot_rules,
+        snapshot_is_public,
+    )
+    .await;
+}
+
 /// Resolve a coalesced-drain iteration's replicable object list. Re-fetches the
 /// repo record and visibility rules FRESH — rules tightened between the coalesced
 /// push and its drain must be honored, fail closed: a newly-withheld blob is not
