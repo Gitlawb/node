@@ -100,6 +100,13 @@ async fn main() -> Result<()> {
     // bootstrap peers. Operators can opt out via GITLAWB_BOOTSTRAP_DISABLE_SEEDS.
     bootstrap::merge_seeds(&mut config);
 
+    // Fail fast on config combinations that are individually in-range but jointly
+    // unsafe — notably a DB pool too small for the concurrent-write cap, which
+    // would let a push burst starve every other DB path (#174 F1).
+    config
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
+
     if !config.public_read {
         warn!(
             "GITLAWB_PUBLIC_READ=false is reserved; per-repository private-read enforcement is not wired in alpha"
@@ -436,27 +443,44 @@ async fn main() -> Result<()> {
         git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(
             config.max_concurrent_git_pushes,
         )),
+        // Bounds how many post-push pin loops run concurrently across all repos (#174 F6),
+        // independent of the per-repo encrypt-task coalescing below. Not a bound on the
+        // MB-scale object-id lists themselves: parked tasks still hold theirs (see the
+        // field doc on AppState::pin_semaphore).
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_pin_tasks)),
         // Coalesces the DETACHED post-push encryption tasks per repo so a rapid pusher
         // cannot grow the outstanding parked-waiter set past one task per repo (#174
         // P2-2). No knob: it is a natural cap (one entry per distinct repo), not a
         // sized pool.
         encrypt_inflight: crate::state::EncryptInflight::new(),
+        // Per-repo in-process write-lease serializer (#174 U2/F3): supplements the pg
+        // advisory lock so a disconnected push's still-reaping git group can't be raced
+        // by a second same-node push. The map is naturally capped (one entry per contended
+        // repo, freed when unreferenced); the sized knob is how many pushes may PARK on
+        // one repo, since each parked push holds a fully buffered pack.
+        repo_write_leases: crate::state::RepoWriteLeases::new(config.repo_lease_max_waiters),
         git_read_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
             config.max_concurrent_reads_per_caller,
         ),
         // Per-source cap on the receive-pack advertisement, sized to an eighth of the
-        // write pool (min 1): a single source can hold at most this many write-pool
-        // slots via the anon advertisement, so saturating the pool takes ~8 distinct
-        // source IPs, each also rate-limited (#174).
+        // write pool (min 1): one resolved client key (rate_limit::client_key) can hold
+        // at most this many slots in the DEDICATED advert pool (git_push_advert_semaphore,
+        // disjoint from the write pool), so saturating that pool takes ~8 distinct keys
+        // (#174). That bounds an IPv4 or single-address caller; a caller controlling many
+        // addresses (an IPv6 /64 is 2^64 keys) still gets one cap per address, since
+        // client_key uses the full IP with no prefix folding. Narrowing the keying is a
+        // deferred design call, not something these caps claim to solve. Sized off the
+        // write pool only because the advert pool is created at the same size; an advert
+        // flood cannot touch a write permit.
         git_push_advert_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
-            (config.max_concurrent_git_pushes / 8).max(1),
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
         ),
         // Per-source cap on the authenticated receive-pack POST, sized like the advert
-        // cap: one source IP can hold at most this many write-pool slots, so
-        // monopolizing the pool takes ~8 distinct source IPs, each also rate-limited
-        // (#174 P1-d).
+        // cap: one resolved client key can hold at most this many write-pool slots, so
+        // monopolizing the pool takes ~8 distinct keys (#174 P1-d). Same residual as
+        // above: keys are full IPs, so a caller with many addresses has many caps.
         git_write_per_caller: rate_limit::PerCallerConcurrency::with_default_max_keys(
-            (config.max_concurrent_git_pushes / 8).max(1),
+            rate_limit::per_source_push_cap(config.max_concurrent_git_pushes),
         ),
         // Bounds concurrent /ipfs visibility walks — a distinct public cost center, so
         // its own pool + per-source sub-cap + per-IP rate limiter, never a git pool
@@ -1101,6 +1125,52 @@ async fn gossip_task(
                     return;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod rate_limiter_sweep_tests {
+    use crate::rate_limit::RateLimiter;
+    use std::time::Duration;
+
+    // Every per-key limiter the router mounts must be swept by the periodic
+    // task, the `/ipfs` one included: a limiter left out keeps expired keys
+    // until its map fills and the inline capacity sweep fires. Fails on the
+    // pre-fix sweeper, which skipped `ipfs_rate_limiter`.
+    #[tokio::test]
+    async fn sweep_evicts_expired_keys_from_every_limiter() {
+        let window = Duration::from_millis(30);
+        let mut state = crate::test_support::test_state_lazy();
+        state.rate_limiter = RateLimiter::new(10, window);
+        state.create_ip_rate_limiter = RateLimiter::new(10, window);
+        state.push_rate_limiter = RateLimiter::new(10, window);
+        state.sync_trigger_rate_limiter = RateLimiter::new(10, window);
+        state.peer_write_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_rate_limiter = RateLimiter::new(10, window);
+        state.ipfs_work_rate_limiter = RateLimiter::new(10, window);
+
+        let limiters = |s: &crate::state::AppState| {
+            [
+                s.rate_limiter.clone(),
+                s.create_ip_rate_limiter.clone(),
+                s.push_rate_limiter.clone(),
+                s.sync_trigger_rate_limiter.clone(),
+                s.peer_write_rate_limiter.clone(),
+                s.ipfs_rate_limiter.clone(),
+                s.ipfs_work_rate_limiter.clone(),
+            ]
+        };
+        for l in limiters(&state) {
+            assert!(l.check("1.2.3.4").await);
+            assert_eq!(l.tracked_keys().await, 1);
+        }
+
+        tokio::time::sleep(window * 3).await;
+        state.sweep_rate_limiters().await;
+
+        for (i, l) in limiters(&state).into_iter().enumerate() {
+            assert_eq!(l.tracked_keys().await, 0, "limiter {i} was not swept");
         }
     }
 }

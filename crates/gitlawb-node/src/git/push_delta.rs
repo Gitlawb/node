@@ -282,19 +282,61 @@ pub struct PinCandidateSet {
 /// it can never leak because the withheld/fail-closed filter still runs on
 /// whatever set is returned. `full_scan` rides on the returned set so the caller
 /// knows when the dangling-inclusive filter is required.
+///
+/// `scan_sem` is the post-receive scan admission pool (`git_encrypt_semaphore`,
+/// #174 F4): both git-spawning stages — the per-tip `cat-file` probe + delta
+/// rev-list, and the full-scan fallback — run under ONE permit held for the
+/// whole blocking scan. The deletion-only fast path (no new tips) spawns no git
+/// and never parks.
+///
+/// `force_full_scan` forces the full-scan fallback regardless of the tips — the
+/// coalesced-drain `PendingWork::FullScan` marker (#174 F5). It composes with
+/// the env kill-switch (either forces), and it disqualifies the empty-tips fast
+/// path: a forced-scan call with no tips must still enumerate the repo, never
+/// silently resolve to an empty delta (which would pin nothing and lose the
+/// drained pushes' work — the F5 bug shape).
 pub async fn resolve_candidates_for_push(
+    scan_sem: std::sync::Arc<tokio::sync::Semaphore>,
     repo_path: PathBuf,
     new_tips: Vec<String>,
     old_tips: Vec<String>,
     git_bin: String,
     timeout: Duration,
+    force_full_scan: bool,
 ) -> PinCandidateSet {
+    let force = force_full_scan || self::force_full_scan();
+    // No-git fast path: a deletion-only push resolves to an empty delta without
+    // spawning any git child, so it must not park on the scan pool. A forced
+    // full scan (caller flag or kill-switch) disqualifies it — the scan spawns git.
+    if new_tips.is_empty() && !force {
+        tracing::info!(delta = 0usize, repo = %repo_path.display(), "pin candidate set from push delta");
+        return PinCandidateSet {
+            candidates: Vec::new(),
+            full_scan: false,
+        };
+    }
+    // Scan admission (#174 F4): DEFER, never shed — a dropped scan would
+    // silently under-pin this push. The permit moves into the blocking closure
+    // so a started scan always completes holding it. Residuals at
+    // `acquire_scan_permit`.
+    let permit =
+        crate::state::acquire_scan_permit(scan_sem, &repo_path, "pin-candidate scan").await;
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         // ONE shared deadline for the whole scan, per jatmn ("the same deadline").
         let deadline = Instant::now() + timeout;
         let new_refs: Vec<&str> = new_tips.iter().map(String::as_str).collect();
         let old_refs: Vec<&str> = old_tips.iter().map(String::as_str).collect();
-        match resolve_push_delta(&repo_path, &new_refs, &old_refs, &git_bin, deadline) {
+        // `force` already folds in the env kill-switch, so the forced arm skips the
+        // delta machinery outright; the unforced arm goes through the normal
+        // resolver (whose own env read is false here by construction).
+        let resolved = if force {
+            tracing::debug!("full scan forced (coalesced-drain marker or kill-switch)");
+            PinCandidates::FullScanRequired
+        } else {
+            resolve_push_delta(&repo_path, &new_refs, &old_refs, &git_bin, deadline)
+        };
+        match resolved {
             PinCandidates::Delta(objs) => {
                 tracing::info!(delta = objs.len(), repo = %repo_path.display(), "pin candidate set from push delta");
                 PinCandidateSet { candidates: objs, full_scan: false }
@@ -547,11 +589,13 @@ mod tests {
         let c1 = repo.commit_file("a.txt", "one\n");
         let c2 = repo.commit_file("b.txt", "two\n");
         let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             repo.path.clone(),
             vec![c2.clone()],
             vec![c1.clone()],
             "git".to_string(),
             std::time::Duration::from_secs(600),
+            false,
         )
         .await;
         assert!(!set.full_scan, "happy-path delta is not a full scan");
@@ -576,16 +620,192 @@ mod tests {
             .into_iter()
             .collect();
         let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
             repo.path.clone(),
             vec![blob],
             vec![],
             "git".to_string(),
             std::time::Duration::from_secs(600),
+            false,
         )
         .await;
         assert!(set.full_scan, "non-commit tip is signalled as a full scan");
         let got: HashSet<String> = set.candidates.into_iter().collect();
         assert_eq!(got, all, "non-commit tip falls back to full repo scan");
+    }
+
+    /// F4 defer proof 2: `resolve_candidates_for_push`'s git stages (the per-tip
+    /// cat-file type probe + delta rev-list, and the full-scan fallback) run under a
+    /// scan-admission permit: with a zero-permit pool the call parks and spawns no
+    /// git; once a permit is available the SAME call runs (defer, not shed). On
+    /// ungated code the git runs regardless of the pool (RED).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_candidates_defers_when_scan_pool_exhausted() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("git.ran");
+        // Fake git records ANY invocation; cat-file reports a commit tip so the
+        // delta stage proceeds, rev-list yields an empty delta.
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\necho ran >> \"{}\"\ncase \"$1\" in\n  cat-file) echo commit ;;\n  *) : ;;\nesac\nexit 0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+        let tip = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+
+        let sem: Arc<Semaphore> = Arc::new(Semaphore::new(0));
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            resolve_candidates_for_push(
+                sem.clone(),
+                dir.path().to_path_buf(),
+                vec![tip.clone()],
+                vec![],
+                git_bin.clone(),
+                Duration::from_secs(5),
+                false,
+            ),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "the pin-candidate scan must defer (park on admission) when the pool is exhausted"
+        );
+        assert!(
+            !marker.exists(),
+            "the scan's git must not spawn while its admission permit is unavailable (F4)"
+        );
+
+        // Release admission: the SAME scan now runs (defer, not shed).
+        sem.add_permits(1);
+        let set = resolve_candidates_for_push(
+            sem,
+            dir.path().to_path_buf(),
+            vec![tip],
+            vec![],
+            git_bin,
+            Duration::from_secs(5),
+            false,
+        )
+        .await;
+        assert!(
+            marker.exists(),
+            "once admission is available the deferred scan runs its git"
+        );
+        assert!(!set.full_scan, "commit tip + empty rev-list is a delta");
+        assert!(set.candidates.is_empty());
+    }
+
+    /// F4 fast-path negative arm: a deletion-only push (no new tips, kill-switch
+    /// off) computes its empty delta without spawning ANY git child, so it must
+    /// complete without acquiring from the scan pool — even at zero permits. The
+    /// per-tip cat-file probe means every push with a non-empty new tip DOES spawn
+    /// git, so this is the only genuinely git-free stage.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_candidates_no_git_fast_path_skips_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::Semaphore;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("git.ran");
+        let fake = dir.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho ran >> \"{}\"\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let set = tokio::time::timeout(
+            Duration::from_millis(500),
+            resolve_candidates_for_push(
+                Arc::new(Semaphore::new(0)),
+                dir.path().to_path_buf(),
+                vec![],
+                vec!["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string()],
+                fake.to_str().unwrap().to_string(),
+                Duration::from_secs(5),
+                false,
+            ),
+        )
+        .await
+        .expect("the no-new-tips fast path must not park on the scan pool");
+        assert_eq!(
+            set,
+            PinCandidateSet {
+                candidates: Vec::new(),
+                full_scan: false
+            }
+        );
+        assert!(!marker.exists(), "the fast path must spawn no git at all");
+    }
+
+    /// #174 F5: the coalesced-drain FullScan marker is signalled via the explicit
+    /// `force_full_scan` flag, and a flagged call with NO tips must still enumerate
+    /// the whole repo (full_scan=true, non-empty candidates). The RED arm of the
+    /// encoding question: if the marker were encoded as a plain empty-tips call
+    /// (flag off — the fast path), the drain would resolve to an empty delta and
+    /// pin nothing, silently losing the coalesced pushes' work.
+    #[tokio::test]
+    async fn forced_full_scan_with_no_tips_enumerates_the_repo() {
+        let repo = Repo::new();
+        repo.commit_file("a.txt", "one\n");
+        let all: HashSet<String> = list_all_objects(&repo.path, "git", td())
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(!all.is_empty(), "fixture repo has objects");
+
+        let set = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            repo.path.clone(),
+            vec![],
+            vec![],
+            "git".to_string(),
+            std::time::Duration::from_secs(600),
+            true,
+        )
+        .await;
+        assert!(set.full_scan, "the forced call is signalled as a full scan");
+        let got: HashSet<String> = set.candidates.into_iter().collect();
+        assert_eq!(
+            got, all,
+            "a forced full scan with no tips enumerates the repo — never an empty delta"
+        );
+
+        // The discriminator: the SAME empty-tips call without the flag is the
+        // deletion-only fast path (empty delta, pin nothing). The two must differ,
+        // or the marker encoding has collapsed into the silent-loss shape.
+        let unforced = resolve_candidates_for_push(
+            std::sync::Arc::new(tokio::sync::Semaphore::new(64)),
+            repo.path.clone(),
+            vec![],
+            vec![],
+            "git".to_string(),
+            std::time::Duration::from_secs(600),
+            false,
+        )
+        .await;
+        assert!(!unforced.full_scan);
+        assert!(unforced.candidates.is_empty());
     }
 
     #[test]

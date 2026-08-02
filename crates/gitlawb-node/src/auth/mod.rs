@@ -529,7 +529,9 @@ mod tests {
             git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+            pin_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
             encrypt_inflight: crate::state::EncryptInflight::new(),
+            repo_write_leases: crate::state::RepoWriteLeases::new(8),
             git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
             git_push_advert_per_caller:
                 crate::rate_limit::PerCallerConcurrency::with_default_max_keys(8),

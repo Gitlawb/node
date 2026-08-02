@@ -175,6 +175,9 @@ pub struct ReceivedRefUpdate {
     pub cert_id: Option<String>,
     pub received_at: String,
     pub from_peer: String,
+    /// Full owner DID — populated by new peers; None for events from older
+    /// peers that predate the wire-format change (#144).
+    pub owner_did: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -874,6 +877,38 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 11,
+        name: "ref_update_owner_did",
+        stmts: &[
+            // Index deferred: the feed gate (#144) does not read owner_did yet.
+            "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
+        ],
+    },
+    // Reservation: v17 is deliberately not main's current_max + 1. The runner keys the
+    // applied set on the integer alone, so a version another in-flight branch also
+    // claims is skipped in full on whichever side merges second: no error, no warning,
+    // and schema_migrations still reads healthy while the column is simply absent.
+    // #253 took 16, and the pin-provenance work below took 18-23 when it merged, so 17
+    // sits between them. Gaps are harmless: the runner iterates the array and never
+    // requires contiguity.
+    Migration {
+        version: 17,
+        name: "sync_queue_attempted_at",
+        stmts: &[
+            // Scheduling key for dequeue_pending_syncs: when the row was last
+            // handed to a worker. Null until first dequeued, which is why the
+            // ordering coalesces onto enqueued_at.
+            "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
+        ],
+    },
+    // The six pin-provenance migrations below were numbered 11-16 while this work was
+    // in flight and moved to 18-23 on merge, because 11 and 16 were claimed elsewhere.
+    // A database that ran an earlier commit of this branch therefore has schema_migrations
+    // rows for the old numbers. Those rows are orphans: the runner skips on `version`
+    // alone and never reads `name`, so nothing detects them, and the DDL below re-runs
+    // as a no-op against objects that already exist. Recreate any such database rather
+    // than upgrading it in place.
+    Migration {
+        version: 18,
         name: "pinned_cids_cid_index",
         stmts: &[
             // GET /ipfs/{cid} resolves an incoming CID -> git oid via pinned_cids.cid
@@ -886,7 +921,7 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 12,
+        version: 19,
         name: "pinned_cids_repo_provenance",
         stmts: &[
             // Record the repository a pin came from so GET /ipfs/{cid} resolves a
@@ -902,7 +937,7 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 13,
+        version: 20,
         name: "pin_repo_sources",
         stmts: &[
             // F1 (#173, jatmn round 8): a shared object (a blob/tree/commit common to
@@ -922,7 +957,7 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 14,
+        version: 21,
         name: "pinned_cids_legacy_provider_cid",
         stmts: &[
             // R8 (#173, jatmn round 10): the opportunistic legacy provider-CID repair
@@ -938,7 +973,7 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 15,
+        version: 22,
         name: "pinned_cids_sources_incomplete",
         stmts: &[
             // U3 (#173): `record_pin_source` is BEST EFFORT at every call site, so a
@@ -957,7 +992,7 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 16,
+        version: 23,
         name: "pin_repair_sweep_cursor",
         stmts: &[
             // U4 (#173): the legacy provider-CID repair sweep walks `pinned_cids` in
@@ -1752,13 +1787,46 @@ impl Db {
         Ok(())
     }
 
+    /// Take up to `limit` pending syncs — the least recently attempted ones —
+    /// and stamp each with the time it was handed out.
+    ///
+    /// Selecting and stamping in one statement is deliberate. A row the worker
+    /// cannot make progress on stays `pending` so it is retried, and if its
+    /// ordering key never moved it would remain among the oldest rows forever,
+    /// holding a fixed-size window against every healthy repo behind it.
+    /// Stamping on the way out makes the key "least recently handed out", so a
+    /// stuck row rotates to the back instead. Doing it here rather than at each
+    /// deferral branch in the worker is what makes that hold by construction:
+    /// no call site can forget it, and a batch that dies mid-loop still leaves
+    /// its rows stamped. `enqueued_at` is left alone so backlog age stays
+    /// measurable.
+    ///
+    /// Two things this deliberately does not promise. The returned rows are the
+    /// right *set*, in no particular order — `RETURNING` does not sort, and
+    /// nothing in `process_batch` depends on the order within a batch. And this
+    /// is not a claim: the rows stay `pending` with no row lock held past the
+    /// statement, so two workers against one database can still be handed the
+    /// same batch. Single-worker deployment is the existing assumption;
+    /// `FOR UPDATE SKIP LOCKED` is what would change that, and it is not here.
+    ///
+    /// Errors surface to the caller, which logs and skips the poll. That is
+    /// worth knowing now that this writes: it can fail for reasons a plain
+    /// SELECT could not, such as a read-only transaction or a lock timeout.
     pub async fn dequeue_pending_syncs(&self, limit: i64) -> Result<Vec<SyncQueueItem>> {
         let rows = sqlx::query(
-            "SELECT id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at
-             FROM sync_queue WHERE status = 'pending'
-             ORDER BY enqueued_at ASC LIMIT $1",
+            // The outer `status = 'pending'` is not redundant with the
+            // subquery's: between the two, a concurrent worker can settle a row,
+            // and without it the UPDATE would still stamp and return a row that
+            // had already left the pending set.
+            "UPDATE sync_queue SET attempted_at = $2
+             WHERE status = 'pending' AND id IN (
+                 SELECT id FROM sync_queue WHERE status = 'pending'
+                 ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
+             )
+             RETURNING id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at",
         )
         .bind(limit)
+        .bind(Utc::now().to_rfc3339())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -2204,10 +2272,46 @@ impl Db {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
         }
         let now = Utc::now().to_rfc3339();
+        // A changed URL drops the reachability gate, so a repointed peer does
+        // not inherit a probe the previous host earned. In the DO UPDATE branch
+        // `peers.http_url` is the existing pre-update row (the proposed value is
+        // $2), and the comparison runs under the conflict row lock, so
+        // concurrent announces for one DID serialize instead of racing a
+        // read-then-write. That orders announces against each other and nothing
+        // more: mark_peer_ping writes by DID with no http_url predicate, so a
+        // probe of the previous URL that lands after a reset can still re-grant
+        // the flag until the next round.
+        //
+        // Comparison is exact. http_url is stored as announced, so a cosmetic
+        // difference such as a trailing slash also clears the flag; the peer
+        // re-earns it on a later gossip round, provided no further announce
+        // lands first. Normalizing instead would mean canonicalizing the stored
+        // value, this comparison, and the existing trim_end_matches call sites.
+        //
+        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
+        // clear it by announcing a different URL, and until #248 lands can also
+        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
+        // writes mark_peer_ping from the stored URL's own probe response. Do not
+        // build a new consumer on this flag as if it were attacker-resistant.
+        //
+        // Only the federated repo fan-out in api/repos.rs gates on this flag.
+        // Four consumers act on a repointed http_url regardless of it (sync.rs's
+        // origin resolve, the post-receive notify fan-out, trigger_sync, and the
+        // public resolve route), and two read surfaces republish it as
+        // `reachable` (api/resolve.rs, api/peers.rs), which is where a reset
+        // becomes externally visible. So this bounds the automatic inheritance
+        // rather than closing the rewrite. Binding a DID to its first-seen
+        // announcing key is what closes it: #273.
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
              VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET http_url = $2, last_seen = $3",
+             ON CONFLICT(did) DO UPDATE SET
+               http_url = $2,
+               last_seen = $3,
+               last_ping_ok = CASE
+                 WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
+                 ELSE peers.last_ping_ok
+               END",
         )
         .bind(did)
         .bind(http_url)
@@ -2825,8 +2929,8 @@ impl Db {
         sqlx::query(
             "INSERT INTO received_ref_updates
              (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, timestamp,
-              cert_id, received_at, from_peer)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+              cert_id, received_at, from_peer, owner_did)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT(id) DO NOTHING",
         )
         .bind(&update.id)
@@ -2840,9 +2944,136 @@ impl Db {
         .bind(&update.cert_id)
         .bind(&update.received_at)
         .bind(&update.from_peer)
+        .bind(&update.owner_did)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Resolve the trusted display `owner_did` for every ref-update row in a page,
+    /// issuing at most one query per *unique* local repo so the cost scales with
+    /// the number of distinct repos in the page rather than the page size.
+    ///
+    /// The stored `owner_did` (and the `repo` slug) arrive over gossipsub or the
+    /// unsigned peer-notify HTTP path, so neither is trusted. This method binds
+    /// the wire `owner_did` to the local repo the slug names before it is ever
+    /// surfaced:
+    ///
+    /// * **P1 (untrusted wire value):** a peer-supplied `owner_did` is only
+    ///   echoed when it normalizes equal to the canonical owner of the *actual
+    ///   local repo* at that slug. A caller asserting `did:key:zVictim` on a
+    ///   `zAlice/widget` row is dropped, because `zVictim` does not own the
+    ///   local `zAlice/widget` repo. The canonical DID is returned (not the raw
+    ///   wire bytes), so the projection is always the local source of truth.
+    /// * **P3 (legacy fallback):** a row stored with `owner_did = None` is
+    ///   attributed only via an *exact, normalized, unique* local match —
+    ///   `get_repo` matches the slug's owner key and name exactly (`LIMIT 1`,
+    ///   preferring canonical rows). The loose prefix-tolerant drop gate
+    ///   (`ref_update_row_names_repo`) is never used for attribution, so a
+    ///   cross-method slug collision cannot synthesize the wrong owner. When no
+    ///   unique local repo proves the owner, `None` is returned.
+    ///
+    /// # P2 mirror-only fallback
+    ///
+    /// Mirror-only repos store their owner as the bare normalized key (no DID
+    /// method prefix).  When a validated wire DID carries a full prefix (e.g.
+    /// `did:key:z…`) and the matching repo is a mirror, the full wire value is
+    /// returned so the API contract preserves the DID method for these rows.
+    ///
+    /// The slug must be `"{owner}/{name}"`; a slug without a `/` cannot be
+    /// attributed and yields `None`.
+    pub async fn resolve_ref_update_owner_dids(
+        &self,
+        rows: &[(&str, Option<&str>)],
+    ) -> Result<Vec<Option<String>>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // ── 1.  Collect unique lookup keys ────────────────────────────────
+        let mut slug_parts: Vec<Option<String>> = Vec::with_capacity(rows.len());
+        // Keys are stored as `format!("{normalized_key}\0{name}")` for cheap
+        // HashMap lookup.
+        let mut unique_keys: Vec<String> = Vec::new();
+
+        for (slug, _wire) in rows {
+            if let Some((owner_part, name)) = slug.rsplit_once('/') {
+                let normalized = normalize_owner_key(owner_part);
+                let key = format!("{normalized}\0{name}");
+                if !unique_keys.contains(&key) {
+                    unique_keys.push(key.clone());
+                }
+                slug_parts.push(Some(key));
+            } else {
+                slug_parts.push(None);
+            }
+        }
+
+        // ── 2.  Fetch all matching repos in one set-based query ──────────
+        // Build a single SQL with one OR condition per unique key so every
+        // distinct slug is resolved in one round-trip regardless of how many
+        // unique repos the page names.
+        let mut repo_map: std::collections::HashMap<String, RepoRecord> =
+            std::collections::HashMap::new();
+
+        if !unique_keys.is_empty() {
+            let mut sql = String::from(
+                "SELECT id, name, owner_did, description, is_public, default_branch,
+                        created_at, updated_at, disk_path, forked_from, machine_id
+                 FROM repos WHERE (",
+            );
+            let mut conds: Vec<String> = Vec::with_capacity(unique_keys.len());
+            for i in 0..unique_keys.len() {
+                let p = (2 * i + 1) as i64;
+                let q = (2 * i + 2) as i64;
+                conds.push(format!("({}) = ${p} AND name = ${q}", OWNER_KEY_CASE_SQL));
+            }
+            sql.push_str(&conds.join(" OR "));
+            sql.push_str(
+                ") ORDER BY CASE WHEN position('/' in id) > 0 THEN 1 ELSE 0 END, \
+                 created_at ASC, id ASC",
+            );
+
+            let mut q = sqlx::query(&sql);
+            for key in &unique_keys {
+                if let Some((owner_part, name)) = key.split_once('\0') {
+                    q = q.bind(owner_part).bind(name);
+                }
+            }
+
+            for row in q.fetch_all(&self.pool).await? {
+                let repo = row_to_repo(row);
+                let key = format!("{}\0{}", normalize_owner_key(&repo.owner_did), repo.name);
+                repo_map.entry(key).or_insert(repo);
+            }
+        }
+
+        // ── 3.  Resolve every input row ──────────────────────────────────
+        let mut results = Vec::with_capacity(rows.len());
+        for (i, (_slug, wire_owner_did)) in rows.iter().enumerate() {
+            let Some(repo) = slug_parts[i].as_ref().and_then(|k| repo_map.get(k)) else {
+                results.push(None);
+                continue;
+            };
+
+            match (wire_owner_did, repo) {
+                (Some(wire), repo)
+                    if normalize_owner_key(wire) == normalize_owner_key(&repo.owner_did) =>
+                {
+                    if repo.id.contains('/') && *wire != repo.owner_did {
+                        results.push(Some((*wire).to_string()));
+                    } else {
+                        results.push(Some(repo.owner_did.clone()));
+                    }
+                }
+                (None, _) => {
+                    results.push(Some(repo.owner_did.clone()));
+                }
+                _ => results.push(None),
+            }
+        }
+
+        Ok(results)
     }
 
     /// One page of ref updates (newest first), optionally scoped to one repo.
@@ -2869,7 +3100,7 @@ impl Db {
         after: Option<(&str, &str)>,
     ) -> Result<Vec<ReceivedRefUpdate>> {
         const COLS: &str = "id, node_did, pusher_did, repo, ref_name, old_sha, new_sha, \
-                            timestamp, cert_id, received_at, from_peer";
+                            timestamp, cert_id, received_at, from_peer, owner_did";
 
         // Positional params in bind order: repo?, after_ts?, after_id?, limit.
         let mut conds: Vec<String> = Vec::new();
@@ -3207,6 +3438,7 @@ fn row_to_ref_update(r: sqlx::postgres::PgRow) -> ReceivedRefUpdate {
         cert_id: r.get("cert_id"),
         received_at: r.get("received_at"),
         from_peer: r.get("from_peer"),
+        owner_did: r.get("owner_did"),
     }
 }
 
@@ -3926,6 +4158,295 @@ mod migration_tests {
         // `schema_migrations` when an existing node upgrades. If you rename
         // it, you must also update the backfill.
         assert_eq!(MIGRATIONS[0].name, MIGRATION_V1_NAME);
+    }
+
+    /// Simulate an existing node at v9 with populated received_ref_updates,
+    /// then apply the v11 migration and verify (a) owner_did IS NULL on
+    /// existing rows, (b) the column exists and is nullable TEXT, and
+    /// (c) idempotent re-run does not error.
+    #[sqlx::test]
+    async fn migration_v11_creates_owner_did_column(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+
+        // Create all tables by running the full migration chain from scratch,
+        // then drop the owner_did column to simulate a pre-v10 schema.
+        db.migrate().await.unwrap();
+        sqlx::query("ALTER TABLE received_ref_updates DROP COLUMN owner_did")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Truncate schema_migrations and re-seed at v9 — simulate an existing
+        // node that has run v1..v9 but not yet v10.
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 10) {
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(m.version)
+            .bind(m.name)
+            .bind("2026-07-01T00:00:00Z")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        // ── Simulate an existing node with rows recorded before v11 ────────
+        // The owner_did column does not exist yet, so we INSERT without it.
+        let row_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO received_ref_updates
+             (id, node_did, pusher_did, repo, ref_name, old_sha, new_sha,
+              timestamp, cert_id, received_at, from_peer)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        )
+        .bind(&row_id)
+        .bind("did:key:zNode")
+        .bind("did:key:zPusher")
+        .bind("z6MkOwner/myrepo")
+        .bind("refs/heads/main")
+        .bind("0000000000000000000000000000000000000000")
+        .bind("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .bind("2026-07-01T12:00:00Z")
+        .bind::<Option<String>>(None)
+        .bind("2026-07-01T12:00:01Z")
+        .bind("12D3KooWPeer")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM received_ref_updates")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            1,
+            "pre-migration row must exist"
+        );
+
+        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did) ──
+        db.migrate().await.unwrap();
+
+        // ── Assertions ────────────────────────────────────────────────────
+
+        // (a) Existing row has owner_did IS NULL (not overwritten).
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner_did FROM received_ref_updates WHERE id = $1")
+                .bind(&row_id)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(owner, None, "existing row's owner_did must be NULL");
+
+        // (b) Column exists and is nullable TEXT.
+        let col: (String, String, String) = sqlx::query_as(
+            "SELECT column_name, data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'received_ref_updates' AND column_name = 'owner_did'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "owner_did");
+        assert_eq!(col.1, "text");
+        assert_eq!(col.2, "YES", "owner_did must be nullable");
+
+        // (c) Version 11 is recorded as applied.
+        let v11_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 11")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            v11_count.0, 1,
+            "migration v11 must be recorded in schema_migrations"
+        );
+
+        // (d) Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
+        db.migrate().await.unwrap();
+    }
+
+    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
+
+    async fn enqueue_one(db: &super::Db, repo: &str) {
+        db.enqueue_sync(
+            repo,
+            "did:key:zPEER",
+            "refs/heads/main",
+            &"0".repeat(40),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn attempted_at_of(db: &super::Db, repo: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT attempted_at FROM sync_queue WHERE repo = $1")
+            .bind(repo)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Upgrade-path test: simulate a node already at v11 and let the real
+    /// migration entry point apply v17, rather than hand-copying its SQL.
+    ///
+    /// This is the test that catches the column being added to the v1
+    /// statement array instead of a new migration. v1 never re-runs on an
+    /// existing install, so that mistake breaks every deployed node's dequeue
+    /// while staying invisible to every other test here, since `#[sqlx::test]`
+    /// hands out a fresh database that runs the whole chain.
+    #[sqlx::test]
+    async fn migration_v17_adds_sync_queue_attempted_at(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll back to v11: drop the column and forget the version.
+        sqlx::query("ALTER TABLE sync_queue DROP COLUMN attempted_at")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 17")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // A row written by the old node, before the column existed.
+        enqueue_one(&db, "z6Mkfoo/legacy").await;
+
+        db.migrate().await.unwrap();
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'sync_queue' AND column_name = 'attempted_at'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "attempted_at must be nullable");
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 17")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v17 must be recorded as applied");
+
+        // The pre-existing row survives with a null key and is still dequeued.
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/legacy").await, None);
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].repo, "z6Mkfoo/legacy");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn dequeue_stamps_attempted_at_on_every_row_it_hands_out(pool: sqlx::PgPool) {
+        // The stamp is what stops a deferred row from holding the window, and
+        // it happens here rather than at the deferral branches so no call site
+        // can forget it.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        assert_eq!(
+            attempted_at_of(&db, "z6Mkfoo/a").await,
+            None,
+            "a freshly enqueued row has no attempt yet"
+        );
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            attempted_at_of(&db, "z6Mkfoo/a").await.is_some(),
+            "dequeue must stamp the row it returns, whatever the worker does next"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_orders_by_last_attempt_then_enqueue_time(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/older").await;
+        enqueue_one(&db, "z6Mkfoo/newer").await;
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:00Z")
+            .bind("z6Mkfoo/older")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:01Z")
+            .bind("z6Mkfoo/newer")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Never-attempted rows fall back to enqueue order.
+        let first = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(first[0].repo, "z6Mkfoo/older");
+
+        // Having been attempted, it now sorts behind the untried row.
+        let second = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(
+            second[0].repo, "z6Mkfoo/newer",
+            "an attempted row must yield to one that has never been tried"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_leaves_enqueued_at_untouched(pool: sqlx::PgPool) {
+        // enqueued_at keeps meaning enqueue time, so backlog age stays
+        // measurable; that is the reason attempted_at is a separate column.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        let before: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+
+        db.dequeue_pending_syncs(10).await.unwrap();
+
+        let after: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[sqlx::test]
+    async fn dequeue_does_not_touch_settled_rows(pool: sqlx::PgPool) {
+        // The stamping UPDATE must not reach a row that already left the
+        // pending set, or a terminal row could be dragged back into rotation.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/failed").await;
+        enqueue_one(&db, "z6Mkfoo/done").await;
+        let ids: Vec<(String, String)> =
+            sqlx::query_as("SELECT repo, id FROM sync_queue ORDER BY repo")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        for (repo, id) in &ids {
+            if repo.ends_with("failed") {
+                db.mark_sync_failed(id).await.unwrap();
+            } else {
+                db.mark_sync_done(id).await.unwrap();
+            }
+        }
+
+        assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
     }
 }
 
@@ -4975,6 +5496,7 @@ mod ref_update_keyset_paging_tests {
             cert_id: None,
             received_at: ts.into(),
             from_peer: "peer".into(),
+            owner_did: None,
         }
     }
 
@@ -5083,6 +5605,7 @@ mod ref_update_keyset_repo_filtered_tests {
             cert_id: None,
             received_at: ts.into(),
             from_peer: "peer".into(),
+            owner_did: None,
         }
     }
 
@@ -5189,6 +5712,7 @@ mod ref_update_keyset_same_timestamp_tests {
             cert_id: None,
             received_at: ts.into(),
             from_peer: "peer".into(),
+            owner_did: None,
         }
     }
 
@@ -5564,7 +6088,7 @@ mod ref_certificate_tests {
     /// row and re-running migrations must recreate it, exercising the real code
     /// path rather than hand-copying the SQL.
     #[sqlx::test]
-    async fn v11_pinned_cids_cid_index_applies_on_upgrade(pool: PgPool) {
+    async fn v18_pinned_cids_cid_index_applies_on_upgrade(pool: PgPool) {
         async fn index_exists(pool: &PgPool) -> bool {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'idx_pinned_cids_cid')",
@@ -5581,12 +6105,12 @@ mod ref_certificate_tests {
             "fresh migration chain creates the index"
         );
 
-        // Simulate a node at v10 (pre-v11): drop the index and its migration record.
+        // Simulate a node at pre-v18: drop the index and its migration record.
         sqlx::query("DROP INDEX IF EXISTS idx_pinned_cids_cid")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 11")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 18")
             .execute(&pool)
             .await
             .unwrap();
@@ -5826,6 +6350,340 @@ mod ref_certificate_tests {
         assert!(
             err.is_err(),
             "raw duplicate INSERT must be rejected by the unique index"
+        );
+    }
+}
+#[cfg(test)]
+mod ref_update_db_tests {
+    use super::{Db, ReceivedRefUpdate};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    fn update(
+        id: &str,
+        repo: &str,
+        owner_did: Option<&str>,
+        ref_name: &str,
+        sha: &str,
+    ) -> ReceivedRefUpdate {
+        ReceivedRefUpdate {
+            id: id.to_string(),
+            node_did: "did:key:zNode".into(),
+            pusher_did: "did:key:zPusher".into(),
+            repo: repo.to_string(),
+            owner_did: owner_did.map(|s| s.to_string()),
+            ref_name: ref_name.to_string(),
+            old_sha: "0000000000000000000000000000000000000000".into(),
+            new_sha: sha.to_string(),
+            timestamp: "2026-07-02T12:00:00Z".into(),
+            cert_id: None,
+            received_at: "2026-07-02T12:00:01Z".into(),
+            from_peer: "12D3KooWTest".into(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_with_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u1",
+            "zOwner/myrepo",
+            Some("did:key:zOwner"),
+            "refs/heads/main",
+            "aaaa",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did.as_deref(), Some("did:key:zOwner"));
+        assert_eq!(all[0].repo, "zOwner/myrepo");
+    }
+
+    #[sqlx::test]
+    async fn insert_and_list_without_owner_did(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u2",
+            "zOwner/myrepo",
+            None,
+            "refs/heads/main",
+            "bbbb",
+        ))
+        .await
+        .unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_did, None);
+    }
+
+    #[sqlx::test]
+    async fn list_repo_ref_updates_filters_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u3",
+            "alice/repo1",
+            Some("did:key:zAlice"),
+            "refs/heads/main",
+            "cccc",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u4",
+            "bob/repo2",
+            Some("did:key:zBob"),
+            "refs/heads/feat",
+            "dddd",
+        ))
+        .await
+        .unwrap();
+
+        let alice_events = db
+            .list_ref_updates_keyset(Some("alice/repo1"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(alice_events.len(), 1);
+        assert_eq!(alice_events[0].id, "u3");
+        assert_eq!(alice_events[0].owner_did.as_deref(), Some("did:key:zAlice"));
+
+        let bob_events = db
+            .list_ref_updates_keyset(Some("bob/repo2"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(bob_events.len(), 1);
+        assert_eq!(bob_events[0].id, "u4");
+        assert_eq!(bob_events[0].owner_did.as_deref(), Some("did:key:zBob"));
+
+        let empty = db
+            .list_ref_updates_keyset(Some("other/repo"), 100, None)
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn list_ref_updates_filtered_by_repo(pool: PgPool) {
+        let db = db(pool).await;
+        db.insert_ref_update(&update(
+            "u5",
+            "ownerA/proj",
+            Some("did:key:zA"),
+            "refs/heads/main",
+            "eeee",
+        ))
+        .await
+        .unwrap();
+        db.insert_ref_update(&update(
+            "u6",
+            "ownerB/proj",
+            Some("did:web:host:zB"),
+            "refs/heads/main",
+            "ffff",
+        ))
+        .await
+        .unwrap();
+
+        let filtered = db
+            .list_ref_updates_keyset(Some("ownerA/proj"), 100, None)
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "u5");
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[sqlx::test]
+    async fn insert_update_idempotent_on_conflict(pool: PgPool) {
+        let db = db(pool).await;
+        let u = update(
+            "u7",
+            "repo/x",
+            Some("did:key:zX"),
+            "refs/heads/main",
+            "gggg",
+        );
+        db.insert_ref_update(&u).await.unwrap();
+        db.insert_ref_update(&u).await.unwrap();
+
+        let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].new_sha, "gggg");
+    }
+}
+
+#[cfg(test)]
+mod peer_reachability_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    const VICTIM_DID: &str = "did:key:z6MkvictimPeerFixture";
+    const HONEST_URL: &str = "https://honest-peer.example.com";
+    const ATTACKER_URL: &str = "https://attacker.example.com";
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// Read the row back through `list_peers`, the same surface the federated
+    /// fan-out filters on, rather than issuing raw SQL from the test.
+    async fn peer(db: &Db, did: &str) -> (String, bool) {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        (row.http_url, row.last_ping_ok)
+    }
+
+    /// Parsed rather than string-compared, so the ordering assertion does not
+    /// depend on the stored timestamp's textual precision.
+    async fn last_seen(db: &Db, did: &str) -> chrono::DateTime<chrono::Utc> {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        chrono::DateTime::parse_from_rfc3339(&row.last_seen.expect("last_seen is set by upsert"))
+            .expect("last_seen is rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Seed a peer that has earned reachability, asserting the seed took so a
+    /// later case cannot pass vacuously on a row that was never written.
+    async fn seed_reachable(db: &Db) {
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
+        assert_eq!(
+            peer(db, VICTIM_DID).await,
+            (HONEST_URL.to_string(), true),
+            "seed did not take"
+        );
+    }
+
+    /// Repointing an existing peer's URL must drop the reachability gate: the
+    /// new host has not been probed, so it cannot inherit the old host's
+    /// earned `last_ping_ok`.
+    #[sqlx::test]
+    async fn url_change_clears_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, ATTACKER_URL).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, ATTACKER_URL, "the URL should still be rewritten");
+        assert!(
+            !reachable,
+            "a repointed peer must re-earn reachability, not inherit it"
+        );
+    }
+
+    /// A plain liveness re-announce carries the same URL and must not cost an
+    /// honest peer its place in the federated fan-out. Guards against a fix
+    /// that clears the flag on every conflict instead of only on a change.
+    #[sqlx::test]
+    async fn same_url_reannounce_keeps_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, HONEST_URL);
+        assert!(
+            reachable,
+            "an unchanged-URL re-announce must not drop the gate"
+        );
+    }
+
+    /// The must-not-grant direction. An unchanged URL preserves the flag as it
+    /// stands, which means FALSE stays FALSE: reachability is earned by a probe,
+    /// never by announcing. This is the only case that fails if the conditional
+    /// is flattened to `last_ping_ok = (peers.http_url IS NOT DISTINCT FROM $2)`,
+    /// which would let any unsigned same-URL re-announce set the flag TRUE.
+    #[sqlx::test]
+    async fn same_url_reannounce_does_not_grant_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        assert_eq!(peer(&db, VICTIM_DID).await, (HONEST_URL.to_string(), false));
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let (_, reachable) = peer(&db, VICTIM_DID).await;
+        assert!(
+            !reachable,
+            "announcing must never grant reachability without a probe"
+        );
+    }
+
+    /// A first insert stays out of the fan-out until a probe confirms it. Guards
+    /// against the conditional leaking into the INSERT branch.
+    #[sqlx::test]
+    async fn fresh_peer_inserts_unreachable(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer("did:key:z6MkfreshPeerFixture", HONEST_URL)
+            .await
+            .unwrap();
+
+        let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// Comparison is exact, by decision: http_url is stored as announced and
+    /// nothing normalizes it, so a trailing slash is a different remote as far
+    /// as this row is concerned and clears the gate. Pins that decision against
+    /// a future normalizing comparison, which every other case here would pass
+    /// because they only ever compare identical or wholly different hosts.
+    #[sqlx::test]
+    async fn cosmetic_url_difference_counts_as_a_change(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        let with_slash = format!("{HONEST_URL}/");
+        db.upsert_peer(VICTIM_DID, &with_slash).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, with_slash);
+        assert!(
+            !reachable,
+            "comparison is exact, so a cosmetic difference clears the gate too"
+        );
+    }
+
+    /// The reset must ride the existing UPDATE, not gate it. Hoisting the
+    /// condition to a statement-level WHERE would leave every case above green
+    /// while silently skipping the whole update on a same-URL re-announce, so
+    /// liveness would stop advancing and the peer would age out on last_seen.
+    #[sqlx::test]
+    async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        let first = last_seen(&db, VICTIM_DID).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let second = last_seen(&db, VICTIM_DID).await;
+        assert!(
+            second > first,
+            "a same-URL re-announce is a liveness signal and must still \
+             advance last_seen: {first} then {second}"
         );
     }
 }

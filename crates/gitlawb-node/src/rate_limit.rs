@@ -154,11 +154,26 @@ impl RateLimiter {
     }
 
     /// Number of distinct keys currently tracked. Test-only introspection so a
-    /// cross-module test can assert that a sweep actually evicted expired entries.
+    /// cross-module test can assert that a sweep actually evicted expired entries
+    /// and observe what it reclaimed. There is no production reader.
     #[cfg(test)]
     pub(crate) async fn tracked_keys(&self) -> usize {
         self.state.lock().await.len()
     }
+}
+
+/// Per-source concurrency cap derived from the write-pool size: one resolved client
+/// key (see [`client_key`]) may hold at most an eighth of the pool, so saturating it
+/// takes ~8 distinct keys. Real for an IPv4 or single-address caller; a caller with a
+/// routed IPv6 /64 has 2^64 keys, because `client_key` returns the full address with
+/// no prefix folding. Narrowing that keying is a deferred decision, so this cap is a
+/// bound per key, not a bound per operator.
+///
+/// Floored at 1 because the value feeds [`PerCallerConcurrency`], where a cap of 0
+/// would shed EVERY receive-pack advertisement and break all pushes. The floor is
+/// load-bearing at the minimum write-pool size (1), which integer-divides to 0.
+pub(crate) fn per_source_push_cap(max_concurrent_git_pushes: usize) -> usize {
+    (max_concurrent_git_pushes / 8).max(1)
 }
 
 /// A bounded per-caller CONCURRENCY limiter — distinct from [`RateLimiter`], which

@@ -132,21 +132,9 @@ async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
 /// `char::is_control` does not cover — they can reorder the displayed line).
 fn sanitize_node_msg(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control() && !is_bidi_format(*c))
+        .filter(|c| !c.is_control() && !gitlawb_core::sanitize::is_bidi_format(*c))
         .take(200)
         .collect()
-}
-
-/// Unicode bidirectional and directional-isolate format characters (category
-/// `Cf`). These are not `char::is_control()` (that is category `Cc` only), but a
-/// right-to-left override or isolate can visually reorder a terminal line to
-/// spoof the error text, so they are stripped alongside the control bytes.
-fn is_bidi_format(c: char) -> bool {
-    matches!(c,
-        '\u{200E}' | '\u{200F}' | '\u{061C}'   // LRM, RLM, ALM
-        | '\u{202A}'..='\u{202E}'              // LRE, RLE, PDF, LRO, RLO
-        | '\u{2066}'..='\u{2069}'              // LRI, RLI, FSI, PDI
-    )
 }
 
 #[cfg(test)]
@@ -291,6 +279,16 @@ mod tests {
         // Length is capped at 200 chars regardless of input size.
         let long = "x".repeat(250);
         assert_eq!(sanitize_node_msg(&long).chars().count(), 200);
+    }
+
+    #[test]
+    fn sanitize_preserves_legitimate_and_rtl_text() {
+        // Must not over-strip: a plain word, a genuine RTL SCRIPT letter (Arabic
+        // U+0627, category Lo — NOT a format char), and ZWJ (U+200D, a legitimate
+        // Cf char, e.g. emoji sequences) all survive. Guards the shared predicate
+        // against being widened into a blanket Cf stripper.
+        let out = sanitize_node_msg("ok \u{0627}\u{200D}b");
+        assert_eq!(out, "ok \u{0627}\u{200D}b");
     }
 
     #[tokio::test]

@@ -92,7 +92,9 @@ fn build_state(db: Arc<crate::db::Db>, pool: PgPool) -> AppState {
         git_write_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         git_push_advert_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         git_encrypt_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
+        pin_semaphore: Arc::new(tokio::sync::Semaphore::new(64)),
         encrypt_inflight: crate::state::EncryptInflight::new(),
+        repo_write_leases: crate::state::RepoWriteLeases::new(8),
         git_read_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(16),
         git_push_advert_per_caller: crate::rate_limit::PerCallerConcurrency::with_default_max_keys(
             8,
@@ -129,6 +131,25 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
         .extension(AuthenticatedDid(did.to_string()))
         .body(body)
         .expect("request builder")
+}
+
+/// A local endpoint whose TCP accept succeeds instantly but that never writes an
+/// HTTP response, so any request against it stalls deterministically until the
+/// caller's own timeout. (A non-routable address hangs only if the network
+/// blackholes the SYN — a fast RST would end the stall early and make a timeout
+/// test pass for the wrong reason.) The accepted sockets are parked in the
+/// spawned task, which dies with the test's runtime, so the peer never sees a
+/// close mid-test.
+pub(crate) async fn silent_http_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    endpoint
 }
 
 #[cfg(test)]
@@ -211,10 +232,12 @@ mod tests {
 
     /// PR3 (#62): the served-git concurrency cap sheds at the HTTP layer before the
     /// DB. The held `git_permit` acquire now sits after the per-source cap, so the
-    /// shed-before-DB property is carried by an explicit `available_permits() == 0`
-    /// early check at the top of the handler (the held permit remains the
-    /// authoritative bound further down). DB-free: an exhausted semaphore sheds
-    /// before any DB/disk access, so a lazy state works. Remove the early-shed block
+    /// cheap early shed is carried by an explicit `available_permits() == 0` check at
+    /// the top of the handler (the held permit remains the authoritative bound further
+    /// down). That check is a permit-less snapshot: it spares a request's DB work once
+    /// the pool is ALREADY saturated, which is the case this test drives, and it does
+    /// not bound the DB window in general. DB-free here because an exhausted semaphore
+    /// sheds before any DB/disk access, so a lazy state works. Remove the early-shed block
     /// from git_info_refs and this goes red (the request falls through to the DB and
     /// returns something other than 503).
     #[tokio::test]
@@ -250,10 +273,11 @@ mod tests {
     }
 
     /// PR3 (#62) sibling of the info/refs shed test: git-upload-pack carries the same
-    /// explicit `available_permits() == 0` early-shed check at the top, so an
-    /// exhausted semaphore must shed it with a 503 before any DB/disk work.
-    /// Anonymous-reachable, so no auth injection is needed. Remove the early-shed
-    /// block from git_upload_pack and this goes red.
+    /// explicit `available_permits() == 0` early check at the top, so an ALREADY
+    /// exhausted semaphore must shed the request with a 503 before its DB/disk work.
+    /// That is the case the permit-less snapshot does deliver; it is not an admission
+    /// bound on the DB window. Anonymous-reachable, so no auth injection is needed.
+    /// Remove the early-shed block from git_upload_pack and this goes red.
     #[tokio::test]
     async fn git_upload_pack_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
@@ -288,8 +312,10 @@ mod tests {
 
     /// PR3 (#62) receive-pack sibling of the info/refs shed test: the early shed
     /// selects the dedicated ADVERT pool for a git-receive-pack advertisement (#174),
-    /// so an exhausted advert pool sheds the advert with 503 before any DB/disk work
-    /// — while the write pool (reserved for authenticated POSTs) is left free here.
+    /// so an ALREADY exhausted advert pool sheds the advert with 503 before its DB/disk
+    /// work (the case the permit-less snapshot delivers, not an admission bound on the
+    /// DB window), while the write pool (reserved for authenticated POSTs) is left
+    /// free here.
     /// Flip the pool selection back to the write pool, or remove the early-shed
     /// block, and this goes red.
     #[tokio::test]
@@ -327,9 +353,12 @@ mod tests {
     /// PR3 (#62) sibling for the push path: git-receive-pack requires an
     /// AuthenticatedDid extension (production: require_signature injects it), so the
     /// request carries one via signed_request_as — without it the Extension
-    /// extractor 500s before the handler body reaches git_permit. The permit is the
-    /// first statement, so an exhausted semaphore still sheds 503 before any DB
-    /// work. Remove the permit line from git_receive_pack and this goes red.
+    /// extractor 500s before the handler body reaches the shed. What sits at the top of
+    /// the handler is a permit-less `available_permits() == 0` peek, NOT the permit
+    /// itself: the authoritative held acquire is taken after the per-repo lease, so a
+    /// lease-blocked waiter pins no write slot. An ALREADY exhausted pool is the case
+    /// the peek delivers, so the request sheds 503 before its DB work here. Remove the
+    /// early-shed block from git_receive_pack and this goes red.
     #[tokio::test]
     async fn git_receive_pack_sheds_with_503_when_semaphore_exhausted() {
         let mut state = test_state_lazy();
@@ -838,6 +867,1093 @@ mod tests {
             shared[0]["ownerDid"],
             serde_json::json!(format!("did:key:{short}")),
             "the canonical did:key row is the survivor"
+        );
+    }
+
+    /// #94: list_webhooks is gated read-visibility THEN owner. Webhook callback
+    /// URLs are owner-secret, so the listing must hide a private repo's existence
+    /// (404, uniform with the read-visibility siblings) and 403 a non-owner of a
+    /// public repo, while a headerless caller gets 401 (no anonymous form). Mounts
+    /// the handler directly (it sits on `optional_signature`, so the handler does
+    /// its own check) and seeds a real webhook so a leak would surface in the body.
+    #[sqlx::test]
+    async fn list_webhooks_is_owner_gated(pool: PgPool) {
+        let owner = "did:key:zHOOKOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let stranger = "did:key:zHOOKSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "hook-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "hook-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let secret_url = "https://hooks.example.com/sekret-endpoint";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .create_webhook(&crate::db::Webhook {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    repo_id: repo.id.clone(),
+                    url: secret_url.to_string(),
+                    secret: Some("topsecret".to_string()),
+                    events: vec!["*".to_string()],
+                    created_by_did: owner.to_string(),
+                    created_at: Utc::now().to_rfc3339(),
+                    active: true,
+                })
+                .await
+                .expect("seed webhook");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/hooks",
+                    axum::routing::get(crate::api::webhooks::list_webhooks),
+                )
+                .with_state(state.clone())
+        };
+        let body_text = |resp_body: &[u8]| String::from_utf8_lossy(resp_body).to_string();
+
+        // Owner on the public repo → 200, hook listed, secret redacted, url present.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-pub/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner must read its own hooks"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let txt = body_text(&bytes);
+        assert!(
+            txt.contains(secret_url),
+            "owner response must include the url"
+        );
+        assert!(txt.contains("***"), "secret must stay redacted");
+        assert!(
+            !txt.contains("topsecret"),
+            "the real secret must never appear"
+        );
+
+        // Non-owner of a PUBLIC repo → 403 (repo is public, existence not secret).
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-pub/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner of a public repo must be forbidden, not served"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body_text(&bytes).contains(secret_url),
+            "403 must not leak the url"
+        );
+
+        // Non-owner of a PRIVATE repo → 404 (existence hidden, uniform with siblings).
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-priv/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader of a private repo must get 404, not 403/200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !body_text(&bytes).contains(secret_url),
+            "404 must not leak the url"
+        );
+
+        // Owner of a PRIVATE repo → 200 (both guards pass: read-visibility admits
+        // the owner, then require_repo_owner admits the owner). Exercises the
+        // both-pass branch the public/owner case does not, and confirms redaction.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-priv/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the owner must read its own private repo's hooks"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let txt = body_text(&bytes);
+        assert!(
+            txt.contains(secret_url),
+            "owner of private repo sees the url"
+        );
+        assert!(
+            txt.contains("***"),
+            "secret stays redacted on the private repo"
+        );
+
+        // Headerless (no AuthenticatedDid) → 401: a webhook listing has no anon form.
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/hook-pub/hooks"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "a headerless caller must get 401"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/does-not-exist/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #94: a visibility READER who is not the owner passes the read gate but is
+    /// still refused the webhook list (the require_repo_owner half), and the
+    /// headerless 401 fires before any lookup so it cannot be an existence oracle
+    /// (headerless on an existing private repo and on an absent repo both 401).
+    #[sqlx::test]
+    async fn list_webhooks_reader_403_and_no_existence_oracle(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zHKRDROWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zHKRDRREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "hook-reader");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        // Root allow-list rule: `reader` may read the repo at "/", but is not the owner.
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        let secret_url = "https://hooks.example.com/reader-case";
+        state
+            .db
+            .create_webhook(&crate::db::Webhook {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                url: secret_url.to_string(),
+                secret: None,
+                events: vec!["*".to_string()],
+                created_by_did: owner.to_string(),
+                created_at: Utc::now().to_rfc3339(),
+                active: true,
+            })
+            .await
+            .expect("seed webhook");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/hooks",
+                    axum::routing::get(crate::api::webhooks::list_webhooks),
+                )
+                .with_state(state.clone())
+        };
+
+        // A listed reader passes authorize_repo_read but is not the owner → 403,
+        // and the webhook url does not leak.
+        let resp = router()
+            .oneshot(signed_request_as(
+                reader,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/hook-reader/hooks"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a non-owner reader passes the read gate but is refused the webhook list"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(secret_url),
+            "403 must not leak the url to a reader"
+        );
+
+        // Existence-oracle check: headerless on the existing private repo → 401,
+        // headerless on an absent repo → 401. Indistinguishable ⇒ no oracle.
+        let headerless = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router()
+            .oneshot(headerless(format!(
+                "/api/v1/repos/{owner}/hook-reader/hooks"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "headerless on an existing private repo → 401 (before any lookup)"
+        );
+        let resp = router()
+            .oneshot(headerless(format!(
+                "/api/v1/repos/{owner}/no-such-repo/hooks"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "headerless on an absent repo → 401 too, so existence does not leak"
+        );
+    }
+
+    /// #94: the read-visibility surfaces admit a listed reader who is NOT the
+    /// owner (the allow-list branch of visibility_check). Pins that a private
+    /// repo's reader — not just its owner — can read replicas and protected
+    /// branches, while a non-reader stranger still 404s.
+    #[sqlx::test]
+    async fn read_visibility_admits_listed_reader(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zRDRDOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zRDRDREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zRDRDSTRGRCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "rdr-repo");
+        repo.is_public = false;
+        state.db.create_repo(&repo).await.expect("seed repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .register_replica(&repo.id, stranger, "https://replica.example.com/x")
+            .await
+            .expect("seed replica");
+        state
+            .db
+            .protect_branch(&repo.id, "main", owner)
+            .await
+            .expect("seed protected branch");
+
+        let call = |handler_router: Router, did: Option<&str>, uri: String| {
+            let req = match did {
+                Some(d) => signed_request_as(d, Method::GET, &uri, Body::empty()),
+                None => Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            };
+            handler_router.oneshot(req)
+        };
+
+        let replicas_router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::get(crate::api::replicas::list_replicas),
+                )
+                .with_state(state.clone())
+        };
+        let protect_router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/branches/protected",
+                    axum::routing::get(crate::api::protect::list_protected_branches),
+                )
+                .with_state(state.clone())
+        };
+
+        // Listed reader (non-owner) → 200 on both surfaces.
+        for (router, path) in [
+            (replicas_router(), "replicas"),
+            (protect_router(), "branches/protected"),
+        ] {
+            let resp = call(
+                router,
+                Some(reader),
+                format!("/api/v1/repos/{owner}/rdr-repo/{path}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "a listed reader must read {path}"
+            );
+        }
+
+        // A non-reader stranger → 404 on both (deny path).
+        for (router, path) in [
+            (replicas_router(), "replicas"),
+            (protect_router(), "branches/protected"),
+        ] {
+            let resp = call(
+                router,
+                Some(stranger),
+                format!("/api/v1/repos/{owner}/rdr-repo/{path}"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "a non-reader stranger must be denied {path}"
+            );
+        }
+    }
+
+    /// #94 sibling: list_replicas is read-visibility-gated. Replica lists are a
+    /// documented public mirror-discovery surface, so a PUBLIC repo stays
+    /// anonymously listable, but a PRIVATE repo must not leak its replica URLs.
+    /// register_replica registers NON-owner DIDs (it rejects the owner), and a
+    /// replica operator is not a visibility reader, so a non-owner replica
+    /// operator of a private repo gets 404 — the intended contract, pinned here.
+    #[sqlx::test]
+    async fn list_replicas_is_read_visibility_gated(pool: PgPool) {
+        let owner = "did:key:zREPLOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let replica_op = "did:key:zREPLOPERATORBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "repl-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "repl-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let replica_url = "https://replica.example.com/mirror-endpoint";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .register_replica(&repo.id, replica_op, replica_url)
+                .await
+                .expect("seed replica");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/replicas",
+                    axum::routing::get(crate::api::replicas::list_replicas),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains(replica_url);
+        let anon = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Public repo, anonymous → 200, replicas listed (mirror-discovery preserved).
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/repl-pub/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public replica list stays anonymous"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "public response must include the replica url"
+        );
+
+        // Private repo, anonymous → 404, no replica URL leaked.
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/repl-priv/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "private replica list is hidden from anon"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the replica url");
+
+        // Private repo, owner → 200.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/repl-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private replica list"
+        );
+
+        // Private repo, the non-owner replica operator → 404 (intended contract:
+        // a replica operator is not a visibility reader).
+        let resp = router()
+            .oneshot(signed_request_as(
+                replica_op,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/repl-priv/replicas"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-owner replica operator of a private repo is not a reader"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(anon(format!("/api/v1/repos/{owner}/no-such-repo/replicas")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #94 sibling: list_labels is read-visibility-gated. A public repo's labels
+    /// stay anonymously listable; a private repo's label names must not leak to a
+    /// non-reader (404). A listed reader of the private repo reads the label; the
+    /// owner reads it; a non-reader stranger 404s.
+    #[sqlx::test]
+    async fn list_labels_is_read_visibility_gated(pool: PgPool) {
+        use crate::db::VisibilityMode;
+        let owner = "did:key:zLBLOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zLBLREADERBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zLBLSTRGRCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "lbl-priv");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .add_label(&repo.id, "bug")
+            .await
+            .expect("seed label");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/labels",
+                    axum::routing::get(crate::api::labels::list_labels),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains("bug");
+        let uri = format!("/api/v1/repos/{owner}/lbl-priv/labels");
+
+        // Owner (signed) → 200, sees the label.
+        let resp = router()
+            .oneshot(signed_request_as(owner, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(leaks(&bytes), "owner response must include the label");
+
+        // Listed reader (signed, non-owner) → 200, sees the label.
+        let resp = router()
+            .oneshot(signed_request_as(reader, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader reads the labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "listed reader response must include the label"
+        );
+
+        // Non-reader stranger (signed) → 404, no label leaked.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader stranger is denied the private labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the label name");
+
+        // Anonymous on the private repo → 404.
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "anon is denied the private labels"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "anon 404 must not leak the label name");
+
+        // Public repo, anonymous → 200, label visible. The gate must not break
+        // the existing anonymous read path for public repos.
+        let pub_repo = seed_repo(owner, "lbl-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        state
+            .db
+            .add_label(&pub_repo.id, "pubtag")
+            .await
+            .expect("seed public label");
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/lbl-pub/labels"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a public repo's labels stay anonymously listable"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("pubtag"),
+            "public anon response must include the label"
+        );
+
+        // Absent repo → 404 (uniform with the non-reader denial; no 500).
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{owner}/no-such-repo/labels"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #94 sibling: list_protected_branches is read-visibility-gated. A public
+    /// repo's protected-branch listing stays anonymous; a private repo must not
+    /// leak its branch names to a non-reader (404, uniform no-existence-oracle).
+    #[sqlx::test]
+    async fn list_protected_branches_is_read_visibility_gated(pool: PgPool) {
+        let owner = "did:key:zPROTOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let state = test_state(pool).await;
+
+        let pub_repo = seed_repo(owner, "prot-pub");
+        state
+            .db
+            .create_repo(&pub_repo)
+            .await
+            .expect("seed public repo");
+        let mut priv_repo = seed_repo(owner, "prot-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        let secret_branch = "release-embargoed";
+        for repo in [&pub_repo, &priv_repo] {
+            state
+                .db
+                .protect_branch(&repo.id, secret_branch, owner)
+                .await
+                .expect("seed protected branch");
+        }
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/branches/protected",
+                    axum::routing::get(crate::api::protect::list_protected_branches),
+                )
+                .with_state(state.clone())
+        };
+        let leaks = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains(secret_branch);
+        let anon = |uri: String| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Public repo, anonymous → 200, branch listed.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/prot-pub/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "public protected-branch list stays anonymous"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            leaks(&bytes),
+            "public response must include the branch name"
+        );
+
+        // Private repo, anonymous → 404, no branch name leaked.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/prot-priv/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "private branch list hidden from anon"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!leaks(&bytes), "404 must not leak the branch name");
+
+        // Private repo, owner → 200, branch listed.
+        let resp = router()
+            .oneshot(signed_request_as(
+                owner,
+                Method::GET,
+                &format!("/api/v1/repos/{owner}/prot-priv/branches/protected"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "owner reads its private protected branches"
+        );
+
+        // Absent repo → 404.
+        let resp = router()
+            .oneshot(anon(format!(
+                "/api/v1/repos/{owner}/no-such-repo/branches/protected"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "absent repo → 404");
+    }
+
+    /// #113: the events read-gate admits a listed reader (the allow-list branch
+    /// of visibility_check), not just the owner — parity with the replica and
+    /// protected-branch surfaces covered by `read_visibility_admits_listed_reader`.
+    /// A non-reader stranger still 404s with no leak.
+    #[sqlx::test]
+    async fn list_repo_events_admits_listed_reader(pool: PgPool) {
+        use crate::db::{RefCertificate, VisibilityMode};
+        let owner = "did:key:zEVTRDROWNERAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let reader = "did:key:zEVTRDRREADERBBBBBBBBBBBBBBBBBBBBBBBB";
+        let stranger = "did:key:zEVTRDRSTRGRCCCCCCCCCCCCCCCCCCCCCCCC";
+        let state = test_state(pool).await;
+
+        let mut repo = seed_repo(owner, "evt-rdr");
+        repo.is_public = false;
+        state
+            .db
+            .create_repo(&repo)
+            .await
+            .expect("seed private repo");
+        state
+            .db
+            .set_visibility_rule(
+                &repo.id,
+                "/",
+                VisibilityMode::B,
+                &[reader.to_string()],
+                owner,
+            )
+            .await
+            .expect("seed reader rule");
+        state
+            .db
+            .insert_ref_certificate(&RefCertificate {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                ref_name: "refs/heads/embargo-rdr".to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: "rdrsha00".to_string(),
+                pusher_did: owner.to_string(),
+                node_did: owner.to_string(),
+                signature: "sig".to_string(),
+                issued_at: Utc::now().to_rfc3339(),
+            })
+            .await
+            .expect("seed private cert");
+
+        let router = || {
+            Router::new()
+                .route(
+                    "/api/v1/repos/{owner}/{repo}/events",
+                    axum::routing::get(crate::api::events::list_repo_events),
+                )
+                .with_state(state.clone())
+        };
+        let uri = format!("/api/v1/repos/{owner}/evt-rdr/events");
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).to_string();
+
+        // Listed reader (non-owner) → 200, the private cert is served.
+        let resp = router()
+            .oneshot(signed_request_as(reader, Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a listed reader (non-owner) must read events"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            text(&bytes).contains("embargo-rdr"),
+            "listed reader sees the private cert"
+        );
+
+        // A non-reader stranger → 404, and the cert ref does not leak.
+        let resp = router()
+            .oneshot(signed_request_as(
+                stranger,
+                Method::GET,
+                &uri,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "a non-reader stranger must 404"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !text(&bytes).contains("embargo-rdr"),
+            "404 must not leak the cert ref"
+        );
+        assert!(
+            !text(&bytes).contains("rdrsha00"),
+            "404 must not leak the cert sha"
+        );
+    }
+
+    /// #113 fail-closed: when the repo lookup ERRORS (not a clean Ok(None)), the
+    /// visibility gate must not be skipped. The buggy `.ok().flatten()` collapsed an
+    /// Err into None, so a transient DB failure during the lookup dropped the gate
+    /// and the handler served the private repo's gossip ref-updates via the
+    /// ungated None branch (slug taken from the URL owner segment). We force a
+    /// deterministic get_repo error by dropping the column its SELECT reads, then
+    /// require the handler to fail closed (500, no secret) instead of 200-with-secret.
+    #[sqlx::test]
+    async fn list_repo_events_fails_closed_when_repo_lookup_errors(pool: PgPool) {
+        use crate::db::ReceivedRefUpdate;
+        let owner = "did:key:zEVTERRAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        // Caller addresses the repo by the full key part (the slug gossip rows use),
+        // so the buggy None-branch fallback slug matches the seeded private update.
+        let keypart = owner.split(':').next_back().unwrap();
+        let state = test_state(pool.clone()).await;
+
+        let mut priv_repo = seed_repo(owner, "evt-priv");
+        priv_repo.is_public = false;
+        state
+            .db
+            .create_repo(&priv_repo)
+            .await
+            .expect("seed private repo");
+
+        state
+            .db
+            .insert_ref_update(&ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: owner.to_string(),
+                pusher_did: owner.to_string(),
+                repo: format!("{keypart}/evt-priv"),
+                ref_name: "refs/heads/embargo-gossip".to_string(),
+                old_sha: "0".repeat(40),
+                new_sha: "gossipSEKRET".to_string(),
+                timestamp: Utc::now().to_rfc3339(),
+                cert_id: None,
+                received_at: Utc::now().to_rfc3339(),
+                from_peer: "peer".to_string(),
+                owner_did: None,
+            })
+            .await
+            .expect("seed private gossip update");
+
+        // Force get_repo's SELECT (which reads machine_id, db/mod.rs) to error,
+        // simulating a transient DB failure during the visibility lookup. The repo
+        // row and the gossip update both remain present.
+        // Precondition: the lookup must succeed before we break it, otherwise the
+        // injection proves nothing.
+        state
+            .db
+            .get_repo(keypart, "evt-priv")
+            .await
+            .expect("pre-drop lookup must succeed")
+            .expect("private repo row must be present pre-drop");
+        sqlx::query("ALTER TABLE repos DROP COLUMN machine_id")
+            .execute(&pool)
+            .await
+            .expect("drop column to force a get_repo error");
+        // Guard the injection: if a future refactor drops machine_id from get_repo's
+        // SELECT, this assertion fails loudly instead of letting the test pass
+        // vacuously (get_repo would return Ok and the gate, not the error path,
+        // would drive the response).
+        assert!(
+            state.db.get_repo(keypart, "evt-priv").await.is_err(),
+            "dropping machine_id must make get_repo error, else this test no longer exercises the Err path"
+        );
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/events",
+                axum::routing::get(crate::api::events::list_repo_events),
+            )
+            .with_state(state.clone());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{keypart}/evt-priv/events"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Fail closed: a lookup error must surface as 500, never a 200 that serves
+        // the private repo's ref metadata through the ungated branch.
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a repo-lookup error must fail closed, not skip the gate"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes).to_string();
+        assert!(
+            !body.contains("gossipSEKRET"),
+            "fail-closed response must not leak the gossip secret"
+        );
+    }
+
+    /// #94 end-to-end seam: a REAL RFC-9421 signature produced exactly as the gl
+    /// client's get_signed does (gitlawb_core::http_sig::sign_request over GET +
+    /// empty body) is accepted by the node's actual optional_signature middleware,
+    /// which verifies it and injects AuthenticatedDid, so the owner's signed
+    /// `gl webhook list` resolves to 200. This stitches the gl signing side and
+    /// the node verifying side in one test (not mockito on one end and a unit
+    /// verify on the other).
+    #[sqlx::test]
+    async fn list_webhooks_accepts_a_real_gl_signature_e2e(pool: PgPool) {
+        use gitlawb_core::http_sig::sign_request;
+        use gitlawb_core::identity::Keypair;
+
+        let kp = Keypair::generate();
+        let owner_did = kp.did().to_string();
+        // Short owner form in the URL path: no colons (so the signed @path and the
+        // node's path_and_query() match byte-for-byte), and get_repo's owner LIKE
+        // match + did_matches still authorize the full-DID signer as the owner.
+        let short = owner_did.split(':').next_back().unwrap().to_string();
+        let state = test_state(pool).await;
+        let repo = seed_repo(&owner_did, "real-sig-repo");
+        state.db.create_repo(&repo).await.expect("seed repo");
+        let url = "https://hooks.example.com/e2e";
+        state
+            .db
+            .create_webhook(&crate::db::Webhook {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                url: url.to_string(),
+                secret: None,
+                events: vec!["*".to_string()],
+                created_by_did: owner_did.clone(),
+                created_at: Utc::now().to_rfc3339(),
+                active: true,
+            })
+            .await
+            .expect("seed webhook");
+
+        let path = format!("/api/v1/repos/{short}/real-sig-repo/hooks");
+        let signed = sign_request(&kp, "GET", &path, b"");
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(&path)
+            .header("content-digest", signed.content_digest)
+            .header("signature-input", signed.signature_input)
+            .header("signature", signed.signature)
+            .body(Body::empty())
+            .unwrap();
+
+        // Mount the handler UNDER the production optional_signature middleware so
+        // the node actually verifies the signature (not the injected-DID shortcut).
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/hooks",
+                axum::routing::get(crate::api::webhooks::list_webhooks),
+            )
+            .layer(axum::middleware::from_fn(crate::auth::optional_signature))
+            .with_state(state);
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the node must verify a real gl-style signature and authorize the owner"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(url),
+            "the verified owner sees the webhook list"
         );
     }
 
@@ -2167,22 +3283,22 @@ mod tests {
     }
 
     /// INV-7 upgrade path for the pin-provenance column (#173, jatmn round 2): a node
-    /// already past v11 gets `pinned_cids.repo_id` from the NEW v12 migration, and a
+    /// already past v11 gets `pinned_cids.repo_id` from the NEW v19 migration, and a
     /// legacy pin recorded before the column existed survives with NULL provenance (so
-    /// it falls back to the repo scan). Simulate the pre-v12 node by dropping the
+    /// it falls back to the repo scan). Simulate the pre-v19 node by dropping the
     /// column and un-applying v12, seed a legacy row, then re-migrate. RED before the
-    /// v12 migration exists (the column is never re-added → the SELECT errors); GREEN
+    /// v19 migration exists (the column is never re-added → the SELECT errors); GREEN
     /// after.
     #[sqlx::test]
     async fn pinned_cids_repo_provenance_upgrade_path(pool: PgPool) {
         let state = test_state(pool.clone()).await;
 
-        // Pre-v12 shape: drop the provenance column and forget v12 was applied.
+        // Pre-v19 shape: drop the provenance column and forget v19 was applied.
         sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS repo_id")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 12")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 19")
             .execute(&pool)
             .await
             .unwrap();
@@ -2196,7 +3312,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Upgrade: re-run migrations → v12 re-adds the column.
+        // Upgrade: re-run migrations → v19 re-adds the column.
         state.db.run_migrations().await.expect("migrate to v12");
 
         // The legacy pin survives with NULL provenance.
@@ -2207,7 +3323,7 @@ mod tests {
                 .expect("legacy pin row survives the upgrade");
         assert!(
             legacy.is_none(),
-            "a pin recorded before v12 must keep NULL provenance (it falls back to the scan)"
+            "a pin recorded before v19 must keep NULL provenance (it falls back to the scan)"
         );
 
         // A new pin can carry provenance.
@@ -2229,7 +3345,7 @@ mod tests {
         assert_eq!(
             prov.as_deref(),
             Some("repo-abc"),
-            "a pin recorded after v12 carries its source repo_id"
+            "a pin recorded after v19 carries its source repo_id"
         );
     }
 
@@ -2435,6 +3551,7 @@ mod tests {
             vec![fx.public_oid.clone()],
             &state.db,
             &pub_repo.id,
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
         )
         .await;
         m.assert_async().await; // asserts /add was NOT called (already pinned)
@@ -2560,6 +3677,7 @@ mod tests {
             vec![fx.public_oid.clone()],
             &state.db,
             &pub_repo.id,
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
         )
         .await;
         m.assert_async().await; // /add NOT called (already pinned)
@@ -2603,7 +3721,7 @@ mod tests {
 
     /// #173 (jatmn round 8, F1 — availability, grok-4.5 adversarial catch): the resolver's
     /// per-object source cap must NEVER evict the first-pinner. A legacy public pin keeps
-    /// its source in `pinned_cids.repo_id` but not in `pin_repo_sources` (pre-v13 pins, or
+    /// its source in `pinned_cids.repo_id` but not in `pin_repo_sources` (pre-v20 pins, or
     /// a pin whose best-effort `record_pin_source` missed). If the cap `LIMIT` were applied
     /// to the whole union with a lexicographic order, an attacker could push the same
     /// object from `MAX_PIN_SOURCES` repos whose grindable ids sort before the public
@@ -2663,9 +3781,9 @@ mod tests {
     }
 
     /// INV-7 upgrade path for the F1 `pin_repo_sources` table (#173, jatmn round 8): a
-    /// node already past v12 gets the table from the NEW v13 migration. Simulate the
-    /// pre-v13 node by dropping the table and un-applying v13, then re-migrate and
-    /// assert a source row round-trips. RED before the v13 migration exists.
+    /// node already past v19 gets the table from the NEW v20 migration. Simulate the
+    /// pre-v20 node by dropping the table and un-applying v13, then re-migrate and
+    /// assert a source row round-trips. RED before the v20 migration exists.
     #[sqlx::test]
     async fn pin_repo_sources_upgrade_path(pool: PgPool) {
         let state = test_state(pool.clone()).await;
@@ -2673,7 +3791,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 13")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 20")
             .execute(&pool)
             .await
             .unwrap();
@@ -2686,7 +3804,7 @@ mod tests {
         assert_eq!(
             state.db.pin_sources_for_oid("upgradeoid").await.unwrap(),
             vec!["repo-upg".to_string()],
-            "the v13 pin_repo_sources table is present after upgrade"
+            "the v20 pin_repo_sources table is present after upgrade"
         );
     }
 
@@ -2749,6 +3867,7 @@ mod tests {
             vec![oid.to_string()],
             &state.db,
             repo_id,
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
         )
         .await;
         m.assert_async().await;
@@ -3327,20 +4446,20 @@ mod tests {
         );
     }
 
-    /// U3 scenario 7 (#173, INV-7 upgrade path): a node already past v14 gets
-    /// `pinned_cids.pin_sources_incomplete` from the NEW v15 migration, re-running the
+    /// U3 scenario 7 (#173, INV-7 upgrade path): a node already past v21 gets
+    /// `pinned_cids.pin_sources_incomplete` from the NEW v22 migration, re-running the
     /// migrations is idempotent, and a row written before the column existed reads as
     /// COMPLETE (so an upgrade cannot arm the O(repos) fallback for every legacy pin).
     #[sqlx::test]
     async fn pinned_cids_sources_incomplete_upgrade_path(pool: PgPool) {
         let state = test_state(pool.clone()).await;
 
-        // Pre-v15 shape: drop the column and forget v15 was applied.
+        // Pre-v22 shape: drop the column and forget v22 was applied.
         sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS pin_sources_incomplete")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 15")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 22")
             .execute(&pool)
             .await
             .unwrap();
@@ -3370,7 +4489,7 @@ mod tests {
             .expect("mark after upgrade");
         assert!(
             state.db.pin_sources_incomplete("preu3oid").await.unwrap(),
-            "the v15 column is present and writable after the upgrade"
+            "the v22 column is present and writable after the upgrade"
         );
     }
 
@@ -3819,6 +4938,7 @@ mod tests {
             vec![fx.public_oid.clone()],
             &state.db,
             "repoZ",
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
         )
         .await;
         assert!(
@@ -3937,6 +5057,7 @@ mod tests {
                 vec![oid],
                 &db,
                 "repoWedge",
+                crate::ipfs_pin::PIN_BATCH_BUDGET,
             ),
         )
         .await
@@ -4066,6 +5187,7 @@ mod tests {
             vec![fx.public_oid.clone()],
             &state.db,
             "repoBF",
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
         )
         .await;
 
@@ -4187,6 +5309,7 @@ mod tests {
             vec![fx.public_oid.clone()],
             &state.db,
             &repo.id,
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
         )
         .await;
         m.assert_async().await;
@@ -4290,6 +5413,7 @@ mod tests {
             vec![fx.public_oid.clone()],
             &state.db,
             "repoCG",
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
         )
         .await;
         m.assert_async().await;
@@ -4354,6 +5478,7 @@ mod tests {
             vec![phantom_oid.clone()],
             &state.db,
             "repoUR",
+            crate::ipfs_pin::PIN_BATCH_BUDGET,
         )
         .await;
 
@@ -4375,28 +5500,28 @@ mod tests {
     }
 
     /// #173 R8 (U7, INV-7 upgrade path): a node already at the prior-max schema (v13)
-    /// gets `pinned_cids.legacy_provider_cid` from the NEW v14 migration. Simulate the
-    /// pre-v14 node by dropping the column and un-applying v14, then re-migrate and
-    /// assert a repair round-trips through the column. RED before the v14 migration
+    /// gets `pinned_cids.legacy_provider_cid` from the NEW v21 migration. Simulate the
+    /// pre-v21 node by dropping the column and un-applying v14, then re-migrate and
+    /// assert a repair round-trips through the column. RED before the v21 migration
     /// exists (the column is never re-added → the repair UPDATE errors).
     #[sqlx::test]
     async fn pinned_cids_legacy_provider_cid_upgrade_path(pool: PgPool) {
         let state = test_state(pool.clone()).await;
 
-        // Pre-v14 shape: drop the column and forget v14 was applied.
+        // Pre-v21 shape: drop the column and forget v21 was applied.
         sqlx::query("ALTER TABLE pinned_cids DROP COLUMN IF EXISTS legacy_provider_cid")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 14")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 21")
             .execute(&pool)
             .await
             .unwrap();
 
-        // Upgrade: re-run migrations → v14 re-adds the column.
+        // Upgrade: re-run migrations → v21 re-adds the column.
         state.db.run_migrations().await.expect("migrate to v14");
 
-        // A repair round-trips through the v14 column.
+        // A repair round-trips through the v21 column.
         state
             .db
             .record_pinned_cid("upg_oid", "QmProviderLegacy", None)
@@ -4413,11 +5538,11 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(cid, "bRawContentKey", "v14 lets the repair rewrite the key");
+        assert_eq!(cid, "bRawContentKey", "v21 lets the repair rewrite the key");
         assert_eq!(
             stashed.as_deref(),
             Some("QmProviderLegacy"),
-            "the v14 legacy_provider_cid column is present after upgrade"
+            "the v21 legacy_provider_cid column is present after upgrade"
         );
     }
 
@@ -4463,20 +5588,20 @@ mod tests {
     }
 
     /// U4 (#173, INV-7 upgrade path): a node already at the prior-max schema (v15) gets
-    /// the `pin_repair_sweep` cursor table from the NEW v16 migration. Simulate the
-    /// pre-v16 node by dropping the table and un-applying v16, then re-migrate and
-    /// assert the cursor round-trips. RED before the v16 migration exists (the table is
+    /// the `pin_repair_sweep` cursor table from the NEW v23 migration. Simulate the
+    /// pre-v23 node by dropping the table and un-applying v16, then re-migrate and
+    /// assert the cursor round-trips. RED before the v23 migration exists (the table is
     /// never recreated, so the cursor read errors).
     #[sqlx::test]
     async fn pin_repair_sweep_cursor_upgrade_path(pool: PgPool) {
         let state = test_state(pool.clone()).await;
 
-        // Pre-v16 shape: drop the table and forget v16 was applied.
+        // Pre-v23 shape: drop the table and forget v23 was applied.
         sqlx::query("DROP TABLE IF EXISTS pin_repair_sweep")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 16")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 23")
             .execute(&pool)
             .await
             .unwrap();
@@ -4494,7 +5619,7 @@ mod tests {
         assert_eq!(
             state.db.pin_repair_cursor().await.unwrap(),
             "def",
-            "the v16 cursor table persists the walk position across writes"
+            "the v23 cursor table persists the walk position across writes"
         );
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM pin_repair_sweep")
             .fetch_one(&pool)
@@ -5755,8 +6880,11 @@ mod tests {
         let short = owner_did.split(':').next_back().unwrap().to_string();
         let mut state = test_state(pool).await;
         // Seed the legacy-probe budget the way production does: from the operator knob.
+        // The legacy-probe budget knob, renamed in the merge: #174 already owned
+        // `--ipfs-max-repos-walked` for its expensive-walk cap, so #173's identically
+        // named knob became `--ipfs-max-legacy-probes`.
         let cfg =
-            crate::config::Config::parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "1"]);
+            crate::config::Config::parse_from(["gitlawb-node", "--ipfs-max-legacy-probes", "1"]);
         state.ipfs_max_legacy_probes = AppState::ipfs_legacy_probe_budget(&cfg);
         assert_eq!(state.ipfs_max_legacy_probes, 1, "knob=1 → one-probe budget");
         // The knob must not touch the history-walk ceiling (must stay MAX_PIN_SOURCES + 1).
@@ -6332,7 +7460,10 @@ mod tests {
     /// the handler skips the whole repo rather than serving. Asserts no leak of the
     /// withheld blob AND that even the *public* blob in that repo is withheld — the
     /// latter distinguishes fail-closed-skip from normal per-blob withholding and
-    /// would serve 200 if the error arm wrongly proceeded.
+    /// would serve 200 if the error arm wrongly proceeded. The skip carries no
+    /// VERDICT (F2), so the response is the retryable truncation 503, not a 404
+    /// claiming the object is absent — never-serve-unproven and never-404-unproven
+    /// hold together.
     #[sqlx::test]
     async fn ipfs_cid_walk_error_fails_closed(pool: PgPool) {
         use crate::db::VisibilityMode;
@@ -6379,7 +7510,8 @@ mod tests {
             .await
             .expect("deny rule");
 
-        // Withheld secret CID under a walk error → 404, no leak.
+        // Withheld secret CID under a walk error → the repo is skipped without a
+        // verdict, so the scan is truncated (503), and nothing leaks.
         let (st, body) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&secret_cid))
@@ -6389,17 +7521,17 @@ mod tests {
         .await;
         assert_eq!(
             st,
-            StatusCode::NOT_FOUND,
-            "walk error must not serve the withheld blob"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "walk error must not serve the withheld blob — the unproven skip sheds 503"
         );
         assert!(
             !body.contains("TOP SECRET"),
-            "walk-error 404 must not leak the secret"
+            "walk-error 503 must not leak the secret"
         );
 
-        // The PUBLIC blob in the same repo is also 404: the walk error fails closed
-        // by skipping the whole repo, not by serving. Without the fail-closed arm
-        // this would serve 200, so this assertion is the load-bearing discriminator.
+        // The PUBLIC blob in the same repo is also not served: the walk error fails
+        // closed by skipping the whole repo. Without the fail-closed arm this would
+        // serve 200, so this assertion is the load-bearing discriminator.
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&public_cid))
@@ -6409,8 +7541,9 @@ mod tests {
         .await;
         assert_eq!(
             st,
-            StatusCode::NOT_FOUND,
-            "walk error fails closed: repo skipped, even the public blob is not served"
+            StatusCode::SERVICE_UNAVAILABLE,
+            "walk error fails closed: repo skipped without a verdict, even the public \
+             blob is not served and the scan sheds 503"
         );
     }
 
@@ -6465,7 +7598,13 @@ mod tests {
             .expect("path rule");
 
         // Fail-closed: a walk error skips the repo, so even the otherwise-reachable
-        // public commit is 404 (not served). A fail-OPEN arm would 200 here.
+        // public commit is NOT served. A fail-OPEN arm would 200 here.
+        //
+        // The skip is a truncation, not an absence verdict (#174 F2): the walk failed,
+        // so nothing was proven about whether this caller may read the object, and the
+        // tail sheds a retryable 503 rather than the definitive 404 this asserted
+        // before the merge. Withholding is the property under test either way; what
+        // changed is that the response no longer claims the object is absent.
         let (st, _) = cid_parts(
             cid_router(&state)
                 .oneshot(cid_anon(&commit_cid))
@@ -6475,7 +7614,7 @@ mod tests {
         .await;
         assert_eq!(
             st,
-            StatusCode::NOT_FOUND,
+            StatusCode::SERVICE_UNAVAILABLE,
             "a commit/tag walk error must fail closed (repo skipped), never serve"
         );
     }
@@ -9058,6 +10197,172 @@ mod tests {
         );
     }
 
+    // ── Ref-update events (issue #144: owner_did wire format) ─────────────────
+
+    fn events_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/events/ref-updates",
+                axum::routing::get(crate::api::events::list_ref_updates),
+            )
+            .with_state(state)
+    }
+
+    #[sqlx::test]
+    async fn events_returns_inserted_ref_updates(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zEVENTSOWNERAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Seed a local repo the wire owner_did is bound to. The stored wire
+        // owner_did is untrusted; it is only surfaced when it matches the
+        // canonical owner of the local repo the slug names.
+        state
+            .db
+            .create_repo(&seed_repo(owner, "myrepo"))
+            .await
+            .unwrap();
+
+        // Insert a gossip event with owner_did set
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/myrepo", owner.split(':').next_back().unwrap()),
+                owner_did: Some(owner.into()),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["repo"],
+            format!("{}/myrepo", owner.split(':').next_back().unwrap())
+        );
+        assert_eq!(events[0]["owner_did"], owner);
+    }
+
+    // P1: a peer-supplied owner_did that does NOT match the canonical owner of
+    // the local repo the slug names must NOT be surfaced. Here zVictim asserts
+    // ownership of alice's widget repo; the projection must drop it to null
+    // rather than poisoning persisted event ownership.
+    #[sqlx::test]
+    async fn events_drop_forged_peer_owner_did(pool: PgPool) {
+        let state = test_state(pool).await;
+        let alice = "did:key:zALICEOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let victim = "did:key:zVICTIMOWNERAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        state
+            .db
+            .create_repo(&seed_repo(alice, "widget"))
+            .await
+            .unwrap();
+
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/widget", alice.split(':').next_back().unwrap()),
+                owner_did: Some(victim.into()),
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        // Forged value dropped: owner_did is null, NOT zVictim.
+        assert_eq!(events[0]["owner_did"], serde_json::Value::Null);
+    }
+
+    // P3: a legacy row stored with owner_did = None must be attributed only via
+    // an exact, unique local match — never a loose prefix-tolerant collision.
+    // alice/widget is owned by alice; a stray None row on a different repo whose
+    // owner key shares a segment must not inherit alice's full DID.
+    #[sqlx::test]
+    async fn events_legacy_none_owner_uses_exact_local_match(pool: PgPool) {
+        let state = test_state(pool).await;
+        let alice = "did:key:zALICEOWNER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let bob = "did:key:zBOBOWNER2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        // Alice owns "widget".
+        state
+            .db
+            .create_repo(&seed_repo(alice, "widget"))
+            .await
+            .unwrap();
+        // Bob owns a distinct "gadget" repo.
+        state
+            .db
+            .create_repo(&seed_repo(bob, "gadget"))
+            .await
+            .unwrap();
+
+        // Legacy None row claiming slug "bob/gadget" (matches bob exactly).
+        state
+            .db
+            .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                id: uuid::Uuid::new_v4().to_string(),
+                node_did: "did:key:zNode".into(),
+                pusher_did: "did:key:zPusher".into(),
+                repo: format!("{}/gadget", bob.split(':').next_back().unwrap()),
+                owner_did: None,
+                ref_name: "refs/heads/main".into(),
+                old_sha: "0000000000000000000000000000000000000000".into(),
+                new_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                timestamp: "2026-07-02T12:00:00Z".into(),
+                cert_id: None,
+                received_at: "2026-07-02T12:00:01Z".into(),
+                from_peer: "12D3KooWTest".into(),
+            })
+            .await
+            .unwrap();
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        let events = body["events"].as_array().unwrap();
+        assert_eq!(events.len(), 1);
+        // Attributed to the exact local owner (bob), not alice via collision.
+        assert_eq!(
+            events[0]["owner_did"],
+            serde_json::Value::String(bob.to_string())
+        );
+    }
+
     #[sqlx::test]
     async fn list_all_bounties_past_private_window_finds_public(pool: PgPool) {
         let state = test_state(pool).await;
@@ -9226,6 +10531,42 @@ mod tests {
             .await
             .unwrap();
         assert!(resp.status().is_success());
+    }
+
+    #[sqlx::test]
+    async fn events_limit_respects_limit_param(pool: PgPool) {
+        let state = test_state(pool).await;
+        let owner = "did:key:zEVENTLIMITAAAAAAAAAAAAAAAAAAAAAAAA";
+
+        for i in 0..5 {
+            state
+                .db
+                .insert_ref_update(&crate::db::ReceivedRefUpdate {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    node_did: "did:key:zNode".into(),
+                    pusher_did: "did:key:zPusher".into(),
+                    repo: format!("{}/r{i}", owner.split(':').next_back().unwrap()),
+                    owner_did: Some(owner.into()),
+                    ref_name: "refs/heads/main".into(),
+                    old_sha: "0000000000000000000000000000000000000000".into(),
+                    new_sha: format!("{i:040x}"),
+                    timestamp: format!("2026-07-02T12:00:{i:02}Z"),
+                    cert_id: None,
+                    received_at: format!("2026-07-02T12:00:{i:02}Z"),
+                    from_peer: "12D3KooWTest".into(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let resp = events_router(state)
+            .oneshot(anon_get("/api/v1/events/ref-updates?limit=2"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = json_body(resp).await;
+        assert_eq!(body["count"].as_i64(), Some(2));
+        assert_eq!(body["events"].as_array().unwrap().len(), 2);
     }
 
     #[sqlx::test]
@@ -9572,1049 +10913,5 @@ mod tests {
             ids.iter().any(|id| id.starts_with("deep-0")),
             "result includes the deep cert matching the prefix"
         );
-    }
-
-    // ---- U3 (#173 F3): coalesced post-push work is REQUEUED, not dropped ----
-    //
-    // The seam mechanics (dirty flag, atomic check-and-clear, Drop backstop) are unit
-    // tested next to the #174 coalescing tests in `api/repos.rs`. These drive the whole
-    // detached task through a mock Kubo node and a real git repo, so the requeue's
-    // fresh re-read (encrypt half) and fail-closed full-scan enumeration (pin half) are
-    // proven end to end, with DB-observable effects. Each test models a push that
-    // coalesced during the in-flight window by (a) marking the repo dirty via a second
-    // `try_begin` and (b) making the repo/policy dynamic so the FIRST pass's spawn-time
-    // captures are stale — a static-state test would pass vacuously over the gap.
-    mod u3_requeue {
-        use super::*;
-        use crate::db::VisibilityMode;
-        use std::collections::HashSet;
-        use std::path::{Path, PathBuf};
-        use std::process::Command;
-
-        fn git(args: &[&str], dir: &Path) {
-            let ok = Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .status()
-                .unwrap()
-                .success();
-            assert!(ok, "git {args:?} failed");
-        }
-        fn oid(rev: &str, dir: &Path) -> String {
-            let out = Command::new("git")
-                .args(["rev-parse", rev])
-                .current_dir(dir)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "rev-parse {rev}: {out:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
-        struct Repo {
-            _td: tempfile::TempDir,
-            path: PathBuf,
-        }
-        fn init_repo() -> Repo {
-            let td = tempfile::TempDir::new().unwrap();
-            let path = td.path().to_path_buf();
-            git(&["init", "-q"], &path);
-            git(&["config", "user.email", "t@t"], &path);
-            git(&["config", "user.name", "t"], &path);
-            Repo { _td: td, path }
-        }
-        /// Commit `content` at `rel`, return the blob oid.
-        fn commit(repo: &Path, rel: &str, content: &str) -> String {
-            let full = repo.join(rel);
-            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
-            std::fs::write(&full, content).unwrap();
-            git(&["add", "."], repo);
-            git(&["commit", "-qm", rel], repo);
-            oid(&format!("HEAD:{rel}"), repo)
-        }
-        /// Write a loose, UNREACHABLE blob (dangling object).
-        fn write_dangling_blob(repo: &Path, content: &str) -> String {
-            let out = Command::new("git")
-                .args(["hash-object", "-w", "--stdin"])
-                .current_dir(repo)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            use std::io::Write;
-            out.stdin
-                .as_ref()
-                .unwrap()
-                .write_all(content.as_bytes())
-                .unwrap();
-            let o = out.wait_with_output().unwrap();
-            assert!(o.status.success());
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
-        fn new_did() -> String {
-            Keypair::generate().did().to_string()
-        }
-
-        /// SCENARIO 2 + 5 (pin half, TAIL-PLACEMENT guard). A coalesced push on a PUBLIC
-        /// repo with NO path-scoped rule must still requeue its pin half: the second
-        /// push's new object is pinned after the task. RED without the loop (stale spawn
-        /// object_list never lists obj2), and RED if the check-and-clear sits inside the
-        /// `has_path_scoped_rule` block (a rules-free repo would never reach it).
-        #[sqlx::test]
-        async fn u3_rules_free_public_repo_requeues_pin_half(pool: PgPool) {
-            let state = test_state(pool).await;
-            let owner = new_did();
-            let repo = seed_repo(&owner, "u3-pin");
-            state.db.create_repo(&repo).await.expect("seed repo");
-            let git_repo = init_repo();
-            let obj1 = commit(&git_repo.path, "a.txt", "one\n");
-            // The coalesced push B adds obj2 (present at requeue time, NOT in the stale
-            // push-A spawn object_list).
-            let obj2 = commit(&git_repo.path, "b.txt", "two\n");
-
-            let mut server = mockito::Server::new_async().await;
-            let _m = server
-                .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
-                .expect_at_least(1)
-                .create_async()
-                .await;
-
-            // Push A admits (guard); push B coalesces (marks dirty).
-            let guard = state
-                .encrypt_inflight
-                .try_begin(&repo.id)
-                .expect("push A admits");
-            assert!(
-                state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                "push B coalesces while A is in flight"
-            );
-
-            // Spawn-time (push A) captures are STALE: object_list lists only obj1, no rule.
-            crate::api::repos::run_post_push_replication_for_test(
-                &state,
-                guard,
-                git_repo.path.clone(),
-                repo.id.clone(),
-                server.url(),
-                true,
-                owner.clone(),
-                vec![obj1.clone()],
-                Some(vec![]),
-                HashSet::new(),
-            )
-            .await;
-
-            assert!(
-                state.db.is_pinned(&obj1).await.unwrap(),
-                "push A's object is pinned on the first pass"
-            );
-            assert!(
-                state.db.is_pinned(&obj2).await.unwrap(),
-                "the coalesced push's new object is pinned by the REQUEUE full scan (RED \
-                 without the loop, or if the check-and-clear sits inside the encrypt gate)"
-            );
-            assert!(
-                state.encrypt_inflight.is_empty(),
-                "the guard key is released once the task exits clean"
-            );
-        }
-
-        /// SCENARIO 1 + 3 (encrypt half, FRESH re-read). A coalesced push adds a
-        /// path-scoped rule withholding a blob. The task must re-read rules FRESH on
-        /// requeue and seal the newly-withheld blob's recovery copy. RED without the loop
-        /// (pass one's stale empty rule set seals nothing).
-        #[sqlx::test]
-        async fn u3_requeue_seals_blob_withheld_by_coalesced_rule_change(pool: PgPool) {
-            let state = test_state(pool).await;
-            let owner = new_did();
-            let reader = new_did();
-            let repo = seed_repo(&owner, "u3-enc");
-            state.db.create_repo(&repo).await.expect("seed repo");
-            let git_repo = init_repo();
-            let _pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
-            let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
-
-            // Coalesced push B changes .gitlawb: withhold /secret/** from anon, grant reader.
-            state
-                .db
-                .set_visibility_rule(&repo.id, "/secret/**", VisibilityMode::B, &[reader], &owner)
-                .await
-                .expect("set rule");
-
-            let mut server = mockito::Server::new_async().await;
-            let _m = server
-                .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
-                .expect_at_least(1)
-                .create_async()
-                .await;
-
-            let guard = state
-                .encrypt_inflight
-                .try_begin(&repo.id)
-                .expect("push A admits");
-            assert!(
-                state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                "push B coalesces"
-            );
-
-            // Push A captures are STALE: no rule, empty withheld set (public repo).
-            crate::api::repos::run_post_push_replication_for_test(
-                &state,
-                guard,
-                git_repo.path.clone(),
-                repo.id.clone(),
-                server.url(),
-                true,
-                owner.clone(),
-                vec![],
-                Some(vec![]),
-                HashSet::new(),
-            )
-            .await;
-
-            assert!(
-                state
-                    .db
-                    .encrypted_blob_recipients_tag(&repo.id, &secret_oid)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                "the coalesced push's newly-withheld blob is sealed after the REQUEUE re-read \
-                 (RED without the loop: pass one's stale empty rules seal nothing)"
-            );
-            assert!(state.encrypt_inflight.is_empty(), "guard key released");
-        }
-
-        /// SCENARIO 4 (visibility-leak negative). The requeue full scan must feed
-        /// `list_all_objects` through the fail-closed filter, never pin it bare: a
-        /// withheld secret blob and a dangling blob must NOT land in the public pin set.
-        #[sqlx::test]
-        async fn u3_requeue_full_scan_does_not_publicly_pin_withheld_or_dangling(pool: PgPool) {
-            let state = test_state(pool).await;
-            let owner = new_did();
-            let reader = new_did();
-            let repo = seed_repo(&owner, "u3-leak");
-            state.db.create_repo(&repo).await.expect("seed repo");
-            let git_repo = init_repo();
-            let pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
-            let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
-            state
-                .db
-                .set_visibility_rule(&repo.id, "/secret/**", VisibilityMode::B, &[reader], &owner)
-                .await
-                .expect("set rule");
-            // Coalesced push adds a new public object and a dangling blob.
-            let new_pub_oid = commit(&git_repo.path, "public/c.txt", "more public\n");
-            let dangling_oid = write_dangling_blob(&git_repo.path, "orphan bytes\n");
-
-            let mut server = mockito::Server::new_async().await;
-            let _m = server
-                .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
-                .expect_at_least(1)
-                .create_async()
-                .await;
-
-            let rules = state.db.list_visibility_rules(&repo.id).await.unwrap();
-            let mut withheld = HashSet::new();
-            withheld.insert(secret_oid.clone());
-
-            let guard = state
-                .encrypt_inflight
-                .try_begin(&repo.id)
-                .expect("push A admits");
-            assert!(
-                state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                "push B coalesces"
-            );
-
-            crate::api::repos::run_post_push_replication_for_test(
-                &state,
-                guard,
-                git_repo.path.clone(),
-                repo.id.clone(),
-                server.url(),
-                true,
-                owner.clone(),
-                vec![pub_oid.clone()],
-                Some(rules),
-                withheld,
-            )
-            .await;
-
-            assert!(
-                state.db.is_pinned(&new_pub_oid).await.unwrap(),
-                "the coalesced push's new PUBLIC object is pinned by the requeue"
-            );
-            assert!(
-                !state.db.is_pinned(&secret_oid).await.unwrap(),
-                "a WITHHELD blob is never publicly pinned by the requeue enumeration (leak guard)"
-            );
-            assert!(
-                !state.db.is_pinned(&dangling_oid).await.unwrap(),
-                "a DANGLING blob is never publicly pinned by the requeue enumeration (leak guard)"
-            );
-            // The withheld blob still gets its ENCRYPTED recovery copy (not a public pin).
-            assert!(
-                state
-                    .db
-                    .encrypted_blob_recipients_tag(&repo.id, &secret_oid)
-                    .await
-                    .unwrap()
-                    .is_some(),
-                "withheld blob is sealed as an encrypted recovery copy, not pinned in the clear"
-            );
-        }
-
-        /// SCENARIO 8 (no-coalesce happy path). A single push with no coalesced follower
-        /// runs exactly one pass, pins its object, and releases the key. No requeue.
-        #[sqlx::test]
-        async fn u3_no_coalesce_single_pass_pins_and_releases(pool: PgPool) {
-            let state = test_state(pool).await;
-            let owner = new_did();
-            let repo = seed_repo(&owner, "u3-happy");
-            state.db.create_repo(&repo).await.expect("seed repo");
-            let git_repo = init_repo();
-            let obj1 = commit(&git_repo.path, "a.txt", "one\n");
-
-            let mut server = mockito::Server::new_async().await;
-            let _m = server
-                .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                .with_status(200)
-                .with_body(r#"{"Hash":"bafyprovider"}"#)
-                .expect_at_least(1)
-                .create_async()
-                .await;
-
-            // No second try_begin: the repo is never marked dirty.
-            let guard = state
-                .encrypt_inflight
-                .try_begin(&repo.id)
-                .expect("push admits");
-            assert_eq!(
-                state.encrypt_inflight.dirty(&repo.id),
-                Some(false),
-                "clean, no coalesce"
-            );
-
-            crate::api::repos::run_post_push_replication_for_test(
-                &state,
-                guard,
-                git_repo.path.clone(),
-                repo.id.clone(),
-                server.url(),
-                true,
-                owner.clone(),
-                vec![obj1.clone()],
-                Some(vec![]),
-                HashSet::new(),
-            )
-            .await;
-
-            assert!(
-                state.db.is_pinned(&obj1).await.unwrap(),
-                "the single push's object is pinned"
-            );
-            assert!(
-                state.encrypt_inflight.is_empty(),
-                "the key is released after one pass"
-            );
-        }
-
-        // ---- U2 (#173): a transient re-read failure must not discard the coalesced
-        // push's work ----
-        //
-        // The requeue pass re-reads repo state fresh. Before this unit, the `Err` arm of
-        // either read (repo row, visibility rules) collapsed into "no rules", which made
-        // `replication_withheld_set` return `None`, which skipped the whole pass. The
-        // dirty flag was already consumed by the atomic check-and-clear at the tail and
-        // there is no reconciliation sweep, so the coalesced push's pin/encrypt work was
-        // lost silently. These tests drive that `Err` arm through the fault seam in
-        // `api::repos::requeue_faults` (a real pool will not fail on demand) and assert
-        // on the WORK PERFORMED, not on control flow.
-        mod u2_reread_retry {
-            use super::*;
-            use crate::api::repos::requeue_faults;
-
-            /// Process-wide tracing capture so a test can assert the give-up is logged at
-            /// ERROR. A global default subscriber can only be installed once per process,
-            /// so it is shared by every test here and assertions filter on the repo id,
-            /// which is a fresh uuid per test.
-            mod logcap {
-                use std::sync::{Arc, Mutex, OnceLock};
-                use tracing::{Event, Level, Subscriber};
-                use tracing_subscriber::layer::{Context, Layer};
-                use tracing_subscriber::prelude::*;
-
-                type Lines = Arc<Mutex<Vec<(Level, String)>>>;
-
-                fn lines() -> &'static Lines {
-                    static LINES: OnceLock<Lines> = OnceLock::new();
-                    LINES.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
-                }
-
-                struct Capture;
-                impl<S: Subscriber> Layer<S> for Capture {
-                    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                        struct V(String);
-                        impl tracing::field::Visit for V {
-                            fn record_debug(
-                                &mut self,
-                                field: &tracing::field::Field,
-                                value: &dyn std::fmt::Debug,
-                            ) {
-                                self.0.push_str(&format!(" {}={:?}", field.name(), value));
-                            }
-                        }
-                        let mut v = V(String::new());
-                        event.record(&mut v);
-                        lines()
-                            .lock()
-                            .unwrap()
-                            .push((*event.metadata().level(), v.0));
-                    }
-                }
-
-                pub(super) fn install() {
-                    static ONCE: OnceLock<()> = OnceLock::new();
-                    ONCE.get_or_init(|| {
-                        let _ = tracing::subscriber::set_global_default(
-                            tracing_subscriber::registry().with(Capture),
-                        );
-                    });
-                }
-
-                pub(super) fn errors_containing(needle: &str) -> Vec<String> {
-                    lines()
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .filter(|(lvl, msg)| *lvl == Level::ERROR && msg.contains(needle))
-                        .map(|(_, msg)| msg.clone())
-                        .collect()
-                }
-            }
-
-            /// SCENARIO 1. The repo re-read fails once, then succeeds: the requeue pass
-            /// must still RUN, under the refreshed state, and pin the coalesced push's
-            /// object. RED before the fix (the single `Err` yielded `(None, false, "")`,
-            /// the pass was skipped, and the already-consumed dirty flag meant the work
-            /// was gone for good).
-            #[sqlx::test]
-            async fn u2_transient_repo_reread_failure_is_retried_and_work_lands(pool: PgPool) {
-                let state = test_state(pool).await;
-                let owner = new_did();
-                let repo = seed_repo(&owner, "u2-retry");
-                state.db.create_repo(&repo).await.expect("seed repo");
-                let git_repo = init_repo();
-                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
-                // The coalesced push B adds obj2, absent from push A's spawn captures.
-                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
-
-                let mut server = mockito::Server::new_async().await;
-                let _m = server
-                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                    .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
-                    .expect_at_least(1)
-                    .create_async()
-                    .await;
-
-                // One transient repo re-read failure, then the real DB answers.
-                requeue_faults::inject(&repo.id, 1, 0);
-
-                let guard = state
-                    .encrypt_inflight
-                    .try_begin(&repo.id)
-                    .expect("push A admits");
-                assert!(
-                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                    "push B coalesces while A is in flight"
-                );
-
-                crate::api::repos::run_post_push_replication_for_test(
-                    &state,
-                    guard,
-                    git_repo.path.clone(),
-                    repo.id.clone(),
-                    server.url(),
-                    true,
-                    owner.clone(),
-                    vec![obj1.clone()],
-                    Some(vec![]),
-                    HashSet::new(),
-                )
-                .await;
-
-                assert!(
-                    state.db.is_pinned(&obj2).await.unwrap(),
-                    "the coalesced push's object is pinned after the retried re-read (RED \
-                     before this unit: the Err arm dropped the pass and the work with it)"
-                );
-                let c = requeue_faults::counters(&repo.id);
-                assert_eq!(
-                    c.repo_read_attempts, 2,
-                    "the failed re-read is retried exactly once before it succeeds"
-                );
-                assert!(
-                    state.encrypt_inflight.is_empty(),
-                    "the guard key is released once the task exits"
-                );
-            }
-
-            /// SCENARIO 2. Every re-read attempt fails: the loop must give up on a BOUND
-            /// (asserted as a literal, so raising or removing the bound goes RED) and log
-            /// the give-up at ERROR so the residual loss is observable rather than silent.
-            #[sqlx::test]
-            async fn u2_sustained_repo_reread_failure_is_bounded_and_logged(pool: PgPool) {
-                logcap::install();
-                let state = test_state(pool).await;
-                let owner = new_did();
-                let repo = seed_repo(&owner, "u2-bounded");
-                state.db.create_repo(&repo).await.expect("seed repo");
-                let git_repo = init_repo();
-                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
-                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
-
-                let mut server = mockito::Server::new_async().await;
-                let _m = server
-                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                    .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
-                    .expect_at_least(1)
-                    .create_async()
-                    .await;
-
-                // Far more failures than the bound allows: the outage never clears.
-                requeue_faults::inject(&repo.id, 10_000, 0);
-
-                let guard = state
-                    .encrypt_inflight
-                    .try_begin(&repo.id)
-                    .expect("push A admits");
-                assert!(
-                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                    "push B coalesces"
-                );
-
-                crate::api::repos::run_post_push_replication_for_test(
-                    &state,
-                    guard,
-                    git_repo.path.clone(),
-                    repo.id.clone(),
-                    server.url(),
-                    true,
-                    owner.clone(),
-                    vec![obj1.clone()],
-                    Some(vec![]),
-                    HashSet::new(),
-                )
-                .await;
-
-                let c = requeue_faults::counters(&repo.id);
-                assert_eq!(
-                    c.repo_read_attempts, 3,
-                    "the re-read is bounded at 3 attempts; unbounded retry or a raised \
-                     bound must fail here"
-                );
-                assert!(
-                    !state.db.is_pinned(&obj2).await.unwrap(),
-                    "with the read never succeeding there is nothing fresh to act on"
-                );
-                let errs = logcap::errors_containing(&repo.id);
-                assert!(
-                    !errs.is_empty(),
-                    "the exhausted requeue re-read is logged at ERROR with the repo id, so \
-                     the residual work loss is observable; captured: {errs:?}"
-                );
-                assert!(
-                    state.encrypt_inflight.is_empty(),
-                    "the guard key is still released on the give-up path"
-                );
-            }
-
-            /// SCENARIO 3. `Ok(None)` (the repo was deleted during the in-flight window)
-            /// is NOT a transient failure: it must release immediately without burning the
-            /// retry budget. The repo id is never inserted, so the re-read legitimately
-            /// returns `Ok(None)`.
-            #[sqlx::test]
-            async fn u2_repo_gone_releases_without_consuming_retries(pool: PgPool) {
-                let state = test_state(pool).await;
-                let owner = new_did();
-                let missing_id = uuid::Uuid::new_v4().to_string();
-                let git_repo = init_repo();
-                let _obj1 = commit(&git_repo.path, "a.txt", "one\n");
-
-                let server = mockito::Server::new_async().await;
-
-                requeue_faults::inject(&missing_id, 0, 0);
-
-                let guard = state
-                    .encrypt_inflight
-                    .try_begin(&missing_id)
-                    .expect("push A admits");
-                assert!(
-                    state.encrypt_inflight.try_begin(&missing_id).is_none(),
-                    "push B coalesces"
-                );
-
-                // Empty object list: pass one touches no pin rows for a repo that is gone.
-                crate::api::repos::run_post_push_replication_for_test(
-                    &state,
-                    guard,
-                    git_repo.path.clone(),
-                    missing_id.clone(),
-                    server.url(),
-                    true,
-                    owner.clone(),
-                    vec![],
-                    Some(vec![]),
-                    HashSet::new(),
-                )
-                .await;
-
-                let c = requeue_faults::counters(&missing_id);
-                assert_eq!(
-                    c.repo_read_attempts, 1,
-                    "a deleted repo is a terminal answer, never retried"
-                );
-                assert_eq!(
-                    c.rules_read_attempts, 0,
-                    "no rules read is attempted once the repo row is gone"
-                );
-                assert!(
-                    state.encrypt_inflight.is_empty(),
-                    "the guard key is released cleanly"
-                );
-            }
-
-            /// SCENARIO 4. A failed visibility-rule read is transient, never an empty
-            /// policy. RED before the fix, where `.ok()` made "the rules read failed" and
-            /// "this repo has no rules" the same value: the withheld blob was then neither
-            /// sealed nor covered, because a `None` rule set skips the pass entirely.
-            #[sqlx::test]
-            async fn u2_transient_rules_read_failure_is_retried_not_read_as_empty(pool: PgPool) {
-                let state = test_state(pool).await;
-                let owner = new_did();
-                let reader = new_did();
-                let repo = seed_repo(&owner, "u2-rules");
-                state.db.create_repo(&repo).await.expect("seed repo");
-                let git_repo = init_repo();
-                let pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
-                let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
-
-                // The coalesced push B is what added the path-scoped rule.
-                state
-                    .db
-                    .set_visibility_rule(
-                        &repo.id,
-                        "/secret/**",
-                        VisibilityMode::B,
-                        &[reader],
-                        &owner,
-                    )
-                    .await
-                    .expect("set rule");
-
-                let mut server = mockito::Server::new_async().await;
-                let _m = server
-                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                    .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
-                    .expect_at_least(1)
-                    .create_async()
-                    .await;
-
-                // The repo row reads fine; the RULES read is the one that blips.
-                requeue_faults::inject(&repo.id, 0, 1);
-
-                let guard = state
-                    .encrypt_inflight
-                    .try_begin(&repo.id)
-                    .expect("push A admits");
-                assert!(
-                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                    "push B coalesces"
-                );
-
-                // Push A's captures are stale: no rule, nothing withheld.
-                crate::api::repos::run_post_push_replication_for_test(
-                    &state,
-                    guard,
-                    git_repo.path.clone(),
-                    repo.id.clone(),
-                    server.url(),
-                    true,
-                    owner.clone(),
-                    vec![pub_oid.clone()],
-                    Some(vec![]),
-                    HashSet::new(),
-                )
-                .await;
-
-                assert!(
-                    state
-                        .db
-                        .encrypted_blob_recipients_tag(&repo.id, &secret_oid)
-                        .await
-                        .unwrap()
-                        .is_some(),
-                    "the withheld blob is sealed under the RETRIED rule set (RED with \
-                     list_visibility_rules(..).ok(): an empty policy seals nothing)"
-                );
-                let c = requeue_faults::counters(&repo.id);
-                assert_eq!(
-                    c.rules_read_attempts, 2,
-                    "the failed rules read is retried, not collapsed into an empty rule set"
-                );
-                assert!(
-                    !state.db.is_pinned(&secret_oid).await.unwrap(),
-                    "the withheld blob is never pinned in the clear by the requeue"
-                );
-            }
-
-            /// SCENARIO 5. The fault-free control for scenario 4: the rules applied by the
-            /// requeue are the COALESCED push's fresh ones, never the spawn-time capture,
-            /// and the retry path does not perturb that (exactly one read of each).
-            #[sqlx::test]
-            async fn u2_requeue_applies_fresh_rules_not_spawn_captures(pool: PgPool) {
-                let state = test_state(pool).await;
-                let owner = new_did();
-                let reader = new_did();
-                let repo = seed_repo(&owner, "u2-fresh");
-                state.db.create_repo(&repo).await.expect("seed repo");
-                let git_repo = init_repo();
-                let pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
-                let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
-                state
-                    .db
-                    .set_visibility_rule(
-                        &repo.id,
-                        "/secret/**",
-                        VisibilityMode::B,
-                        &[reader],
-                        &owner,
-                    )
-                    .await
-                    .expect("set rule");
-
-                let mut server = mockito::Server::new_async().await;
-                let _m = server
-                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                    .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
-                    .expect_at_least(1)
-                    .create_async()
-                    .await;
-
-                requeue_faults::inject(&repo.id, 0, 0);
-
-                let guard = state
-                    .encrypt_inflight
-                    .try_begin(&repo.id)
-                    .expect("push A admits");
-                assert!(
-                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                    "push B coalesces"
-                );
-
-                crate::api::repos::run_post_push_replication_for_test(
-                    &state,
-                    guard,
-                    git_repo.path.clone(),
-                    repo.id.clone(),
-                    server.url(),
-                    true,
-                    owner.clone(),
-                    vec![pub_oid.clone()],
-                    Some(vec![]),
-                    HashSet::new(),
-                )
-                .await;
-
-                let c = requeue_faults::counters(&repo.id);
-                assert_eq!(
-                    (c.repo_read_attempts, c.rules_read_attempts),
-                    (1, 1),
-                    "a healthy DB is read exactly once per requeue pass"
-                );
-                assert!(
-                    state.db.is_pinned(&pub_oid).await.unwrap(),
-                    "the visible object is pinned under the fresh rules"
-                );
-                assert!(
-                    !state.db.is_pinned(&secret_oid).await.unwrap(),
-                    "the freshly-read rule withholds the secret blob (the spawn-time \
-                     capture had no rules at all)"
-                );
-            }
-
-            /// SCENARIO 6. Regression guard on the property the fix must not disturb: the
-            /// tail check-and-clear is atomic, so a push coalescing during it is still
-            /// covered by exactly one more pass, and the key is released after.
-            #[sqlx::test]
-            async fn u2_coalesced_push_still_covered_by_exactly_one_requeue_pass(pool: PgPool) {
-                let state = test_state(pool).await;
-                let owner = new_did();
-                let repo = seed_repo(&owner, "u2-coalesce");
-                state.db.create_repo(&repo).await.expect("seed repo");
-                let git_repo = init_repo();
-                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
-                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
-
-                let mut server = mockito::Server::new_async().await;
-                let _m = server
-                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                    .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
-                    .expect_at_least(1)
-                    .create_async()
-                    .await;
-
-                requeue_faults::inject(&repo.id, 0, 0);
-
-                let guard = state
-                    .encrypt_inflight
-                    .try_begin(&repo.id)
-                    .expect("push A admits");
-                // Push B lands during the in-flight window: dirty flag set.
-                assert!(
-                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                    "push B coalesces"
-                );
-                assert_eq!(
-                    state.encrypt_inflight.dirty(&repo.id),
-                    Some(true),
-                    "the coalesced push marked the repo dirty"
-                );
-
-                crate::api::repos::run_post_push_replication_for_test(
-                    &state,
-                    guard,
-                    git_repo.path.clone(),
-                    repo.id.clone(),
-                    server.url(),
-                    true,
-                    owner.clone(),
-                    vec![obj1.clone()],
-                    Some(vec![]),
-                    HashSet::new(),
-                )
-                .await;
-
-                assert_eq!(
-                    requeue_faults::counters(&repo.id).repo_read_attempts,
-                    1,
-                    "one coalesced push means exactly one requeue pass, no re-spin"
-                );
-                assert!(
-                    state.db.is_pinned(&obj1).await.unwrap(),
-                    "push A's object is pinned"
-                );
-                assert!(
-                    state.db.is_pinned(&obj2).await.unwrap(),
-                    "the coalesced push's object is covered by the requeue pass"
-                );
-                assert!(
-                    state.encrypt_inflight.is_empty(),
-                    "the key is released once the task is clean"
-                );
-            }
-
-            /// Wait for the tail's atomic check-and-clear to consume the pending dirty
-            /// bit (`Some(true)` -> `Some(false)`), which is the exact instant the task
-            /// enters `requeue_refresh_state`'s retry window. Deterministic, so the
-            /// coalescing push below lands INSIDE that window rather than on a sleep
-            /// guess. `None` means the key is already gone (the task exited), which the
-            /// caller reports as its own failure.
-            async fn wait_for_refresh_window(
-                inflight: &crate::state::EncryptInflight,
-                repo_id: &str,
-            ) -> bool {
-                for _ in 0..5_000 {
-                    match inflight.dirty(repo_id) {
-                        Some(false) => return true,
-                        None => return false,
-                        Some(true) => {}
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-                false
-            }
-
-            /// SCENARIO 7 (#173 F3, RED-before/GREEN-after). A push that coalesces WHILE
-            /// the re-read is retrying must not be thrown away when that re-read finally
-            /// gives up. `requeue_or_release` returning true cleared the dirty bit without
-            /// marking the guard released, so a `break` on `Failed` let
-            /// `EncryptInflightGuard::drop` remove the key outright and push C's pass was
-            /// never attempted, a silent drop with no reconciliation sweep behind it.
-            ///
-            /// Exactly `REQUEUE_REREAD_MAX_ATTEMPTS` injected repo-read faults, so the
-            /// first refresh exhausts its budget and the DB is healthy for the next one.
-            /// Push C coalesces inside that window. RED with `Failed => break`: obj_c is
-            /// never pinned. GREEN when `Failed` falls through and lets the tail decide.
-            #[sqlx::test]
-            async fn u2_failed_reread_keeps_a_push_that_coalesced_during_the_window(pool: PgPool) {
-                let state = test_state(pool).await;
-                let owner = new_did();
-                let repo = seed_repo(&owner, "u2-window");
-                state.db.create_repo(&repo).await.expect("seed repo");
-                let git_repo = init_repo();
-                let obj_a = commit(&git_repo.path, "a.txt", "one\n");
-                let obj_c = commit(&git_repo.path, "c.txt", "three\n");
-
-                let mut server = mockito::Server::new_async().await;
-                let _m = server
-                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                    .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
-                    .expect_at_least(1)
-                    .create_async()
-                    .await;
-
-                // Exactly the bound: the FIRST refresh burns all three attempts and gives
-                // up; every later refresh sees a healthy DB.
-                requeue_faults::inject(&repo.id, 3, 0);
-
-                let guard = state
-                    .encrypt_inflight
-                    .try_begin(&repo.id)
-                    .expect("push A admits");
-                assert!(
-                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                    "push B coalesces while A is in flight"
-                );
-
-                // Push C lands during the retry window, after the tail already consumed
-                // push B's dirty bit.
-                let inflight = state.encrypt_inflight.clone();
-                let repo_id = repo.id.clone();
-                let coalesced = tokio::spawn(async move {
-                    if !wait_for_refresh_window(&inflight, &repo_id).await {
-                        return false;
-                    }
-                    inflight.try_begin(&repo_id).is_none()
-                });
-
-                crate::api::repos::run_post_push_replication_for_test(
-                    &state,
-                    guard,
-                    git_repo.path.clone(),
-                    repo.id.clone(),
-                    server.url(),
-                    true,
-                    owner.clone(),
-                    vec![obj_a.clone()],
-                    Some(vec![]),
-                    HashSet::new(),
-                )
-                .await;
-
-                assert!(
-                    coalesced.await.expect("coalescing task"),
-                    "push C must have coalesced inside the retry window for this test to \
-                     mean anything"
-                );
-                assert!(
-                    state.db.is_pinned(&obj_c).await.unwrap(),
-                    "the push that coalesced during the retry window must still get a pass \
-                     once the DB recovers (RED with `Failed => break`: the dirty bit was \
-                     already consumed, so the pass was dropped with nothing to re-derive it)"
-                );
-                assert!(
-                    state.encrypt_inflight.is_empty(),
-                    "the guard key is released once the task exits"
-                );
-            }
-
-            /// SCENARIO 8 (#173 F3, the sustained-outage guard on the fall-through). Falling
-            /// through on `Failed` means `requeue_or_release` runs again, so a DB that never
-            /// recovers must still TERMINATE rather than spin. It does: an extra lap only
-            /// happens when a push actually coalesced, and each lap pays a full bounded
-            /// re-read (3 attempts with backoff). One coalescing push during the window buys
-            /// exactly one extra lap: 6 repo-read attempts, then exit.
-            #[sqlx::test]
-            async fn u2_sustained_failure_with_a_coalesce_terminates_after_one_more_lap(
-                pool: PgPool,
-            ) {
-                let state = test_state(pool).await;
-                let owner = new_did();
-                let repo = seed_repo(&owner, "u2-sustained-window");
-                state.db.create_repo(&repo).await.expect("seed repo");
-                let git_repo = init_repo();
-                let obj_a = commit(&git_repo.path, "a.txt", "one\n");
-
-                let mut server = mockito::Server::new_async().await;
-                let _m = server
-                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
-                    .with_status(200)
-                    .with_body(r#"{"Hash":"bafyprovider"}"#)
-                    .expect_at_least(1)
-                    .create_async()
-                    .await;
-
-                // The outage never clears.
-                requeue_faults::inject(&repo.id, 10_000, 0);
-
-                let guard = state
-                    .encrypt_inflight
-                    .try_begin(&repo.id)
-                    .expect("push A admits");
-                assert!(
-                    state.encrypt_inflight.try_begin(&repo.id).is_none(),
-                    "push B coalesces"
-                );
-
-                let inflight = state.encrypt_inflight.clone();
-                let repo_id = repo.id.clone();
-                let coalesced = tokio::spawn(async move {
-                    if !wait_for_refresh_window(&inflight, &repo_id).await {
-                        return false;
-                    }
-                    inflight.try_begin(&repo_id).is_none()
-                });
-
-                // The watchdog is the real assertion: a fall-through that re-spins without
-                // the dirty gate would never return here.
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
-                    crate::api::repos::run_post_push_replication_for_test(
-                        &state,
-                        guard,
-                        git_repo.path.clone(),
-                        repo.id.clone(),
-                        server.url(),
-                        true,
-                        owner.clone(),
-                        vec![obj_a.clone()],
-                        Some(vec![]),
-                        HashSet::new(),
-                    ),
-                )
-                .await
-                .expect(
-                    "the task must terminate under a sustained outage; a fall-through that \
-                     does not gate on the dirty bit spins forever",
-                );
-
-                assert!(
-                    coalesced.await.expect("coalescing task"),
-                    "push C must have coalesced inside the retry window"
-                );
-                assert_eq!(
-                    requeue_faults::counters(&repo.id).repo_read_attempts,
-                    6,
-                    "one coalescing push buys exactly one more bounded re-read lap \
-                     (3 + 3 attempts), never an unbounded retry"
-                );
-                assert!(
-                    state.encrypt_inflight.is_empty(),
-                    "the guard key is released on the give-up path"
-                );
-            }
-        }
     }
 }

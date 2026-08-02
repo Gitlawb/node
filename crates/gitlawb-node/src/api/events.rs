@@ -138,9 +138,33 @@ pub async fn list_ref_updates(
     let caller = auth.as_ref().map(|e| e.0 .0.as_str());
     let updates = collect_visible_ref_updates(&state.db, None, limit, caller).await?;
 
+    // Resolve the trusted display owner_did per row. The stored wire value is
+    // untrusted (arrives over gossip / unsigned peer notify), so it is echoed
+    // only when it matches the canonical owner of the local repo the slug
+    // names (#P1); legacy None rows are attributed via an exact unique local
+    // match (#P3). Both surfaces share this resolver so they cannot drift.
+    // The batch resolver issues at most one query per distinct local repo
+    // rather than one per event row (#P2).
+    let raw_dids: Vec<Option<String>> = state
+        .db
+        .resolve_ref_update_owner_dids(
+            &updates
+                .iter()
+                .map(|u| (u.repo.as_str(), u.owner_did.as_deref()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+    let owner_dids: Vec<serde_json::Value> = raw_dids
+        .into_iter()
+        .map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
+        .collect();
+
     let events: Vec<serde_json::Value> = updates
         .iter()
-        .map(|u| {
+        .enumerate()
+        .map(|(i, u)| {
+            let owner_did = owner_dids[i].clone();
             serde_json::json!({
                 "id":          u.id,
                 "node_did":    u.node_did,
@@ -153,6 +177,7 @@ pub async fn list_ref_updates(
                 "cert_id":     u.cert_id,
                 "received_at": u.received_at,
                 "from_peer":   u.from_peer,
+                "owner_did":   owner_did,
             })
         })
         .collect();
@@ -225,6 +250,7 @@ pub async fn list_repo_events(
                 "pusher_did": c.pusher_did,
                 "node_did":   c.node_did,
                 "timestamp":  c.issued_at,
+                "owner_did":  record.owner_did,
                 "source":     "local",
             })
         })
@@ -240,28 +266,46 @@ pub async fn list_repo_events(
     // collect_visible_ref_updates drops any row whose slug matches a local repo the
     // caller cannot read (fail-closed), and propagates DB errors instead of swallowing
     // them.
-    let gossip_events: Vec<serde_json::Value> =
-        collect_visible_ref_updates(&state.db, Some(&repo_id_str), limit, caller)
-            .await?
-            .iter()
-            .map(|u| {
-                serde_json::json!({
-                    "type":        "gossipsub",
-                    "id":          u.id,
-                    "repo":        u.repo,
-                    "ref_name":    u.ref_name,
-                    "old_sha":     u.old_sha,
-                    "new_sha":     u.new_sha,
-                    "pusher_did":  u.pusher_did,
-                    "node_did":    u.node_did,
-                    "timestamp":   u.timestamp,
-                    "cert_id":     u.cert_id,
-                    "received_at": u.received_at,
-                    "from_peer":   u.from_peer,
-                    "source":      "gossipsub",
-                })
+    let gossip_updates =
+        collect_visible_ref_updates(&state.db, Some(&repo_id_str), limit, caller).await?;
+    let gossip_raw: Vec<Option<String>> = state
+        .db
+        .resolve_ref_update_owner_dids(
+            &gossip_updates
+                .iter()
+                .map(|u| (u.repo.as_str(), u.owner_did.as_deref()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+    let gossip_owner_dids: Vec<serde_json::Value> = gossip_raw
+        .into_iter()
+        .map(|o| o.map_or(serde_json::Value::Null, |s| serde_json::json!(s)))
+        .collect();
+
+    let gossip_events: Vec<serde_json::Value> = gossip_updates
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let owner_did = gossip_owner_dids[i].clone();
+            serde_json::json!({
+                "type":        "gossipsub",
+                "id":          u.id,
+                "repo":        u.repo,
+                "ref_name":    u.ref_name,
+                "old_sha":     u.old_sha,
+                "new_sha":     u.new_sha,
+                "pusher_did":  u.pusher_did,
+                "node_did":    u.node_did,
+                "timestamp":   u.timestamp,
+                "cert_id":     u.cert_id,
+                "received_at": u.received_at,
+                "from_peer":   u.from_peer,
+                "owner_did":   owner_did,
+                "source":      "gossipsub",
             })
-            .collect();
+        })
+        .collect();
 
     // Merge both lists
     let mut all_events: Vec<serde_json::Value> = cert_events;
@@ -326,6 +370,7 @@ mod ref_updates_feed_tests {
             cert_id: None,
             received_at: Utc::now().to_rfc3339(),
             from_peer: "peer1".into(),
+            owner_did: None,
         }
     }
 
@@ -1105,7 +1150,14 @@ mod ref_updates_feed_tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(count(&body_json(resp).await), 2);
+        let body = body_json(resp).await;
+        assert_eq!(count(&body), 2);
+        for event in body["events"].as_array().unwrap() {
+            assert_eq!(
+                event["owner_did"], OWNER,
+                "each event must carry the local owner_did"
+            );
+        }
     }
 
     // Anon reads a quarantined mirror → 404 (withheld without disclosing existence

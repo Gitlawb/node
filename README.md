@@ -4,7 +4,7 @@
 
 Gitlawb Node is the open-source node software behind the Gitlawb network. It lets anyone run a self-hosted node, publish repositories under a DID, sign writes with Ed25519 HTTP signatures, replicate git activity across peers, and move toward a resilient app-delivery network where code and build assets can be served closer to users.
 
-Gitlawb is not trying to be only “another git host.” The long-term direction is:
+Gitlawb is not trying to be only "another git host." The long-term direction is:
 
 ```txt
 Decentralized GitHub
@@ -34,12 +34,12 @@ This is a Rust workspace with four crates:
 
 Most git hosting today depends on a small number of centralized platforms. Gitlawb Nodes are designed for a different model:
 
-- **Own your identity** — every user, agent, and node is an Ed25519 keypair represented as `did:key:z6Mk...`.
-- **Signed writes by default** — write requests use RFC 9421 HTTP Signatures instead of passwords.
-- **Git-native transport** — repositories are still real git repositories served over smart HTTP.
-- **Agent-native workflows** — the `gl` CLI and MCP server expose repo, issue, task, PR, and UCAN flows to AI agents.
-- **Peer-aware delivery** — nodes can announce, discover, gossip, and sync with each other.
-- **App CDN direction** — the network can evolve from decentralized code storage into code + asset + app delivery.
+- **Own your identity**: every user, agent, and node is an Ed25519 keypair represented as `did:key:z6Mk...`.
+- **Signed writes by default**: write requests use RFC 9421 HTTP Signatures instead of passwords.
+- **Git-native transport**: repositories are still real git repositories served over smart HTTP.
+- **Agent-native workflows**: the `gl` CLI and MCP server expose repo, issue, task, PR, and UCAN flows to AI agents.
+- **Peer-aware delivery**: nodes can announce, discover, gossip, and sync with each other.
+- **App CDN direction**: the network can evolve from decentralized code storage into code + asset + app delivery.
 
 ---
 
@@ -189,14 +189,14 @@ For public-network use, make sure `GITLAWB_NODE` points to the node you want. Th
 
 Public nodes (e.g. `node.gitlawb.com`) require two things on writes:
 
-1. **RFC 9421 HTTP Signatures** — every write is signed by your identity key. `gl`
+1. **RFC 9421 HTTP Signatures**: every write is signed by your identity key. `gl`
    and the `git-remote-gitlawb` helper do this automatically. An old/unsigned CLI
    fails with `401 not_an_agent`; `gl` will tell you to upgrade and register.
 2. **An iCaptcha proof** on the spam-gated writes (**repo create, fork, register**).
    `gl` solves this for you: on the node's `403 icaptcha_proof_required` it reads the
    `x-icaptcha-url` / `x-icaptcha-level` hints, requests a challenge, solves it
    locally (arithmetic / algebra / sequence), and **retries the same signed request**
-   with the `x-icaptcha-proof` header — no manual steps, no env vars.
+   with the `x-icaptcha-proof` header. No manual steps, no env vars.
 
 ```bash
 gl identity new                                   # create did:key identity
@@ -215,14 +215,14 @@ Notes:
 - **Proofs are short-lived (~5 min TTL) and single-use.** If one expires between
   solving and use, the client transparently solves a fresh one and retries.
 - **What needs what:** create / fork / register are signed **and** iCaptcha-gated;
-  `git push` is **signed-only** (owner signature is the gate — no per-push challenge);
+  `git push` is **signed-only** (owner signature is the gate, no per-push challenge);
   reads (clone / fetch / `repo info`) need no proof. A non-existent repo returns a
   clear `404`, never a placeholder.
 - **API-key iCaptcha deployments:** set `GITLAWB_ICAPTCHA_URL` to your iCaptcha
   origin and `GITLAWB_ICAPTCHA_API_KEY` to its key. The client only talks to an
   `https` origin whose host is allowlisted (that URL or the public default), and
-  sends the bearer token **only** to your configured origin — never to a URL a
-  node advertises — so a hostile node can't capture the key or redirect the solve.
+  sends the bearer token **only** to your configured origin, never to a URL a
+  node advertises, so a hostile node can't capture the key or redirect the solve.
 
 ---
 
@@ -343,11 +343,15 @@ Important node settings:
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
-| `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack, receive-pack, or `info/refs` advertisement may run before it is aborted (504). Default 600. Also bounds the withheld-blob classification walk (on both the upload-pack serve and receive-pack replication paths) and the push-side pin-candidate discovery (`rev-list` / `cat-file`), each reaped via process-group teardown at the deadline. |
+| `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack, receive-pack, or `info/refs` advertisement may run before it is aborted (504). Default 600. Also bounds the withheld-blob classification walk (on both the upload-pack serve and receive-pack replication paths) and the push-side pin-candidate discovery (`rev-list` / `cat-file`), each reaped via process-group teardown at the deadline. On the path-scoped upload-pack path the classification walk and the pack serve share ONE deadline, so this value bounds their combined duration rather than granting each stage a full budget: a walk that consumes it leaves the serve nothing and the clone gets a 504. Serving large path-scoped repos may therefore need a higher value than they did when each stage was budgeted separately. Accepted range is 1 to 3153600000 (100 years), since the node derives deadlines from this value and a larger one cannot be represented. |
 | `GITLAWB_GIT_ACQUIRE_TIMEOUT_SECS` | Max seconds the storage-acquisition phase (Tigris HEAD/GET, push advisory-lock) of a served git op may run before the request is shed with a 503, separate from the git-run timeout. The concurrency permit is released on expiry so a stalled backend cannot pin the pool. Default 30. |
+| `GITLAWB_REPO_LEASE_MAX_WAITERS` | Max pushes parked at once waiting for the same repo's write lease. Each waiter pins its buffered pack body, so this bounds that memory for a hot repo; past the cap the newest push sheds a 503 + Retry-After instead of queueing. Pushes to other repos are unaffected, and the lease holder is not counted. Default 8. |
 | `GITLAWB_MAX_CONCURRENT_IPFS_WALKS` | Max concurrent `GET /ipfs/{cid}` visibility walks across all callers (own pool, disjoint from the served-git pools); over-cap sheds 503. Default 32. |
 | `GITLAWB_IPFS_WALK_PER_SOURCE` | Max concurrent `/ipfs` walks a single source IP may hold. Default 4. |
-| `GITLAWB_IPFS_MAX_REPOS_WALKED` | Max legacy (NULL-provenance) repos probed per `/ipfs/{cid}` request, bounding the scan-fallback fan-out. A truncated scan returns a retryable 503, not a false 404. Default 256. |
+| `GITLAWB_IPFS_MAX_LEGACY_PROBES` | Max legacy (NULL-provenance) repos probed per `/ipfs/{cid}` request, bounding the scan-fallback fan-out. A truncated scan returns a retryable 503, not a false 404. Default 256. |
+| `GITLAWB_IPFS_MAX_REPOS_WALKED` | Max expensive path-scope visibility walks per `/ipfs/{cid}` request; over-cap repos are skipped and the scan continues, shedding a retryable 503 (not a false 404) if the object is then found nowhere. Raised to `MAX_PIN_SOURCES + 1` if set below it, so a provenanced request is never truncated before its full source set is tried. Default 64. |
+| `GITLAWB_IPFS_MAX_REPO_VISITS` | Ceiling on repos one `/ipfs/{cid}` request may visit (acquire + probe) past the visibility gate. Also the worst-case per-request Tigris fetch count. On exhaustion the scan stops with a retryable 503. Default 1024. |
+| `GITLAWB_IPFS_REQUEST_BUDGET_SECS` | Absolute wall-clock budget for one admitted `/ipfs/{cid}` request's acquire+walk lifetime. Per-stage clamps bound the acquire and walk stages to the remaining budget, and no stage starts once it is exhausted; the scan then stops with a retryable 503. The object-type probe and content-read `cat-file` subprocesses are budget-checked before starting and each also run under their own deadline (the lesser of `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` and the remaining budget), reaped via process-group teardown, so a hung `cat-file` cannot hold the request's walk slot past it. One hang path is still unbounded: the probe's object-store readability check is a plain filesystem sweep with nothing to reap, so a wedged filesystem can hold the slot past the deadline. Default 600. Accepted range is 1 to 3153600000 (100 years), since the node derives a deadline from this value and a larger one cannot be represented. |
 | `GITLAWB_IPFS_RATE_LIMIT` | Max `/ipfs/{cid}` requests per client IP per hour (route flood brake). 0 disables. Default 600. |
 | `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |
 | `GITLAWB_PINATA_JWT` | Optional Pinata/IPFS warm-storage pinning. |
