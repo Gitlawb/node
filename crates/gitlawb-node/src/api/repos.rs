@@ -960,6 +960,104 @@ pub(crate) async fn run_encrypt_pin_task_for_test(
     .await;
 }
 
+/// Test-only fault-injection seam for the drain re-reads in
+/// `resolve_drain_object_list`. The behavior worth testing lives on the `Err` arm of
+/// the two re-reads, which a real Postgres pool will not produce on demand, so the two
+/// reads go through the wrappers below and consult this table first. Keyed by `repo_id`
+/// (a fresh uuid per test) so tests running in parallel in one process cannot see each
+/// other's injections, and it also records the ATTEMPT counts the retry-bound
+/// assertions key on.
+#[cfg(test)]
+pub(crate) mod drain_faults {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Default, Clone, Copy, Debug)]
+    pub(crate) struct Counters {
+        pub(crate) repo_read_failures_left: usize,
+        pub(crate) rules_read_failures_left: usize,
+        pub(crate) repo_read_attempts: usize,
+        pub(crate) rules_read_attempts: usize,
+    }
+
+    fn table() -> &'static Mutex<HashMap<String, Counters>> {
+        static TABLE: OnceLock<Mutex<HashMap<String, Counters>>> = OnceLock::new();
+        TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Make the next `repo_read_failures` repo re-reads and the next
+    /// `rules_read_failures` rule re-reads for `repo_id` return `Err`, then succeed.
+    /// Only the tests that drive the retry arms call it, so it is dead until they land.
+    #[allow(dead_code)]
+    pub(crate) fn inject(repo_id: &str, repo_read_failures: usize, rules_read_failures: usize) {
+        table().lock().unwrap().insert(
+            repo_id.to_string(),
+            Counters {
+                repo_read_failures_left: repo_read_failures,
+                rules_read_failures_left: rules_read_failures,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Observed attempt counts (and remaining injections) for `repo_id`.
+    /// Only the tests that assert the retry bound call it, so it is dead until they land.
+    #[allow(dead_code)]
+    pub(crate) fn counters(repo_id: &str) -> Counters {
+        table()
+            .lock()
+            .unwrap()
+            .get(repo_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Production-path hook: count one repo re-read attempt, return whether it must fail.
+    pub(crate) fn take_repo_read(repo_id: &str) -> bool {
+        let mut map = table().lock().unwrap();
+        let c = map.entry(repo_id.to_string()).or_default();
+        c.repo_read_attempts += 1;
+        if c.repo_read_failures_left > 0 {
+            c.repo_read_failures_left -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Production-path hook: count one rules re-read attempt, return whether it must fail.
+    pub(crate) fn take_rules_read(repo_id: &str) -> bool {
+        let mut map = table().lock().unwrap();
+        let c = map.entry(repo_id.to_string()).or_default();
+        c.rules_read_attempts += 1;
+        if c.rules_read_failures_left > 0 {
+            c.rules_read_failures_left -= 1;
+            return true;
+        }
+        false
+    }
+}
+
+/// The drain's repo re-read, behind the test-only fault seam above.
+async fn drain_get_repo(ctx: &EncryptTaskCtx) -> anyhow::Result<Option<RepoRecord>> {
+    #[cfg(test)]
+    if drain_faults::take_repo_read(&ctx.repo_id) {
+        return Err(anyhow::anyhow!("injected repo re-read failure"));
+    }
+    ctx.db.get_repo(&ctx.owner_did, &ctx.repo_name).await
+}
+
+/// The drain's visibility-rule re-read, behind the test-only fault seam above.
+async fn drain_list_rules(
+    ctx: &EncryptTaskCtx,
+    record_id: &str,
+) -> anyhow::Result<Vec<crate::db::VisibilityRule>> {
+    #[cfg(test)]
+    if drain_faults::take_rules_read(&ctx.repo_id) {
+        return Err(anyhow::anyhow!("injected visibility-rule re-read failure"));
+    }
+    ctx.db.list_visibility_rules(record_id).await
+}
+
 /// Resolve a coalesced-drain iteration's replicable object list. Re-fetches the
 /// repo record and visibility rules FRESH — rules tightened between the coalesced
 /// push and its drain must be honored, fail closed: a newly-withheld blob is not
@@ -980,7 +1078,7 @@ async fn resolve_drain_object_list(
     Option<Vec<crate::db::VisibilityRule>>,
     bool,
 )> {
-    let record = match ctx.db.get_repo(&ctx.owner_did, &ctx.repo_name).await {
+    let record = match drain_get_repo(ctx).await {
         Ok(Some(r)) => r,
         Ok(None) => {
             tracing::warn!(
@@ -1002,7 +1100,7 @@ async fn resolve_drain_object_list(
     // fresh by owner/name, and a delete+re-create between spawn and drain gives
     // the row a NEW id — rules read against the stale id come back empty and
     // would fail open for the new row.
-    let rules_opt = ctx.db.list_visibility_rules(&record.id).await.ok();
+    let rules_opt = drain_list_rules(ctx, &record.id).await.ok();
     let (_announce, withheld) = replication_withheld_set(
         ctx.encrypt_sem.clone(),
         rules_opt.clone(),
