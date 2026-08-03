@@ -578,7 +578,16 @@ pub async fn git_info_refs(
     }
     .map_err(|e| {
         tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
-        AppError::Git(e.to_string())
+        // This closure bypasses the `From<anyhow::Error>` chain, so a typed
+        // refusal would otherwise be stringified into a 500 `git_error`. Route
+        // just that one case through `From` and leave every other failure on
+        // exactly today's behavior: this call site also serves the read path via
+        // `acquire`, whose error vocabulary is out of scope here.
+        if e.is::<crate::git::repo_store::RepoUnavailable>() {
+            AppError::from(e)
+        } else {
+            AppError::Git(e.to_string())
+        }
     })?;
 
     smart_http::info_refs(&disk_path, &service)

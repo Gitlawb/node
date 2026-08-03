@@ -55,6 +55,17 @@ impl RepoStore {
         }
     }
 
+    /// Same as [`RepoStore::for_testing`] but with Tigris enabled, so the paths
+    /// that only run when a backend is configured are reachable in a test.
+    #[cfg(test)]
+    pub fn for_testing_with_tigris(
+        repos_dir: PathBuf,
+        lock_pool: PgPool,
+        tigris: TigrisClient,
+    ) -> Self {
+        Self::new(repos_dir, Some(tigris), lock_pool, Duration::from_secs(300))
+    }
+
     /// Shorten the lock-acquire deadline so the busy path is reachable in a test
     /// without waiting out the production default.
     #[cfg(test)]
@@ -151,26 +162,51 @@ impl RepoStore {
     /// Use this for operations that precede a write (e.g. `info/refs` for
     /// `git-receive-pack`) so the client sees the same refs that `acquire_write()`
     /// will operate on.
+    ///
+    /// A failed existence check refuses the acquire rather than guessing the
+    /// archive is absent, matching the under-lock path in `acquire_write()`.
     pub async fn acquire_fresh(&self, owner_did: &str, repo_name: &str) -> Result<PathBuf> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
 
         if let Some(ref tigris) = self.tigris {
-            if tigris.exists(&owner_slug, repo_name).await.unwrap_or(false) {
-                debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
-                if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
-                    // The Tigris archive is present (HEAD ok) but unreadable — a
-                    // corrupt/partial upload, or a transient GET failure. If we have a
-                    // valid local copy, proceed with it rather than blocking the write;
-                    // the post-write upload re-syncs (self-heals) Tigris. Only hard-fail
-                    // when there is no local copy to fall back to.
-                    if local_path.exists() {
-                        warn!(repo = %repo_name, err = %e,
-                            "acquire_fresh: tigris download failed — falling back to local copy");
-                        return Ok(local_path);
+            // The HEAD and the download fail for epistemically DIFFERENT reasons,
+            // so they are kept apart rather than collapsed into one `Result`. The
+            // `unwrap_or(false)` this replaced read a HEAD error as "no archive"
+            // and silently advertised a possibly-stale local copy to a client that
+            // is about to push against it.
+            match tigris.exists(&owner_slug, repo_name).await {
+                Ok(true) => {
+                    debug!(repo = %repo_name, "acquire_fresh: downloading latest from tigris");
+                    if let Err(e) = tigris.download(&owner_slug, repo_name, &local_path).await {
+                        // The Tigris archive is present (HEAD ok) but unreadable — a
+                        // corrupt/partial upload, or a transient GET failure. If we have a
+                        // valid local copy, proceed with it rather than blocking the write;
+                        // the post-write upload re-syncs (self-heals) Tigris. Only hard-fail
+                        // when there is no local copy to fall back to.
+                        if local_path.exists() {
+                            warn!(repo = %repo_name, err = %e,
+                                "acquire_fresh: tigris download failed — falling back to local copy");
+                            return Ok(local_path);
+                        }
+                        return Err(e).context("downloading repo from tigris (fresh)");
                     }
-                    return Err(e).context("downloading repo from tigris (fresh)");
+                    return Ok(local_path);
                 }
-                return Ok(local_path);
+                Ok(false) => {}
+                Err(e) => {
+                    // We do not know whether a newer archive exists, so we cannot
+                    // tell whether the local copy is current. Advertising stale refs
+                    // here sends the client into a push computed against the wrong
+                    // base, so refuse for the same reason `acquire_write` refuses on
+                    // this condition. A transient storage blip costs a retryable
+                    // refusal, which is the cheaper failure.
+                    warn!(repo = %repo_name, err = %e,
+                        "acquire_fresh: tigris HEAD failed — refusing rather than \
+                         guessing the archive is absent");
+                    return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                        "tigris HEAD failed during acquire_fresh for {owner_slug}/{repo_name}"
+                    )));
+                }
             }
         }
 
@@ -2091,6 +2127,71 @@ mod tests {
         assert!(
             body.contains("internal_error"),
             "an unrelated failure must keep the internal_error code, got {body}"
+        );
+    }
+
+    /// A Tigris client aimed at a closed port, so every call fails at the
+    /// transport layer promptly and `exists()` returns `Err` rather than
+    /// `Ok(false)`.
+    #[cfg(test)]
+    fn unreachable_tigris() -> TigrisClient {
+        TigrisClient::for_testing_with_endpoint("test-bucket", "http://127.0.0.1:1")
+    }
+
+    /// A failed HEAD tells us nothing about whether a newer archive exists, so
+    /// the pre-write refresh must refuse rather than read the failure as "no
+    /// archive" and serve a possibly-stale local copy to the pushing client.
+    ///
+    /// Asserts on the downcast, not the message, so a context rewrite cannot
+    /// quietly make this vacuous.
+    #[sqlx::test]
+    async fn acquire_fresh_refuses_when_the_head_check_fails(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 2).await;
+        let store = RepoStore::for_testing_with_tigris(
+            PathBuf::from("/tmp/gitlawb-headfail-fresh"),
+            lock_pool,
+            unreachable_tigris(),
+        );
+
+        let err = store
+            .acquire_fresh("did:key:z6MkHeadFail", "freshrepo")
+            .await
+            .expect_err("a failed HEAD must refuse rather than serve the local copy");
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
+        );
+    }
+
+    /// The under-lock sibling of the above. `acquire_write` already refuses on
+    /// this condition; this proves the `RefreshFailure::Unknown` arm end to end
+    /// against a real failing HEAD rather than by reading the code.
+    #[sqlx::test]
+    async fn acquire_write_refuses_when_the_head_check_fails(pool: PgPool) {
+        let opts = (*pool.connect_options()).clone();
+        let lock_pool = no_reap_pool(&opts, 2).await;
+        let store = RepoStore::for_testing_with_tigris(
+            PathBuf::from("/tmp/gitlawb-headfail-write"),
+            lock_pool,
+            unreachable_tigris(),
+        );
+
+        // Not `expect_err`: the guard is not Debug, and a guard obtained here
+        // must be released rather than dropped on a panic path.
+        let err = match store
+            .acquire_write("did:key:z6MkHeadFail", "writerepo")
+            .await
+        {
+            Err(e) => e,
+            Ok(guard) => {
+                guard.release(false).await;
+                panic!("a failed HEAD must refuse the write rather than proceed on a stale tree");
+            }
+        };
+        assert!(
+            err.downcast_ref::<RepoUnavailable>().is_some(),
+            "the refusal must be typed so the handler layer maps it to a retryable 503, got {err:#}"
         );
     }
 

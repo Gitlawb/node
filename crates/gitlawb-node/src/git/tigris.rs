@@ -31,6 +31,33 @@ impl TigrisClient {
         })
     }
 
+    /// Build a client pointed at an arbitrary endpoint, for tests.
+    ///
+    /// The production constructor reads the endpoint and credentials from the
+    /// environment, which a test cannot steer without mutating process-global
+    /// state. This takes both explicitly so a test can aim the client at a
+    /// closed port and get a prompt transport error out of `exists()`.
+    ///
+    /// `RetryConfig::disabled()` is load-bearing, not tidiness: the SDK's default
+    /// policy retries a connection refusal with backoff, which turns each failing
+    /// call into seconds of waiting.
+    #[cfg(test)]
+    pub fn for_testing_with_endpoint(bucket: &str, endpoint: &str) -> Self {
+        use aws_sdk_s3::config::{retry::RetryConfig, Credentials, Region};
+
+        let config = aws_sdk_s3::config::Config::builder()
+            .endpoint_url(endpoint)
+            .credentials_provider(Credentials::new("test", "test", None, None, "test"))
+            .region(Region::new("auto"))
+            .retry_config(RetryConfig::disabled())
+            .behavior_version_latest()
+            .build();
+        Self {
+            s3: S3Client::from_conf(config),
+            bucket: bucket.to_string(),
+        }
+    }
+
     /// S3 key for a given repo: `repos/v1/{owner_slug}/{repo_name}.tar.zst`
     fn repo_key(owner_slug: &str, repo_name: &str) -> String {
         format!("repos/v1/{owner_slug}/{repo_name}.tar.zst")
