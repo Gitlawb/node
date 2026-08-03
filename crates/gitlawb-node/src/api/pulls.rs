@@ -224,10 +224,31 @@ pub async fn merge_pr(
         &pr.title,
     );
 
-    // Always release the advisory lock — even on error; upload to Tigris only on success.
-    guard.release(merge_result.is_ok()).await;
+    // Always release the advisory lock — even on error; upload to storage only on success.
+    let release_result = guard.release(merge_result.is_ok()).await;
 
     let merge_sha = merge_result.map_err(|e| AppError::Git(e.to_string()))?;
+    // A durable-upload failure is recoverable ONLY while the pending-upload
+    // marker protects the merge commit; verify it exists before choosing to
+    // proceed (proceeding keeps the DB status consistent with the already
+    // merged ref, which a retry cannot un-merge). Without the marker nothing
+    // protects the merge from a stale-archive rollback — fail the request so
+    // the inconsistency is surfaced instead of silently losable.
+    if let Err(e) = release_result {
+        if state
+            .repo_store
+            .pending_marker_exists(&record.owner_did, &record.name)
+        {
+            tracing::error!(repo = %record.name, pr = %pr.id, err = %e,
+                "merge committed locally but durable upload failed — storage re-syncs on next upload");
+        } else {
+            tracing::error!(repo = %record.name, pr = %pr.id, err = %e,
+                "merge committed locally with NO durable protection — failing the request");
+            return Err(AppError::Git(format!(
+                "merge applied locally but durability could not be guaranteed: {e}"
+            )));
+        }
+    }
 
     state.db.merge_pr(&pr.id, &merger_did).await?;
     let _ = state.db.touch_repo(&record.id).await;

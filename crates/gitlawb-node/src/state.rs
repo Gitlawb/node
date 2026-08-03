@@ -48,7 +48,7 @@ pub struct AppState {
     pub graphql_schema: Arc<crate::graphql::GitlawbSchema>,
     /// Fly.io machine ID — used for fly-replay routing in multi-machine deployments
     pub machine_id: Option<String>,
-    /// Centralized repo storage: local disk cache + optional Tigris backend
+    /// Centralized repo storage: local disk cache + optional object-store backend
     pub repo_store: RepoStore,
     /// Per-DID rate limiter for creation endpoints (repos, issues, PRs)
     pub rate_limiter: RateLimiter,
