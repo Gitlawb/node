@@ -577,7 +577,11 @@ pub async fn git_info_refs(
             .await
     }
     .map_err(|e| {
-        tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
+        if is_expected_transient_acquire_failure(&e) {
+            tracing::warn!(repo = %name, service = %service, err = %e, "repo acquire failed");
+        } else {
+            tracing::error!(repo = %name, service = %service, err = %e, "repo acquire failed");
+        }
         // This closure bypasses the `From<anyhow::Error>` chain, so a typed
         // refusal would otherwise be stringified into a 500 `git_error`. Route
         // just that one case through `From` and leave every other failure on
@@ -602,6 +606,23 @@ pub async fn git_info_refs(
 /// [`smart_http::GitServiceTimeout`] to 504, a malformed client request to 400,
 /// anything else to a 500 git error. Pure (no logging) so it is unit-testable;
 /// callers add their own tracing.
+/// Acquire failures that are ordinary and transient: lock contention
+/// ([`RepoBusy`]) and an under-lock refresh that could not reach object storage
+/// ([`RepoUnavailable`]). Both already log at their raise site and both map to a
+/// retryable 503, so the handler layer logs them at warn rather than paging.
+/// Best-effort, like the database startup classifier: anything this cannot
+/// recognize counts as NOT transient and keeps its error-level log.
+///
+/// [`RepoBusy`]: crate::git::repo_store::RepoBusy
+/// [`RepoUnavailable`]: crate::git::repo_store::RepoUnavailable
+fn is_expected_transient_acquire_failure(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::git::repo_store::RepoBusy>()
+        .is_some()
+        || err
+            .downcast_ref::<crate::git::repo_store::RepoUnavailable>()
+            .is_some()
+}
+
 fn git_service_app_error(err: &anyhow::Error) -> AppError {
     if err
         .downcast_ref::<smart_http::GitServiceTimeout>()
@@ -946,7 +967,11 @@ pub async fn git_receive_pack(
         .acquire_write(&record.owner_did, &record.name)
         .await
         .inspect_err(|e| {
-            tracing::error!(repo = %name, err = %e, "acquire_write failed");
+            if is_expected_transient_acquire_failure(e) {
+                tracing::warn!(repo = %name, err = %e, "acquire_write failed");
+            } else {
+                tracing::error!(repo = %name, err = %e, "acquire_write failed");
+            }
         })?;
     let disk_path = guard.path().to_path_buf();
     tracing::debug!(repo = %name, path = %disk_path.display(), "running git receive-pack");
@@ -1879,6 +1904,26 @@ mod tests {
         // Anything else -> 500 git error.
         let other = anyhow::anyhow!("some other git failure");
         assert!(matches!(git_service_app_error(&other), AppError::Git(_)));
+    }
+
+    #[test]
+    fn is_expected_transient_matches_both_typed_refusals() {
+        // The real raise shape wraps the marker in a `.context()` layer naming the
+        // owner slug and repo, so the downcast has to survive that wrapping.
+        let busy = anyhow::Error::new(crate::git::repo_store::RepoBusy)
+            .context("another write is in progress for alice/demo");
+        assert!(is_expected_transient_acquire_failure(&busy));
+
+        let unavailable = anyhow::Error::new(crate::git::repo_store::RepoUnavailable)
+            .context("could not read the archive HEAD for alice/demo");
+        assert!(is_expected_transient_acquire_failure(&unavailable));
+    }
+
+    #[test]
+    fn is_expected_transient_rejects_unrelated_failures() {
+        // Anything the classifier cannot recognize keeps paging at error level.
+        let other = anyhow::anyhow!("disk on fire");
+        assert!(!is_expected_transient_acquire_failure(&other));
     }
 
     fn repo_owned_by(owner_did: &str) -> crate::db::RepoRecord {
