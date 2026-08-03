@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.7.1](https://github.com/Gitlawb/node/compare/v0.7.0...v0.7.1) (2026-08-03)
+
+
+### Bug Fixes
+
+* **ci:** make the docker dependency cache work and unbreak Dockerfile.bins ([99b2b9a](https://github.com/Gitlawb/node/commit/99b2b9a16662761a3959a2941798e6823621bda5))
+* **ci:** make the docker dependency cache work and unbreak Dockerfile.bins ([a49e04d](https://github.com/Gitlawb/node/commit/a49e04ddcd23f3b666421486ae60c3c4329e2242)), closes [#265](https://github.com/Gitlawb/node/issues/265) [#266](https://github.com/Gitlawb/node/issues/266)
+* **db:** pin profile DID matching with lone non-key fixture and boundary matrix ([b4016dc](https://github.com/Gitlawb/node/commit/b4016dce9d1fe450603173f9d92bd880127620fa)), closes [#298](https://github.com/Gitlawb/node/issues/298)
+* **node:** add a shared owner/name slug validator ([#272](https://github.com/Gitlawb/node/issues/272)) ([51d82de](https://github.com/Gitlawb/node/commit/51d82ded57a776d9c7e2fe65895efdbf9e227dc8))
+* **node:** bound the slug owner by NAME_MAX, not the DID limit ([#272](https://github.com/Gitlawb/node/issues/272)) ([27b0495](https://github.com/Gitlawb/node/commit/27b0495a6f7edeecddbe62b0f075a7e3b1ef5053))
+* **node:** fail a sync row terminally when a non-directory holds the owner path ([2e664b7](https://github.com/Gitlawb/node/commit/2e664b7885036ee72ce175af95bb567b18222583))
+* **node:** make a stalled sync queue visible, and fix two test claims ([9aa4c17](https://github.com/Gitlawb/node/commit/9aa4c17aefd1885d134b1334b54551366cdd8ef0))
+* **node:** move the attempted_at migration to v17, clear of two open branches ([fbc5868](https://github.com/Gitlawb/node/commit/fbc5868bd16946ea184dad26abcdb0e89d68e99a))
+* **node:** prove the mirror path is inside repos_dir before running git ([#272](https://github.com/Gitlawb/node/issues/272)) ([3ca9473](https://github.com/Gitlawb/node/commit/3ca94739ed7b90e4c265a0947025dc3b50e7583b))
+* **node:** reject a malformed slug at the notify boundary ([#272](https://github.com/Gitlawb/node/issues/272)) ([c587a40](https://github.com/Gitlawb/node/commit/c587a40a508acea9f74c3468d42ff037397c75d0))
+* **node:** reset a peer's reachability gate when an announce changes its http_url ([#270](https://github.com/Gitlawb/node/issues/270)) ([1964f88](https://github.com/Gitlawb/node/commit/1964f88378fe6942ffca5836de3a092b5b8f67b4))
+* **node:** reset a peer's reachability gate when an announce changes its http_url ([#270](https://github.com/Gitlawb/node/issues/270)) ([e2560ee](https://github.com/Gitlawb/node/commit/e2560ee46c28e4e966d87867a86dc4bad4ca7a3a))
+* **node:** stamp every dequeued sync row so a stuck one yields the batch ([6e64d0d](https://github.com/Gitlawb/node/commit/6e64d0d0a7fdd38ef3a56820c1808dd7c9bbd658))
+* **node:** stop a peer-supplied repo slug from escaping repos_dir ([#272](https://github.com/Gitlawb/node/issues/272)) ([c70b1df](https://github.com/Gitlawb/node/commit/c70b1df42d5c3f70ec4c272886c85fcc16ed92d1))
+* **node:** validate the queued slug before the worker derives a path ([#272](https://github.com/Gitlawb/node/issues/272)) ([9f00e24](https://github.com/Gitlawb/node/commit/9f00e24aec217e4b8256dd437cff4741b1478b96))
+* **review:** correct two comment claims and guard two more wrong shapes ([#270](https://github.com/Gitlawb/node/issues/270)) ([811ad50](https://github.com/Gitlawb/node/commit/811ad504bc268c8e9cddac93822adcd00bfe9ff8))
+* **review:** stop the dequeue overclaiming, and pin the starvation premise ([457be11](https://github.com/Gitlawb/node/commit/457be11d728a2a34775cf96be2bc5af9a58cb250))
+* strict DID matching in get_profile ([acb4714](https://github.com/Gitlawb/node/commit/acb47145beec8ce7b20b7a2479f7a55ed68e2a89))
+* strict DID matching in get_profile ([13b565b](https://github.com/Gitlawb/node/commit/13b565bcac09f075a7fd555a6e9acdd27de6c7bb))
+* target stored did on profile update aliases ([9836c3a](https://github.com/Gitlawb/node/commit/9836c3a21bc96a2ce95cb1fd12bd84b22142787d))
+
 ## [0.7.0](https://github.com/Gitlawb/node/compare/v0.6.0...v0.7.0) (2026-07-22)
 
 
