@@ -987,8 +987,6 @@ pub(crate) mod drain_faults {
 
     /// Make the next `repo_read_failures` repo re-reads and the next
     /// `rules_read_failures` rule re-reads for `repo_id` return `Err`, then succeed.
-    /// Only the tests that drive the retry arms call it, so it is dead until they land.
-    #[allow(dead_code)]
     pub(crate) fn inject(repo_id: &str, repo_read_failures: usize, rules_read_failures: usize) {
         table().lock().unwrap().insert(
             repo_id.to_string(),
@@ -1001,8 +999,6 @@ pub(crate) mod drain_faults {
     }
 
     /// Observed attempt counts (and remaining injections) for `repo_id`.
-    /// Only the tests that assert the retry bound call it, so it is dead until they land.
-    #[allow(dead_code)]
     pub(crate) fn counters(repo_id: &str) -> Counters {
         table()
             .lock()
@@ -1058,6 +1054,84 @@ async fn drain_list_rules(
     ctx.db.list_visibility_rules(record_id).await
 }
 
+/// Attempts allowed for the drain re-read before the lap gives up. The coalesced
+/// push's work is already out of the pending slot (`finish_or_take_pending` took it
+/// in the same critical section that kept the key), and there is no reconciliation
+/// sweep to re-derive it: a transient read error must be RETRIED here or that push's
+/// pin/encrypt pass is gone. The bound keeps a sustained outage from spinning
+/// forever; on exhaustion the work is still lost (the pre-existing residual), but
+/// the give-up is logged at ERROR so it is observable instead of silent.
+const DRAIN_REREAD_MAX_ATTEMPTS: usize = 3;
+
+/// Backoff before the next re-read attempt. Doubles per attempt.
+const DRAIN_REREAD_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The outcome of the drain's fresh state re-read, keeping the three cases distinct
+/// that a single `Err => None` collapses into one: a usable refresh, a repo that
+/// genuinely no longer exists (terminal, and NOT a retry), and a transient read
+/// failure (retryable).
+enum DrainRefresh {
+    State {
+        /// Boxed only to keep the enum small: `RepoRecord` dwarfs the other two
+        /// variants, which carry nothing (clippy::large_enum_variant).
+        record: Box<RepoRecord>,
+        rules: Vec<crate::db::VisibilityRule>,
+    },
+    Gone,
+    Failed,
+}
+
+/// Re-read repo state for a drain lap, retrying transient read errors.
+///
+/// Both reads are retryable and neither may be read as an absence: an `Err` from the
+/// repo row is not "the repo is gone", and an `Err` from the rule list is not "this
+/// repo has no rules" (`.ok()` made those indistinguishable, and a `None` rule set
+/// makes `replication_withheld_set` return `None`, which skips the entire lap). Only
+/// `Ok(None)` on the repo row is a terminal absence, and it consumes no retry budget.
+///
+/// The whole `RepoRecord` comes back, not just its rules and flags: the caller writes
+/// against `record.id` from this FRESH re-fetch, never `ctx.repo_id` frozen at spawn.
+async fn drain_refresh_state(ctx: &EncryptTaskCtx) -> DrainRefresh {
+    let mut backoff = DRAIN_REREAD_BACKOFF;
+    for attempt in 1..=DRAIN_REREAD_MAX_ATTEMPTS {
+        let record = match drain_get_repo(ctx).await {
+            Ok(Some(rec)) => Box::new(rec),
+            Ok(None) => return DrainRefresh::Gone,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %ctx.repo_id, err = %e, attempt,
+                    "coalesced drain: repo re-read failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+                continue;
+            }
+        };
+        // record.id, never the spawn-time ctx.repo_id: the record above is re-fetched
+        // fresh by owner/name, and a delete+re-create between spawn and drain gives
+        // the row a NEW id - rules read against the stale id come back empty and
+        // would fail open for the new row.
+        match drain_list_rules(ctx, &record.id).await {
+            Ok(rules) => return DrainRefresh::State { record, rules },
+            Err(e) => {
+                tracing::warn!(
+                    repo = %ctx.repo_id, err = %e, attempt,
+                    "coalesced drain: visibility-rule re-read failed; retrying"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+        }
+    }
+    tracing::error!(
+        repo = %ctx.repo_id,
+        attempts = DRAIN_REREAD_MAX_ATTEMPTS,
+        "coalesced drain: re-read failed on every attempt; the coalesced push's \
+         pin/encrypt pass is dropped (no reconciliation sweep re-derives it)"
+    );
+    DrainRefresh::Failed
+}
+
 /// Resolve a coalesced-drain iteration's replicable object list. Re-fetches the
 /// repo record and visibility rules FRESH — rules tightened between the coalesced
 /// push and its drain must be honored, fail closed: a newly-withheld blob is not
@@ -1078,29 +1152,27 @@ async fn resolve_drain_object_list(
     Option<Vec<crate::db::VisibilityRule>>,
     bool,
 )> {
-    let record = match drain_get_repo(ctx).await {
-        Ok(Some(r)) => r,
-        Ok(None) => {
+    // Both re-reads are bounded-retried: a transient blip must not discard the
+    // coalesced push's work (`finish_or_take_pending` already took it out of the
+    // pending slot and no sweep re-derives it). The rules come back from the same
+    // refresh, read against the FRESH record.id, never the spawn-time ctx.repo_id.
+    let (record, rules_opt) = match drain_refresh_state(ctx).await {
+        DrainRefresh::State { record, rules } => (*record, Some(rules)),
+        DrainRefresh::Gone => {
             tracing::warn!(
                 repo = %ctx.repo_id,
                 "coalesced drain: repo record is gone; dropping the pending work"
             );
             return None;
         }
-        Err(e) => {
+        DrainRefresh::Failed => {
             tracing::warn!(
                 repo = %ctx.repo_id,
-                err = %e,
                 "coalesced drain: repo re-fetch failed; pinning nothing (fail closed)"
             );
             return None;
         }
     };
-    // record.id, never the spawn-time ctx.repo_id: the record above is re-fetched
-    // fresh by owner/name, and a delete+re-create between spawn and drain gives
-    // the row a NEW id — rules read against the stale id come back empty and
-    // would fail open for the new row.
-    let rules_opt = drain_list_rules(ctx, &record.id).await.ok();
     let (_announce, withheld) = replication_withheld_set(
         ctx.encrypt_sem.clone(),
         rules_opt.clone(),

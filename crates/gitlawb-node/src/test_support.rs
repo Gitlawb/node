@@ -11275,5 +11275,678 @@ mod tests {
                 "the key is released after one pass"
             );
         }
+
+        mod u2_reread_retry {
+            use super::*;
+            use crate::api::repos::drain_faults;
+
+            /// Process-wide tracing capture so a test can assert the give-up is logged at
+            /// ERROR. A global default subscriber can only be installed once per process,
+            /// so it is shared by every test here and assertions filter on the repo id,
+            /// which is a fresh uuid per test.
+            mod logcap {
+                use std::sync::{Arc, Mutex, OnceLock};
+                use tracing::{Event, Level, Subscriber};
+                use tracing_subscriber::layer::{Context, Layer};
+                use tracing_subscriber::prelude::*;
+
+                type Lines = Arc<Mutex<Vec<(Level, String)>>>;
+
+                fn lines() -> &'static Lines {
+                    static LINES: OnceLock<Lines> = OnceLock::new();
+                    LINES.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
+                }
+
+                struct Capture;
+                impl<S: Subscriber> Layer<S> for Capture {
+                    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                        struct V(String);
+                        impl tracing::field::Visit for V {
+                            fn record_debug(
+                                &mut self,
+                                field: &tracing::field::Field,
+                                value: &dyn std::fmt::Debug,
+                            ) {
+                                self.0.push_str(&format!(" {}={:?}", field.name(), value));
+                            }
+                        }
+                        let mut v = V(String::new());
+                        event.record(&mut v);
+                        lines()
+                            .lock()
+                            .unwrap()
+                            .push((*event.metadata().level(), v.0));
+                    }
+                }
+
+                pub(super) fn install() {
+                    static ONCE: OnceLock<()> = OnceLock::new();
+                    ONCE.get_or_init(|| {
+                        let _ = tracing::subscriber::set_global_default(
+                            tracing_subscriber::registry().with(Capture),
+                        );
+                    });
+                }
+
+                pub(super) fn errors_containing(needle: &str) -> Vec<String> {
+                    lines()
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|(lvl, msg)| *lvl == Level::ERROR && msg.contains(needle))
+                        .map(|(_, msg)| msg.clone())
+                        .collect()
+                }
+            }
+
+            /// SCENARIO 1. The repo re-read fails once, then succeeds: the drain lap
+            /// must still RUN, under the refreshed state, and pin the coalesced push's
+            /// object. RED before the fix (the single `Err` returned `None`, the lap
+            /// pinned nothing, and `finish_or_take_pending` had already taken the
+            /// pending work out of the slot, so it was gone for good).
+            #[sqlx::test]
+            async fn u2_transient_repo_reread_failure_is_retried_and_work_lands(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-retry");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let key = crate::state::repo_identity_key(&owner, &repo.name);
+                let git_repo = init_repo();
+                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
+                let tip_a = oid("HEAD", &git_repo.path);
+                // The coalesced push B adds obj2, absent from push A's spawn captures.
+                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
+                let tip_b = oid("HEAD", &git_repo.path);
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // One transient repo re-read failure, then the real DB answers.
+                drain_faults::inject(&repo.id, 1, 0);
+
+                let guard = admit(&state, &key);
+                coalesce(&state, &key, vec![(tip_a, tip_b)]);
+
+                crate::api::repos::run_encrypt_pin_task_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    owner.clone(),
+                    repo.name.clone(),
+                    server.url(),
+                    vec![obj1.clone()],
+                    Some(vec![]),
+                    true,
+                )
+                .await;
+
+                assert!(
+                    state.db.is_pinned(&obj2).await.unwrap(),
+                    "the coalesced push's object is pinned after the retried re-read (RED \
+                     before this unit: the Err arm dropped the lap and the work with it)"
+                );
+                let c = drain_faults::counters(&repo.id);
+                assert_eq!(
+                    c.repo_read_attempts, 2,
+                    "the failed re-read is retried exactly once before it succeeds"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is released once the task exits"
+                );
+            }
+
+            /// SCENARIO 2. Every re-read attempt fails: the loop must give up on a BOUND
+            /// (asserted as a literal, so raising or removing the bound goes RED) and log
+            /// the give-up at ERROR so the residual loss is observable rather than silent.
+            #[sqlx::test]
+            async fn u2_sustained_repo_reread_failure_is_bounded_and_logged(pool: PgPool) {
+                logcap::install();
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-bounded");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let key = crate::state::repo_identity_key(&owner, &repo.name);
+                let git_repo = init_repo();
+                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
+                let tip_a = oid("HEAD", &git_repo.path);
+                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
+                let tip_b = oid("HEAD", &git_repo.path);
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // Far more failures than the bound allows: the outage never clears.
+                drain_faults::inject(&repo.id, 10_000, 0);
+
+                let guard = admit(&state, &key);
+                coalesce(&state, &key, vec![(tip_a, tip_b)]);
+
+                crate::api::repos::run_encrypt_pin_task_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    owner.clone(),
+                    repo.name.clone(),
+                    server.url(),
+                    vec![obj1.clone()],
+                    Some(vec![]),
+                    true,
+                )
+                .await;
+
+                let c = drain_faults::counters(&repo.id);
+                assert_eq!(
+                    c.repo_read_attempts, 3,
+                    "the re-read is bounded at 3 attempts; unbounded retry or a raised \
+                     bound must fail here"
+                );
+                assert!(
+                    !state.db.is_pinned(&obj2).await.unwrap(),
+                    "with the read never succeeding there is nothing fresh to act on"
+                );
+                let errs = logcap::errors_containing(&repo.id);
+                assert!(
+                    !errs.is_empty(),
+                    "the exhausted drain re-read is logged at ERROR with the repo id, so \
+                     the residual work loss is observable; captured: {errs:?}"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is still released on the give-up path"
+                );
+            }
+
+            /// SCENARIO 3. `Ok(None)` (the repo was deleted during the in-flight window)
+            /// is NOT a transient failure: it must release immediately without burning the
+            /// retry budget. The repo row is never created, so the re-read legitimately
+            /// returns `Ok(None)`.
+            #[sqlx::test]
+            async fn u2_repo_gone_releases_without_consuming_retries(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let missing_id = uuid::Uuid::new_v4().to_string();
+                let missing_name = "u2-gone".to_string();
+                let key = crate::state::repo_identity_key(&owner, &missing_name);
+                let git_repo = init_repo();
+                let _obj1 = commit(&git_repo.path, "a.txt", "one\n");
+                let tip_a = oid("HEAD", &git_repo.path);
+                let _obj2 = commit(&git_repo.path, "b.txt", "two\n");
+                let tip_b = oid("HEAD", &git_repo.path);
+
+                let server = mockito::Server::new_async().await;
+
+                drain_faults::inject(&missing_id, 0, 0);
+
+                let guard = admit(&state, &key);
+                // A real pair, so a drain lap actually runs and reaches the re-read.
+                coalesce(&state, &key, vec![(tip_a, tip_b)]);
+
+                // Empty object list: pass one touches no pin rows for a repo that is gone.
+                crate::api::repos::run_encrypt_pin_task_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    missing_id.clone(),
+                    owner.clone(),
+                    missing_name.clone(),
+                    server.url(),
+                    vec![],
+                    Some(vec![]),
+                    true,
+                )
+                .await;
+
+                let c = drain_faults::counters(&missing_id);
+                assert_eq!(
+                    c.repo_read_attempts, 1,
+                    "a deleted repo is a terminal answer, never retried"
+                );
+                assert_eq!(
+                    c.rules_read_attempts, 0,
+                    "no rules read is attempted once the repo row is gone"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is released cleanly"
+                );
+            }
+
+            /// SCENARIO 4. A failed visibility-rule read is transient, never an empty
+            /// policy. RED before the fix, where `.ok()` made "the rules read failed" and
+            /// "this repo has no rules" the same value: the withheld blob was then neither
+            /// sealed nor covered, because a `None` rule set skips the entire lap.
+            #[sqlx::test]
+            async fn u2_transient_rules_read_failure_is_retried_not_read_as_empty(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let reader = new_did();
+                let repo = seed_repo(&owner, "u2-rules");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let key = crate::state::repo_identity_key(&owner, &repo.name);
+                let git_repo = init_repo();
+                let pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
+                let tip_a = oid("HEAD", &git_repo.path);
+                let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
+                let tip_b = oid("HEAD", &git_repo.path);
+
+                // The coalesced push B is what added the path-scoped rule.
+                state
+                    .db
+                    .set_visibility_rule(
+                        &repo.id,
+                        "/secret/**",
+                        VisibilityMode::B,
+                        &[reader],
+                        &owner,
+                    )
+                    .await
+                    .expect("set rule");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // The repo row reads fine; the RULES read is the one that blips.
+                drain_faults::inject(&repo.id, 0, 1);
+
+                let guard = admit(&state, &key);
+                coalesce(&state, &key, vec![(tip_a, tip_b)]);
+
+                // Push A's captures are stale: no rule, nothing withheld.
+                crate::api::repos::run_encrypt_pin_task_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    owner.clone(),
+                    repo.name.clone(),
+                    server.url(),
+                    vec![pub_oid.clone()],
+                    Some(vec![]),
+                    true,
+                )
+                .await;
+
+                assert!(
+                    state
+                        .db
+                        .encrypted_blob_recipients_tag(&repo.id, &secret_oid)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "the withheld blob is sealed under the RETRIED rule set (RED with \
+                     list_visibility_rules(..).ok(): an empty policy seals nothing)"
+                );
+                let c = drain_faults::counters(&repo.id);
+                assert_eq!(
+                    c.rules_read_attempts, 2,
+                    "the failed rules read is retried, not collapsed into an empty rule set"
+                );
+                assert!(
+                    !state.db.is_pinned(&secret_oid).await.unwrap(),
+                    "the withheld blob is never pinned in the clear by the drain"
+                );
+            }
+
+            /// SCENARIO 5. The fault-free control for scenario 4: the rules applied by the
+            /// drain are the COALESCED push's fresh ones, never the spawn-time capture,
+            /// and the retry path does not perturb that (exactly one read of each).
+            #[sqlx::test]
+            async fn u2_requeue_applies_fresh_rules_not_spawn_captures(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let reader = new_did();
+                let repo = seed_repo(&owner, "u2-fresh");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let key = crate::state::repo_identity_key(&owner, &repo.name);
+                let git_repo = init_repo();
+                let pub_oid = commit(&git_repo.path, "public/a.txt", "public\n");
+                let tip_a = oid("HEAD", &git_repo.path);
+                let secret_oid = commit(&git_repo.path, "secret/b.txt", "TOP SECRET\n");
+                let tip_b = oid("HEAD", &git_repo.path);
+                state
+                    .db
+                    .set_visibility_rule(
+                        &repo.id,
+                        "/secret/**",
+                        VisibilityMode::B,
+                        &[reader],
+                        &owner,
+                    )
+                    .await
+                    .expect("set rule");
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                drain_faults::inject(&repo.id, 0, 0);
+
+                let guard = admit(&state, &key);
+                coalesce(&state, &key, vec![(tip_a, tip_b)]);
+
+                crate::api::repos::run_encrypt_pin_task_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    owner.clone(),
+                    repo.name.clone(),
+                    server.url(),
+                    vec![pub_oid.clone()],
+                    Some(vec![]),
+                    true,
+                )
+                .await;
+
+                let c = drain_faults::counters(&repo.id);
+                assert_eq!(
+                    (c.repo_read_attempts, c.rules_read_attempts),
+                    (1, 1),
+                    "a healthy DB is read exactly once per drain lap"
+                );
+                assert!(
+                    state.db.is_pinned(&pub_oid).await.unwrap(),
+                    "the visible object is pinned under the fresh rules"
+                );
+                assert!(
+                    !state.db.is_pinned(&secret_oid).await.unwrap(),
+                    "the freshly-read rule withholds the secret blob (the spawn-time \
+                     capture had no rules at all)"
+                );
+            }
+
+            /// SCENARIO 6. Regression guard on the property the fix must not disturb: the
+            /// finish-or-take critical section is atomic, so a push coalescing during it is
+            /// still covered by exactly one more lap, and the key is released after.
+            #[sqlx::test]
+            async fn u2_coalesced_push_still_covered_by_exactly_one_requeue_pass(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-coalesce");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let key = crate::state::repo_identity_key(&owner, &repo.name);
+                let git_repo = init_repo();
+                let obj1 = commit(&git_repo.path, "a.txt", "one\n");
+                let tip_a = oid("HEAD", &git_repo.path);
+                let obj2 = commit(&git_repo.path, "b.txt", "two\n");
+                let tip_b = oid("HEAD", &git_repo.path);
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                drain_faults::inject(&repo.id, 0, 0);
+
+                let guard = admit(&state, &key);
+                // Push B lands during the in-flight window: its tip pair is merged.
+                coalesce(&state, &key, vec![(tip_a.clone(), tip_b.clone())]);
+                assert_eq!(
+                    state.encrypt_inflight.pending_for(&key),
+                    Some(PendingWork::Tips(vec![(tip_a, tip_b)])),
+                    "the coalesced push recorded its work in the pending slot"
+                );
+
+                crate::api::repos::run_encrypt_pin_task_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    owner.clone(),
+                    repo.name.clone(),
+                    server.url(),
+                    vec![obj1.clone()],
+                    Some(vec![]),
+                    true,
+                )
+                .await;
+
+                assert_eq!(
+                    drain_faults::counters(&repo.id).repo_read_attempts,
+                    1,
+                    "one coalesced push means exactly one drain lap, no re-spin"
+                );
+                assert!(
+                    state.db.is_pinned(&obj1).await.unwrap(),
+                    "push A's object is pinned"
+                );
+                assert!(
+                    state.db.is_pinned(&obj2).await.unwrap(),
+                    "the coalesced push's object is covered by the drain lap"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the key is released once the task is clean"
+                );
+            }
+
+            /// Wait for `finish_or_take_pending` to take the pending work out of the slot
+            /// (`Tips(nonempty)` -> `Tips(empty)`), which is the exact instant the task
+            /// enters `drain_refresh_state`'s retry window. Deterministic, so the
+            /// coalescing push below lands INSIDE that window rather than on a sleep
+            /// guess. `None` means the key is already gone (the task exited), which the
+            /// caller reports as its own failure.
+            async fn wait_for_drain_window(
+                inflight: &crate::state::EncryptInflight,
+                key: &str,
+            ) -> bool {
+                for _ in 0..5_000 {
+                    match inflight.pending_for(key) {
+                        Some(PendingWork::Tips(acc)) if acc.is_empty() => return true,
+                        None => return false,
+                        Some(_) => {}
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                false
+            }
+
+            /// SCENARIO 7 (RED-before/GREEN-after). A push that coalesces WHILE the
+            /// re-read is retrying must not be thrown away when that re-read finally
+            /// gives up. Breaking the drain loop on the give-up would let
+            /// `EncryptInflightGuard::drop` remove the key with push C's work still
+            /// recorded, and push C's lap would never run: a silent drop with no
+            /// reconciliation sweep behind it.
+            ///
+            /// Exactly `DRAIN_REREAD_MAX_ATTEMPTS` injected repo-read faults, so the
+            /// first refresh exhausts its budget and the DB is healthy for the next one.
+            /// Push C coalesces inside that window.
+            #[sqlx::test]
+            async fn u2_failed_reread_keeps_a_push_that_coalesced_during_the_window(pool: PgPool) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-window");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let key = crate::state::repo_identity_key(&owner, &repo.name);
+                let git_repo = init_repo();
+                let obj_a = commit(&git_repo.path, "a.txt", "one\n");
+                let tip_a = oid("HEAD", &git_repo.path);
+                let _obj_b = commit(&git_repo.path, "b.txt", "two\n");
+                let tip_b = oid("HEAD", &git_repo.path);
+                let obj_c = commit(&git_repo.path, "c.txt", "three\n");
+                let tip_c = oid("HEAD", &git_repo.path);
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // Exactly the bound: the FIRST refresh burns all three attempts and gives
+                // up; every later refresh sees a healthy DB.
+                drain_faults::inject(&repo.id, 3, 0);
+
+                let guard = admit(&state, &key);
+                coalesce(&state, &key, vec![(tip_a.clone(), tip_b.clone())]);
+
+                // Push C lands during the retry window, after the loop already took push
+                // B's pending work out of the slot. It MUST carry a real tip pair: an
+                // empty merge leaves the slot empty and no extra lap runs at all.
+                let inflight = state.encrypt_inflight.clone();
+                let watch_key = key.clone();
+                let coalesced = tokio::spawn(async move {
+                    if !wait_for_drain_window(&inflight, &watch_key).await {
+                        return false;
+                    }
+                    matches!(
+                        inflight.try_begin(&watch_key, vec![(tip_b, tip_c)]),
+                        BeginOutcome::Coalesced
+                    )
+                });
+
+                crate::api::repos::run_encrypt_pin_task_for_test(
+                    &state,
+                    guard,
+                    git_repo.path.clone(),
+                    repo.id.clone(),
+                    owner.clone(),
+                    repo.name.clone(),
+                    server.url(),
+                    vec![obj_a.clone()],
+                    Some(vec![]),
+                    true,
+                )
+                .await;
+
+                assert!(
+                    coalesced.await.expect("coalescing task"),
+                    "push C must have coalesced inside the retry window for this test to \
+                     mean anything"
+                );
+                assert!(
+                    state.db.is_pinned(&obj_c).await.unwrap(),
+                    "the push that coalesced during the retry window must still get a lap \
+                     once the DB recovers (RED if the give-up breaks the loop: the pending \
+                     work was already taken, so the lap was dropped with nothing to \
+                     re-derive it)"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is released once the task exits"
+                );
+            }
+
+            /// SCENARIO 8 (the sustained-outage guard on the fall-through). Continuing the
+            /// loop on a give-up means `finish_or_take_pending` runs again, so a DB that
+            /// never recovers must still TERMINATE rather than spin. It does: an extra lap
+            /// only happens when a push actually coalesced, and each lap pays a full
+            /// bounded re-read (3 attempts with backoff). One coalescing push during the
+            /// window buys exactly one extra lap: 6 repo-read attempts, then exit.
+            #[sqlx::test]
+            async fn u2_sustained_failure_with_a_coalesce_terminates_after_one_more_lap(
+                pool: PgPool,
+            ) {
+                let state = test_state(pool).await;
+                let owner = new_did();
+                let repo = seed_repo(&owner, "u2-sustained-window");
+                state.db.create_repo(&repo).await.expect("seed repo");
+                let key = crate::state::repo_identity_key(&owner, &repo.name);
+                let git_repo = init_repo();
+                let obj_a = commit(&git_repo.path, "a.txt", "one\n");
+                let tip_a = oid("HEAD", &git_repo.path);
+                let _obj_b = commit(&git_repo.path, "b.txt", "two\n");
+                let tip_b = oid("HEAD", &git_repo.path);
+                let _obj_c = commit(&git_repo.path, "c.txt", "three\n");
+                let tip_c = oid("HEAD", &git_repo.path);
+
+                let mut server = mockito::Server::new_async().await;
+                let _m = server
+                    .mock("POST", mockito::Matcher::Regex(r"^/api/v0/add".to_string()))
+                    .with_status(200)
+                    .with_body(r#"{"Hash":"bafyprovider"}"#)
+                    .expect_at_least(1)
+                    .create_async()
+                    .await;
+
+                // The outage never clears.
+                drain_faults::inject(&repo.id, 10_000, 0);
+
+                let guard = admit(&state, &key);
+                coalesce(&state, &key, vec![(tip_a.clone(), tip_b.clone())]);
+
+                let inflight = state.encrypt_inflight.clone();
+                let watch_key = key.clone();
+                let coalesced = tokio::spawn(async move {
+                    if !wait_for_drain_window(&inflight, &watch_key).await {
+                        return false;
+                    }
+                    matches!(
+                        inflight.try_begin(&watch_key, vec![(tip_b, tip_c)]),
+                        BeginOutcome::Coalesced
+                    )
+                });
+
+                // The watchdog is the real assertion: a loop that re-spins without the
+                // pending gate would never return here.
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    crate::api::repos::run_encrypt_pin_task_for_test(
+                        &state,
+                        guard,
+                        git_repo.path.clone(),
+                        repo.id.clone(),
+                        owner.clone(),
+                        repo.name.clone(),
+                        server.url(),
+                        vec![obj_a.clone()],
+                        Some(vec![]),
+                        true,
+                    ),
+                )
+                .await
+                .expect(
+                    "the task must terminate under a sustained outage; a fall-through that \
+                     does not gate on the pending slot spins forever",
+                );
+
+                assert!(
+                    coalesced.await.expect("coalescing task"),
+                    "push C must have coalesced inside the retry window"
+                );
+                assert_eq!(
+                    drain_faults::counters(&repo.id).repo_read_attempts,
+                    6,
+                    "one coalescing push buys exactly one more bounded re-read lap \
+                     (3 + 3 attempts), never an unbounded retry"
+                );
+                assert!(
+                    state.encrypt_inflight.is_empty(),
+                    "the guard key is released on the give-up path"
+                );
+            }
+        }
     }
 }
