@@ -1798,8 +1798,34 @@ mod tests {
         };
         guard.release(true).await;
 
-        // Give the spawned close a moment, then see which backend we land on.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Wait for the backend to actually go away rather than sleeping a fixed
+        // span, which is flaky on slow CI. The observer is a STANDALONE
+        // connection for the same reason `poll_until_free` uses one: taking it
+        // from the pool under test would hand us the very session being measured.
+        // Nothing but the close under test can retire that backend, because
+        // `no_reap_pool` disables idle timeout and max lifetime, so a zero count
+        // here is attributable to `release()` and to nothing else.
+        {
+            use sqlx::Connection;
+            let deadline = std::time::Duration::from_secs(5);
+            let start = std::time::Instant::now();
+            let mut observer = sqlx::PgConnection::connect_with(&opts)
+                .await
+                .expect("standalone observer connection");
+            while start.elapsed() < deadline {
+                let alive: (i64,) =
+                    sqlx::query_as("SELECT count(*) FROM pg_stat_activity WHERE pid = $1")
+                        .bind(pid_before)
+                        .fetch_one(&mut observer)
+                        .await
+                        .expect("observer pg_stat_activity probe");
+                if alive.0 == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
         let pid_after = {
             let mut c = lock_pool.acquire().await.unwrap();
             let pid: (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
