@@ -348,7 +348,9 @@ impl RepoStore {
                     warn!(repo = %repo_name, err = %e,
                         "write acquire: tigris HEAD failed — refusing the write rather than \
                          guessing the archive is absent");
-                    return Err(e).context("checking tigris for the repo archive before a write");
+                    return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                        "tigris HEAD failed before a write for {owner_slug}/{repo_name}"
+                    )));
                 }
                 None => {
                     // TIMED OUT, which is NOT the same as failed, and must not reach
@@ -362,11 +364,23 @@ impl RepoStore {
                     //
                     // Refuse the acquire. Returning here drops the guard, whose Drop
                     // frees the lock and its pool slot.
-                    return Err(anyhow::anyhow!(
-                        "tigris refresh exceeded the {}s under-lock bound for {owner_slug}/{repo_name}; \
-                         refusing the write rather than proceeding against a possibly-stale tree",
+                    //
+                    // `error!`, not the sibling `warn!` above, and that is deliberate.
+                    // The handler layer demotes every `RepoUnavailable` to warn because
+                    // the common cause is an ordinary storage blip. A stall that ran out
+                    // the whole bound is not that: it pinned a lock-pool slot for the
+                    // full duration, and this raise-site `error!` is what keeps it
+                    // paging. Do NOT "fix" it to match the arm above.
+                    tracing::error!(
+                        repo = %repo_name,
+                        owner = %owner_slug,
+                        bound_secs = self.lock_held_transfer_timeout.as_secs(),
+                        "under-lock tigris refresh exceeded the transfer bound, refusing the write"
+                    );
+                    return Err(anyhow::Error::new(RepoUnavailable).context(format!(
+                        "tigris refresh exceeded the {}s under-lock bound for {owner_slug}/{repo_name}",
                         self.lock_held_transfer_timeout.as_secs()
-                    ));
+                    )));
                 }
             }
         }
@@ -932,6 +946,24 @@ impl std::fmt::Display for RepoBusy {
 }
 
 impl std::error::Error for RepoBusy {}
+
+/// The under-lock refresh could not establish what is in object storage, so the
+/// write was refused rather than run against a possibly-stale tree.
+///
+/// A distinct type rather than a bare `anyhow` string so the handler layer can map
+/// it to a retryable 503 with a FIXED body. The internal message names the owner
+/// slug and repo, which must stay in the log at the raise site rather than reaching
+/// the client.
+#[derive(Debug)]
+pub struct RepoUnavailable;
+
+impl std::fmt::Display for RepoUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("repository is temporarily unavailable")
+    }
+}
+
+impl std::error::Error for RepoUnavailable {}
 
 /// Run a future under a wall-clock bound, returning `None` if it did not finish.
 ///
@@ -2001,6 +2033,65 @@ mod tests {
         );
 
         held.release(true).await;
+    }
+
+    /// An under-lock refresh refusal must surface as a retryable 503 with a fixed
+    /// body, not a 500 carrying the owner slug and repo name. Built directly from
+    /// the typed error so it needs no database; the `.context()` layer is kept
+    /// deliberately, because the real raise path wraps one and this proves anyhow
+    /// preserves downcastability through it.
+    #[tokio::test]
+    async fn repo_unavailable_maps_to_retryable_503_with_fixed_body() {
+        use axum::response::IntoResponse;
+
+        let err = anyhow::Error::new(RepoUnavailable)
+            .context("tigris HEAD failed before a write for did_key_z6MkTest/secret-repo");
+
+        let resp = crate::error::AppError::from(err).into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "a storage blip is transient and must be retryable, not a 500"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("repo_unavailable"),
+            "the 503 must carry the repo_unavailable code, got {body}"
+        );
+        assert!(
+            !body.contains("secret-repo"),
+            "the 503 body must be fixed and must not name the repo, got {body}"
+        );
+        assert!(
+            !body.contains("did_key_z6MkTest"),
+            "the 503 body must be fixed and must not name the owner, got {body}"
+        );
+    }
+
+    /// The new downcast rung must be additive: an unrelated anyhow error still
+    /// falls through to the internal 500.
+    #[tokio::test]
+    async fn repo_unavailable_rung_does_not_swallow_unrelated_errors() {
+        use axum::response::IntoResponse;
+
+        let resp =
+            crate::error::AppError::from(anyhow::anyhow!("some other failure")).into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "an unrelated failure must not be reclassified as retryable"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("internal_error"),
+            "an unrelated failure must keep the internal_error code, got {body}"
+        );
     }
 
     /// The transfer bound is a knob, so it gets the same parse/default/reject-zero

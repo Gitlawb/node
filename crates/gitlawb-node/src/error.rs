@@ -50,6 +50,9 @@ pub enum AppError {
     #[error("repository is busy")]
     RepoBusy,
 
+    #[error("repository is temporarily unavailable")]
+    RepoUnavailable,
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 
@@ -89,7 +92,13 @@ impl From<anyhow::Error> for AppError {
             // site and the client gets a fixed retryable body.
             Err(err) => match err.downcast::<crate::git::repo_store::RepoBusy>() {
                 Ok(_) => AppError::RepoBusy,
-                Err(err) => AppError::Internal(err),
+                // Same reasoning one rung down: a refused under-lock refresh is a
+                // transient storage condition, and its internal message names the
+                // owner slug and repo, so the variant carries nothing.
+                Err(err) => match err.downcast::<crate::git::repo_store::RepoUnavailable>() {
+                    Ok(_) => AppError::RepoUnavailable,
+                    Err(err) => AppError::Internal(err),
+                },
             },
         }
     }
@@ -158,6 +167,13 @@ impl IntoResponse for AppError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "repo_busy",
                 "repository is busy — retry".into(),
+            ),
+            // 503 with a FIXED body for the same reason: the caller should retry, and
+            // must not be told which repo could not be refreshed or why.
+            AppError::RepoUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_unavailable",
+                "repository is temporarily unavailable, retry".into(),
             ),
             AppError::Db(e) if db_unavailable(e) => (
                 StatusCode::SERVICE_UNAVAILABLE,
