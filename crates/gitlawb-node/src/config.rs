@@ -1026,6 +1026,24 @@ mod tests {
     }
 
     #[test]
+    fn ipfs_max_repos_walked_defaults_and_rejects_out_of_range() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).ipfs_max_repos_walked,
+            64
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "8"])
+                .ipfs_max_repos_walked,
+            8
+        );
+        // 0 would walk no repos (serve nothing); clap must reject it.
+        assert!(Config::try_parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "0"]).is_err());
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--ipfs-max-repos-walked", "1048577"]).is_err()
+        );
+    }
+
+    #[test]
     fn ipfs_max_repo_visits_defaults_and_rejects_out_of_range() {
         assert_eq!(
             Config::parse_from(["gitlawb-node"]).ipfs_max_repo_visits,
