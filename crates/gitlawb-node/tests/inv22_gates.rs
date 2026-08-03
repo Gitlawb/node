@@ -147,8 +147,12 @@ fn inv22_concurrency_gates_present_and_not_bypassed() {
     // recovery copies are absent until an unrelated later push. Scan only the
     // production half of the file — the u5 tests in its `mod tests` also name the
     // drain call, and matching them would make this check vacuous.
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`. api/repos.rs carries
+    // test-only items (the drain fault seam, the task entry point) ABOVE the production
+    // code these gates scan for, so splitting on the attribute truncated the production
+    // half above every line being checked and the gate went vacuously blind.
     let repos_production = repos
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
     assert!(
@@ -326,8 +330,12 @@ fn f6_ipfs_metadata_queries_are_deadline_wrapped() {
 #[test]
 fn f2_pinata_enqueues_refs_not_retained_object_lists() {
     let repos = src("api/repos.rs");
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`. api/repos.rs carries
+    // test-only items (the drain fault seam, the task entry point) ABOVE the production
+    // code these gates scan for, so splitting on the attribute truncated the production
+    // half above every line being checked and the gate went vacuously blind.
     let production = repos
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
 
@@ -386,8 +394,12 @@ fn f2_pinata_enqueues_refs_not_retained_object_lists() {
 fn f3_second_writer_leased_until_reap() {
     let repos = src("api/repos.rs");
     let smart_http = src("git/smart_http.rs");
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`. api/repos.rs carries
+    // test-only items (the drain fault seam, the task entry point) ABOVE the production
+    // code these gates scan for, so splitting on the attribute truncated the production
+    // half above every line being checked and the gate went vacuously blind.
     let repos_production = repos
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
 
@@ -511,8 +523,12 @@ fn inv22_ipfs_walk_admission_reaches_every_blocking_site() {
 fn inv22_replication_tail_spawns_at_the_durability_boundary() {
     let repos = src("api/repos.rs");
     // Production half only — the tests below name these identifiers too.
+    // Split at the TEST MODULE, not at the first `#[cfg(test)]`. api/repos.rs carries
+    // test-only items (the drain fault seam, the task entry point) ABOVE the production
+    // code these gates scan for, so splitting on the attribute truncated the production
+    // half above every line being checked and the gate went vacuously blind.
     let production = repos
-        .split("#[cfg(test)]")
+        .split("\nmod tests {")
         .next()
         .expect("split always yields a first chunk");
 
