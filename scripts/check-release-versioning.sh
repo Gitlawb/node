@@ -57,10 +57,19 @@ orphaned="$(comm -13 <(printf '%s\n' "$members") <(printf '%s\n' "$listed"))"
 
 # Second half of the invariant: being listed does nothing without the marker,
 # because the generic updater keys on the annotation to find the line.
+#
+# Scoped to the [package] table on purpose. A manifest-wide match is satisfied by
+# an annotated `version` under any other table, so a crate could leave the version
+# cargo actually reads unannotated, pass this gate, and still freeze at release
+# time while release-please rewrote the decoy line instead.
 unmarked=""
 while IFS= read -r manifest; do
   [ -n "$manifest" ] || continue
-  if ! grep -qE '^version = ".*" # x-release-please-version' "$ROOT/$manifest"; then
+  if ! awk '
+    /^[[:space:]]*\[/ { in_package = ($0 ~ /^[[:space:]]*\[package\][[:space:]]*$/); next }
+    in_package && /^version = ".*" # x-release-please-version/ { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$ROOT/$manifest"; then
     unmarked="$unmarked$manifest"$'\n'
   fi
 done <<< "$members"
