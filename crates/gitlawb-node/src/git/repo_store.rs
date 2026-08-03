@@ -880,6 +880,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn containment_rejects_a_symlinked_directory_inside_the_root() {
         use std::os::unix::fs::symlink;
@@ -896,6 +897,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn containment_rejects_a_symlinked_file_inside_the_root() {
         use std::os::unix::fs::symlink;
@@ -927,6 +929,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn containment_rejects_a_missing_candidate_under_a_symlinked_parent() {
         use std::os::unix::fs::symlink;
@@ -943,6 +946,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn containment_reports_io_error_for_a_dangling_symlink() {
         // The link entry exists, so the candidate is the thing to resolve, and
