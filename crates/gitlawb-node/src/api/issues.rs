@@ -265,8 +265,20 @@ pub async fn close_issue(
                 .and_then(|i| i.author),
             // Cannot establish authorship, so fail closed. Deliberately 403 rather
             // than 404 for a non-owner: a caller who is not authorized to write
-            // should not learn from this route whether the issue exists.
-            Ok(None) | Err(_) => None,
+            // should not learn from this route whether the issue exists. Both arms
+            // below return None; they are split only so a read failure is visible
+            // to operators, since a genuinely absent issue and an unreadable one
+            // are the same answer to the client but not the same event.
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(
+                    repo = %repo,
+                    issue = %issue_id,
+                    err = %e,
+                    "get_issue failed during close_issue authorship pre-check"
+                );
+                None
+            }
         };
         let is_author = author_did
             .as_deref()
