@@ -67,7 +67,7 @@ Known limitations:
 - UCAN chain validation and revocation are not complete.
 - Repository write authorization is not capability-complete yet; HTTP signatures prove identity, not full authorization policy.
 - Peer writes are signed by upgraded nodes, but strict signed-peer enforcement is opt-in during rolling upgrades.
-- GraphQL mutations need mutation-aware auth before becoming a public write surface.
+- GraphQL mutations require a signed identity (a verified signer bound to the acting DID) but are limited to the agent-task queue; repo writes are not exposed over GraphQL and remain REST-only.
 
 See:
 
