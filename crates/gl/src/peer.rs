@@ -115,6 +115,27 @@ fn local_add_refusal(status: reqwest::StatusCode, body: &Value) -> Option<String
     ))
 }
 
+/// The error text for a remote announce reply, or `None` when the peer accepted
+/// it.
+///
+/// Split out so the ordering is assertable: the status has to reach the caller
+/// even when the body does not parse. That case is reachable rather than
+/// theoretical, because the read above is capped, so a peer answering with a
+/// body past the cap leaves truncated JSON behind, and `peer_url` is whatever
+/// the caller passed, so a non-JSON error page is just as easy. Parsing first
+/// and failing on the parse would swallow the status the user needs.
+fn remote_announce_failure(status: reqwest::StatusCode, raw: &str) -> Option<String> {
+    if status.is_success() {
+        return None;
+    }
+    // Falls back to the body itself when there is no `message` field, which is
+    // what a truncated or non-JSON reply leaves. Sanitized either way: it is the
+    // peer's text and it is headed for the terminal.
+    let parsed: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    let msg = sanitize_node_msg(parsed["message"].as_str().unwrap_or(raw));
+    Some(format!("announce failed ({status}): {msg}"))
+}
+
 /// The block printed after a peer accepts our announce. Split out so the
 /// defanging is assertable: the DID and URL are the remote peer's own strings,
 /// and `peer_url` is caller-chosen, so this is the least trusted body the
@@ -164,12 +185,12 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
     // the terminal through the error return. An announce reply is a DID, a URL
     // and a count, so 8 KiB is well past what the shape needs.
     let raw = read_body_capped(resp, 8 * 1024).await;
-    let result: Value = serde_json::from_str(&raw).context("invalid JSON response")?;
 
-    if !status.is_success() {
-        let msg = sanitize_node_msg(result["message"].as_str().unwrap_or("unknown error"));
-        anyhow::bail!("announce failed ({status}): {msg}");
+    if let Some(failure) = remote_announce_failure(status, &raw) {
+        anyhow::bail!("{failure}");
     }
+
+    let result: Value = serde_json::from_str(&raw).context("invalid JSON response")?;
 
     let their_did = result["node_did"].as_str().unwrap_or("?");
     let their_url = result["node_url"].as_str().unwrap_or("?");
@@ -270,7 +291,7 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{announced_peer_summary, local_add_refusal};
+    use super::{announced_peer_summary, cmd_add, local_add_refusal, remote_announce_failure};
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -375,6 +396,116 @@ mod tests {
             "warning not bounded: {} chars",
             warning.chars().count()
         );
+    }
+
+    /// The status is the part the user can act on, so it must survive a body
+    /// that does not parse. The read is capped, so a peer answering past the cap
+    /// leaves exactly this: a valid status and truncated JSON.
+    #[test]
+    fn a_remote_announce_failure_keeps_the_status_when_the_body_does_not_parse() {
+        let truncated = r#"{"error":"service_unavailable","message":"backend is do"#;
+        let failure = remote_announce_failure(StatusCode::SERVICE_UNAVAILABLE, truncated)
+            .expect("a non-success status must produce a failure");
+
+        assert!(
+            failure.contains("503"),
+            "the status must survive an unparseable body: {failure:?}"
+        );
+    }
+
+    /// A parseable error body still reports the peer's own message.
+    #[test]
+    fn a_remote_announce_failure_carries_the_peers_message() {
+        let failure = remote_announce_failure(
+            StatusCode::FORBIDDEN,
+            r#"{"error":"forbidden","message":"unproven announce cannot change an existing peer"}"#,
+        )
+        .expect("a non-success status must produce a failure");
+
+        assert!(
+            failure.contains("403")
+                && failure.contains("unproven announce cannot change an existing peer"),
+            "status and reason must both survive: {failure:?}"
+        );
+    }
+
+    /// The fallback path prints the raw body, so it is defanged like every other
+    /// peer-supplied string headed for the terminal.
+    #[test]
+    fn a_remote_announce_failure_defangs_an_unparseable_body() {
+        let failure = remote_announce_failure(
+            StatusCode::BAD_GATEWAY,
+            "\u{1b}]2;pwned\u{7}<html>gateway error</html>",
+        )
+        .expect("a non-success status must produce a failure");
+
+        assert!(
+            !failure.chars().any(|c| c.is_control()),
+            "control char leaked to the terminal: {failure:?}"
+        );
+        assert!(failure.contains("502"), "status dropped: {failure:?}");
+        assert!(
+            failure.contains("gateway error"),
+            "the body is all the user gets when there is no message field: {failure:?}"
+        );
+    }
+
+    /// The unit tests above bind the helper. This one binds the CALL SITE: the
+    /// failure check has to run before the parse, or a body past the read cap
+    /// turns a 503 into "invalid JSON response" and the status the user needs is
+    /// gone. Reordering the two statements in `cmd_add` compiles and passes every
+    /// other test in this file, so only driving the command catches it.
+    #[tokio::test]
+    async fn a_peer_failure_past_the_read_cap_still_reports_its_status() {
+        let mut peer = mockito::Server::new_async().await;
+        let mut local = mockito::Server::new_async().await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        std::fs::write(
+            dir.path().join("identity.pem"),
+            kp.to_pem().unwrap().as_bytes(),
+        )
+        .unwrap();
+
+        let _local_info = local
+            .mock("GET", "/")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"public_url":"https://me.example"}"#)
+            .create_async()
+            .await;
+
+        // Valid JSON, but past the 8 KiB read cap, so what survives the read is
+        // truncated and unparseable. This is the shape the cap itself creates.
+        let oversized = format!(r#"{{"message":"{}"}}"#, "x".repeat(16 * 1024));
+        let _peer_refusal = peer
+            .mock("POST", "/api/v1/peers/announce")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(oversized)
+            .create_async()
+            .await;
+
+        let err = cmd_add(peer.url(), local.url(), Some(dir.path().to_path_buf()))
+            .await
+            .expect_err("a 503 from the peer must fail the command");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("503"),
+            "the status must survive a body past the read cap: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("invalid JSON response"),
+            "the parse failure must not stand in for the status: {rendered:?}"
+        );
+    }
+
+    /// An accepted announce produces no error, so the caller proceeds to parse.
+    #[test]
+    fn an_accepted_remote_announce_produces_no_failure() {
+        assert!(remote_announce_failure(StatusCode::OK, r#"{"peer_count":3}"#).is_none());
     }
 
     /// The accepted-announce block prints the remote peer's own DID and URL, so
