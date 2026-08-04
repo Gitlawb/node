@@ -97,6 +97,22 @@ async fn cmd_list(node: String) -> Result<()> {
     Ok(())
 }
 
+/// The warning text for a local peer-add reply, or `None` when the node
+/// accepted it.
+///
+/// Split out so the refusal path is assertable. The node now answers 403 when
+/// an unproven caller tries to repoint an existing peer's `http_url`, so a
+/// reply that arrived and refused must not reach the success line.
+fn local_add_refusal(status: reqwest::StatusCode, body: &Value) -> Option<String> {
+    if status.is_success() {
+        return None;
+    }
+    let msg = body["message"].as_str().unwrap_or("unknown error");
+    Some(format!(
+        "warning: local peer list not updated ({status}): {msg}"
+    ))
+}
+
 async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result<()> {
     let keypair = load_keypair_from_dir(dir.as_deref())?;
     let my_did = keypair.did().to_string();
@@ -150,9 +166,24 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
             "did": their_did,
             "http_url": their_url,
         }))?;
-        // This requires the local node to be running; ignore errors here
-        let _ = local_client.post("/api/v1/peers/announce", &add_body).await;
-        println!("  Added to local peer list.");
+        // This requires the local node to be running, so a transport failure
+        // stays a warning rather than failing the command. A reply that
+        // ARRIVED and refused is different: the announce route answers 403
+        // when an unproven caller tries to repoint an existing peer, and
+        // printing the success line over that reports a completed add that
+        // never happened. Same status handling as the remote announce above,
+        // except best effort.
+        match local_client.post("/api/v1/peers/announce", &add_body).await {
+            Ok(resp) => {
+                let status = resp.status();
+                let result: Value = resp.json().await.unwrap_or(Value::Null);
+                match local_add_refusal(status, &result) {
+                    Some(warning) => eprintln!("{warning}"),
+                    None => println!("  Added to local peer list."),
+                }
+            }
+            Err(e) => eprintln!("warning: local peer list not updated: {e}"),
+        }
     }
 
     Ok(())
@@ -209,4 +240,43 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
         println!("  Note: {err}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_add_refusal;
+    use reqwest::StatusCode;
+    use serde_json::json;
+
+    /// The node's 403 for repointing an existing peer must surface, not print
+    /// as a completed add. Without the status check the command prints "Added
+    /// to local peer list." over a refusal.
+    #[test]
+    fn a_refused_local_add_warns_with_the_node_reason() {
+        let warning = local_add_refusal(
+            StatusCode::FORBIDDEN,
+            &json!({ "error": "forbidden", "message": "peer http_url change requires a signature from that peer" }),
+        )
+        .expect("a refusal must not render as success");
+
+        assert!(warning.contains("403"), "must name the status: {warning}");
+        assert!(
+            warning.contains("requires a signature"),
+            "must carry the node's own reason: {warning}"
+        );
+    }
+
+    /// A refusal with no message body still warns rather than passing silently.
+    #[test]
+    fn a_refusal_without_a_message_still_warns() {
+        let warning = local_add_refusal(StatusCode::BAD_REQUEST, &serde_json::Value::Null)
+            .expect("a refusal must not render as success");
+        assert!(warning.contains("400"), "must name the status: {warning}");
+    }
+
+    /// The accepted case stays quiet, so the success line still prints.
+    #[test]
+    fn an_accepted_local_add_produces_no_warning() {
+        assert!(local_add_refusal(StatusCode::OK, &json!({ "peer_count": 3 })).is_none());
+    }
 }
