@@ -136,6 +136,21 @@ fn remote_announce_failure(status: reqwest::StatusCode, raw: &str) -> Option<Str
     Some(format!("announce failed ({status}): {msg}"))
 }
 
+/// Which line the local peer-add prints, and whether it is a warning.
+///
+/// Split out because the SELECTION is what the fix is: `local_add_refusal` was
+/// already unit-tested six ways, and replacing this whole match with an
+/// unconditional "Added to local peer list." still left 312 tests green. The
+/// helper was pinned; the wiring was not, which is the shape
+/// `unit-test-on-helper-does-not-prove-handler-wiring` names. With the choice
+/// extracted, the call site is a two-line dispatch carrying no logic.
+fn local_add_report(status: reqwest::StatusCode, body: &Value) -> (bool, String) {
+    match local_add_refusal(status, body) {
+        Some(warning) => (true, warning),
+        None => (false, "  Added to local peer list.".to_string()),
+    }
+}
+
 /// The block printed after a peer accepts our announce. Split out so the
 /// defanging is assertable: the DID and URL are the remote peer's own strings,
 /// and `peer_url` is caller-chosen, so this is the least trusted body the
@@ -224,9 +239,11 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
                 // routes a non-success status to the warning.
                 let raw = read_body_capped(resp, 8 * 1024).await;
                 let result: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-                match local_add_refusal(status, &result) {
-                    Some(warning) => eprintln!("{warning}"),
-                    None => println!("  Added to local peer list."),
+                let (is_warning, line) = local_add_report(status, &result);
+                if is_warning {
+                    eprintln!("{line}");
+                } else {
+                    println!("{line}");
                 }
             }
             Err(e) => eprintln!("warning: local peer list not updated: {e}"),
@@ -291,7 +308,10 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{announced_peer_summary, cmd_add, local_add_refusal, remote_announce_failure};
+    use super::{
+        announced_peer_summary, cmd_add, local_add_refusal, local_add_report,
+        remote_announce_failure,
+    };
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -506,6 +526,40 @@ mod tests {
     #[test]
     fn an_accepted_remote_announce_produces_no_failure() {
         assert!(remote_announce_failure(StatusCode::OK, r#"{"peer_count":3}"#).is_none());
+    }
+
+    /// The selection, not the helper. A refusal must never yield the success
+    /// line, and the success line must never carry the warning prefix. This is
+    /// what stayed green when the entire match was replaced with an
+    /// unconditional "Added to local peer list."
+    #[test]
+    fn a_local_add_refusal_never_selects_the_success_line() {
+        let (is_warning, line) = local_add_report(
+            StatusCode::FORBIDDEN,
+            &json!({ "message": "unproven announce cannot change an existing peer's http_url: did:key:zAbc" }),
+        );
+
+        assert!(is_warning, "a 403 must select the warning stream: {line:?}");
+        assert!(
+            !line.contains("Added to local peer list"),
+            "a refusal rendered as the success line: {line:?}"
+        );
+        assert!(
+            line.contains("unproven announce cannot change an existing peer"),
+            "the node's reason must reach the user: {line:?}"
+        );
+    }
+
+    /// The other direction, so the fix cannot be satisfied by always warning.
+    #[test]
+    fn an_accepted_local_add_selects_the_success_line() {
+        let (is_warning, line) = local_add_report(StatusCode::OK, &json!({ "peer_count": 3 }));
+
+        assert!(!is_warning, "a 200 must not select the warning stream");
+        assert!(
+            line.contains("Added to local peer list"),
+            "the success line must still print: {line:?}"
+        );
     }
 
     /// The accepted-announce block prints the remote peer's own DID and URL, so
