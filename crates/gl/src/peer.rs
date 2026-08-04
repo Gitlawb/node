@@ -251,17 +251,35 @@ mod tests {
     /// The node's 403 for repointing an existing peer must surface, not print
     /// as a completed add. Without the status check the command prints "Added
     /// to local peer list." over a refusal.
+    ///
+    /// The fixture body is the real wire shape, not an invented one: the
+    /// message is the Display of `PeerWriteDenied::UnprovenRepoint`, declared
+    /// in `crates/gitlawb-node/src/db/mod.rs`. The executable detector for a
+    /// wording change is the node-side pin
+    /// `announce_unsigned_repoint_is_a_403_denial` in
+    /// `crates/gitlawb-node/src/api/peers.rs`, which asserts this same
+    /// substring against a response driven through the real router, so
+    /// rewording the Display turns that test red and the grep for the old
+    /// phrase lands here.
+    ///
+    /// The assertion bites rather than echoing its own input because the
+    /// substring is reachable only through the helper's `body["message"]`
+    /// extraction; the fixture's `error` field carries a different string, so
+    /// reading `body["error"]` instead fails this test.
     #[test]
     fn a_refused_local_add_warns_with_the_node_reason() {
         let warning = local_add_refusal(
             StatusCode::FORBIDDEN,
-            &json!({ "error": "forbidden", "message": "peer http_url change requires a signature from that peer" }),
+            &json!({
+                "error": "forbidden",
+                "message": "unproven announce cannot change an existing peer's http_url: did:key:z6MkuMqUm4i228K9qXidJ57zqSWAcQLgrcbMxB8RKVLuqitj"
+            }),
         )
         .expect("a refusal must not render as success");
 
         assert!(warning.contains("403"), "must name the status: {warning}");
         assert!(
-            warning.contains("requires a signature"),
+            warning.contains("unproven announce cannot change an existing peer"),
             "must carry the node's own reason: {warning}"
         );
     }
