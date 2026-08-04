@@ -1164,6 +1164,9 @@ async fn pin_new_objects_gated(
     crate::ipfs_pin::pin_new_objects(
         ipfs_api,
         repo_path,
+        // The literal, not `state.git_bin`: tests point that at a fake walk git, and
+        // this is the same choice `api/ipfs`'s bounded call sites already document.
+        "git",
         object_list,
         db,
         crate::ipfs_pin::PIN_BATCH_BUDGET,
@@ -2326,8 +2329,12 @@ async fn post_receive_replication_tail(
                         &pinata_upload_url,
                         &pinata_jwt,
                         &repo_path_clone,
+                        // The literal, not `state.git_bin`: tests point that at a fake
+                        // walk git, and this read must run the real one.
+                        "git",
                         object_list,
                         &db_clone,
+                        crate::ipfs_pin::PIN_BATCH_BUDGET,
                     )
                     .await,
                 )

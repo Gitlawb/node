@@ -441,14 +441,14 @@ pub fn object_type_bounded(
     let probe_started = std::time::Instant::now();
     match batch_check_probe(git_bin, repo_path, sha256_hex, deadline)? {
         BatchProbe::Present(ty) => Ok(Some(ty)),
-        BatchProbe::Fault(detail) => Err(classify_store_fault(repo_path, detail)),
+        BatchProbe::Fault(detail) => Err(classify_store_fault(repo_path, sha256_hex, detail)),
         BatchProbe::Missing => {
             // A clean `missing` is the absence-vs-unreadable-pack COLLISION (#174 F5):
             // a genuinely missing object AND a packed object whose pack/idx is
             // unreadable (permissions, or a mid-repack race) both print an identical
             // clean `missing`. Disambiguate OUT OF BAND on store readability — an
             // unreadable store is not an absence verdict (taint -> retryable 503).
-            if !object_store_readable(repo_path) {
+            if !object_store_readable(repo_path, sha256_hex) {
                 return Err(ProbeError::Transient(anyhow::anyhow!(
                     "git cat-file inconclusive: object store not readable at {} (not an absence verdict)",
                     repo_path.display()
@@ -477,7 +477,9 @@ pub fn object_type_bounded(
             // different instant than the failing probe).
             match batch_check_probe(git_bin, repo_path, sha256_hex, deadline)? {
                 BatchProbe::Present(ty) => Ok(Some(ty)),
-                BatchProbe::Fault(detail) => Err(classify_store_fault(repo_path, detail)),
+                BatchProbe::Fault(detail) => {
+                    Err(classify_store_fault(repo_path, sha256_hex, detail))
+                }
                 BatchProbe::Missing => Ok(None),
             }
         }
@@ -489,22 +491,46 @@ pub fn object_type_bounded(
 /// store on which git still fails is a persistent, deterministic fault — a corrupt repo
 /// or a bad `.git/config` — that a retry cannot fix (terminal 500). The `detail` is
 /// carried for the server log; the client-facing body is opaque (set by the caller).
-fn classify_store_fault(repo_path: &Path, detail: anyhow::Error) -> ProbeError {
-    if object_store_readable(repo_path) {
+///
+/// Readability is judged FOR `sha256_hex`: the probe checks the oid's own loose fan-out
+/// directory rather than all 256, so the verdict is scoped to the location git would
+/// actually need for THIS object and one unrelated broken directory cannot veto every
+/// probe on the repo.
+fn classify_store_fault(repo_path: &Path, sha256_hex: &str, detail: anyhow::Error) -> ProbeError {
+    if object_store_readable(repo_path, sha256_hex) {
         ProbeError::Deterministic(detail)
     } else {
         ProbeError::Transient(detail)
     }
 }
 
-/// Best-effort check that a repo's object store is readable, used to disambiguate a
-/// genuine missing-object `git cat-file` fatal from an unreadable or racing pack
-/// (both emit "could not get object info"). Returns false on any unreadable
-/// `objects/` dir or any pack/idx that cannot be opened (EACCES / EIO), so the
-/// caller surfaces an error rather than a false absence. Cheap — a couple of readdir
-/// plus open probes. It narrows, but does not close, the concurrent-repack TOCTOU: it
-/// samples a different instant than the failing cat-file.
-fn object_store_readable(repo_path: &Path) -> bool {
+/// Best-effort check that a repo's object store is readable FOR `sha256_hex`, used to
+/// disambiguate a genuine missing-object `git cat-file` verdict from an unreadable or
+/// racing store (both emit an identical clean `missing`). Returns false on an unreadable
+/// `objects/` dir, an unreadable `objects/pack` dir, any pack/idx that cannot be opened,
+/// or an unreadable loose fan-out directory for this oid (EACCES / EIO), so the caller
+/// surfaces an error rather than a false absence.
+///
+/// Only `NotFound` is benign, on both the pack and the loose leg: a loose-only store has
+/// no `objects/pack`, and a packed or genuinely-absent object has no loose file. Any
+/// OTHER error is a store the process cannot read, and absence cannot be certified
+/// through it. Treating EACCES like NotFound is exactly the #174 F2 swallow this replaces.
+///
+/// The loose leg is a single `File::open` of THIS oid's `objects/<xx>/<rest>`, not a
+/// drain of the fan-out directory. The caller supplies the CID, the CID fixes the sha,
+/// and the sha selects which of the 256 directories would be drained, so a drain would
+/// let an anonymous `/ipfs/{cid}` caller choose how much dirent work the probe does. The
+/// open detects the same fault: path resolution through an unreadable directory fails
+/// with EACCES even when the file inside does not exist.
+///
+/// Accepted direction: an unreadable fan-out dir makes this false for EVERY oid in that
+/// fan-out, including one that is packed or genuinely absent, so such a CID sheds a
+/// retryable 503 instead of a 404. That is the fail-closed answer (absence cannot be
+/// certified through a directory we cannot read), and a conservative shed, not a leak.
+///
+/// Cheap: two readdirs plus a couple of opens. It narrows, but does not close, the
+/// concurrent-repack TOCTOU: it samples a different instant than the failing cat-file.
+fn object_store_readable(repo_path: &Path, sha256_hex: &str) -> bool {
     let objects = repo_path.join("objects");
     // The objects dir itself must be listable; drain the iterator so a mid-listing
     // EACCES/EIO surfaces, not just the initial open.
@@ -517,23 +543,60 @@ fn object_store_readable(repo_path: &Path) -> bool {
         }
     }
     // Every pack file and its index must be openable for read. A loose-only store
-    // (no pack dir) is fine — the objects readdir above already proved reachability.
-    if let Ok(pack_entries) = std::fs::read_dir(objects.join("pack")) {
-        for entry in pack_entries {
-            let Ok(entry) = entry else {
-                return false;
-            };
-            let path = entry.path();
-            if matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("pack") | Some("idx")
-            ) && std::fs::File::open(&path).is_err()
-            {
-                return false;
+    // (no pack dir) is fine, since the objects readdir above already proved reachability,
+    // but only that NotFound is fine; an unreadable pack dir is not.
+    match std::fs::read_dir(objects.join("pack")) {
+        Ok(pack_entries) => {
+            for entry in pack_entries {
+                let Ok(entry) = entry else {
+                    return false;
+                };
+                let path = entry.path();
+                if matches!(
+                    path.extension().and_then(|s| s.to_str()),
+                    Some("pack") | Some("idx")
+                ) && std::fs::File::open(&path).is_err()
+                {
+                    return false;
+                }
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+    // Validate the oid BEFORE deriving any path component from it: `get(..2)` alone
+    // bounds the length but would admit `..` and other non-hex pairs into a path built
+    // from a caller-supplied string. Both of git's object-id widths are accepted:
+    // `init_bare` runs `git init --bare --object-format=sha1`, so production oids are 40
+    // hex and a 64-only guard would make this whole leg dead code there. A non-oid skips
+    // the loose leg and lets the objects/ and pack checks carry the verdict.
+    let is_hex_oid =
+        matches!(sha256_hex.len(), 40 | 64) && sha256_hex.bytes().all(|b| b.is_ascii_hexdigit());
+    if is_hex_oid {
+        match std::fs::File::open(objects.join(&sha256_hex[0..2]).join(&sha256_hex[2..])) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return false,
         }
     }
     true
+}
+
+/// Is the object store readable AT ALL, independent of any single object?
+///
+/// [`object_store_readable`] judges readability FOR one oid: when the string is a real
+/// 40/64-hex object id it also probes that oid's own loose fan-out directory, so one
+/// unreadable `objects/<xx>` (1/256 of the store) makes the verdict false for the oids that
+/// live there and true for everything else. Passing the EMPTY STRING deliberately fails
+/// that hex-oid guard, which skips the per-oid leg entirely and leaves the `objects/` and
+/// `objects/pack` checks to carry the verdict. The skip is not incidental: it is pinned by
+/// `object_store_readable_rejects_a_non_hex_sha_without_building_a_path`.
+///
+/// Callers use this to tell a store-wide fault, where every remaining object fails
+/// identically and stopping is the right answer, from an object-scoped one, where stopping
+/// forfeits healthy objects. Cheap: two readdirs and a couple of opens, no child spawn.
+pub(crate) fn object_store_readable_store_wide(repo_path: &Path) -> bool {
+    object_store_readable(repo_path, "")
 }
 
 /// Bounded, reaped variant of [`read_object_content`] for the async `/ipfs` serve
@@ -556,6 +619,55 @@ pub fn read_object_content_bounded(
         bail!("git cat-file failed: {}", String::from_utf8_lossy(&stderr));
     }
     Ok(stdout)
+}
+
+/// Bounded, reaped variant of [`read_object`] (#174 F3): composes [`object_type_bounded`]
+/// with [`read_object_content_bounded`] against a single `deadline`, so a caller that
+/// needs type+bytes gets one bounded call instead of two unbounded ones.
+///
+/// Contract:
+/// - `Ok(None)` means a VERIFIED absence, never "we could not tell". Every probe or read
+///   the store could not honestly serve is a [`ProbeError`], so a caller can distinguish
+///   an absent object from an unreadable one.
+/// - A content-stage failure lands in the same [`ProbeError`] vocabulary the type stage
+///   uses, and by the same rules: a watchdog timeout of the reaped child is `Transient`
+///   (retryable), exactly as the type stage classifies that identical failure, and every
+///   other content failure goes through [`classify_store_fault`], so it is `Transient` when
+///   the object store is not readable and `Deterministic` (terminal) when it is. The timeout
+///   is split out first because readability says nothing about a child that was reaped: the
+///   store is readable in the common case, which would make one fault retryable at the type
+///   stage and terminal at the content stage.
+/// - Same process-group teardown guarantees as its two constituents: SIGTERM grace then
+///   an unconditional group SIGKILL at `deadline`, with the leader reaped.
+///
+/// This is SYNCHRONOUS blocking work (child spawn, pipe drain, watchdog join). Async
+/// callers must run it under `tokio::task::spawn_blocking`, as `api/ipfs` already does
+/// for the two constituents; calling it directly from a runtime task blocks a worker.
+pub fn read_object_bounded(
+    git_bin: &str,
+    repo_path: &Path,
+    sha256_hex: &str,
+    deadline: std::time::Instant,
+) -> std::result::Result<Option<(String, Vec<u8>)>, ProbeError> {
+    match object_type_bounded(git_bin, repo_path, sha256_hex, deadline)? {
+        None => Ok(None),
+        Some(obj_type) => {
+            match read_object_content_bounded(git_bin, repo_path, sha256_hex, &obj_type, deadline) {
+                Ok(bytes) => Ok(Some((obj_type, bytes))),
+                // The watchdog reaped the child at `deadline`. That is the same failure
+                // `batch_check_probe` maps to `Transient` at the type stage, and it is
+                // retryable regardless of how readable the store is, so it is routed
+                // before readability gets a say.
+                Err(e)
+                    if e.downcast_ref::<crate::git::smart_http::GitServiceTimeout>()
+                        .is_some() =>
+                {
+                    Err(ProbeError::Transient(e))
+                }
+                Err(e) => Err(classify_store_fault(repo_path, sha256_hex, e)),
+            }
+        }
+    }
 }
 
 /// Read a git object by its SHA-256 hex object ID.
@@ -912,6 +1024,285 @@ mod tests {
         (bare, blob)
     }
 
+    /// #174 F2 (RED-before/GREEN-after): an unreadable pack DIRECTORY (distinct from the
+    /// unreadable pack FILE case above) was swallowed by `if let Ok(..) = read_dir(pack)`,
+    /// which treats EACCES exactly like the benign NotFound of a loose-only store. The
+    /// store then read as readable and the fault classified DETERMINISTIC (terminal 500)
+    /// for a condition a chmod can clear.
+    ///
+    /// Observed here, not assumed (the fixture looks like it should behave otherwise):
+    /// with the blob PACKED and `objects/pack` at mode 000, `cat-file --batch-check`
+    /// exits 0 printing `<oid> missing` on stdout AND `error: unable to open object pack
+    /// directory` on stderr. `has_error_diag` runs before the present/missing parse, so
+    /// this reaches `BatchProbe::Fault` and therefore `classify_store_fault`, not the
+    /// clean-`missing` branch. The assertion must therefore match the VARIANT: `is_err()`
+    /// is already satisfied at head and would be vacuous.
+    #[cfg(unix)]
+    #[test]
+    fn object_type_bounded_unreadable_pack_dir_is_transient_not_deterministic() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let (bare, blob) = bare_repo_with_blob(td.path());
+        assert!(Command::new("git")
+            .args(["gc", "-q"])
+            .current_dir(&bare)
+            .status()
+            .unwrap()
+            .success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        let pack_dir = bare.join("objects").join("pack");
+        let chmod = |mode: u32| {
+            let mut perms = std::fs::metadata(&pack_dir).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(&pack_dir, perms).unwrap();
+        };
+        chmod(0o000);
+        // Root bypasses permission bits, so witness the exact operation the probe
+        // performs (`read_dir` of the pack dir) and skip rather than falsely fail.
+        let genuinely_unreadable = std::fs::read_dir(&pack_dir).is_err();
+        let res = super::object_type_bounded("git", &bare, &blob, deadline);
+        chmod(0o755); // restore BEFORE any assertion that can panic, so TempDir cleans up
+
+        if genuinely_unreadable {
+            assert!(
+                matches!(res, Err(super::ProbeError::Transient(_))),
+                "an unreadable pack DIRECTORY is a store-readability fault: it must be a \
+                 retryable Transient (-> 503), not a terminal Deterministic (-> 500); got {res:?}"
+            );
+        }
+
+        // Must-not direction: with permissions restored the same store is healthy again,
+        // so the fix cannot have hard-wired the repo into permanently-broken.
+        assert_eq!(
+            super::object_type_bounded("git", &bare, &blob, deadline)
+                .unwrap()
+                .as_deref(),
+            Some("blob"),
+            "a packed blob on a restored store must probe present again"
+        );
+        assert!(
+            super::object_type_bounded("git", &bare, &"0".repeat(64), deadline)
+                .unwrap()
+                .is_none(),
+            "a genuinely-absent oid on a restored store must still be Ok(None)"
+        );
+    }
+
+    /// #174 F2 (RED-before/GREEN-after): no LOOSE fan-out directory was probed at all.
+    /// Draining `read_dir(objects)` enumerates the fan-out dir NAMES but proves none of
+    /// them listable, so an unreadable `objects/<xx>` read as a healthy store and the
+    /// fault classified Deterministic.
+    ///
+    /// Observed here, not assumed: with the blob LOOSE and `objects/<xx>` at mode 000,
+    /// `cat-file --batch-check` exits 0 printing `<oid> missing` on stdout AND `error:
+    /// unable to open loose object <oid>: Permission denied` on stderr, so it reaches
+    /// `BatchProbe::Fault` rather than the clean-`missing` branch. Match the VARIANT:
+    /// `is_err()` holds at head and would make this vacuous.
+    #[cfg(unix)]
+    #[test]
+    fn object_type_bounded_unreadable_fanout_is_transient_not_deterministic() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        // No `gc`: the blob stays loose, which is what puts it behind a fan-out dir.
+        let (bare, blob) = bare_repo_with_blob(td.path());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        let fanout = bare.join("objects").join(&blob[0..2]);
+        let loose = fanout.join(&blob[2..]);
+        assert!(
+            loose.is_file(),
+            "fixture must leave the blob loose at {loose:?}"
+        );
+        let chmod = |mode: u32| {
+            let mut perms = std::fs::metadata(&fanout).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(&fanout, perms).unwrap();
+        };
+        chmod(0o000);
+        // Witness with `File::open` of the exact loose path, the operation the probe
+        // itself makes; a `read_dir` witness would be a proxy that can drift from the code.
+        let genuinely_unreadable = std::fs::File::open(&loose).is_err();
+        let res = super::object_type_bounded("git", &bare, &blob, deadline);
+        chmod(0o755); // restore BEFORE any assertion that can panic
+
+        if genuinely_unreadable {
+            assert!(
+                matches!(res, Err(super::ProbeError::Transient(_))),
+                "an unreadable loose fan-out directory is a store-readability fault: it \
+                 must be a retryable Transient (-> 503), not Deterministic (-> 500); got {res:?}"
+            );
+        }
+
+        // Must-not direction: restored store probes present, and an absent oid (whose
+        // fan-out dir does not exist at all) must stay benign NotFound -> Ok(None).
+        assert_eq!(
+            super::object_type_bounded("git", &bare, &blob, deadline)
+                .unwrap()
+                .as_deref(),
+            Some("blob"),
+            "the loose blob must probe present again once the fan-out dir is readable"
+        );
+        assert!(
+            super::object_type_bounded("git", &bare, &"0".repeat(64), deadline)
+                .unwrap()
+                .is_none(),
+            "an absent oid whose fan-out dir does not exist must remain Ok(None), or the \
+             fan-out probe has over-tightened into 'every healthy store is broken'"
+        );
+    }
+
+    /// #174 F2 must-not direction: the fan-out and pack-dir tightening must not turn a
+    /// HEALTHY loose-only store into "not readable". A loose-only store has no
+    /// `objects/pack` at all, and a genuinely-absent oid has no loose file, so NotFound
+    /// has to stay benign on both legs. Get this wrong and every packed object's probe
+    /// (which has no loose file either) sheds a 503 for a perfectly healthy repo.
+    #[cfg(unix)]
+    #[test]
+    fn object_store_readable_loose_only_store_is_readable() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (bare, blob) = bare_repo_with_blob(td.path());
+        // `git clone --bare` creates an empty objects/pack; a true loose-only store has
+        // none, which is the state that must not be mistaken for an unreadable one.
+        let _ = std::fs::remove_dir_all(bare.join("objects").join("pack"));
+
+        assert!(
+            super::object_store_readable(&bare, &blob),
+            "a loose-only store with no objects/pack must read as readable"
+        );
+        assert!(
+            super::object_store_readable(&bare, &"0".repeat(64)),
+            "an absent oid (no loose file, no fan-out dir) must stay benign NotFound"
+        );
+    }
+
+    /// #174 F2, pinning the accepted direction from the plan rather than leaving it to be
+    /// discovered in production: on a PACKED store, a leftover but unreadable fan-out
+    /// directory makes the probe false for every oid in that fan-out, including one whose
+    /// object is packed or genuinely absent. That is deliberate fail-closed behavior (we
+    /// cannot certify absence through a directory we cannot read), and it sheds a
+    /// retryable 503 rather than asserting a false 404.
+    ///
+    /// The recreate step is required, not optional: `git gc` REMOVES the emptied fan-out
+    /// directory (afterwards `objects/` holds only `info` and `pack`), so a test that
+    /// assumed a leftover directory could not construct its state at all.
+    #[cfg(unix)]
+    #[test]
+    fn object_store_readable_packed_store_with_leftover_unreadable_fanout_is_not_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let (bare, blob) = bare_repo_with_blob(td.path());
+        assert!(Command::new("git")
+            .args(["gc", "-q"])
+            .current_dir(&bare)
+            .status()
+            .unwrap()
+            .success());
+        let fanout = bare.join("objects").join(&blob[0..2]);
+        assert!(
+            !fanout.exists(),
+            "gc is expected to remove the emptied fan-out dir; recreate it deliberately"
+        );
+        std::fs::create_dir_all(&fanout).unwrap();
+        let chmod = |mode: u32| {
+            let mut perms = std::fs::metadata(&fanout).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(&fanout, perms).unwrap();
+        };
+        chmod(0o000);
+        // Same euid==0 witness discipline: root ignores the bits, so probe the exact
+        // operation the code performs before asserting on its outcome.
+        let genuinely_unreadable = std::fs::File::open(fanout.join(&blob[2..])).is_err();
+        let packed = super::object_store_readable(&bare, &blob);
+        // An oid that shares the broken fan-out but is genuinely absent: same verdict.
+        let absent_in_broken_fanout = format!("{}{}", &blob[0..2], "0".repeat(blob.len() - 2));
+        let absent = super::object_store_readable(&bare, &absent_in_broken_fanout);
+        chmod(0o755); // restore BEFORE any assertion that can panic
+
+        if genuinely_unreadable {
+            assert!(
+                !packed,
+                "a packed object behind an unreadable fan-out dir must read as not-readable"
+            );
+            assert!(
+                !absent,
+                "an absent oid in the same unreadable fan-out must ALSO read as \
+                 not-readable (fail closed: absence cannot be certified through it)"
+            );
+        }
+        assert!(
+            super::object_store_readable(&bare, &blob),
+            "restoring the fan-out dir must restore the readable verdict"
+        );
+    }
+
+    /// #174 F2: the oid is validated as ASCII hex of one of git's two widths BEFORE any
+    /// path component is derived from it. `get(..2)` alone bounds the length but admits
+    /// `..` and other non-hex pairs into a path built from a caller-supplied string.
+    /// A non-oid skips the loose leg entirely and lets the objects/ and pack checks carry
+    /// the verdict, so the answer on a healthy repo is `true`, with no path touched
+    /// outside `objects/`.
+    ///
+    /// Must-not direction on the same fixture: a real 40-hex oid is NOT skipped. Width 40
+    /// matters because `init_bare` runs `git init --bare --object-format=sha1`, so every
+    /// production oid is 40 hex; a 64-only guard would silently make the fan-out probe
+    /// dead code on exactly the repos the node creates.
+    #[cfg(unix)]
+    #[test]
+    fn object_store_readable_rejects_a_non_hex_sha_without_building_a_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let (bare, blob) = bare_repo_with_blob(td.path());
+
+        // A healthy repo answers `true` for every malformed oid, because the loose leg is
+        // skipped rather than being handed `../../etc` to join.
+        for bad in [
+            "../../etc",
+            &"a".repeat(41),
+            &format!("{}z", "a".repeat(39)),
+        ] {
+            assert!(
+                super::object_store_readable(&bare, bad),
+                "a malformed oid must skip the fan-out leg, not veto a healthy store: {bad:?}"
+            );
+        }
+
+        // Now break one fan-out dir and probe it two ways: a 40-hex oid living in it must
+        // be checked (-> false), while a 41-character string with the same prefix must
+        // still be skipped (-> true). Same broken directory, so the only difference is
+        // whether the guard admitted the oid.
+        let broken = bare.join("objects").join("aa");
+        std::fs::create_dir_all(&broken).unwrap();
+        let chmod = |mode: u32| {
+            let mut perms = std::fs::metadata(&broken).unwrap().permissions();
+            perms.set_mode(mode);
+            std::fs::set_permissions(&broken, perms).unwrap();
+        };
+        chmod(0o000);
+        let oid40 = format!("aa{}", "b".repeat(38));
+        let genuinely_unreadable = std::fs::File::open(broken.join(&oid40[2..])).is_err();
+        let checked = super::object_store_readable(&bare, &oid40);
+        let skipped = super::object_store_readable(&bare, &format!("aa{}", "b".repeat(39)));
+        chmod(0o755); // restore BEFORE any assertion that can panic
+
+        if genuinely_unreadable {
+            assert!(
+                !checked,
+                "a 40-hex oid must reach the fan-out probe, or the guard has disabled the \
+                 whole check on the sha1 repos init_bare creates"
+            );
+            assert!(
+                skipped,
+                "a 41-character string must be rejected before any path is built from it"
+            );
+        }
+        // Sanity: the healthy sha256 oid is unaffected by the unrelated broken directory.
+        assert!(
+            super::object_store_readable(&bare, &blob),
+            "an unrelated broken fan-out dir must not veto a probe scoped to another oid"
+        );
+    }
+
     /// #174 F5/U4 (RED-before/GREEN-after, the CORE regression guard): a repo with a
     /// corrupt `.git/config` makes `git cat-file` die with `fatal: bad config line N`
     /// (exit 128, NO `error:` line) while `objects/` stays fully readable. The old
@@ -958,7 +1349,7 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            super::object_store_readable(&bare),
+            super::object_store_readable(&bare, &blob),
             "config corruption must leave objects/ readable (that is the whole point: \
              a readable store + a git failure == deterministic, not transient)"
         );
@@ -1096,6 +1487,229 @@ mod tests {
             matches!(res, Err(super::ProbeError::Transient(_))),
             "an unaffordable disambiguation is NOT an absence verdict: it must taint to \
              a retryable Transient, never a false Ok(None) 404; got {res:?}"
+        );
+    }
+
+    /// #174 F3: the composed bounded read must round-trip a present object exactly as
+    /// the unbounded `read_object` does: same `(type, bytes)` shape, bytes without the
+    /// git framing header.
+    #[cfg(unix)]
+    #[test]
+    fn read_object_bounded_roundtrips_a_present_blob() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (bare, blob) = bare_repo_with_blob(td.path());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        let got = super::read_object_bounded("git", &bare, &blob, deadline)
+            .expect("a healthy store must not fault")
+            .expect("a present blob must not read as absent");
+        assert_eq!(got.0, "blob");
+        assert_eq!(
+            got.1, b"f5 u4 content\n",
+            "the content bytes must be the raw object content the CID is computed from"
+        );
+    }
+
+    /// #174 F3: `Ok(None)` is reserved for a VERIFIED absence, and a healthy store must
+    /// still produce it, so the composed helper must not fault-taint every miss.
+    #[cfg(unix)]
+    #[test]
+    fn read_object_bounded_absent_is_none() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (bare, _blob) = bare_repo_with_blob(td.path());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+
+        let res = super::read_object_bounded("git", &bare, &"0".repeat(64), deadline);
+        assert!(
+            matches!(res, Ok(None)),
+            "a genuinely-absent oid on a healthy store must be Ok(None); got {res:?}"
+        );
+    }
+
+    /// #174 F3, the whole point of the helper: a wedged git cannot hold the caller past
+    /// the deadline. The fake traps SIGTERM and sleeps a BOUNDED 30s, so a regression
+    /// reports rather than wedges the suite, and the watchdog must escalate to SIGKILL to
+    /// reap it. The failure is a spawn/timeout of the reaped child, which is retryable, so
+    /// the variant is Transient.
+    #[cfg(unix)]
+    #[test]
+    fn read_object_bounded_returns_by_deadline_with_a_hung_git() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
+        let fake = td.path().join("fakegit");
+        std::fs::write(&fake, "#!/bin/sh\ntrap '' TERM\necho $$ > pid\nsleep 30\n").unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = bare.clone();
+        let oid = "0".repeat(64);
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let res = super::read_object_bounded(
+                &git_bin,
+                &path,
+                &oid,
+                Instant::now() + Duration::from_secs(1),
+            );
+            let _ = tx.send((res, started.elapsed()));
+        });
+        // Generous ceiling, following the visibility_pack reap tests: this asserts only
+        // "returned within the ceiling", never tight timing.
+        let (res, elapsed) = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("read_object_bounded must return by its deadline, not on the child's lifetime");
+        assert!(
+            matches!(res, Err(super::ProbeError::Transient(_))),
+            "a reaped hung child is a retryable fault, never an absence verdict; got {res:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "elapsed {elapsed:?} must stay inside the watchdog budget"
+        );
+
+        // The child's process group must be gone when the call returns.
+        let pid: i32 = std::fs::read_to_string(bare.join("pid"))
+            .expect("the fake git must have recorded its pid")
+            .trim()
+            .parse()
+            .unwrap();
+        let mut gone = false;
+        for _ in 0..200 {
+            // SAFETY: kill(2) with signal 0 only probes existence; ESRCH means gone.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            gone,
+            "the hung git child (pid {pid}) must be reaped, not orphaned"
+        );
+    }
+
+    /// #174 F3: a fault raised by the CONTENT stage must be classified through the same
+    /// `classify_store_fault` vocabulary as the type stage, not leak out as a bare error
+    /// and not decay into a false absence. The fixture is a fake git that answers
+    /// `cat-file --batch-check` cleanly (so the type stage succeeds and the content stage
+    /// is genuinely reached) and then fails the content read; the store itself is
+    /// readable, so the classification is Deterministic.
+    #[cfg(unix)]
+    #[test]
+    fn read_object_bounded_content_read_fault_is_classified() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
+        let fake = td.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nif [ \"$2\" = \"--batch-check\" ]; then read oid; echo \"$oid blob 6\"; exit 0; fi\n\
+             echo 'error: unable to read object' >&2\nexit 128\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let res =
+            super::read_object_bounded(fake.to_str().unwrap(), &bare, &"a".repeat(64), deadline);
+        assert!(
+            matches!(res, Err(super::ProbeError::Deterministic(_))),
+            "a content-read failure on a READABLE store is a terminal Deterministic fault \
+             (-> 500), never Ok(None) (-> a false 404) and never Transient; got {res:?}"
+        );
+    }
+
+    /// #174 F3: the two stages must agree about ONE fault. A watchdog timeout of the
+    /// reaped child is `Transient` when the TYPE stage raises it (a spawn or timeout
+    /// failure is retryable), so the CONTENT stage must not route the identical failure
+    /// through `classify_store_fault` and call it `Deterministic` just because the store
+    /// happens to be readable. The fixture answers `--batch-check` cleanly, so the content
+    /// stage is genuinely reached, and then hangs past the deadline with SIGTERM trapped so
+    /// the watchdog has to escalate; the store itself is readable, which is exactly the
+    /// condition that used to flip the verdict to terminal.
+    ///
+    /// The sleep is a BOUNDED 30s and the call runs on its own thread, following the
+    /// sibling reap tests: a regression reports rather than wedging the suite.
+    #[cfg(unix)]
+    #[test]
+    fn read_object_bounded_content_stage_timeout_is_transient_not_deterministic() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let td = tempfile::TempDir::new().unwrap();
+        let bare = td.path().join("bare.git");
+        std::fs::create_dir_all(bare.join("objects/pack")).unwrap();
+        let fake = td.path().join("fakegit");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nif [ \"$2\" = \"--batch-check\" ]; then read oid; echo \"$oid blob 6\"; exit 0; fi\n\
+             trap '' TERM\necho $$ > pid\nsleep 30\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&fake).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&fake, perm).unwrap();
+        let git_bin = fake.to_str().unwrap().to_string();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = bare.clone();
+        std::thread::spawn(move || {
+            let res = super::read_object_bounded(
+                &git_bin,
+                &path,
+                &"a".repeat(64),
+                Instant::now() + Duration::from_secs(1),
+            );
+            let _ = tx.send(res);
+        });
+        let res = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the content stage must return by its deadline, not on the child's lifetime");
+
+        // Prove the content stage was actually reached, or the assertion below would be
+        // about the type stage's own timeout arm and prove nothing new.
+        assert!(
+            bare.join("pid").exists(),
+            "the fixture must have reached the content read, or this test pins the wrong stage"
+        );
+        assert!(
+            matches!(res, Err(super::ProbeError::Transient(_))),
+            "a reaped content-stage child is the same retryable failure the type stage calls \
+             Transient; classifying it by store readability makes one fault terminal at one \
+             stage and retryable at the other; got {res:?}"
+        );
+    }
+
+    /// #174 F3 companion: a fault raised by the TYPE stage propagates through the
+    /// composed helper with its classification intact (a corrupt `.git/config` on a
+    /// readable objects/ dir is Deterministic).
+    #[cfg(unix)]
+    #[test]
+    fn read_object_bounded_type_stage_fault_keeps_its_classification() {
+        use std::io::Write;
+        let td = tempfile::TempDir::new().unwrap();
+        let (bare, blob) = bare_repo_with_blob(td.path());
+        let mut cfg = std::fs::OpenOptions::new()
+            .append(true)
+            .open(bare.join("config"))
+            .unwrap();
+        cfg.write_all(b"\n[broken section\nnot a valid = = = line\n")
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let res = super::read_object_bounded("git", &bare, &blob, deadline);
+        assert!(
+            matches!(res, Err(super::ProbeError::Deterministic(_))),
+            "a bad-config fatal on a readable store must stay Deterministic through the \
+             composed helper; got {res:?}"
         );
     }
 
