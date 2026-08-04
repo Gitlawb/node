@@ -2251,33 +2251,56 @@ impl Db {
             // The refusal is split by cause, because methodNotSupported is only
             // a true statement about a foreign method: a did:key whose key
             // material does not resolve gets the resolution failure instead.
-            PeerWriteAuthority::Unproven => match did.parse::<gitlawb_core::did::Did>() {
-                // Only reachable from the bootstrap announce-back in main.rs,
-                // which passes the contacted peer's raw JSON string; the
-                // announce handler parses req.did before calling here.
-                Err(e) => {
-                    return Err(PeerWriteDenied::UnresolvableDid {
-                        did: did.to_string(),
-                        reason: e.to_string(),
-                    }
-                    .into());
-                }
-                Ok(d) if !d.is_did_key() => {
-                    return Err(PeerWriteDenied::UnsupportedDidMethod {
-                        did: did.to_string(),
-                    }
-                    .into());
-                }
-                Ok(d) => {
-                    if let Err(e) = d.to_verifying_key() {
+            // Scoped to the INSERT, not to the DID. The check exists to stop a
+            // permanently uncorrectable row being CREATED; applied to a row that
+            // already exists it prevents nothing and freezes it instead. Before
+            // this gate, upsert_peer validated nothing and the handler accepted
+            // any parseable DID, so deployed tables hold did:web rows and
+            // did:key rows whose key never resolved. Judging the DID first made
+            // every one of those permanently unrefreshable: the unsigned
+            // announce is refused, and a signed one cannot exist because no key
+            // resolves. The row stays and keeps steering fan-out either way.
+            //
+            // The read-then-write race is benign: if a row appears in between,
+            // this write becomes an UPDATE and the UnprovenRepoint guard below
+            // still refuses any http_url change.
+            PeerWriteAuthority::Unproven
+                if !sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM peers WHERE did = $1)",
+                )
+                .bind(did)
+                .fetch_one(&self.pool)
+                .await
+                .unwrap_or(false) =>
+            {
+                match did.parse::<gitlawb_core::did::Did>() {
+                    // Only reachable from the bootstrap announce-back in main.rs,
+                    // which passes the contacted peer's raw JSON string; the
+                    // announce handler parses req.did before calling here.
+                    Err(e) => {
                         return Err(PeerWriteDenied::UnresolvableDid {
                             did: did.to_string(),
                             reason: e.to_string(),
                         }
                         .into());
                     }
+                    Ok(d) if !d.is_did_key() => {
+                        return Err(PeerWriteDenied::UnsupportedDidMethod {
+                            did: did.to_string(),
+                        }
+                        .into());
+                    }
+                    Ok(d) => {
+                        if let Err(e) = d.to_verifying_key() {
+                            return Err(PeerWriteDenied::UnresolvableDid {
+                                did: did.to_string(),
+                                reason: e.to_string(),
+                            }
+                            .into());
+                        }
+                    }
                 }
-            },
+            }
             _ => {}
         }
         let now = Utc::now().to_rfc3339();
@@ -6545,6 +6568,56 @@ mod peer_authority_tests {
             .expect("rejection must be the typed denial, or the handler renders it as a 500")
     }
 
+    /// A row a deployed database ALREADY holds must keep refreshing its
+    /// liveness. Before this gate existed `upsert_peer` did no DID validation
+    /// at all and the handler accepted any parseable DID, so live peer tables
+    /// carry did:web rows and did:key rows whose key never resolved. Judging
+    /// the DID before looking at whether the row exists freezes those forever:
+    /// the unsigned refresh is refused, and a signed one is impossible because
+    /// no key resolves. Nothing is protected by that, since the row is already
+    /// there and an identical-URL refresh changes no authority. Kills a gate
+    /// scoped to the DID instead of to the INSERT.
+    #[sqlx::test]
+    async fn a_legacy_row_can_still_refresh_its_liveness(pool: PgPool) {
+        let db = db(pool).await;
+
+        for legacy in [WEB_DID, "did:key:znotarealkeymaterial"] {
+            sqlx::query(
+                "INSERT INTO peers (did, http_url, last_seen, announced_at) \
+                 VALUES ($1, $2, $3, $3)",
+            )
+            .bind(legacy)
+            .bind(HONEST_URL)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(&db.pool)
+            .await
+            .expect("seeding a pre-gate row must succeed");
+
+            db.upsert_peer(legacy, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("a legacy row must keep refreshing its liveness: {legacy} -> {e}")
+                });
+        }
+    }
+
+    /// The other half: the gate still refuses to CREATE such a row. Without
+    /// this, scoping the check to the insert path could be satisfied by
+    /// dropping the check altogether.
+    #[sqlx::test]
+    async fn a_legacy_did_still_cannot_be_created_fresh(pool: PgPool) {
+        let db = db(pool).await;
+
+        let err = db
+            .upsert_peer(WEB_DID, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("an unseen non-did:key must still be refused at insert");
+        assert!(
+            matches!(denial(err), PeerWriteDenied::UnsupportedDidMethod { .. }),
+            "the insert refusal must survive the insert-scoping"
+        );
+    }
+
     /// Discovery stays open: an unproven caller may still seed an unseen
     /// did:key row. Kills a gate widened until it rejects inserts too.
     #[sqlx::test]
@@ -6871,6 +6944,7 @@ mod peer_authority_tests {
 /// | `prune_self_peers` (db/mod.rs) | a delete keyed on `http_url`; cannot repoint; boot-only caller in main.rs |
 /// | `prune_non_public_peers` (db/mod.rs) | a delete keyed on a computed bad-DID array; cannot repoint; boot-only caller in main.rs |
 /// | `seed_local_peer` (sync.rs) | excluded by test-module location: a deliberate `upsert_peer` bypass for `file://` fixtures, which the public-URL gate rejects |
+/// | `a_legacy_row_can_still_refresh_its_liveness` (db/mod.rs) | test-only. Seeds a PRE-GATE row by raw SQL on purpose: `upsert_peer` cannot create one, since the gate it is testing refuses exactly that DID. The fixture models what a deployed table already holds |
 ///
 /// And the `upsert_peer` CALL-SITE authority table, which the ledger above
 /// structurally cannot hold, because the bootstrap site issues no SQL of its own
@@ -6889,6 +6963,7 @@ mod peers_table_writer_guard {
     /// the table. Bidirectional: an undispositioned hit fails, and so does a
     /// listed function that no longer has one.
     const LEDGER: &[(&str, usize)] = &[
+        ("a_legacy_row_can_still_refresh_its_liveness", 1),
         ("mark_peer_ping", 1),
         ("prune_non_public_peers", 1),
         ("prune_self_peers", 1),
