@@ -6959,6 +6959,72 @@ mod peers_table_writer_guard {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
+    /// The per-file scan, split out so the multi-line-SQL property can be
+    /// asserted against a synthetic source rather than only against the real
+    /// tree, which happens to contain no multi-line peers write today. A guard
+    /// whose blind spot is invisible because the tree does not currently
+    /// exercise it is one that fails the moment somebody writes normal code.
+    fn scan_source(src: &str) -> BTreeMap<String, usize> {
+        let needles: Vec<String> = needles().iter().map(|n| n.to_lowercase()).collect();
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        // Normalize the WHOLE file before matching, not each line on its
+        // own. Per-line `contains` is whitespace- and case-sensitive, so
+        // `sqlx::query(r#"UPDATE\n  peers SET ..."#)` walked straight past
+        // it, and that multi-line form is how the longer queries in this
+        // file are already written. Verified both ways: the single-line
+        // bypass went RED, the identical statement split across lines
+        // stayed GREEN. Offsets are mapped back to line numbers so each
+        // statement is still attributed to the function that issues it.
+        let mut flat = String::with_capacity(src.len());
+        let mut starts: Vec<(usize, usize)> = Vec::new(); // (offset, line index)
+        for (idx, line) in src.lines().enumerate() {
+            starts.push((flat.len(), idx));
+            flat.push_str(&line.trim().to_lowercase());
+            flat.push(' ');
+        }
+        let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Re-derive offsets against the collapsed text by walking it once.
+        let mut collapsed = String::with_capacity(flat.len());
+        let mut owners: Vec<usize> = Vec::new(); // line index per byte
+        for (idx, line) in src.lines().enumerate() {
+            for tok in line.trim().to_lowercase().split_whitespace() {
+                if !collapsed.is_empty() {
+                    collapsed.push(' ');
+                    owners.push(idx);
+                }
+                for _ in 0..tok.len() {
+                    owners.push(idx);
+                }
+                collapsed.push_str(tok);
+            }
+        }
+
+        let fn_at: Vec<&str> = {
+            let mut current = "<module level>";
+            src.lines()
+                .map(|line| {
+                    if let Some(name) = declared_fn(line) {
+                        current = name;
+                    }
+                    current
+                })
+                .collect()
+        };
+
+        for needle in &needles {
+            let mut from = 0usize;
+            while let Some(rel) = collapsed[from..].find(needle.as_str()) {
+                let at = from + rel;
+                let line_idx = owners.get(at).copied().unwrap_or(0);
+                let owner = fn_at.get(line_idx).copied().unwrap_or("<module level>");
+                *found.entry(owner.to_string()).or_default() += 1;
+                from = at + needle.len();
+            }
+        }
+        found
+    }
+
     /// Each dispositioned writer and the number of statements it issues against
     /// the table. Bidirectional: an undispositioned hit fails, and so does a
     /// listed function that no longer has one.
@@ -7012,6 +7078,43 @@ mod peers_table_writer_guard {
     /// The backstop the authority parameter cannot provide: a new raw write
     /// against the table from outside `upsert_peer` is invisible to the type
     /// system, so it is caught here or not at all.
+    /// The blind spot this guard shipped with: matching a verb-plus-table needle
+    /// per line is whitespace- and case-sensitive, so the identical statement split
+    /// across lines walked past it. That form is how the longer queries in this
+    /// file are already written, so it is the shape a future writer most likely
+    /// takes. Both directions asserted, plus lowercase.
+    ///
+    /// The fixtures are DERIVED from `needles()` at runtime for the same reason
+    /// the needles themselves are: a literal here would be found by the scan of
+    /// this very file and counted against this test function. Deriving them
+    /// also means the test follows if the needle set ever changes.
+    #[test]
+    fn the_scan_sees_a_write_whose_verb_and_table_are_on_different_lines() {
+        for needle in needles() {
+            let (verb, table) = needle.rsplit_once(' ').expect("a needle is '<VERB> peers'");
+            let cases = [
+                ("single-line", format!("{verb} {table} SET x = $1")),
+                (
+                    "split across lines",
+                    format!("{verb}\n             {table}\n             SET x = $1"),
+                ),
+                (
+                    "lowercase, double-spaced",
+                    format!("{}  {} set x = $1", verb.to_lowercase(), table),
+                ),
+            ];
+            for (label, sql) in cases {
+                let src = format!("fn sneaky() {{\n    sqlx::query(\"{sql}\");\n}}\n");
+                let found = scan_source(&src);
+                assert_eq!(
+                    found.get("sneaky").copied(),
+                    Some(1),
+                    "the scan missed a peers write written {label} with needle {needle:?}: {found:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn every_peers_table_write_is_dispositioned() {
         let mut files = Vec::new();
@@ -7026,18 +7129,12 @@ mod peers_table_writer_guard {
             files.len()
         );
 
-        let needles = needles();
         let mut found: BTreeMap<String, usize> = BTreeMap::new();
         for file in &files {
             let src = std::fs::read_to_string(file).expect("source file must be readable");
-            let mut current = "<module level>";
-            for line in src.lines() {
-                if let Some(name) = declared_fn(line) {
-                    current = name;
-                }
-                if needles.iter().any(|n| line.contains(n.as_str())) {
-                    *found.entry(current.to_string()).or_default() += 1;
-                }
+
+            for (owner, n) in scan_source(&src) {
+                *found.entry(owner).or_default() += n;
             }
         }
 
