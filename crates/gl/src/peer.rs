@@ -7,7 +7,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{read_body_capped, sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -107,10 +107,26 @@ fn local_add_refusal(status: reqwest::StatusCode, body: &Value) -> Option<String
     if status.is_success() {
         return None;
     }
-    let msg = body["message"].as_str().unwrap_or("unknown error");
+    // The message is the node's, not ours, so it is defanged before it reaches
+    // the terminal. Only the message: the status and the prose are ours.
+    let msg = sanitize_node_msg(body["message"].as_str().unwrap_or("unknown error"));
     Some(format!(
         "warning: local peer list not updated ({status}): {msg}"
     ))
+}
+
+/// The block printed after a peer accepts our announce. Split out so the
+/// defanging is assertable: the DID and URL are the remote peer's own strings,
+/// and `peer_url` is caller-chosen, so this is the least trusted body the
+/// command handles. Only the display is sanitized; the values sent on to our
+/// local node stay verbatim, since that is data rather than terminal output and
+/// the node runs its own validation on them.
+fn announced_peer_summary(their_did: &str, their_url: &str, peer_count: u64) -> String {
+    format!(
+        "Announced to peer node:\n  DID:        {}\n  URL:        {}\n  Their peers: {peer_count}\n",
+        sanitize_node_msg(their_did),
+        sanitize_node_msg(their_url),
+    )
 }
 
 async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result<()> {
@@ -143,10 +159,15 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
         .await
         .context("failed to connect to peer")?;
     let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON response")?;
+    // `peer_url` is fully caller-chosen, so this body is the least trusted one
+    // in the command: bound the read, and defang the message before it reaches
+    // the terminal through the error return. An announce reply is a DID, a URL
+    // and a count, so 8 KiB is well past what the shape needs.
+    let raw = read_body_capped(resp, 8 * 1024).await;
+    let result: Value = serde_json::from_str(&raw).context("invalid JSON response")?;
 
     if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
+        let msg = sanitize_node_msg(result["message"].as_str().unwrap_or("unknown error"));
         anyhow::bail!("announce failed ({status}): {msg}");
     }
 
@@ -154,10 +175,10 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
     let their_url = result["node_url"].as_str().unwrap_or("?");
     let peer_count = result["peer_count"].as_u64().unwrap_or(0);
 
-    println!("Announced to peer node:");
-    println!("  DID:        {their_did}");
-    println!("  URL:        {their_url}");
-    println!("  Their peers: {peer_count}");
+    print!(
+        "{}",
+        announced_peer_summary(their_did, their_url, peer_count)
+    );
 
     // Also add their info to our local node's peer list
     // (the peer's /announce response includes their did + url)
@@ -176,7 +197,12 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
         match local_client.post("/api/v1/peers/announce", &add_body).await {
             Ok(resp) => {
                 let status = resp.status();
-                let result: Value = resp.json().await.unwrap_or(Value::Null);
+                // Same bound as the remote announce above: a compromised local
+                // node (or a MITM on plain http) must not force an unbounded
+                // read. A body that does not parse stays `Null`, which still
+                // routes a non-success status to the warning.
+                let raw = read_body_capped(resp, 8 * 1024).await;
+                let result: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
                 match local_add_refusal(status, &result) {
                     Some(warning) => eprintln!("{warning}"),
                     None => println!("  Added to local peer list."),
@@ -244,7 +270,7 @@ async fn cmd_resolve(did: String, node: String) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::local_add_refusal;
+    use super::{announced_peer_summary, local_add_refusal};
     use reqwest::StatusCode;
     use serde_json::json;
 
@@ -296,5 +322,100 @@ mod tests {
     #[test]
     fn an_accepted_local_add_produces_no_warning() {
         assert!(local_add_refusal(StatusCode::OK, &json!({ "peer_count": 3 })).is_none());
+    }
+
+    /// The warning is printed straight to a terminal, so a node-supplied message
+    /// carrying an OSC title-rewrite plus a C0 escape must reach it defanged.
+    #[test]
+    fn a_refusal_message_cannot_carry_terminal_escapes() {
+        let warning = local_add_refusal(
+            StatusCode::FORBIDDEN,
+            &json!({ "message": "\u{1b}]2;pwned\u{7}legit-looking text" }),
+        )
+        .expect("a refusal must not render as success");
+
+        assert!(
+            !warning.chars().any(|c| c.is_control()),
+            "control char leaked to the terminal: {warning:?}"
+        );
+        assert!(
+            warning.contains("legit-looking text"),
+            "printable text dropped: {warning:?}"
+        );
+    }
+
+    /// Bidi format chars are not `char::is_control`, yet they reorder the
+    /// displayed line, so a refusal must not carry them either.
+    #[test]
+    fn a_refusal_message_cannot_carry_bidi_overrides() {
+        let warning = local_add_refusal(
+            StatusCode::FORBIDDEN,
+            &json!({ "message": "peer \u{202e}refused\u{202c} here" }),
+        )
+        .expect("a refusal must not render as success");
+
+        assert!(
+            !warning.chars().any(gitlawb_core::sanitize::is_bidi_format),
+            "bidi format char leaked to the terminal: {warning:?}"
+        );
+    }
+
+    /// A hostile node must not be able to dump an arbitrary amount of text into
+    /// the user's scrollback through the warning line.
+    #[test]
+    fn a_refusal_message_is_length_bounded() {
+        let warning = local_add_refusal(
+            StatusCode::FORBIDDEN,
+            &json!({ "message": "x".repeat(5000) }),
+        )
+        .expect("a refusal must not render as success");
+
+        assert!(
+            warning.chars().count() < 500,
+            "warning not bounded: {} chars",
+            warning.chars().count()
+        );
+    }
+
+    /// The accepted-announce block prints the remote peer's own DID and URL, so
+    /// a hostile peer answering 200 must not get escapes onto the terminal that
+    /// way either. The refusal path is not the only sink in this command.
+    #[test]
+    fn an_accepted_announce_summary_cannot_carry_terminal_escapes() {
+        let summary = announced_peer_summary(
+            "did:key:z6Mk\u{1b}]2;pwned\u{7}abc",
+            "https://peer.example\u{202e}moc.live//:sptth",
+            3,
+        );
+
+        assert!(
+            !summary.chars().any(|c| c.is_control() && c != '\n'),
+            "control char leaked to the terminal: {summary:?}"
+        );
+        assert!(
+            !summary.chars().any(gitlawb_core::sanitize::is_bidi_format),
+            "bidi format char leaked to the terminal: {summary:?}"
+        );
+        assert!(
+            summary.contains("did:key:z6Mk") && summary.contains("Their peers: 3"),
+            "printable content dropped: {summary:?}"
+        );
+    }
+
+    /// The counterweight to the stripping tests: a legitimate message with RTL
+    /// script letters and a ZWJ must survive intact, so the sanitizer is not
+    /// proven by over-stripping.
+    #[test]
+    fn a_legitimate_refusal_message_survives_intact() {
+        let warning = local_add_refusal(
+            StatusCode::FORBIDDEN,
+            &json!({ "message": "peer refused \u{0627}\u{200D}b" }),
+        )
+        .expect("a refusal must not render as success");
+
+        assert!(
+            warning.contains("peer refused \u{0627}\u{200D}b"),
+            "legitimate text mangled: {warning:?}"
+        );
     }
 }
