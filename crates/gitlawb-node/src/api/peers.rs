@@ -17,8 +17,31 @@ use gitlawb_core::did::Did;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthenticatedDid;
+use crate::db::{PeerWriteAuthority, PeerWriteDenied};
 use crate::error::{AppError, Result};
 use crate::state::AppState;
+
+/// Map an `upsert_peer` failure onto its response class.
+///
+/// The boundary's denials arrive inside an anyhow chain, so they are downcast
+/// back out the way `From<anyhow::Error> for AppError` already recovers sqlx
+/// errors. Without this a refusal renders as a 500, which is the mis-rendered
+/// denial this gate exists to avoid. An authority refusal is 403; naming a DID
+/// method that can never authenticate is a fact about the input's form, so it
+/// is the 400 validation class.
+fn peer_write_error(err: anyhow::Error) -> AppError {
+    match err.downcast::<PeerWriteDenied>() {
+        Ok(denied) => match &denied {
+            PeerWriteDenied::UnsupportedDidMethod { .. } => {
+                AppError::BadRequest(denied.to_string())
+            }
+            PeerWriteDenied::UnprovenRepoint { .. } | PeerWriteDenied::ProofDidMismatch { .. } => {
+                AppError::Forbidden(denied.to_string())
+            }
+        },
+        Err(other) => AppError::from(other),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AnnounceRequest {
@@ -187,18 +210,23 @@ pub async fn announce(
         .did
         .parse()
         .map_err(|e: gitlawb_core::Error| AppError::BadRequest(e.to_string()))?;
-    if let Some(Extension(auth)) = auth {
+    // The extension's DID is cryptographically derived, never body-supplied:
+    // auth/mod.rs resolves the verifying key FROM the keyid DID itself, so what
+    // is carried through to the upsert boundary below is a proof, not a claim.
+    let proven_did: Option<String> = if let Some(Extension(auth)) = auth {
         if auth.0 != announced_did.to_string() {
             return Err(AppError::BadRequest(
                 "Signature keyid must match announced DID".into(),
             ));
         }
+        Some(auth.0)
     } else {
         tracing::warn!(
             did = %announced_did,
             "accepted unsigned peer announce; set GITLAWB_REQUIRE_SIGNED_PEER_WRITES=true after all peers upgrade"
         );
-    }
+        None
+    };
 
     // Validate the URL is a public http(s) endpoint. The announce route is
     // reachable unauthenticated (until all peers sign), so without this an
@@ -228,7 +256,20 @@ pub async fn announce(
         ));
     }
 
-    state.db.upsert_peer(&req.did, &req.http_url).await?;
+    // The authority declaration, not a re-statement of the check above: the
+    // boundary carries the proven DID and re-checks it against the row itself,
+    // so the keyid comparison above is an early rejection rather than the only
+    // gate. The other writer (the bootstrap announce-back in main.rs) never
+    // reaches this handler at all.
+    let authority = match proven_did.as_deref() {
+        Some(did) => PeerWriteAuthority::Proven(did),
+        None => PeerWriteAuthority::Unproven,
+    };
+    state
+        .db
+        .upsert_peer(&req.did, &req.http_url, authority)
+        .await
+        .map_err(peer_write_error)?;
 
     tracing::info!(did = %req.did, url = %req.http_url, "peer announced");
 
@@ -770,7 +811,11 @@ mod tests {
         let did = Keypair::generate().did().to_string();
         state
             .db
-            .upsert_peer(&did, "https://peer.example.com")
+            .upsert_peer(
+                &did,
+                "https://peer.example.com",
+                crate::db::PeerWriteAuthority::Unproven,
+            )
             .await
             .unwrap();
         did
@@ -1153,6 +1198,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// U1 (#273). An unsigned announce must not repoint an existing peer's row.
+    ///
+    /// Kills the unconditional `ON CONFLICT(did) DO UPDATE SET http_url = $2` in
+    /// `Db::upsert_peer`. The failure message carries BOTH observed values,
+    /// because the gate is the observed rewrite (2xx AND the attacker URL
+    /// stored), not merely a failing assertion: a 429 from the peer-write brake,
+    /// a fixture URL `is_public_http_url` rejects, or a DB error would all read
+    /// as "assertion failed" while proving nothing about this defect.
+    #[sqlx::test]
+    async fn unsigned_announce_cannot_repoint_an_existing_peer(pool: PgPool) {
+        const HONEST: &str = "https://honest-peer.example.com";
+        const ATTACKER: &str = "https://attacker.example.com";
+
+        let state = test_state(pool).await;
+        let did = Keypair::generate().did().to_string();
+        state
+            .db
+            .upsert_peer(&did, HONEST, crate::db::PeerWriteAuthority::Unproven)
+            .await
+            .unwrap();
+
+        let stored_url = |peers: Vec<crate::db::PeerRecord>| {
+            peers.into_iter().find(|p| p.did == did).map(|p| p.http_url)
+        };
+        assert_eq!(
+            stored_url(state.db.list_peers().await.unwrap()).as_deref(),
+            Some(HONEST),
+            "seed did not take; the case below would pass vacuously"
+        );
+
+        // Clone before build_router consumes state, so the row can be read back.
+        let db = state.db.clone();
+        let body = format!(r#"{{"did":"{did}","http_url":"{ATTACKER}"}}"#);
+        let resp = crate::server::build_router(state)
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &body,
+                "203.0.113.77:5000",
+            ))
+            .await
+            .unwrap();
+        let status = resp.status();
+        let stored = stored_url(db.list_peers().await.unwrap())
+            .expect("peer row vanished; neither the allowed nor the denied outcome");
+
+        assert_eq!(
+            stored, HONEST,
+            "unsigned announce repointed an existing peer (observed status {status}, stored http_url {stored})"
+        );
     }
 
     // Build a request carrying a REAL RFC 9421 signature (not just an injected
