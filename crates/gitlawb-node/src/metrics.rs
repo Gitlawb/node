@@ -235,7 +235,11 @@ pub fn record_auth_failure(route: &str, reason: &str) {
     }
 }
 
-/// Record one sync_queue item outcome. `status` ∈ {done, failed, skipped}.
+/// Record one sync_queue item outcome. `status` ∈ {done, failed, skipped,
+/// rejected, deferred}. `rejected` is terminal and caused by a guard (a
+/// malformed slug, or a path resolving outside repos_dir); `deferred` leaves
+/// the row pending for a later pass, so a queue stalled on an operator
+/// condition is visible rather than looking idle.
 pub fn record_sync_processed(status: &str) {
     if let Some(c) = SYNC_PROCESSED.get() {
         c.with_label_values(&[status]).inc();

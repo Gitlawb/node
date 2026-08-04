@@ -8,20 +8,33 @@ FROM rust:1.91-bookworm AS builder
 
 WORKDIR /build
 
-# Cache dependencies first for faster rebuilds
+# Cache dependencies first for faster rebuilds.
+# EVERY workspace member's manifest must be copied here, not just the ones this
+# image ships: cargo loads the whole workspace before it resolves anything, so a
+# missing member's Cargo.toml (or a path dependency pointing at one) aborts the
+# layer before a single crate is fetched.
 COPY Cargo.toml Cargo.lock ./
 COPY crates/gitlawb-core/Cargo.toml crates/gitlawb-core/
 COPY crates/gitlawb-node/Cargo.toml crates/gitlawb-node/
 COPY crates/gl/Cargo.toml crates/gl/
 COPY crates/git-remote-gitlawb/Cargo.toml crates/git-remote-gitlawb/
+COPY crates/gitlawb-attest/Cargo.toml crates/gitlawb-attest/
+COPY crates/icaptcha-client/Cargo.toml crates/icaptcha-client/
 
-# Fetch deps (this layer caches until Cargo.{toml,lock} change)
-RUN mkdir -p crates/gitlawb-core/src crates/gitlawb-node/src crates/gl/src crates/git-remote-gitlawb/src && \
+# Fetch deps (this layer caches until Cargo.{toml,lock} change).
+# No `|| true`: this layer is expected to succeed, and swallowing its exit code
+# is what let it sit dead from the moment gl gained a path dependency on
+# icaptcha-client. A failure here should stop the build, not silently turn every
+# image build into a cold one.
+RUN mkdir -p crates/gitlawb-core/src crates/gitlawb-node/src crates/gl/src \
+        crates/git-remote-gitlawb/src crates/gitlawb-attest/src crates/icaptcha-client/src && \
     echo 'fn main() {}' > crates/gitlawb-node/src/main.rs && \
     echo 'fn main() {}' > crates/gl/src/main.rs && \
     echo 'fn main() {}' > crates/git-remote-gitlawb/src/main.rs && \
     echo '' > crates/gitlawb-core/src/lib.rs && \
-    cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb || true
+    echo '' > crates/gitlawb-attest/src/lib.rs && \
+    echo '' > crates/icaptcha-client/src/lib.rs && \
+    cargo build --release --locked -p gitlawb-node -p gl -p git-remote-gitlawb
 
 # Now copy real sources and build for real.
 # Force-bump mtimes so cargo's fingerprint check rebuilds — without this,
@@ -34,7 +47,7 @@ RUN find crates -name "*.rs" -exec touch {} + && \
     rm -rf target/release/.fingerprint/gitlawb-node-* \
            target/release/.fingerprint/gl-* \
            target/release/.fingerprint/git-remote-gitlawb-* && \
-    cargo build --release -p gitlawb-node -p gl -p git-remote-gitlawb && \
+    cargo build --release --locked -p gitlawb-node -p gl -p git-remote-gitlawb && \
     strip target/release/gitlawb-node target/release/gl target/release/git-remote-gitlawb
 
 # ── Runtime stage ───────────────────────────────────────────────────────────

@@ -1,0 +1,112 @@
+# Dependency allowlist for the `gitlawb-core` crate.
+#
+# gitlawb-core is the shared-primitives crate every consumer embeds (the `gl`
+# CLI, git-remote-gitlawb, the node daemon). It must stay lean so those
+# consumers do not inherit daemon-weight dependencies. This file is the source
+# of truth for the crates gitlawb-core's NORMAL (non-dev, non-build) transitive
+# dependency closure is allowed to contain. CI (`scripts/check-gitlawb-core-deps.sh`,
+# wired into the `core-deps-purity` job in .github/workflows/pr-checks.yml)
+# fails if gitlawb-core's tree contains any crate not listed here.
+#
+# The allowlist is exhaustive-by-construction: a NEW dependency reds CI whether
+# or not anyone thought to ban it, which a denylist cannot do.
+#
+# Measured in-workspace, so feature unification across the workspace can, in
+# rare cases, surface a crate here that gitlawb-core would not pull standalone.
+# An unexpected new entry is a prompt to check what pulled it in, not noise to
+# rubber-stamp.
+#
+# Regenerate (from repo root, after an INTENTIONAL dependency change):
+#   cargo tree -p gitlawb-core --edges normal --prefix none \
+#     | sed -E 's/ v[0-9].*$//' \
+#     | grep -v '^gitlawb-core$' \
+#     | sort -u
+# then paste the result below this header block. (The checker snapshots and
+# restores Cargo.lock; a manual regen may refresh it — `git checkout Cargo.lock`
+# afterward if you did not intend that.)
+#
+# Lines starting with `#` and blank lines are ignored by the checker.
+aead
+anyhow
+base-x
+base256emoji
+base64
+base64ct
+block-buffer
+cfg-if
+chacha20
+chacha20poly1305
+chrono
+cid
+cipher
+const-oid
+const-str
+core2
+cpufeatures
+crypto-common
+crypto_box
+crypto_secretbox
+curve25519-dalek
+curve25519-dalek-derive
+data-encoding
+data-encoding-macro
+data-encoding-macro-internal
+der
+digest
+ed25519
+ed25519-dalek
+equivalent
+generic-array
+getrandom
+hashbrown
+hex
+iana-time-zone
+indexmap
+inout
+itoa
+libc
+match-lookup
+memchr
+multibase
+multihash
+multihash-codetable
+multihash-derive
+multihash-derive-impl
+num-traits
+opaque-debug
+pem-rfc7468
+pkcs8
+poly1305
+ppv-lite86
+proc-macro-crate
+proc-macro2
+quote
+rand
+rand_chacha
+rand_core
+salsa20
+serde
+serde_core
+serde_derive
+serde_json
+sha2
+signature
+spki
+subtle
+syn
+synstructure
+thiserror
+thiserror-impl
+toml_datetime
+toml_edit
+toml_parser
+typenum
+unicode-ident
+universal-hash
+unsigned-varint
+uuid
+winnow
+zerocopy
+zeroize
+zeroize_derive
+zmij

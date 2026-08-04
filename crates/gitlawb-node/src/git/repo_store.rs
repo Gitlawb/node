@@ -303,6 +303,131 @@ fn validate_path_components(owner_did: &str, repo_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a peer-supplied `owner/name` sync slug and return its two halves.
+///
+/// The sync queue carries a single `repo` string that peers control, and the
+/// worker turns it into a filesystem path. `PathBuf::join` does not normalize,
+/// and an absolute second component replaces the accumulated path, so an
+/// unvalidated `a//tmp/x` resolved to `/tmp/x.git` outside `repos_dir` (#272).
+///
+/// The halves are checked with the same validators that guard
+/// `RepoStore::local_path`, so there is one owner rule and one name rule in the
+/// crate. The one rule added here is the leading `.`/`-` check on the owner
+/// half: `validate_owner_did` has no such rule (it also serves full DIDs, which
+/// always start with `d`), and without it an owner half of `.` puts a
+/// peer-controlled mirror at the `repos_dir` root, which canonicalizes back
+/// inside the root and so passes containment.
+pub(crate) fn validate_repo_slug(slug: &str) -> Result<(&str, &str)> {
+    let mut parts = slug.split('/');
+    let (Some(owner), Some(name)) = (parts.next(), parts.next()) else {
+        anyhow::bail!("repo slug must be 'owner/name'");
+    };
+    if parts.next().is_some() {
+        anyhow::bail!("repo slug must contain exactly one '/'");
+    }
+    if owner.is_empty() || name.is_empty() {
+        anyhow::bail!("repo slug has an empty owner or name");
+    }
+    if owner.starts_with('.') || owner.starts_with('-') {
+        anyhow::bail!("repo slug owner must not start with '.' or '-'");
+    }
+    // The owner half becomes one path component, so it is bounded by NAME_MAX
+    // (255), not by the DID column's 256. The two differ by exactly one, and
+    // that one length is the gap that matters: validate_owner_did accepts 256,
+    // create_dir_all then fails with ENAMETOOLONG on every attempt, and the
+    // worker leaves such a row pending, so it is re-picked forever. Rejecting
+    // it here means an undeliverable slug never enters the queue at all.
+    if owner.len() > 255 {
+        anyhow::bail!("repo slug owner exceeds 255 chars");
+    }
+    validate_owner_did(owner)?;
+    validate_repo_name(name)?;
+    Ok((owner, name))
+}
+
+/// The answer from [`path_within_root`].
+///
+/// Three-valued rather than a bool because the two negative answers call for
+/// opposite handling. `Outside` is a deterministic verdict about a hostile or
+/// misconfigured path: the same input fails the same way forever, so the caller
+/// can retire the work. `IoError` says the question could not be answered at
+/// all (EACCES, an unmounted root), which is transient, so the caller must keep
+/// the work and try again rather than permanently retire a legitimate repo.
+#[derive(Debug)]
+pub(crate) enum Containment {
+    /// The candidate resolves inside the root.
+    Contained,
+    /// The candidate resolves outside the root.
+    Outside,
+    /// The filesystem could not answer the question.
+    IoError(std::io::Error),
+}
+
+/// Does `candidate` canonically resolve inside `root`?
+///
+/// The third layer of path defence, after the character allowlist and the
+/// component walk on `RepoStore::local_path`. Those two read the path as text
+/// and cannot see a symlink standing between the root and the target (#272).
+///
+/// One contract covers both the clone and the fetch branch. `symlink_metadata`
+/// decides which:
+///
+///   * The candidate exists (including as a symlink), so the candidate itself is
+///     canonicalized. That resolves the link and catches a mirror path that is a
+///     symlink to a bare repo outside the root, which a parent-only check misses
+///     entirely: the parent canonicalizes clean, `exists()` follows the link, and
+///     the fetch then writes through it.
+///   * The candidate does not exist, so its parent is canonicalized instead.
+///     This is the first-clone case. Canonicalizing the candidate unconditionally
+///     would reject every first clone, since `canonicalize` errors on a path that
+///     does not exist.
+///
+/// Pure: it reads the filesystem and never creates, moves, or removes anything.
+/// Callers that need the parent directory to exist create it themselves before
+/// asking, because a predicate that created a directory as a side effect of
+/// being asked would be wrong for a caller asking about a path it is about to
+/// delete.
+pub(crate) fn path_within_root(candidate: &Path, root: &Path) -> Containment {
+    let root = match root.canonicalize() {
+        Ok(p) => p,
+        // A root that cannot be resolved is an operator condition, never a
+        // verdict on the candidate, so every error kind is retryable here.
+        Err(e) => return Containment::IoError(e),
+    };
+
+    let resolved = match std::fs::symlink_metadata(candidate) {
+        // The candidate exists as an entry: resolve it, links and all. A failure
+        // now (a dangling symlink, a permission change mid-flight) is an I/O
+        // answer, since the entry was there a moment ago.
+        Ok(_) => match candidate.canonicalize() {
+            Ok(p) => p,
+            Err(e) => return Containment::IoError(e),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = candidate.parent() else {
+                return Containment::Outside;
+            };
+            match parent.canonicalize() {
+                Ok(p) => p,
+                // A parent that is not there is a real answer about where this
+                // path sits; anything else is the filesystem failing to answer.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Containment::Outside;
+                }
+                Err(e) => return Containment::IoError(e),
+            }
+        }
+        // Neither "it is there" nor "it is not there": we cannot tell.
+        Err(e) => return Containment::IoError(e),
+    };
+
+    if resolved.starts_with(&root) {
+        Containment::Contained
+    } else {
+        Containment::Outside
+    }
+}
+
 fn validate_owner_did(owner_did: &str) -> Result<()> {
     if owner_did.is_empty() {
         anyhow::bail!("owner_did is empty");
@@ -404,6 +529,251 @@ fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── sync slug validation (#272) ────────────────────────────────────────
+
+    #[test]
+    fn slug_accepts_owner_and_name() {
+        let (owner, name) = validate_repo_slug("z6Mkfoo/hello").expect("valid slug");
+        assert_eq!(owner, "z6Mkfoo");
+        assert_eq!(name, "hello");
+    }
+
+    #[test]
+    fn slug_rejects_traversal_in_owner_half() {
+        assert!(validate_repo_slug("../hello").is_err());
+    }
+
+    #[test]
+    fn slug_rejects_owner_half_only_the_did_validator_catches() {
+        // These are the cases that isolate the `validate_owner_did` delegation.
+        // `../hello` does NOT: the leading-character rule above rejects it
+        // first, so deleting the delegation leaves that case green. Each owner
+        // half here has exactly one separator, a non-empty name, and a leading
+        // character the slug rules allow, so only the delegation can reject it.
+        for bad in [
+            "a..b/hello",    // interior `..` sequence
+            "a%2e%2e/hello", // percent-encoded, disallowed `%`
+            "own\\er/hello", // backslash
+        ] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_extra_separator() {
+        // The verified #272 escape: `a//tmp/x` joined to an absolute
+        // `/tmp/x.git` outside repos_dir.
+        assert!(validate_repo_slug("a//tmp/gitlawb-probe").is_err());
+        assert!(validate_repo_slug("../../etc/evil").is_err());
+        assert!(validate_repo_slug("a/../../x").is_err());
+    }
+
+    #[test]
+    fn slug_rejects_trailing_segment_only_the_separator_count_catches() {
+        // The case that isolates the separator-count rule. Every slug in
+        // `slug_rejects_extra_separator` is caught by some earlier rule
+        // instead: `a//tmp/...` has an empty name half, `../../etc/evil` trips
+        // the leading-character rule, and `a/../../x` has `..` as its name. Here
+        // both halves are individually valid, so only the count can reject it.
+        // It matters because the worker would otherwise join
+        // `repos_dir/z6Mkfoo/hello.git` while composing the remote URL from the
+        // full three-segment slug, silently mirroring one repo under another's
+        // path.
+        assert!(validate_repo_slug("z6Mkfoo/hello/extra").is_err());
+    }
+
+    #[test]
+    fn slug_rejects_missing_separator() {
+        for bad in ["..", "demo", ""] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_empty_half() {
+        for bad in ["/hello", "z6Mkfoo/"] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_leading_dot_or_dash_owner() {
+        // `./hello` would otherwise resolve to a mirror at the repos_dir root,
+        // which the containment check would approve.
+        for bad in ["./hello", "-owner/hello"] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_bad_name_half() {
+        for bad in [
+            "z6Mkfoo/he\0llo",
+            "z6Mkfoo/.hidden",
+            "z6Mkfoo/-dash",
+            "z6Mkfoo/a..b",
+        ] {
+            assert!(validate_repo_slug(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn slug_rejects_overlong_halves() {
+        let long_owner = format!("{}/hello", "z".repeat(257));
+        let long_name = format!("z6Mkfoo/{}", "n".repeat(101));
+        assert!(validate_repo_slug(&long_owner).is_err());
+        assert!(validate_repo_slug(&long_name).is_err());
+    }
+
+    #[test]
+    fn slug_rejects_owner_half_at_the_filesystem_name_limit() {
+        // The owner half becomes a single path component, and Linux NAME_MAX is
+        // 255, so 256 is accepted by validate_owner_did (which bails only above
+        // 256) but can never be created on disk. That made the sync row
+        // permanently un-runnable: create_dir_all failed with ENAMETOOLONG on
+        // every pass and the worker left the row pending, so ten unsigned
+        // requests could hold the whole oldest-first batch forever.
+        assert!(validate_repo_slug(&format!("{}/hello", "z".repeat(256))).is_err());
+        // 255 is the largest creatable component and must still be accepted, so
+        // the bound is not quietly over-tightened.
+        assert!(validate_repo_slug(&format!("{}/hello", "z".repeat(255))).is_ok());
+    }
+
+    // ── canonical containment (#272) ───────────────────────────────────────
+
+    use tempfile::TempDir;
+
+    #[test]
+    fn containment_accepts_a_path_inside_the_root() {
+        let root = TempDir::new().unwrap();
+        let inside = root.path().join("z6Mkfoo");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(matches!(
+            path_within_root(&inside.join("hello.git"), root.path()),
+            Containment::Contained
+        ));
+    }
+
+    #[test]
+    fn containment_rejects_a_sibling_outside_the_root() {
+        let base = TempDir::new().unwrap();
+        let root = base.path().join("root");
+        let sibling = base.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        assert!(matches!(
+            path_within_root(&sibling, &root),
+            Containment::Outside
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn containment_rejects_a_symlinked_directory_inside_the_root() {
+        use std::os::unix::fs::symlink;
+        let base = TempDir::new().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = root.join("owner");
+        symlink(&outside, &link).unwrap();
+        assert!(matches!(
+            path_within_root(&link, &root),
+            Containment::Outside
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn containment_rejects_a_symlinked_file_inside_the_root() {
+        use std::os::unix::fs::symlink;
+        let base = TempDir::new().unwrap();
+        let root = base.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = base.path().join("secret.txt");
+        std::fs::write(&outside, b"x").unwrap();
+        let link = root.join("hello.git");
+        symlink(&outside, &link).unwrap();
+        assert!(matches!(
+            path_within_root(&link, &root),
+            Containment::Outside
+        ));
+    }
+
+    #[test]
+    fn containment_accepts_a_missing_candidate_whose_parent_is_inside() {
+        // The first-clone case: the mirror path does not exist yet, so only the
+        // parent can be canonicalized. Rejecting this is total loss of mirroring.
+        let root = TempDir::new().unwrap();
+        let owner = root.path().join("z6Mkfoo");
+        std::fs::create_dir_all(&owner).unwrap();
+        let candidate = owner.join("hello.git");
+        assert!(!candidate.exists());
+        assert!(matches!(
+            path_within_root(&candidate, root.path()),
+            Containment::Contained
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn containment_rejects_a_missing_candidate_under_a_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+        let base = TempDir::new().unwrap();
+        let root = base.path().join("root");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("z6Mkfoo")).unwrap();
+        let candidate = root.join("z6Mkfoo").join("hello.git");
+        assert!(matches!(
+            path_within_root(&candidate, &root),
+            Containment::Outside
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn containment_reports_io_error_for_a_dangling_symlink() {
+        // The link entry exists, so the candidate is the thing to resolve, and
+        // resolving it fails. That is an I/O answer, not a verdict of Outside:
+        // the worker must retry rather than permanently retire the row.
+        use std::os::unix::fs::symlink;
+        let root = TempDir::new().unwrap();
+        let link = root.path().join("hello.git");
+        symlink(root.path().join("nothing-here"), &link).unwrap();
+        assert!(matches!(
+            path_within_root(&link, root.path()),
+            Containment::IoError(_)
+        ));
+    }
+
+    #[test]
+    fn containment_reports_io_error_for_an_uncanonicalizable_root() {
+        // A repos_dir that cannot be resolved is an operator condition (an
+        // unmounted volume, a bad config), not a hostile path.
+        let base = TempDir::new().unwrap();
+        let root = base.path().join("not-mounted");
+        let candidate = base.path().join("not-mounted").join("hello.git");
+        assert!(matches!(
+            path_within_root(&candidate, &root),
+            Containment::IoError(_)
+        ));
+    }
+
+    #[test]
+    fn containment_creates_nothing_on_disk() {
+        // The predicate is pure: the admin purge path asks it about directories
+        // it is about to delete, so creating one as a side effect would be wrong.
+        let root = TempDir::new().unwrap();
+        let candidate = root.path().join("z6Mkfoo").join("hello.git");
+        let _ = path_within_root(&candidate, root.path());
+        assert!(!candidate.exists());
+        assert!(!root.path().join("z6Mkfoo").exists());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     // ── repo_name validation ───────────────────────────────────────────────
 

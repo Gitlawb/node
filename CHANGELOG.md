@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.0](https://github.com/Gitlawb/node/compare/v0.6.0...v0.7.0) (2026-07-22)
+
+
+### Features
+
+* **gl:** actually verify certificate signatures in gl cert show ([b0a2ed8](https://github.com/Gitlawb/node/commit/b0a2ed830821b5a77b0dafdcf5ce4b1ad904ec25))
+* **gl:** doctor warns when a shell alias shadows the gl binary ([0765c42](https://github.com/Gitlawb/node/commit/0765c42feff47b29054b9a277881a7cd5bfd9135))
+
+
+### Bug Fixes
+
+* **gl:** address review findings — non-fatal DID check, exact-host loopback, detached HEAD, multi-URL remotes, command-aware unalias ([3fa38dc](https://github.com/Gitlawb/node/commit/3fa38dce4e435ef017f607d355266c2892161f8d))
+* **gl:** anchor cert --verify to a trusted issuer; pin canonical payload form ([c681af7](https://github.com/Gitlawb/node/commit/c681af70dba3a76b11795d324f2ca0fecf7e42fd))
+* **gl:** detect gitlawb remotes beyond origin in gl status ([2d88937](https://github.com/Gitlawb/node/commit/2d88937fbabf21013f28debb4d4f93270a4bb8cd))
+* **gl:** doctor treats a reachable local node as configuration, not failure ([94c61f7](https://github.com/Gitlawb/node/commit/94c61f79421fa26ecc1bdf7c255e0c48e66a2048))
+* **gl:** make gl init's push guidance match the repo's actual state ([cb42a48](https://github.com/Gitlawb/node/commit/cb42a4830d0d070165e2212f316d009ec716dbee))
+* warn about the oh-my-zsh gl alias at install time ([e3df51d](https://github.com/Gitlawb/node/commit/e3df51d76c0275fde33954ff0af0aab95fd0cb7d))
+
 ## [0.6.0](https://github.com/Gitlawb/node/compare/v0.5.1...v0.6.0) (2026-07-22)
 
 
