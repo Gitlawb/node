@@ -27,14 +27,15 @@ use crate::state::AppState;
 /// back out the way `From<anyhow::Error> for AppError` already recovers sqlx
 /// errors. Without this a refusal renders as a 500, which is the mis-rendered
 /// denial this gate exists to avoid. An authority refusal is 403; naming a DID
-/// method that can never authenticate is a fact about the input's form, so it
-/// is the 400 validation class.
+/// method that can never authenticate, or a DID whose verifying key cannot be
+/// resolved, is a fact about the input's form, so both are the 400 validation
+/// class. The match stays exhaustive with no wildcard: the compile error a new
+/// denial causes here is what finds every mapping site.
 fn peer_write_error(err: anyhow::Error) -> AppError {
     match err.downcast::<PeerWriteDenied>() {
         Ok(denied) => match &denied {
-            PeerWriteDenied::UnsupportedDidMethod { .. } => {
-                AppError::BadRequest(denied.to_string())
-            }
+            PeerWriteDenied::UnsupportedDidMethod { .. }
+            | PeerWriteDenied::UnresolvableDid { .. } => AppError::BadRequest(denied.to_string()),
             PeerWriteDenied::UnprovenRepoint { .. } | PeerWriteDenied::ProofDidMismatch { .. } => {
                 AppError::Forbidden(denied.to_string())
             }
@@ -1629,6 +1630,42 @@ mod tests {
         );
         assert!(
             snapshot(&state.db, WEB_DID).await.is_none(),
+            "a rejected announce must leave no row behind"
+        );
+    }
+
+    /// The sibling of the case above, and the one it must not swallow: the
+    /// method IS did:key, so methodNotSupported would be a false statement
+    /// about the input. The value is the W3C secp256k1 did:key test vector,
+    /// which decodes cleanly and is simply not an ed25519 key. Still the 400
+    /// validation class, still nothing written.
+    #[sqlx::test]
+    async fn announce_of_an_unresolvable_did_key_is_a_400_with_the_cause(pool: PgPool) {
+        let state = test_state(pool).await;
+        let did = "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme";
+
+        let resp = announce_only(state.clone())
+            .oneshot(unsigned_post(
+                "/api/v1/peers/announce",
+                &announce_body(did, OWNER_URL),
+                "203.0.113.99:5000",
+            ))
+            .await
+            .unwrap();
+
+        let (status, code, message) = status_and_error(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unresolvable did:key is a validation failure: {message}"
+        );
+        assert_eq!(code, "bad_request");
+        assert!(
+            message.contains("cannot resolve DID"),
+            "the rejection must report resolution, not method support, got {message:?}"
+        );
+        assert!(
+            snapshot(&state.db, did).await.is_none(),
             "a rejected announce must leave no row behind"
         );
     }

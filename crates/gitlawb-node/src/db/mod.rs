@@ -2186,6 +2186,16 @@ pub enum PeerWriteDenied {
         "methodNotSupported: only did:key peers can be registered without a proof of control: {did}"
     )]
     UnsupportedDidMethod { did: String },
+
+    /// The value is a did:key (or never parsed as a DID at all), but no
+    /// verifying key can be resolved from it. Distinct from
+    /// `UnsupportedDidMethod`, which is a true statement about a foreign
+    /// method; this one carries the underlying resolution failure instead of
+    /// claiming did:key is unsupported. The wording mirrors the signed path in
+    /// auth/mod.rs, so the two surfaces that judge the same input say the same
+    /// sentence.
+    #[error("cannot resolve DID '{did}': {reason}")]
+    UnresolvableDid { did: String, reason: String },
 }
 
 impl Db {
@@ -2236,17 +2246,37 @@ impl Db {
             // is_did_key() and creates exactly the permanently uncorrectable
             // row this gate exists to prevent. to_verifying_key() is the same
             // resolution auth/mod.rs performs on the keyid.
-            PeerWriteAuthority::Unproven
-                if !did
-                    .parse::<gitlawb_core::did::Did>()
-                    .map(|d| d.to_verifying_key().is_ok())
-                    .unwrap_or(false) =>
-            {
-                return Err(PeerWriteDenied::UnsupportedDidMethod {
-                    did: did.to_string(),
+            //
+            // The refusal is split by cause, because methodNotSupported is only
+            // a true statement about a foreign method: a did:key whose key
+            // material does not resolve gets the resolution failure instead.
+            PeerWriteAuthority::Unproven => match did.parse::<gitlawb_core::did::Did>() {
+                // Only reachable from the bootstrap announce-back in main.rs,
+                // which passes the contacted peer's raw JSON string; the
+                // announce handler parses req.did before calling here.
+                Err(e) => {
+                    return Err(PeerWriteDenied::UnresolvableDid {
+                        did: did.to_string(),
+                        reason: e.to_string(),
+                    }
+                    .into());
                 }
-                .into());
-            }
+                Ok(d) if !d.is_did_key() => {
+                    return Err(PeerWriteDenied::UnsupportedDidMethod {
+                        did: did.to_string(),
+                    }
+                    .into());
+                }
+                Ok(d) => {
+                    if let Err(e) = d.to_verifying_key() {
+                        return Err(PeerWriteDenied::UnresolvableDid {
+                            did: did.to_string(),
+                            reason: e.to_string(),
+                        }
+                        .into());
+                    }
+                }
+            },
             _ => {}
         }
         let now = Utc::now().to_rfc3339();
@@ -6652,27 +6682,163 @@ mod peer_authority_tests {
         assert!(!reachable, "a never-probed peer must insert unreachable");
     }
 
-    /// R8. Only a DID whose verifying key can be derived can ever authenticate,
-    /// so an unproven insert of anything else would create a row no one could
-    /// ever correct through the proven path. Rejected in the validation class,
-    /// with nothing written. Kills a method gate applied only to the update
-    /// path, and kills a gate that checks the method LABEL rather than the key
-    /// material: `did:key:notarealkey` carries the right method and no
-    /// derivable key, so the row it would create is the permanently
-    /// uncorrectable one this gate exists to prevent.
+    /// R8. A DID whose method can never authenticate is refused in the
+    /// validation class, with nothing written. Kills a method gate applied only
+    /// to the update path. This case is about the METHOD LABEL alone, which is
+    /// the one thing methodNotSupported can truthfully say; a did:key whose key
+    /// material does not resolve is a different refusal and is covered by the
+    /// unresolvable tests below, so it is deliberately not in this loop.
     #[sqlx::test]
     async fn unproven_insert_of_a_non_did_key_is_rejected(pool: PgPool) {
         let db = db(pool).await;
 
-        for did in [WEB_DID, "did:gitlawb:z6MkSomeKey", "did:key:notarealkey"] {
+        for did in [WEB_DID, "did:gitlawb:z6MkSomeKey"] {
             let err = db
                 .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
                 .await
                 .expect_err("a DID method that can never authenticate must not be insertable");
 
+            let denied = denial(err);
             assert!(
-                matches!(denial(err), PeerWriteDenied::UnsupportedDidMethod { .. }),
+                matches!(denied, PeerWriteDenied::UnsupportedDidMethod { .. }),
+                "the denial must be the typed method refusal: {did}"
+            );
+            assert!(
+                denied
+                    .to_string()
+                    .contains("methodNotSupported: only did:key peers"),
                 "the denial must name the unsupported method"
+            );
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+
+    /// The oversized method-id is refused ahead of the quadratic base58 decode,
+    /// and the caller is told THAT, not that did:key is unsupported. Kills
+    /// folding the key-resolution failure back into the method class.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_oversized_did_key_reports_the_cause(pool: PgPool) {
+        let db = db(pool).await;
+        let did = format!("did:key:z{}", "a".repeat(70));
+
+        let err = db
+            .upsert_peer(&did, HONEST_URL, PeerWriteAuthority::Unproven)
+            .await
+            .expect_err("a did:key whose key cannot be resolved must not be insertable");
+
+        let denied = denial(err);
+        assert!(
+            matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+            "the denial must be the typed resolution refusal"
+        );
+        let denied = denied.to_string();
+        assert!(
+            denied.contains("cannot resolve DID"),
+            "an unresolvable did:key must report resolution, not method support, got {denied:?}"
+        );
+        assert!(
+            denied.contains("method-specific id too long"),
+            "the denial must carry the underlying cause, got {denied:?}"
+        );
+        assert!(
+            row(&db, &did).await.is_none(),
+            "a rejected announce must leave no row behind: {did}"
+        );
+    }
+
+    /// The remaining resolution failures, one input class per entry, each
+    /// pinned to its own cause. The multibase entry asserts only the class
+    /// message: its sub-reason is multibase's own Display and a dependency bump
+    /// can reword it.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unresolvable_did_key_reports_the_cause(pool: PgPool) {
+        let db = db(pool).await;
+
+        // "0" is not in the base58btc alphabet, so the decode itself fails.
+        // "notarealkey" carries the right method label and no decodable key,
+        // which is the permanently uncorrectable row this gate prevents.
+        // The secp256k1 vector is the W3C did:key test vector: it decodes
+        // cleanly and is simply not an ed25519 key.
+        // The wrong-length vector is base58btc(0xed 0x01 || sixteen bytes
+        // 0x00..0x0f) with the multibase 'z' prefix: the right multicodec, half
+        // the key.
+        for (did, cause) in [
+            ("did:key:z0", None),
+            ("did:key:notarealkey", None),
+            (
+                "did:key:zQ3shokFTS3brHcDQrn82RUDfCZESWL1ZdCEJwekUDPQiYBme",
+                Some("not an ed25519 multicodec key"),
+            ),
+            (
+                "did:key:zAq9r99PUfP1Xyitb5n8V9sxht",
+                Some("ed25519 key must be 32 bytes"),
+            ),
+        ] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a did:key whose key cannot be resolved must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+                "the denial must be the typed resolution refusal: {did}"
+            );
+            let denied = denied.to_string();
+            assert!(
+                denied.contains("cannot resolve DID"),
+                "an unresolvable did:key must report resolution, not method support: \
+                 {did} got {denied:?}"
+            );
+            if let Some(cause) = cause {
+                assert!(
+                    denied.contains(cause),
+                    "the denial must carry the underlying cause {cause:?}: {did} got {denied:?}"
+                );
+            }
+            assert!(
+                row(&db, did).await.is_none(),
+                "a rejected announce must leave no row behind: {did}"
+            );
+        }
+    }
+
+    /// The bootstrap announce-back in main.rs hands this boundary the contacted
+    /// peer's raw JSON string, so a value that never parses as a DID reaches
+    /// here; the announce handler cannot produce it, since it parses req.did
+    /// first. The parse error is what an operator reading that loop's warning
+    /// needs, and methodNotSupported would be a false claim about a string that
+    /// names no method at all.
+    #[sqlx::test]
+    async fn unproven_insert_of_an_unparseable_string_reports_the_parse_failure(pool: PgPool) {
+        let db = db(pool).await;
+
+        for (did, cause) in [
+            ("not-a-did", "does not start with 'did:'"),
+            ("did:foo:x", "unsupported DID method: foo"),
+        ] {
+            let err = db
+                .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
+                .await
+                .expect_err("a string that is not a DID must not be insertable");
+
+            let denied = denial(err);
+            assert!(
+                matches!(denied, PeerWriteDenied::UnresolvableDid { .. }),
+                "the denial must be the typed resolution refusal: {did}"
+            );
+            let denied = denied.to_string();
+            assert!(
+                denied.contains("cannot resolve DID"),
+                "an unparseable DID must report resolution, not method support: \
+                 {did} got {denied:?}"
+            );
+            assert!(
+                denied.contains(cause),
+                "the denial must carry the parse failure {cause:?}: {did} got {denied:?}"
             );
             assert!(
                 row(&db, did).await.is_none(),
