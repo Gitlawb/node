@@ -80,6 +80,19 @@ impl Did {
             )));
         }
 
+        // Refuse an oversized id before decoding. base58 decoding is quadratic
+        // in its input, and both callers of this function take the string from
+        // an untrusted request: the unauthenticated peer-announce gate, and the
+        // HTTP-signature keyid. An ed25519 did:key method-id is a fixed 48
+        // characters, so this bound is slack rather than a behavior change, and
+        // it has to sit ahead of the decode to be worth anything.
+        const MAX_METHOD_ID_LEN: usize = 64;
+        if self.method_id().len() > MAX_METHOD_ID_LEN {
+            return Err(Error::InvalidDid(
+                "did:key method-specific id too long".to_string(),
+            ));
+        }
+
         let (_, bytes) =
             multibase::decode(self.method_id()).map_err(|e| Error::InvalidDid(e.to_string()))?;
 
@@ -307,5 +320,53 @@ mod tests {
     fn method_id_extraction() {
         assert_eq!(Did::web("example.com").method_id(), "example.com");
         assert_eq!(Did::gitlawb("z6MkSomeKey").method_id(), "z6MkSomeKey");
+    }
+
+    /// An oversized method-specific id is refused on its length, before the
+    /// base58 decode runs.
+    ///
+    /// base58 decoding is quadratic in the input, and `to_verifying_key` is
+    /// reached from two places that take an attacker-supplied string: the
+    /// unauthenticated peer-announce gate, and the HTTP-signature keyid. A
+    /// 64k-character DID measured 8s through the router without this guard
+    /// against 4.6ms with it, on a tokio worker with no spawn_blocking, so a
+    /// single caller could buy CPU-seconds by the thousand.
+    ///
+    /// Asserting the MESSAGE is what makes this load-bearing: an oversized id
+    /// errors either way, so a test that only checked `is_err()` would pass
+    /// with the guard removed, having merely paid the cost it exists to avoid.
+    #[test]
+    fn to_verifying_key_rejects_an_oversized_method_id_before_decoding() {
+        let oversized = format!("did:key:z{}", "z".repeat(64_000));
+        let did: Did = oversized.parse().expect("method is still `key`");
+
+        let start = std::time::Instant::now();
+        let err = did.to_verifying_key().expect_err("must be refused");
+        let elapsed = start.elapsed();
+
+        assert!(
+            err.to_string().contains("too long"),
+            "must be refused on length, not after the decode: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "refusal must not pay the quadratic decode: took {elapsed:?}"
+        );
+    }
+
+    /// The bound must not reject a real key. Every `did:key` this project
+    /// mints is a fixed 48 characters, so the limit is slack, not a behavior
+    /// change.
+    #[test]
+    fn to_verifying_key_still_accepts_a_real_did_key() {
+        use ed25519_dalek::SigningKey;
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let did = Did::from_verifying_key(&signing.verifying_key());
+        assert_eq!(
+            did.method_id().len(),
+            48,
+            "did:key method-id is fixed-width"
+        );
+        did.to_verifying_key().expect("a real did:key must resolve");
     }
 }

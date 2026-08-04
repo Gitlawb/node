@@ -1404,16 +1404,24 @@ mod tests {
             })
     }
 
-    /// Seed a peer row and assert the seed took, so no case below can pass
-    /// vacuously against a row that was never written.
+    /// Seed a peer row that has EARNED reachability, asserting the seed took,
+    /// so no case below can pass vacuously against a row that was never written
+    /// or against a flag that was already false. Without the granted ping a
+    /// "must be unreachable after this" assertion compares false to false and
+    /// stays green with the production code that clears the flag removed.
     async fn seed_peer_row(state: &AppState, did: &str, url: &str) -> PeerSnapshot {
         state
             .db
             .upsert_peer(did, url, crate::db::PeerWriteAuthority::Unproven)
             .await
             .expect("seed");
+        state.db.mark_peer_ping(did, true).await.expect("seed ping");
         let seeded = snapshot(&state.db, did).await.expect("seed did not take");
         assert_eq!(seeded.1, url, "seed did not take");
+        assert!(
+            seeded.3,
+            "the seeded row must start reachable, or a later unreachable assertion is vacuous"
+        );
         seeded
     }
 

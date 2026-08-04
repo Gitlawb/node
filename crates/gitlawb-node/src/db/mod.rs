@@ -2222,16 +2222,24 @@ impl Db {
                 }
                 .into());
             }
-            // Only did:key can ever authenticate: auth/mod.rs resolves the
-            // verifying key from the keyid DID itself and rejects every other
-            // method. A did:web or did:gitlawb row seeded here would therefore
-            // be unwritable by anyone forever, since no proof could ever
-            // satisfy the branch above, while still steering the sync origin
-            // resolve, the notify fan-out, and the public resolve route.
+            // Only a DID whose verifying key resolves can ever authenticate:
+            // auth/mod.rs resolves the key from the keyid DID itself and
+            // rejects everything else. A row seeded here that cannot yield a
+            // key would therefore be unwritable by anyone forever, since no
+            // proof could ever satisfy the branch above, while still steering
+            // the sync origin resolve, the notify fan-out, and the public
+            // resolve route.
+            //
+            // The check is key derivability, NOT the method label. `Did`'s
+            // FromStr only runs validate(), which accepts key/web/gitlawb and
+            // never looks at the key material, so `did:key:notarealkey` passes
+            // is_did_key() and creates exactly the permanently uncorrectable
+            // row this gate exists to prevent. to_verifying_key() is the same
+            // resolution auth/mod.rs performs on the keyid.
             PeerWriteAuthority::Unproven
                 if !did
                     .parse::<gitlawb_core::did::Did>()
-                    .map(|d| d.is_did_key())
+                    .map(|d| d.to_verifying_key().is_ok())
                     .unwrap_or(false) =>
             {
                 return Err(PeerWriteDenied::UnsupportedDidMethod {
@@ -6251,7 +6259,9 @@ mod peer_reachability_tests {
     use super::{Db, PeerWriteAuthority};
     use sqlx::PgPool;
 
-    const VICTIM_DID: &str = "did:key:z6MkvictimPeerFixture";
+    // Real derivable did:key fixtures. The unproven arm resolves the verifying
+    // key, so a made-up method-id is refused before any SQL runs.
+    const VICTIM_DID: &str = "did:key:z6Mkrmsd28nDTPBjk55EJCSjtJLVJDZffyczjBEHvywhutM4";
     const HONEST_URL: &str = "https://honest-peer.example.com";
     const ATTACKER_URL: &str = "https://attacker.example.com";
 
@@ -6381,14 +6391,18 @@ mod peer_reachability_tests {
         let db = db(pool).await;
 
         db.upsert_peer(
-            "did:key:z6MkfreshPeerFixture",
+            "did:key:z6MkfGVENKztfeXa631WYVqyAGaXeP8AnN6nTkfogHn9vaaQ",
             HONEST_URL,
             PeerWriteAuthority::Unproven,
         )
         .await
         .unwrap();
 
-        let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
+        let (_, reachable) = peer(
+            &db,
+            "did:key:z6MkfGVENKztfeXa631WYVqyAGaXeP8AnN6nTkfogHn9vaaQ",
+        )
+        .await;
         assert!(!reachable, "a never-probed peer must insert unreachable");
     }
 
@@ -6449,8 +6463,10 @@ mod peer_authority_tests {
     use super::{Db, PeerWriteAuthority, PeerWriteDenied};
     use sqlx::PgPool;
 
-    const VICTIM_DID: &str = "did:key:z6MkvictimAuthorityFixture";
-    const OTHER_DID: &str = "did:key:z6MkotherAuthorityFixture";
+    // Real derivable did:key fixtures. The unproven arm resolves the verifying
+    // key, so a made-up method-id is refused before any SQL runs.
+    const VICTIM_DID: &str = "did:key:z6MkuMqUm4i228K9qXidJ57zqSWAcQLgrcbMxB8RKVLuqitj";
+    const OTHER_DID: &str = "did:key:z6MkuzEVwHSWSCLq6xAkgTAJxHMa24KuBtgozce77TEihnWD";
     const WEB_DID: &str = "did:web:squatter.example.com";
     const HONEST_URL: &str = "https://honest-peer.example.com";
     const ATTACKER_URL: &str = "https://attacker.example.com";
@@ -6636,15 +6652,19 @@ mod peer_authority_tests {
         assert!(!reachable, "a never-probed peer must insert unreachable");
     }
 
-    /// R8. Only did:key can ever authenticate, so an unproven insert of any
-    /// other method would create a row no one could ever correct through the
-    /// proven path. Rejected in the validation class, with nothing written.
-    /// Kills a method gate applied only to the update path.
+    /// R8. Only a DID whose verifying key can be derived can ever authenticate,
+    /// so an unproven insert of anything else would create a row no one could
+    /// ever correct through the proven path. Rejected in the validation class,
+    /// with nothing written. Kills a method gate applied only to the update
+    /// path, and kills a gate that checks the method LABEL rather than the key
+    /// material: `did:key:notarealkey` carries the right method and no
+    /// derivable key, so the row it would create is the permanently
+    /// uncorrectable one this gate exists to prevent.
     #[sqlx::test]
     async fn unproven_insert_of_a_non_did_key_is_rejected(pool: PgPool) {
         let db = db(pool).await;
 
-        for did in [WEB_DID, "did:gitlawb:z6MkSomeKey"] {
+        for did in [WEB_DID, "did:gitlawb:z6MkSomeKey", "did:key:notarealkey"] {
             let err = db
                 .upsert_peer(did, HONEST_URL, PeerWriteAuthority::Unproven)
                 .await
