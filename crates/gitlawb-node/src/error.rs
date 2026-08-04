@@ -35,6 +35,15 @@ pub enum AppError {
     #[error("invalid request: {0}")]
     BadRequest(String),
 
+    /// A DID was well-formed enough to carry to a resolver but no verifying key
+    /// could be derived from it. Its own code rather than plain `bad_request`
+    /// because the auth middleware already answers `unresolvable_did` for the
+    /// same failure on a request's keyid, and a client should not have to
+    /// substring-match a message to tell this apart from the other validation
+    /// failures on the same route.
+    #[error("unresolvable did: {0}")]
+    UnresolvableDid(String),
+
     #[error("too many requests: {0}")]
     TooManyRequests(String),
 
@@ -132,6 +141,9 @@ impl IntoResponse for AppError {
             // IcaptchaProofRequired is handled above (it carries extra headers/fields).
             AppError::IcaptchaProofRequired { .. } => unreachable!("handled before this match"),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            AppError::UnresolvableDid(msg) => {
+                (StatusCode::BAD_REQUEST, "unresolvable_did", msg.clone())
+            }
             AppError::TooManyRequests(msg) => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limited", msg.clone())
             }

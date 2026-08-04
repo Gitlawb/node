@@ -29,13 +29,19 @@ use crate::state::AppState;
 /// denial this gate exists to avoid. An authority refusal is 403; naming a DID
 /// method that can never authenticate, or a DID whose verifying key cannot be
 /// resolved, is a fact about the input's form, so both are the 400 validation
-/// class. The match stays exhaustive with no wildcard: the compile error a new
-/// denial causes here is what finds every mapping site.
+/// class, and the unresolvable one carries its own code so it reads the same to
+/// a client as the auth middleware's answer for an unresolvable keyid. The match
+/// stays exhaustive with no wildcard: the compile error a new denial causes here
+/// is what finds every mapping site.
 fn peer_write_error(err: anyhow::Error) -> AppError {
     match err.downcast::<PeerWriteDenied>() {
         Ok(denied) => match &denied {
-            PeerWriteDenied::UnsupportedDidMethod { .. }
-            | PeerWriteDenied::UnresolvableDid { .. } => AppError::BadRequest(denied.to_string()),
+            PeerWriteDenied::UnsupportedDidMethod { .. } => {
+                AppError::BadRequest(denied.to_string())
+            }
+            PeerWriteDenied::UnresolvableDid { .. } => {
+                AppError::UnresolvableDid(denied.to_string())
+            }
             PeerWriteDenied::UnprovenRepoint { .. } | PeerWriteDenied::ProofDidMismatch { .. } => {
                 AppError::Forbidden(denied.to_string())
             }
@@ -1659,7 +1665,12 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "an unresolvable did:key is a validation failure: {message}"
         );
-        assert_eq!(code, "bad_request");
+        assert_eq!(
+            code, "unresolvable_did",
+            "the code must name the cause, the same way the signed path does for a keyid it \
+             cannot resolve; a client distinguishing this from the other 400s on this route \
+             must not have to substring-match the message: {message:?}"
+        );
         assert!(
             message.contains("cannot resolve DID"),
             "the rejection must report resolution, not method support, got {message:?}"

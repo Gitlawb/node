@@ -2192,8 +2192,9 @@ pub enum PeerWriteDenied {
     /// `UnsupportedDidMethod`, which is a true statement about a foreign
     /// method; this one carries the underlying resolution failure instead of
     /// claiming did:key is unsupported. The wording mirrors the signed path in
-    /// auth/mod.rs, so the two surfaces that judge the same input say the same
-    /// sentence.
+    /// auth/mod.rs, and peer_write_error maps it to the same `unresolvable_did`
+    /// code that path returns, so the two surfaces that judge the same input
+    /// answer with the same sentence under the same name.
     #[error("cannot resolve DID '{did}': {reason}")]
     UnresolvableDid { did: String, reason: String },
 }
