@@ -6661,3 +6661,131 @@ mod peer_authority_tests {
         }
     }
 }
+
+/// #273 completeness ledger: every writer of the `peers` table.
+///
+/// The required set is derived from the authority that DEFINES membership, the
+/// write statements themselves, not from the set of `upsert_peer` callers. A
+/// caller scan is structurally blind to a future writer that issues its own SQL
+/// and bypasses `upsert_peer`, which is precisely the case the type system
+/// cannot see.
+///
+/// The type system carries the real weight: `upsert_peer`'s authority parameter
+/// has no default, so a new caller cannot omit its declaration, compile-enforced
+/// and exhaustive by construction. This scan is the backstop for the bypass case
+/// alone, which is why it is one equality assertion rather than a framework.
+///
+/// The ledger, one row per function that writes the table:
+///
+/// | Writer | Disposition |
+/// | --- | --- |
+/// | `upsert_peer` (db/mod.rs) | guarded by the authority parameter |
+/// | `mark_peer_ping` (db/mod.rs) | benign for `http_url`: it writes only `last_seen` and `last_ping_ok`. It IS the table's other production writer, and its unauthenticated reachability is tracked separately as issue #269 |
+/// | `prune_self_peers` (db/mod.rs) | a delete keyed on `http_url`; cannot repoint; boot-only caller in main.rs |
+/// | `prune_non_public_peers` (db/mod.rs) | a delete keyed on a computed bad-DID array; cannot repoint; boot-only caller in main.rs |
+/// | `seed_local_peer` (sync.rs) | excluded by test-module location: a deliberate `upsert_peer` bypass for `file://` fixtures, which the public-URL gate rejects |
+///
+/// And the `upsert_peer` CALL-SITE authority table, which the ledger above
+/// structurally cannot hold, because the bootstrap site issues no SQL of its own
+/// and therefore can never appear in a scan of write statements:
+///
+/// | Call site | Authority declared |
+/// | --- | --- |
+/// | api/peers.rs (announce) | proven if and only if the `AuthenticatedDid` extension is present, carrying that extension's DID |
+/// | main.rs (bootstrap announce-back) | unproven, unconditionally. Reasoned-not-run: no runtime test reaches that site in this change |
+#[cfg(test)]
+mod peers_table_writer_guard {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// Each dispositioned writer and the number of statements it issues against
+    /// the table. Bidirectional: an undispositioned hit fails, and so does a
+    /// listed function that no longer has one.
+    const LEDGER: &[(&str, usize)] = &[
+        ("mark_peer_ping", 1),
+        ("prune_non_public_peers", 1),
+        ("prune_self_peers", 1),
+        ("seed_local_peer", 1),
+        ("upsert_peer", 2),
+    ];
+
+    /// Assembled at runtime rather than written as literals, so this module's
+    /// own source does not match the scan it performs.
+    fn needles() -> Vec<String> {
+        ["INSERT INTO ", "UPDATE ", "DELETE FROM "]
+            .iter()
+            .map(|verb| format!("{verb}peers"))
+            .collect()
+    }
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("the crate source tree must be readable") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The function a line declares, if it declares one.
+    fn declared_fn(line: &str) -> Option<&str> {
+        let trimmed = line.trim_start();
+        let rest = [
+            "pub(crate) async fn ",
+            "pub(crate) fn ",
+            "pub async fn ",
+            "pub fn ",
+            "async fn ",
+            "fn ",
+        ]
+        .iter()
+        .find_map(|p| trimmed.strip_prefix(p))?;
+        rest.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .filter(|name| !name.is_empty())
+    }
+
+    /// The backstop the authority parameter cannot provide: a new raw write
+    /// against the table from outside `upsert_peer` is invisible to the type
+    /// system, so it is caught here or not at all.
+    #[test]
+    fn every_peers_table_write_is_dispositioned() {
+        let mut files = Vec::new();
+        rust_sources(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        // Anti-vacuity: a scrape that walked nothing would report a clean tree.
+        assert!(
+            files.len() > 10,
+            "the scan found only {} source files, so a clean result proves nothing",
+            files.len()
+        );
+
+        let needles = needles();
+        let mut found: BTreeMap<String, usize> = BTreeMap::new();
+        for file in &files {
+            let src = std::fs::read_to_string(file).expect("source file must be readable");
+            let mut current = "<module level>";
+            for line in src.lines() {
+                if let Some(name) = declared_fn(line) {
+                    current = name;
+                }
+                if needles.iter().any(|n| line.contains(n.as_str())) {
+                    *found.entry(current.to_string()).or_default() += 1;
+                }
+            }
+        }
+
+        let expected: BTreeMap<String, usize> =
+            LEDGER.iter().map(|(f, n)| ((*f).to_string(), *n)).collect();
+        assert_eq!(
+            found, expected,
+            "the peers-table writers no longer match the ledger. A new writer must \
+             be dispositioned in the table above (and gated), and a removed one \
+             dropped from LEDGER"
+        );
+    }
+}
