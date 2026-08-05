@@ -364,19 +364,27 @@ fn batch_object_types(
     // Drop stdin so the child sees EOF on its input pipe.
     drop(child.stdin.take());
 
+    // Drain stdout on a background thread so the pipe can never fill up and
+    // deadlock the child while we poll for completion (P2).  Otherwise a
+    // batch larger than the OS pipe buffer would block the child on write
+    // and try_wait would never observe an exit.
+    let mut stdout_reader = child.stdout.take().context("stdout not captured")?;
+    let stdout_thread = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout_reader.read_to_end(&mut buf);
+        buf
+    });
+
     // Poll for completion, checking the cancellation flag between iterations.
-    let output = loop {
+    let status = loop {
         if cancelled.load(Ordering::Relaxed) {
             let _ = child.kill();
             let _ = child.wait();
             return Ok(HashMap::new());
         }
         match child.try_wait() {
-            Ok(Some(_status)) => {
-                break child
-                    .wait_with_output()
-                    .context("git cat-file --batch-check failed")?;
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
@@ -388,7 +396,22 @@ fn batch_object_types(
             }
         }
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The child has exited, so the pipe write end is closed; join the reader
+    // thread which sees EOF once it drains the remaining buffered output.
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| AppError::Git("git cat-file --batch-check stdout reader panicked".into()))?;
+
+    // A non-zero exit means the check itself failed (e.g. repo gone) — do not
+    // interpret partial output as authoritative (P2).
+    if !status.success() {
+        return Err(AppError::Git(
+            "git cat-file --batch-check exited unsuccessfully".into(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout);
 
     let mut results = HashMap::with_capacity(shas.len());
     for line in stdout.lines() {
@@ -421,6 +444,11 @@ fn batch_object_types(
 /// The global listing filters each pinned object on current repo visibility
 /// to prevent metadata disclosure when repos are made private after push (#136).
 /// Only pins from repos the caller can currently read are returned.
+///
+/// Response fields: `pins` is this page's visible pins (0..=limit), `count`
+/// is the number of pins in THIS page only (not a node-wide total), and
+/// `truncated` is set when the scan was cut short by the walk/probe/deadline
+/// budgets — paginate with `next_cursor`/`truncated_cursor` to continue (P2).
 pub async fn list_pins(
     State(state): State<AppState>,
     Query(query): Query<ListPinsQuery>,
@@ -448,6 +476,54 @@ pub async fn list_pins(
             "count": 0,
         })));
     }
+
+    // Decode cursors BEFORE charging any rate limit: malformed or expired
+    // tokens return 400 without consuming per-DID/global quota or triggering
+    // the full-repo catalog load (P2).
+    let decode_cursor = |s: &str| -> Option<(String, String)> {
+        let bytes = URL_SAFE_NO_PAD.decode(s.as_bytes()).ok()?;
+        let decoded = String::from_utf8(bytes).ok()?;
+        let parts: Vec<&str> = decoded.splitn(2, '|').collect();
+        if parts.len() == 2 {
+            Some((parts[0].to_string(), parts[1].to_string()))
+        } else {
+            None
+        }
+    };
+    let encode_cursor =
+        |pa: &str, sha: &str| -> String { URL_SAFE_NO_PAD.encode(format!("{pa}|{sha}")) };
+
+    let initial_cursor: Option<(String, String, String)> = match query.cursor.as_ref() {
+        Some(c) => match decode_cursor(c) {
+            Some((pa, sha)) => Some((pa, sha, String::new())),
+            None => {
+                return Err(AppError::BadRequest(
+                    "invalid cursor: expected base64-encoded pinned_at|sha256_hex".into(),
+                ))
+            }
+        },
+        None => None,
+    };
+
+    // Truncated resume cursor: XChaCha20Poly1305 AEAD token. Decrypts to the
+    // same (pinned_at, sha256_hex, repo) cursor on the server side but the
+    // caller cannot decode hidden-row metadata from the wire format. If the
+    // token is present but undecodable we return an explicit error so the
+    // client does not silently restart at page 1.
+    let truncated_resume: Option<(String, String, String)> = match query.truncated_cursor.as_ref() {
+        Some(t) => {
+            let seed = state.cursor_seed();
+            match decode_opaque_cursor(&seed, t) {
+                Some((pa, sha, repo)) => Some((pa, sha, repo)),
+                None => {
+                    return Err(AppError::BadRequest(
+                        "invalid or expired truncated_cursor".into(),
+                    ))
+                }
+            }
+        }
+        None => None,
+    };
 
     // Per-DID rate limit: the listing performs expensive git walks and cat-file
     // probes, so a throwaway DID with a valid signature can exhaust resources (P1).
@@ -497,56 +573,6 @@ pub async fn list_pins(
         query_owner_dids.push(r.owner_did.clone());
     }
 
-    // Decode the optional keyset cursor from base64.
-    // Wire format: "pinned_at|sha256_hex" (2-tuple).  On resume we widen it
-    // to (pinned_at, sha256_hex, "") so the SQL 3-tuple predicate skips
-    // already-emitted SHAs while still processing remaining associations
-    // of the batch's last SHA (P1).
-    let decode_cursor = |s: &str| -> Option<(String, String)> {
-        let bytes = URL_SAFE_NO_PAD.decode(s.as_bytes()).ok()?;
-        let decoded = String::from_utf8(bytes).ok()?;
-        let parts: Vec<&str> = decoded.splitn(2, '|').collect();
-        if parts.len() == 2 {
-            Some((parts[0].to_string(), parts[1].to_string()))
-        } else {
-            None
-        }
-    };
-    let encode_cursor =
-        |pa: &str, sha: &str| -> String { URL_SAFE_NO_PAD.encode(format!("{pa}|{sha}")) };
-
-    let initial_cursor: Option<(String, String, String)> = match query.cursor.as_ref() {
-        Some(c) => match decode_cursor(c) {
-            Some((pa, sha)) => Some((pa, sha, String::new())),
-            None => {
-                return Err(AppError::BadRequest(
-                    "invalid cursor: expected base64-encoded pinned_at|sha256_hex".into(),
-                ))
-            }
-        },
-        None => None,
-    };
-
-    // Truncated resume cursor: XChaCha20Poly1305 AEAD token. Decrypts to the
-    // same (pinned_at, sha256_hex, repo) cursor on the server side but the
-    // caller cannot decode hidden-row metadata from the wire format. If the
-    // token is present but undecodable we return an explicit error so the
-    // client does not silently restart at page 1.
-    let truncated_resume: Option<(String, String, String)> = match query.truncated_cursor.as_ref() {
-        Some(t) => {
-            let seed = state.node_keypair.to_seed();
-            match decode_opaque_cursor(&seed, t) {
-                Some((pa, sha, repo)) => Some((pa, sha, repo)),
-                None => {
-                    return Err(AppError::BadRequest(
-                        "invalid or expired truncated_cursor".into(),
-                    ))
-                }
-            }
-        }
-        None => None,
-    };
-
     // Build a lookup of slug -> (repo, rules) once.
     let mut repos_by_slug = HashMap::new();
     for r in repos {
@@ -593,6 +619,10 @@ pub async fn list_pins(
     let mut response_cursor: Option<(String, String)> = None;
     let mut allowed_blobs_by_repo: HashMap<String, (HashSet<String>, PathBuf)> = HashMap::new();
     let mut page_truncated = false;
+    // Set when a visibility walk fails so the fetch loop stops instead of
+    // burning MAX_BATCHES iterations re-fetching a tail it cannot make
+    // progress on (P2).
+    let mut walk_failed = false;
     // Per-repo cache of sha256_hex → is_structural (true for commit/tree/tag).
     let mut structural_cache: HashMap<String, HashMap<String, bool>> = HashMap::new();
     let mut probe_count = 0usize;
@@ -732,26 +762,34 @@ pub async fn list_pins(
                                 allowed_blobs_by_repo.insert(repo.id.clone(), (allowed, rp));
                             }
                             _ => {
-                                // Walk failed (timeout / error / panic).
+                                // Walk failed (timeout / error / panic). Do
+                                // NOT cache an empty result here: that would
+                                // classify this repo's pins as hidden and
+                                // permanently skip rows the caller should see
+                                // (P2). Defer them by stopping before this
+                                // index and ending the request; the next
+                                // request re-attempts the walk.
                                 cancelled.store(true, Ordering::Relaxed);
                                 page_truncated = true;
+                                walk_failed = true;
                                 if i < walk_limit_idx {
                                     walk_limit_idx = i;
                                 }
-                                allowed_blobs_by_repo
-                                    .insert(repo.id.clone(), (HashSet::new(), PathBuf::new()));
+                                break;
                             }
                         }
                     }
                     Ok(Err(_)) | Err(_) => {
                         // Repo-store acquisition failed or timed out — same
                         // strategy (P2).  The walk permit is dropped here.
+                        // Never cache an empty result (would hide this repo's
+                        // pins); defer to the next request instead.
                         page_truncated = true;
+                        walk_failed = true;
                         if i < walk_limit_idx {
                             walk_limit_idx = i;
                         }
-                        allowed_blobs_by_repo
-                            .insert(repo.id.clone(), (HashSet::new(), PathBuf::new()));
+                        break;
                     }
                 };
             }
@@ -979,6 +1017,14 @@ pub async fn list_pins(
                 break 'fetch;
             }
         }
+
+        // A walk failed this batch — do not loop back and re-fetch the same
+        // deferred tail (it cannot make progress this request).  Pins already
+        // emitted before the deferred index stay in the response and
+        // page_truncated tells the caller to continue on a fresh request (P2).
+        if walk_failed {
+            break;
+        }
     }
     let page_filled = pins.len() >= max_visible as usize;
     if !page_truncated && batch_hit_limit {
@@ -997,6 +1043,8 @@ pub async fn list_pins(
 
     let mut body = serde_json::json!({
         "pins": pins,
+        // Per-page count, NOT a node-wide total — clients must paginate to
+        // count the full listing (P2).
         "count": pins.len(),
     });
 
@@ -1016,7 +1064,7 @@ pub async fn list_pins(
             body["next_cursor"] = serde_json::json!(encode_cursor(pa, sha));
         } else if let Some((ref pa, ref sha, ref repo)) = db_cursor {
             let cursor_str = format!("{pa}|{sha}|{repo}");
-            let seed = state.node_keypair.to_seed();
+            let seed = state.cursor_seed();
             let token = create_opaque_cursor(&seed, &cursor_str);
             body["truncated_cursor"] = serde_json::json!(token);
         }
@@ -1034,8 +1082,34 @@ mod tests {
     use sqlx::PgPool;
 
     #[sqlx::test]
+    async fn anonymous_pins_is_401_before_any_db_work(pool: PgPool) {
+        let app_state = test_state(pool).await;
+        let q = Query(ListPinsQuery {
+            limit: 50,
+            cursor: None,
+            truncated_cursor: None,
+        });
+        let result = list_pins(State(app_state), q, None).await;
+        assert!(
+            matches!(result, Err(AppError::Unauthorized(_))),
+            "expected 401 for anonymous, got {result:?}"
+        );
+    }
+
+    #[sqlx::test]
     async fn test_ipfs_cursor_guard(pool: PgPool) {
         let app_state = test_state(pool.clone()).await;
+
+        // Create a real bare repo on disk for the path-scoped repo so its
+        // visibility walk SUCCEEDS.  A failed walk is now DEFERRED (P2) rather
+        // than treated as empty, so without a real repo the listing could never
+        // advance past the hidden window.  The fabricated hidden SHAs below are
+        // absent from the repo, so they probe as missing -> classified hidden.
+        let hidden_repo_path = std::path::PathBuf::from("/tmp")
+            .join("did_key_z6Mkwowner")
+            .join("ipfstest.git");
+        let _ = std::fs::remove_dir_all(&hidden_repo_path);
+        crate::git::store::init_bare(&hidden_repo_path).unwrap();
 
         // Seed a path-scoped repo
         sqlx::query(
@@ -1088,8 +1162,15 @@ mod tests {
         .await
         .unwrap();
 
-        // Insert 1 visible pin, then a 2005-pin hidden stretch, then 1 visible pin.
-        // The hidden pins go in `ipfstest` (which has a deny rule and no physical repo so allowed_blobs is empty).
+        // Insert 1 visible pin, then a 250-pin hidden stretch, then 1 visible pin.
+        // The hidden pins go in `ipfstest` (path-scoped deny rule; the walk
+        // succeeds against the empty bare repo above, so these fabricated SHAs
+        // probe as "missing" and are classified hidden — under the P2 fix a
+        // FAILED walk is deferred, not treated as empty, so a real repo is
+        // required for the hidden window to be classifiable).
+        // 250 > one 200-SHA batch but < two batches, so the FIRST request
+        // probes batch 1 and returns a truncated_cursor at batch 2, and a
+        // single resume classifies batch 2 and surfaces vis-2-sha.
         // The visible pins go in `ipfsvis` (which has no rules, so they are always visible).
         // Note: three separate execute calls — sqlx prepared statements do not
         // support multiple semicolon-delimited statements in a single query().
@@ -1103,7 +1184,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
              SELECT 'hid-sha-' || i, 'hid-cid-' || i, '2026-07-03T09:00:00Z', 'z6Mkwowner/ipfstest', 'did:key:z6Mkwowner'
-             FROM generate_series(1, 2005) as i",
+             FROM generate_series(1, 250) as i",
         )
         .execute(app_state.db.pool())
         .await
@@ -1142,9 +1223,10 @@ mod tests {
         let decoded = String::from_utf8(bytes).unwrap();
         assert!(decoded.contains("vis-1-sha"));
 
-        // Case 2: Follow the cursor. The next 2005 rows are hidden.
-        // It will hit MAX_BATCHES (2000 rows) and return a truncated_cursor
-        // whose XChaCha20Poly1305-encrypted payload conceals the hidden SHA.
+        // Case 2: Follow the cursor. The next 250 rows are hidden.
+        // The first 200-SHA batch consumes the 200-probe budget, so the second
+        // batch defers and the response returns a truncated_cursor whose
+        // XChaCha20Poly1305-encrypted payload conceals the hidden SHA.
         q.cursor = Some(cursor1);
         let res2 = list_pins(
             State(app_state.clone()),

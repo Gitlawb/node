@@ -610,3 +610,46 @@ async fn p2p_info(State(state): State<AppState>) -> Json<serde_json::Value> {
         None => Json(json!({ "enabled": false })),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::test_state;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    // Load-bearing auth gate: the pin index spans the entire node, so an
+    // unsigned GET must be rejected through the real router for BOTH the
+    // ipfs pins listing and the arweave anchors listing, before any DB work.
+    #[sqlx::test]
+    async fn unsigned_get_pins_and_anchors_is_401_through_build_router(pool: PgPool) {
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let pins = Request::builder()
+            .method("GET")
+            .uri("/api/v1/ipfs/pins?limit=50")
+            .body(Body::empty())
+            .unwrap();
+        let pins_resp = router.clone().oneshot(pins).await.unwrap();
+        assert_eq!(
+            pins_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous pin listing must be rejected"
+        );
+
+        let anchors = Request::builder()
+            .method("GET")
+            .uri("/api/v1/arweave/anchors?limit=50")
+            .body(Body::empty())
+            .unwrap();
+        let anchors_resp = router.oneshot(anchors).await.unwrap();
+        assert_eq!(
+            anchors_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous anchors listing must be rejected"
+        );
+    }
+}

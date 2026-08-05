@@ -257,6 +257,16 @@ pub struct Config {
         default_value_t = 1200
     )]
     pub ipfs_list_global_rate_limit: usize,
+
+    /// Optional cluster-shared secret used to key the AEAD-sealed opaque
+    /// truncated_cursor tokens.  When unset, tokens are keyed on this node's
+    /// Ed25519 seed, so a token minted on node A cannot be resumed on node B
+    /// (the CLI treats that as expired and restarts with the last keyset
+    /// cursor, which re-scans without advancing through hidden windows).
+    /// Set the same GITLAWB_CURSOR_SECRET on every node behind a load
+    /// balancer so truncated cursors resume correctly across instances.
+    #[arg(long, env = "GITLAWB_CURSOR_SECRET")]
+    pub cursor_secret: Option<String>,
 }
 
 impl Config {

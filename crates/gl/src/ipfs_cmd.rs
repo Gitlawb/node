@@ -207,16 +207,6 @@ async fn list_pins_paginated(client: &NodeClient) -> Result<(Vec<Value>, bool)> 
 
         let pins = resp["pins"].as_array().cloned().unwrap_or_default();
 
-        if pins.is_empty() {
-            consecutive_empty_pages += 1;
-            if consecutive_empty_pages >= MAX_CONSECUTIVE_EMPTY {
-                incomplete = true;
-                break;
-            }
-        } else {
-            consecutive_empty_pages = 0;
-        }
-
         if all_pins.len() + pins.len() > MAX_ROWS {
             incomplete = true;
             break;
@@ -235,6 +225,26 @@ async fn list_pins_paginated(client: &NodeClient) -> Result<(Vec<Value>, bool)> 
 
         let next = resp["next_cursor"].as_str().map(String::from);
         let new_trunc = resp["truncated_cursor"].as_str().map(String::from);
+
+        // Empty pages are only legitimate progress when the server hands us a
+        // fresh truncated_cursor (an all-deferred page carries no next_cursor).
+        // An identical token is caught by the cycle guard below, so resetting
+        // on any fresh token keeps genuine multi-batch truncation from tripping
+        // the guard while still bounding a hostile node that returns empty
+        // pages with no way forward (P2).
+        if pins.is_empty() {
+            if new_trunc.is_some() {
+                consecutive_empty_pages = 0;
+            } else {
+                consecutive_empty_pages += 1;
+                if consecutive_empty_pages >= MAX_CONSECUTIVE_EMPTY {
+                    incomplete = true;
+                    break;
+                }
+            }
+        } else {
+            consecutive_empty_pages = 0;
+        }
 
         // Detect cursor cycling: keys on the exact (next_cursor, truncated)
         // pair, so a node that returns a fresh pair every page never trips it.

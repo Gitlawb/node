@@ -128,4 +128,27 @@ impl AppState {
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
     }
+
+    /// Seed for the AEAD key that seals opaque truncated_cursor tokens.
+    ///
+    /// Uses the cluster-shared `GITLAWB_CURSOR_SECRET` when configured so a
+    /// token minted on one node can be resumed on another behind a load
+    /// balancer; otherwise falls back to this node's Ed25519 seed (single-node
+    /// deployments only — a load-balanced cluster must set the shared secret,
+    /// or truncated cursors will not resume across instances).
+    pub fn cursor_seed(&self) -> [u8; 32] {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        match &self.config.cursor_secret {
+            Some(secret) if !secret.is_empty() => {
+                let hk = Hkdf::<Sha256>::new(None, secret.as_bytes());
+                let mut okm = [0u8; 32];
+                hk.expand(b"gitlawb-ipfs-cursor-v1", &mut okm)
+                    .expect("32 bytes is a valid HKDF output length");
+                okm
+            }
+            _ => *self.node_keypair.to_seed(),
+        }
+    }
 }

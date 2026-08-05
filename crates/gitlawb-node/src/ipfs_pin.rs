@@ -119,7 +119,9 @@ pub async fn pin_new_objects(
         match db.is_pinned(&sha).await {
             Ok(true) => {
                 if !repo_slug.is_empty() {
-                    let _ = db.update_pinned_cid_repo(&sha, repo_slug, owner_did).await;
+                    if let Err(e) = db.update_pinned_cid_repo(&sha, repo_slug, owner_did).await {
+                        tracing::warn!(sha = %sha, err = %e, "failed to update pinned_cid_repo");
+                    }
                 }
                 continue;
             }

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -367,15 +367,33 @@ impl Db {
     /// Must be called while holding the migration advisory lock.
     async fn run_pending_migrations(&self) -> Result<()> {
         for m in MIGRATIONS {
-            let already: bool = sqlx::query(
-                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
-            )
-            .bind(m.version)
-            .fetch_one(&self.pool)
-            .await?
-            .get::<bool, _>("applied");
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM schema_migrations WHERE version = $1")
+                    .bind(m.version)
+                    .fetch_optional(&self.pool)
+                    .await?;
 
-            if already {
+            if let Some((applied_name,)) = row {
+                // Name-collision guard: the runner keys the applied set on the
+                // version integer alone, so a version claimed by two in-flight
+                // branches is silently skipped in full on whichever side merges
+                // second. Catch that here: if this binary's migration name for
+                // an already-applied version differs from what was recorded,
+                // another branch claimed the number first and this migration
+                // will never run. Fail loudly instead of shipping a node that
+                // believes it migrated.
+                if applied_name != m.name {
+                    bail!(
+                        "migration v{} is already recorded under name {:?}, \
+                         but this binary applies {:?} for that version; \
+                         another branch claimed version {} first. Renumber this \
+                         migration above the current high-water mark.",
+                        m.version,
+                        applied_name,
+                        m.name,
+                        m.version
+                    );
+                }
                 continue;
             }
 
@@ -896,7 +914,29 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 12,
+        version: 17,
+        name: "sync_queue_attempted_at",
+        stmts: &[
+            // Scheduling key for dequeue_pending_syncs: when the row was last
+            // handed to a worker. Null until first dequeued, which is why the
+            // ordering coalesces onto enqueued_at.
+            "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
+        ],
+    },
+    // Reservation: these four migrations claim versions 18-21, deliberately
+    // above every live claim on main. main's v17 reservation comment holds
+    // 12-14 for the #173 stack and 16 for the old #253 claim; v17 is taken by
+    // sync_queue_attempted_at. The runner keys the applied set on the integer
+    // alone, so a version another in-flight branch also claims is skipped in
+    // full on whichever side merges second — no error, no warning, and
+    // schema_migrations still reads healthy while the objects are simply
+    // absent. If any of 12-21 is claimed by a branch that merges before this
+    // one, renumber above the new high-water mark. The name-collision guard in
+    // run_pending_migrations fails loudly on a version that was applied under a
+    // different name, which is the closest the runner can get to catching a
+    // silent skip.
+    Migration {
+        version: 18,
         name: "pinned_cids_repo_owner",
         stmts: &[
             "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS repo TEXT",
@@ -943,14 +983,14 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 13,
+        version: 19,
         name: "arweave_anchors_repo_owner_index",
         stmts: &[
             "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo_owner_anchored ON arweave_anchors (repo, owner_did, anchored_at DESC)",
         ],
     },
     Migration {
-        version: 14,
+        version: 20,
         name: "pinned_cid_repos_junction",
         stmts: &[
             r#"CREATE TABLE IF NOT EXISTS pinned_cid_repos (
@@ -976,12 +1016,12 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
     Migration {
-        version: 15,
+        version: 21,
         name: "pinned_cid_repos_backfill_all_associations",
         stmts: &[
-            // Migration 12's UPDATE … FROM branch_cids selects one arbitrary
+            // Migration 18's UPDATE … FROM branch_cids selects one arbitrary
             // row per SHA because UPDATE … FROM picks one matching source row
-            // when multiple match.  Migration 14 then backfills pinned_cid_repos
+            // when multiple match.  Migration 20 then backfills pinned_cid_repos
             // from the scalar pinned_cids.repo, losing every other association.
             // This migration backfills the junction table directly from ALL
             // matching branch_cids rows so every repo that pinned an object
@@ -998,16 +1038,6 @@ const MIGRATIONS: &[Migration] = &[
                         = split_part(bc.repo, '/', 1)
                ) m ON p.cid = m.cid AND p.sha256_hex = m.sha
                ON CONFLICT (sha256_hex, repo) DO NOTHING"#,
-        ],
-    },
-    Migration {
-        version: 17,
-        name: "sync_queue_attempted_at",
-        stmts: &[
-            // Scheduling key for dequeue_pending_syncs: when the row was last
-            // handed to a worker. Null until first dequeued, which is why the
-            // ordering coalesces onto enqueued_at.
-            "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
         ],
     },
 ];
@@ -2334,6 +2364,9 @@ impl Db {
         owner_did: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        // Both writes run in one transaction so a failure cannot leave a
+        // pinned_cids row without its pinned_cid_repos association (P2).
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
              VALUES ($1, $2, $3, $4, $5)
@@ -2346,7 +2379,7 @@ impl Db {
         .bind(&now)
         .bind(repo)
         .bind(owner_did)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         // Also record the (repo, owner_did) association in the junction table
@@ -2361,9 +2394,10 @@ impl Db {
             .bind(repo)
             .bind(owner_did)
             .bind(&now)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2612,16 +2646,22 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
-    /// Record the Pinata CID for a git object.
     /// Record the Pinata CID with explicit repo/owner_did association.
+    /// `cid` is the local content CID computed from the git object bytes and
+    /// `pinata_cid` is the CID assigned by the pinning provider; they can
+    /// differ (providers may re-block or re-name), so each is stored in its
+    /// own column.  Both writes run in one transaction so a failure cannot
+    /// leave a half-recorded pin (P2).
     pub async fn record_pinata_cid_full(
         &self,
         sha256_hex: &str,
+        cid: &str,
         pinata_cid: &str,
         repo: &str,
         owner_did: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo, owner_did)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -2630,12 +2670,12 @@ impl Db {
                 owner_did = COALESCE(NULLIF(EXCLUDED.owner_did, ''), pinned_cids.owner_did)",
         )
         .bind(sha256_hex)
-        .bind(pinata_cid) // fallback local cid if row is new
+        .bind(cid)
         .bind(&now)
         .bind(pinata_cid)
         .bind(repo)
         .bind(owner_did)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if !repo.is_empty() && !owner_did.is_empty() {
@@ -2648,9 +2688,10 @@ impl Db {
             .bind(repo)
             .bind(owner_did)
             .bind(&now)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 }

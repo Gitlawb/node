@@ -63,14 +63,41 @@ pub async fn list_anchors(
             "authentication required for anchor listing".into(),
         ));
     }
+    let caller_str = caller.unwrap();
+
+    // Short-circuit for zero limit before any work or admission check (P2).
+    if limit == 0 {
+        return Ok(Json(serde_json::json!({
+            "anchors": [],
+            "count": 0,
+        })));
+    }
+
+    // Per-DID rate limit: mirror list_pins so a single DID cannot drain the
+    // shared global bucket while each request still loads readable repos and
+    // their visibility rules (P2).  Checked above the ?repo= branch so the
+    // scoped path shares the same listing budget as the global path.
+    if !state.ipfs_list_rate_limiter.check(caller_str).await {
+        return Err(AppError::TooManyRequests(
+            "rate limit exceeded for anchor listing".into(),
+        ));
+    }
+
+    // Global rate limit: keyed on a fixed value so DID rotation cannot
+    // bypass the enumeration cost guard.  Checked after the per-DID limiter
+    // so a single DID cannot exhaust the shared bucket (P2).
+    if !state.ipfs_list_global_limiter.check("global").await {
+        return Err(AppError::TooManyRequests(
+            "rate limit exceeded for anchor listing".into(),
+        ));
+    }
 
     if let Some(slug) = &q.repo {
         let Some((owner_key, name)) = slug.split_once('/') else {
             return Err(AppError::BadRequest(format!("invalid repo slug: {slug}")));
         };
         let (record, _rules) =
-            crate::api::authorize_repo_read(&state, owner_key, name, Some(caller.unwrap()), "/")
-                .await?;
+            crate::api::authorize_repo_read(&state, owner_key, name, Some(caller_str), "/").await?;
 
         // Use the normalized slug so full-DID queries match persisted values (P2)
         let owner_short = crate::db::normalize_owner_key(&record.owner_did);
@@ -87,21 +114,6 @@ pub async fn list_anchors(
         })));
     }
 
-    // Short-circuit for zero limit before any work or admission check (P2).
-    if limit == 0 {
-        return Ok(Json(serde_json::json!({
-            "anchors": [],
-            "count": 0,
-        })));
-    }
-
-    // Global rate limit: prevent DID-rotation enumeration (P2).
-    if !state.ipfs_list_global_limiter.check("global").await {
-        return Err(AppError::TooManyRequests(
-            "rate limit exceeded for anchor listing".into(),
-        ));
-    }
-
     // Authenticated caller without ?repo=: scope to readable repos (P1).
     // Use the deduped, quarantine-filtered view (same as the pin listing).
     let repos = state
@@ -115,7 +127,7 @@ pub async fn list_anchors(
         .list_visibility_rules_for_repos(&ids)
         .await
         .map_err(AppError::Internal)?;
-    let (repos, owner_dids) = readable_repo_pairs(&repos, &rules_by_repo, caller.unwrap());
+    let (repos, owner_dids) = readable_repo_pairs(&repos, &rules_by_repo, caller_str);
     let anchors = state
         .db
         .list_arweave_anchors_for_repos(&repos, &owner_dids, limit)
