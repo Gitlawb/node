@@ -7,14 +7,15 @@
 //! during the normal mock-consumed run because the mock is on loopback and
 //! `NO_PROXY` covers it — the blackhole isn't even exercised).
 //!
-//! This test asserts that a non-loopback destination fails *while the blackhole
-//! is armed*. The destination is a local HTTP server on `127.0.0.2`, a loopback
-//! alias that `NO_PROXY` does NOT cover.  With the blackhole active the proxy
-//! intercepts the connection and blocks it; without the blackhole the request
-//! would reach the server directly and succeed, turning this test RED.
+//! This test asserts that a destination the blackhole's `NO_PROXY` does NOT
+//! cover fails *while the blackhole is armed*.  The destination is a local HTTP
+//! server on `[::1]` (IPv6 loopback), which `NO_PROXY` (`127.0.0.1, localhost`)
+//! does not list.  With the blackhole active the proxy intercepts the
+//! connection and blocks it; without the blackhole the request would reach the
+//! server directly and succeed, turning this test RED.
 //!
 //! A positive control (disarmed blackhole) runs first, proving the fixture is
-//! valid and `127.0.0.2` is reachable.
+//! valid and `[::1]` is reachable.
 //!
 //! Design constraints (see issue #211):
 //!   - An unresolvable host would keep the request failing even when the guard
@@ -22,13 +23,17 @@
 //!     a reachable address.
 //!   - A real external host would make a live network call the moment the guard
 //!     disarms, and on any runner that cannot reach that host the connect error
-//!     again masquerades as the blackhole.  A local loopback alias avoids both
+//!     again masquerades as the blackhole.  A local loopback address avoids both
 //!     problems — it is always reachable when unblocked and never reaches the
 //!     real network.
-//!   - This depends on reqwest's `NO_PROXY` matching by exact IP (holds in the
-//!     pinned reqwest/hyper-util; recheck on upgrade) and on the OS routing
-//!     `127/8` as loopback (default on Linux; macOS needs an explicit alias —
-//!     the test fails loudly, never skips, if `127.0.0.2` cannot be bound).
+//!   - The address must NOT be covered by `NO_PROXY`, yet must exist on every
+//!     platform.  An arbitrary `127/8` alias is not portable: macOS only binds
+//!     `127.0.0.1` by default.  `[::1]` (IPv6 loopback) is present by default
+//!     on Linux, macOS, and Windows, and `NO_PROXY` only lists `127.0.0.1` and
+//!     `localhost`, so the blackhole still intercepts it.
+//!   - This depends on hyper-util's proxy matcher having no implicit loopback
+//!     bypass — a host is only proxied-around when literally listed in
+//!     `NO_PROXY` (verified in the pinned hyper-util; recheck on upgrade).
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -39,7 +44,7 @@ use icaptcha_client::{obtain_proof, Challenge, IcaptchaCfg};
 mod support;
 
 /// A minimal HTTP server that responds to iCaptcha challenge and answer
-/// requests on a loopback alias NOT covered by NO_PROXY.
+/// requests on the IPv6 loopback address NOT covered by NO_PROXY.
 ///
 /// When the blackhole is working, the proxy should intercept these requests
 /// and `obtain_proof` should fail.  When the blackhole is disarmed, the
@@ -92,21 +97,21 @@ fn make_cfg(url: &str) -> IcaptchaCfg {
 
 #[test]
 fn obtain_proof_blackhole_tripwire() {
-    // Bind to 127.0.0.2, a loopback alias NOT covered by NO_PROXY.  Linux
-    // routes the whole 127/8 block as loopback; macOS does not alias it by
-    // default (add one with `sudo ifconfig lo0 alias 127.0.0.2`).  Fail
-    // loudly on platforms that cannot bind it: a silent skip would report
-    // this tripwire as green while exercising none of the negative control,
-    // recreating the very gap it exists to close.
-    let listener = TcpListener::bind("127.0.0.2:0").expect(
-        "cannot bind 127.0.0.2 for the blackhole tripwire. Linux routes \
-         127/8 as loopback; on macOS add the alias first \
-         (`sudo ifconfig lo0 alias 127.0.0.2`). This test fails rather than \
-         silently skipping so a platform without the alias cannot count the \
-         negative control as passed.",
+    // Bind to [::1], IPv6 loopback, which NO_PROXY (127.0.0.1, localhost)
+    // does not cover.  Unlike an arbitrary 127/8 alias, IPv6 loopback is
+    // present by default on Linux, macOS, and Windows, so the fixture is
+    // portable across platforms.  Fail loudly if it cannot be bound: a
+    // silent skip would report this tripwire as green while exercising
+    // none of the negative control, recreating the very gap it exists to
+    // close.
+    let listener = TcpListener::bind(("::1", 0)).expect(
+        "cannot bind [::1] for the blackhole tripwire. IPv6 loopback (::1) \
+         is present by default on Linux, macOS, and Windows. This test fails \
+         rather than silently skipping so a platform without it cannot count \
+         the negative control as passed.",
     );
     let port = listener.local_addr().unwrap().port();
-    let url = format!("http://127.0.0.2:{port}");
+    let url = format!("http://[::1]:{port}");
     serve_icaptcha(listener);
 
     // ── Positive control: disarmed blackhole → obtain_proof succeeds ──────
@@ -128,7 +133,7 @@ fn obtain_proof_blackhole_tripwire() {
     let result = obtain_proof(&cfg, Some(solve));
 
     let err = result.expect_err(
-        "blackhole tripwire: obtain_proof succeeded against 127.0.0.2, \
+        "blackhole tripwire: obtain_proof succeeded against [::1], \
          meaning the proxy blackhole did not intercept the request; \
          the no-live-call guard is disarmed",
     );
