@@ -52,7 +52,8 @@ impl MutationRoot {
             updated_at: now,
             deadline: input.deadline,
         };
-        db.create_task(&task)
+        let task = db
+            .create_task(&task)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(AgentTaskType::from(task))
@@ -73,15 +74,23 @@ impl MutationRoot {
         let assignee_did = caller.to_string();
         let db = ctx.data_unchecked::<Arc<Db>>();
         let tx = ctx.data_unchecked::<tokio::sync::broadcast::Sender<TaskEventBroadcast>>();
-        let task = db
-            .claim_task(&id, &assignee_did)
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let task = db.claim_task(&id, &assignee_did).await.map_err(|e| {
+            if e.downcast_ref::<crate::db::TaskReservedForOtherAssignee>()
+                .is_some()
+            {
+                // Distinct from a lost race so clients can stop retrying.
+                return async_graphql::Error::new(
+                    "task not claimable: reserved for another assignee",
+                );
+            }
+            async_graphql::Error::new(e.to_string())
+        })?;
+        let by_did = task.assignee_did.clone().unwrap_or(assignee_did);
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "pending".to_string(),
             new_status: "claimed".to_string(),
-            by_did: assignee_did,
+            by_did,
             at: Utc::now().to_rfc3339(),
         });
         Ok(AgentTaskType::from(task))
@@ -110,15 +119,19 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
-        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+        if !crate::api::did_matches(
+            caller,
+            crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
+        ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can complete it",
             ));
         }
         let task = db
-            .finish_task(&id, "completed", input.result.as_deref())
+            .finish_task(&id, "completed", input.result.as_deref(), &by_did)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let by_did = task.assignee_did.clone().unwrap_or(by_did);
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -151,16 +164,20 @@ impl MutationRoot {
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .ok_or_else(|| async_graphql::Error::new("task not found"))?;
-        if !crate::api::did_matches(caller, existing.assignee_did.as_deref().unwrap_or_default()) {
+        if !crate::api::did_matches(
+            caller,
+            crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
+        ) {
             return Err(async_graphql::Error::new(
                 "only the task assignee can fail it",
             ));
         }
         let reason = input.reason.unwrap_or_default();
         let task = db
-            .finish_task(&id, "failed", Some(&reason))
+            .finish_task(&id, "failed", Some(&reason), &by_did)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let by_did = task.assignee_did.clone().unwrap_or(by_did);
         let _ = tx.send(TaskEventBroadcast {
             task_id: id,
             old_status: "claimed".to_string(),
@@ -289,5 +306,86 @@ mod tests {
             "the assignee should complete the task: {}",
             errors(&resp)
         );
+    }
+
+    /// Pre-assigned GraphQL claimTask must reject a stranger (no UCAN leak)
+    /// and admit the reserved assignee.
+    #[sqlx::test]
+    async fn claim_task_honors_preassigned_assignee(pool: PgPool) {
+        let state = crate::test_support::test_state(pool).await;
+        let reserved = "did:key:zGQLRESERVEDAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let thief = "did:key:zGQLTHIEFBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let now = chrono::Utc::now().to_rfc3339();
+        let task = crate::db::AgentTask {
+            id: "task-gql-reserved".into(),
+            repo_id: None,
+            kind: "build".into(),
+            status: "pending".into(),
+            delegator_did: "did:key:zGQLDELEGATORCCCCCCCCCCCCCCCCCCCCCCCCCC".into(),
+            assignee_did: Some(reserved.into()),
+            capability: "repo:write".into(),
+            ucan_token: Some("gql-ucan-secret".into()),
+            payload: None,
+            result: None,
+            created_at: now.clone(),
+            updated_at: now,
+            deadline: None,
+        };
+        state.db.create_task(&task).await.expect("seed");
+        let schema = state.graphql_schema.as_ref();
+
+        let q = |actor: &str| {
+            format!(
+                r#"mutation {{ claimTask(id: "task-gql-reserved", assigneeDid: "{actor}") {{ id status ucanToken }} }}"#
+            )
+        };
+
+        let resp = schema
+            .execute(Request::new(q(thief)).data(AuthenticatedDid(thief.into())))
+            .await;
+        let errs = errors(&resp);
+        assert!(
+            errs.contains("reserved"),
+            "stranger claim must surface reserved deny distinctly: {errs}"
+        );
+        assert!(
+            !errs.contains("gql-ucan-secret"),
+            "UCAN must not leak in GraphQL errors: {errs}"
+        );
+        if let Ok(data) = resp.data.into_json() {
+            let s = data.to_string();
+            assert!(
+                !s.contains("gql-ucan-secret"),
+                "UCAN must not leak in GraphQL data on failed claim: {s}"
+            );
+        }
+        // Parity with REST: failed steal must leave the row untouched.
+        let still = state
+            .db
+            .get_task("task-gql-reserved")
+            .await
+            .expect("get")
+            .expect("task exists");
+        assert_eq!(
+            still.status, "pending",
+            "status must stay pending after steal"
+        );
+        assert_eq!(
+            still.assignee_did.as_deref(),
+            Some(reserved),
+            "assignee_did must stay reserved after steal"
+        );
+
+        let resp = schema
+            .execute(Request::new(q(reserved)).data(AuthenticatedDid(reserved.into())))
+            .await;
+        assert!(
+            errors(&resp).is_empty(),
+            "reserved assignee must claim: {}",
+            errors(&resp)
+        );
+        let data = resp.data.into_json().expect("json data");
+        assert_eq!(data["claimTask"]["status"], "claimed");
+        assert_eq!(data["claimTask"]["ucanToken"], "gql-ucan-secret");
     }
 }

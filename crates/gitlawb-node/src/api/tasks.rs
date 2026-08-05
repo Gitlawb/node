@@ -117,7 +117,7 @@ pub async fn create_task(
         updated_at: now,
         deadline: body.deadline,
     };
-    state.db.create_task(&task).await.map_err(|e| {
+    let task = state.db.create_task(&task).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -175,16 +175,22 @@ pub async fn claim_task(
         return Err(forbidden("assignee_did must be the authenticated signer"));
     }
     let task = state.db.claim_task(&id, &auth.0).await.map_err(|e| {
+        if e.downcast_ref::<crate::db::TaskReservedForOtherAssignee>()
+            .is_some()
+        {
+            return forbidden("task not claimable: reserved for another assignee");
+        }
         (
             StatusCode::CONFLICT,
             Json(json!({ "error": e.to_string() })),
         )
     })?;
+    let by_did = task.assignee_did.clone().unwrap_or_else(|| auth.0.clone());
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "pending".to_string(),
         new_status: "claimed".to_string(),
-        by_did: auth.0,
+        by_did,
         at: Utc::now().to_rfc3339(),
     });
     Ok(Json(task_to_json(&task)))
@@ -219,14 +225,14 @@ pub async fn complete_task(
         })?;
     if !crate::api::did_matches(
         &auth.0,
-        existing.assignee_did.as_deref().unwrap_or_default(),
+        crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
     ) {
         return Err(forbidden("only the task assignee can complete it"));
     }
     let by_did = auth.0;
     let task = state
         .db
-        .finish_task(&id, "completed", body.result.as_deref())
+        .finish_task(&id, "completed", body.result.as_deref(), &by_did)
         .await
         .map_err(|e| {
             (
@@ -234,6 +240,7 @@ pub async fn complete_task(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
+    let by_did = task.assignee_did.clone().unwrap_or(by_did);
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "claimed".to_string(),
@@ -272,7 +279,7 @@ pub async fn fail_task(
         })?;
     if !crate::api::did_matches(
         &auth.0,
-        existing.assignee_did.as_deref().unwrap_or_default(),
+        crate::db::trim_assignee_did(existing.assignee_did.as_deref().unwrap_or_default()),
     ) {
         return Err(forbidden("only the task assignee can fail it"));
     }
@@ -280,7 +287,7 @@ pub async fn fail_task(
     let reason = body.reason.unwrap_or_default();
     let task = state
         .db
-        .finish_task(&id, "failed", Some(&reason))
+        .finish_task(&id, "failed", Some(&reason), &by_did)
         .await
         .map_err(|e| {
             (
@@ -288,6 +295,7 @@ pub async fn fail_task(
                 Json(json!({ "error": e.to_string() })),
             )
         })?;
+    let by_did = task.assignee_did.clone().unwrap_or(by_did);
     let _ = state.task_event_tx.send(TaskEventBroadcast {
         task_id: id,
         old_status: "claimed".to_string(),
