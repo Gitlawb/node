@@ -1440,7 +1440,9 @@ mod ref_updates_feed_tests {
 
     // A DB error in the gate fails closed as 500, not swallowed into an empty 200 (the
     // regression the old get_repo().ok().flatten() allowed). Inject by dropping a
-    // column get_repo selects so its query errors.
+    // column get_repo selects so its query errors. Also pin the anonymous body to
+    // the exact opaque object (#226): substring checks miss truncated or differently
+    // shaped leaks, and a vacuous "db_error || internal_error" assert cannot fail.
     #[sqlx::test]
     async fn repo_events_db_error_fails_closed_500(pool: PgPool) {
         let state = test_state(pool.clone()).await;
@@ -1462,6 +1464,18 @@ mod ref_updates_feed_tests {
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a DB error must fail closed (500), never serve an empty 200"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8_lossy(&bytes);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "error": "db_error",
+                "message": crate::error::DB_ERROR_MESSAGE,
+            })
         );
     }
 

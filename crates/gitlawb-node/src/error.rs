@@ -85,6 +85,14 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+/// Generic client-facing message for `AppError::Internal`. The real error is
+/// logged server-side; never put sqlx/anyhow detail in the HTTP body (#226).
+pub const INTERNAL_ERROR_MESSAGE: &str = "an internal error occurred";
+
+/// Generic client-facing message for non-unavailable `AppError::Db`. Query /
+/// schema errors stay in logs; the HTTP body must not leak them (#226).
+pub const DB_ERROR_MESSAGE: &str = "a database error occurred";
+
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         // iCaptcha challenges carry structured discovery so clients don't have to
@@ -147,12 +155,29 @@ impl IntoResponse for AppError {
                 DB_UNAVAILABLE_CODE,
                 DB_UNAVAILABLE_MESSAGE.into(),
             ),
-            AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
-            AppError::Internal(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal_error",
-                e.to_string(),
-            ),
+            // Opaque body + server log: bare `?` on sqlx paths becomes `AppError::Db`
+            // via `From`, so this arm (not `Internal`) is the common leak for open
+            // routes like GET /api/v1/repos and GET /api/v1/peers (#226).
+            AppError::Db(e) => {
+                tracing::error!(error = %e, "database error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "db_error",
+                    DB_ERROR_MESSAGE.into(),
+                )
+            }
+            // Opaque body: handlers that map with `.map_err(AppError::Internal)`
+            // (e.g. GET /ipfs/{cid}) land here; other DB failures usually hit `Db`.
+            // Log `{e:#}` so context-wrapped anyhow chains keep the leaf cause
+            // (Display alone is only the outermost layer; see api/repos.rs).
+            AppError::Internal(e) => {
+                tracing::error!(error = %format!("{e:#}"), "internal error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    INTERNAL_ERROR_MESSAGE.into(),
+                )
+            }
         };
 
         let body = Json(json!({
@@ -169,6 +194,7 @@ pub type Result<T> = std::result::Result<T, AppError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
 
     #[test]
     fn timeout_maps_to_504_distinct_from_git_500() {
@@ -180,6 +206,70 @@ mod tests {
         assert_eq!(
             AppError::Git("x".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// #226: raw sqlx/DB detail must never appear in the Internal 500 body.
+    #[tokio::test]
+    async fn internal_error_body_is_opaque() {
+        let leak = "error returned from database: relation \"repos\" does not exist";
+        let resp = AppError::Internal(anyhow::anyhow!("{leak}")).into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        // Exact object: a new `detail` field with different sensitive text must
+        // also fail, not only a repeat of the original error string.
+        assert_eq!(
+            v,
+            json!({
+                "error": "internal_error",
+                "message": INTERNAL_ERROR_MESSAGE,
+            })
+        );
+    }
+
+    /// #226: `AppError::Db` query errors (the common `?` path) must also be opaque.
+    #[tokio::test]
+    async fn db_error_body_is_opaque() {
+        let resp = AppError::Db(sqlx::Error::Protocol(
+            "error returned from database: column \"is_public\" does not exist".into(),
+        ))
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v,
+            json!({
+                "error": "db_error",
+                "message": DB_ERROR_MESSAGE,
+            })
+        );
+    }
+
+    /// Connection-level failures must stay 503 `db_unavailable`, not collapse
+    /// into the opaque 500 `db_error` arm if `db_unavailable` loses a variant.
+    #[tokio::test]
+    async fn db_pool_timeout_stays_503_unavailable() {
+        let resp = AppError::Db(sqlx::Error::PoolTimedOut).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let v: Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(
+            v,
+            json!({
+                "error": DB_UNAVAILABLE_CODE,
+                "message": DB_UNAVAILABLE_MESSAGE,
+            })
         );
     }
 }
