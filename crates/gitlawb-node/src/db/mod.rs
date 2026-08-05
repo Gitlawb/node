@@ -879,18 +879,17 @@ const MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "ref_update_owner_did",
         stmts: &[
-            // Index deferred — the feed gate (#144) does not read owner_did yet.
+            // Index deferred: the feed gate (#144) does not read owner_did yet.
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
-    // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
-    // The runner keys the applied set on the integer alone, so a version another
-    // in-flight branch also claims is skipped in full on whichever side merges
-    // second — no error, no warning, and schema_migrations still reads healthy
-    // while the column is simply absent. Two open branches already claim into
-    // this range: #135/#173 holds through 14 (15 once it rebases past v11), and
-    // #253 took 16. 17 clears both. Gaps are harmless: the runner iterates the
-    // array and never requires contiguity.
+    // Reservation: v17 is deliberately not main's current_max + 1. The runner keys the
+    // applied set on the integer alone, so a version another in-flight branch also
+    // claims is skipped in full on whichever side merges second: no error, no warning,
+    // and schema_migrations still reads healthy while the column is simply absent.
+    // #253 took 16, and the pin-provenance work below took 18-23 when it merged, so 17
+    // sits between them. Gaps are harmless: the runner iterates the array and never
+    // requires contiguity.
     Migration {
         version: 17,
         name: "sync_queue_attempted_at",
@@ -901,7 +900,124 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
         ],
     },
+    // The six pin-provenance migrations below were numbered 11-16 while this work was
+    // in flight and moved to 18-23 on merge, because 11 and 16 were claimed elsewhere.
+    // A database that ran an earlier commit of this branch therefore has schema_migrations
+    // rows for the old numbers. Those rows are orphans: the runner skips on `version`
+    // alone and never reads `name`, so nothing detects them, and the DDL below re-runs
+    // as a no-op against objects that already exist. Recreate any such database rather
+    // than upgrading it in place.
+    Migration {
+        version: 18,
+        name: "pinned_cids_cid_index",
+        stmts: &[
+            // GET /ipfs/{cid} resolves an incoming CID -> git oid via pinned_cids.cid
+            // (#173); index it so the per-request lookup is not a table scan. This is
+            // a NEW versioned migration (not appended to the applied v1 bundle) so a
+            // node already past v1 actually gets the index. Non-unique on purpose: cid
+            // is a function of raw content, so a UNIQUE index could reject a legitimate
+            // record_pinned_cid insert, and colliding rows serve byte-identical content.
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_cid ON pinned_cids(cid)",
+        ],
+    },
+    Migration {
+        version: 19,
+        name: "pinned_cids_repo_provenance",
+        stmts: &[
+            // Record the repository a pin came from so GET /ipfs/{cid} resolves a
+            // provenanced pin straight to its ONE source repo instead of scanning every
+            // repo (#173, jatmn round 2 — bounds the anonymous fan-out and removes the
+            // updated_at-ordering false-404). NEW versioned migration (never appended to
+            // the applied v1 pinned_cids table) so a node past v1 gets the column.
+            // Nullable: pins recorded before this migration have no provenance and fall
+            // back to the legacy repo scan; new pins carry repo_id and resolve to one
+            // repo. Indexed for the resolver's oid -> repo_id lookup.
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS repo_id TEXT",
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_repo_id ON pinned_cids(repo_id)",
+        ],
+    },
+    Migration {
+        version: 20,
+        name: "pin_repo_sources",
+        stmts: &[
+            // F1 (#173, jatmn round 8): a shared object (a blob/tree/commit common to
+            // forks and mirrors) can be pinned from more than one repo. `pinned_cids`
+            // keeps only the FIRST pinner's `repo_id`, so a shared object first pinned
+            // from a private/quarantined repo 404s by CID even when a later PUBLIC repo
+            // also pinned it. Record EVERY pin-path source so `GET /ipfs/{cid}` can try
+            // each. NEW versioned migration (never appended to an applied block, INV-7).
+            // Bounded per object at insert time (MAX_PIN_SOURCES) so an adversary pushing
+            // one object from N repos cannot make resolution O(repos) (R2, INV-10).
+            "CREATE TABLE IF NOT EXISTS pin_repo_sources (
+                 sha256_hex TEXT NOT NULL,
+                 repo_id    TEXT NOT NULL,
+                 PRIMARY KEY (sha256_hex, repo_id)
+             )",
+            "CREATE INDEX IF NOT EXISTS idx_pin_repo_sources_sha ON pin_repo_sources(sha256_hex)",
+        ],
+    },
+    Migration {
+        version: 21,
+        name: "pinned_cids_legacy_provider_cid",
+        stmts: &[
+            // R8 (#173, jatmn round 10): the opportunistic legacy provider-CID repair
+            // rewrites `pinned_cids.cid` from a stored PROVIDER CID (Kubo dag-pb /
+            // Pinata CIDv0) to the raw-content resolver key and stashes the OLD value
+            // here, so the rewrite is auditable and the row's legacy origin survives.
+            // Distinct from `pinata_cid` on purpose: `has_pinata_cid` gates the Pinata
+            // pin-skip, so parking a Kubo-legacy CID there would make Pinata forever
+            // skip re-pinning that object. NEW versioned migration (never appended to an
+            // applied block, INV-7) so a node past v13 actually gets the column.
+            // Nullable: only a repaired row sets it.
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS legacy_provider_cid TEXT",
+        ],
+    },
+    Migration {
+        version: 22,
+        name: "pinned_cids_sources_incomplete",
+        stmts: &[
+            // U3 (#173): `record_pin_source` is BEST EFFORT at every call site, so a
+            // non-empty, below-cap source set is not proof that every source was
+            // recorded. An object first pinned from a private repo and later pushed
+            // from a PUBLIC repo whose record failed keeps a set naming only the
+            // private source, and the resolver used to call that set complete and 404
+            // an object the public repo would serve. Record the miss DURABLY here so
+            // `GET /ipfs/{cid}` keeps the bounded scan fallback for exactly those
+            // objects. Not inferable from row counts or timestamps: neither can tell
+            // "no other source exists" from "a source failed to record", which is the
+            // whole distinction. NEW versioned migration (never appended to an applied
+            // block, INV-7). NOT NULL DEFAULT FALSE so every pre-existing row reads as
+            // complete and ordinary denials stay off the O(repos) path (INV-10).
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS pin_sources_incomplete BOOLEAN NOT NULL DEFAULT FALSE",
+        ],
+    },
+    Migration {
+        version: 23,
+        name: "pin_repair_sweep_cursor",
+        stmts: &[
+            // U4 (#173): the legacy provider-CID repair sweep walks `pinned_cids` in
+            // bounded batches over an ordered `sha256_hex` cursor. The cursor has to be
+            // DURABLE, or a restart rewinds the walk to the start of the table and an
+            // upgraded node with a large pin set never finishes repairing it. One row
+            // (`id = 1`, enforced by the CHECK) rather than a key-value table: there is
+            // exactly one sweep and no second consumer, and a real constraint beats a
+            // convention nobody can enforce. NEW versioned migration (never appended to
+            // an applied block, INV-7). No default row is inserted: an absent row is the
+            // "never swept" state, which the empty-string cursor start already means, so
+            // there is no first-run special case to get wrong.
+            "CREATE TABLE IF NOT EXISTS pin_repair_sweep (
+                 id     INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+                 cursor TEXT NOT NULL
+             )",
+        ],
+    },
 ];
+
+/// Max distinct source repos recorded per pinned object (F1, #173 jatmn round 8).
+/// Bounds both the resolver's per-OID source loop and the `pin_repo_sources` growth,
+/// so an adversary re-pushing one object from many repos cannot make resolution
+/// O(repos) (R2, INV-10).
+pub const MAX_PIN_SOURCES: i64 = 16;
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
@@ -1076,6 +1192,22 @@ impl Db {
             .fetch_optional(&self.pool)
             .await?;
 
+        Ok(row.map(row_to_repo))
+    }
+
+    /// Fetch a repo by its stable `id`. Used by the `/ipfs/{cid}` provenance path,
+    /// which resolves a pin straight to its ONE source repo (#173) instead of
+    /// scanning `list_all_repos`. `id` is exact, so unlike `get_repo`'s fuzzy
+    /// owner/name match there is no mirror-vs-canonical disambiguation.
+    pub async fn get_repo_by_id(&self, id: &str) -> Result<Option<RepoRecord>> {
+        let row = sqlx::query(
+            "SELECT id, name, owner_did, description, is_public, default_branch,
+                    created_at, updated_at, disk_path, forked_from, machine_id
+             FROM repos WHERE id = $1 LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(row_to_repo))
     }
 
@@ -2268,18 +2400,385 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
-    pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
+    /// Every git oid a pinned CID maps to (`pinned_cids.cid` -> `sha256_hex`).
+    /// `GET /ipfs/{cid}` resolves the content-addressed CID a client sends back to
+    /// the object's git oid this way: a real pin CID digests the raw object
+    /// content, not the git oid, so the digest cannot be `git cat-file`d directly
+    /// (#173). The index is unique on the git oid but NON-unique on cid, so two
+    /// distinct oids can share one content-CID (a tree and a blob whose raw bytes
+    /// collide, or byte-identical content pinned under two oids). Returning every
+    /// candidate lets the handler try each rather than pick one arbitrarily and
+    /// false-404 when the chosen one is withheld or absent while another is
+    /// readable (#173). Empty when the CID was never pinned on this node.
+    pub async fn oids_for_cid(&self, cid: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT sha256_hex FROM pinned_cids WHERE cid = $1")
+            .bind(cid)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("sha256_hex"))
+            .collect())
+    }
+
+    /// Record a pinned object's CID and the repository it was pinned from
+    /// (`repo_id`, #173). On conflict the `COALESCE` backfills a NULL provenance
+    /// from a known source while keeping first-pinner-owns: an existing non-NULL
+    /// `repo_id` is never rewritten by a later push of the same oid, but a legacy
+    /// pin (or a pin recorded before provenance existed) whose `repo_id` is NULL
+    /// gets it filled the next time the object is re-pinned with a known source.
+    /// `cid`/`pinned_at` are left untouched on conflict. `repo_id` is `None` only
+    /// for a legacy pin with no known source; those fall back to the resolver's scan.
+    ///
+    /// The production first-pin path now goes through [`Self::record_pinned_cid_with_source`]
+    /// (U3, #173) so the pin and its source land atomically; this remains the seam for
+    /// seeding legacy, source-less rows in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn record_pinned_cid(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo_id: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT(sha256_hex) DO NOTHING",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
         .bind(cid)
         .bind(Utc::now().to_rfc3339())
+        .bind(repo_id)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// The resolver key currently stored for a pinned object (`pinned_cids.cid`),
+    /// or `None` for an unpinned oid. The opportunistic legacy-repair path reads
+    /// it to decide candidacy from the codec of the string alone (no object bytes)
+    /// before it recomputes anything.
+    pub async fn cid_for_oid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("cid")))
+    }
+
+    /// Rewrite a legacy provider-CID row to the raw-content resolver key, stashing
+    /// the old provider value in `legacy_provider_cid` (#173 R8, KTD8). Before this
+    /// branch the pin path stored the PROVIDER CID (Kubo dag-pb / Pinata CIDv0) in
+    /// `cid`; the `/ipfs` resolver recomputes the raw CID and 404s a mismatched key
+    /// even though `list_pinned_cids` still advertises it. The `WHERE cid =
+    /// $old_provider_cid` guard makes a concurrent double-repair a no-op (the second
+    /// writer sees the already-rewritten key and matches nothing) and never touches
+    /// a row keyed on a different value. Stashed in `legacy_provider_cid`, NOT
+    /// `pinata_cid`: the latter gates the Pinata pin-skip (`has_pinata_cid`), so a
+    /// Kubo-legacy CID parked there would make Pinata permanently skip the object.
+    pub async fn repair_legacy_provider_cid(
+        &self,
+        sha256_hex: &str,
+        raw_cid: &str,
+        old_provider_cid: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE pinned_cids
+                SET cid = $2, legacy_provider_cid = $3
+              WHERE sha256_hex = $1 AND cid = $3",
+        )
+        .bind(sha256_hex)
+        .bind(raw_cid)
+        .bind(old_provider_cid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One ordered batch of `pinned_cids` rows strictly after `cursor`, for the U4
+    /// legacy provider-CID repair sweep. Returns `(sha256_hex, cid)` ordered by
+    /// `sha256_hex` (the table's primary key, so the walk rides the PK index) and
+    /// capped at `limit` rows, which is what BOUNDS the sweep: one pass can never read
+    /// more than a batch, however large the pin set is.
+    ///
+    /// Deliberately NOT filtered to legacy rows in SQL. "Is this a raw CIDv1" is a
+    /// multibase+codec decode (`is_raw_cidv1`), which Postgres cannot express, and a
+    /// prefix-match approximation would silently mis-classify keys under a different
+    /// multihash. The caller applies the real predicate, so `limit` bounds rows READ
+    /// (the DB cost), not rows repaired.
+    pub async fn pinned_cids_after(
+        &self,
+        cursor: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT sha256_hex, cid FROM pinned_cids
+              WHERE sha256_hex > $1
+              ORDER BY sha256_hex
+              LIMIT $2",
+        )
+        .bind(cursor)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("sha256_hex"), r.get::<String, _>("cid")))
+            .collect())
+    }
+
+    /// Where the U4 repair sweep's walk left off, or `""` before it has ever run.
+    /// Empty string sorts below every hex oid, so a first run and a rewound run are
+    /// the same code path (`sha256_hex > ''` is the whole table).
+    pub async fn pin_repair_cursor(&self) -> Result<String> {
+        let row = sqlx::query("SELECT cursor FROM pin_repair_sweep WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("cursor"))
+            .unwrap_or_default())
+    }
+
+    /// Persist the sweep's walk position. Written after every batch, so a restart
+    /// resumes rather than re-walking the table from the beginning. A rewrite is a
+    /// plain upsert: the sweep is the single writer, and re-repairing an
+    /// already-repaired row is a no-op anyway (the codec cost gate spares it).
+    pub async fn set_pin_repair_cursor(&self, cursor: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pin_repair_sweep (id, cursor) VALUES (1, $1)
+             ON CONFLICT (id) DO UPDATE SET cursor = EXCLUDED.cursor",
+        )
+        .bind(cursor)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The repository a pinned object was recorded from (`pinned_cids.repo_id`),
+    /// or `None` for a legacy pin (recorded before provenance existed) or an
+    /// unpinned oid. `GET /ipfs/{cid}` uses this to gate+serve the ONE source
+    /// repo instead of scanning every repo (#173).
+    pub async fn provenance_for_oid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT repo_id FROM pinned_cids WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("repo_id")))
+    }
+
+    /// Backfill the source repo on an already-pinned object whose provenance is
+    /// NULL (a legacy pin recorded before provenance existed, #173, jatmn). The
+    /// `AND repo_id IS NULL` guard keeps first-pinner-owns: an existing non-NULL
+    /// provenance is left untouched. Touches only `repo_id` and never re-pins the
+    /// object's bytes, so it is safe to call on the already-pinned skip path.
+    pub async fn backfill_pin_provenance(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE pinned_cids SET repo_id = $2 WHERE sha256_hex = $1 AND repo_id IS NULL",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a repository as a source for a pinned object (F1, #173 jatmn round 8),
+    /// bounded to about `MAX_PIN_SOURCES` distinct repos per object. The count guard
+    /// lives inside the INSERT (a single statement), which suppresses a re-push of the
+    /// SAME `(oid, repo)` via `ON CONFLICT DO NOTHING`. It does NOT hard-serialize
+    /// concurrent inserts of DIFFERENT repos for the same object: under Postgres READ
+    /// COMMITTED each concurrent writer's count subquery reads a snapshot that omits the
+    /// others' uncommitted rows, so N concurrent pushers can each see `count < cap` and
+    /// overshoot by up to N-1 rows. The overshoot is a small constant (bounded by
+    /// concurrent-pusher count, never O(repos)), and the RESOLVER read side
+    /// (`pin_sources_for_oid`) caps the ADDITIONAL sources at `MAX_PIN_SOURCES` (always
+    /// keeping the first-pinner), so the INV-10 bound on serve-time work holds at
+    /// `O(MAX_PIN_SOURCES + 1)` regardless of a table overshoot.
+    ///
+    /// A record that ACTUALLY ADDS a source row also CLEARS the
+    /// `pin_sources_incomplete` marker for the object, in the SAME transaction as the
+    /// insert (U3, #173), so the clear cannot drift across the four call sites or land
+    /// without the row it describes.
+    ///
+    /// The clear is gated on `rows_affected() > 0` because the INSERT is a no-op in two
+    /// ordinary cases: the `(oid, repo)` pair already exists (`ON CONFLICT DO NOTHING`)
+    /// and the source set is at cap (the count guard). The skip path calls this for
+    /// EVERY already-pinned object, and on a requeue pass that list is the whole-repo
+    /// enumeration, so an unconditional clear meant the next coalesced push from a repo
+    /// already in the set wiped the marker for every object in the repo without
+    /// recording anything (round 11 regression). The residual, which the gate does not
+    /// close: the marker is per-object, not per-(object, repo), so a GENUINE record from
+    /// a third repo C still clears a marker that repo A's failed record set. That is the
+    /// deliberate cost of a single boolean; closing it needs a per-(oid, repo) marker
+    /// table, and it fails in the safe direction (the marker only ever ADDS the scan
+    /// fallback, never removes a source the resolver already tries).
+    pub async fn record_pin_source(&self, sha256_hex: &str, repo_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            sqlx::query(
+                "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
+                  WHERE sha256_hex = $1 AND pin_sources_incomplete",
+            )
+            .bind(sha256_hex)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Record a first pin and its source ATOMICALLY (U3, #173). The first-pin path
+    /// used to run `record_pinned_cid` and `record_pin_source` as two independent
+    /// best-effort calls, so the pin could land while its source did not, leaving a
+    /// source set that is silently missing its own first pinner. One transaction
+    /// removes that window entirely: either both rows land or neither does, and a
+    /// total failure leaves the object unpinned so the next push retries it.
+    ///
+    /// The marker clear carries the same `rows_affected` gate as `record_pin_source`.
+    /// It is not load-bearing here: this path runs only when `is_pinned` said no row
+    /// exists, and `mark_pin_sources_incomplete` is a no-op without a `pinned_cids` row,
+    /// so there is no marker to wrongly clear. The gate is kept for the one window that
+    /// is not covered by that argument, a concurrent pinner landing the row between the
+    /// `is_pinned` check and this upsert, and so the two clears cannot drift apart.
+    pub async fn record_pinned_cid_with_source(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
+        )
+        .bind(sha256_hex)
+        .bind(cid)
+        .bind(Utc::now().to_rfc3339())
+        .bind(repo_id)
+        .execute(&mut *tx)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO pin_repo_sources (sha256_hex, repo_id)
+             SELECT $1, $2
+             WHERE (SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1) < $3
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo_id)
+        .bind(MAX_PIN_SOURCES)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted > 0 {
+            sqlx::query(
+                "UPDATE pinned_cids SET pin_sources_incomplete = FALSE
+                  WHERE sha256_hex = $1 AND pin_sources_incomplete",
+            )
+            .bind(sha256_hex)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Mark this object's pin-source set as KNOWN INCOMPLETE (U3, #173). Called when a
+    /// `record_pin_source` exhausts its retries, which is the only moment the node
+    /// knows a source it meant to record is missing. `GET /ipfs/{cid}` reads it to keep
+    /// the bounded scan fallback for that object, so a public copy that would serve is
+    /// no longer 404'd. A no-op when no `pinned_cids` row exists (the first-pin path is
+    /// transactional, so there is no half-recorded pin to describe).
+    pub async fn mark_pin_sources_incomplete(&self, sha256_hex: &str) -> Result<()> {
+        sqlx::query("UPDATE pinned_cids SET pin_sources_incomplete = TRUE WHERE sha256_hex = $1")
+            .bind(sha256_hex)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether this object's pin-source set is KNOWN INCOMPLETE (U3, #173): a
+    /// `record_pin_source` for it failed outright and no later record has repaired the
+    /// set. `false` for an unpinned oid and for every row predating the column, so the
+    /// common path is unchanged and an ordinary denial never fans out (INV-10).
+    pub async fn pin_sources_incomplete(&self, sha256_hex: &str) -> Result<bool> {
+        let flag: Option<bool> = sqlx::query_scalar(
+            "SELECT pin_sources_incomplete FROM pinned_cids WHERE sha256_hex = $1",
+        )
+        .bind(sha256_hex)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(flag.unwrap_or(false))
+    }
+
+    /// Every source repository recorded for a pinned object (F1, #173 jatmn round 8):
+    /// the union of the first-pinner `pinned_cids.repo_id` and the `pin_repo_sources`
+    /// rows, deduped and ordered for a deterministic resolver walk.
+    ///
+    /// The first-pinner (a single row by `pinned_cids`' PK on `sha256_hex`) is ALWAYS
+    /// included; the `LIMIT MAX_PIN_SOURCES` caps only the ADDITIONAL `pin_repo_sources`
+    /// rows. This keeps the resolver's per-source work a bounded `O(MAX_PIN_SOURCES + 1)`
+    /// ceiling (INV-10) while never letting the cap evict the original source. A prior
+    /// version applied the `LIMIT` to the whole UNION with a lexicographic `ORDER BY`,
+    /// which let an attacker 404 a legacy public CID (first-pinner in `pinned_cids` but
+    /// not yet in `pin_repo_sources`) by pushing the same object from `MAX_PIN_SOURCES`
+    /// repos whose grindable ids sort before it, evicting the public source from the
+    /// window. Empty for a legacy pin with no known source (it falls back to the repo
+    /// scan) or an unpinned oid.
+    pub async fn pin_sources_for_oid(&self, sha256_hex: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT repo_id FROM pinned_cids
+                 WHERE sha256_hex = $1 AND repo_id IS NOT NULL
+             UNION
+             SELECT repo_id FROM (
+                 SELECT repo_id FROM pin_repo_sources
+                     WHERE sha256_hex = $1
+                 ORDER BY repo_id
+                 LIMIT $2
+             ) capped
+             ORDER BY repo_id",
+        )
+        .bind(sha256_hex)
+        .bind(MAX_PIN_SOURCES)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("repo_id"))
+            .collect())
+    }
+
+    /// Whether `pin_repo_sources` is at the `MAX_PIN_SOURCES` cap for this oid, i.e.
+    /// the provenance source set returned by [`Self::pin_sources_for_oid`] may be
+    /// INCOMPLETE. `record_pin_source` stops inserting at exactly `MAX_PIN_SOURCES`
+    /// rows and drops later sources silently, so a full table is the only observable
+    /// signal that a servable source (e.g. a later public pinner) may have been
+    /// dropped. `get_by_cid` uses this to decide whether a provenance miss should fall
+    /// back to the bounded legacy scan (which gates every repo through the real
+    /// visibility gate and so finds a dropped public source) rather than 404 — closing
+    /// the pin-source griefing hole where 16 attacker sources bury a public one. `>=`
+    /// (not `==`) is defensive against any future overshoot.
+    pub async fn pin_sources_at_cap(&self, sha256_hex: &str) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM pin_repo_sources WHERE sha256_hex = $1")
+                .bind(sha256_hex)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count >= MAX_PIN_SOURCES)
     }
 
     pub async fn record_encrypted_blob(
@@ -2352,6 +2851,17 @@ impl Db {
         Ok(row.map(|r| r.get("recipients_tag")))
     }
 
+    /// Every pinned object this node ADVERTISES (`GET /api/v1/ipfs/pins`).
+    ///
+    /// U4 (#173): rows still keyed on a legacy PROVIDER CID (Kubo dag-pb / Pinata
+    /// CIDv0, written by releases before this branch) are withheld from the listing.
+    /// The `/ipfs/{cid}` resolver recomputes the raw-content CID from the object bytes
+    /// and refuses any row whose stored key does not match, so advertising the legacy
+    /// key hands a client a CID this node deliberately will not serve. The background
+    /// repair sweep rewrites those rows to the raw key, and each one reappears here the
+    /// moment it is repaired. Filtering is done in Rust because the raw-CIDv1 test is a
+    /// multibase+codec decode (`is_raw_cidv1`), not something SQL can express; it is the
+    /// SAME predicate the repair path uses as its cost gate, so the two cannot drift.
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
         let rows = sqlx::query(
             "SELECT sha256_hex, cid, pinned_at, pinata_cid FROM pinned_cids ORDER BY pinned_at DESC",
@@ -2360,6 +2870,7 @@ impl Db {
         .await?;
         Ok(rows
             .into_iter()
+            .filter(|r| gitlawb_core::cid::is_raw_cidv1(r.get::<&str, _>("cid")))
             .map(|r| PinnedCidRecord {
                 sha256_hex: r.get("sha256_hex"),
                 cid: r.get("cid"),
@@ -2381,18 +2892,34 @@ impl Db {
     }
 
     /// Record the Pinata CID for a git object.
-    /// Inserts the row if it doesn't exist (objects pinned directly to Pinata
-    /// without a prior local IPFS pin get cid = pinata_cid).
-    pub async fn record_pinata_cid(&self, sha256_hex: &str, pinata_cid: &str) -> Result<()> {
+    ///
+    /// `raw_cid` is the locally-computed raw-content CID (`Cid::from_git_object_bytes`,
+    /// CIDv1/raw/sha2-256), the resolver key `GET /ipfs/{cid}` looks up; `pinata_cid`
+    /// is the provider CID Pinata returned (a dag-pb/UnixFS CID for gateway retrieval).
+    /// Inserts the row if it doesn't exist (an object pinned directly to Pinata with
+    /// no prior local IPFS pin gets `cid = raw_cid`, never the provider CID — a dag-pb
+    /// provider CID must never become an alias that serves raw bytes that do not hash
+    /// to it, #173). On conflict `cid` is left untouched: a prior local pin already
+    /// stored the correct raw CID, and the COALESCE backfills a NULL provenance from a
+    /// known source while keeping first-pinner-owns.
+    pub async fn record_pinata_cid(
+        &self,
+        sha256_hex: &str,
+        raw_cid: &str,
+        pinata_cid: &str,
+        repo_id: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo_id)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid,
+                 repo_id = COALESCE(pinned_cids.repo_id, EXCLUDED.repo_id)",
         )
         .bind(sha256_hex)
-        .bind(pinata_cid) // fallback local cid if row is new
+        .bind(raw_cid) // resolver-key cid: locally-computed raw CID, never the provider CID
         .bind(Utc::now().to_rfc3339())
         .bind(pinata_cid)
+        .bind(repo_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -5712,6 +6239,51 @@ mod ref_certificate_tests {
         assert_eq!(
             certs[0].id, "keep-id",
             "dedup keeps the most recent (later issued_at)"
+        );
+    }
+
+    /// INV-7: upgrade-path test — an existing node already past v1 must still get
+    /// the `pinned_cids.cid` index. It ships as its OWN v11 migration (not appended
+    /// to the applied v1 bundle), so dropping the index + its `schema_migrations`
+    /// row and re-running migrations must recreate it, exercising the real code
+    /// path rather than hand-copying the SQL.
+    #[sqlx::test]
+    async fn v18_pinned_cids_cid_index_applies_on_upgrade(pool: PgPool) {
+        async fn index_exists(pool: &PgPool) -> bool {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE indexname = 'idx_pinned_cids_cid')",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap()
+        }
+
+        let db = Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+        assert!(
+            index_exists(&pool).await,
+            "fresh migration chain creates the index"
+        );
+
+        // Simulate a node at pre-v18: drop the index and its migration record.
+        sqlx::query("DROP INDEX IF EXISTS idx_pinned_cids_cid")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 18")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !index_exists(&pool).await,
+            "precondition: index and its migration record removed"
+        );
+
+        // Re-run migrations: v11 re-applies and recreates the index on the upgrade.
+        db.run_migrations().await.unwrap();
+        assert!(
+            index_exists(&pool).await,
+            "v11 must recreate idx_pinned_cids_cid on an upgrading node"
         );
     }
 

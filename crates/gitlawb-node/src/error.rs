@@ -41,11 +41,17 @@ pub enum AppError {
     #[error("incomplete: {0}")]
     Incomplete(String),
 
+    #[error("search incomplete: {0}")]
+    SearchIncomplete(String),
+
     #[error("git error: {0}")]
     Git(String),
 
     #[error("git service timed out: {0}")]
     Timeout(String),
+
+    #[error("server overloaded: {0}")]
+    Overloaded(String),
 
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
@@ -138,6 +144,15 @@ impl IntoResponse for AppError {
             AppError::Incomplete(msg) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, "incomplete", msg.clone())
             }
+            // A bounded search that could not complete (the CID resolver hit its
+            // legacy-probe or walk ceiling), distinct from the 404 that asserts a
+            // definitive not-found: absence was NOT proven, so the caller should
+            // retry rather than treat it as gone (#173, F2). 503, retryable.
+            AppError::SearchIncomplete(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "search_incomplete",
+                msg.clone(),
+            ),
             AppError::Git(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "git_error", msg.clone()),
             // 504, distinct from the 500 git_error and from the read-gate's 404 /
             // the auth 401, so the client can tell a deadline from a failure.
@@ -147,6 +162,12 @@ impl IntoResponse for AppError {
                 DB_UNAVAILABLE_CODE,
                 DB_UNAVAILABLE_MESSAGE.into(),
             ),
+            // 503 with a Retry-After (attached after this match — the shared tail
+            // can't carry per-variant headers). This is the single place Overloaded
+            // becomes a response, so it can never ship a 503 without the retry hint.
+            AppError::Overloaded(msg) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "overloaded", msg.clone())
+            }
             AppError::Db(e) => (StatusCode::INTERNAL_SERVER_ERROR, "db_error", e.to_string()),
             AppError::Internal(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -160,7 +181,21 @@ impl IntoResponse for AppError {
             "message": message,
         }));
 
-        (status, body).into_response()
+        let mut resp = (status, body).into_response();
+        // Both retryable 503s advertise when to retry: Overloaded (capacity shed) and
+        // SearchIncomplete (a bounded CID search cut short by a cap — retry may complete
+        // it). They ride the shared tail above for body/status, so the header is attached
+        // here rather than in bespoke early returns, keeping each variant handled once.
+        if matches!(
+            self,
+            AppError::Overloaded(_) | AppError::SearchIncomplete(_)
+        ) {
+            resp.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_static("1"),
+            );
+        }
+        resp
     }
 }
 
@@ -180,6 +215,16 @@ mod tests {
         assert_eq!(
             AppError::Git("x".into()).into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn overloaded_maps_to_503_with_retry_after() {
+        let resp = AppError::Overloaded("x".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").unwrap().to_str().unwrap(),
+            "1"
         );
     }
 }
