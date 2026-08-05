@@ -255,7 +255,7 @@ impl Db {
         &self.pool
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
     }
@@ -264,7 +264,7 @@ impl Db {
     /// provisions an empty per-test database, so DB-backed tests must run this
     /// before seeding. Reuses the production `migrate()` path (the advisory lock
     /// is harmless on an isolated test DB and migrations are idempotent).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-harness"))]
     pub(crate) async fn run_migrations(&self) -> Result<()> {
         self.migrate().await
     }
