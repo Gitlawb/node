@@ -34,6 +34,17 @@ use gitlawb_core::http_sig::{
 };
 use gitlawb_core::identity::verify;
 
+/// Per-route-group ceiling on how much request body [`require_signature`] will
+/// buffer BEFORE it has authenticated anything.
+///
+/// This is middleware state rather than a constant because a single number cannot
+/// serve both a 2 GB git push and a 2 MB profile update: the git write group
+/// passes `GITLAWB_MAX_PACK_BYTES`, every other signed group passes
+/// [`crate::server::SIGNED_BODY_LIMIT`]. Making it a required piece of state means
+/// a new signed route group cannot be wired up without choosing a limit.
+#[derive(Clone, Copy, Debug)]
+pub struct SignatureBodyLimit(pub usize);
+
 /// Axum middleware that enforces HTTP Signature authentication (RFC 9421).
 ///
 /// Every write request must carry:
@@ -48,20 +59,52 @@ use gitlawb_core::identity::verify;
 ///   4. Resolves the did:key to an Ed25519 VerifyingKey
 ///   5. Rebuilds the signing string and verifies the Ed25519 signature
 ///   6. Verifies Content-Digest matches the request body
-pub async fn require_signature(request: Request, next: Next) -> Response {
-    // Buffer the body so we can verify content-digest and pass it downstream
+pub async fn require_signature(
+    State(SignatureBodyLimit(limit)): State<SignatureBodyLimit>,
+    request: Request,
+    next: Next,
+) -> Response {
+    verify_signature(limit, request, next).await
+}
+
+/// The signature check itself, shared by [`require_signature`] and the optional
+/// variant. `limit` bounds the pre-auth buffer; see [`SignatureBodyLimit`].
+async fn verify_signature(limit: usize, request: Request, next: Next) -> Response {
+    // Buffer the body so we can verify content-digest and pass it downstream.
+    //
+    // The buffer is bounded, because this runs BEFORE any identity check: an
+    // unauthenticated caller with no DID, no signature and no repo reaches this
+    // line. Nothing upstream supplies the bound. On the git write routes
+    // `RequestBodyLimitLayer` sits on the inner router, and a later `.layer()` is
+    // the OUTER service, so this middleware runs first and sees the raw body. On
+    // every other signed group axum's 2 MB `DefaultBodyLimit` is enforced by the
+    // `Bytes`/`Json` extractors through a request extension, which collecting the
+    // body here bypasses. `Limited` stops reading at the limit rather than reading
+    // everything and then measuring it, which is the property that matters.
     let (parts, body) = request.into_parts();
-    let body_bytes =
-        match body.collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => return (
+    let body_bytes = match http_body_util::Limited::new(body, limit).collect().await {
+        Ok(collected) => collected.to_bytes(),
+        // Over the limit: a distinct status from the 401 an unsigned request gets
+        // and the 400 below, so a client can tell "too big" from "not authenticated"
+        // and from "your body did not arrive".
+        Err(e) if e.is::<http_body_util::LengthLimitError>() => return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": "body_too_large",
+                "message": format!("request body exceeds the {limit}-byte limit for this route"),
+            })),
+        )
+            .into_response(),
+        Err(_) => {
+            return (
                 StatusCode::BAD_REQUEST,
                 Json(
                     json!({ "error": "unreadable_body", "message": "could not read request body" }),
                 ),
             )
-                .into_response(),
-        };
+                .into_response()
+        }
+    };
 
     let sig_input = parts
         .headers
@@ -248,11 +291,17 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
 /// Optional variant for rolling upgrades: verify and inject `AuthenticatedDid` when
 /// RFC 9421 signature headers are present, but allow legacy unsigned requests to
 /// continue when no signature attempt was made.
-pub async fn optional_signature(request: Request, next: Next) -> Response {
+pub async fn optional_signature(
+    State(SignatureBodyLimit(limit)): State<SignatureBodyLimit>,
+    request: Request,
+    next: Next,
+) -> Response {
     let has_signature_headers = request.headers().contains_key("signature-input")
         || request.headers().contains_key("signature");
     if has_signature_headers {
-        return require_signature(request, next).await;
+        // Same pre-auth buffer, same bound: presenting signature headers is not
+        // authentication, so this path is as reachable as the required one.
+        return verify_signature(limit, request, next).await;
     }
     next.run(request).await
 }
