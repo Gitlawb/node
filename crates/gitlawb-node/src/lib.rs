@@ -1055,11 +1055,33 @@ async fn ping_peer_health(client: &reqwest::Client, http_url: &str) -> bool {
 /// every later start would then take the `exists()` branch and re-parse that
 /// corrupt file forever, exiting `invalid PEM key` instead of regenerating. Remove
 /// it on failure so the next start starts clean.
-fn write_key_or_cleanup(path: &std::path::Path, write_result: std::io::Result<()>) -> Result<()> {
+///
+/// `before_remove` is the observation seam, run immediately before the
+/// removal (a no-op in production, per the `PublishFaults` precedent); the
+/// ordering test uses it to assert the caller has already closed its handle.
+fn write_key_or_cleanup(
+    path: &std::path::Path,
+    write_result: std::io::Result<()>,
+    before_remove: fn(),
+) -> Result<()> {
     write_result.map_err(|e| {
-        // Best-effort: if removal also fails there is nothing more to do, and the
-        // original write error is the one worth surfacing.
-        let _ = std::fs::remove_file(path);
+        before_remove();
+        // The original write error stays the one surfaced: it is the actionable
+        // failure. But a removal that itself fails is exactly the state that
+        // later exhausts the KEY_TEMP_ATTEMPTS deterministic temp names and
+        // blocks recovery, so it must be visible in the operator's log at the
+        // moment it happens rather than discarded. NotFound means the job is
+        // already done.
+        if let Err(rm) = std::fs::remove_file(path) {
+            if rm.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    path = %path.display(),
+                    err = %rm,
+                    "could not remove the temp key file after a failed write; it will \
+                     occupy one of the bounded temp names until it is cleared"
+                );
+            }
+        }
         anyhow::Error::new(e).context(format!("failed to write key to {}", path.display()))
     })
 }
@@ -1074,8 +1096,18 @@ fn ensure_key_mode_0600(path: &std::path::Path) -> Result<()> {
     let mode = std::fs::metadata(path)
         .with_context(|| format!("stat identity key {}", path.display()))?
         .permissions()
-        .mode()
-        & 0o777;
+        .mode();
+    check_mode_0600(mode, path)
+}
+
+/// The mode comparison behind `ensure_key_mode_0600`, taking a mode already
+/// read by the caller. `load_existing_key` holds an open descriptor on the key
+/// and reads the mode through it, so it must not stat the PATH a second time:
+/// the second stat is a different lookup and can resolve to a different inode.
+/// The message text is unchanged and is pinned by `loose_key_mode_is_rejected_not_used`.
+#[cfg(unix)]
+fn check_mode_0600(mode: u32, path: &std::path::Path) -> Result<()> {
+    let mode = mode & 0o777;
     if mode != 0o600 {
         anyhow::bail!(
             "identity key {} has mode {mode:o}, expected 0600 — refusing to use a \
@@ -1250,24 +1282,81 @@ fn is_key_content_error(err: &anyhow::Error) -> bool {
 /// Load an already-provisioned identity key. On Unix, defensively tighten looser
 /// permissions to 0600 (do NOT reject a loose key — that would break existing
 /// deployments; just narrow them), then verify the mode is actually 0600.
+///
+/// MUST NOT BREAK: a loose-permission REGULAR key file is NARROWED to 0600 and
+/// loaded, never rejected. Operators have such keys on disk today and rejecting
+/// them would fail their next start. The refusals added below apply only to a
+/// SYMLINK or a non-regular file, neither of which any working deployment has
+/// at its key path.
+///
+/// On Unix every step runs through one descriptor opened with `O_NOFOLLOW`
+/// (#194, P2). `GITLAWB_KEY` only names a path, so an attacker able to plant a
+/// symlink there would otherwise redirect the defensive chmod above onto any
+/// file the node can reach, turning a privileged start into a filesystem
+/// integrity attack, and would leave the mode check and the read resolving the
+/// path twice with a window in between. `O_NOFOLLOW` makes the open of a
+/// symlink fail (`ELOOP`), and fchmod, fstat, and the read through the
+/// descriptor cannot be re-pointed afterwards. Non-Unix keeps the plain
+/// read-by-path: `custom_flags` does not exist there and the chmod this
+/// protects is itself Unix-only.
 fn load_existing_key(path: &std::path::Path) -> Result<Keypair> {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(path) {
-            if meta.permissions().mode() & 0o777 != 0o600 {
-                // Do NOT silently ignore a failed tighten (#194, F2): surface it
-                // so a key we cannot secure is not read and used exposed.
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                    .with_context(|| {
-                        format!("could not tighten identity key {} to 0600", path.display())
-                    })?;
-            }
+    let pem = {
+        use std::io::Read;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| {
+                // ELOOP is what O_NOFOLLOW returns when the final component is
+                // a symlink. Matched on the raw errno, not on
+                // `ErrorKind::FilesystemLoop`, which is still unstable
+                // (io_error_more) on the 1.95 toolchain, let alone the 1.91
+                // MSRV.
+                let why = if e.raw_os_error() == Some(libc::ELOOP) {
+                    "refusing to load identity key through a symlink"
+                } else {
+                    "failed to open identity key"
+                };
+                // Keep the io::Error as the root so the recovery re-parse can
+                // still downcast it for its NotFound arm.
+                anyhow::Error::new(e).context(format!("{why}: {}", path.display()))
+            })?;
+        let meta = f
+            .metadata()
+            .with_context(|| format!("stat identity key {}", path.display()))?;
+        if !meta.is_file() {
+            // A plain anyhow error, never KeyContentError: recovery quarantines
+            // (destroys) only content-class failures, and this one says nothing
+            // about any key's content.
+            anyhow::bail!(
+                "identity key {} is not a regular file; refusing to load it",
+                path.display()
+            );
+        }
+        if meta.permissions().mode() & 0o777 != 0o600 {
+            // Do NOT silently ignore a failed tighten (#194, F2): surface it
+            // so a key we cannot secure is not read and used exposed.
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!("could not tighten identity key {} to 0600", path.display())
+                })?;
         }
         // Verify the key is actually 0600 before using it — a chmod that
         // succeeded-but-no-op'd (some mounts) still leaves it exposed.
-        ensure_key_mode_0600(path)?;
-    }
+        let mode = f
+            .metadata()
+            .with_context(|| format!("stat identity key {}", path.display()))?
+            .permissions()
+            .mode();
+        check_mode_0600(mode, path)?;
+        let mut pem = String::new();
+        f.read_to_string(&mut pem)
+            .with_context(|| format!("failed to read key from {}", path.display()))?;
+        pem
+    };
+    #[cfg(not(unix))]
     let pem = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read key from {}", path.display()))?;
     // Content-class failure (#194, U2): an empty file reads Ok("") and is
@@ -1868,6 +1957,17 @@ struct PublishFaults {
     /// injected `Err` must NOT fail the publish (#194, U1).
     #[cfg(unix)]
     marker_fsync: fn() -> std::io::Result<()>,
+    /// Runs before the PRIMARY temp file's `write_all`; an `Err` is taken as
+    /// the write result, so the publish takes `write_key_or_cleanup`'s error
+    /// path. There is no other way to fail that write on a healthy
+    /// filesystem, and the error path is where the handle-close ordering is
+    /// observable (#194, P2).
+    temp_write: fn() -> std::io::Result<()>,
+    /// Observation seam, NOT a fault: runs immediately before
+    /// `write_key_or_cleanup` removes the primary temp file. Production
+    /// passes a no-op; the ordering test uses it to sample /proc/self/fd and
+    /// prove the temp handle is already closed at removal time.
+    before_temp_remove: fn(),
     /// Runs before the fallback's `write_all`; an `Err` is taken as the write
     /// result.
     fallback_write: fn() -> std::io::Result<()>,
@@ -1893,6 +1993,8 @@ impl PublishFaults {
         marker_create: || Ok(()),
         #[cfg(unix)]
         marker_fsync: || Ok(()),
+        temp_write: || Ok(()),
+        before_temp_remove: || {},
         fallback_write: || Ok(()),
         fallback_fsync: || Ok(()),
         #[cfg(unix)]
@@ -2028,8 +2130,18 @@ fn publish_key_atomically(
     // linked (#194). The fsync makes the PEM bytes durable BEFORE the name can
     // appear: without it a power crash after the link could leave a durable
     // final name over truncated bytes, wedging every later start.
-    write_key_or_cleanup(&tmp, f.write_all(pem).and_then(|()| f.sync_all()))?;
+    // `sync_all` needs the live handle, so the write-and-fsync result is
+    // computed first; the handle is then closed BEFORE write_key_or_cleanup
+    // runs its error-path removal (#194, P2). Windows cannot remove an open
+    // file, so with the removal ahead of the close a failed write leaks
+    // .{stem}.tmp.{pid}.{n}, and those names are deterministic per pid and
+    // bounded by KEY_TEMP_ATTEMPTS: restarts under a reused container pid
+    // exhaust them and block recovery after storage becomes healthy.
+    let write_result = (faults.temp_write)()
+        .and_then(|()| f.write_all(pem))
+        .and_then(|()| f.sync_all());
     drop(f);
+    write_key_or_cleanup(&tmp, write_result, faults.before_temp_remove)?;
 
     before_link();
 
@@ -3594,7 +3706,7 @@ mod identity_key_tests {
         assert!(key_path.exists());
 
         let err = std::io::Error::other("simulated ENOSPC");
-        let r = write_key_or_cleanup(&key_path, Err(err));
+        let r = write_key_or_cleanup(&key_path, Err(err), || {});
         assert!(r.is_err(), "the write error must propagate");
         assert!(
             !key_path.exists(),
@@ -3609,10 +3721,79 @@ mod identity_key_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let key_path = dir.path().join("identity.pem");
         std::fs::write(&key_path, b"good-pem").expect("seed file");
-        assert!(write_key_or_cleanup(&key_path, Ok(())).is_ok());
+        assert!(write_key_or_cleanup(&key_path, Ok(()), || {}).is_ok());
         assert!(
             key_path.exists(),
             "a successful write leaves the file in place"
+        );
+    }
+
+    /// Count of `/proc/self/fd` entries resolving to a `.fdprobe.pem.tmp.`
+    /// name, sampled by `probe_open_temp_fds` at temp-removal time. The stem
+    /// is unique to the ordering test, so a handle another test is holding
+    /// concurrently cannot be counted. `usize::MAX` is the never-sampled
+    /// sentinel, so a seam that never fires fails the assertion rather than
+    /// passing as zero.
+    #[cfg(target_os = "linux")]
+    static OPEN_TEMP_FDS_AT_REMOVE: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    /// `before_temp_remove` seam body for the ordering test. Resolves each
+    /// descriptor to its target PATH rather than comparing fd numbers, so a
+    /// recycled descriptor number cannot false-pass.
+    #[cfg(target_os = "linux")]
+    fn probe_open_temp_fds() {
+        let open = std::fs::read_dir("/proc/self/fd")
+            .expect("/proc/self/fd is readable on linux")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .filter(|target| target.to_string_lossy().contains(".fdprobe.pem.tmp."))
+            .count();
+        OPEN_TEMP_FDS_AT_REMOVE.store(open, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// #194 (P2): the temp key handle must be CLOSED before the error path
+    /// removes the temp. Windows cannot remove an open file, so with the
+    /// handle still live at removal time a failed write or fsync leaves
+    /// `.{stem}.tmp.{pid}.{n}` behind; those names are deterministic per pid
+    /// and bounded by `KEY_TEMP_ATTEMPTS`, so restarts under a reused
+    /// container pid exhaust all of them and block recovery once storage is
+    /// healthy again. Linux removes open files happily, so asserting the
+    /// removal succeeded would pass either way; the MECHANISM is asserted
+    /// instead, by sampling /proc/self/fd at the moment of removal. Linux-only
+    /// by cfg (CI is Linux); other Unixes still run the two behavioral
+    /// removal tests above. RED with the removal running before `drop(f)`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn temp_handle_is_closed_before_error_path_removal() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Stem unique to this test: the probe matches temp names by substring.
+        let key_path = dir.path().join("fdprobe.pem");
+        OPEN_TEMP_FDS_AT_REMOVE.store(usize::MAX, SeqCst);
+
+        let faults = PublishFaults {
+            temp_write: || Err(std::io::Error::other("simulated ENOSPC")),
+            before_temp_remove: probe_open_temp_fds,
+            ..PublishFaults::NONE
+        };
+        let err = match publish_key_atomically(&key_path, b"pem-bytes", &|| {}, &|| {}, faults) {
+            Err(e) => e,
+            Ok(_) => panic!("a failed temp write must fail the publish"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to write key to"),
+            "the write error must be the one surfaced: {msg}"
+        );
+        assert_eq!(
+            OPEN_TEMP_FDS_AT_REMOVE.load(SeqCst),
+            0,
+            "the temp handle must already be closed when the error path removes the temp"
+        );
+        assert!(
+            names_containing(dir.path(), ".fdprobe.pem.tmp.").is_empty(),
+            "the failed write must leave no temp behind to burn a bounded name"
         );
     }
 
@@ -3641,6 +3822,134 @@ mod identity_key_tests {
         assert!(
             ensure_key_mode_0600(&key_path).is_ok(),
             "a 0600 key must be accepted"
+        );
+    }
+
+    /// Does this filesystem actually honor a mode change made the way the
+    /// loader makes it? The witness runs the EXACT operation the vulnerable
+    /// code performed (a path-based `set_permissions`) on a throwaway subject
+    /// and reports whether the bits moved. On a mode-ignoring mount they do
+    /// not, and a "the target's mode is unchanged" assertion would then pass
+    /// for a reason that has nothing to do with the guard under test, so the
+    /// callers below skip that assertion instead of banking a vacuous pass.
+    /// This also covers the euid-0 case the module otherwise has no guard
+    /// for: root cannot make a mode-ignoring mount honor a chmod either.
+    fn path_chmod_moves_the_bits(subject: &std::path::Path) -> bool {
+        let before = std::fs::metadata(subject)
+            .expect("witness subject exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        let probe = if before == 0o600 { 0o644 } else { 0o600 };
+        if std::fs::set_permissions(subject, std::fs::Permissions::from_mode(probe)).is_err() {
+            return false;
+        }
+        let after = std::fs::metadata(subject)
+            .expect("witness subject exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        // Restore before returning: a witness that leaves the subject
+        // narrowed would break the caller's own cleanup.
+        let _ = std::fs::set_permissions(subject, std::fs::Permissions::from_mode(before));
+        after == probe
+    }
+
+    /// #194 (P2): `GITLAWB_KEY` names a PATH, so an attacker who can plant a
+    /// symlink there redirects everything the loader does by name. The load
+    /// must refuse a symlinked key path outright; the symlink TARGET must
+    /// keep its original mode (the finding, stated in the must-not
+    /// direction: a privileged start must not chmod an arbitrary
+    /// service-readable file to 0600); and the refusal must NOT be
+    /// content-class, because the recovery path quarantines (destroys)
+    /// through that class and must never do so on a symlink. RED without
+    /// `O_NOFOLLOW`: the open follows the link, the target lands 0600, and
+    /// the non-PEM content is then misclassified as a corrupt key.
+    #[test]
+    fn symlinked_key_path_is_refused_and_target_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"not a key at all").expect("seed victim");
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644))
+            .expect("victim starts 0644");
+        let control = dir.path().join("control.txt");
+        std::fs::write(&control, b"witness").expect("seed control");
+        let bits_observable = path_chmod_moves_the_bits(&control);
+
+        let key_path = dir.path().join("identity.pem");
+        std::os::unix::fs::symlink(&victim, &key_path).expect("plant symlink at the key path");
+
+        let err = match super::load_existing_key(&key_path) {
+            Err(e) => e,
+            Ok(_) => panic!("a symlinked identity key path must be refused, not followed"),
+        };
+
+        if bits_observable {
+            let mode = std::fs::metadata(&victim)
+                .expect("the victim must still exist")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o644,
+                "the defensive chmod must not reach the symlink target; it landed {mode:o}"
+            );
+        }
+        assert!(
+            !super::is_key_content_error(&err),
+            "a symlink refusal must not be content-class; recovery quarantines through \
+             that class and would destroy a file it never validated. got: {err:#}"
+        );
+    }
+
+    /// #194 (P2): a key path that is not a regular file (here a directory) is
+    /// refused before anything is done to it. The discriminant matters: the
+    /// old path-based loader also ERRORED on a directory, but only at the
+    /// final `read_to_string`, after it had already chmodded the directory to
+    /// 0600, so `is_err()` alone proves nothing. The load-bearing assertions
+    /// are that the directory's mode is untouched and that the failure names
+    /// the refusal. Permissions are restored before any assertion that can
+    /// panic so `TempDir` cleanup succeeds, following
+    /// `quarantine_and_removal_both_blocked_errors_loudly`.
+    #[test]
+    fn non_regular_key_path_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let control = dir.path().join("control");
+        std::fs::create_dir(&control).expect("seed control dir");
+        let bits_observable = path_chmod_moves_the_bits(&control);
+
+        let key_path = dir.path().join("identity.pem");
+        std::fs::create_dir(&key_path).expect("plant a directory at the key path");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o755))
+            .expect("key dir starts 0755");
+
+        let result = super::load_existing_key(&key_path);
+        let mode = std::fs::metadata(&key_path)
+            .expect("the directory must still exist")
+            .permissions()
+            .mode()
+            & 0o777;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o755))
+            .expect("restore the key dir before asserting");
+
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a directory at the key path must be refused, not loaded"),
+        };
+        if bits_observable {
+            assert_eq!(
+                mode, 0o755,
+                "a non-regular key path must be refused before it is chmodded; it landed {mode:o}"
+            );
+        }
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular file"),
+            "the refusal must name why it refused: {msg}"
+        );
+        assert!(
+            !super::is_key_content_error(&err),
+            "a non-regular refusal must not be content-class: {msg}"
         );
     }
 
