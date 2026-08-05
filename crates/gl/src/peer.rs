@@ -7,7 +7,7 @@ use clap::{Args, Subcommand};
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -126,13 +126,10 @@ async fn cmd_add(peer_url: String, node: String, dir: Option<PathBuf>) -> Result
         .post(announce_path, &body)
         .await
         .context("failed to connect to peer")?;
-    let status = resp.status();
-    let result: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = result["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("announce failed ({status}): {msg}");
-    }
+    // Status before body. `/peers/announce` shares its per-IP bucket with the
+    // peer-write routes, so a wide push to the same peer can leave a plain
+    // rate-limit 429 here; parsing first reported it as malformed JSON.
+    let result: Value = json_or_denial("announce", resp).await?;
 
     let their_did = result["node_did"].as_str().unwrap_or("?");
     let their_url = result["node_url"].as_str().unwrap_or("?");

@@ -5,6 +5,7 @@ pub mod encrypt;
 pub mod error;
 pub mod http_sig;
 pub mod identity;
+pub mod node_denial;
 pub mod sanitize;
 pub mod ucan;
 

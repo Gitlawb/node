@@ -31,7 +31,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -50,13 +50,34 @@ struct DegradedState {
     db_startup: Arc<DbStartupStatus>,
 }
 
-/// Two independent counters with no cross-field invariant — atomics, not a
-/// lock, so the retry loop and the degraded handlers never contend.
+/// Independent fields with no cross-field invariant — atomics, not a lock, so
+/// the retry loop and the degraded handlers never contend.
 #[derive(Default)]
 struct DbStartupStatus {
     attempts: AtomicU64,
     next_retry_secs: AtomicU64,
+    /// Set once the retry loop sees a migration version collision. Latched:
+    /// the condition is a code-level numbering bug that cannot heal between
+    /// attempts, and it changes what the readiness payload must say.
+    schema_conflict: AtomicBool,
 }
+
+impl DbStartupStatus {
+    fn mark_schema_conflict(&self) {
+        self.schema_conflict.store(true, Ordering::Relaxed);
+    }
+
+    fn schema_conflict(&self) -> bool {
+        self.schema_conflict.load(Ordering::Relaxed)
+    }
+}
+
+/// Distinct from `error::DB_UNAVAILABLE_CODE`: the database is reachable and
+/// healthy, the schema it holds disagrees with this build. Retrying will never
+/// clear it, so the readiness payload must not read as "still initializing".
+const DB_SCHEMA_CONFLICT_CODE: &str = "db_schema_conflict";
+const DB_SCHEMA_CONFLICT_MESSAGE: &str =
+    "database schema conflicts with this build; operator action is required";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -347,6 +368,22 @@ async fn main() -> Result<()> {
         std::time::Duration::from_secs(3600),
         200_000,
     );
+    // Flood brake for the signed write routes. Every signed attempt there spends
+    // a `consumed_signatures` row before the handler checks anything, and any
+    // freshly minted did:key signs, so the brake is what bounds the durable
+    // writes an unregistered caller can force. Its own bucket so it cannot drain
+    // the creation, push, or peer-sync quotas. Bounded key set (a
+    // client-influenced IP); 0 disables.
+    let signed_write_rate_limiter = rate_limit::RateLimiter::new_bounded(
+        config.signed_write_rate_limit,
+        std::time::Duration::from_secs(3600),
+        200_000,
+    );
+    if config.signed_write_rate_limit == 0 {
+        tracing::warn!(
+            "GITLAWB_SIGNED_WRITE_RATE_LIMIT=0 — signed-write IP rate limiting disabled"
+        );
+    }
     if config.sync_trigger_rate_limit == 0 {
         tracing::warn!(
             "GITLAWB_SYNC_TRIGGER_RATE_LIMIT=0 — /sync/trigger IP rate limiting disabled"
@@ -377,6 +414,7 @@ async fn main() -> Result<()> {
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
+        signed_write_rate_limiter,
         shutdown_tx: shutdown_tx.clone(),
     };
 
@@ -406,13 +444,15 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Periodic cleanup of expired rate limit entries + consumed-proof ledger
+    // Periodic cleanup of expired rate limit entries, the consumed-proof
+    // ledger, and the HTTP-signature replay ledger
     {
         let rl = state.rate_limiter.clone();
         let create_ip_rl = state.create_ip_rate_limiter.clone();
         let push_rl = state.push_rate_limiter.clone();
         let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
         let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let signed_write_rl = state.signed_write_rate_limiter.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
@@ -424,12 +464,16 @@ async fn main() -> Result<()> {
                         push_rl.cleanup().await;
                         sync_trigger_rl.cleanup().await;
                         peer_write_rl.cleanup().await;
+                        signed_write_rl.cleanup().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
                         if let Err(e) = db.sweep_expired_proofs(now).await {
                             tracing::warn!(err = %e, "failed to sweep expired iCaptcha proofs");
+                        }
+                        if let Err(e) = db.sweep_expired_signatures(now).await {
+                            tracing::warn!(err = %e, "failed to sweep expired signature ledger rows");
                         }
                     }
                     _ = shutdown_rx.changed() => {
@@ -639,7 +683,14 @@ async fn connect_db_with_retry(
                 // the provider — and take liveness down with it), but log at
                 // error level and skip straight to the maximum backoff; the
                 // /ready health check is what surfaces this to deploys.
-                let permanent = is_likely_permanent_db_error(&err);
+                // One call decides the backoff, the log level and the readiness
+                // signal, and applies the latch. Everything below reads from
+                // its result, so the branch cannot drift away from the latch.
+                let fault = record_db_startup_failure(&err, &db_startup);
+                let DbStartupFault {
+                    permanent,
+                    schema_conflict,
+                } = fault;
                 let retry_secs = if permanent {
                     max_retry_secs
                 } else {
@@ -648,7 +699,14 @@ async fn connect_db_with_retry(
                 db_startup
                     .next_retry_secs
                     .store(retry_secs, Ordering::Relaxed);
-                if permanent {
+                if schema_conflict {
+                    tracing::error!(
+                        attempts,
+                        retry_secs,
+                        err = %err,
+                        "database schema conflicts with this build's migration catalogue; this will not heal on retry; operator action is required"
+                    );
+                } else if permanent {
                     tracing::error!(
                         attempts,
                         retry_secs,
@@ -677,12 +735,52 @@ async fn connect_db_with_retry(
     }
 }
 
+/// What a failed startup attempt means for the retry loop and for what the
+/// node tells the outside world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DbStartupFault {
+    /// Jump straight to the maximum backoff and log at error level.
+    permanent: bool,
+    /// The schema disagrees with this build. Latched into `DbStartupStatus`,
+    /// so the degraded 503 body stops saying "initializing".
+    schema_conflict: bool,
+}
+
+/// Classify a failed startup attempt **and** record its consequence on
+/// `db_startup`. The two are one function on purpose: a classification that
+/// never reaches the readiness payload leaves /ready reporting "database
+/// initializing" forever for a fault that cannot heal, and separate
+/// classify-then-latch steps can silently drift apart. `connect_db_with_retry`
+/// derives its backoff and log level from the returned value, so the call site
+/// cannot keep the decision while dropping the latch.
+fn record_db_startup_failure(err: &anyhow::Error, db_startup: &DbStartupStatus) -> DbStartupFault {
+    let schema_conflict = err
+        .downcast_ref::<db::MigrationVersionCollision>()
+        .is_some();
+    if schema_conflict {
+        db_startup.mark_schema_conflict();
+    }
+    DbStartupFault {
+        permanent: is_likely_permanent_db_error(err),
+        schema_conflict,
+    }
+}
+
 /// Errors that indicate misconfiguration rather than a transient outage: a
-/// malformed DATABASE_URL, or a server that answered and rejected us —
-/// Postgres error class 28xxx (invalid authorization) or 3D000 (database
-/// does not exist). Best-effort: an error that anyhow can't downcast back to
-/// sqlx just counts as transient.
+/// malformed DATABASE_URL, a server that answered and rejected us — Postgres
+/// error class 28xxx (invalid authorization) or 3D000 (database does not
+/// exist), or a migration version collision. Best-effort: an error that anyhow
+/// can't downcast back to a known type just counts as transient.
 fn is_likely_permanent_db_error(err: &anyhow::Error) -> bool {
+    // A version collision is a code-level numbering bug. It is the loudest
+    // thing the migration guard can report, so it must never be filed under
+    // "database unavailable, retrying".
+    if err
+        .downcast_ref::<db::MigrationVersionCollision>()
+        .is_some()
+    {
+        return true;
+    }
     match err.downcast_ref::<sqlx::Error>() {
         Some(sqlx::Error::Configuration(_)) => true,
         Some(sqlx::Error::Database(db)) => db
@@ -746,11 +844,27 @@ fn build_degraded_router(node_did: String, db_startup: Arc<DbStartupStatus>) -> 
 /// vocabulary with error.rs so clients see the same code/message for
 /// "database unavailable" regardless of which phase produced it.
 fn degraded_body(db_startup: &DbStartupStatus) -> serde_json::Value {
+    // A schema conflict is not a database that is still coming up. Saying
+    // "initializing" for it hides a permanent, operator-actionable fault behind
+    // a status that reads as "wait longer".
+    let (state, code, message) = if db_startup.schema_conflict() {
+        (
+            "schema_conflict",
+            DB_SCHEMA_CONFLICT_CODE,
+            DB_SCHEMA_CONFLICT_MESSAGE,
+        )
+    } else {
+        (
+            "initializing",
+            error::DB_UNAVAILABLE_CODE,
+            error::DB_UNAVAILABLE_MESSAGE,
+        )
+    };
     serde_json::json!({
         "status": "degraded",
-        "database": "initializing",
-        "error": error::DB_UNAVAILABLE_CODE,
-        "message": error::DB_UNAVAILABLE_MESSAGE,
+        "database": state,
+        "error": code,
+        "message": message,
         "db_attempts": db_startup.attempts.load(Ordering::Relaxed),
         "db_next_retry_secs": db_startup.next_retry_secs.load(Ordering::Relaxed),
     })
@@ -848,6 +962,40 @@ fn build_operator_client(
     Ok(operator::OperatorClient::new(cfg))
 }
 
+/// A bootstrap peer's answer to our signed announce, reduced to what the
+/// caller has to act on.
+#[derive(Debug, PartialEq, Eq)]
+enum AnnounceOutcome {
+    Accepted,
+    /// Any non-2xx. Carries the peer's `x-gitlawb-error` code when it sent
+    /// one, which is what makes a spent-signature-ledger rejection (429
+    /// `signature_ledger_full`, 409 `signature_replayed`) diagnosable rather
+    /// than just "some 4xx".
+    Rejected {
+        status: u16,
+        error_code: Option<String>,
+    },
+}
+
+/// Classify a bootstrap announce response.
+///
+/// Split out from `gossip_task` so the rejection path is unit-testable: the
+/// whole defect was that a non-2xx fell off the end of an `if` with no `else`,
+/// leaving a node whose announces are being refused looking exactly like one
+/// succeeding.
+fn classify_announce_response(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> AnnounceOutcome {
+    if status.is_success() {
+        return AnnounceOutcome::Accepted;
+    }
+    AnnounceOutcome::Rejected {
+        status: status.as_u16(),
+        error_code: api::peers::peer_error_code(headers).map(str::to_string),
+    }
+}
+
 /// Announce to bootstrap peers on startup, then periodically ping all known peers.
 async fn gossip_task(
     state: AppState,
@@ -912,8 +1060,8 @@ async fn gossip_task(
         )
         .await
         {
-            Ok(Ok(resp)) => {
-                if resp.status().is_success() {
+            Ok(Ok(resp)) => match classify_announce_response(resp.status(), resp.headers()) {
+                AnnounceOutcome::Accepted => {
                     if let Ok(json) = resp.json::<serde_json::Value>().await {
                         // Add them back to our peer list
                         if let (Some(their_did), Some(their_url)) = (
@@ -927,7 +1075,19 @@ async fn gossip_task(
                         }
                     }
                 }
-            }
+                // Without this arm a refused announce produced no log line at
+                // all, so a node whose peers reject it looked identical to one
+                // succeeding. Same shape as the two sibling signed calls
+                // (sync.rs replica registration, repos.rs peer sync notify).
+                AnnounceOutcome::Rejected { status, error_code } => {
+                    warn!(
+                        url = %announce_url,
+                        status = status,
+                        error_code = error_code.as_deref().unwrap_or("none"),
+                        "bootstrap peer announce rejected"
+                    );
+                }
+            },
             Ok(Err(e)) => {
                 tracing::warn!(url = %announce_url, err = %e, "failed to announce to bootstrap peer")
             }
@@ -1082,5 +1242,201 @@ mod gossip_ssrf_tests {
     async fn ping_peer_health_reports_unhealthy_on_connection_error() {
         let ok = ping_peer_health(&production_http_client(), "http://127.0.0.1:1").await;
         assert!(!ok, "a connection error must count as an unhealthy peer");
+    }
+}
+
+#[cfg(test)]
+mod gossip_announce_tests {
+    use super::{classify_announce_response, AnnounceOutcome};
+    use reqwest::header::HeaderMap;
+    use reqwest::StatusCode;
+
+    fn headers(code: Option<&str>) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        if let Some(c) = code {
+            h.insert("x-gitlawb-error", c.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn a_2xx_announce_is_accepted() {
+        assert_eq!(
+            classify_announce_response(StatusCode::OK, &headers(None)),
+            AnnounceOutcome::Accepted
+        );
+    }
+
+    // The defect: every non-2xx fell off the end of an `if` with no `else`, so
+    // a node whose announces were being refused logged nothing at all. Each of
+    // these must come back Rejected, carrying the status and, when the peer
+    // sent one, the x-gitlawb-error code that names the reason.
+    #[test]
+    fn a_ledger_rejection_is_reported_with_its_error_code() {
+        assert_eq!(
+            classify_announce_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &headers(Some("signature_ledger_full"))
+            ),
+            AnnounceOutcome::Rejected {
+                status: 429,
+                error_code: Some("signature_ledger_full".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_announce_response(StatusCode::CONFLICT, &headers(Some("signature_replayed"))),
+            AnnounceOutcome::Rejected {
+                status: 409,
+                error_code: Some("signature_replayed".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_announce_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &headers(Some("signature_ledger_unavailable"))
+            ),
+            AnnounceOutcome::Rejected {
+                status: 503,
+                error_code: Some("signature_ledger_unavailable".to_string()),
+            }
+        );
+    }
+
+    // A proxy that strips unknown X- headers, or a peer that never sets one,
+    // must still produce a rejection with its status rather than silence.
+    #[test]
+    fn a_rejection_without_an_error_code_is_still_reported() {
+        assert_eq!(
+            classify_announce_response(StatusCode::FORBIDDEN, &headers(None)),
+            AnnounceOutcome::Rejected {
+                status: 403,
+                error_code: None,
+            }
+        );
+        assert_eq!(
+            classify_announce_response(StatusCode::INTERNAL_SERVER_ERROR, &headers(None)),
+            AnnounceOutcome::Rejected {
+                status: 500,
+                error_code: None,
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+mod db_startup_signal_tests {
+    use super::{
+        degraded_body, is_likely_permanent_db_error, record_db_startup_failure, DbStartupStatus,
+    };
+    use crate::db::MigrationVersionCollision;
+
+    fn collision_error() -> anyhow::Error {
+        anyhow::Error::new(MigrationVersionCollision {
+            version: 16,
+            recorded_name: "pinned_cids_repo_provenance".to_string(),
+            build_name: "consumed_signatures",
+        })
+        // Wrapped the way the real call path wraps it, so the classifier has
+        // to look through the context chain.
+        .context("connecting to postgres")
+    }
+
+    // The wire between the classifier and the readiness payload. Classifying a
+    // collision correctly is useless if nothing latches it: the backoff and the
+    // log level would be right while /ready still reported "initializing"
+    // forever, which is the defect. This drives the same function
+    // `connect_db_with_retry` calls on every failed attempt, so the latch is
+    // what is under test, not just its two endpoints.
+    #[test]
+    fn a_collision_latches_the_readiness_signal() {
+        let status = DbStartupStatus::default();
+        assert!(!status.schema_conflict(), "precondition: not yet latched");
+
+        let fault = record_db_startup_failure(&collision_error(), &status);
+
+        assert!(fault.schema_conflict, "the fault must name the conflict");
+        assert!(fault.permanent, "and classify it as permanent");
+        assert!(
+            status.schema_conflict(),
+            "the collision must latch the startup status, or the readiness \
+             payload keeps claiming the database is initializing"
+        );
+        assert_eq!(
+            degraded_body(&status)["database"],
+            "schema_conflict",
+            "the latch must reach the payload the degraded router serves"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_outage_does_not_latch_a_schema_conflict() {
+        let status = DbStartupStatus::default();
+
+        let fault = record_db_startup_failure(
+            &anyhow::Error::new(sqlx::Error::PoolTimedOut).context("connecting to postgres"),
+            &status,
+        );
+
+        assert!(!fault.schema_conflict);
+        assert!(!fault.permanent);
+        assert!(
+            !status.schema_conflict(),
+            "a transient outage must not latch the conflict signal"
+        );
+        assert_eq!(degraded_body(&status)["database"], "initializing");
+    }
+
+    // Defect 1: a schema collision never heals on its own, so it must classify
+    // as permanent and take the error-level, operator-action branch, not the
+    // "database unavailable during startup; retrying" warn branch.
+    #[test]
+    fn a_migration_collision_is_permanent() {
+        assert!(
+            is_likely_permanent_db_error(&collision_error()),
+            "a migration version collision must classify as permanent"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_connection_error_is_still_transient() {
+        let err = anyhow::Error::new(sqlx::Error::PoolTimedOut).context("connecting to postgres");
+        assert!(
+            !is_likely_permanent_db_error(&err),
+            "a pool timeout is a transient outage, not a permanent misconfiguration"
+        );
+        let io = anyhow::Error::new(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        )))
+        .context("connecting to postgres");
+        assert!(
+            !is_likely_permanent_db_error(&io),
+            "a refused TCP connection is a transient outage"
+        );
+    }
+
+    // Defect 1, readiness half: the payload must not claim the database is
+    // merely initializing when the real cause is a schema conflict.
+    #[test]
+    fn the_degraded_body_distinguishes_a_schema_conflict_from_an_ordinary_wait() {
+        let waiting = DbStartupStatus::default();
+        let body = degraded_body(&waiting);
+        assert_eq!(body["database"], "initializing");
+        assert_eq!(body["error"], crate::error::DB_UNAVAILABLE_CODE);
+
+        let conflicted = DbStartupStatus::default();
+        conflicted.mark_schema_conflict();
+        let body = degraded_body(&conflicted);
+        assert_eq!(
+            body["database"], "schema_conflict",
+            "a schema conflict must not read as 'initializing'"
+        );
+        assert_eq!(body["error"], super::DB_SCHEMA_CONFLICT_CODE);
+        assert_ne!(
+            body["error"],
+            crate::error::DB_UNAVAILABLE_CODE,
+            "the conflict must carry its own code"
+        );
+        assert_eq!(body["status"], "degraded");
     }
 }

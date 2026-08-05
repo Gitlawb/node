@@ -81,6 +81,16 @@ pub struct AppState {
     /// sink as trigger and accepts unsigned requests from known peers, so it is
     /// braked too; each peer's distinct IP gets its own bucket.
     pub peer_write_rate_limiter: RateLimiter,
+    /// Per-client-IP limiter for the signed write routes (tasks, pull-request
+    /// merge/close/review/comment, webhooks, branch protection, stars, replicas,
+    /// labels, visibility, agent deregistration, bounties, profile, issue
+    /// close/comment). Every signed attempt on those routes commits a
+    /// `consumed_signatures` row before the handler checks ownership or
+    /// existence, and `require_signature` resolves the key from the did:key
+    /// itself, so any freshly minted keypair can force that durable write. Its
+    /// own bucket so a flood here cannot drain the creation, push, or peer-sync
+    /// quotas. Keyed by `push_limiter_trust`.
+    pub signed_write_rate_limiter: RateLimiter,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:

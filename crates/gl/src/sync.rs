@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{read_body_capped, sanitize_node_msg, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -37,7 +37,7 @@ pub async fn run(args: SyncArgs) -> Result<()> {
             let keypair = load_keypair_from_dir(args.dir.as_deref())
                 .context("identity not found — run `gl identity new` first")?;
             let client = NodeClient::new(&args.node, Some(keypair));
-            let resp = client.post("/api/v1/sync/trigger", b"{}").await?;
+            let mut resp = client.post("/api/v1/sync/trigger", b"{}").await?;
             // The node now requires a signature on this route and rate-limits it,
             // so a denial (401/429/…) is expected. Check the status BEFORE parsing:
             // otherwise a JSON-ish error body deserializes into a zero-count struct
@@ -46,7 +46,8 @@ pub async fn run(args: SyncArgs) -> Result<()> {
             if !status.is_success() {
                 // Bound the read: a hostile or broken node must not force an
                 // unbounded allocation just to surface a denial (INV-6, read half).
-                let raw = read_body_capped(resp, 8 * 1024).await;
+                let raw = read_body_capped(&mut resp, 8 * 1024).await;
+                let raw = String::from_utf8_lossy(&raw).into_owned();
                 let msg = serde_json::from_str::<serde_json::Value>(&raw)
                     .ok()
                     .and_then(|v| {
@@ -102,39 +103,6 @@ fn trigger_counts(resp: &serde_json::Value) -> (u64, u64) {
         resp["peers_reached"].as_u64().unwrap_or(0),
         resp["repos_enqueued"].as_u64().unwrap_or(0),
     )
-}
-
-/// Read at most `cap` bytes of a response body. Bounds the allocation from a
-/// hostile or broken node returning a huge error body — the display is capped
-/// separately, but the read itself must not be unbounded (INV-6, read half).
-async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    while buf.len() < cap {
-        match resp.chunk().await {
-            Ok(Some(chunk)) => {
-                let take = (cap - buf.len()).min(chunk.len());
-                buf.extend_from_slice(&chunk[..take]);
-                if take < chunk.len() {
-                    break; // hit the cap mid-chunk
-                }
-            }
-            _ => break, // end of body or read error — return what we have
-        }
-    }
-    String::from_utf8_lossy(&buf).into_owned()
-}
-
-/// Strip terminal-dangerous characters from (and cap the length of) a
-/// node-supplied error string before surfacing it. The node a caller talks to
-/// could be hostile and embed escape sequences in its error body; those must not
-/// reach the terminal verbatim (INV-6). We drop the C0/C1 control bytes (which
-/// defangs ANSI/OSC escapes) AND the Unicode bidi/format controls (which
-/// `char::is_control` does not cover — they can reorder the displayed line).
-fn sanitize_node_msg(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() && !gitlawb_core::sanitize::is_bidi_format(*c))
-        .take(200)
-        .collect()
 }
 
 #[cfg(test)]
@@ -324,8 +292,8 @@ mod tests {
             .with_body("A".repeat(2_000_000))
             .create_async()
             .await;
-        let resp = reqwest::get(format!("{}/big", server.url())).await.unwrap();
-        let out = read_body_capped(resp, 8192).await;
+        let mut resp = reqwest::get(format!("{}/big", server.url())).await.unwrap();
+        let out = read_body_capped(&mut resp, 8192).await;
         assert!(out.len() <= 8192, "read not bounded: {} bytes", out.len());
         assert!(!out.is_empty(), "expected some body");
     }

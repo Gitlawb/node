@@ -8,7 +8,7 @@ use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-use crate::http::NodeClient;
+use crate::http::{json_or_denial, NodeClient};
 use crate::identity::load_keypair_from_dir;
 
 #[derive(Args)]
@@ -55,16 +55,7 @@ pub async fn run(args: RegisterArgs) -> Result<()> {
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let payload: Value = resp.json().await.context("invalid JSON response")?;
-
-    if !status.is_success() {
-        let msg = payload
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        anyhow::bail!("registration failed ({status}): {msg}");
-    }
+    let payload: Value = json_or_denial("registration", resp).await?;
 
     // Save bootstrap UCAN
     let ucan = payload.get("ucan").and_then(|v| v.as_str()).unwrap_or("");

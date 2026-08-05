@@ -3,8 +3,40 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
+
+/// A migration version this build defines is already recorded in the database
+/// under a different name. Distinct type, not a bare `anyhow!`, because the
+/// startup retry loop has to tell this apart from a transient outage: it never
+/// heals on its own, so it must be reported as a schema conflict rather than
+/// "the database is coming up". See `is_likely_permanent_db_error`.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "migration version {version} is already applied in this database as {recorded_name:?}, but \
+     this build defines v{version} as {build_name:?}. Either two migrations claimed the same \
+     version, in which case renumber this build's migration above every applied version instead \
+     of reusing v{version}; or {recorded_name:?} is leftover bookkeeping from abandoned numbering \
+     on a build that no longer exists, in which case drop the stale row with \
+     `DELETE FROM schema_migrations WHERE version = {version}` after confirming its schema \
+     objects match what v{version} ({build_name:?}) creates."
+)]
+pub struct MigrationVersionCollision {
+    pub version: i64,
+    pub recorded_name: String,
+    pub build_name: &'static str,
+}
+
+/// A version recorded in `schema_migrations` that this build's catalogue does
+/// not define at all: a row written by a since-renumbered build, say, or by an
+/// older binary during a rollback. Never fatal on its own (see the note in
+/// `run_pending_migrations`), but reported so it is visible before a future
+/// migration claims that number and turns it into a boot failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedOrphanMigration {
+    pub version: i64,
+    pub name: String,
+}
 
 // ── Public data types ─────────────────────────────────────────────────────────
 
@@ -358,22 +390,54 @@ impl Db {
             .execute(&mut *lock_conn)
             .await;
 
-        result
+        for orphan in result.as_ref().map(Vec::as_slice).unwrap_or_default() {
+            warn!(
+                version = orphan.version,
+                name = %orphan.name,
+                "schema_migrations records a version this build does not define; it is \
+                 leftover bookkeeping (a renumbered or rolled-back build). Harmless now, but a \
+                 future migration claiming this version will abort startup. Confirm its schema \
+                 objects are already covered and then run \
+                 `DELETE FROM schema_migrations WHERE version = <version>`"
+            );
+        }
+
+        result.map(|_| ())
     }
 
     /// Apply every migration whose version isn't yet recorded, in order.
     /// Must be called while holding the migration advisory lock.
-    async fn run_pending_migrations(&self) -> Result<()> {
+    ///
+    /// Returns the recorded versions this build's catalogue does not define.
+    /// The caller reports them; they are deliberately NOT fatal. A legitimate
+    /// rollback produces them transiently (an older binary re-runs an
+    /// idempotent migration under its old number and records it), and aborting
+    /// startup would turn a supported roll-forward into an outage. The reason
+    /// to surface them anyway is that such a row is exactly what trips the
+    /// collision check later, once some other branch claims that version.
+    async fn run_pending_migrations(&self) -> Result<Vec<RecordedOrphanMigration>> {
         for m in MIGRATIONS {
-            let already: bool = sqlx::query(
-                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
-            )
-            .bind(m.version)
-            .fetch_one(&self.pool)
-            .await?
-            .get::<bool, _>("applied");
+            // Compare the recorded *name*, not just the version. Two branches
+            // developed in parallel can each claim the same version number;
+            // with a version-only check the one that merges second is silently
+            // skipped, leaving the schema it needs missing while
+            // `schema_migrations` still reads healthy. Fail loudly at startup
+            // instead, so the collision is fixed by renumbering.
+            let recorded: Option<String> =
+                sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version = $1")
+                    .bind(m.version)
+                    .fetch_optional(&self.pool)
+                    .await?;
 
-            if already {
+            if let Some(recorded) = recorded {
+                if recorded != m.name {
+                    return Err(MigrationVersionCollision {
+                        version: m.version,
+                        recorded_name: recorded,
+                        build_name: m.name,
+                    }
+                    .into());
+                }
                 continue;
             }
 
@@ -419,7 +483,20 @@ impl Db {
             );
         }
 
-        Ok(())
+        // The loop above only ever looks at versions this build defines, so a
+        // recorded version the catalogue no longer mentions is invisible to it.
+        // That is precisely the row a renumber leaves behind. Find it by asking
+        // the database what it has, rather than by asking about what we know.
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT version, name FROM schema_migrations ORDER BY version ASC")
+                .fetch_all(&self.pool)
+                .await
+                .context("listing recorded migrations")?;
+        Ok(rows
+            .into_iter()
+            .filter(|(version, _)| !MIGRATIONS.iter().any(|m| m.version == *version))
+            .map(|(version, name)| RecordedOrphanMigration { version, name })
+            .collect())
     }
 
     /// Returns `(version, name, applied_at)` for every applied migration,
@@ -883,6 +960,41 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
+    Migration {
+        // v12..v15 are claimed by the in-flight IPFS CID branch
+        // (fix/issue-135-ipfs-cid-tree-gate). That branch is behind main and
+        // still numbers its four migrations 11..14, so once it rebases past
+        // main's v11 (ref_update_owner_did) they shift up to 12..15. Numbering
+        // above that range keeps whichever branch merges second from having
+        // its migration skipped as "already applied".
+        version: 16,
+        name: "consumed_signatures",
+        stmts: &[
+            // Single-use ledger for HTTP message signatures. `sig_hash` is a
+            // fixed-width hex SHA-256 digest of the canonical signature key,
+            // never the raw nonce or signing string: the value is
+            // attacker-influenced, so storing a digest bounds bytes per row and
+            // keeps unbounded input out of the table. The CHECK enforces the
+            // fixed width at the schema level so a caller cannot store
+            // something else by accident.
+            // `keyid` backs the per-identity live-row cap
+            // (`MAX_LIVE_SIGNATURES_PER_KEYID`). Despite the column name it
+            // holds the hex of the RESOLVED public key, not the wire DID: the
+            // cap compares by string equality and one keypair has many valid
+            // multibase spellings. `expires_at` is the
+            // unix-seconds instant after which the signature can no longer be
+            // accepted, used by the sweep.
+            r#"CREATE TABLE IF NOT EXISTS consumed_signatures (
+                sig_hash   TEXT   NOT NULL PRIMARY KEY
+                                  CHECK (char_length(sig_hash) = 64),
+                keyid      TEXT   NOT NULL,
+                expires_at BIGINT NOT NULL
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_consumed_signatures_expires ON consumed_signatures(expires_at)",
+            // The cap counts live rows for one keyid, so it needs both columns.
+            "CREATE INDEX IF NOT EXISTS idx_consumed_signatures_keyid_expires ON consumed_signatures(keyid, expires_at)",
+        ],
+    },
     // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
     // The runner keys the applied set on the integer alone, so a version another
     // in-flight branch also claims is skipped in full on whichever side merges
@@ -902,6 +1014,52 @@ const MIGRATIONS: &[Migration] = &[
         ],
     },
 ];
+
+// ── HTTP-signature replay ledger ──────────────────────────────────────────────
+
+/// Outcome of charging one HTTP message signature against the replay ledger.
+/// The three cases are deliberately distinct so a caller can answer each with
+/// its own status code: a replay is the client's fault and is permanent for
+/// that signature, whereas a full identity ledger is a rate condition the same
+/// client can retry once its live rows expire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ConsumeSignature {
+    /// The signature had not been seen; it is now spent.
+    Inserted,
+    /// The signature was already spent. Reject as a replay.
+    Replayed,
+    /// This identity already holds `MAX_LIVE_SIGNATURES_PER_KEYID` live rows.
+    /// The signature was NOT recorded.
+    IdentityLedgerFull,
+}
+
+/// Cap on live (unexpired) ledger rows a single `keyid` may hold.
+///
+/// The ledger is an attacker-influenced key map on routes that carry no rate
+/// limiter (tasks, bounties, issue and PR comments, hooks, profile), and
+/// identities are permissionless, so a flood of *distinct* signatures from one
+/// identity would otherwise allocate rows without bound. Hashing the key bounds
+/// bytes per row; only this bounds row count.
+///
+/// 512 over the 390s retention window is ~1.3 sustained requests per second
+/// from one identity, an order of magnitude above any real client (a push plus
+/// its API calls is tens of requests).
+///
+/// The cap counts LIVE rows (`expires_at >= now`), and the sweep runs on an
+/// independent 300s tick (`main.rs`), so expired-but-unswept rows sit in the
+/// table uncounted. On-disk peak is therefore about double the cap, not equal
+/// to it: at the sustained ceiling an identity retires 512/390 rows per second,
+/// so up to `512 * 300 / 390` ≈ 394 expired rows accumulate between sweeps, for
+/// a peak near 906 and a hard bound of 1024 (one sweep period is shorter than
+/// the TTL, so at most one cap's worth can be pending deletion).
+///
+/// Measured against Postgres at 1M rows, laid out the way the cap produces them
+/// (64-hex `sig_hash`, 64-hex identity, 512 rows per identity): heap 166 MB, PK
+/// index 119 MB, expires index 21 MB, identity+expires index 101 MB, total 407
+/// MB — about 430 bytes per row including indexes. One identity's worst case is
+/// thus ~1024 rows, roughly 440 KB.
+pub const MAX_LIVE_SIGNATURES_PER_KEYID: i64 = 512;
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
@@ -1359,6 +1517,80 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Atomically consume an HTTP message signature. `sig_hash` is the
+    /// fixed-width hex SHA-256 digest of the canonical signature key,
+    /// `identity` the signing identity the per-identity cap is charged against,
+    /// `now` the arrival instant in unix seconds, and `expires_at` the instant
+    /// after which the signature can no longer be accepted (so the row can be
+    /// swept).
+    ///
+    /// `identity` must be a canonical form of the resolved public key, never
+    /// the wire DID: the cap compares by string equality, and one keypair has
+    /// many valid `did:key` spellings. The column keeps its historical `keyid`
+    /// name (renaming it would need a new migration for no behavioral gain).
+    ///
+    /// A `sig_hash` of any width other than 64 violates the table's CHECK
+    /// constraint and comes back as a query `Err`, which `consume_signature`
+    /// (`auth/mod.rs`) reports as 503 `signature_ledger_unavailable` — so a
+    /// caller that ever passes one would send an operator chasing a phantom
+    /// database outage. Unreachable today: both `ledger_key` arms return a hex
+    /// SHA-256.
+    ///
+    /// One statement does the whole decision. The `INSERT ... ON CONFLICT DO
+    /// NOTHING` is what makes the check atomic: two concurrent replays of the
+    /// same signature cannot both win, because the primary key arbitrates. A
+    /// separate SELECT first would reintroduce exactly that race.
+    pub async fn consume_signature(
+        &self,
+        sig_hash: &str,
+        identity: &str,
+        now: i64,
+        expires_at: i64,
+    ) -> Result<ConsumeSignature> {
+        let (inserted, live): (i64, i64) = sqlx::query_as(
+            r#"WITH live AS (
+                   SELECT COUNT(*) AS n FROM consumed_signatures
+                   WHERE keyid = $2 AND expires_at >= $4
+               ), ins AS (
+                   INSERT INTO consumed_signatures (sig_hash, keyid, expires_at)
+                   SELECT $1, $2, $3 FROM live WHERE live.n < $5
+                   ON CONFLICT (sig_hash) DO NOTHING
+                   RETURNING 1
+               )
+               SELECT (SELECT COUNT(*) FROM ins) AS inserted,
+                      (SELECT n FROM live)       AS live_count"#,
+        )
+        .bind(sig_hash)
+        .bind(identity)
+        .bind(expires_at)
+        .bind(now)
+        .bind(MAX_LIVE_SIGNATURES_PER_KEYID)
+        .fetch_one(&self.pool)
+        .await?;
+
+        if inserted > 0 {
+            Ok(ConsumeSignature::Inserted)
+        } else if live >= MAX_LIVE_SIGNATURES_PER_KEYID {
+            // The insert was suppressed by the cap. A capped identity replaying
+            // an already-spent signature also lands here; that is deliberate,
+            // since the cap is the more actionable condition to report.
+            Ok(ConsumeSignature::IdentityLedgerFull)
+        } else {
+            Ok(ConsumeSignature::Replayed)
+        }
+    }
+
+    /// Delete ledger rows for signatures that can no longer be accepted.
+    /// Returns rows removed. This is what keeps the table proportional to the
+    /// retention window rather than to total requests seen.
+    pub async fn sweep_expired_signatures(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM consumed_signatures WHERE expires_at < $1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     /// Delete consumed-proof rows whose proof has expired. Returns rows removed.
@@ -3944,6 +4176,120 @@ mod migration_tests {
 }
 
 #[cfg(test)]
+mod migration_guard_tests {
+    use super::{MigrationVersionCollision, MIGRATIONS};
+
+    async fn record(pool: &sqlx::PgPool, version: i64, name: &str) {
+        sqlx::query(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+        )
+        .bind(version)
+        .bind(name)
+        .bind("2026-07-01T00:00:00Z")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// A recorded version this build's catalogue no longer defines is
+    /// reported, and does not by itself stop startup.
+    #[sqlx::test]
+    async fn a_recorded_version_the_catalogue_does_not_define_is_reported(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        record(&db.pool, 9_001, "ghost_migration").await;
+
+        let orphans = db
+            .run_pending_migrations()
+            .await
+            .expect("an unknown recorded version must not fail startup");
+
+        assert!(
+            orphans
+                .iter()
+                .any(|o| o.version == 9_001 && o.name == "ghost_migration"),
+            "expected the orphan row to be reported, got {orphans:?}"
+        );
+        // And startup as a whole still succeeds.
+        db.migrate().await.expect("migrate must still succeed");
+    }
+
+    /// The concrete rollback sequence: this build records v16, an older binary
+    /// whose catalogue still numbers the same migration v12 records
+    /// (12, 'consumed_signatures') as a no-op, then we roll forward. The stale
+    /// row must surface as an orphan, not bail.
+    #[sqlx::test]
+    async fn a_rolled_back_binarys_stale_row_surfaces_without_bailing(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        // The rolled-back binary finds no v12 row, re-runs
+        // CREATE TABLE IF NOT EXISTS consumed_signatures as a no-op, records v12.
+        record(&db.pool, 12, "consumed_signatures").await;
+
+        let orphans = db
+            .run_pending_migrations()
+            .await
+            .expect("a rollback's leftover bookkeeping row must not abort startup");
+
+        assert!(
+            orphans
+                .iter()
+                .any(|o| o.version == 12 && o.name == "consumed_signatures"),
+            "expected the stale (12, consumed_signatures) row to be reported, got {orphans:?}"
+        );
+        assert!(
+            !MIGRATIONS.iter().any(|m| m.version == 12),
+            "this test assumes the catalogue does not define v12"
+        );
+    }
+
+    /// A version the catalogue DOES define, recorded under a different name,
+    /// is a genuine collision and still aborts startup.
+    #[sqlx::test]
+    async fn a_genuine_name_collision_still_bails(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        sqlx::query("UPDATE schema_migrations SET name = $1 WHERE version = 16")
+            .bind("pinned_cids_repo_provenance")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let err = db
+            .run_pending_migrations()
+            .await
+            .expect_err("a name collision on a defined version must abort startup");
+
+        let collision = err
+            .downcast_ref::<MigrationVersionCollision>()
+            .expect("the collision must be a distinguishable MigrationVersionCollision");
+        assert_eq!(collision.version, 16);
+        assert_eq!(collision.recorded_name, "pinned_cids_repo_provenance");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("16"), "message must name the version: {msg}");
+        assert!(
+            msg.contains("pinned_cids_repo_provenance"),
+            "message must name the recorded name: {msg}"
+        );
+        assert!(
+            msg.contains("consumed_signatures"),
+            "message must name this build's name: {msg}"
+        );
+        // Both remedies must be offered, so the operator is not sent to the
+        // wrong one.
+        assert!(
+            msg.contains("renumber"),
+            "message must offer the renumber remedy: {msg}"
+        );
+        assert!(
+            msg.contains("DELETE FROM schema_migrations"),
+            "message must offer the stale-row remedy: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod agent_discovery_tests {
     use super::{filter_discoverable, AgentRow};
 
@@ -4992,6 +5338,441 @@ mod icaptcha_ledger_tests {
                 .await
                 .unwrap(),
             "the token must stay spent so it can't admit a second mirror"
+        );
+    }
+}
+
+/// Exercises the HTTP-signature replay ledger (`consumed_signatures`): its
+/// single-use accessor, the sweep that bounds it, the per-identity cap, and the
+/// v16 upgrade path from a database sitting at the version below it, plus the
+/// runner's guard against a version applied under a different migration name.
+#[cfg(test)]
+mod signature_ledger_tests {
+    use super::{ConsumeSignature, Db, MIGRATIONS};
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// The ledger key is a fixed-width hex SHA-256 digest, never a raw nonce
+    /// (KTD6). Build one deterministically from a seed so tests stay readable.
+    fn key(seed: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(seed.as_bytes());
+        hex::encode(h.finalize())
+    }
+
+    /// First sighting of a signature is recorded (allowed); the identical key
+    /// again is a replay (rejected); a distinct key is independently allowed.
+    #[sqlx::test]
+    async fn consume_signature_is_single_use(pool: PgPool) {
+        let db = db(pool).await;
+        let now = 1_000i64;
+        let exp = now + 330;
+        let kid = "did:key:zAlice";
+
+        assert_eq!(
+            db.consume_signature(&key("a"), kid, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "first sighting is recorded and allowed"
+        );
+        assert_eq!(
+            db.consume_signature(&key("a"), kid, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed,
+            "the identical signature is a replay and must be rejected"
+        );
+        assert_eq!(
+            db.consume_signature(&key("b"), kid, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "a different signature is independent and allowed"
+        );
+    }
+
+    /// The sweep deletes only rows whose `expires_at` is strictly before the
+    /// cutoff and returns the deleted count. A swept signature is usable again
+    /// (its acceptance window has passed, so the time check now rejects it
+    /// anyway), while an unswept one keeps rejecting replays.
+    #[sqlx::test]
+    async fn sweep_expired_signatures_removes_only_expired(pool: PgPool) {
+        let db = db(pool).await;
+        let kid = "did:key:zAlice";
+        let (old_a, old_b, fresh) = (key("old-a"), key("old-b"), key("fresh"));
+
+        for (k, exp) in [(&old_a, 100i64), (&old_b, 199), (&fresh, 500)] {
+            assert_eq!(
+                db.consume_signature(k, kid, 0, exp).await.unwrap(),
+                ConsumeSignature::Inserted
+            );
+        }
+
+        let deleted = db.sweep_expired_signatures(200).await.unwrap();
+        assert_eq!(
+            deleted, 2,
+            "only the two rows with expires_at < 200 are swept"
+        );
+
+        assert_eq!(
+            db.consume_signature(&old_a, kid, 200, 530).await.unwrap(),
+            ConsumeSignature::Inserted,
+            "a swept signature is free again"
+        );
+        assert_eq!(
+            db.consume_signature(&fresh, kid, 200, 530).await.unwrap(),
+            ConsumeSignature::Replayed,
+            "an unexpired spent signature survives the sweep and still blocks replays"
+        );
+    }
+
+    /// KTD6, proved by execution rather than by pointing at the TTL: a single
+    /// identity flooding *distinct* signatures fills its cap and is then
+    /// rejected with an outcome distinct from a replay, and its row count stops
+    /// growing. A second identity is untouched by the first one's cap.
+    #[sqlx::test]
+    async fn per_identity_cap_bounds_row_count(pool: PgPool) {
+        let db = db(pool).await;
+        let now = 1_000i64;
+        let exp = now + 330; // every row stays live for the whole run
+        let flooder = "did:key:zFlooder";
+        let cap = super::MAX_LIVE_SIGNATURES_PER_KEYID;
+
+        // Fill exactly to the cap with distinct keys.
+        for i in 0..cap {
+            assert_eq!(
+                db.consume_signature(&key(&format!("flood-{i}")), flooder, now, exp)
+                    .await
+                    .unwrap(),
+                ConsumeSignature::Inserted,
+                "distinct signature {i} is below the cap and must be recorded"
+            );
+        }
+
+        // Every further distinct signature is refused, with an outcome the
+        // caller can tell apart from a replay.
+        for i in cap..cap + 25 {
+            assert_eq!(
+                db.consume_signature(&key(&format!("flood-{i}")), flooder, now, exp)
+                    .await
+                    .unwrap(),
+                ConsumeSignature::IdentityLedgerFull,
+                "signature {i} is over the cap and must be refused distinctly"
+            );
+        }
+
+        // Storage stopped growing: the flood allocated cap rows, not cap + 25.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM consumed_signatures WHERE keyid = $1"
+            )
+            .bind(flooder)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            cap,
+            "the flood must not allocate a row per request seen"
+        );
+
+        // A second identity is unaffected by the first one's cap, and its own
+        // replays still read as replays.
+        let bystander = "did:key:zBystander";
+        assert_eq!(
+            db.consume_signature(&key("bystander-1"), bystander, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "the cap is per identity, not global"
+        );
+        assert_eq!(
+            db.consume_signature(&key("bystander-1"), bystander, now, exp)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed
+        );
+
+        // The cap counts *live* rows only: once the flooder's rows age out and
+        // are swept, it can sign again.
+        // Everything inserted above shares `exp`, so this clears the flooder's
+        // `cap` rows plus the bystander's single row.
+        assert_eq!(
+            db.sweep_expired_signatures(exp + 1).await.unwrap(),
+            cap as u64 + 1
+        );
+        assert_eq!(
+            db.consume_signature(&key("flood-after-sweep"), flooder, exp + 1, exp + 331)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted,
+            "the cap must lift once the identity's rows expire"
+        );
+    }
+
+    /// Upgrade path: an existing node sitting at the highest migration below
+    /// v16 must gain the ledger table and its sweep index when it applies v16,
+    /// and the table must round-trip. A fresh-database test cannot cover this —
+    /// it never exercises the "everything but v16" -> v16 step in isolation.
+    #[sqlx::test]
+    async fn migration_v16_creates_signature_ledger(pool: PgPool) {
+        let db = Db::for_testing(pool);
+
+        // Build the whole schema, then tear the v16 objects back down and
+        // re-seed `schema_migrations` with every migration below v16 to
+        // simulate a node that has run everything else but not yet v16.
+        db.run_migrations().await.unwrap();
+        sqlx::query("DROP TABLE IF EXISTS consumed_signatures")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        for m in MIGRATIONS.iter().take_while(|m| m.version < 16) {
+            sqlx::query(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(m.version)
+            .bind(m.name)
+            .bind("2026-07-01T00:00:00Z")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        // Derive the baseline from the catalogue rather than hardcoding it, so
+        // the test keeps meaning "upgrade from whatever ships below v16" as
+        // other branches land migrations in the 12..16 range.
+        let baseline = MIGRATIONS
+            .iter()
+            .map(|m| m.version)
+            .filter(|v| *v < 16)
+            .max()
+            .expect("catalogue must have migrations below v16");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM schema_migrations")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+            baseline,
+            "baseline must be the highest migration below v16"
+        );
+
+        // ── Apply the pending v16 migration ───────────────────────────────
+        db.run_migrations().await.unwrap();
+
+        // (a) The table exists.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_name = 'consumed_signatures'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "v16 must create consumed_signatures"
+        );
+
+        // (b) The sweep index exists.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE tablename = 'consumed_signatures'
+                   AND indexname = 'idx_consumed_signatures_expires'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "the sweep needs an index on expires_at"
+        );
+
+        // (b2) The per-keyid cap index exists too.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pg_indexes
+                 WHERE tablename = 'consumed_signatures'
+                   AND indexname = 'idx_consumed_signatures_keyid_expires'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "the per-keyid live-row cap needs an index on (keyid, expires_at)"
+        );
+
+        // (c) It round-trips: insert, read back, and the digest survives whole.
+        let k = key("upgrade-path");
+        sqlx::query(
+            "INSERT INTO consumed_signatures (sig_hash, keyid, expires_at) VALUES ($1, $2, $3)",
+        )
+        .bind(&k)
+        .bind("did:key:zUpgrade")
+        .bind(9_000_000_000i64)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (got_key, got_keyid, got_exp): (String, String, i64) = sqlx::query_as(
+            "SELECT sig_hash, keyid, expires_at FROM consumed_signatures WHERE sig_hash = $1",
+        )
+        .bind(&k)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(got_key, k);
+        assert_eq!(got_keyid, "did:key:zUpgrade");
+        assert_eq!(got_exp, 9_000_000_000i64);
+    }
+
+    /// Re-running migrations over an already-migrated database is a no-op: v16
+    /// applies cleanly a second time, records exactly one `schema_migrations`
+    /// row, and does not disturb rows already in the ledger.
+    #[sqlx::test]
+    async fn migrations_are_idempotent(pool: PgPool) {
+        let db = db(pool).await;
+        let k = key("survives-remigration");
+        assert_eq!(
+            db.consume_signature(&k, "did:key:zAlice", 1_000, 1_330)
+                .await
+                .unwrap(),
+            ConsumeSignature::Inserted
+        );
+
+        // Third and fourth passes over the same database.
+        db.run_migrations().await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 16"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "v16 must be recorded exactly once"
+        );
+        assert_eq!(
+            db.consume_signature(&k, "did:key:zAlice", 1_000, 1_330)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed,
+            "re-running migrations must not drop or recreate the ledger"
+        );
+
+        // The skip-by-version check is only half of it. Force v16's statements
+        // to actually execute a second time (a node that lost its
+        // `schema_migrations` row, or a re-applied deploy) and they must still
+        // succeed against the objects they already created.
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 16")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.run_migrations()
+            .await
+            .expect("v16's own statements must be safe to re-execute");
+        assert_eq!(
+            db.consume_signature(&k, "did:key:zAlice", 1_000, 1_330)
+                .await
+                .unwrap(),
+            ConsumeSignature::Replayed,
+            "re-executing v16 must not wipe the ledger"
+        );
+    }
+
+    /// A version recorded under a *different* name than the catalogue defines
+    /// means two branches independently claimed the same version number. The
+    /// old applied-check only looked at `version`, so the loser's migration was
+    /// silently skipped and the schema quietly went missing. The runner must
+    /// refuse to start and name the version, the expected name, and the name
+    /// the database actually recorded.
+    #[sqlx::test]
+    async fn migration_version_applied_under_other_name_is_rejected(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // Rewrite v16's recorded name as if a colliding branch had applied its
+        // own v16 first. The ledger objects stay in place; only the bookkeeping
+        // disagrees, which is exactly the undetectable case.
+        sqlx::query("UPDATE schema_migrations SET name = $1 WHERE version = 16")
+            .bind("something_else")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let err = db
+            .run_migrations()
+            .await
+            .expect_err("a name mismatch on an applied version must abort startup");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("16"),
+            "error must name the colliding version, got: {msg}"
+        );
+        assert!(
+            msg.contains("consumed_signatures"),
+            "error must name the migration this build expects, got: {msg}"
+        );
+        assert!(
+            msg.contains("something_else"),
+            "error must name what the database recorded, got: {msg}"
+        );
+    }
+
+    /// The guard must not be a blanket failure: a database whose recorded names
+    /// all match the catalogue migrates cleanly, and a version that is not yet
+    /// applied still applies normally even while earlier versions are present.
+    #[sqlx::test]
+    async fn matching_names_and_pending_versions_still_migrate(pool: PgPool) {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        // (a) Every recorded name matches -> a second run is a clean no-op.
+        db.run_migrations()
+            .await
+            .expect("matching names must not trip the guard");
+        for m in MIGRATIONS {
+            let recorded: String =
+                sqlx::query_scalar("SELECT name FROM schema_migrations WHERE version = $1")
+                    .bind(m.version)
+                    .fetch_one(&db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(recorded, m.name, "v{} name must round-trip", m.version);
+        }
+
+        // (b) A pending version still applies: drop v16's bookkeeping (and its
+        // table) so it is genuinely unapplied while every lower version remains recorded
+        // with matching names.
+        sqlx::query("DROP TABLE IF EXISTS consumed_signatures")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 16")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        db.run_migrations()
+            .await
+            .expect("an unapplied version must still apply");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_name = 'consumed_signatures'"
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+            1,
+            "the pending migration must have run"
         );
     }
 }
