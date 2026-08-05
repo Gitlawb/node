@@ -2,7 +2,6 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use crate::http::NodeClient;
@@ -87,12 +86,7 @@ async fn resolve_owner_repo(
         did.split(':').next_back().unwrap_or(&did).to_string()
     } else {
         let client = NodeClient::new(node, None);
-        let info: Value = client
-            .get("/")
-            .await?
-            .json()
-            .await
-            .context("failed to fetch node info")?;
+        let info = crate::http::read_json(client.get("/").await?, "node info").await?;
         let did = info["did"].as_str().context("node missing DID")?;
         did.split(':').next_back().unwrap_or(did).to_string()
     };
@@ -123,12 +117,7 @@ async fn cmd_set(
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("visibility set failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "visibility set").await?;
 
     println!("✓ Visibility rule set on {owner}/{name}: {path_glob} (mode {mode})");
     if path_glob != "/" {
@@ -156,12 +145,7 @@ async fn cmd_remove(
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("visibility remove failed ({status}): {msg}");
-    }
+    let _ = crate::http::read_json(resp, "visibility remove").await?;
 
     println!("✓ Visibility rule removed from {owner}/{name}: {path_glob}");
     Ok(())
@@ -179,12 +163,7 @@ async fn cmd_list(repo: String, node: String, dir: Option<PathBuf>) -> Result<()
         .await
         .context("failed to connect to node")?;
 
-    let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or_default();
-    if !status.is_success() {
-        let msg = body["message"].as_str().unwrap_or("unknown error");
-        anyhow::bail!("visibility list failed ({status}): {msg}");
-    }
+    let body = crate::http::read_json(resp, "visibility list").await?;
 
     let rules = body["rules"].as_array().cloned().unwrap_or_default();
     if rules.is_empty() {
@@ -306,5 +285,27 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolve_owner_repo_surfaces_denial() {
+        // A slash-free repo with an empty identity dir forces the GET / node-info
+        // fetch. A gated 404 there must Err (surfacing the status), proving the
+        // read_json conversion is load-bearing rather than silently ignored.
+        let mut server = mockito::Server::new_async().await;
+        let dir = tempfile::TempDir::new().unwrap(); // empty, no identity.pem, forces the GET / branch
+        let _m = server
+            .mock("GET", "/")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"denied"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let err = resolve_owner_repo("noslash", &server.url(), Some(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("404"), "got: {err}");
+        _m.assert_async().await;
     }
 }
