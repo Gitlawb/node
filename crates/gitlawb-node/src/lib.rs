@@ -1306,7 +1306,14 @@ fn load_existing_key(path: &std::path::Path) -> Result<Keypair> {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut f = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // O_NONBLOCK as well as O_NOFOLLOW, because the is_file refusal
+            // below is only reachable if the open itself returns. Opening a
+            // FIFO read-only BLOCKS until a writer connects, so a planted named
+            // pipe at the key path would hang startup forever instead of being
+            // refused, with the same reachability as the symlink case. On a
+            // regular file O_NONBLOCK has no effect, and a non-regular fd never
+            // survives the check below, so nothing else needs to clear it.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
             .map_err(|e| {
                 // ELOOP is what O_NOFOLLOW returns when the final component is
@@ -3950,6 +3957,57 @@ mod identity_key_tests {
         assert!(
             !super::is_key_content_error(&err),
             "a non-regular refusal must not be content-class: {msg}"
+        );
+    }
+
+    /// A FIFO at the key path must be refused, not waited on. The directory
+    /// case above cannot catch this: opening a directory fails immediately with
+    /// EISDIR, so the `is_file` refusal is reached, while `open(O_RDONLY)` on a
+    /// FIFO BLOCKS until a writer connects and the refusal is never reached at
+    /// all. A planted named pipe therefore hangs startup forever rather than
+    /// being rejected, which is the same reachability the symlink case has (an
+    /// actor who can place the configured key path).
+    ///
+    /// The call runs on its own thread with a bounded wait so a regression
+    /// fails the test instead of hanging the suite. RED without `O_NONBLOCK` on
+    /// the open: the thread never sends and the recv times out.
+    #[test]
+    fn fifo_key_path_is_refused_rather_than_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key_path = dir.path().join("identity.pem");
+        let c_path = std::ffi::CString::new(key_path.as_os_str().as_bytes()).expect("cstring");
+        // SAFETY: c_path is a valid NUL-terminated path that does not yet exist.
+        let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe_path = key_path.clone();
+        let handle = std::thread::spawn(move || {
+            let r = super::load_existing_key(&probe_path).map(|_| ());
+            let _ = tx.send(r);
+        });
+
+        let outcome = rx.recv_timeout(std::time::Duration::from_secs(5));
+        let err = match outcome {
+            Ok(Err(e)) => e,
+            Ok(Ok(())) => panic!("a FIFO at the key path must be refused, not loaded"),
+            Err(_) => panic!(
+                "load_existing_key blocked on a FIFO at the key path: the non-regular \
+                 refusal is unreachable because the open itself waits for a writer"
+            ),
+        };
+        handle.join().expect("probe thread");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not a regular file"),
+            "the refusal must name why it refused: {msg}"
+        );
+        assert!(
+            !super::is_key_content_error(&err),
+            "a FIFO refusal must not be content-class: {msg}"
         );
     }
 
