@@ -1766,11 +1766,19 @@ impl Db {
 
     pub async fn dequeue_pending_syncs(&self, limit: i64) -> Result<Vec<SyncQueueItem>> {
         let rows = sqlx::query(
-            "SELECT id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at
-             FROM sync_queue WHERE status = 'pending'
-             ORDER BY enqueued_at ASC LIMIT $1",
+            // The outer `status = 'pending'` is not redundant with the
+            // subquery's: between the two, a concurrent worker can settle a row,
+            // and without it the UPDATE would still stamp and return a row that
+            // had already left the pending set.
+            "UPDATE sync_queue SET attempted_at = $2
+             WHERE status = 'pending' AND id IN (
+                 SELECT id FROM sync_queue WHERE status = 'pending'
+                 ORDER BY COALESCE(attempted_at, enqueued_at) ASC LIMIT $1
+             )
+             RETURNING id, repo, node_did, ref_name, new_sha, cid, status, enqueued_at",
         )
         .bind(limit)
+        .bind(Utc::now().to_rfc3339())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -4313,6 +4321,186 @@ mod migration_tests {
             "",
             "non-tip pin must fall back to empty owner_did"
         );
+    }
+
+    // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
+
+    async fn enqueue_one(db: &super::Db, repo: &str) {
+        db.enqueue_sync(
+            repo,
+            "did:key:zPEER",
+            "refs/heads/main",
+            &"0".repeat(40),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn attempted_at_of(db: &super::Db, repo: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT attempted_at FROM sync_queue WHERE repo = $1")
+            .bind(repo)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Upgrade-path test: simulate a node already at v11 and let the real
+    /// migration entry point apply v17, rather than hand-copying its SQL.
+    ///
+    /// This is the test that catches the column being added to the v1
+    /// statement array instead of a new migration. v1 never re-runs on an
+    /// existing install, so that mistake breaks every deployed node's dequeue
+    /// while staying invisible to every other test here, since `#[sqlx::test]`
+    /// hands out a fresh database that runs the whole chain.
+    #[sqlx::test]
+    async fn migration_v17_adds_sync_queue_attempted_at(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll back to v11: drop the column and forget the version.
+        sqlx::query("ALTER TABLE sync_queue DROP COLUMN attempted_at")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 17")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // A row written by the old node, before the column existed.
+        enqueue_one(&db, "z6Mkfoo/legacy").await;
+
+        db.migrate().await.unwrap();
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'sync_queue' AND column_name = 'attempted_at'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "attempted_at must be nullable");
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 17")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v17 must be recorded as applied");
+
+        // The pre-existing row survives with a null key and is still dequeued.
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/legacy").await, None);
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].repo, "z6Mkfoo/legacy");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn dequeue_stamps_attempted_at_on_every_row_it_hands_out(pool: sqlx::PgPool) {
+        // The stamp is what stops a deferred row from holding the window, and
+        // it happens here rather than at the deferral branches so no call site
+        // can forget it.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        assert_eq!(
+            attempted_at_of(&db, "z6Mkfoo/a").await,
+            None,
+            "a freshly enqueued row has no attempt yet"
+        );
+
+        let items = db.dequeue_pending_syncs(10).await.unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(
+            attempted_at_of(&db, "z6Mkfoo/a").await.is_some(),
+            "dequeue must stamp the row it returns, whatever the worker does next"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_orders_by_last_attempt_then_enqueue_time(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/older").await;
+        enqueue_one(&db, "z6Mkfoo/newer").await;
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:00Z")
+            .bind("z6Mkfoo/older")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sync_queue SET enqueued_at = $1 WHERE repo = $2")
+            .bind("2026-07-29T00:00:01Z")
+            .bind("z6Mkfoo/newer")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Never-attempted rows fall back to enqueue order.
+        let first = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(first[0].repo, "z6Mkfoo/older");
+
+        // Having been attempted, it now sorts behind the untried row.
+        let second = db.dequeue_pending_syncs(1).await.unwrap();
+        assert_eq!(
+            second[0].repo, "z6Mkfoo/newer",
+            "an attempted row must yield to one that has never been tried"
+        );
+    }
+
+    #[sqlx::test]
+    async fn dequeue_leaves_enqueued_at_untouched(pool: sqlx::PgPool) {
+        // enqueued_at keeps meaning enqueue time, so backlog age stays
+        // measurable; that is the reason attempted_at is a separate column.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/a").await;
+        let before: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+
+        db.dequeue_pending_syncs(10).await.unwrap();
+
+        let after: String =
+            sqlx::query_scalar("SELECT enqueued_at FROM sync_queue WHERE repo = 'z6Mkfoo/a'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[sqlx::test]
+    async fn dequeue_does_not_touch_settled_rows(pool: sqlx::PgPool) {
+        // The stamping UPDATE must not reach a row that already left the
+        // pending set, or a terminal row could be dragged back into rotation.
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        enqueue_one(&db, "z6Mkfoo/failed").await;
+        enqueue_one(&db, "z6Mkfoo/done").await;
+        let ids: Vec<(String, String)> =
+            sqlx::query_as("SELECT repo, id FROM sync_queue ORDER BY repo")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        for (repo, id) in &ids {
+            if repo.ends_with("failed") {
+                db.mark_sync_failed(id).await.unwrap();
+            } else {
+                db.mark_sync_done(id).await.unwrap();
+            }
+        }
+
+        assert!(db.dequeue_pending_syncs(10).await.unwrap().is_empty());
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/failed").await, None);
+        assert_eq!(attempted_at_of(&db, "z6Mkfoo/done").await, None);
     }
 }
 
