@@ -1,3 +1,13 @@
+//! Shared helpers for the icaptcha-client integration tests.
+//!
+//! CONCURRENCY CONSTRAINT: [`arm_blackhole`] and [`disarm_proxy_env`] mutate
+//! process-wide proxy env vars and restore them on drop.  Each test binary
+//! that consumes this module currently has exactly one `#[test]`, so there is
+//! no concurrent use.  `cargo test` runs tests within a binary in parallel by
+//! default, so the NEXT test added to either file MUST be serialized against
+//! these helpers (e.g. a shared `Mutex` in this module, or the `serial_test`
+//! crate) or it will race on the proxy vars.
+
 use std::ffi::OsString;
 
 const PROXY_VARS: &[&str] = &[
@@ -45,6 +55,8 @@ pub struct EnvGuard {
 /// forced through `proxy_url`, with NO_PROXY covering loopback.  Also clears
 /// REQUEST_METHOD, which causes hyper-util to ignore all proxy variables when
 /// set.  Restores prior values on drop.
+///
+/// Not safe to call from concurrent tests (see module docs).
 pub fn arm_blackhole(proxy_url: &str) -> EnvGuard {
     let prev = EnvSnapshot::capture(PROXY_VARS);
 
@@ -67,6 +79,8 @@ pub fn arm_blackhole(proxy_url: &str) -> EnvGuard {
 
 /// Clear every proxy-related env var so connections go direct.  Restores
 /// prior values on drop.
+///
+/// Not safe to call from concurrent tests (see module docs).
 #[allow(dead_code)]
 pub fn disarm_proxy_env() -> EnvGuard {
     let prev = EnvSnapshot::capture(PROXY_VARS);

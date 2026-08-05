@@ -10,17 +10,21 @@
 //! "no live call" half of the guard load-bearing, the test blackholes every
 //! non-loopback destination via a proxy observer: `NO_PROXY` lets the loopback
 //! mock through while every proxy variable routes any other host through a TCP
-//! listener that counts connections.  Zero observed connections (accepted
-//! during the `obtain_proof` call) proves no leak reached the network on the
-//! exercised synchronous path.
+//! listener that counts connections.  Zero observed connections proves no leak
+//! reached the network on the exercised path.
 //!
 //! The observer design counts every accepted connection regardless of whether
 //! the caller propagates the transport error, so it catches leaks that a
 //! closed-port blackhole (which only surfaces propagating errors) would miss.
-//! Because the accept loop runs in a detached thread, a leak whose TCP
-//! handshake completes after the counter is read is not observed — this is a
-//! known limitation of the single-threaded test harness, not a gap in the
-//! guard itself.
+//! To close the timing race inherent in a detached accept loop, the count is
+//! read only after a bounded drain: the test opens a flush connection and
+//! blocks until the accept thread has acknowledged (counted) it.  Because
+//! `accept()` hands out connections FIFO, every leak connection that completed
+//! its TCP handshake before the flush is counted before the flush — the
+//! assertion therefore covers all egress in flight when `obtain_proof`
+//! returned.  A leak that starts its handshake after the drain is outside the
+//! window; that is the irreducible limit of observing a detached accept loop,
+//! and it is the remaining, well-defined gap this guard accepts.
 //!
 //! SCOPE: The observer only witnesses leaks issued on the path this test drives
 //! (a single passing round, 200 on both endpoints, no PoW, no Continue/Failed,
@@ -36,9 +40,8 @@
 //! mock is still consumed and this test stayed green.  So we blackhole the
 //! scheme-specific variables too.
 
-use std::net::TcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Condvar, Mutex};
 
 use icaptcha_client::{obtain_proof, Challenge, IcaptchaCfg};
 
@@ -48,25 +51,30 @@ mod support;
 ///
 /// Acts as the proxy target: any leaked connection to a non-loopback
 /// destination will be routed through this listener and increment the
-/// counter.  The test then asserts zero connections (those accepted
-/// during the synchronous `obtain_proof` call).
+/// counter.  The count is guarded by a Mutex + Condvar so the test can block
+/// until the detached accept thread has acknowledged a specific connection
+/// (see [`ProxyObserver::drain`]).
 struct ProxyObserver {
     _listener: Arc<TcpListener>,
     port: u16,
-    count: Arc<AtomicUsize>,
+    count: Arc<Mutex<usize>>,
+    ack: Arc<Condvar>,
 }
 
 impl ProxyObserver {
     fn bind() -> Self {
         let listener = Arc::new(TcpListener::bind("127.0.0.1:0").expect("bind proxy observer"));
         let port = listener.local_addr().unwrap().port();
-        let count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::new(Mutex::new(0usize));
+        let ack = Arc::new(Condvar::new());
         let c = Arc::clone(&count);
+        let a = Arc::clone(&ack);
         let l = Arc::clone(&listener);
         std::thread::spawn(move || {
             for stream in l.incoming() {
                 if stream.is_ok() {
-                    c.fetch_add(1, Ordering::SeqCst);
+                    *c.lock().unwrap() += 1;
+                    a.notify_all();
                 }
             }
         });
@@ -74,11 +82,42 @@ impl ProxyObserver {
             _listener: listener,
             port,
             count,
+            ack,
         }
     }
 
     fn port(&self) -> u16 {
         self.port
+    }
+
+    fn count(&self) -> usize {
+        *self.count.lock().unwrap()
+    }
+
+    /// Bounded acknowledgement barrier for the accept loop.
+    ///
+    /// Opens a flush connection to the listener and blocks until the accept
+    /// thread has counted it (bounded by a timeout).  Because `accept()`
+    /// hands out connections FIFO, once this flush is counted every
+    /// connection that completed its handshake before it is counted too.
+    /// This lets the test assert "no egress was accepted before this point"
+    /// without racing the detached accept loop.
+    fn drain(&self) {
+        let target = *self.count.lock().unwrap() + 1;
+        let _flush =
+            TcpStream::connect(("127.0.0.1", self.port)).expect("observer flush connection");
+        let mut count = self.count.lock().unwrap();
+        while *count < target {
+            let (guard, timed_out) = self
+                .ack
+                .wait_timeout(count, std::time::Duration::from_secs(5))
+                .unwrap();
+            count = guard;
+            assert!(
+                !timed_out.timed_out(),
+                "proxy observer drain timed out; accept loop stalled"
+            );
+        }
     }
 }
 
@@ -117,11 +156,7 @@ fn obtain_proof_consumes_the_mocked_service_and_makes_no_live_call() {
     let solve = |_c: &Challenge| Some("silent".to_string());
     let solver: &dyn Fn(&Challenge) -> Option<String> = &solve;
 
-    // Connections accepted during obtain_proof are counted by the
-    // detached accept thread.  We read the counter after the call
-    // returns; a leak whose TCP handshake completes after this read
-    // is outside the assertion's window (see module-level doc).
-    let count_before = observer.count.load(Ordering::SeqCst);
+    let count_before = observer.count();
 
     let proof = obtain_proof(&cfg, Some(solver))
         .expect("obtain_proof should complete against the mocked service");
@@ -130,7 +165,14 @@ fn obtain_proof_consumes_the_mocked_service_and_makes_no_live_call() {
     challenge.assert();
     answer.assert();
 
-    let leak_count = observer.count.load(Ordering::SeqCst) - count_before;
+    // Drain the accept loop before asserting: a leak connection that was
+    // accepted (or sitting in the backlog) when obtain_proof returned is
+    // counted ahead of the flush, so the count after drain reflects all
+    // egress in flight during the call.  The flush connection itself is
+    // accepted and counted too, so it is excluded from the leak accounting
+    // (exactly one connection).
+    observer.drain();
+    let leak_count = observer.count() - count_before - 1;
 
     assert_eq!(
         leak_count, 0,

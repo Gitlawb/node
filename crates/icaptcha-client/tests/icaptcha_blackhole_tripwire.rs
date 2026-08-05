@@ -27,7 +27,8 @@
 //!     real network.
 //!   - This depends on reqwest's `NO_PROXY` matching by exact IP (holds in the
 //!     pinned reqwest/hyper-util; recheck on upgrade) and on the OS routing
-//!     `127/8` as loopback (default on Linux; macOS may need an explicit alias).
+//!     `127/8` as loopback (default on Linux; macOS needs an explicit alias —
+//!     the test fails loudly, never skips, if `127.0.0.2` cannot be bound).
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -91,15 +92,19 @@ fn make_cfg(url: &str) -> IcaptchaCfg {
 
 #[test]
 fn obtain_proof_blackhole_tripwire() {
-    // Try to bind to 127.0.0.2 — skip if the OS doesn't route 127/8 as
-    // loopback (macOS needs an explicit alias).
-    let listener = match TcpListener::bind("127.0.0.2:0") {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("SKIP: 127.0.0.2 not available ({e}); skipping tripwire test");
-            return;
-        }
-    };
+    // Bind to 127.0.0.2, a loopback alias NOT covered by NO_PROXY.  Linux
+    // routes the whole 127/8 block as loopback; macOS does not alias it by
+    // default (add one with `sudo ifconfig lo0 alias 127.0.0.2`).  Fail
+    // loudly on platforms that cannot bind it: a silent skip would report
+    // this tripwire as green while exercising none of the negative control,
+    // recreating the very gap it exists to close.
+    let listener = TcpListener::bind("127.0.0.2:0").expect(
+        "cannot bind 127.0.0.2 for the blackhole tripwire. Linux routes \
+         127/8 as loopback; on macOS add the alias first \
+         (`sudo ifconfig lo0 alias 127.0.0.2`). This test fails rather than \
+         silently skipping so a platform without the alias cannot count the \
+         negative control as passed.",
+    );
     let port = listener.local_addr().unwrap().port();
     let url = format!("http://127.0.0.2:{port}");
     serve_icaptcha(listener);
