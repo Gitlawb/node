@@ -194,6 +194,46 @@ pub struct Config {
     )]
     pub db_max_connections: u32,
 
+    /// Maximum connections in the dedicated advisory-lock pool, which is separate
+    /// from the main pool above.
+    ///
+    /// Size this against the expected peak number of concurrent distinct-repo
+    /// writers, NOT small. Every in-flight repo write pins one connection here for
+    /// its whole duration (the write, its metadata tail, and the bounded archive
+    /// upload), so this value is a hard ceiling on simultaneous writes node-wide.
+    /// Keeping it separate from GITLAWB_DB_MAX_CONNECTIONS is what stops a push
+    /// burst from starving ordinary request handlers; the cost is that
+    /// (main pool + lock pool) must fit inside the database server's
+    /// max_connections, times the number of nodes, plus admin tooling.
+    #[arg(
+        long,
+        env = "GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS",
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub db_lock_pool_max_connections: u32,
+
+    /// Upper bound, in seconds, on any single object-storage transfer that runs
+    /// while the per-repo advisory lock is HELD.
+    ///
+    /// Two bounded spans exist, and the bound applies per span. The acquire-side
+    /// refresh in `acquire_write` covers the existence HEAD and the download
+    /// together under ONE budget (it runs after the lock is taken and before the
+    /// guard is constructed), and the archive upload in `release` gets its own.
+    /// Worst-case slot occupancy is therefore about twice this value plus the git
+    /// work between them, not one times this value. Both used to be free, because the lock's
+    /// connection was returned to the pool immediately; now that a write guard
+    /// pins a lock-pool connection for its whole lifetime, an unbounded transfer
+    /// holds that slot, and enough stalled transfers deny every write on the node.
+    /// This is the bound that keeps a stall from becoming an outage.
+    #[arg(
+        long,
+        env = "GITLAWB_LOCK_HELD_TRANSFER_TIMEOUT_SECS",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub lock_held_transfer_timeout_secs: u64,
+
     /// Maximum time a request waits for a pool connection before failing with
     /// 503, in seconds. Bounds queueing when the database is slow or down.
     #[arg(
@@ -255,6 +295,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_pool_size_defaults_to_32_and_rejects_zero() {
+        assert_eq!(
+            Config::parse_from(["gitlawb-node"]).db_lock_pool_max_connections,
+            32
+        );
+        assert_eq!(
+            Config::parse_from(["gitlawb-node", "--db-lock-pool-max-connections", "8"])
+                .db_lock_pool_max_connections,
+            8
+        );
+        // A zero-sized lock pool would deny every write, so clap must reject it
+        // rather than let a node boot into a state where no repo can be written.
+        assert!(
+            Config::try_parse_from(["gitlawb-node", "--db-lock-pool-max-connections", "0"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn git_service_timeout_defaults_to_600_and_rejects_zero() {

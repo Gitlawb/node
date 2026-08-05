@@ -250,11 +250,6 @@ pub struct Db {
 }
 
 impl Db {
-    /// Access the underlying Postgres connection pool.
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
-    }
-
     #[cfg(test)]
     pub fn for_testing(pool: PgPool) -> Self {
         Self { pool }
@@ -293,6 +288,46 @@ impl Db {
         let db = Self { pool };
         db.migrate().await?;
         Ok(db)
+    }
+
+    /// Build the dedicated pool that advisory-lock connections come from.
+    ///
+    /// Deliberately **lazy**: connections open on first use rather than at boot.
+    /// The main pool has to connect eagerly because it runs migrations, which is
+    /// why it needs `connect_db_with_retry`'s backoff and degraded-server
+    /// handoff. This pool has no startup work at all, so an eager connect would
+    /// only add a new way for the process to fail to boot, and would need a
+    /// second copy of that retry machinery to be safe. Being lazy removes the
+    /// failure mode instead of handling it: if Postgres is unreachable when the
+    /// first write arrives, that write fails on the pool's own acquire timeout,
+    /// the same way any other database-backed request already does.
+    ///
+    /// Kept separate from the main pool so a burst of lock-holding connections
+    /// cannot starve ordinary request handlers. See
+    /// `GITLAWB_DB_LOCK_POOL_MAX_CONNECTIONS` for the sizing tradeoff.
+    pub fn lock_pool(
+        database_url: &str,
+        max_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Result<PgPool> {
+        info!(
+            max_connections,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "creating dedicated advisory-lock pool (lazy)"
+        );
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            // Explicit, and load-bearing rather than cosmetic: `RepoWriteGuard::Drop`
+            // has a no-runtime branch that calls `PoolConnection::leak()` and relies
+            // on the husk's own drop doing nothing. With `min_connections > 0` that
+            // drop still spawns a pool-replenish task, and spawning without a runtime
+            // panics inside Drop, which aborts the process during unwind. It is 0 by
+            // default, so this line exists to keep a future tuning change from
+            // silently re-arming that panic.
+            .min_connections(0)
+            .acquire_timeout(acquire_timeout)
+            .connect_lazy(database_url)
+            .context("creating advisory-lock pool")
     }
 
     /// Cheap liveness probe against the pool, for readiness checks: one
