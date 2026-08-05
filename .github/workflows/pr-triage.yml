@@ -70,9 +70,23 @@ jobs:
             const changedRust = names.some(n => n.startsWith("crates/") && n.endsWith(".rs"));
             // A test can live in a tests/ dir, a *_test.rs file, or (the common Rust
             // pattern) an inline #[test] / #[cfg(test)] block added inside the source file.
+            // Match an added attribute whose last path component contains `test`,
+            // followed by `]` or `(`. That covers the four forms in the tree today
+            // (#[test], #[tokio::test], #[tokio::test(flavor = ...)], #[sqlx::test])
+            // and the harnesses a future contributor might reach for without naming
+            // them one by one (#[rstest], #[test_case], #[wasm_bindgen_test]).
+            //
+            // Deliberately NOT keying on an added assert!/assert_eq!: a production
+            // assertion is ordinary Rust, so that signal lets a testless PR clear the
+            // label silently. This heuristic is only a nudge, so it should fail in the
+            // loud direction -- labeling a PR that did add tests gets corrected by the
+            // author, while clearing one that did not is invisible.
+            //
+            // Anchored to the start of the added line, so a comment or a string that
+            // merely mentions #[test] does not count.
             const addsInlineTest = files.some(f =>
               f.filename.endsWith(".rs") && f.patch &&
-              /^\+.*#\[(test\]|cfg\(test\))/m.test(f.patch));
+              /^\+\s*#\[(cfg\(test\)|(?:\w+::)*\w*test\w*[\](])/m.test(f.patch));
             const touchedTests =
               names.some(n => n.includes("/tests/") || n.endsWith("_test.rs")) || addsInlineTest;
             if (changedRust && !touchedTests) want.add("needs-tests");
