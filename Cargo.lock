@@ -3378,10 +3378,13 @@ version = "0.7.1"
 dependencies = [
  "anyhow",
  "gitlawb-core",
+ "libc",
  "mockito",
  "reqwest",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
