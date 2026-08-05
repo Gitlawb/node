@@ -216,6 +216,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Resolve release tag
         id: rel
         env:
@@ -223,13 +228,7 @@ jobs:
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
-          esac
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
           # ghcr requires a lowercase repository path, and unlike metadata-action,
           # buildx's `--output name=` does no lowercasing — a mixed-case owner
           # makes the digest push fail with "invalid reference format".
@@ -311,8 +310,14 @@ jobs:
     if: ${{ !cancelled() && needs.docker.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       packages: write
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Resolve release tag
         id: rel
         env:
@@ -320,13 +325,7 @@ jobs:
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
-          esac
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
 
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -542,6 +541,11 @@ jobs:
       contents: read
       id-token: write # npm trusted publishing (OIDC) + provenance
     steps:
+      - name: Check out workflow scripts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
       - name: Resolve release tag
         id: rel
         env:
@@ -549,13 +553,7 @@ jobs:
           RELEASE_TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           set -euo pipefail
-          TAG="${DISPATCH_TAG:-$RELEASE_TAG}"
-          case "$TAG" in
-            v[0-9]*) ;;
-            *) echo "::error::'$TAG' does not look like a release tag (vX.Y.Z)"; exit 1 ;;
-          esac
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+          scripts/resolve-release-tag.sh "${DISPATCH_TAG:-$RELEASE_TAG}"
 
       - name: Checkout release tag
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
