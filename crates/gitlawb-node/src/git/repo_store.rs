@@ -152,7 +152,34 @@ impl RepoStore {
     }
 
     /// Take a write lock (Postgres advisory lock), ensure repo is local, return guard.
-    /// The lock prevents concurrent writes to the same repo across machines.
+    ///
+    /// # Cross-machine guarantee
+    ///
+    /// When multiple nodes share a single Postgres database (the shared-Postgres
+    /// deployment model), this lock prevents concurrent writes to the same repo
+    /// across machines. The lock has no effect across separate Postgres instances
+    /// (federated per-node-DB topology).
+    ///
+    /// # Rolling upgrade caveat (SHA-256 re-keying)
+    ///
+    /// This function hashes `(owner_slug, repo_name)` with SHA-256 to produce a
+    /// stable `i64` key. Earlier builds used `std::collections::DefaultHasher`,
+    /// whose algorithm is not frozen by the Rust standard and has already
+    /// shifted across toolchain versions. The SHA-256 swap re-keys *every*
+    /// repo: an old-binary node holding the legacy `DefaultHasher` key and a
+    /// new-binary node holding the SHA-256 key for the same repo compute
+    /// *different* i64 keys, so PostgreSQL treats them as independent locks and
+    /// the cross-machine write-exclusion this lock provides is lost for the
+    /// duration of a rolling upgrade.
+    ///
+    /// The accepted remediation (see issue #210) is operational: during a
+    /// shared-Postgres rolling upgrade, **drain in-flight writes or cut over
+    /// through a single node** (e.g. stop receive-pack / issue / pull / archive
+    /// writers on the old version) before bringing new-binary nodes online. The
+    /// window is bounded by the operator's rollout cadence. A future
+    /// transition release could acquire both legacy and new keys for one cycle
+    /// and drop the legacy one a release later; that's optional given the
+    /// accepted-window path.
     pub async fn acquire_write(&self, owner_did: &str, repo_name: &str) -> Result<RepoWriteGuard> {
         let (owner_slug, local_path) = self.local_path(owner_did, repo_name)?;
         let lock_key = advisory_lock_key(&owner_slug, repo_name);
@@ -518,12 +545,19 @@ impl RepoWriteGuard {
 }
 
 /// Compute a stable i64 hash for a Postgres advisory lock key.
+///
+/// Uses SHA-256 (not `DefaultHasher`) so the same `(owner_slug, repo_name)`
+/// produces the same `i64` key across every Rust toolchain version, operating
+/// system, and machine — the algorithm is frozen by the SHA-2 standard rather
+/// than by a std-internal implementation detail.
 fn advisory_lock_key(owner_slug: &str, repo_name: &str) -> i64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    owner_slug.hash(&mut hasher);
-    repo_name.hash(&mut hasher);
-    hasher.finish() as i64
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(owner_slug.as_bytes());
+    hasher.update(b":");
+    hasher.update(repo_name.as_bytes());
+    let digest = hasher.finalize();
+    i64::from_le_bytes(digest[..8].try_into().expect("sha256 output is >= 8 bytes"))
 }
 
 #[cfg(test)]
@@ -931,5 +965,47 @@ mod tests {
                 "owner_did={bad:?} must be rejected"
             );
         }
+    }
+
+    // ── advisory_lock_key stability ─────────────────────────────────────────
+
+    #[test]
+    fn advisory_lock_key_is_stable() {
+        // Golden value: SHA-256("did_key_...:<repo_name>")[..8] as i64 little-endian.
+        // If this test fails, the hashing algorithm has changed — the new key
+        // must be backward-compatible or the rollout planned accordingly.
+        let key = advisory_lock_key(
+            "did_key_z6MkqDnb7Siv3Cwj7pGJq4T5EsUisECqR8KpnDLwcaZq5TPr",
+            "hello",
+        );
+        assert_eq!(key, -6680856138670956537_i64);
+    }
+
+    #[test]
+    fn advisory_lock_key_differs_for_different_inputs() {
+        // Vary one axis at a time so a regression that drops either parameter
+        // from the hash is caught, not just one that drops both. The golden
+        // test above backstops a total algorithm swap.
+        let base = advisory_lock_key("owner_a", "repo_a");
+
+        // Same owner, different repo: a regression that hashes only owner_slug
+        // would make these collide.
+        let same_owner_diff_repo = advisory_lock_key("owner_a", "repo_b");
+        assert_ne!(
+            base, same_owner_diff_repo,
+            "key must depend on repo_name, not just owner_slug"
+        );
+
+        // Same repo, different owner: a regression that hashes only repo_name
+        // would make these collide.
+        let diff_owner_same_repo = advisory_lock_key("owner_b", "repo_a");
+        assert_ne!(
+            base, diff_owner_same_repo,
+            "key must depend on owner_slug, not just repo_name"
+        );
+
+        // Sanity: both axes varying at once still differs (the original shape).
+        let both_differ = advisory_lock_key("owner_b", "repo_b");
+        assert_ne!(base, both_differ);
     }
 }
