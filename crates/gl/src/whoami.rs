@@ -1,6 +1,6 @@
 //! `gl whoami` — print current identity and optional node registration info.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -23,8 +23,7 @@ pub struct WhoamiArgs {
 }
 
 pub async fn run(args: WhoamiArgs) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    run_to_writer(args, &mut stdout).await
+    run_to_writer(args, &mut std::io::stdout()).await
 }
 
 pub(crate) async fn run_to_writer(args: WhoamiArgs, w: &mut impl std::io::Write) -> Result<()> {
@@ -78,7 +77,8 @@ pub(crate) async fn run_to_writer(args: WhoamiArgs, w: &mut impl std::io::Write)
                 );
             }
             Err(e) => {
-                bail!("agent lookup failed: {e}");
+                let msg = sanitize_node_msg(&e.to_string());
+                return Err(e).context(format!("agent lookup failed: {msg}"));
             }
         }
     }
@@ -215,7 +215,23 @@ mod tests {
             node: Some(server.url()),
             json: false,
         };
-        run(args).await.unwrap();
+        let mut out = Vec::new();
+        run_to_writer(args, &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Registered: no"), "unexpected output: {out}");
+
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(server.url()),
+            json: true,
+        };
+        let mut out = Vec::new();
+        run_to_writer(args, &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("\"registered\": false"),
+            "unexpected output: {out}"
+        );
     }
 
     #[tokio::test]
