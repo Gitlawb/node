@@ -65,10 +65,12 @@ pub(crate) async fn run_to_writer(args: WhoamiArgs, w: &mut impl std::io::Write)
                 let msg = serde_json::from_str::<Value>(&raw)
                     .ok()
                     .and_then(|v| {
-                        v.get("message")
-                            .or_else(|| v.get("error"))
-                            .and_then(|m| m.as_str())
-                            .map(String::from)
+                        let non_empty = |m: Option<&Value>| {
+                            m.and_then(|m| m.as_str())
+                                .map(String::from)
+                                .filter(|s| !s.is_empty())
+                        };
+                        non_empty(v.get("message")).or_else(|| non_empty(v.get("error")))
                     })
                     .unwrap_or(raw);
                 bail!(
@@ -297,15 +299,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_whoami_server_error_unusable_message_uses_error() {
+        let dir = TempDir::new().unwrap();
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let pem = kp.to_pem().unwrap();
+        std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
+        let did = kp.did().to_string();
+
+        let mut server = mockito::Server::new_async().await;
+        let _agent = server
+            .mock("GET", format!("/api/v1/agents/{did}").as_str())
+            .with_status(500)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"","error":"boom"}"#)
+            .create_async()
+            .await;
+
+        let args = WhoamiArgs {
+            dir: Some(dir.path().to_path_buf()),
+            node: Some(server.url()),
+            json: false,
+        };
+        let err = run(args).await.unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("boom"),
+            "expected 'boom' from error field, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_whoami_with_node_transport_error() {
         let dir = TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
         let pem = kp.to_pem().unwrap();
         std::fs::write(dir.path().join("identity.pem"), pem.as_bytes()).unwrap();
 
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let node = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
         let args = WhoamiArgs {
             dir: Some(dir.path().to_path_buf()),
-            node: Some("http://127.0.0.1:1".to_string()),
+            node: Some(node),
             json: false,
         };
         let err = run(args).await.unwrap_err();
