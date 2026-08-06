@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_whoami_server_error_caps_body_size() {
+    async fn test_whoami_server_error_body_display_bounded() {
         let dir = TempDir::new().unwrap();
         let kp = gitlawb_core::identity::Keypair::generate();
         let pem = kp.to_pem().unwrap();
