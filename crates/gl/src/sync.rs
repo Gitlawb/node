@@ -107,7 +107,7 @@ fn trigger_counts(resp: &serde_json::Value) -> (u64, u64) {
 /// Read at most `cap` bytes of a response body. Bounds the allocation from a
 /// hostile or broken node returning a huge error body — the display is capped
 /// separately, but the read itself must not be unbounded (INV-6, read half).
-async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
+pub(crate) async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
     let mut buf: Vec<u8> = Vec::new();
     while buf.len() < cap {
         match resp.chunk().await {
@@ -130,7 +130,7 @@ async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> String {
 /// reach the terminal verbatim (INV-6). We drop the C0/C1 control bytes (which
 /// defangs ANSI/OSC escapes) AND the Unicode bidi/format controls (which
 /// `char::is_control` does not cover — they can reorder the displayed line).
-fn sanitize_node_msg(s: &str) -> String {
+pub(crate) fn sanitize_node_msg(s: &str) -> String {
     s.chars()
         .filter(|c| !c.is_control() && !gitlawb_core::sanitize::is_bidi_format(*c))
         .take(200)
