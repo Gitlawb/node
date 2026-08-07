@@ -81,8 +81,41 @@ pub struct PullRequest {
     pub status: String, // "open" | "merged" | "closed"
     pub merged_by_did: Option<String>,
     pub merged_at: Option<String>,
+    /// Head commit of the source branch, tracked while the pull request is open
+    /// and frozen at close or merge. Null until something pushes to that branch.
+    pub head_commit: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// One append-only commit-status claim. A producer reporting twice for the same
+/// context leaves both rows; the visible status is a projection over the history,
+/// ordered on the database-assigned `seq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusClaim {
+    pub id: String,
+    /// Database-assigned ordering key. Ignored on insert (see
+    /// [`Db::insert_status_claim`]); nothing the producer supplies orders the
+    /// projection.
+    pub seq: i64,
+    pub repo_id: String,
+    /// Lowercase 40-character hex commit SHA. Never existence-checked.
+    pub commit_sha: String,
+    pub state: String,
+    pub context: String,
+    pub target_url: Option<String>,
+    pub description: Option<String>,
+    pub producer_did: String,
+    pub authorizing_did: String,
+    /// The producer's RFC 9421 `Signature` header value, and below it the
+    /// `Signature-Input` and the canonical bytes they covered. Captured at write
+    /// time because none of it can be recovered once the request is gone, which
+    /// is what keeps a claim verifiable as history.
+    pub signature: String,
+    pub signature_input: String,
+    pub signed_payload: Vec<u8>,
+    /// Server-assigned rfc3339 timestamp. Display data only; ordering is `seq`.
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -899,6 +932,69 @@ const MIGRATIONS: &[Migration] = &[
             // handed to a worker. Null until first dequeued, which is why the
             // ordering coalesces onto enqueued_at.
             "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
+        ],
+    },
+    // Reservation: v24, not main's current_max + 1 (which is 18). Same reason as
+    // v17 above — the runner keys the applied set on the version integer alone,
+    // so a version another in-flight branch also claims is skipped in full on
+    // whichever side merges second, silently and with schema_migrations still
+    // reading healthy. Two open branches claim 18 through 23 under their own
+    // names: origin/pr-173 and origin/fix/issue-135-ipfs-cid-tree-gate. 24
+    // clears both. Gaps are harmless; the runner never requires contiguity.
+    //
+    // The whole commit-status surface lands in this one entry rather than three,
+    // because a merged entry is never edited and a second version would collide
+    // with the same branches this one already had to clear.
+    Migration {
+        version: 24,
+        name: "status_claims_pr_head_and_push_events",
+        stmts: &[
+            // Append-only claim history. `seq` is a bigserial because the
+            // ordering key must be assigned by the database: the producer
+            // supplies nothing that orders the projection, and created_at is
+            // display data that can collide within a single second.
+            r#"CREATE TABLE IF NOT EXISTS status_claims (
+                id               TEXT NOT NULL PRIMARY KEY,
+                seq              BIGSERIAL NOT NULL,
+                repo_id          TEXT NOT NULL,
+                commit_sha       TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                context          TEXT NOT NULL,
+                target_url       TEXT,
+                description      TEXT,
+                producer_did     TEXT NOT NULL,
+                authorizing_did  TEXT NOT NULL,
+                signature        TEXT NOT NULL,
+                signature_input  TEXT NOT NULL,
+                signed_payload   BYTEA NOT NULL,
+                created_at       TEXT NOT NULL
+            )"#,
+            // Read path: every claim for one commit.
+            "CREATE INDEX IF NOT EXISTS idx_status_claims_repo_commit ON status_claims(repo_id, commit_sha)",
+            // Cap count and latest-per-tuple lookup, which orders on seq DESC.
+            "CREATE INDEX IF NOT EXISTS idx_status_claims_tuple ON status_claims(repo_id, commit_sha, producer_did, context, seq DESC)",
+            // Stored head of a pull request's source branch. Nullable: a PR
+            // opened before anything pushed has no head yet.
+            "ALTER TABLE pull_requests ADD COLUMN IF NOT EXISTS head_commit TEXT",
+            // Local push events, one row per ref update observed on the
+            // receive-pack path. Deliberately NOT received_ref_updates, which
+            // the unauthenticated global feed at /api/v1/events/ref-updates also
+            // reads: writing local pushes there would publish private-repo
+            // pushes on an anonymous surface. Also not `push_events`, which v1
+            // already defines for agent trust scoring on a different shape
+            // (agent_did, commit_hash, object_count, pushed_at); reusing that
+            // name would have been a silent no-op under IF NOT EXISTS.
+            r#"CREATE TABLE IF NOT EXISTS repo_push_events (
+                id         TEXT NOT NULL PRIMARY KEY,
+                repo_id    TEXT NOT NULL,
+                ref_name   TEXT NOT NULL,
+                after_sha  TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"#,
+            // Keyset paging cursor: (created_at, id) ascending within a repo, so
+            // a poller with a since-cursor pages forward with an id tiebreak
+            // when two pushes share a timestamp.
+            "CREATE INDEX IF NOT EXISTS idx_repo_push_events_cursor ON repo_push_events(repo_id, created_at, id)",
         ],
     },
 ];
@@ -1773,7 +1869,7 @@ impl Db {
     pub async fn list_prs(&self, repo_id: &str) -> Result<Vec<PullRequest>> {
         let rows = sqlx::query(
             "SELECT id,repo_id,number,title,body,author_did,source_branch,target_branch,
-                    status,merged_by_did,merged_at,created_at,updated_at
+                    status,merged_by_did,merged_at,head_commit,created_at,updated_at
              FROM pull_requests WHERE repo_id=$1 ORDER BY number DESC",
         )
         .bind(repo_id)
@@ -1785,7 +1881,7 @@ impl Db {
     pub async fn get_pr(&self, repo_id: &str, number: i64) -> Result<Option<PullRequest>> {
         let row = sqlx::query(
             "SELECT id,repo_id,number,title,body,author_did,source_branch,target_branch,
-                    status,merged_by_did,merged_at,created_at,updated_at
+                    status,merged_by_did,merged_at,head_commit,created_at,updated_at
              FROM pull_requests WHERE repo_id=$1 AND number=$2",
         )
         .bind(repo_id)
@@ -1965,6 +2061,63 @@ impl Db {
                 created_at: r.get("created_at"),
             })
             .collect())
+    }
+}
+
+// ── Status Claims ─────────────────────────────────────────────────────────────
+
+impl Db {
+    /// Append one claim. `claim.seq` is ignored: the column is a `bigserial` and
+    /// the database assigns the value, which is returned here so a caller can
+    /// report the row it just wrote without a second read.
+    // Consumed by the write handler in U3; tests are the only caller until then.
+    #[allow(dead_code)]
+    pub async fn insert_status_claim(&self, claim: &StatusClaim) -> Result<i64> {
+        let row = sqlx::query(
+            "INSERT INTO status_claims
+             (id, repo_id, commit_sha, state, context, target_url, description,
+              producer_did, authorizing_did, signature, signature_input,
+              signed_payload, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+             RETURNING seq",
+        )
+        .bind(&claim.id)
+        .bind(&claim.repo_id)
+        .bind(&claim.commit_sha)
+        .bind(&claim.state)
+        .bind(&claim.context)
+        .bind(&claim.target_url)
+        .bind(&claim.description)
+        .bind(&claim.producer_did)
+        .bind(&claim.authorizing_did)
+        .bind(&claim.signature)
+        .bind(&claim.signature_input)
+        .bind(&claim.signed_payload)
+        .bind(&claim.created_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get::<i64, _>("seq"))
+    }
+
+    /// Every claim recorded for one commit, oldest first. Ordering is on `seq`,
+    /// never on the timestamp, which is display data and can collide.
+    #[allow(dead_code)]
+    pub async fn list_status_claims(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+    ) -> Result<Vec<StatusClaim>> {
+        let rows = sqlx::query(
+            "SELECT id,seq,repo_id,commit_sha,state,context,target_url,description,
+                    producer_did,authorizing_did,signature,signature_input,
+                    signed_payload,created_at
+             FROM status_claims WHERE repo_id=$1 AND commit_sha=$2 ORDER BY seq ASC",
+        )
+        .bind(repo_id)
+        .bind(commit_sha)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_status_claim).collect())
     }
 }
 
@@ -2867,8 +3020,28 @@ fn row_to_pr(r: sqlx::postgres::PgRow) -> PullRequest {
         status: r.get("status"),
         merged_by_did: r.get("merged_by_did"),
         merged_at: r.get("merged_at"),
+        head_commit: r.get("head_commit"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+    }
+}
+
+fn row_to_status_claim(r: sqlx::postgres::PgRow) -> StatusClaim {
+    StatusClaim {
+        id: r.get("id"),
+        seq: r.get("seq"),
+        repo_id: r.get("repo_id"),
+        commit_sha: r.get("commit_sha"),
+        state: r.get("state"),
+        context: r.get("context"),
+        target_url: r.get("target_url"),
+        description: r.get("description"),
+        producer_did: r.get("producer_did"),
+        authorizing_did: r.get("authorizing_did"),
+        signature: r.get("signature"),
+        signature_input: r.get("signature_input"),
+        signed_payload: r.get("signed_payload"),
+        created_at: r.get("created_at"),
     }
 }
 
@@ -3838,6 +4011,334 @@ mod migration_tests {
 
         // Idempotent re-run.
         db.migrate().await.unwrap();
+    }
+
+    // ── Status claims, stored PR head, push events (v24) ─────────────────────
+
+    /// The version this branch's migration claims. Kept as a named constant so
+    /// the upgrade test's rollback target is derived from `MIGRATIONS` rather
+    /// than hard-coded twice.
+    const V24: i64 = 24;
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn sample_claim(repo_id: &str, sha: &str, context: &str) -> super::StatusClaim {
+        super::StatusClaim {
+            id: uuid::Uuid::new_v4().to_string(),
+            // Ignored on insert: the database assigns the ordering key.
+            seq: 0,
+            repo_id: repo_id.to_string(),
+            commit_sha: sha.to_string(),
+            state: "success".to_string(),
+            context: context.to_string(),
+            target_url: Some("https://ci.example.com/runs/1".to_string()),
+            description: Some("all checks passed".to_string()),
+            producer_did: "did:key:zProducer".to_string(),
+            authorizing_did: "did:key:zOwner".to_string(),
+            signature: "sig1=:YWJj:".to_string(),
+            signature_input: "sig1=(\"@method\" \"@target-uri\");created=1754524800".to_string(),
+            signed_payload: b"POST /api/v1/repos/o/r/statuses/aaa\n{}".to_vec(),
+            created_at: "2026-08-07T00:00:00+00:00".to_string(),
+        }
+    }
+
+    async fn table_exists(db: &super::Db, table: &str) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("public.{table}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn column_exists(db: &super::Db, table: &str, column: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns
+             WHERE table_name = $1 AND column_name = $2)",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn insert_push_event(db: &super::Db, repo_id: &str, ref_name: &str, sha: &str, at: &str) {
+        sqlx::query(
+            "INSERT INTO repo_push_events (id, repo_id, ref_name, after_sha, created_at)
+             VALUES ($1,$2,$3,$4,$5)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(sha)
+        .bind(at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    fn sample_pr(repo_id: &str, number: i64) -> super::PullRequest {
+        super::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo_id.to_string(),
+            number,
+            title: "add a thing".to_string(),
+            body: None,
+            author_did: "did:key:zAuthor".to_string(),
+            source_branch: "feature".to_string(),
+            target_branch: "main".to_string(),
+            status: "open".to_string(),
+            merged_by_did: None,
+            merged_at: None,
+            head_commit: None,
+            created_at: "2026-08-07T00:00:00+00:00".to_string(),
+            updated_at: "2026-08-07T00:00:00+00:00".to_string(),
+        }
+    }
+
+    /// Fresh-database path: the whole chain on an empty database creates all
+    /// three v24 objects, and a claim round-trips field for field, including
+    /// the nullable columns in both directions.
+    #[sqlx::test]
+    async fn migration_v24_fresh_chain_round_trips_a_claim(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        assert!(table_exists(&db, "status_claims").await);
+        assert!(table_exists(&db, "repo_push_events").await);
+        assert!(column_exists(&db, "pull_requests", "head_commit").await);
+
+        let full = sample_claim("repo-1", SHA_A, "ci/build");
+        let seq = db.insert_status_claim(&full).await.unwrap();
+        assert!(seq > 0, "the database must assign a positive sequence");
+
+        // Same tuple, nullable fields absent.
+        let mut sparse = sample_claim("repo-1", SHA_A, "ci/build");
+        sparse.state = "pending".to_string();
+        sparse.target_url = None;
+        sparse.description = None;
+        db.insert_status_claim(&sparse).await.unwrap();
+
+        let claims = db.list_status_claims("repo-1", SHA_A).await.unwrap();
+        assert_eq!(claims.len(), 2, "both claims are kept, nothing overwritten");
+
+        let got = &claims[0];
+        assert_eq!(got.id, full.id);
+        assert_eq!(got.seq, seq);
+        assert_eq!(got.repo_id, full.repo_id);
+        assert_eq!(got.commit_sha, full.commit_sha);
+        assert_eq!(got.state, full.state);
+        assert_eq!(got.context, full.context);
+        assert_eq!(got.target_url, full.target_url);
+        assert_eq!(got.description, full.description);
+        assert_eq!(got.producer_did, full.producer_did);
+        assert_eq!(got.authorizing_did, full.authorizing_did);
+        assert_eq!(got.signature, full.signature);
+        assert_eq!(got.signature_input, full.signature_input);
+        assert_eq!(got.signed_payload, full.signed_payload);
+        assert_eq!(got.created_at, full.created_at);
+
+        let sparse_row = &claims[1];
+        assert_eq!(sparse_row.id, sparse.id);
+        assert_eq!(sparse_row.state, "pending");
+        assert_eq!(sparse_row.target_url, None, "nullable column reads as None");
+        assert_eq!(
+            sparse_row.description, None,
+            "nullable column reads as None"
+        );
+
+        // A different commit does not see this commit's claims.
+        assert!(db
+            .list_status_claims("repo-1", &"b".repeat(40))
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The push-events table takes a row per observed ref update.
+        insert_push_event(
+            &db,
+            "repo-1",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T00:00:00+00:00",
+        )
+        .await;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM repo_push_events WHERE repo_id = $1")
+                .bind("repo-1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Upgrade path, the load-bearing one: `#[sqlx::test]` hands out a fresh
+    /// database that runs the entire chain, so the fresh-chain test above stays
+    /// green even if the v24 statements were appended to an already-applied
+    /// entry. Only a simulated existing node catches that.
+    #[sqlx::test]
+    async fn migration_v24_upgrade_path_adds_claims_head_commit_and_push_events(
+        pool: sqlx::PgPool,
+    ) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll the database back to the state of a node at the highest version
+        // below 24 that this build declares.
+        sqlx::query("DROP TABLE IF EXISTS status_claims")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE IF EXISTS repo_push_events")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE pull_requests DROP COLUMN IF EXISTS head_commit")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version >= $1")
+            .bind(V24)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let prior = MIGRATIONS
+            .iter()
+            .map(|m| m.version)
+            .filter(|v| *v < V24)
+            .max()
+            .expect("MIGRATIONS must declare a version below 24");
+        let recorded_max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_max, prior,
+            "the simulated node must sit at the highest version below {V24}"
+        );
+
+        // A pull request written by the old node, before the column existed.
+        let legacy = sample_pr("repo-legacy", 1);
+        db.create_pr(&legacy).await.unwrap();
+
+        // Upgrade through the real entry point rather than hand-copied SQL.
+        db.migrate().await.unwrap();
+
+        assert!(
+            table_exists(&db, "status_claims").await,
+            "status_claims missing after upgrade on an existing node"
+        );
+        assert!(
+            table_exists(&db, "repo_push_events").await,
+            "repo_push_events missing after upgrade on an existing node"
+        );
+        assert!(
+            column_exists(&db, "pull_requests", "head_commit").await,
+            "head_commit missing after upgrade on an existing node"
+        );
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'pull_requests' AND column_name = 'head_commit'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "head_commit must be nullable");
+
+        // The pre-existing row survives with a null head.
+        let survived = db.get_pr("repo-legacy", 1).await.unwrap().unwrap();
+        assert_eq!(survived.head_commit, None);
+
+        // And the runtime paths work against the upgraded schema.
+        let claim = sample_claim("repo-legacy", SHA_A, "ci/build");
+        let seq = db.insert_status_claim(&claim).await.unwrap();
+        let claims = db.list_status_claims("repo-legacy", SHA_A).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].id, claim.id);
+        assert_eq!(claims[0].seq, seq);
+        assert_eq!(claims[0].target_url, claim.target_url);
+        insert_push_event(
+            &db,
+            "repo-legacy",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T00:00:00+00:00",
+        )
+        .await;
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 24")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v24 must be recorded as applied");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    /// A pull request opened before anything pushed to its source branch has no
+    /// stored head, on both read paths.
+    #[sqlx::test]
+    async fn pr_created_before_any_push_has_no_head_commit(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        db.create_pr(&sample_pr("repo-1", 1)).await.unwrap();
+
+        let one = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        assert_eq!(
+            one.head_commit, None,
+            "get_pr must read a null head as None"
+        );
+
+        let listed = db.list_prs("repo-1").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].head_commit, None,
+            "list_prs must read a null head as None"
+        );
+    }
+
+    /// The projection orders on `seq`, so prove the database hands out strictly
+    /// increasing values in insertion order rather than assuming it.
+    #[sqlx::test]
+    async fn status_claim_seq_is_monotonic_within_a_tuple(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        let mut seqs = Vec::new();
+        let mut ids = Vec::new();
+        for state in ["pending", "failure", "success"] {
+            let mut claim = sample_claim("repo-1", SHA_A, "ci/build");
+            claim.state = state.to_string();
+            // Identical server timestamp on every row: nothing but `seq` can
+            // recover the insertion order.
+            claim.created_at = "2026-08-07T00:00:00+00:00".to_string();
+            seqs.push(db.insert_status_claim(&claim).await.unwrap());
+            ids.push(claim.id);
+        }
+
+        assert!(
+            seqs[0] < seqs[1] && seqs[1] < seqs[2],
+            "seq must strictly increase in insertion order, got {seqs:?}"
+        );
+
+        let claims = db.list_status_claims("repo-1", SHA_A).await.unwrap();
+        assert_eq!(
+            claims.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            ids,
+            "claims must read back in seq order"
+        );
+        assert_eq!(
+            claims.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            seqs,
+            "the stored seq must be the one the insert reported"
+        );
     }
 
     #[sqlx::test]
