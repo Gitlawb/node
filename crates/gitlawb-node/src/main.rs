@@ -377,6 +377,19 @@ async fn main() -> Result<()> {
         push_limiter_trust,
         sync_trigger_rate_limiter,
         peer_write_rate_limiter,
+        walk_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            config.walk_concurrency_limit as usize,
+        )),
+        ipfs_list_rate_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_list_rate_limit,
+            std::time::Duration::from_secs(3600),
+            200_000,
+        ),
+        ipfs_list_global_limiter: rate_limit::RateLimiter::new_bounded(
+            config.ipfs_list_global_rate_limit,
+            std::time::Duration::from_secs(3600),
+            1,
+        ),
         shutdown_tx: shutdown_tx.clone(),
     };
 
@@ -413,6 +426,8 @@ async fn main() -> Result<()> {
         let push_rl = state.push_rate_limiter.clone();
         let sync_trigger_rl = state.sync_trigger_rate_limiter.clone();
         let peer_write_rl = state.peer_write_rate_limiter.clone();
+        let ipfs_list_rl = state.ipfs_list_rate_limiter.clone();
+        let ipfs_list_global_rl = state.ipfs_list_global_limiter.clone();
         let db = state.db.clone();
         let mut shutdown_rx = state.subscribe_shutdown();
         tokio::spawn(async move {
@@ -424,6 +439,8 @@ async fn main() -> Result<()> {
                         push_rl.cleanup().await;
                         sync_trigger_rl.cleanup().await;
                         peer_write_rl.cleanup().await;
+                        ipfs_list_rl.cleanup().await;
+                        ipfs_list_global_rl.cleanup().await;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)

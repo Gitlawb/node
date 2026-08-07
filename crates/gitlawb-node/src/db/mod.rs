@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
@@ -160,6 +160,8 @@ pub struct PinnedCidRecord {
     pub cid: String,
     pub pinned_at: String,
     pub pinata_cid: Option<String>,
+    pub repo: String,
+    pub owner_did: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,15 +367,33 @@ impl Db {
     /// Must be called while holding the migration advisory lock.
     async fn run_pending_migrations(&self) -> Result<()> {
         for m in MIGRATIONS {
-            let already: bool = sqlx::query(
-                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
-            )
-            .bind(m.version)
-            .fetch_one(&self.pool)
-            .await?
-            .get::<bool, _>("applied");
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT name FROM schema_migrations WHERE version = $1")
+                    .bind(m.version)
+                    .fetch_optional(&self.pool)
+                    .await?;
 
-            if already {
+            if let Some((applied_name,)) = row {
+                // Name-collision guard: the runner keys the applied set on the
+                // version integer alone, so a version claimed by two in-flight
+                // branches is silently skipped in full on whichever side merges
+                // second. Catch that here: if this binary's migration name for
+                // an already-applied version differs from what was recorded,
+                // another branch claimed the number first and this migration
+                // will never run. Fail loudly instead of shipping a node that
+                // believes it migrated.
+                if applied_name != m.name {
+                    bail!(
+                        "migration v{} is already recorded under name {:?}, \
+                         but this binary applies {:?} for that version; \
+                         another branch claimed version {} first. Renumber this \
+                         migration above the current high-water mark.",
+                        m.version,
+                        applied_name,
+                        m.name,
+                        m.version
+                    );
+                }
                 continue;
             }
 
@@ -678,6 +698,15 @@ const MIGRATIONS: &[Migration] = &[
             )"#,
             "CREATE INDEX IF NOT EXISTS idx_repo_replicas_repo ON repo_replicas(repo_id)",
             "CREATE INDEX IF NOT EXISTS idx_repo_replicas_did  ON repo_replicas(replica_did)",
+            // ── Pinned CID repos (junction table for shared-object associations) ──
+            r#"CREATE TABLE IF NOT EXISTS pinned_cid_repos (
+                sha256_hex TEXT NOT NULL,
+                repo       TEXT NOT NULL,
+                owner_did  TEXT NOT NULL,
+                pinned_at  TEXT NOT NULL,
+                PRIMARY KEY (sha256_hex, repo)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cid_repos_repo ON pinned_cid_repos(repo, owner_did)",
             // ── PR comments ─────────────────────────────────────────────────
             r#"CREATE TABLE IF NOT EXISTS pr_comments (
                 id         TEXT NOT NULL PRIMARY KEY,
@@ -856,6 +885,7 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE repos ADD COLUMN IF NOT EXISTS quarantined BOOLEAN NOT NULL DEFAULT FALSE",
         ],
     },
+
     Migration {
         version: 10,
         name: "ref_cert_unique_per_ref",
@@ -883,14 +913,6 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE received_ref_updates ADD COLUMN IF NOT EXISTS owner_did TEXT",
         ],
     },
-    // Reservation: v17, deliberately not main's current_max + 1 (which is 12).
-    // The runner keys the applied set on the integer alone, so a version another
-    // in-flight branch also claims is skipped in full on whichever side merges
-    // second — no error, no warning, and schema_migrations still reads healthy
-    // while the column is simply absent. Two open branches already claim into
-    // this range: #135/#173 holds through 14 (15 once it rebases past v11), and
-    // #253 took 16. 17 clears both. Gaps are harmless: the runner iterates the
-    // array and never requires contiguity.
     Migration {
         version: 17,
         name: "sync_queue_attempted_at",
@@ -899,6 +921,123 @@ const MIGRATIONS: &[Migration] = &[
             // handed to a worker. Null until first dequeued, which is why the
             // ordering coalesces onto enqueued_at.
             "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
+        ],
+    },
+    // Reservation: these four migrations claim versions 18-21, deliberately
+    // above every live claim on main. main's v17 reservation comment holds
+    // 12-14 for the #173 stack and 16 for the old #253 claim; v17 is taken by
+    // sync_queue_attempted_at. The runner keys the applied set on the integer
+    // alone, so a version another in-flight branch also claims is skipped in
+    // full on whichever side merges second — no error, no warning, and
+    // schema_migrations still reads healthy while the objects are simply
+    // absent. If any of 12-21 is claimed by a branch that merges before this
+    // one, renumber above the new high-water mark. The name-collision guard in
+    // run_pending_migrations fails loudly on a version that was applied under a
+    // different name, which is the closest the runner can get to catching a
+    // silent skip.
+    Migration {
+        version: 18,
+        name: "pinned_cids_repo_owner",
+        stmts: &[
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS repo TEXT",
+            "ALTER TABLE pinned_cids ADD COLUMN IF NOT EXISTS owner_did TEXT",
+            // Backfill repo/owner only when both the CID AND the Git SHA match
+            // between pinned_cids and branch_cids.  The CID alone does not encode
+            // the Git object type, so a private blob and a public commit with the
+            // same raw bytes would share a CID, and the plain CID-join would
+            // wrongly assign the private pin to the public repo (P1).  Requiring
+            // p.sha256_hex = bc.sha ensures only the ref-target objects
+            // (commits) are matched — blobs/trees fall through to the empty-
+            // string fallback below, which is safer than a wrong assignment.
+            r#"UPDATE pinned_cids p
+               SET repo = m.repo,
+                   owner_did = m.owner_did
+               FROM (
+                   SELECT DISTINCT
+                       bc.cid,
+                       bc.sha,
+                       bc.repo,
+                       r.owner_did
+                   FROM branch_cids bc
+                   JOIN repos r
+                     ON r.name = split_part(bc.repo, '/', 2)
+                    AND (CASE WHEN r.owner_did LIKE 'did:key:%' AND position(':' in substr(r.owner_did, 9)) = 0 THEN substr(r.owner_did, 9) ELSE r.owner_did END)
+                        = split_part(bc.repo, '/', 1)
+               ) m
+               WHERE p.cid = m.cid
+                 AND p.sha256_hex = m.sha"#,
+            // Fallback for remaining rows
+            "UPDATE pinned_cids SET repo = '' WHERE repo IS NULL",
+            "UPDATE pinned_cids SET owner_did = '' WHERE owner_did IS NULL",
+            // Default the new columns so a pre-v11 binary still running during
+            // a rolling deploy can INSERT (sha256_hex, cid, pinned_at) without
+            // hitting a NOT NULL violation (P2).
+            "ALTER TABLE pinned_cids ALTER COLUMN repo SET DEFAULT ''",
+            "ALTER TABLE pinned_cids ALTER COLUMN owner_did SET DEFAULT ''",
+            "ALTER TABLE pinned_cids ALTER COLUMN repo SET NOT NULL",
+            "ALTER TABLE pinned_cids ALTER COLUMN owner_did SET NOT NULL",
+            // New unique constraint for post-v11 ON CONFLICT(repo, sha256_hex)
+            "CREATE UNIQUE INDEX IF NOT EXISTS pinned_cids_repo_sha_hex_key ON pinned_cids (repo, sha256_hex)",
+            // Old PK on sha256_hex kept intact for pre-v11 ON CONFLICT(sha256_hex)
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cids_repo_owner ON pinned_cids (repo, owner_did)",
+        ],
+    },
+    Migration {
+        version: 19,
+        name: "arweave_anchors_repo_owner_index",
+        stmts: &[
+            "CREATE INDEX IF NOT EXISTS idx_arweave_anchors_repo_owner_anchored ON arweave_anchors (repo, owner_did, anchored_at DESC)",
+        ],
+    },
+    Migration {
+        version: 20,
+        name: "pinned_cid_repos_junction",
+        stmts: &[
+            r#"CREATE TABLE IF NOT EXISTS pinned_cid_repos (
+                sha256_hex TEXT NOT NULL,
+                repo       TEXT NOT NULL,
+                owner_did  TEXT NOT NULL,
+                pinned_at  TEXT NOT NULL,
+                PRIMARY KEY (sha256_hex, repo)
+            )"#,
+            "CREATE INDEX IF NOT EXISTS idx_pinned_cid_repos_repo ON pinned_cid_repos(repo, owner_did)",
+            // Backfill from existing pinned_cids rows that have non-empty repo/owner
+            r#"INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+               SELECT sha256_hex, repo, owner_did, pinned_at
+               FROM pinned_cids
+               WHERE repo IS NOT NULL AND repo != ''
+                 AND owner_did IS NOT NULL AND owner_did != ''
+               ON CONFLICT (sha256_hex, repo) DO NOTHING"#,
+            // Note: legacy (unassociated) pinned_cids rows with empty repo
+            // or owner_did are intentionally not migrated to the junction
+            // table: the scoped listing requires a known (repo, owner_did)
+            // pair, and silently showing orphaned objects to every caller
+            // would leak SHA/CID pairs from before the migration.,
+        ],
+    },
+    Migration {
+        version: 21,
+        name: "pinned_cid_repos_backfill_all_associations",
+        stmts: &[
+            // Migration 18's UPDATE … FROM branch_cids selects one arbitrary
+            // row per SHA because UPDATE … FROM picks one matching source row
+            // when multiple match.  Migration 20 then backfills pinned_cid_repos
+            // from the scalar pinned_cids.repo, losing every other association.
+            // This migration backfills the junction table directly from ALL
+            // matching branch_cids rows so every repo that pinned an object
+            // can discover it through the scoped listing (P2).
+            r#"INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+               SELECT DISTINCT p.sha256_hex, m.repo, m.owner_did, p.pinned_at
+               FROM pinned_cids p
+               INNER JOIN (
+                   SELECT DISTINCT bc.cid, bc.sha, bc.repo, r.owner_did
+                   FROM branch_cids bc
+                   JOIN repos r
+                     ON r.name = split_part(bc.repo, '/', 2)
+                    AND (CASE WHEN r.owner_did LIKE 'did:key:%' AND position(':' in substr(r.owner_did, 9)) = 0 THEN substr(r.owner_did, 9) ELSE r.owner_did END)
+                        = split_part(bc.repo, '/', 1)
+               ) m ON p.cid = m.cid AND p.sha256_hex = m.sha
+               ON CONFLICT (sha256_hex, repo) DO NOTHING"#,
         ],
     },
 ];
@@ -1659,31 +1798,6 @@ impl Db {
         Ok(())
     }
 
-    /// Take up to `limit` pending syncs — the least recently attempted ones —
-    /// and stamp each with the time it was handed out.
-    ///
-    /// Selecting and stamping in one statement is deliberate. A row the worker
-    /// cannot make progress on stays `pending` so it is retried, and if its
-    /// ordering key never moved it would remain among the oldest rows forever,
-    /// holding a fixed-size window against every healthy repo behind it.
-    /// Stamping on the way out makes the key "least recently handed out", so a
-    /// stuck row rotates to the back instead. Doing it here rather than at each
-    /// deferral branch in the worker is what makes that hold by construction:
-    /// no call site can forget it, and a batch that dies mid-loop still leaves
-    /// its rows stamped. `enqueued_at` is left alone so backlog age stays
-    /// measurable.
-    ///
-    /// Two things this deliberately does not promise. The returned rows are the
-    /// right *set*, in no particular order — `RETURNING` does not sort, and
-    /// nothing in `process_batch` depends on the order within a batch. And this
-    /// is not a claim: the rows stay `pending` with no row lock held past the
-    /// statement, so two workers against one database can still be handed the
-    /// same batch. Single-worker deployment is the existing assumption;
-    /// `FOR UPDATE SKIP LOCKED` is what would change that, and it is not here.
-    ///
-    /// Errors surface to the caller, which logs and skips the poll. That is
-    /// worth knowing now that this writes: it can fail for reasons a plain
-    /// SELECT could not, such as a read-only transaction or a lock timeout.
     pub async fn dequeue_pending_syncs(&self, limit: i64) -> Result<Vec<SyncQueueItem>> {
         let rows = sqlx::query(
             // The outer `status = 'pending'` is not redundant with the
@@ -2268,15 +2382,84 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
-    pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
+    #[allow(dead_code)]
+    pub async fn get_pinned_cid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT cid FROM pinned_cids WHERE sha256_hex = $1 LIMIT 1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("cid")))
+    }
+
+    /// Record a pinned CID with explicit repo/owner_did association.
+    /// Phase 1 (expand): targets the kept sha256_hex PK so pre-v10 and
+    /// post-v10 writers share the same conflict target.  Phase 2 (contract)
+    /// will switch to ON CONFLICT(repo, sha256_hex) after the old PK is
+    /// dropped and (repo, sha256_hex) becomes the new primary key.
+    pub async fn record_pinned_cid_full(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        repo: &str,
+        owner_did: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        // Both writes run in one transaction so a failure cannot leave a
+        // pinned_cids row without its pinned_cid_repos association (P2).
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
-             VALUES ($1, $2, $3)
-             ON CONFLICT(sha256_hex) DO NOTHING",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+                repo = COALESCE(NULLIF(EXCLUDED.repo, ''), pinned_cids.repo),
+                owner_did = COALESCE(NULLIF(EXCLUDED.owner_did, ''), pinned_cids.owner_did)",
         )
         .bind(sha256_hex)
         .bind(cid)
-        .bind(Utc::now().to_rfc3339())
+        .bind(&now)
+        .bind(repo)
+        .bind(owner_did)
+        .execute(&mut *tx)
+        .await?;
+
+        // Also record the (repo, owner_did) association in the junction table
+        // so shared Git objects are visible to every repo's readers (P2).
+        if !repo.is_empty() && !owner_did.is_empty() {
+            sqlx::query(
+                "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (sha256_hex, repo) DO NOTHING",
+            )
+            .bind(sha256_hex)
+            .bind(repo)
+            .bind(owner_did)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_pinned_cid_repo(
+        &self,
+        sha256_hex: &str,
+        repo: &str,
+        owner_did: &str,
+    ) -> Result<()> {
+        if repo.is_empty() || owner_did.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (sha256_hex, repo) DO NOTHING",
+        )
+        .bind(sha256_hex)
+        .bind(repo)
+        .bind(owner_did)
+        .bind(&now)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2352,9 +2535,10 @@ impl Db {
         Ok(row.map(|r| r.get("recipients_tag")))
     }
 
+    #[allow(dead_code)]
     pub async fn list_pinned_cids(&self) -> Result<Vec<PinnedCidRecord>> {
         let rows = sqlx::query(
-            "SELECT sha256_hex, cid, pinned_at, pinata_cid FROM pinned_cids ORDER BY pinned_at DESC",
+            "SELECT sha256_hex, cid, pinned_at, pinata_cid, repo, owner_did FROM pinned_cids ORDER BY pinned_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2365,6 +2549,130 @@ impl Db {
                 cid: r.get("cid"),
                 pinned_at: r.get("pinned_at"),
                 pinata_cid: r.get("pinata_cid"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
+            })
+            .collect())
+    }
+
+    #[allow(dead_code)]
+    pub async fn get_pinata_cid(&self, sha256_hex: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT pinata_cid FROM pinned_cids WHERE sha256_hex = $1 AND pinata_cid IS NOT NULL LIMIT 1")
+            .bind(sha256_hex)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("pinata_cid")))
+    }
+
+    /// Bounded global pin query: returns pins for any of the given (repo, owner_did)
+    /// pairs, ordered by (pinned_at DESC, sha256_hex DESC, repo DESC) and capped
+    /// by both distinct-object count and total-association row count.
+    /// The inner DISTINCT ON picks up to `sha_limit` unique SHAs; the outer query
+    /// then returns ALL repo associations for those SHAs, bounded by `assoc_limit`
+    /// rows.  When `cursor` is `Some((pinned_at, sha256_hex, repo))`, the inner
+    /// query skips rows whose keyset position is not strictly before the cursor,
+    /// so a partially-returned SHA (outer result hit `assoc_limit`) resumes
+    /// correctly on the next fetch.
+    pub async fn list_pinned_cids_for_repos(
+        &self,
+        repos: &[String],
+        owner_dids: &[String],
+        sha_limit: i64,
+        assoc_limit: i64,
+        cursor: Option<(&str, &str, &str)>,
+    ) -> Result<Vec<PinnedCidRecord>> {
+        let rows = if let Some((pa, sha, repo)) = cursor {
+            sqlx::query(
+                r#"WITH batch_shas AS (
+                    SELECT sha256_hex
+                    FROM (
+                        SELECT DISTINCT ON (p.sha256_hex) p.sha256_hex, p.pinned_at
+                        FROM pinned_cids p
+                        LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                        JOIN UNNEST($1::text[], $2::text[])
+                             AS pairs(repo, owner_did)
+                          ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                             = (pairs.repo, pairs.owner_did)
+                        WHERE (p.pinned_at, p.sha256_hex, COALESCE(pr.repo, p.repo))
+                              < ($3::text, $4::text, $5::text)
+                        ORDER BY p.sha256_hex, p.pinned_at DESC
+                    ) deduped
+                    ORDER BY pinned_at DESC, sha256_hex DESC
+                    LIMIT $6
+                )
+                SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
+                       COALESCE(pr.repo, p.repo) AS repo,
+                       COALESCE(pr.owner_did, p.owner_did) AS owner_did
+                FROM pinned_cids p
+                LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                JOIN batch_shas bs ON bs.sha256_hex = p.sha256_hex
+                JOIN UNNEST($1::text[], $2::text[])
+                     AS pairs(repo, owner_did)
+                  ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                     = (pairs.repo, pairs.owner_did)
+                WHERE (p.pinned_at, p.sha256_hex, COALESCE(pr.repo, p.repo))
+                      < ($3::text, $4::text, $5::text)
+                ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
+                         COALESCE(pr.repo, p.repo) DESC
+                LIMIT $7"#,
+            )
+            .bind(repos)
+            .bind(owner_dids)
+            .bind(pa)
+            .bind(sha)
+            .bind(repo)
+            .bind(sha_limit)
+            .bind(assoc_limit)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"WITH batch_shas AS (
+                    SELECT sha256_hex
+                    FROM (
+                        SELECT DISTINCT ON (p.sha256_hex) p.sha256_hex, p.pinned_at
+                        FROM pinned_cids p
+                        LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                        JOIN UNNEST($1::text[], $2::text[])
+                             AS pairs(repo, owner_did)
+                          ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                             = (pairs.repo, pairs.owner_did)
+                        ORDER BY p.sha256_hex, p.pinned_at DESC
+                    ) deduped
+                    ORDER BY pinned_at DESC, sha256_hex DESC
+                    LIMIT $3
+                )
+                SELECT p.sha256_hex, p.cid, p.pinned_at, p.pinata_cid,
+                       COALESCE(pr.repo, p.repo) AS repo,
+                       COALESCE(pr.owner_did, p.owner_did) AS owner_did
+                FROM pinned_cids p
+                LEFT JOIN pinned_cid_repos pr ON pr.sha256_hex = p.sha256_hex
+                JOIN batch_shas bs ON bs.sha256_hex = p.sha256_hex
+                JOIN UNNEST($1::text[], $2::text[])
+                     AS pairs(repo, owner_did)
+                  ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
+                     = (pairs.repo, pairs.owner_did)
+                ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
+                         COALESCE(pr.repo, p.repo) DESC
+                LIMIT $4"#,
+            )
+            .bind(repos)
+            .bind(owner_dids)
+            .bind(sha_limit)
+            .bind(assoc_limit)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|r| PinnedCidRecord {
+                sha256_hex: r.get("sha256_hex"),
+                cid: r.get("cid"),
+                pinned_at: r.get("pinned_at"),
+                pinata_cid: r.get("pinata_cid"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
             })
             .collect())
     }
@@ -2380,21 +2688,52 @@ impl Db {
         Ok(row.get::<i64, _>("cnt") > 0)
     }
 
-    /// Record the Pinata CID for a git object.
-    /// Inserts the row if it doesn't exist (objects pinned directly to Pinata
-    /// without a prior local IPFS pin get cid = pinata_cid).
-    pub async fn record_pinata_cid(&self, sha256_hex: &str, pinata_cid: &str) -> Result<()> {
+    /// Record the Pinata CID with explicit repo/owner_did association.
+    /// `cid` is the local content CID computed from the git object bytes and
+    /// `pinata_cid` is the CID assigned by the pinning provider; they can
+    /// differ (providers may re-block or re-name), so each is stored in its
+    /// own column.  Both writes run in one transaction so a failure cannot
+    /// leave a half-recorded pin (P2).
+    pub async fn record_pinata_cid_full(
+        &self,
+        sha256_hex: &str,
+        cid: &str,
+        pinata_cid: &str,
+        repo: &str,
+        owner_did: &str,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid",
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid,
+                repo = COALESCE(NULLIF(EXCLUDED.repo, ''), pinned_cids.repo),
+                owner_did = COALESCE(NULLIF(EXCLUDED.owner_did, ''), pinned_cids.owner_did)",
         )
         .bind(sha256_hex)
-        .bind(pinata_cid) // fallback local cid if row is new
-        .bind(Utc::now().to_rfc3339())
+        .bind(cid)
+        .bind(&now)
         .bind(pinata_cid)
-        .execute(&self.pool)
+        .bind(repo)
+        .bind(owner_did)
+        .execute(&mut *tx)
         .await?;
+
+        if !repo.is_empty() && !owner_did.is_empty() {
+            sqlx::query(
+                "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (sha256_hex, repo) DO NOTHING",
+            )
+            .bind(sha256_hex)
+            .bind(repo)
+            .bind(owner_did)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -2810,6 +3149,50 @@ impl Db {
             .fetch_all(&self.pool)
             .await?
         };
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ArweaveAnchor {
+                id: r.get("id"),
+                repo: r.get("repo"),
+                owner_did: r.get("owner_did"),
+                ref_name: r.get("ref_name"),
+                old_sha: r.get("old_sha"),
+                new_sha: r.get("new_sha"),
+                cid: r.get("cid"),
+                irys_tx_id: r.get("irys_tx_id"),
+                arweave_url: r.get("arweave_url"),
+                node_did: r.get("node_did"),
+                anchored_at: r.get("anchored_at"),
+            })
+            .collect())
+    }
+
+    /// List arweave anchors scoped to repos the caller can read.
+    /// Filtered by (repo, owner_did) pairs from the caller's readable set.
+    pub async fn list_arweave_anchors_for_repos(
+        &self,
+        repos: &[String],
+        owner_dids: &[String],
+        limit: i64,
+    ) -> Result<Vec<ArweaveAnchor>> {
+        if repos.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, repo, owner_did, ref_name, old_sha, new_sha, cid, irys_tx_id, arweave_url, node_did, anchored_at
+             FROM arweave_anchors
+             WHERE (repo, owner_did) IN (
+                 SELECT * FROM UNNEST($1::text[], $2::text[])
+             )
+             ORDER BY anchored_at DESC
+             LIMIT $3",
+        )
+        .bind(repos)
+        .bind(owner_dids)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows
             .into_iter()
@@ -3574,7 +3957,8 @@ impl Db {
 
 #[cfg(test)]
 mod migration_tests {
-    use super::{MIGRATIONS, MIGRATION_V1_NAME};
+    use super::{Db, MIGRATIONS, MIGRATION_V1_NAME};
+    use sqlx::{PgPool, Row};
 
     #[test]
     fn migrations_are_non_empty() {
@@ -3760,6 +4144,282 @@ mod migration_tests {
 
         // (d) Re-run: idempotent — ADD COLUMN IF NOT EXISTS must not error.
         db.migrate().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn test_migration_v11_upgrade_path(pool: PgPool) {
+        let db = Db::for_testing(pool);
+
+        // Run migrations up to version 9
+        async fn run_migrations_up_to(db: &Db, version: i64) {
+            sqlx::query(
+                r#"CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version    BIGINT  NOT NULL PRIMARY KEY,
+                    name       TEXT    NOT NULL,
+                    applied_at TEXT    NOT NULL
+                )"#,
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+            for m in super::MIGRATIONS {
+                if m.version > version {
+                    break;
+                }
+                let already: bool = sqlx::query(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
+                )
+                .bind(m.version)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+                .get::<bool, _>("applied");
+
+                if already {
+                    continue;
+                }
+
+                let mut tx = db.pool.begin().await.unwrap();
+                for stmt in m.stmts {
+                    sqlx::query(stmt).execute(&mut *tx).await.unwrap();
+                }
+                sqlx::query(
+                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                )
+                .bind(m.version)
+                .bind(m.name)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+        }
+
+        run_migrations_up_to(&db, 9).await;
+
+        // Seed a repo, branch_cids, and pinned_cids under v9 schema
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch, created_at, updated_at, disk_path)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        )
+        .bind("repo-123")
+        .bind("myrepo")
+        .bind("did:key:z6Mkwowner")
+        .bind("desc")
+        .bind(true)
+        .bind("main")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("/srv/repo-123")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO branch_cids (repo, ref_name, sha, cid, node_did, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind("z6Mkwowner/myrepo")
+        .bind("refs/heads/main")
+        .bind("old-sha")
+        .bind("old-cid")
+        .bind("node-did")
+        .bind("2026-07-03T00:00:00Z")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
+             VALUES ($1, $2, $3)",
+        )
+        .bind("old-sha")
+        .bind("old-cid")
+        .bind("2026-07-03T00:00:00Z")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Run remaining migrations (v10 = ref_cert_dedup, v11 = pinned_cids)
+        db.run_migrations().await.unwrap();
+
+        // Verify backfilling of repo and owner_did columns
+        let row = sqlx::query(
+            "SELECT sha256_hex, cid, repo, owner_did FROM pinned_cids WHERE sha256_hex = 'old-sha'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.get::<String, _>("repo"), "z6Mkwowner/myrepo");
+        assert_eq!(row.get::<String, _>("owner_did"), "did:key:z6Mkwowner");
+
+        // Phase 1 (expand): the old PK on sha256_hex still rejects duplicate
+        // SHA across repos — pre-v10 ON CONFLICT(sha256_hex) keeps working.
+        let res = sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("old-sha")
+        .bind("old-cid")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("other-repo")
+        .bind("other-owner")
+        .execute(&db.pool)
+        .await;
+
+        assert!(
+            res.is_err(),
+            "Phase 1: old PK on sha256_hex must reject duplicate SHA across repos"
+        );
+
+        // Phase 2 (contract): drop the old PK and UNIQUE, promote to compound PK.
+        // Once all pre-v10 writers are drained this step makes the migration
+        // complete — same SHA can appear in different repos.
+        sqlx::query("ALTER TABLE pinned_cids DROP CONSTRAINT pinned_cids_pkey")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP INDEX IF EXISTS pinned_cids_repo_sha_hex_key")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE pinned_cids ADD PRIMARY KEY (repo, sha256_hex)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Now the same SHA works in a different repo (compound PK allows it).
+        let res = sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("old-sha")
+        .bind("old-cid")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("other-repo")
+        .bind("other-owner")
+        .execute(&db.pool)
+        .await;
+
+        assert!(
+            res.is_ok(),
+            "Phase 2: compound PK must allow same SHA in different repos"
+        );
+    }
+
+    /// A pinned CID whose SHA is not a current branch_cids ref tip falls back to
+    /// repo = '' after migration v11. This tests that the backfill does not
+    /// silently orphan such pins by leaving repo NULL/unqueryable; the empty
+    /// string is at least queryable by list_pinned_cids_for_repos callers.
+    #[sqlx::test]
+    async fn test_migration_v11_orphan_non_tip_pin(pool: PgPool) {
+        let db = Db::for_testing(pool);
+
+        // Run migrations up to version 9
+        async fn run_migrations_up_to(db: &Db, version: i64) {
+            sqlx::query(
+                r#"CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version    BIGINT  NOT NULL PRIMARY KEY,
+                    name       TEXT    NOT NULL,
+                    applied_at TEXT    NOT NULL
+                )"#,
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+            for m in super::MIGRATIONS {
+                if m.version > version {
+                    break;
+                }
+                let already: bool = sqlx::query(
+                    "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1) AS applied",
+                )
+                .bind(m.version)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+                .get::<bool, _>("applied");
+
+                if already {
+                    continue;
+                }
+
+                let mut tx = db.pool.begin().await.unwrap();
+                for stmt in m.stmts {
+                    sqlx::query(stmt).execute(&mut *tx).await.unwrap();
+                }
+                sqlx::query(
+                    "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3)",
+                )
+                .bind(m.version)
+                .bind(m.name)
+                .bind(chrono::Utc::now().to_rfc3339())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+                tx.commit().await.unwrap();
+            }
+        }
+
+        run_migrations_up_to(&db, 9).await;
+
+        // Seed a repo and a pinned_cid, but no matching branch_cids entry.
+        sqlx::query(
+            "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch, created_at, updated_at, disk_path)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+        )
+        .bind("repo-orphan")
+        .bind("orphan-repo")
+        .bind("did:key:z6Mkworphan")
+        .bind("desc")
+        .bind(true)
+        .bind("main")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("2026-07-03T00:00:00Z")
+        .bind("/srv/orphan")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // This CID is a pinned object that is NOT a current ref tip —
+        // no matching row in branch_cids exists.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
+             VALUES ($1, $2, $3)",
+        )
+        .bind("orphan-sha")
+        .bind("orphan-cid")
+        .bind("2026-07-03T00:00:00Z")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Run remaining migrations (v10 = ref_cert_dedup, v11 = pinned_cids)
+        db.run_migrations().await.unwrap();
+
+        // The orphan pin should have fallen back to repo = '' because
+        // branch_cids had no matching cid to backfill from.
+        let row = sqlx::query(
+            "SELECT sha256_hex, repo, owner_did FROM pinned_cids WHERE sha256_hex = 'orphan-sha'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            row.get::<String, _>("repo"),
+            "",
+            "non-tip pin must fall back to empty repo"
+        );
+        assert_eq!(
+            row.get::<String, _>("owner_did"),
+            "",
+            "non-tip pin must fall back to empty owner_did"
+        );
     }
 
     // ── sync_queue scheduling (attempted_at, v17) ────────────────────────────
@@ -4691,6 +5351,99 @@ mod dedup_db_tests {
         assert!(!got.is_public, "non-key row's is_public must be preserved");
     }
 
+    /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
+    /// expression agree on every boundary value in the owner-key normalization
+    /// set. A mismatch would let the Rust code bind a different key than the SQL
+    /// predicate filters on, silently breaking the did:key-only matching contract.
+    #[sqlx::test]
+    async fn normalize_owner_key_matches_sql_case(pool: PgPool) {
+        // The full boundary set: did:key short/full, bare, non-key DIDs,
+        // did:key with extra colon, empty, empty residual, uppercase.
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        // Build a VALUES list with the column aliased as `owner_did` so the
+        // OWNER_KEY_CASE_SQL expression (which references `owner_did`) works
+        // verbatim — no search-and-replace that could hide a drift.
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(owner_did) AS (VALUES {values_sql})
+             SELECT owner_did, ({key}) AS normalized FROM data ORDER BY owner_did",
+            key = super::OWNER_KEY_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "normalize_owner_key(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
+
+    /// Verify that `PROFILE_DID_CASE_SQL` (which aliases the column `did`) also
+    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
+    #[sqlx::test]
+    async fn profile_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(did) AS (VALUES {values_sql})
+             SELECT did, ({key}) AS normalized FROM data ORDER BY did",
+            key = super::PROFILE_DID_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
+
     /// get_profile must not resolve a non-key DID (e.g. did:gitlawb:) when
     /// queried with the bare short id. The old `LIKE '%:' || $1` clause was too
     /// broad and could return the wrong profile row.
@@ -4786,99 +5539,6 @@ mod dedup_db_tests {
             .unwrap();
         let got = db.get_profile(short).await.unwrap().unwrap();
         assert_eq!(got.profile_cid.as_deref(), Some("bafytestcid"));
-    }
-
-    /// Verify that the Rust `normalize_owner_key` and the `OWNER_KEY_CASE_SQL`
-    /// expression agree on every boundary value in the owner-key normalization
-    /// set. A mismatch would let the Rust code bind a different key than the SQL
-    /// predicate filters on, silently breaking the did:key-only matching contract.
-    #[sqlx::test]
-    async fn normalize_owner_key_matches_sql_case(pool: PgPool) {
-        // The full boundary set: did:key short/full, bare, non-key DIDs,
-        // did:key with extra colon, empty, empty residual, uppercase.
-        let boundary_values = [
-            "did:key:z6Mkfoo",
-            "z6Mkfoo",
-            "did:gitlawb:z6Mkfoo",
-            "did:web:example.com:alice",
-            "did:key:did:gitlawb:z6Mkfoo",
-            "",
-            "did:key:",
-            "DID:KEY:z6Mkfoo",
-        ];
-
-        // Build a VALUES list with the column aliased as `owner_did` so the
-        // OWNER_KEY_CASE_SQL expression (which references `owner_did`) works
-        // verbatim — no search-and-replace that could hide a drift.
-        let values_sql: String = boundary_values
-            .iter()
-            .map(|v| format!("('{}'::text)", v))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "WITH data(owner_did) AS (VALUES {values_sql})
-             SELECT owner_did, ({key}) AS normalized FROM data ORDER BY owner_did",
-            key = super::OWNER_KEY_CASE_SQL
-        );
-
-        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
-
-        assert_eq!(
-            rows.len(),
-            boundary_values.len(),
-            "every boundary value must produce a row"
-        );
-
-        for (val, sql_result) in &rows {
-            let rust_result = super::normalize_owner_key(val);
-            assert_eq!(
-                sql_result, rust_result,
-                "normalize_owner_key(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
-            );
-        }
-    }
-
-    /// Verify that `PROFILE_DID_CASE_SQL` (which aliases the column `did`) also
-    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
-    #[sqlx::test]
-    async fn profile_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
-        let boundary_values = [
-            "did:key:z6Mkfoo",
-            "z6Mkfoo",
-            "did:gitlawb:z6Mkfoo",
-            "did:web:example.com:alice",
-            "did:key:did:gitlawb:z6Mkfoo",
-            "",
-            "did:key:",
-            "DID:KEY:z6Mkfoo",
-        ];
-
-        let values_sql: String = boundary_values
-            .iter()
-            .map(|v| format!("('{}'::text)", v))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "WITH data(did) AS (VALUES {values_sql})
-             SELECT did, ({key}) AS normalized FROM data ORDER BY did",
-            key = super::PROFILE_DID_CASE_SQL
-        );
-
-        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
-
-        assert_eq!(
-            rows.len(),
-            boundary_values.len(),
-            "every boundary value must produce a row"
-        );
-
-        for (val, sql_result) in &rows {
-            let rust_result = super::normalize_owner_key(val);
-            assert_eq!(
-                sql_result, rust_result,
-                "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
-            );
-        }
     }
 }
 
@@ -6272,6 +6932,93 @@ mod peer_reachability_tests {
             second > first,
             "a same-URL re-announce is a liveness signal and must still \
              advance last_seen: {first} then {second}"
+        );
+    }
+}
+
+/// Regression: the outer SELECT of `list_pinned_cids_for_repos` must apply the
+/// same 3-tuple keyset as the inner batch_shas CTE.  Without it, a resumed page
+/// past `assoc_limit` re-orders ALL associations for the batch SHAs and repeats
+/// rows already shown instead of advancing (one SHA + five repos + LIMIT 3
+/// returned r05,r04,r03 on page 2 instead of r02,r01).
+#[cfg(test)]
+mod pinned_cid_keyset_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// One SHA pinned into five repos, all at the same timestamp. Page 1 with
+    /// assoc_limit=3 shows r05,r04,r03; resuming at r03 must yield r02,r01.
+    #[sqlx::test]
+    async fn outer_keyset_resumes_past_assoc_limit(pool: PgPool) {
+        let db = db(pool).await;
+        let owner = "did:key:z6Mkwowner";
+
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("sha-1")
+        .bind("cid-1")
+        .bind("2026-07-03T09:00:00Z")
+        .bind("r01")
+        .bind(owner)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        for repo in ["r01", "r02", "r03", "r04", "r05"] {
+            sqlx::query(
+                "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind("sha-1")
+            .bind(repo)
+            .bind(owner)
+            .bind("2026-07-03T09:00:00Z")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let repos: Vec<String> = (1..=5).map(|i| format!("r0{i}")).collect();
+        let owners: Vec<String> = (0..5).map(|_| owner.to_string()).collect();
+
+        // Page 1: repo DESC order → r05, r04, r03.
+        let page1 = db
+            .list_pinned_cids_for_repos(&repos, &owners, 200, 3, None)
+            .await
+            .unwrap();
+        let page1_repos: Vec<&str> = page1.iter().map(|p| p.repo.as_str()).collect();
+        assert_eq!(
+            page1_repos,
+            vec!["r05", "r04", "r03"],
+            "page 1 must surface the three newest associations in repo-DESC order"
+        );
+
+        // Resume at the last shown row (pinned_at, sha, r03).
+        let last = page1.last().unwrap();
+        let cursor = Some((
+            last.pinned_at.as_str(),
+            last.sha256_hex.as_str(),
+            last.repo.as_str(),
+        ));
+
+        let page2 = db
+            .list_pinned_cids_for_repos(&repos, &owners, 200, 3, cursor)
+            .await
+            .unwrap();
+        let page2_repos: Vec<&str> = page2.iter().map(|p| p.repo.as_str()).collect();
+        assert_eq!(
+            page2_repos,
+            vec!["r02", "r01"],
+            "resuming past assoc_limit must advance to the remaining \
+             associations, not repeat r05,r04,r03"
         );
     }
 }

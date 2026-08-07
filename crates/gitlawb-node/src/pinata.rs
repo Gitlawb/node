@@ -76,6 +76,10 @@ pub async fn pin_object(
 /// this shape — change both in lockstep. Objects already recorded with a
 /// `pinata_cid` are skipped. Returns `(sha_hex, cid)` pairs for each newly
 /// pinned object.
+///
+/// `repo_slug` and `owner_did` are recorded alongside each pin so the scoped
+/// listing query can find them.  Pass empty strings if not available.
+#[allow(clippy::too_many_arguments)]
 pub async fn pin_new_objects(
     client: &reqwest::Client,
     upload_url: &str,
@@ -83,6 +87,8 @@ pub async fn pin_new_objects(
     repo_path: &std::path::Path,
     object_list: Vec<String>,
     db: &crate::db::Db,
+    repo_slug: &str,
+    owner_did: &str,
 ) -> Vec<(String, String)> {
     if jwt.is_empty() {
         return vec![];
@@ -92,7 +98,14 @@ pub async fn pin_new_objects(
 
     for sha in object_list {
         match db.has_pinata_cid(&sha).await {
-            Ok(true) => continue,
+            Ok(true) => {
+                if !repo_slug.is_empty() {
+                    if let Err(e) = db.update_pinned_cid_repo(&sha, repo_slug, owner_did).await {
+                        tracing::warn!(sha = %sha, err = %e, "failed to update pinned_cid_repo");
+                    }
+                }
+                continue;
+            }
             Ok(false) => {}
             Err(e) => {
                 tracing::warn!(sha = %sha, err = %e, "DB error checking pinata_cid");
@@ -111,7 +124,20 @@ pub async fn pin_new_objects(
 
         match pin_object(client, upload_url, jwt, &sha, &data).await {
             Ok(cid) if !cid.is_empty() => {
-                if let Err(e) = db.record_pinata_cid(&sha, &cid).await {
+                // Store the provider-assigned CID in pinata_cid and the locally
+                // computed content CID in cid so the two never get confused
+                // (P2).
+                let local_cid = gitlawb_core::cid::Cid::from_git_object_bytes(&data);
+                if let Err(e) = db
+                    .record_pinata_cid_full(
+                        &sha,
+                        &local_cid.to_string(),
+                        &cid,
+                        repo_slug,
+                        owner_did,
+                    )
+                    .await
+                {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinata_cid in DB");
                 }
                 pinned.push((sha, cid));

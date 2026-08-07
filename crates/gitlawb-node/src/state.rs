@@ -81,6 +81,16 @@ pub struct AppState {
     /// sink as trigger and accepts unsigned requests from known peers, so it is
     /// braked too; each peer's distinct IP gets its own bucket.
     pub peer_write_rate_limiter: RateLimiter,
+    /// Concurrency limiter for expensive visibility walks (git rev-list /
+    /// git ls-tree) triggered by the IPFS pin listing endpoint (P1).
+    /// Prevents a flood of signed requests from exhausting the blocking
+    /// pool or leaving git children running past their timeout.
+    pub walk_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Per-DID rate limiter for the IPFS pin listing endpoint.
+    pub ipfs_list_rate_limiter: RateLimiter,
+    /// Global (non-sybil) rate limiter for the IPFS pin listing endpoint.
+    /// Keyed on a fixed value so rotating DIDs cannot bypass it (P1).
+    pub ipfs_list_global_limiter: RateLimiter,
     /// Process-wide graceful-shutdown signal. Sending `true` causes every
     /// task that holds a `watch::Receiver` to exit at its next await point.
     /// Used by:
@@ -117,5 +127,28 @@ impl AppState {
     #[allow(dead_code)] // used by tests and any future handler that wants to short-circuit
     pub fn is_shutting_down(&self) -> bool {
         *self.shutdown_tx.borrow()
+    }
+
+    /// Seed for the AEAD key that seals opaque truncated_cursor tokens.
+    ///
+    /// Uses the cluster-shared `GITLAWB_CURSOR_SECRET` when configured so a
+    /// token minted on one node can be resumed on another behind a load
+    /// balancer; otherwise falls back to this node's Ed25519 seed (single-node
+    /// deployments only — a load-balanced cluster must set the shared secret,
+    /// or truncated cursors will not resume across instances).
+    pub fn cursor_seed(&self) -> [u8; 32] {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        match &self.config.cursor_secret {
+            Some(secret) if !secret.is_empty() => {
+                let hk = Hkdf::<Sha256>::new(None, secret.as_bytes());
+                let mut okm = [0u8; 32];
+                hk.expand(b"gitlawb-ipfs-cursor-v1", &mut okm)
+                    .expect("32 bytes is a valid HKDF output length");
+                okm
+            }
+            _ => *self.node_keypair.to_seed(),
+        }
     }
 }

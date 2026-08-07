@@ -210,17 +210,19 @@ pub fn build_router(state: AppState) -> Router {
     .layer(axum::Extension(push_limiter));
 
     // ── IPFS content-addressed retrieval and pin listing ──────────────────
-    // `/ipfs/{cid}` carries `optional_signature` so `get_by_cid` sees the caller
-    // identity and can apply per-repo visibility (#110); anonymous callers stay
-    // anonymous and still read genuinely public content. `/api/v1/ipfs/pins`
-    // stays unsigned — gating the pin index is tracked separately (#121).
+    // Both `/ipfs/{cid}` and `/api/v1/ipfs/pins` carry `optional_signature`
+    // so handlers see the caller identity and can apply per-repo visibility.
+    // Anonymous callers stay anonymous for public content; the pin listing
+    // requires authentication (handled in the handler itself).
     let ipfs_routes = Router::new()
         .route("/ipfs/{cid}", get(ipfs::get_by_cid))
-        .layer(middleware::from_fn(auth::optional_signature))
-        .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)));
+        .merge(Router::new().route("/api/v1/ipfs/pins", get(ipfs::list_pins)))
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Arweave permanent anchors ──────────────────────────────────────────
-    let arweave_routes = Router::new().route("/api/v1/arweave/anchors", get(arweave::list_anchors));
+    let arweave_routes = Router::new()
+        .route("/api/v1/arweave/anchors", get(arweave::list_anchors))
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // ── Bounty routes (write — require HTTP Signature) ─────────────────
     let bounty_write_routes = add_auth_layers(
@@ -606,5 +608,48 @@ async fn p2p_info(State(state): State<AppState>) -> Json<serde_json::Value> {
             }))
         }
         None => Json(json!({ "enabled": false })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::test_state;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    // Load-bearing auth gate: the pin index spans the entire node, so an
+    // unsigned GET must be rejected through the real router for BOTH the
+    // ipfs pins listing and the arweave anchors listing, before any DB work.
+    #[sqlx::test]
+    async fn unsigned_get_pins_and_anchors_is_401_through_build_router(pool: PgPool) {
+        let state = test_state(pool).await;
+        let router = build_router(state);
+
+        let pins = Request::builder()
+            .method("GET")
+            .uri("/api/v1/ipfs/pins?limit=50")
+            .body(Body::empty())
+            .unwrap();
+        let pins_resp = router.clone().oneshot(pins).await.unwrap();
+        assert_eq!(
+            pins_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous pin listing must be rejected"
+        );
+
+        let anchors = Request::builder()
+            .method("GET")
+            .uri("/api/v1/arweave/anchors?limit=50")
+            .body(Body::empty())
+            .unwrap();
+        let anchors_resp = router.oneshot(anchors).await.unwrap();
+        assert_eq!(
+            anchors_resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "anonymous anchors listing must be rejected"
+        );
     }
 }
