@@ -1010,6 +1010,12 @@ pub async fn git_receive_pack(
         }
     }
 
+    // Keep the stored head of every open PR fed by this push in step with the
+    // branch, and let closed and merged PRs keep the head they froze at.
+    if !ref_updates.is_empty() {
+        update_open_pr_heads(&state.db, &record.id, &ref_updates).await;
+    }
+
     // Fire push webhooks — one per ref update
     if !ref_updates.is_empty() {
         let base_url = state
@@ -1651,6 +1657,50 @@ struct RefUpdate {
     old_sha: String,
     new_sha: String,
     ref_name: String,
+}
+
+/// The bare branch name behind a full ref, or `None` if the ref is not a
+/// branch.
+///
+/// The push path only ever sees full refs (`refs/heads/feature`) while a pull
+/// request stores the bare name (`feature`), so the two have to be reconciled
+/// somewhere; comparing them directly matches nothing and turns the head update
+/// into a silent no-op. Stripping only `refs/heads/` (rather than taking the
+/// last path segment) is what keeps a tag push off the branch update: a
+/// `refs/tags/feature` push must not move the head of a PR whose source branch
+/// is `feature`, and it also preserves slashes in names like `release/1.x`.
+fn branch_from_ref(ref_name: &str) -> Option<&str> {
+    ref_name
+        .strip_prefix("refs/heads/")
+        .filter(|branch| !branch.is_empty())
+}
+
+/// Point every open pull request fed by this push at the branch's new tip.
+///
+/// One UPDATE per ref update, each keyed on (repo, source branch, open) — no
+/// per-PR probing, no repo listing, no filesystem access, and the cost does not
+/// grow with the number of open pull requests. A failure is logged and skipped:
+/// the push itself already succeeded and the objects are on disk, so refusing
+/// the response over a stale rollup target would be the worse trade.
+async fn update_open_pr_heads(db: &crate::db::Db, repo_id: &str, ref_updates: &[RefUpdate]) {
+    for update in ref_updates {
+        // A deletion carries an all-zero new SHA. Storing it would hand the
+        // rollup a target that resolves to no commit, so leave the last real
+        // head standing.
+        if update.new_sha == ZERO_SHA {
+            continue;
+        }
+        let Some(branch) = branch_from_ref(&update.ref_name) else {
+            continue;
+        };
+        if let Err(e) = db.set_open_pr_heads(repo_id, branch, &update.new_sha).await {
+            tracing::warn!(
+                err = %e,
+                ref_name = %update.ref_name,
+                "failed to update stored pull request heads for a pushed branch"
+            );
+        }
+    }
 }
 
 /// Parse git receive-pack pkt-line ref updates from the request body.
@@ -2550,6 +2600,307 @@ mod tests {
             "clone_url should preserve the full non-key owner DID. got: {}",
             response_non_key.clone_url
         );
+    }
+
+    // ── Stored pull-request head maintenance on push ──────────────────────
+
+    const PR_SHA_OLD: &str = "1111111111111111111111111111111111111111";
+    const PR_SHA_NEW: &str = "2222222222222222222222222222222222222222";
+
+    async fn pr_head_db(pool: sqlx::PgPool) -> crate::db::Db {
+        let db = crate::db::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// An open PR on `feature` in `repo_id`, with no stored head yet.
+    async fn seed_open_pr(db: &crate::db::Db, repo_id: &str, number: i64, source_branch: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        db.create_pr(&crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo_id.to_string(),
+            number,
+            title: "t".into(),
+            body: None,
+            author_did: "did:key:zAuthor".into(),
+            source_branch: source_branch.into(),
+            target_branch: "main".into(),
+            status: "open".into(),
+            merged_by_did: None,
+            merged_at: None,
+            head_commit: None,
+            created_at: now.clone(),
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    }
+
+    fn ref_update(ref_name: &str, old_sha: &str, new_sha: &str) -> RefUpdate {
+        RefUpdate {
+            old_sha: old_sha.into(),
+            new_sha: new_sha.into(),
+            ref_name: ref_name.into(),
+        }
+    }
+
+    async fn head_of(db: &crate::db::Db, repo_id: &str, number: i64) -> Option<String> {
+        db.get_pr(repo_id, number)
+            .await
+            .unwrap()
+            .unwrap()
+            .head_commit
+    }
+
+    /// The push path sees `refs/heads/feature`; `source_branch` stores
+    /// `feature`. Pin the mapping directly, because a WHERE clause comparing
+    /// the full ref against the bare name matches nothing and would make the
+    /// whole update a silent no-op that still reads green everywhere else.
+    #[test]
+    fn branch_from_ref_strips_only_branch_refs() {
+        assert_eq!(branch_from_ref("refs/heads/feature"), Some("feature"));
+        assert_eq!(
+            branch_from_ref("refs/heads/release/1.x"),
+            Some("release/1.x")
+        );
+        // A tag push must not move a PR whose source branch shares the name.
+        assert_eq!(branch_from_ref("refs/tags/feature"), None);
+        assert_eq!(branch_from_ref("refs/notes/commits"), None);
+        assert_eq!(branch_from_ref("feature"), None);
+        assert_eq!(branch_from_ref("refs/heads/"), None);
+    }
+
+    /// Scenario 1: a push to a PR's source branch moves that PR's stored head.
+    #[sqlx::test]
+    async fn push_to_source_branch_moves_the_open_pr_head(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-1", 1, "feature").await;
+
+        update_open_pr_heads(
+            &db,
+            "repo-1",
+            &[ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW)],
+        )
+        .await;
+
+        assert_eq!(
+            head_of(&db, "repo-1", 1).await,
+            Some(PR_SHA_NEW.to_string())
+        );
+    }
+
+    /// Scenario 2: a push to a different branch of the same repo changes
+    /// nothing.
+    #[sqlx::test]
+    async fn push_to_unrelated_branch_leaves_the_pr_head_unchanged(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-1", 1, "feature").await;
+        db.set_open_pr_heads("repo-1", "feature", PR_SHA_OLD)
+            .await
+            .unwrap();
+
+        update_open_pr_heads(
+            &db,
+            "repo-1",
+            &[ref_update("refs/heads/main", PR_SHA_OLD, PR_SHA_NEW)],
+        )
+        .await;
+
+        assert_eq!(
+            head_of(&db, "repo-1", 1).await,
+            Some(PR_SHA_OLD.to_string()),
+            "a push to main must not move a PR whose source is `feature`"
+        );
+    }
+
+    /// Scenario 3: after the PR is closed, further pushes to the same branch
+    /// leave the frozen head alone.
+    #[sqlx::test]
+    async fn push_after_close_does_not_move_the_frozen_head(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-1", 1, "feature").await;
+        db.set_open_pr_heads("repo-1", "feature", PR_SHA_OLD)
+            .await
+            .unwrap();
+        let pr = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        db.close_pr(&pr.id).await.unwrap();
+
+        update_open_pr_heads(
+            &db,
+            "repo-1",
+            &[ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW)],
+        )
+        .await;
+
+        assert_eq!(
+            head_of(&db, "repo-1", 1).await,
+            Some(PR_SHA_OLD.to_string()),
+            "a closed PR keeps the head it froze at"
+        );
+    }
+
+    /// Scenario 5: a force-push is a non-fast-forward ref update, so the stored
+    /// head must follow it. The rollup target is the branch head, not the
+    /// newest commit, and the discarded SHA must stop being the target.
+    #[sqlx::test]
+    async fn force_push_moves_the_pr_head_to_the_new_sha(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-1", 1, "feature").await;
+        db.set_open_pr_heads("repo-1", "feature", PR_SHA_OLD)
+            .await
+            .unwrap();
+
+        // Non-fast-forward: old_sha is the discarded tip, new_sha is unrelated.
+        let rewritten = "3333333333333333333333333333333333333333";
+        update_open_pr_heads(
+            &db,
+            "repo-1",
+            &[ref_update("refs/heads/feature", PR_SHA_OLD, rewritten)],
+        )
+        .await;
+
+        assert_eq!(
+            head_of(&db, "repo-1", 1).await,
+            Some(rewritten.to_string()),
+            "the rewritten tip becomes the rollup target"
+        );
+    }
+
+    /// A same-named branch in two repos is an ordinary shape, and a missing
+    /// repo predicate would be invisible to every single-repo assertion.
+    #[sqlx::test]
+    async fn push_does_not_move_a_same_named_branch_in_another_repo(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-1", 1, "feature").await;
+        seed_open_pr(&db, "repo-2", 1, "feature").await;
+
+        update_open_pr_heads(
+            &db,
+            "repo-1",
+            &[ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW)],
+        )
+        .await;
+
+        assert_eq!(
+            head_of(&db, "repo-1", 1).await,
+            Some(PR_SHA_NEW.to_string())
+        );
+        assert_eq!(
+            head_of(&db, "repo-2", 1).await,
+            None,
+            "the other repo's PR on the same branch name must be untouched"
+        );
+    }
+
+    /// A tag push carries a ref name whose last segment can equal a branch
+    /// name. It is not a branch update and must not move a head.
+    #[sqlx::test]
+    async fn tag_push_does_not_move_a_same_named_branch_pr(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-1", 1, "feature").await;
+        db.set_open_pr_heads("repo-1", "feature", PR_SHA_OLD)
+            .await
+            .unwrap();
+
+        update_open_pr_heads(
+            &db,
+            "repo-1",
+            &[ref_update("refs/tags/feature", PR_SHA_OLD, PR_SHA_NEW)],
+        )
+        .await;
+
+        assert_eq!(
+            head_of(&db, "repo-1", 1).await,
+            Some(PR_SHA_OLD.to_string()),
+            "a tag named like the source branch must not move the head"
+        );
+    }
+
+    /// Deleting the source branch is a ref update whose new SHA is all zeros.
+    /// Writing that as the head would hand the rollup a target no commit
+    /// resolves to, so the last real SHA stands.
+    #[sqlx::test]
+    async fn branch_deletion_leaves_the_last_real_sha_in_place(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-1", 1, "feature").await;
+        db.set_open_pr_heads("repo-1", "feature", PR_SHA_OLD)
+            .await
+            .unwrap();
+
+        update_open_pr_heads(
+            &db,
+            "repo-1",
+            &[ref_update("refs/heads/feature", PR_SHA_OLD, ZERO_SHA)],
+        )
+        .await;
+
+        assert_eq!(
+            head_of(&db, "repo-1", 1).await,
+            Some(PR_SHA_OLD.to_string()),
+            "a deletion must not store an all-zero head"
+        );
+    }
+
+    /// The scenario tests above drive `update_open_pr_heads` directly, because a
+    /// full receive-pack POST needs a real pack. That proves the mechanism and
+    /// says nothing about the sink: delete the call from the push handler and
+    /// every one of them still passes while no push ever moves a head again.
+    /// Pin the wiring by source, the way the authz guards in `api/mod.rs` do.
+    /// The slice stops at the handler's own closing brace (the first `}` in
+    /// column 0) so a call in a later function cannot satisfy this, and
+    /// full-line comments are stripped so the doc comment on the call cannot
+    /// stand in for the call. Note the boundary is found by brace rather than by
+    /// a declaration prefix: `handler_names` in `api/mod.rs` scrapes every
+    /// source file for the public-async declaration prefix, so spelling that
+    /// prefix here as data (in a literal or even in this comment) registers an
+    /// empty handler name and panics that guard.
+    #[test]
+    fn the_push_handler_actually_calls_the_head_update() {
+        let src = include_str!("repos.rs");
+        let start = src
+            .find("fn git_receive_pack(")
+            .expect("git_receive_pack not found (renamed or removed?)");
+        let rest = &src[start..];
+        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        let body: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            body.contains("update_open_pr_heads(&state.db, &record.id, &ref_updates)"),
+            "the receive-pack handler must feed the parsed ref updates to the \
+             stored-head update; without that call every head-maintenance test \
+             here passes against a helper nothing invokes"
+        );
+    }
+
+    /// A multi-ref push is one request. Every branch in it that has an open PR
+    /// must be updated, not just the first — the same collapse-to-first bug the
+    /// ref-certificate loop above already had to fix.
+    #[sqlx::test]
+    async fn a_multi_ref_push_updates_every_matching_pr(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-1", 1, "feature").await;
+        seed_open_pr(&db, "repo-1", 2, "second").await;
+
+        let other = "4444444444444444444444444444444444444444";
+        update_open_pr_heads(
+            &db,
+            "repo-1",
+            &[
+                ref_update("refs/heads/feature", PR_SHA_OLD, PR_SHA_NEW),
+                ref_update("refs/heads/second", PR_SHA_OLD, other),
+            ],
+        )
+        .await;
+
+        assert_eq!(
+            head_of(&db, "repo-1", 1).await,
+            Some(PR_SHA_NEW.to_string())
+        );
+        assert_eq!(head_of(&db, "repo-1", 2).await, Some(other.to_string()));
     }
 
     /// The receive-pack *advertisement* (`GET info/refs?service=git-receive-pack`)

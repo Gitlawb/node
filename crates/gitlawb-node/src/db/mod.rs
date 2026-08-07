@@ -1891,16 +1891,56 @@ impl Db {
         Ok(row.map(row_to_pr))
     }
 
-    pub async fn merge_pr(&self, pr_id: &str, merged_by_did: &str) -> Result<()> {
+    /// Point every OPEN pull request in `repo_id` whose source branch is
+    /// `branch` at `new_sha`, in one statement. Returns the rows updated.
+    ///
+    /// The `status='open'` predicate is the freeze: once a pull request is
+    /// closed or merged, later pushes to the same branch no longer move its
+    /// stored head, so the recorded target stays the commit the decision was
+    /// actually made against. `branch` is a bare name — callers on the push
+    /// path see full refs and must strip `refs/heads/` first.
+    pub async fn set_open_pr_heads(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        new_sha: &str,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE pull_requests SET head_commit=$1
+             WHERE repo_id=$2 AND source_branch=$3 AND status='open'",
+        )
+        .bind(new_sha)
+        .bind(repo_id)
+        .bind(branch)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Mark a pull request merged, stamping the source head it merged.
+    ///
+    /// `head_commit` is what the merge actually consumed, read under the repo
+    /// write lock: the caller loaded the row before taking that lock, so a push
+    /// landing in between moved the branch and the row's own value is stale.
+    /// `None` (an unresolvable source head) leaves the stored value alone
+    /// rather than nulling a head the push path had already recorded.
+    pub async fn merge_pr(
+        &self,
+        pr_id: &str,
+        merged_by_did: &str,
+        head_commit: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "UPDATE pull_requests
-             SET status='merged', merged_by_did=$1, merged_at=$2, updated_at=$2
+             SET status='merged', merged_by_did=$1, merged_at=$2, updated_at=$2,
+                 head_commit=COALESCE($4, head_commit)
              WHERE id=$3",
         )
         .bind(merged_by_did)
         .bind(&now)
         .bind(pr_id)
+        .bind(head_commit)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -4021,6 +4061,18 @@ mod migration_tests {
     const V24: i64 = 24;
 
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Seed a stored head without going through the code under test, so a
+    /// freeze assertion cannot pass just because the writer never ran.
+    async fn set_head_directly(db: &super::Db, pr_id: &str, sha: &str) {
+        sqlx::query("UPDATE pull_requests SET head_commit=$1 WHERE id=$2")
+            .bind(sha)
+            .bind(pr_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
 
     fn sample_claim(repo_id: &str, sha: &str, context: &str) -> super::StatusClaim {
         super::StatusClaim {
@@ -4301,6 +4353,128 @@ mod migration_tests {
         assert_eq!(
             listed[0].head_commit, None,
             "list_prs must read a null head as None"
+        );
+    }
+
+    /// The push-side update is one statement keyed on (repo, source branch,
+    /// open). Prove every arm of that WHERE clause in both directions in one
+    /// pass: the open PR on the branch moves, an open PR on a different branch
+    /// does not, and the closed and merged PRs on the *same* branch keep the
+    /// head they froze at. The status predicate is the whole freeze mechanism,
+    /// so a missing one shows up here as a moved head on a closed PR.
+    #[sqlx::test]
+    async fn set_open_pr_heads_moves_open_prs_on_the_branch_and_freezes_the_rest(
+        pool: sqlx::PgPool,
+    ) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // #1 open on `feature` — must move.
+        db.create_pr(&sample_pr("repo-1", 1)).await.unwrap();
+        // #2 open on `other` — must not move.
+        let mut other = sample_pr("repo-1", 2);
+        other.source_branch = "other".to_string();
+        db.create_pr(&other).await.unwrap();
+        // #3 closed on `feature`, frozen at SHA_A.
+        let closed = sample_pr("repo-1", 3);
+        db.create_pr(&closed).await.unwrap();
+        set_head_directly(&db, &closed.id, SHA_A).await;
+        db.close_pr(&closed.id).await.unwrap();
+        // #4 merged on `feature`, frozen at SHA_A.
+        let merged = sample_pr("repo-1", 4);
+        db.create_pr(&merged).await.unwrap();
+        set_head_directly(&db, &merged.id, SHA_A).await;
+        db.merge_pr(&merged.id, "did:key:zMerger", None)
+            .await
+            .unwrap();
+
+        let moved = db
+            .set_open_pr_heads("repo-1", "feature", SHA_B)
+            .await
+            .unwrap();
+        assert_eq!(moved, 1, "only the one open PR on `feature` may be updated");
+
+        assert_eq!(
+            db.get_pr("repo-1", 1).await.unwrap().unwrap().head_commit,
+            Some(SHA_B.to_string()),
+            "an open PR on the pushed branch must track the new head"
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
+            None,
+            "a PR on an unrelated branch must be untouched"
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 3).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "a closed PR's head is frozen"
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 4).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "a merged PR's head is frozen"
+        );
+    }
+
+    /// A same-named branch is the common case across repos, so a missing repo
+    /// predicate would be invisible to every single-repo assertion above.
+    #[sqlx::test]
+    async fn set_open_pr_heads_is_scoped_to_the_named_repo(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        db.create_pr(&sample_pr("repo-1", 1)).await.unwrap();
+        db.create_pr(&sample_pr("repo-2", 1)).await.unwrap();
+
+        let moved = db
+            .set_open_pr_heads("repo-1", "feature", SHA_B)
+            .await
+            .unwrap();
+        assert_eq!(moved, 1, "the sibling repo's PR must not be counted");
+
+        assert_eq!(
+            db.get_pr("repo-1", 1).await.unwrap().unwrap().head_commit,
+            Some(SHA_B.to_string())
+        );
+        assert_eq!(
+            db.get_pr("repo-2", 1).await.unwrap().unwrap().head_commit,
+            None,
+            "a push in one repo must not move a same-named branch's PR elsewhere"
+        );
+    }
+
+    /// The merge stamp writes the head it actually merged, overwriting whatever
+    /// a racing push left. Passing `None` (a merge that could not resolve the
+    /// source head) must preserve the stored value rather than null it out.
+    #[sqlx::test]
+    async fn merge_pr_stamps_the_supplied_head_and_none_preserves_it(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        let stamped = sample_pr("repo-1", 1);
+        db.create_pr(&stamped).await.unwrap();
+        set_head_directly(&db, &stamped.id, SHA_A).await;
+        db.merge_pr(&stamped.id, "did:key:zMerger", Some(SHA_B))
+            .await
+            .unwrap();
+        let after = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        assert_eq!(after.status, "merged");
+        assert_eq!(
+            after.head_commit,
+            Some(SHA_B.to_string()),
+            "the merge stamps the head it merged, not the one the row carried"
+        );
+
+        let preserved = sample_pr("repo-1", 2);
+        db.create_pr(&preserved).await.unwrap();
+        set_head_directly(&db, &preserved.id, SHA_A).await;
+        db.merge_pr(&preserved.id, "did:key:zMerger", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "an unresolvable source head must not null a stored head"
         );
     }
 
