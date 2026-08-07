@@ -485,8 +485,8 @@ impl Db {
 // NOTE: the v1 migration includes columns (seq, prev, pusher_sig on
 // ref_certificates) that were historically added by later migrations. These
 // were bundled into v1 for development convenience. cert_id on arweave_anchors
-// is added by migration v12 as ALTER TABLE; signature_input, content_digest,
-// and request_path are added by v13.  New installs reach v12/v13 via sequential
+// is added by migration v18 as ALTER TABLE; signature_input, content_digest,
+// and request_path are added by v19.  New installs reach v18/v19 via sequential
 // migration; existing installs with the columns already present are no-ops via
 // IF NOT EXISTS.
 //
@@ -5009,7 +5009,7 @@ mod migration_tests {
             "pre-migration row must exist"
         );
 
-        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did, v12 arweave) ──
+        // ── Apply pending migrations (v10 ref_cert_unique_per_ref, v11 owner_did, v18 arweave) ──
         db.migrate().await.unwrap();
 
         // ── Assertions ────────────────────────────────────────────────────
@@ -7039,7 +7039,7 @@ mod ref_certificate_tests {
         let db = db(pool.clone()).await;
 
         // Drop the unique indexes so we can simulate pre-v10 duplicate rows.
-        // v13's (repo_id, seq) index must also be removed because raw INSERTS
+        // v19's (repo_id, seq) index must also be removed because raw INSERTS
         // without an explicit seq all get DEFAULT 1.
         sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
             .execute(&pool)
@@ -7376,7 +7376,7 @@ mod ref_certificate_tests {
 
         // 2. Roll back to v9: remove unique indexes and the
         //    schema_migrations record so that run_migrations() re-applies v10.
-        //    Also drop v13's (repo_id, seq) index so raw INSERTS below work.
+        //    Also drop v19's (repo_id, seq) index so raw INSERTS below work.
         sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_ref")
             .execute(&pool)
             .await
@@ -7588,9 +7588,9 @@ mod ref_certificate_tests {
         );
     }
 
-    /// INV-7: upgrade-path test for migration v13 — seed a database at v12
+    /// INV-7: upgrade-path test for migration v19 — seed a database at v18
     /// with multiple same-repo/different-ref certificates (all at seq=1),
-    /// then let run_migrations() apply v13 and verify (a) seq values are
+    /// then let run_migrations() apply v19 and verify (a) seq values are
     /// distinct per repo, (b) the (repo_id, seq) unique index exists and
     /// rejects a raw INSERT with a colliding seq.
     #[sqlx::test]
@@ -7599,13 +7599,13 @@ mod ref_certificate_tests {
         let db = Db::for_testing(pool.clone());
         db.run_migrations().await.unwrap();
 
-        // 2. Roll back to v12: drop the (repo_id, seq) index and the
-        //    schema_migrations record for v13 so run_migrations() re-applies it.
+        // 2. Roll back to v18: drop the (repo_id, seq) index and the
+        //    schema_migrations record for v19 so run_migrations() re-applies it.
         sqlx::query("DROP INDEX IF EXISTS idx_ref_certs_repo_seq")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("DELETE FROM schema_migrations WHERE version = 13")
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 19")
             .execute(&pool)
             .await
             .unwrap();
@@ -7652,7 +7652,7 @@ mod ref_certificate_tests {
             .unwrap();
         }
 
-        // 4. Re-run migrations — v13 backfills seq.
+        // 4. Re-run migrations — v19 backfills seq.
         db.run_migrations().await.unwrap();
 
         // 5. Assert distinct seq values per repo.
