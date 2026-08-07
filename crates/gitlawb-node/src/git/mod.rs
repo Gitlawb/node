@@ -190,26 +190,41 @@ impl GitCommand {
         // interleaving between the check and the insert — if canceled
         // is set while we hold the lock, the sweep cannot drain the
         // registry until we release it.
-        if let Some(ref ctx) = ctx {
+        //
+        // The lock is held ONLY for the check + register decision, never
+        // across `wait_with_output` below: a zombie-reap that outlives the
+        // deadline must not block other threads from registering or draining
+        // their pgids (R1-P2).
+        let kill_after_cancel = if let Some(ref ctx) = ctx {
             let mut registry = ctx.registry.lock().unwrap_or_else(|e| e.into_inner());
             if ctx.canceled.load(Ordering::SeqCst) {
-                // Canceled after spawn: kill the whole process group (not
-                // just the immediate child) and wait to avoid zombies.
+                true
+            } else {
                 if let Some(pgid) = pgid {
-                    #[cfg(unix)]
-                    unsafe {
-                        let _ = libc::kill(-pgid, libc::SIGTERM);
-                    }
+                    registry.insert(pgid);
                 }
-                let _ = child.wait_with_output();
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "scan canceled after spawn",
-                ));
+                false
             }
+        } else {
+            false
+        };
+
+        if kill_after_cancel {
+            // Canceled after spawn: kill the whole process group (not just the
+            // immediate child) and wait to avoid zombies.  The pgid was never
+            // registered (we bailed before the insert), so no registry cleanup
+            // is owed here.
             if let Some(pgid) = pgid {
-                registry.insert(pgid);
+                #[cfg(unix)]
+                unsafe {
+                    let _ = libc::kill(-pgid, libc::SIGTERM);
+                }
             }
+            let _ = child.wait_with_output();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "scan canceled after spawn",
+            ));
         }
 
         let guard = PgidGuard { pgid, ctx };
