@@ -2106,21 +2106,19 @@ impl Db {
 
 // ── Status Claims ─────────────────────────────────────────────────────────────
 
-impl Db {
-    /// Append one claim. `claim.seq` is ignored: the column is a `bigserial` and
-    /// the database assigns the value, which is returned here so a caller can
-    /// report the row it just wrote without a second read.
-    // Consumed by the write handler in U3; tests are the only caller until then.
-    #[allow(dead_code)]
-    pub async fn insert_status_claim(&self, claim: &StatusClaim) -> Result<i64> {
-        let row = sqlx::query(
-            "INSERT INTO status_claims
-             (id, repo_id, commit_sha, state, context, target_url, description,
-              producer_did, authorizing_did, signature, signature_input,
-              signed_payload, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-             RETURNING seq",
-        )
+const INSERT_STATUS_CLAIM_SQL: &str = "INSERT INTO status_claims
+     (id, repo_id, commit_sha, state, context, target_url, description,
+      producer_did, authorizing_did, signature, signature_input,
+      signed_payload, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+     RETURNING seq";
+
+/// The bind chain for [`INSERT_STATUS_CLAIM_SQL`], shared by the plain and the
+/// capped insert so the two can never bind different columns.
+fn status_claim_insert(
+    claim: &StatusClaim,
+) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    sqlx::query(INSERT_STATUS_CLAIM_SQL)
         .bind(&claim.id)
         .bind(&claim.repo_id)
         .bind(&claim.commit_sha)
@@ -2134,9 +2132,98 @@ impl Db {
         .bind(&claim.signature_input)
         .bind(&claim.signed_payload)
         .bind(&claim.created_at)
-        .fetch_one(&self.pool)
-        .await?;
+}
+
+/// The three write-path bounds. All three are checked in the insert transaction:
+/// one alone bounds nothing, because the context string and the commit SHA are
+/// both caller-chosen and the SHA is never existence-checked.
+pub struct ClaimCaps {
+    /// Claims for one (repo, commit, producer, context).
+    pub per_tuple: i64,
+    /// Distinct contexts for one (repo, commit).
+    pub contexts_per_commit: i64,
+    /// Total claim rows for one repo.
+    pub per_repo: i64,
+}
+
+/// Outcome of a capped append. `CapExceeded` names the bound that refused, for
+/// the caller's 429 message; it is not a database error.
+pub enum ClaimInsert {
+    Inserted(i64),
+    CapExceeded(&'static str),
+}
+
+impl Db {
+    /// Append one claim. `claim.seq` is ignored: the column is a `bigserial` and
+    /// the database assigns the value, which is returned here so a caller can
+    /// report the row it just wrote without a second read.
+    // The write handler uses the capped form below; this stays the uncapped
+    // primitive the db tests drive directly.
+    #[allow(dead_code)]
+    pub async fn insert_status_claim(&self, claim: &StatusClaim) -> Result<i64> {
+        let row = status_claim_insert(claim).fetch_one(&self.pool).await?;
         Ok(row.get::<i64, _>("seq"))
+    }
+
+    /// Append one claim only if all three caps still admit it, with the counts
+    /// and the insert in one transaction so a concurrent writer cannot slip an
+    /// extra row past a bound that was counted a moment earlier.
+    pub async fn insert_status_claim_capped(
+        &self,
+        claim: &StatusClaim,
+        caps: &ClaimCaps,
+    ) -> Result<ClaimInsert> {
+        let mut tx = self.pool.begin().await?;
+
+        let tuple_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM status_claims
+             WHERE repo_id=$1 AND commit_sha=$2 AND producer_did=$3 AND context=$4",
+        )
+        .bind(&claim.repo_id)
+        .bind(&claim.commit_sha)
+        .bind(&claim.producer_did)
+        .bind(&claim.context)
+        .fetch_one(&mut *tx)
+        .await?;
+        if tuple_count >= caps.per_tuple {
+            return Ok(ClaimInsert::CapExceeded(
+                "claims for this commit, producer and context",
+            ));
+        }
+
+        // A context already present does not widen the fanout, so only a NEW
+        // context is measured against the limit.
+        let row = sqlx::query(
+            "SELECT count(DISTINCT context) AS contexts,
+                    COALESCE(bool_or(context = $3), false) AS present
+             FROM status_claims WHERE repo_id=$1 AND commit_sha=$2",
+        )
+        .bind(&claim.repo_id)
+        .bind(&claim.commit_sha)
+        .bind(&claim.context)
+        .fetch_one(&mut *tx)
+        .await?;
+        let contexts: i64 = row.get("contexts");
+        let present: bool = row.get("present");
+        if !present && contexts >= caps.contexts_per_commit {
+            return Ok(ClaimInsert::CapExceeded(
+                "distinct contexts for this commit",
+            ));
+        }
+
+        let repo_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM status_claims WHERE repo_id=$1")
+                .bind(&claim.repo_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if repo_rows >= caps.per_repo {
+            return Ok(ClaimInsert::CapExceeded("claims for this repository"));
+        }
+
+        let inserted = status_claim_insert(claim).fetch_one(&mut *tx).await?;
+        let seq = inserted.get::<i64, _>("seq");
+        tx.commit().await?;
+        Ok(ClaimInsert::Inserted(seq))
     }
 
     /// Every claim recorded for one commit, oldest first. Ordering is on `seq`,

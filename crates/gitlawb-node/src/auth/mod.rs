@@ -17,6 +17,25 @@ use crate::state::AppState;
 #[derive(Clone, Debug)]
 pub struct AuthenticatedDid(pub String);
 
+/// The RFC 9421 material this request was actually verified against, injected
+/// alongside [`AuthenticatedDid`] by `require_signature`.
+///
+/// A handler that records a signed claim as history has to store it: the header
+/// values and the canonical signing string are gone once the request ends, and a
+/// stored claim nobody can re-verify is not history. `signing_string` is the exact
+/// byte sequence the Ed25519 verification succeeded over, not a rebuild — a
+/// handler reconstructing it from headers would be verifying a different string
+/// than the middleware did.
+#[derive(Clone, Debug)]
+pub struct SignatureMaterial {
+    /// The `Signature` header value.
+    pub signature: String,
+    /// The `Signature-Input` header value.
+    pub signature_input: String,
+    /// The canonical bytes the signature covered.
+    pub signing_string: String,
+}
+
 /// Whether `caller` is authorized to push to `record`.
 ///
 /// Phase 1 (`GITLAWB_ENFORCE_OWNER_PUSH`): owner-only, via the canonical
@@ -242,6 +261,13 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
     request
         .extensions_mut()
         .insert(AuthenticatedDid(sig.key_id.to_string()));
+    // Carry the verified material forward for handlers that persist a signed
+    // claim; none of it can be recovered once the request is gone.
+    request.extensions_mut().insert(SignatureMaterial {
+        signature: sig_header,
+        signature_input: sig_input,
+        signing_string,
+    });
     next.run(request).await
 }
 

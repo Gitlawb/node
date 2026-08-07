@@ -14,7 +14,7 @@ use tracing::Level;
 
 use crate::api::{
     agents, arweave, bounties, certs, changelog, events, ipfs, issues, labels, peers, profiles,
-    protect, pulls, register, replicas, repos, resolve, stars, tasks, visibility, webhooks,
+    protect, pulls, register, replicas, repos, resolve, stars, status, tasks, visibility, webhooks,
 };
 use crate::auth;
 use crate::rate_limit;
@@ -182,6 +182,26 @@ pub fn build_router(state: AppState) -> Router {
             ),
         state.clone(),
     );
+
+    // ── Status claim writes — signature, plus the per-DID throttle AND the
+    // per-IP flood brake `creation_routes` carries. Not in `write_routes`, which
+    // has neither: every call here appends a row, so an unthrottled writer grows
+    // the claim log on demand and the three per-repo caps would be the only bound.
+    let status_write_routes = add_auth_layers(
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/statuses/{sha}",
+                post(status::create_status),
+            )
+            .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
+            .layer(axum::Extension(state.rate_limiter.clone())),
+        state.clone(),
+    )
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(rate_limit::IpRateLimiter {
+        limiter: state.create_ip_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    }));
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.
@@ -469,6 +489,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(profile_write_routes)
         .merge(creation_routes)
         .merge(write_routes)
+        .merge(status_write_routes)
         .merge(git_write_routes)
         .merge(git_read_routes)
         .merge(issue_write_routes)

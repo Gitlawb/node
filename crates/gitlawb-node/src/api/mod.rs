@@ -22,6 +22,7 @@ pub mod replicas;
 pub mod repos;
 pub mod resolve;
 pub mod stars;
+pub mod status;
 pub mod tasks;
 pub mod visibility;
 pub mod webhooks;
@@ -175,6 +176,7 @@ mod authz_guard {
         let events = include_str!("events.rs");
         let tasks = include_str!("tasks.rs");
         let stars = include_str!("stars.rs");
+        let status = include_str!("status.rs");
         let protect = include_str!("protect.rs");
         let visibility = include_str!("visibility.rs");
         let profiles = include_str!("profiles.rs");
@@ -195,6 +197,13 @@ mod authz_guard {
             // (existence hiding) and require_repo_owner guards the owner half.
             (webhooks, "list_webhooks", "authorize_repo_read("),
             (webhooks, "list_webhooks", "require_repo_owner("),
+            // Same two-half shape as list_webhooks: authorize_repo_read runs
+            // first (a quarantined or unreadable repo gets the missing-repo
+            // not-found, never a 403 that would confirm existence), then
+            // require_repo_owner 403s a non-owner of a readable repo. Both halves
+            // are pinned, because dropping either changes what a stranger learns.
+            (status, "create_status", "authorize_repo_read("),
+            (status, "create_status", "require_repo_owner("),
             (labels, "add_label", "require_repo_owner("),
             (labels, "remove_label", "require_repo_owner("),
             // Bucket A' — owner OR author (did_matches against the author)
@@ -490,6 +499,7 @@ mod authz_guard {
             (include_str!("replicas.rs"), "replicas.rs"),
             (include_str!("repos.rs"), "repos.rs"),
             (include_str!("stars.rs"), "stars.rs"),
+            (include_str!("status.rs"), "status.rs"),
             (include_str!("visibility.rs"), "visibility.rs"),
             (include_str!("webhooks.rs"), "webhooks.rs"),
         ];
