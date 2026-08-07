@@ -213,6 +213,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/commits/{sha}/status",
             get(status::commit_status),
         )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/pulls/{number}/status",
+            get(status::pull_request_status),
+        )
         .layer(middleware::from_fn(auth::optional_signature));
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git

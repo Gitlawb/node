@@ -168,16 +168,35 @@ pub async fn commit_status(
         crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
 
     let commit_sha = normalize_sha(&sha)?;
-    // KTD-5: current authorization, not write-time authorization. An ownership
-    // transfer drops the prior owner's claims from the projection while the
-    // append-only history keeps them.
+    let statuses = project_claims(&state, &record, &commit_sha).await?;
+
+    Ok(Json(CombinedStatus {
+        state: combined_state(&statuses).to_string(),
+        sha: commit_sha,
+        total_count: statuses.len(),
+        statuses,
+        reported_only: true,
+    }))
+}
+
+/// The projection, in one place. Both read surfaces call it, so R3's "the rollup
+/// is derived by the same projection as the commit read" holds by construction
+/// rather than by two implementations happening to agree.
+///
+/// KTD-5: current authorization, not write-time authorization. An ownership
+/// transfer drops the prior owner's claims from the projection while the
+/// append-only history keeps them.
+async fn project_claims(
+    state: &AppState,
+    record: &crate::db::RepoRecord,
+    commit_sha: &str,
+) -> Result<Vec<StatusEntry>> {
     let authorizing = authorizing_did_variants(&record.owner_did);
     let claims = state
         .db
-        .latest_status_claims(&record.id, &commit_sha, &authorizing)
+        .latest_status_claims(&record.id, commit_sha, &authorizing)
         .await?;
-
-    let statuses: Vec<StatusEntry> = claims
+    Ok(claims
         .into_iter()
         .map(|c| StatusEntry {
             state: c.state,
@@ -187,15 +206,135 @@ pub async fn commit_status(
             producer_did: c.producer_did,
             created_at: c.created_at,
         })
-        .collect();
+        .collect())
+}
 
-    Ok(Json(CombinedStatus {
+/// The pull request head rollup (R11). `state` stays inside the four wire values
+/// whatever happened to the head (KTD-1): an unresolvable head is carried by
+/// `head_resolved`, alongside the pull request's own state, so a client can tell
+/// "the head could not be resolved" from "the head resolved and nothing reported"
+/// without a fifth state value no client understands.
+#[derive(Serialize)]
+pub struct PullRequestStatus {
+    pub number: i64,
+    /// The pull request's own state: open, closed, or merged.
+    pub pull_request_state: String,
+    pub head_resolved: bool,
+    /// The target commit, absent exactly when `head_resolved` is false.
+    pub sha: Option<String>,
+    pub state: String,
+    pub total_count: usize,
+    pub statuses: Vec<StatusEntry>,
+    pub reported_only: bool,
+}
+
+/// GET /api/v1/repos/:owner/:repo/pulls/:number/status
+///
+/// Same optional-auth shape as the commit read, and the auth extension MUST stay
+/// last in the extractor list.
+pub async fn pull_request_status(
+    State(state): State<AppState>,
+    Path((owner, name, number)): Path<(String, String, i64)>,
+    auth: Option<Extension<AuthenticatedDid>>,
+) -> Result<Json<PullRequestStatus>> {
+    let caller = auth.as_ref().map(|Extension(a)| a.0.as_str());
+    // The gate runs first, on the requested path, before the pull request row is
+    // loaded. Its deny is the repo's own not-found, byte-identical to a missing
+    // repo. Once it passes, a missing pull request number is the plain not-found:
+    // existence is no longer secret.
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
+
+    let pr = state
+        .db
+        .get_pr(&record.id, number)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("PR #{number} not found")))?;
+
+    let head = rollup_head(&state, &record, &pr).await?;
+
+    let statuses = match &head {
+        Some(sha) => project_claims(&state, &record, sha).await?,
+        None => Vec::new(),
+    };
+
+    Ok(Json(PullRequestStatus {
+        number: pr.number,
+        pull_request_state: pr.status,
+        head_resolved: head.is_some(),
+        sha: head,
         state: combined_state(&statuses).to_string(),
-        sha: commit_sha,
         total_count: statuses.len(),
         statuses,
         reported_only: true,
     }))
+}
+
+/// Branch-head lookups performed by the rollup fallback, counted so a test can
+/// assert WORK DONE rather than only the answer returned. A fallback that
+/// re-resolved on every read and then discarded the answer would be invisible in
+/// the response and visible here.
+#[cfg(test)]
+pub(crate) static BRANCH_RESOLVES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The rollup's target commit (KTD-4).
+///
+/// The stored head wins whenever it is set. It is frozen at close or merge, so a
+/// closed or merged pull request keeps the commit the decision was made against,
+/// and only an OPEN pull request with no stored head falls back to the branch.
+///
+/// The fallback is one database read: the branch heads this node recorded for the
+/// repo, the same `list_branch_cids` lookup the refs handler in
+/// `crate::api::repos` uses. It deliberately does NOT go through
+/// `git::store` ref listing, which needs an acquired repository path — on a cold
+/// node that downloads the whole repository from object storage, and this read
+/// group carries no rate limiter, so an anonymous caller could drive repeated
+/// downloads with a URL.
+///
+/// The resolved head is persisted, which makes an unauthenticated GET write. That
+/// is only acceptable because the write is self-limiting: it fires exactly when
+/// `head_commit` is absent and it fills it, and the fill is conditioned on that
+/// same absence in SQL, so the branch is never taken twice for one pull request.
+async fn rollup_head(
+    state: &AppState,
+    record: &crate::db::RepoRecord,
+    pr: &crate::db::PullRequest,
+) -> Result<Option<String>> {
+    if let Some(stored) = pr.head_commit.clone() {
+        return Ok(Some(stored));
+    }
+    if pr.status != "open" {
+        return Ok(None);
+    }
+
+    // Keyed the way the push path writes the row: the normalized owner key and
+    // the repo's own name, never the alias the caller happened to put in the URL.
+    let slug = format!(
+        "{}/{}",
+        crate::db::normalize_owner_key(&record.owner_did),
+        record.name
+    );
+    #[cfg(test)]
+    BRANCH_RESOLVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let heads = state.db.list_branch_cids(&slug).await?;
+    let resolved = heads
+        .iter()
+        .find(|h| {
+            h.ref_name
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&h.ref_name)
+                == pr.source_branch
+        })
+        // A recorded head that is not a commit SHA is no target at all, and
+        // storing it would leave the rollup pointing at nothing forever.
+        .and_then(|h| normalize_sha(&h.sha).ok());
+
+    let Some(sha) = resolved else {
+        return Ok(None);
+    };
+    state.db.set_pr_head_if_absent(&pr.id, &sha).await?;
+    Ok(Some(sha))
 }
 
 /// KTD-1's fold: any error or failure yields failure, else any pending yields
@@ -1441,5 +1580,682 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed claims across shas");
+    }
+
+    // ── Pull request rollup (U5) ──────────────────────────────────────────
+
+    fn rollup_router(state: crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls/{number}/status",
+                axum::routing::get(super::pull_request_status),
+            )
+            .with_state(state)
+    }
+
+    fn rollup_uri(owner: &str, repo: &str, number: i64) -> String {
+        format!("/api/v1/repos/{owner}/{repo}/pulls/{number}/status")
+    }
+
+    async fn get_rollup(
+        state: &crate::state::AppState,
+        did: Option<&str>,
+        uri: &str,
+    ) -> axum::response::Response {
+        let req = match did {
+            Some(d) => signed_request_as(d, Method::GET, uri, Body::empty()),
+            None => axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        };
+        rollup_router(state.clone()).oneshot(req).await.unwrap()
+    }
+
+    fn seed_pr(repo_id: &str, number: i64, source_branch: &str) -> crate::db::PullRequest {
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::db::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo_id.to_string(),
+            number,
+            title: format!("PR {number}"),
+            body: None,
+            author_did: OWNER.to_string(),
+            source_branch: source_branch.to_string(),
+            target_branch: "main".to_string(),
+            status: "open".to_string(),
+            merged_by_did: None,
+            merged_at: None,
+            head_commit: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// The key `branch_cids` rows are written under on the push path: the
+    /// normalized owner key and the repo's own name, not the path alias.
+    fn branch_slug(repo: &RepoRecord) -> String {
+        format!(
+            "{}/{}",
+            crate::db::normalize_owner_key(&repo.owner_did),
+            repo.name
+        )
+    }
+
+    async fn seed_branch_head(
+        state: &crate::state::AppState,
+        repo: &RepoRecord,
+        branch: &str,
+        sha: &str,
+    ) {
+        state
+            .db
+            .upsert_branch_cid(
+                &branch_slug(repo),
+                &format!("refs/heads/{branch}"),
+                sha,
+                "bafyseed",
+                OWNER,
+            )
+            .await
+            .expect("seed branch head");
+    }
+
+    /// Serializes the tests that read [`super::BRANCH_RESOLVES`] and zeroes it, so
+    /// the counter measures one test's requests rather than whatever else the
+    /// harness is running in the same process. Held for the test's lifetime.
+    /// Async-aware on purpose: the guard is held across the test's awaits, which a
+    /// blocking `std` mutex must not be.
+    async fn resolve_count_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let guard = LOCK.lock().await;
+        super::BRANCH_RESOLVES.store(0, std::sync::atomic::Ordering::SeqCst);
+        guard
+    }
+
+    fn resolve_count() -> usize {
+        super::BRANCH_RESOLVES.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The four wire states (KTD-1). The rollup never adds a fifth value, whatever
+    /// happened to the head.
+    fn assert_wire_state(body: &serde_json::Value) {
+        let state = body["state"].as_str().expect("state must be a string");
+        assert!(
+            ["error", "failure", "pending", "success"].contains(&state),
+            "rollup state {state:?} is outside the four-value wire set"
+        );
+    }
+
+    /// R3/R11: the rollup is the SAME projection as the commit read. Asserted by
+    /// comparing the two responses on the head SHA, so the two surfaces cannot
+    /// drift into two answers.
+    #[sqlx::test]
+    async fn rollup_matches_the_commit_read_for_the_stored_head(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-same", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        state
+            .db
+            .set_open_pr_heads(&repo.id, "feature", SHA_A)
+            .await
+            .unwrap();
+
+        for (st, ctx) in [("success", "ci/build"), ("pending", "ci/test")] {
+            let resp = post_as(
+                &state,
+                OWNER,
+                &uri(OWNER, "rollup-same", SHA_A),
+                body_of(st, ctx),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        let commit =
+            body_json(get_status(&state, None, &status_uri(OWNER, "rollup-same", SHA_A)).await)
+                .await;
+        let rollup =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-same", 1)).await).await;
+
+        assert_eq!(rollup["sha"], SHA_A);
+        assert_eq!(rollup["head_resolved"], true);
+        assert_eq!(rollup["pull_request_state"], "open");
+        assert_eq!(rollup["reported_only"], true);
+        assert_eq!(rollup["state"], commit["state"]);
+        assert_eq!(rollup["total_count"], commit["total_count"]);
+        assert_eq!(
+            rollup["statuses"], commit["statuses"],
+            "the rollup must serve the commit read's projection unchanged"
+        );
+    }
+
+    /// Covers AE2 (rollup half). Two contexts on the head, one failing: the
+    /// rollup must not read as success.
+    #[sqlx::test]
+    async fn ae2_rollup_with_a_failing_context_does_not_read_as_success(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-ae2", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        state
+            .db
+            .set_open_pr_heads(&repo.id, "feature", SHA_A)
+            .await
+            .unwrap();
+
+        for (st, ctx) in [("success", "ci/build"), ("failure", "ci/test")] {
+            let resp = post_as(
+                &state,
+                OWNER,
+                &uri(OWNER, "rollup-ae2", SHA_A),
+                body_of(st, ctx),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-ae2", 1)).await).await;
+        assert_eq!(body["state"], "failure");
+        assert_ne!(body["state"], "success");
+        assert_eq!(body["total_count"], 2);
+    }
+
+    /// R12's first arm: a resolved head with nothing reported is pending-zero with
+    /// `head_resolved` TRUE. Pairs with the unresolvable case below, which differs
+    /// on that boolean alone.
+    #[sqlx::test]
+    async fn resolved_head_with_no_claims_is_pending_zero_and_head_resolved(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-silent", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        state
+            .db
+            .set_open_pr_heads(&repo.id, "feature", SHA_A)
+            .await
+            .unwrap();
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-silent", 1)).await).await;
+        assert_wire_state(&body);
+        assert_eq!(body["state"], "pending");
+        assert_eq!(body["total_count"], 0);
+        assert_eq!(body["statuses"].as_array().unwrap().len(), 0);
+        assert_eq!(body["head_resolved"], true);
+        assert_eq!(body["sha"], SHA_A);
+    }
+
+    /// R17: an open pull request whose source branch is gone has no resolvable
+    /// head. The answer is pending with zero contexts and `head_resolved` FALSE,
+    /// which is the ONLY field separating it from the reported-nothing case above.
+    #[sqlx::test]
+    async fn unresolvable_head_differs_from_silent_head_on_head_resolved_alone(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-gone", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "deleted-branch");
+        state.db.create_pr(&pr).await.unwrap();
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-gone", 1)).await).await;
+        assert_wire_state(&body);
+        assert_eq!(body["state"], "pending");
+        assert_eq!(body["total_count"], 0);
+        assert_eq!(body["statuses"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            body["head_resolved"], false,
+            "an unresolvable head must report head_resolved false, which is the \
+             only field separating it from a resolved head nobody reported on"
+        );
+        assert!(
+            body["sha"].is_null(),
+            "an unresolved head must carry no target sha, got {:?}",
+            body["sha"]
+        );
+        assert_eq!(body["pull_request_state"], "open");
+        // Nothing was resolvable, so nothing was persisted either.
+        assert_eq!(
+            state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit,
+            None
+        );
+    }
+
+    /// R17's closed arm: a closed pull request with no stored head answers
+    /// unresolved and does NOT fall back to the branch, even when the branch still
+    /// has a head. Resolving there would hand a reader a commit the pull request
+    /// was never decided against.
+    #[sqlx::test]
+    async fn closed_pr_with_no_stored_head_does_not_resolve_the_branch(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-closed", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        state.db.close_pr(&pr.id).await.unwrap();
+        // The branch is alive and would resolve if the fallback ran.
+        seed_branch_head(&state, &repo, "feature", SHA_B).await;
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-closed", 1)).await).await;
+        assert_wire_state(&body);
+        assert_eq!(body["pull_request_state"], "closed");
+        assert_eq!(
+            body["head_resolved"], false,
+            "a closed pull request with no stored head is unresolved, not back-filled"
+        );
+        assert!(body["sha"].is_null(), "no branch resolve on a closed PR");
+        assert_eq!(body["total_count"], 0);
+        assert_eq!(
+            state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit,
+            None,
+            "a closed PR's head must not be back-filled from the live branch"
+        );
+        assert_eq!(
+            resolve_count(),
+            0,
+            "a closed pull request must not trigger a branch resolve at all"
+        );
+    }
+
+    /// R17's merged arm: the stored head is frozen at merge and its claims are
+    /// still served, with the pull request state named.
+    #[sqlx::test]
+    async fn merged_pr_serves_its_frozen_head(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-merged", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "rollup-merged", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        state.db.merge_pr(&pr.id, OWNER, Some(SHA_A)).await.unwrap();
+        // The branch moved on after the merge; the frozen head must win.
+        seed_branch_head(&state, &repo, "feature", SHA_B).await;
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-merged", 1)).await).await;
+        assert_eq!(body["pull_request_state"], "merged");
+        assert_eq!(body["head_resolved"], true);
+        assert_eq!(body["sha"], SHA_A);
+        assert_eq!(body["state"], "success");
+        assert_eq!(body["total_count"], 1);
+    }
+
+    /// The force-push flow: a re-pointed head is a fresh target, so the rollup
+    /// goes back to pending-zero until something reports on the new SHA. A rollup
+    /// keyed to the OLD sha would keep showing a green that describes code nobody
+    /// is looking at any more.
+    #[sqlx::test]
+    async fn moving_the_stored_head_repoints_the_rollup(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-force", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        state
+            .db
+            .set_open_pr_heads(&repo.id, "feature", SHA_A)
+            .await
+            .unwrap();
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "rollup-force", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let before =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-force", 1)).await).await;
+        assert_eq!(before["state"], "success");
+
+        state
+            .db
+            .set_open_pr_heads(&repo.id, "feature", SHA_B)
+            .await
+            .unwrap();
+
+        let after =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-force", 1)).await).await;
+        assert_eq!(after["sha"], SHA_B);
+        assert_eq!(after["state"], "pending");
+        assert_eq!(after["total_count"], 0);
+    }
+
+    /// The open-PR fallback: no stored head, a live source branch, so the branch
+    /// head is resolved from the database, served, AND persisted as the stored
+    /// head for the next read.
+    #[sqlx::test]
+    async fn open_pr_without_a_stored_head_resolves_and_persists_the_branch_head(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-fallback", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        seed_branch_head(&state, &repo, "feature", SHA_A).await;
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-fallback", 1)).await)
+                .await;
+        assert_eq!(body["head_resolved"], true);
+        assert_eq!(body["sha"], SHA_A);
+        assert_eq!(body["state"], "pending");
+        assert_eq!(
+            state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit,
+            Some(SHA_A.to_string()),
+            "the resolved head must be persisted as the stored head"
+        );
+    }
+
+    /// The fallback writes on an UNAUTHENTICATED read, so it has to be
+    /// self-limiting: it fires only while `head_commit` is absent, and it sets it.
+    ///
+    /// Proven two ways, because the output alone would not show it. The response
+    /// says the second read returned the STORED sha after the branch moved
+    /// underneath it, which it could not do if it had re-resolved; and the resolve
+    /// counter says the branch lookup RAN once across two reads, which is the
+    /// work-done bound rather than the results-emitted one — a fallback that
+    /// re-read the branch on every call and then discarded the answer would leave
+    /// the response identical and the cost doubled.
+    #[sqlx::test]
+    async fn head_fallback_resolves_once_and_later_reads_use_the_stored_head(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-once", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        seed_branch_head(&state, &repo, "feature", SHA_A).await;
+
+        let first =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-once", 1)).await).await;
+        assert_eq!(first["sha"], SHA_A, "the first read resolves the branch");
+        assert_eq!(
+            resolve_count(),
+            1,
+            "the first read must perform exactly one branch-head lookup"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit,
+            Some(SHA_A.to_string()),
+            "the first read persists what it resolved"
+        );
+
+        // Move the branch WITHOUT going through the push path, so nothing updates
+        // the stored head. A second read that resolved again would return SHA_B.
+        seed_branch_head(&state, &repo, "feature", SHA_B).await;
+
+        let second =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-once", 1)).await).await;
+        assert_eq!(
+            second["sha"], SHA_A,
+            "the second read must be served from the stored head, not a fresh branch resolve"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit,
+            Some(SHA_A.to_string()),
+            "the stored head must not be rewritten by a later read"
+        );
+        assert_eq!(
+            resolve_count(),
+            1,
+            "the branch resolve must not run again once a head is stored"
+        );
+    }
+
+    /// The rollup's deny is the repo's own not-found, byte for byte what a caller
+    /// gets for a repo that does not exist. The pull request and its claims are
+    /// seeded first, so the deny cannot pass vacuously.
+    #[sqlx::test]
+    async fn anon_rollup_on_private_repo_is_indistinguishable_from_missing(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let target = rollup_uri(OWNER, "rollup-private", 1);
+
+        let missing = status_and_bytes(get_rollup(&state, None, &target).await).await;
+
+        let repo = seed_repo(OWNER, "rollup-private", false);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        state
+            .db
+            .set_open_pr_heads(&repo.id, "feature", SHA_A)
+            .await
+            .unwrap();
+        seed_claim(
+            &pool,
+            "33333333-0000-0000-0000-000000000001",
+            &repo.id,
+            SHA_A,
+            OWNER,
+            OWNER,
+            "ci/build",
+            "success",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let denied = status_and_bytes(get_rollup(&state, None, &target).await).await;
+
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            denied, missing,
+            "a private-repo deny must be byte-identical to the missing-repo response"
+        );
+        assert!(
+            !String::from_utf8_lossy(&denied.1).contains("ci/build"),
+            "the deny must carry no trace of the claim"
+        );
+    }
+
+    /// A pull request number that does not exist on a repo the caller CAN read is
+    /// the plain not-found: existence is not secret once the read gate passed.
+    #[sqlx::test]
+    async fn unknown_pr_number_on_a_visible_repo_is_404(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-missing-pr", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        let resp = get_rollup(&state, None, &rollup_uri(OWNER, "rollup-missing-pr", 99)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// R18's endpoint boundary: the rollup lives ONLY on the per-pull-request
+    /// endpoint. The list response must gain no rollup field and do no status
+    /// work, or one list call becomes N projections.
+    ///
+    /// Asserted on the ABSENCE of the named rollup fields, never on the full field
+    /// set: `head_commit` already surfaces on this response through the pull
+    /// request's own Serialize, and `status` is the pull request's own open/closed
+    /// state, so neither is evidence either way.
+    #[sqlx::test]
+    async fn pr_list_response_carries_no_rollup_fields(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-boundary", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        state
+            .db
+            .set_open_pr_heads(&repo.id, "feature", SHA_A)
+            .await
+            .unwrap();
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "rollup-boundary", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let router = Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/pulls",
+                axum::routing::get(crate::api::pulls::list_prs),
+            )
+            .with_state(state.clone());
+        let resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/api/v1/repos/{OWNER}/rollup-boundary/pulls"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let entry = &body["pulls"][0];
+        assert_eq!(
+            entry["number"], 1,
+            "the list must still serve the pull request"
+        );
+        for field in [
+            "combined_state",
+            "head_resolved",
+            "reported_only",
+            "rollup",
+            "statuses",
+            "total_count",
+        ] {
+            assert!(
+                entry.get(field).is_none(),
+                "the pull request list response must not carry `{field}`"
+            );
+            assert!(
+                body.get(field).is_none(),
+                "the pull request list envelope must not carry `{field}`"
+            );
+        }
+    }
+
+    /// R18's cost bound, by source read: no path in this module acquires the
+    /// repository. `repo_store.acquire` downloads the whole repository from object
+    /// storage on a cold node, and this read group carries no rate limiter, so an
+    /// anonymous caller could drive repeated downloads. The ref helper that needs
+    /// an acquired path is named here too, since reaching for it is how the
+    /// acquire gets reintroduced.
+    #[test]
+    fn status_module_never_acquires_the_repo_or_lists_refs_from_disk() {
+        let src = include_str!("status.rs");
+        // Split on the tests module itself, not on any `#[cfg(test)]` attribute:
+        // the production half carries test-only instrumentation of its own, and
+        // stopping at the first attribute would leave most of the module unscanned.
+        let (body_of_module, rest) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("module has a tests module");
+        assert!(
+            !rest.is_empty() && body_of_module.contains("pull_request_status"),
+            "the scan must cover the whole production half of the module"
+        );
+        for banned in ["repo_store.acquire", "store::list_refs"] {
+            assert!(
+                !body_of_module.contains(banned),
+                "the status module must not call `{banned}` — the rollup's branch \
+                 resolve is a database read, not a repository acquire"
+            );
+        }
+        assert!(
+            body_of_module.contains("list_branch_cids("),
+            "the fallback's branch lookup must be the database-backed list_branch_cids"
+        );
+    }
+
+    /// The rollup route exists on the production router and its group kept
+    /// `optional_signature`: a group that is never merged is not a route, and a
+    /// group without the layer reads every caller as anonymous.
+    #[sqlx::test]
+    async fn rollup_route_is_registered_with_optional_signature(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-wired", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        let target = rollup_uri(OWNER, "rollup-wired", 1);
+
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(&target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the rollup route must exist on the production router and serve a public repo to anon"
+        );
+
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(&target)
+                    .header("signature", "sig1=:bm90YXNpZw==:")
+                    .header("signature-input", "sig1=(\"@method\");alg=\"ed25519\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, bytes) = status_and_bytes(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a presented signature must be verified, which only happens if the \
+             rollup's group still carries optional_signature"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "invalid_signature");
     }
 }

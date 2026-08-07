@@ -1917,6 +1917,28 @@ impl Db {
         Ok(result.rows_affected())
     }
 
+    /// Record `sha` as the head of one OPEN pull request that has none yet.
+    /// Returns the rows updated, so a caller can tell a fill from a no-op.
+    ///
+    /// Both predicates are the point. `head_commit IS NULL` makes the write
+    /// self-limiting: the rollup's read-side fallback is reachable by an
+    /// unauthenticated GET, and this is what stops it from firing more than once
+    /// per pull request, or from rolling a head a concurrent push already
+    /// recorded back to a staler branch tip. `status='open'` is the same freeze
+    /// [`Db::set_open_pr_heads`] applies: a closed or merged pull request's head,
+    /// including its absence, is a decided fact and not back-fillable.
+    pub async fn set_pr_head_if_absent(&self, pr_id: &str, sha: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE pull_requests SET head_commit=$1
+             WHERE id=$2 AND head_commit IS NULL AND status='open'",
+        )
+        .bind(sha)
+        .bind(pr_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Mark a pull request merged, stamping the source head it merged.
     ///
     /// `head_commit` is what the merge actually consumed, read under the repo
@@ -4601,6 +4623,68 @@ mod migration_tests {
             db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
             Some(SHA_A.to_string()),
             "an unresolvable source head must not null a stored head"
+        );
+    }
+
+    /// The read-side fallback's write, which an UNAUTHENTICATED rollup read can
+    /// trigger. It has to be self-limiting in SQL, not by handler ordering: it
+    /// fills an absent head on an open pull request and refuses every other case,
+    /// so a concurrent push that already recorded a newer head cannot be rolled
+    /// back to a staler branch tip, and a closed pull request's frozen head (or
+    /// frozen absence) is never written at all.
+    #[sqlx::test]
+    async fn set_pr_head_if_absent_fills_only_an_absent_open_head(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Absent head, open: filled.
+        let fresh = sample_pr("repo-1", 1);
+        db.create_pr(&fresh).await.unwrap();
+        assert_eq!(db.set_pr_head_if_absent(&fresh.id, SHA_A).await.unwrap(), 1);
+        assert_eq!(
+            db.get_pr("repo-1", 1).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string())
+        );
+
+        // Head already present: refused, and the stored value stands.
+        assert_eq!(
+            db.set_pr_head_if_absent(&fresh.id, SHA_B).await.unwrap(),
+            0,
+            "a stored head must never be overwritten by a read-side fallback"
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 1).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "a stored head must never be overwritten by a read-side fallback"
+        );
+
+        // Absent head but closed: refused.
+        let closed = sample_pr("repo-1", 2);
+        db.create_pr(&closed).await.unwrap();
+        db.close_pr(&closed.id).await.unwrap();
+        assert_eq!(
+            db.set_pr_head_if_absent(&closed.id, SHA_A).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
+            None,
+            "a closed pull request's head must not be back-filled"
+        );
+
+        // Absent head but merged: refused.
+        let merged = sample_pr("repo-1", 3);
+        db.create_pr(&merged).await.unwrap();
+        db.merge_pr(&merged.id, "did:key:zMerger", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.set_pr_head_if_absent(&merged.id, SHA_A).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 3).await.unwrap().unwrap().head_commit,
+            None
         );
     }
 

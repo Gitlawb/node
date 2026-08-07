@@ -230,6 +230,11 @@ mod authz_guard {
             // is the repo's own not-found rather than an existence oracle over
             // which commits were reported on.
             (status, "commit_status", "authorize_repo_read("),
+            // The rollup gates on the same helper before the pull request row is
+            // loaded, so a caller who cannot read the repo cannot learn which
+            // pull request numbers exist on it — and the fallback's branch
+            // resolve and head persist sit behind that same gate.
+            (status, "pull_request_status", "authorize_repo_read("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),
