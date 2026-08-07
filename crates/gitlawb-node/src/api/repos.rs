@@ -1016,6 +1016,12 @@ pub async fn git_receive_pack(
         update_open_pr_heads(&state.db, &record.id, &ref_updates).await;
     }
 
+    // Record the push for the catch-up poll surface, before the webhooks below
+    // fire. A subscriber whose delivery fails finds the work by polling instead.
+    if !ref_updates.is_empty() {
+        record_push_events(&state.db, &record.id, &ref_updates).await;
+    }
+
     // Fire push webhooks — one per ref update
     if !ref_updates.is_empty() {
         let base_url = state
@@ -1653,10 +1659,63 @@ pub async fn get_icaptcha_proof(
 
 // ── Pkt-line parsing ──────────────────────────────────────────────────────
 
-struct RefUpdate {
-    old_sha: String,
-    new_sha: String,
-    ref_name: String,
+pub(crate) struct RefUpdate {
+    pub(crate) old_sha: String,
+    pub(crate) new_sha: String,
+    pub(crate) ref_name: String,
+}
+
+/// Record one catch-up poll event per ref update of a push.
+///
+/// This is the producer behind the repo-scoped push-event poll surface: a
+/// subscriber whose webhook delivery failed can still find the work by polling
+/// the repo's events since its last cursor, which makes delivery reliability a
+/// read-side property instead of requiring retry machinery on the send side.
+///
+/// The rows go into `repo_push_events`, never `received_ref_updates`: the
+/// unauthenticated global feed reads the latter, so a local push written there
+/// would publish a private repo's push metadata to anonymous callers.
+///
+/// Every row of one push shares a single timestamp, which is why the read side
+/// pages on `(created_at, id)` rather than the timestamp alone. A failure is
+/// logged and skipped: the push itself already succeeded and the objects are on
+/// disk, so refusing the response over a missed poll row would be the worse
+/// trade.
+pub(crate) async fn record_push_events(
+    db: &crate::db::Db,
+    repo_id: &str,
+    ref_updates: &[RefUpdate],
+) {
+    // Canonical UTC rfc3339 with a fixed sub-second width and a `Z` offset, not
+    // the default `+00:00`. Two reasons, both load-bearing for the cursor. The
+    // column is TEXT and the keyset predicate compares it lexicographically, so a
+    // single fixed width is what makes string order equal time order. And the
+    // value is handed back to the poller as a query parameter, where a literal
+    // `+` decodes to a space: a client that echoes the cursor unencoded would
+    // then re-read the page it just consumed, forever.
+    let created_at =
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, /* use_z */ true);
+    for update in ref_updates {
+        // A deletion carries an all-zero new SHA. Recording it would hand a
+        // poller a target that resolves to no commit.
+        if update.new_sha == ZERO_SHA {
+            continue;
+        }
+        let event = crate::db::RepoPushEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo_id.to_string(),
+            ref_name: update.ref_name.clone(),
+            after_sha: update.new_sha.clone(),
+            created_at: created_at.clone(),
+        };
+        if let Err(e) = db.insert_repo_push_event(&event).await {
+            tracing::warn!(
+                err = %e,
+                ref_name = %update.ref_name,
+                "failed to record a push event for the catch-up poll surface"
+            );
+        }
+    }
 }
 
 /// The bare branch name behind a full ref, or `None` if the ref is not a
@@ -2992,6 +3051,59 @@ mod tests {
             status,
             StatusCode::TOO_MANY_REQUESTS,
             "repo creation must be IP-throttled before signature verification"
+        );
+    }
+}
+
+#[cfg(test)]
+mod push_event_wiring_tests {
+    /// The catch-up scenarios in `api/events.rs` drive `record_push_events`
+    /// directly, because a full receive-pack POST needs a real pack. That proves
+    /// the mechanism and says nothing about the sink: delete the call from the
+    /// push handler and every one of them still passes while no push is ever
+    /// discoverable by polling again. Pin the wiring by source, the way the
+    /// stored-head guard above and the authz guards in `api/mod.rs` do. The slice
+    /// stops at the handler's own closing brace (the first `}` in column 0) so a
+    /// call in a later function cannot satisfy this, and full-line comments are
+    /// stripped so the doc comment on the call cannot stand in for the call.
+    #[test]
+    fn the_push_handler_actually_records_push_events() {
+        let src = include_str!("repos.rs");
+        let start = src
+            .find("fn git_receive_pack(")
+            .expect("git_receive_pack not found (renamed or removed?)");
+        let rest = &src[start..];
+        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        let body: String = rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            body.contains("record_push_events(&state.db, &record.id, &ref_updates)"),
+            "the receive-pack handler must feed the parsed ref updates to the \
+             push-event recorder; without that call the catch-up poll surface is \
+             fed by nothing and every scenario test for it passes against a \
+             helper the push path never invokes"
+        );
+    }
+
+    /// The containment constraint as a source property, independent of any one
+    /// scenario: the producer must never write a local push into the table the
+    /// unauthenticated global feed reads.
+    #[test]
+    fn the_push_event_recorder_never_targets_the_gossip_table() {
+        let src = include_str!("repos.rs");
+        let start = src
+            .find("async fn record_push_events(")
+            .expect("record_push_events not found (renamed or removed?)");
+        let rest = &src[start..];
+        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        assert!(
+            !rest[..end].contains("insert_ref_update"),
+            "a local push must not be written into received_ref_updates, which the \
+             anonymous /api/v1/events/ref-updates feed also reads"
         );
     }
 }

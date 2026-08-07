@@ -409,6 +409,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/events",
             get(events::list_repo_events),
         )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/push-events",
+            get(events::list_repo_push_events),
+        )
         .route("/api/v1/agents", get(agents::list_agents))
         .route("/api/v1/agents/{did}", get(agents::show_agent))
         .route("/api/v1/agents/{did}/trust", get(agents::get_trust))

@@ -158,6 +158,26 @@ pub struct Webhook {
     pub active: bool,
 }
 
+/// One local push event: a single ref update observed on this node's
+/// receive-pack path, recorded so a subscriber that missed the push webhook can
+/// still discover the work by polling.
+///
+/// Stored in `repo_push_events`, deliberately NOT in `received_ref_updates`.
+/// That table is also read by the unauthenticated global feed at
+/// `GET /api/v1/events/ref-updates`, so writing a local push there would publish
+/// a private repo's push metadata to anonymous callers. This one is read only by
+/// the repo-scoped poll surface, behind that repo's read gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoPushEvent {
+    pub id: String,
+    pub repo_id: String,
+    pub ref_name: String,
+    /// The SHA the ref points at after the push. A deletion is never recorded,
+    /// so this is always a real commit at the time it was written.
+    pub after_sha: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefCertificate {
     pub id: String,
@@ -2737,6 +2757,77 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+// ── Repo Push Events ──────────────────────────────────────────────────────────
+
+impl Db {
+    /// Record one local push event. Idempotent on the row id.
+    pub async fn insert_repo_push_event(&self, event: &RepoPushEvent) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO repo_push_events (id, repo_id, ref_name, after_sha, created_at)
+             VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&event.id)
+        .bind(&event.repo_id)
+        .bind(&event.ref_name)
+        .bind(&event.after_sha)
+        .bind(&event.created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One page of a repo's push events, OLDEST first, walked by a `(created_at,
+    /// id)` keyset cursor rather than an offset.
+    ///
+    /// `after` is the cursor a poller last saw; the page reads rows strictly
+    /// after it via the row-value predicate `(created_at, id) > (after_ts,
+    /// after_id)`, which matches the `ORDER BY` exactly. The id half is not
+    /// decoration: one multi-ref push stamps every one of its rows with the same
+    /// timestamp, so a timestamp-only cursor either repeats a row or drops one at
+    /// every page boundary that lands inside such a push. `(repo_id, created_at,
+    /// id)` is the index this predicate rides.
+    ///
+    /// Oldest-first is what makes the cursor stable under concurrent writes: a
+    /// push landing mid-walk sorts after the window being paged, so it cannot
+    /// shift it, and the next poll picks it up.
+    pub async fn list_repo_push_events_keyset(
+        &self,
+        repo_id: &str,
+        after: Option<(&str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<RepoPushEvent>> {
+        const COLS: &str = "id, repo_id, ref_name, after_sha, created_at";
+
+        // Positional params in bind order: repo_id, after_ts?, after_id?, limit.
+        let (cursor_clause, limit_param) = match after {
+            Some(_) => (" AND (created_at, id) > ($2, $3)", 4),
+            None => ("", 2),
+        };
+        let sql = format!(
+            "SELECT {COLS} FROM repo_push_events WHERE repo_id = $1{cursor_clause} \
+             ORDER BY created_at ASC, id ASC LIMIT ${limit_param}"
+        );
+
+        let mut q = sqlx::query(&sql).bind(repo_id.to_string());
+        if let Some((ts, id)) = after {
+            q = q.bind(ts.to_string()).bind(id.to_string());
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(row_to_repo_push_event).collect())
+    }
+}
+
+fn row_to_repo_push_event(r: sqlx::postgres::PgRow) -> RepoPushEvent {
+    RepoPushEvent {
+        id: r.get("id"),
+        repo_id: r.get("repo_id"),
+        ref_name: r.get("ref_name"),
+        after_sha: r.get("after_sha"),
+        created_at: r.get("created_at"),
     }
 }
 

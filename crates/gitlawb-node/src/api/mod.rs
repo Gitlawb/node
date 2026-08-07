@@ -226,6 +226,10 @@ mod authz_guard {
             (protect, "list_protected_branches", "authorize_repo_read("),
             (labels, "list_labels", "authorize_repo_read("),
             (events, "list_repo_events", "authorize_repo_read("),
+            // The catch-up poll surface gates before any push-event row is read,
+            // so a stranger cannot use it to learn that a private repo exists or
+            // is being pushed to.
+            (events, "list_repo_push_events", "authorize_repo_read("),
             // The status read gates before any claim data is loaded, so its deny
             // is the repo's own not-found rather than an existence oracle over
             // which commits were reported on.
