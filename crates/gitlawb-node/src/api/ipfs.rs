@@ -933,9 +933,11 @@ pub async fn list_pins(
                 // Past the MAX_WALKS wall or an unprobed structural candidate.
                 // Remaining pins are handled by the next request; db_cursor
                 // stays at the last processed pin so no row is skipped.
-                if i < probe_limit && !page_truncated {
-                    page_truncated = true;
-                }
+                // page_truncated must be set for BOTH walls: at a probe wall
+                // (probe_limit < walk_limit_idx) the page can be unfilled, and
+                // without the flag the response carries no cursor and the
+                // client stops instead of resuming past the wall.
+                page_truncated = true;
                 // Save cursor so the keyset predicate < resumes at the
                 // first unprocessed row.  When i == 0 there is no processed
                 // pin — use the cursor that fetched this batch so the SQL
@@ -1503,6 +1505,151 @@ mod tests {
                 "truncated_cursor must not contain hidden sha256_hex in the clear: {sha}"
             );
         }
+    }
+
+    #[sqlx::test]
+    async fn test_probe_wall_sets_truncated_and_resumes(pool: PgPool) {
+        let app_state = test_state(pool.clone()).await;
+
+        // Two path-scoped repos, each backed by a real bare repo on disk so the
+        // visibility walk SUCCEEDS (a failed walk defers instead of classifying).
+        let owner_slug = "did_key_z6Mkwowner";
+        let repo_a_path = std::path::PathBuf::from("/tmp")
+            .join(owner_slug)
+            .join("probrepa.git");
+        let repo_b_path = std::path::PathBuf::from("/tmp")
+            .join(owner_slug)
+            .join("probrepb.git");
+        let _ = std::fs::remove_dir_all(&repo_a_path);
+        let _ = std::fs::remove_dir_all(&repo_b_path);
+        crate::git::store::init_bare(&repo_a_path).unwrap();
+        crate::git::store::init_bare(&repo_b_path).unwrap();
+
+        for (id, name, path) in [
+            ("repo-probrepa", "probrepa", repo_a_path.clone()),
+            ("repo-probrepb", "probrepb", repo_b_path.clone()),
+        ] {
+            sqlx::query(
+                "INSERT INTO repos (id, name, owner_did, description, is_public, default_branch, created_at, updated_at, disk_path)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            )
+            .bind(id)
+            .bind(name)
+            .bind("did:key:z6Mkwowner")
+            .bind("desc")
+            .bind(true)
+            .bind("main")
+            .bind("2026-07-03T00:00:00Z")
+            .bind("2026-07-03T00:00:00Z")
+            .bind(path.to_str().unwrap())
+            .execute(app_state.db.pool())
+            .await
+            .unwrap();
+
+            sqlx::query(
+                "INSERT INTO visibility_rules (id, repo_id, path_glob, mode, reader_dids, created_by, created_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(format!("rule-{id}"))
+            .bind(id)
+            .bind("/secret/**")
+            .bind("deny")
+            .bind("")
+            .bind("did:key:z6Mkwowner")
+            .bind("2026-07-03T00:00:00Z")
+            .execute(app_state.db.pool())
+            .await
+            .unwrap();
+        }
+
+        // 150 SHAs, each pinned in repo A and ALSO associated with repo B via the
+        // junction table.  Junction rows are needed for BOTH repos: the listing
+        // query LEFT JOINs pinned_cid_repos on sha, so a lone repo-B junction
+        // row would make COALESCE(pr.repo, p.repo) collapse every association to
+        // repo B.  With both junction rows each SHA yields 2 association rows in
+        // one batch (<=200 unique SHAs) = 300 structural candidates — more than
+        // MAX_PROBES (200), so Phase 2 folds the tail into probe_limit mid-batch.
+        const SHARED: i64 = 150;
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             SELECT 'probesha-' || i, 'probecid-' || i, '2026-07-03T09:00:00Z',
+                    'z6Mkwowner/probrepa', 'did:key:z6Mkwowner'
+             FROM generate_series(1, $1) as i",
+        )
+        .bind(SHARED)
+        .execute(app_state.db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+             SELECT 'probesha-' || i, 'z6Mkwowner/probrepa', 'did:key:z6Mkwowner', '2026-07-03T09:00:00Z'
+             FROM generate_series(1, $1) as i",
+        )
+        .bind(SHARED)
+        .execute(app_state.db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+             SELECT 'probesha-' || i, 'z6Mkwowner/probrepb', 'did:key:z6Mkwowner', '2026-07-03T09:00:00Z'
+             FROM generate_series(1, $1) as i",
+        )
+        .bind(SHARED)
+        .execute(app_state.db.pool())
+        .await
+        .unwrap();
+
+        // First request hits the probe wall mid-batch.  The page has no visible
+        // pins, so without page_truncated it would emit NO cursor and the client
+        // would stop; the fix must set truncated and return a truncated_cursor.
+        let auth = Extension(AuthenticatedDid("did:key:z6Mkstranger".to_string()));
+        let res1 = list_pins(
+            State(app_state.clone()),
+            Query(ListPinsQuery {
+                limit: 200,
+                cursor: None,
+                truncated_cursor: None,
+            }),
+            Some(auth.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert!(res1["pins"].as_array().unwrap().is_empty());
+        assert_eq!(
+            res1.get("truncated").and_then(|v| v.as_bool()),
+            Some(true),
+            "a probe wall mid-batch must set truncated even when the page is empty"
+        );
+        let truncated_cursor = res1["truncated_cursor"]
+            .as_str()
+            .expect("probe wall must emit a truncated_cursor for resume")
+            .to_string();
+
+        // Resume: the folded tail is re-fetched past the wall, classified, and
+        // the listing completes without further truncation.
+        let res2 = list_pins(
+            State(app_state.clone()),
+            Query(ListPinsQuery {
+                limit: 200,
+                cursor: None,
+                truncated_cursor: Some(truncated_cursor),
+            }),
+            Some(auth),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(res2["pins"].as_array().unwrap().is_empty());
+        assert!(
+            res2.get("truncated").is_none(),
+            "resume past the probe wall must complete without another wall"
+        );
+
+        // Clean up the on-disk repos.
+        let _ = std::fs::remove_dir_all(&repo_a_path);
+        let _ = std::fs::remove_dir_all(&repo_b_path);
     }
 
     #[sqlx::test]

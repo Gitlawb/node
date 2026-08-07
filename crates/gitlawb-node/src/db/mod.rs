@@ -1056,6 +1056,10 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
 /// drift apart. If you change `normalize_owner_key`, update this const too.
 const OWNER_KEY_CASE_SQL: &str = "CASE WHEN owner_did LIKE 'did:key:%' AND position(':' in substr(owner_did, 9)) = 0 THEN substr(owner_did, 9) ELSE owner_did END";
 
+/// SQL CASE expression byte-identical to `normalize_owner_key`, but for columns
+/// named `did` (like in agent_profiles) instead of `owner_did`.
+const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(':' in substr(did, 9)) = 0 THEN substr(did, 9) ELSE did END";
+
 #[cfg(test)]
 mod normalize_owner_key_tests {
     use super::normalize_owner_key;
@@ -2254,10 +2258,46 @@ impl Db {
             anyhow::bail!("refusing to register non-public peer http_url: {http_url}");
         }
         let now = Utc::now().to_rfc3339();
+        // A changed URL drops the reachability gate, so a repointed peer does
+        // not inherit a probe the previous host earned. In the DO UPDATE branch
+        // `peers.http_url` is the existing pre-update row (the proposed value is
+        // $2), and the comparison runs under the conflict row lock, so
+        // concurrent announces for one DID serialize instead of racing a
+        // read-then-write. That orders announces against each other and nothing
+        // more: mark_peer_ping writes by DID with no http_url predicate, so a
+        // probe of the previous URL that lands after a reset can still re-grant
+        // the flag until the next round.
+        //
+        // Comparison is exact. http_url is stored as announced, so a cosmetic
+        // difference such as a trailing slash also clears the flag; the peer
+        // re-earns it on a later gossip round, provided no further announce
+        // lands first. Normalizing instead would mean canonicalizing the stored
+        // value, this comparison, and the existing trim_end_matches call sites.
+        //
+        // last_ping_ok is NOT a trust signal. An unauthenticated caller can
+        // clear it by announcing a different URL, and until #248 lands can also
+        // set it through the unauthenticated GET /api/v1/peers/{did}/ping, which
+        // writes mark_peer_ping from the stored URL's own probe response. Do not
+        // build a new consumer on this flag as if it were attacker-resistant.
+        //
+        // Only the federated repo fan-out in api/repos.rs gates on this flag.
+        // Four consumers act on a repointed http_url regardless of it (sync.rs's
+        // origin resolve, the post-receive notify fan-out, trigger_sync, and the
+        // public resolve route), and two read surfaces republish it as
+        // `reachable` (api/resolve.rs, api/peers.rs), which is where a reset
+        // becomes externally visible. So this bounds the automatic inheritance
+        // rather than closing the rewrite. Binding a DID to its first-seen
+        // announcing key is what closes it: #273.
         sqlx::query(
             "INSERT INTO peers (did, http_url, last_seen, last_ping_ok, announced_at)
              VALUES ($1, $2, $3, FALSE, $3)
-             ON CONFLICT(did) DO UPDATE SET http_url = $2, last_seen = $3",
+             ON CONFLICT(did) DO UPDATE SET
+               http_url = $2,
+               last_seen = $3,
+               last_ping_ok = CASE
+                 WHEN peers.http_url IS DISTINCT FROM $2 THEN FALSE
+                 ELSE peers.last_ping_ok
+               END",
         )
         .bind(did)
         .bind(http_url)
@@ -2570,6 +2610,8 @@ impl Db {
                      AS pairs(repo, owner_did)
                   ON (COALESCE(pr.repo, p.repo), COALESCE(pr.owner_did, p.owner_did))
                      = (pairs.repo, pairs.owner_did)
+                WHERE (p.pinned_at, p.sha256_hex, COALESCE(pr.repo, p.repo))
+                      < ($3::text, $4::text, $5::text)
                 ORDER BY p.pinned_at DESC, p.sha256_hex DESC,
                          COALESCE(pr.repo, p.repo) DESC
                 LIMIT $7"#,
@@ -3799,6 +3841,9 @@ impl Db {
             let new_website = website.or(existing.website.as_deref());
             let new_socials = socials.or(existing.socials.as_deref());
 
+            // get_profile equates bare short ids with did:key:<id>. UPDATE must target
+            // the stored row identity (existing.did), not the caller's raw input form,
+            // or a did:key: alias against a bare-stored profile updates zero rows.
             sqlx::query(
                 "UPDATE agent_profiles
                  SET display_name=$1, bio=$2, avatar_url=$3, website=$4, socials=$5, updated_at=$6
@@ -3810,12 +3855,12 @@ impl Db {
             .bind(new_website)
             .bind(new_socials)
             .bind(&now)
-            .bind(did)
+            .bind(&existing.did)
             .execute(&self.pool)
             .await?;
 
             Ok(ProfileRecord {
-                did: did.to_string(),
+                did: existing.did,
                 display_name: new_name.map(String::from),
                 bio: new_bio.map(String::from),
                 avatar_url: new_avatar.map(String::from),
@@ -3856,14 +3901,20 @@ impl Db {
     }
 
     pub async fn get_profile(&self, did: &str) -> Result<Option<ProfileRecord>> {
-        let row = sqlx::query(
+        // Same owner-key contract as get_repo: strip `did:key:` only when the
+        // remainder is a bare key id. The old `LIKE '%:' || $1` matched any DID
+        // method that shared a suffix and could resolve the wrong profile.
+        let did_key = normalize_owner_key(did);
+        let sql = format!(
             "SELECT did, display_name, bio, avatar_url, website, socials, profile_cid, created_at, updated_at
              FROM agent_profiles
-             WHERE did = $1 OR did LIKE '%:' || $1",
-        )
-        .bind(did)
-        .fetch_optional(&self.pool)
-        .await?;
+             WHERE ({key}) = $1",
+            key = PROFILE_DID_CASE_SQL
+        );
+        let row = sqlx::query(&sql)
+            .bind(did_key)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|r| ProfileRecord {
             did: r.get("did"),
@@ -3879,10 +3930,17 @@ impl Db {
     }
 
     pub async fn set_profile_cid(&self, did: &str, cid: &str) -> Result<()> {
-        sqlx::query("UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE did = $3")
+        // Same did:key / bare equivalence as get_profile so a full did:key: form
+        // updates a profile stored under the bare short id.
+        let did_key = normalize_owner_key(did);
+        let sql = format!(
+            "UPDATE agent_profiles SET profile_cid = $1, updated_at = $2 WHERE ({key}) = $3",
+            key = PROFILE_DID_CASE_SQL
+        );
+        sqlx::query(&sql)
             .bind(cid)
             .bind(Utc::now().to_rfc3339())
-            .bind(did)
+            .bind(did_key)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -5342,6 +5400,146 @@ mod dedup_db_tests {
             );
         }
     }
+
+    /// Verify that `PROFILE_DID_CASE_SQL` (which aliases the column `did`) also
+    /// agrees with Rust `normalize_owner_key` across the full boundary matrix.
+    #[sqlx::test]
+    async fn profile_did_case_sql_matches_normalize_owner_key(pool: PgPool) {
+        let boundary_values = [
+            "did:key:z6Mkfoo",
+            "z6Mkfoo",
+            "did:gitlawb:z6Mkfoo",
+            "did:web:example.com:alice",
+            "did:key:did:gitlawb:z6Mkfoo",
+            "",
+            "did:key:",
+            "DID:KEY:z6Mkfoo",
+        ];
+
+        let values_sql: String = boundary_values
+            .iter()
+            .map(|v| format!("('{}'::text)", v))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "WITH data(did) AS (VALUES {values_sql})
+             SELECT did, ({key}) AS normalized FROM data ORDER BY did",
+            key = super::PROFILE_DID_CASE_SQL
+        );
+
+        let rows: Vec<(String, String)> = sqlx::query_as(&sql).fetch_all(&pool).await.unwrap();
+
+        assert_eq!(
+            rows.len(),
+            boundary_values.len(),
+            "every boundary value must produce a row"
+        );
+
+        for (val, sql_result) in &rows {
+            let rust_result = super::normalize_owner_key(val);
+            assert_eq!(
+                sql_result, rust_result,
+                "PROFILE_DID_CASE_SQL(\"{val}\") mismatch: Rust = \"{rust_result}\", SQL CASE = \"{sql_result}\""
+            );
+        }
+    }
+
+    /// get_profile must not resolve a non-key DID (e.g. did:gitlawb:) when
+    /// queried with the bare short id. The old `LIKE '%:' || $1` clause was too
+    /// broad and could return the wrong profile row.
+    #[sqlx::test]
+    async fn get_profile_does_not_match_non_key_did(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkprof1";
+
+        // Seed only a non-key DID row first. When queried with the bare short ID,
+        // get_profile must return None (lone non-key fixture test).
+        db.upsert_profile(
+            &format!("did:gitlawb:{short}"),
+            Some("other-method"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let got = db.get_profile(short).await.unwrap();
+        assert!(
+            got.is_none(),
+            "bare short id must not resolve a lone non-key DID profile"
+        );
+
+        // Now seed the canonical bare key profile row as well.
+        db.upsert_profile(short, Some("canonical"), None, None, None, None)
+            .await
+            .unwrap();
+
+        let got = db
+            .get_profile(short)
+            .await
+            .unwrap()
+            .expect("bare short id should resolve the key-form profile");
+        assert_eq!(got.did, short);
+        assert_eq!(got.display_name.as_deref(), Some("canonical"));
+
+        let got = db
+            .get_profile(&format!("did:key:{short}"))
+            .await
+            .unwrap()
+            .expect("did:key form should also resolve the key-form profile");
+        assert_eq!(got.did, short);
+
+        let got = db
+            .get_profile(&format!("did:gitlawb:{short}"))
+            .await
+            .unwrap()
+            .expect("full non-key DID should resolve its own profile");
+        assert_eq!(got.did, format!("did:gitlawb:{short}"));
+        assert_eq!(got.display_name.as_deref(), Some("other-method"));
+    }
+
+    /// upsert_profile must update a bare-stored profile when called with the
+    /// full did:key: form. get_profile equates the two, so the UPDATE has to
+    /// target existing.did rather than the raw input.
+    #[sqlx::test]
+    async fn upsert_profile_updates_via_did_key_alias(pool: PgPool) {
+        let db = db(pool).await;
+        let short = "z6Mkprof2";
+
+        db.upsert_profile(short, Some("before"), None, None, None, None)
+            .await
+            .unwrap();
+
+        let updated = db
+            .upsert_profile(
+                &format!("did:key:{short}"),
+                Some("after"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.did, short, "preserve the stored did form on update");
+        assert_eq!(updated.display_name.as_deref(), Some("after"));
+
+        let got = db
+            .get_profile(short)
+            .await
+            .unwrap()
+            .expect("profile should still resolve by bare short id");
+        assert_eq!(got.did, short);
+        assert_eq!(got.display_name.as_deref(), Some("after"));
+
+        db.set_profile_cid(&format!("did:key:{short}"), "bafytestcid")
+            .await
+            .unwrap();
+        let got = db.get_profile(short).await.unwrap().unwrap();
+        assert_eq!(got.profile_cid.as_deref(), Some("bafytestcid"));
+    }
 }
 
 /// Exercises the iCaptcha single-use proof ledger (`icaptcha_consumed_proofs`),
@@ -6568,5 +6766,259 @@ mod ref_update_db_tests {
         let all = db.list_ref_updates_keyset(None, 100, None).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].new_sha, "gggg");
+    }
+}
+
+#[cfg(test)]
+mod peer_reachability_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    const VICTIM_DID: &str = "did:key:z6MkvictimPeerFixture";
+    const HONEST_URL: &str = "https://honest-peer.example.com";
+    const ATTACKER_URL: &str = "https://attacker.example.com";
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// Read the row back through `list_peers`, the same surface the federated
+    /// fan-out filters on, rather than issuing raw SQL from the test.
+    async fn peer(db: &Db, did: &str) -> (String, bool) {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        (row.http_url, row.last_ping_ok)
+    }
+
+    /// Parsed rather than string-compared, so the ordering assertion does not
+    /// depend on the stored timestamp's textual precision.
+    async fn last_seen(db: &Db, did: &str) -> chrono::DateTime<chrono::Utc> {
+        let row = db
+            .list_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.did == did)
+            .expect("seeded peer row is missing");
+        chrono::DateTime::parse_from_rfc3339(&row.last_seen.expect("last_seen is set by upsert"))
+            .expect("last_seen is rfc3339")
+            .with_timezone(&chrono::Utc)
+    }
+
+    /// Seed a peer that has earned reachability, asserting the seed took so a
+    /// later case cannot pass vacuously on a row that was never written.
+    async fn seed_reachable(db: &Db) {
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        db.mark_peer_ping(VICTIM_DID, true).await.unwrap();
+        assert_eq!(
+            peer(db, VICTIM_DID).await,
+            (HONEST_URL.to_string(), true),
+            "seed did not take"
+        );
+    }
+
+    /// Repointing an existing peer's URL must drop the reachability gate: the
+    /// new host has not been probed, so it cannot inherit the old host's
+    /// earned `last_ping_ok`.
+    #[sqlx::test]
+    async fn url_change_clears_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, ATTACKER_URL).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, ATTACKER_URL, "the URL should still be rewritten");
+        assert!(
+            !reachable,
+            "a repointed peer must re-earn reachability, not inherit it"
+        );
+    }
+
+    /// A plain liveness re-announce carries the same URL and must not cost an
+    /// honest peer its place in the federated fan-out. Guards against a fix
+    /// that clears the flag on every conflict instead of only on a change.
+    #[sqlx::test]
+    async fn same_url_reannounce_keeps_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, HONEST_URL);
+        assert!(
+            reachable,
+            "an unchanged-URL re-announce must not drop the gate"
+        );
+    }
+
+    /// The must-not-grant direction. An unchanged URL preserves the flag as it
+    /// stands, which means FALSE stays FALSE: reachability is earned by a probe,
+    /// never by announcing. This is the only case that fails if the conditional
+    /// is flattened to `last_ping_ok = (peers.http_url IS NOT DISTINCT FROM $2)`,
+    /// which would let any unsigned same-URL re-announce set the flag TRUE.
+    #[sqlx::test]
+    async fn same_url_reannounce_does_not_grant_reachability(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        assert_eq!(peer(&db, VICTIM_DID).await, (HONEST_URL.to_string(), false));
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let (_, reachable) = peer(&db, VICTIM_DID).await;
+        assert!(
+            !reachable,
+            "announcing must never grant reachability without a probe"
+        );
+    }
+
+    /// A first insert stays out of the fan-out until a probe confirms it. Guards
+    /// against the conditional leaking into the INSERT branch.
+    #[sqlx::test]
+    async fn fresh_peer_inserts_unreachable(pool: PgPool) {
+        let db = db(pool).await;
+
+        db.upsert_peer("did:key:z6MkfreshPeerFixture", HONEST_URL)
+            .await
+            .unwrap();
+
+        let (_, reachable) = peer(&db, "did:key:z6MkfreshPeerFixture").await;
+        assert!(!reachable, "a never-probed peer must insert unreachable");
+    }
+
+    /// Comparison is exact, by decision: http_url is stored as announced and
+    /// nothing normalizes it, so a trailing slash is a different remote as far
+    /// as this row is concerned and clears the gate. Pins that decision against
+    /// a future normalizing comparison, which every other case here would pass
+    /// because they only ever compare identical or wholly different hosts.
+    #[sqlx::test]
+    async fn cosmetic_url_difference_counts_as_a_change(pool: PgPool) {
+        let db = db(pool).await;
+        seed_reachable(&db).await;
+
+        let with_slash = format!("{HONEST_URL}/");
+        db.upsert_peer(VICTIM_DID, &with_slash).await.unwrap();
+
+        let (url, reachable) = peer(&db, VICTIM_DID).await;
+        assert_eq!(url, with_slash);
+        assert!(
+            !reachable,
+            "comparison is exact, so a cosmetic difference clears the gate too"
+        );
+    }
+
+    /// The reset must ride the existing UPDATE, not gate it. Hoisting the
+    /// condition to a statement-level WHERE would leave every case above green
+    /// while silently skipping the whole update on a same-URL re-announce, so
+    /// liveness would stop advancing and the peer would age out on last_seen.
+    #[sqlx::test]
+    async fn same_url_reannounce_still_advances_last_seen(pool: PgPool) {
+        let db = db(pool).await;
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+        let first = last_seen(&db, VICTIM_DID).await;
+
+        db.upsert_peer(VICTIM_DID, HONEST_URL).await.unwrap();
+
+        let second = last_seen(&db, VICTIM_DID).await;
+        assert!(
+            second > first,
+            "a same-URL re-announce is a liveness signal and must still \
+             advance last_seen: {first} then {second}"
+        );
+    }
+}
+
+/// Regression: the outer SELECT of `list_pinned_cids_for_repos` must apply the
+/// same 3-tuple keyset as the inner batch_shas CTE.  Without it, a resumed page
+/// past `assoc_limit` re-orders ALL associations for the batch SHAs and repeats
+/// rows already shown instead of advancing (one SHA + five repos + LIMIT 3
+/// returned r05,r04,r03 on page 2 instead of r02,r01).
+#[cfg(test)]
+mod pinned_cid_keyset_tests {
+    use super::Db;
+    use sqlx::PgPool;
+
+    async fn db(pool: PgPool) -> Db {
+        let db = Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+        db
+    }
+
+    /// One SHA pinned into five repos, all at the same timestamp. Page 1 with
+    /// assoc_limit=3 shows r05,r04,r03; resuming at r03 must yield r02,r01.
+    #[sqlx::test]
+    async fn outer_keyset_resumes_past_assoc_limit(pool: PgPool) {
+        let db = db(pool).await;
+        let owner = "did:key:z6Mkwowner";
+
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, repo, owner_did)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("sha-1")
+        .bind("cid-1")
+        .bind("2026-07-03T09:00:00Z")
+        .bind("r01")
+        .bind(owner)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        for repo in ["r01", "r02", "r03", "r04", "r05"] {
+            sqlx::query(
+                "INSERT INTO pinned_cid_repos (sha256_hex, repo, owner_did, pinned_at)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind("sha-1")
+            .bind(repo)
+            .bind(owner)
+            .bind("2026-07-03T09:00:00Z")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+
+        let repos: Vec<String> = (1..=5).map(|i| format!("r0{i}")).collect();
+        let owners: Vec<String> = (0..5).map(|_| owner.to_string()).collect();
+
+        // Page 1: repo DESC order → r05, r04, r03.
+        let page1 = db
+            .list_pinned_cids_for_repos(&repos, &owners, 200, 3, None)
+            .await
+            .unwrap();
+        let page1_repos: Vec<&str> = page1.iter().map(|p| p.repo.as_str()).collect();
+        assert_eq!(
+            page1_repos,
+            vec!["r05", "r04", "r03"],
+            "page 1 must surface the three newest associations in repo-DESC order"
+        );
+
+        // Resume at the last shown row (pinned_at, sha, r03).
+        let last = page1.last().unwrap();
+        let cursor = Some((
+            last.pinned_at.as_str(),
+            last.sha256_hex.as_str(),
+            last.repo.as_str(),
+        ));
+
+        let page2 = db
+            .list_pinned_cids_for_repos(&repos, &owners, 200, 3, cursor)
+            .await
+            .unwrap();
+        let page2_repos: Vec<&str> = page2.iter().map(|p| p.repo.as_str()).collect();
+        assert_eq!(
+            page2_repos,
+            vec!["r02", "r01"],
+            "resuming past assoc_limit must advance to the remaining \
+             associations, not repeat r05,r04,r03"
+        );
     }
 }
