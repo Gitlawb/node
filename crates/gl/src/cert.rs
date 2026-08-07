@@ -156,6 +156,12 @@ async fn cmd_show(
     let node_did = cert["node_did"].as_str().unwrap_or("?");
     let signature = cert["signature"].as_str().unwrap_or("?");
     let issued_at = cert["issued_at"].as_str().unwrap_or("?");
+    let seq = cert["seq"].as_i64().unwrap_or(0);
+    let prev = cert["prev"].as_str().unwrap_or("?");
+    let pusher_sig = cert["pusher_sig"].as_str();
+    let signature_input = cert["signature_input"].as_str();
+    let content_digest = cert["content_digest"].as_str();
+    let request_path = cert["request_path"].as_str();
 
     println!("Ref Certificate: {cert_id}");
     println!("  Ref:       {ref_name}");
@@ -163,6 +169,7 @@ async fn cmd_show(
     println!("  New SHA:   {new_sha}");
     println!("  Pusher:    {pusher}");
     println!("  Node DID:  {node_did}");
+    println!("  Seq:       {seq}");
     println!("  Issued at: {issued_at}");
     println!("  Signature: {signature}");
     println!();
@@ -174,7 +181,20 @@ async fn cmd_show(
     // names; the node-DID comparison below covers *which* node that is.
     let repo_id = cert["repo_id"].as_str().unwrap_or("");
     let verdict = verify_signature(
-        repo_id, ref_name, old_sha, new_sha, pusher, node_did, issued_at, signature,
+        repo_id,
+        ref_name,
+        old_sha,
+        new_sha,
+        pusher,
+        node_did,
+        issued_at,
+        seq,
+        prev,
+        pusher_sig,
+        signature_input,
+        content_digest,
+        request_path,
+        signature,
     );
 
     println!("Signature verification:");
@@ -242,6 +262,11 @@ async fn cmd_show(
 /// Rebuild the node's canonical signing payload (field order must match
 /// gitlawb-node/src/cert.rs::issue_ref_certificate exactly) and verify the
 /// certificate's Ed25519 signature against the key embedded in `node_did`.
+///
+/// Certificates after this PR use a 13-field payload.  Pre-PR certificates
+/// were signed over 7 fields (repo_id, ref, old, new, pusher, node, ts) with
+/// NULL proof columns.  Try 13-field first; if it fails and all proof fields
+/// are None, retry with the 7-field payload.
 #[allow(clippy::too_many_arguments)]
 fn verify_signature(
     repo_id: &str,
@@ -251,22 +276,21 @@ fn verify_signature(
     pusher: &str,
     node_did: &str,
     issued_at: &str,
+    seq: i64,
+    prev: &str,
+    pusher_sig: Option<&str>,
+    signature_input: Option<&str>,
+    content_digest: Option<&str>,
+    request_path: Option<&str>,
     signature_b64: &str,
 ) -> std::result::Result<(), String> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use std::str::FromStr;
 
-    let payload = serde_json::json!({
-        "repo_id": repo_id,
-        "ref":     ref_name,
-        "old":     old_sha,
-        "new":     new_sha,
-        "pusher":  pusher,
-        "node":    node_did,
-        "ts":      issued_at,
-    });
-    let payload_bytes =
-        serde_json::to_vec(&payload).map_err(|e| format!("could not serialize payload: {e}"))?;
+    let proof_fields_null = pusher_sig.is_none()
+        && signature_input.is_none()
+        && content_digest.is_none()
+        && request_path.is_none();
 
     let did =
         gitlawb_core::did::Did::from_str(node_did).map_err(|e| format!("bad node DID: {e}"))?;
@@ -281,8 +305,47 @@ fn verify_signature(
         .try_into()
         .map_err(|_| "signature is not 64 bytes".to_string())?;
 
-    gitlawb_core::identity::verify(&verifying_key, &payload_bytes, &sig_bytes)
-        .map_err(|_| "Ed25519 signature does not match the signed payload".to_string())
+    // Try 13-field payload first.
+    let payload_13 = serde_json::json!({
+        "repo_id": repo_id,
+        "ref":     ref_name,
+        "old":     old_sha,
+        "new":     new_sha,
+        "pusher":  pusher,
+        "node":    node_did,
+        "ts":      issued_at,
+        "seq":     seq,
+        "prev":    prev,
+        "pusher_sig": pusher_sig,
+        "signature_input": signature_input,
+        "content_digest": content_digest,
+        "request_path": request_path,
+    });
+    let payload_bytes_13 =
+        serde_json::to_vec(&payload_13).map_err(|e| format!("could not serialize payload: {e}"))?;
+
+    let sig_valid_13 =
+        gitlawb_core::identity::verify(&verifying_key, &payload_bytes_13, &sig_bytes);
+
+    if proof_fields_null && sig_valid_13.is_err() {
+        // Fall back to 7-field payload for pre-PR certificates.
+        let payload_7 = serde_json::json!({
+            "repo_id": repo_id,
+            "ref":     ref_name,
+            "old":     old_sha,
+            "new":     new_sha,
+            "pusher":  pusher,
+            "node":    node_did,
+            "ts":      issued_at,
+        });
+        let payload_bytes_7 = serde_json::to_vec(&payload_7)
+            .map_err(|e| format!("could not serialize payload: {e}"))?;
+        gitlawb_core::identity::verify(&verifying_key, &payload_bytes_7, &sig_bytes).map_err(|_| {
+            "Ed25519 signature does not match the signed payload (7-field)".to_string()
+        })
+    } else {
+        sig_valid_13.map_err(|_| "Ed25519 signature does not match the signed payload".to_string())
+    }
 }
 
 async fn resolve_cert_id(client: &NodeClient, owner: &str, name: &str, id: &str) -> Result<String> {
@@ -334,11 +397,19 @@ mod tests {
             "pusher":  "did:key:z6MkPusher",
             "node":    "did:key:z6MkNode",
             "ts":      "2026-07-22T00:00:00+00:00",
+            "seq":     1,
+            "prev":   "0000000000000000000000000000000000000000000000000000000000000000",
+            "pusher_sig": serde_json::Value::Null,
+            "signature_input": serde_json::Value::Null,
+            "content_digest": serde_json::Value::Null,
+            "request_path": serde_json::Value::Null,
         });
         let frozen = concat!(
-            r#"{"new":"newsha","node":"did:key:z6MkNode","old":"oldsha","#,
-            r#""pusher":"did:key:z6MkPusher","ref":"refs/heads/main","#,
-            r#""repo_id":"repo-1","ts":"2026-07-22T00:00:00+00:00"}"#,
+            r#"{"content_digest":null,"new":"newsha","node":"did:key:z6MkNode","old":"oldsha","#,
+            r#""prev":"0000000000000000000000000000000000000000000000000000000000000000","#,
+            r#""pusher":"did:key:z6MkPusher","pusher_sig":null,"ref":"refs/heads/main","#,
+            r#""repo_id":"repo-1","request_path":null,"seq":1,"signature_input":null,"#,
+            r#""ts":"2026-07-22T00:00:00+00:00"}"#,
         );
         assert_eq!(serde_json::to_string(&payload).unwrap(), frozen);
     }
@@ -349,6 +420,7 @@ mod tests {
     fn verify_signature_round_trip_and_tamper() {
         let kp = gitlawb_core::identity::Keypair::generate();
         let node_did = kp.did().as_str().to_string();
+        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
 
         let payload = serde_json::json!({
             "repo_id": "repo-1",
@@ -358,6 +430,12 @@ mod tests {
             "pusher":  "did:key:z6MkPusher",
             "node":    node_did,
             "ts":      "2026-07-22T00:00:00+00:00",
+            "seq":     1,
+            "prev":    prev,
+            "pusher_sig": serde_json::Value::Null,
+            "signature_input": serde_json::Value::Null,
+            "content_digest": serde_json::Value::Null,
+            "request_path": serde_json::Value::Null,
         });
         let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
 
@@ -369,6 +447,12 @@ mod tests {
             "did:key:z6MkPusher",
             &node_did,
             "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            None,
+            None,
+            None,
+            None,
             &sig,
         );
         assert!(ok.is_ok(), "expected valid signature, got: {ok:?}");
@@ -381,6 +465,12 @@ mod tests {
             "did:key:z6MkPusher",
             &node_did,
             "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            None,
+            None,
+            None,
+            None,
             &sig,
         );
         assert!(tampered.is_err(), "tampered payload must not verify");
@@ -393,8 +483,124 @@ mod tests {
             "did:key:z6MkPusher",
             &node_did,
             "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            None,
+            None,
+            None,
+            None,
             "not-base64url!!!",
         );
         assert!(garbage.is_err(), "malformed signature must not verify");
+    }
+
+    #[test]
+    fn verify_signature_all_fields_populated() {
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+        let prev = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let pusher_sig = "sig-123";
+        let signature_input = "sig-input-123";
+        let content_digest = "sha256-123";
+        let request_path = "/repo.git/git-receive-pack";
+
+        let payload = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+            "seq":     1,
+            "prev":    prev,
+            "pusher_sig": pusher_sig,
+            "signature_input": signature_input,
+            "content_digest": content_digest,
+            "request_path": request_path,
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload).unwrap());
+
+        let ok = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            1,
+            prev,
+            Some(pusher_sig),
+            Some(signature_input),
+            Some(content_digest),
+            Some(request_path),
+            &sig,
+        );
+        assert!(ok.is_ok(), "expected valid signature, got: {ok:?}");
+    }
+
+    #[test]
+    fn verify_signature_7_field_legacy_fallback() {
+        // A true 7-field (pre-PR) payload — no seq, prev, or proof fields.
+        // The fallback must detect the 13-field mismatch and retry with 7.
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let node_did = kp.did().as_str().to_string();
+
+        let payload_7 = serde_json::json!({
+            "repo_id": "repo-1",
+            "ref":     "refs/heads/main",
+            "old":     "0".repeat(40),
+            "new":     "a".repeat(40),
+            "pusher":  "did:key:z6MkPusher",
+            "node":    node_did,
+            "ts":      "2026-07-22T00:00:00+00:00",
+        });
+        let sig = kp.sign_b64(&serde_json::to_vec(&payload_7).unwrap());
+
+        // All proof fields None → triggers 7-field fallback.
+        let ok = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"a".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            1,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            None,
+            None,
+            None,
+            None,
+            &sig,
+        );
+        assert!(
+            ok.is_ok(),
+            "legacy 7-field certificate must verify via fallback, got: {ok:?}"
+        );
+
+        // Tampered new_sha must still fail.
+        let tampered = verify_signature(
+            "repo-1",
+            "refs/heads/main",
+            &"0".repeat(40),
+            &"b".repeat(40),
+            "did:key:z6MkPusher",
+            &node_did,
+            "2026-07-22T00:00:00+00:00",
+            1,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            None,
+            None,
+            None,
+            None,
+            &sig,
+        );
+        assert!(
+            tampered.is_err(),
+            "tampered 7-field payload must not verify"
+        );
     }
 }
