@@ -111,10 +111,15 @@ pub async fn pin_new_objects(
 
         match pin_object(client, upload_url, jwt, &sha, &data).await {
             Ok(cid) if !cid.is_empty() => {
-                if let Err(e) = db.record_pinata_cid(&sha, &cid).await {
-                    tracing::warn!(sha = %sha, err = %e, "failed to record pinata_cid in DB");
+                // Only a successfully-persisted record counts as pinned; an
+                // upload that failed to reach the DB is not durably pinned
+                // (R1-P3).
+                match db.record_pinata_cid(&sha, &cid).await {
+                    Ok(()) => pinned.push((sha, cid)),
+                    Err(e) => {
+                        tracing::warn!(sha = %sha, err = %e, "failed to record pinata_cid in DB");
+                    }
                 }
-                pinned.push((sha, cid));
             }
             Ok(_) => {}
             Err(e) => {

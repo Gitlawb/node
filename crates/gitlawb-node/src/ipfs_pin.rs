@@ -94,6 +94,9 @@ pub async fn cat(ipfs_api: &str, cid: &str) -> Result<Vec<u8>> {
 /// lockstep.
 ///
 /// Returns a list of `(sha256_hex, cid)` pairs for objects pinned this call.
+/// An object whose upload succeeded but whose DB record failed is NOT included:
+/// it is not durably pinned, so counting it as "filled" would overstate the
+/// sweep's repair (R1-P3).
 pub async fn pin_new_objects(
     ipfs_api: &str,
     repo_path: &std::path::Path,
@@ -107,12 +110,13 @@ pub async fn pin_new_objects(
     let mut pinned = Vec::new();
 
     for sha in object_list {
-        // Skip if already pinned
-        match db.is_pinned(&sha).await {
+        // Skip if already pinned to local IPFS (checks cid column,
+        // which is NULL for Pinata-only rows so those will be retried).
+        match db.has_ipfs_cid(&sha).await {
             Ok(true) => continue,
             Ok(false) => {}
             Err(e) => {
-                tracing::warn!(sha = %sha, err = %e, "DB error checking pinned status");
+                tracing::warn!(sha = %sha, err = %e, "DB error checking IPFS pinned status");
                 continue;
             }
         }
@@ -129,12 +133,12 @@ pub async fn pin_new_objects(
 
         // Pin to IPFS
         match pin_git_object(ipfs_api, &sha, &data).await {
-            Ok(cid) if !cid.is_empty() => {
-                if let Err(e) = db.record_pinned_cid(&sha, &cid).await {
+            Ok(cid) if !cid.is_empty() => match db.record_pinned_cid(&sha, &cid).await {
+                Ok(()) => pinned.push((sha, cid)),
+                Err(e) => {
                     tracing::warn!(sha = %sha, err = %e, "failed to record pinned CID in DB");
                 }
-                pinned.push((sha, cid));
-            }
+            },
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(sha = %sha, err = %e, "failed to pin git object to IPFS");

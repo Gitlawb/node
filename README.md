@@ -342,6 +342,7 @@ Important node settings:
 | `GITLAWB_BOOTSTRAP_DISABLE_SEEDS` | Disable embedded seed peers for isolated dev/test networks. |
 | `GITLAWB_REQUIRE_SIGNED_PEER_WRITES` | Require signed peer announce/sync writes. |
 | `GITLAWB_AUTO_SYNC` | Enable automatic sync from known peers. |
+| `GITLAWB_RECONCILIATION_SWEEP` | Enable the hourly durability sweep that re-pins/backstops missing objects (default `true`; disabled when no IPFS/Pinata backend is configured). |
 | `GITLAWB_MAX_PACK_BYTES` | Max git pack body size for smart-HTTP routes. |
 | `GITLAWB_GIT_SERVICE_TIMEOUT_SECS` | Max seconds a served git upload-pack/receive-pack may run before it is aborted (504). Default 600. Does not bound `info/refs` or the withheld-blob path. |
 | `GITLAWB_TIGRIS_BUCKET` | Optional S3/Tigris shared repo storage bucket. |

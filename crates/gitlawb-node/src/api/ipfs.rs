@@ -213,15 +213,37 @@ pub async fn get_by_cid(
 
 /// GET /api/v1/ipfs/pins
 ///
-/// Returns all CIDs that have been pinned to the local IPFS node from git
-/// objects received via push. Each entry includes the git SHA-256 hex, the
-/// CIDv1 string, and the timestamp when it was pinned.
+/// Returns all CIDs that have been pinned from git objects received via push.
+/// Each entry includes the git SHA-256 hex, a CIDv1 string, and the timestamp
+/// when it was pinned.  For Pinata-only rows (no local IPFS pin), the `cid`
+/// field carries `pinata_cid` so CLI consumers see a usable value.
+///
+/// The raw `pinata_cid` is deliberately NOT surfaced: it is node-internal state
+/// (which Pinata identity a blob was uploaded with) and exposing it to
+/// unauthenticated callers leaks infrastructure detail (R1-P3). Rows with
+/// neither a local nor a Pinata CID are omitted so `cid` stays an
+/// always-string field.
 pub async fn list_pins(State(state): State<AppState>) -> Result<Json<serde_json::Value>> {
     let pins = state
         .db
         .list_pinned_cids()
         .await
         .map_err(AppError::Internal)?;
+
+    let pins: Vec<serde_json::Value> = pins
+        .into_iter()
+        .filter(|p| p.cid.is_some() || p.pinata_cid.is_some())
+        .map(|p| {
+            // Synthesize a usable CID from pinata_cid when this is a
+            // Pinata-only row (no local IPFS pin).
+            let display_cid = p.cid.clone().or_else(|| p.pinata_cid.clone());
+            serde_json::json!({
+                "sha256_hex": p.sha256_hex,
+                "cid": display_cid,
+                "pinned_at": p.pinned_at,
+            })
+        })
+        .collect();
 
     Ok(Json(serde_json::json!({
         "pins": pins,

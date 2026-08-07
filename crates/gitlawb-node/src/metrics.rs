@@ -15,6 +15,9 @@
 //!     `gitlawb_pack_size_bytes`
 //!   * a single `gitlawb_info{version, did}` gauge = 1, for joins/dashboards
 //!   * currently-connected peer count — `gitlawb_peers_connected`
+//!   * reconciliation sweep gaps found and filled —
+//!     `gitlawb_reconciliation_gaps_found_total` /
+//!     `gitlawb_reconciliation_gaps_filled_total`
 //!
 //! All metrics live in a single process-wide registry initialized by
 //! [`init`]. Increment helpers (`record_push`, `record_auth_failure`, ...)
@@ -33,8 +36,8 @@
 use std::sync::OnceLock;
 
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 /// The single, process-wide metrics registry. Initialized by [`init`].
@@ -51,6 +54,8 @@ static SYNC_PROCESSED: OnceLock<IntCounterVec> = OnceLock::new();
 static WEBHOOK_DELIVERIES: OnceLock<IntCounterVec> = OnceLock::new();
 static PACK_SIZE: OnceLock<Histogram> = OnceLock::new();
 static PEERS_CONNECTED: OnceLock<IntGauge> = OnceLock::new();
+static RECONCILIATION_GAPS_FOUND: OnceLock<IntCounter> = OnceLock::new();
+static RECONCILIATION_GAPS_FILLED: OnceLock<IntCounter> = OnceLock::new();
 
 /// One-time initializer. Builds the registry, registers every metric,
 /// and sets the constant `gitlawb_info` gauge. Idempotent — calling
@@ -197,6 +202,30 @@ pub fn init(version: &str, node_did: &str) {
         .set(peers_connected)
         .expect("set PEERS_CONNECTED once");
 
+    let gaps_found = IntCounter::with_opts(Opts::new(
+        "gitlawb_reconciliation_gaps_found_total",
+        "Total reconciliation sweep gaps detected (objects that should be pinned but are not)",
+    ))
+    .expect("gitlawb_reconciliation_gaps_found_total definition");
+    registry
+        .register(Box::new(gaps_found.clone()))
+        .expect("register gitlawb_reconciliation_gaps_found_total");
+    RECONCILIATION_GAPS_FOUND
+        .set(gaps_found)
+        .expect("set RECONCILIATION_GAPS_FOUND once");
+
+    let gaps_filled = IntCounter::with_opts(Opts::new(
+        "gitlawb_reconciliation_gaps_filled_total",
+        "Total reconciliation sweep gaps successfully filled (objects pinned by the sweep)",
+    ))
+    .expect("gitlawb_reconciliation_gaps_filled_total definition");
+    registry
+        .register(Box::new(gaps_filled.clone()))
+        .expect("register gitlawb_reconciliation_gaps_filled_total");
+    RECONCILIATION_GAPS_FILLED
+        .set(gaps_filled)
+        .expect("set RECONCILIATION_GAPS_FILLED once");
+
     REGISTRY
         .set(registry)
         .expect("set REGISTRY once (init must be called exactly once)");
@@ -268,6 +297,20 @@ pub fn set_peers_connected(count: i64) {
     }
 }
 
+/// Record reconciliation sweep gaps found (objects that should be pinned but are not).
+pub fn record_reconciliation_gaps_found(count: u64) {
+    if let Some(c) = RECONCILIATION_GAPS_FOUND.get() {
+        c.inc_by(count);
+    }
+}
+
+/// Record reconciliation sweep gaps filled (objects successfully pinned by the sweep).
+pub fn record_reconciliation_gaps_filled(count: u64) {
+    if let Some(c) = RECONCILIATION_GAPS_FILLED.get() {
+        c.inc_by(count);
+    }
+}
+
 /// Encode the registry as the standard Prometheus text exposition format.
 /// Returns an error if `init` was never called.
 pub fn encode() -> Result<String, prometheus::Error> {
@@ -305,6 +348,8 @@ mod tests {
             .expect("PUSHES set after init")
             .with_label_values(&["alice/repo"])
             .inc();
+        record_reconciliation_gaps_found(7);
+        record_reconciliation_gaps_filled(3);
 
         let body = encode().expect("encode should succeed after init");
         assert!(
@@ -318,6 +363,14 @@ mod tests {
         assert!(
             body.contains("gitlawb_pushes_total{repo=\"alice/repo\"} 1"),
             "expected the incremented counter to be visible in: {body}"
+        );
+        assert!(
+            body.contains("gitlawb_reconciliation_gaps_found_total 7"),
+            "expected the reconciliation gaps-found counter to be visible in: {body}"
+        );
+        assert!(
+            body.contains("gitlawb_reconciliation_gaps_filled_total 3"),
+            "expected the reconciliation gaps-filled counter to be visible in: {body}"
         );
     }
 

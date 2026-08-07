@@ -176,13 +176,12 @@ fn rev_list_delta(repo_path: &Path, new_tips: &[&str], old_tips: &[&str]) -> Res
 /// unreachable/dangling ones), which is what the sweep needs to catch
 /// stragglers — do not swap it for a reachability walk.
 pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
+    let output = crate::git::GitCommand::new(repo_path)
         .args([
             "cat-file",
             "--batch-all-objects",
             "--batch-check=%(objectname)",
         ])
-        .current_dir(repo_path)
         .output()
         .context("failed to run git cat-file")?;
 
@@ -204,13 +203,12 @@ pub fn list_all_objects(repo_path: &Path) -> Result<Vec<String>> {
 /// filter needs to tell blobs (content, withholdable) from commits/trees
 /// (structural, never withheld) without typing the candidate list itself.
 pub fn list_all_objects_with_type(repo_path: &Path) -> Result<Vec<(String, String)>> {
-    let output = Command::new("git")
+    let output = crate::git::GitCommand::new(repo_path)
         .args([
             "cat-file",
             "--batch-all-objects",
             "--batch-check=%(objectname) %(objecttype)",
         ])
-        .current_dir(repo_path)
         .output()
         .context("failed to run git cat-file")?;
 
@@ -264,10 +262,12 @@ pub struct PinCandidateSet {
 /// Every degraded path is **logged**, not silent: a full-scan fallback, a
 /// failed full scan, and a panicked blocking task each emit a warning. On a
 /// failed full scan or a task panic the candidate set is empty (pin nothing
-/// this push); that is a durability gap the reconciliation sweep backstops, and
-/// it can never leak because the withheld/fail-closed filter still runs on
-/// whatever set is returned. `full_scan` rides on the returned set so the caller
-/// knows when the dangling-inclusive filter is required.
+/// this push); that is a durability gap the reconciliation sweep backstops
+/// when it is enabled and a pin backend is configured (a node running with the
+/// sweep disabled or with no IPFS/Pinata backend has no backstop), and it can
+/// never leak because the withheld/fail-closed filter still runs on whatever
+/// set is returned. `full_scan` rides on the returned set so the caller knows
+/// when the dangling-inclusive filter is required.
 pub async fn resolve_candidates_for_push(
     repo_path: PathBuf,
     new_tips: Vec<String>,

@@ -66,9 +66,8 @@ pub fn list_refs(repo_path: &Path) -> Result<Vec<(String, String)>> {
 /// Read the current HEAD commit hash of a repository.
 /// Returns None if the repo is empty (no commits yet).
 pub fn head_commit(repo_path: &Path) -> Result<Option<String>> {
-    let output = Command::new("git")
+    let output = crate::git::GitCommand::new(repo_path)
         .args(["rev-parse", "--verify", "HEAD"])
-        .current_dir(repo_path)
         .output()
         .context("failed to run git rev-parse")?;
 
@@ -272,10 +271,13 @@ pub struct TreeEntry {
 /// `gitlawb_core::cid::Cid::from_git_object_bytes`.
 ///
 /// Get just the object type. Returns `None` if the object doesn't exist.
+///
+/// Runs through [`crate::git::GitCommand`] so a cat-file invoked from inside a
+/// reconciliation sweep's blocking scan is registered in the scan context and
+/// killed on deadline, exactly like the pack/cat-file commands it calls (R1-P3).
 pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>> {
-    let type_output = Command::new("git")
+    let type_output = crate::git::GitCommand::new(repo_path)
         .args(["cat-file", "-t", sha256_hex])
-        .current_dir(repo_path)
         .output()
         .context("failed to run git cat-file -t")?;
 
@@ -292,9 +294,8 @@ pub fn object_type(repo_path: &Path, sha256_hex: &str) -> Result<Option<String>>
 
 /// Read an object's content if its type is already known.
 pub fn read_object_content(repo_path: &Path, sha256_hex: &str, obj_type: &str) -> Result<Vec<u8>> {
-    let content_output = Command::new("git")
+    let content_output = crate::git::GitCommand::new(repo_path)
         .args(["cat-file", obj_type, sha256_hex])
-        .current_dir(repo_path)
         .output()
         .context("failed to run git cat-file <type>")?;
 
