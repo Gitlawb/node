@@ -2780,6 +2780,38 @@ impl Db {
         Ok(())
     }
 
+    /// The SHA of the most recent push this node recorded for one ref of a repo,
+    /// or `None` if it has never seen a push for it.
+    ///
+    /// This is the pull request rollup's branch resolve. It reads
+    /// `repo_push_events` rather than `branch_cids` because that table is written
+    /// unconditionally for every ref update on the receive-pack path, while
+    /// `branch_cids` only gets a row when the pushed objects came back carrying a
+    /// pin CID — on a node with no pinning configured it is never written at all,
+    /// which left the resolve permanently unable to answer.
+    ///
+    /// Both the ref filter and the ordering are the database's work: the caller
+    /// gets one row, not the repo's whole push history to scan. Ordering on
+    /// `(created_at, id)` rather than the timestamp alone matches the
+    /// `(repo_id, created_at, id)` index and is what makes "most recent" total —
+    /// one multi-ref push stamps every one of its rows with the same timestamp.
+    pub async fn latest_push_sha_for_ref(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT after_sha FROM repo_push_events
+             WHERE repo_id = $1 AND ref_name = $2
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .bind(ref_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("after_sha")))
+    }
+
     /// One page of a repo's push events, OLDEST first, walked by a `(created_at,
     /// id)` keyset cursor rather than an offset.
     ///

@@ -284,18 +284,29 @@ pub(crate) static BRANCH_RESOLVES: std::sync::atomic::AtomicUsize =
 /// closed or merged pull request keeps the commit the decision was made against,
 /// and only an OPEN pull request with no stored head falls back to the branch.
 ///
-/// The fallback is one database read: the branch heads this node recorded for the
-/// repo, the same `list_branch_cids` lookup the refs handler in
-/// `crate::api::repos` uses. It deliberately does NOT go through
-/// `git::store` ref listing, which needs an acquired repository path — on a cold
-/// node that downloads the whole repository from object storage, and this read
-/// group carries no rate limiter, so an anonymous caller could drive repeated
-/// downloads with a URL.
+/// The fallback is one database read: the latest push this node recorded for the
+/// pull request's source branch, from `repo_push_events`. It deliberately does
+/// NOT go through `git::store` ref listing, which needs an acquired repository
+/// path — on a cold node that downloads the whole repository from object storage,
+/// and this read group carries no rate limiter, so an anonymous caller could
+/// drive repeated downloads with a URL.
+///
+/// `repo_push_events` is the source rather than `branch_cids` because
+/// `record_push_events` writes it for every ref update unconditionally, whereas
+/// the sole writer of `branch_cids` sits behind a pin CID. A node with no object
+/// pinning configured never writes that table, so a resolve keyed on it could
+/// never answer there and every open pull request without a stored head reported
+/// `head_resolved: false` forever. The residual limit is that only pushes taken
+/// after this shipped have rows, so a branch last pushed before then still does
+/// not resolve.
 ///
 /// The resolved head is persisted, which makes an unauthenticated GET write. That
 /// is only acceptable because the write is self-limiting: it fires exactly when
 /// `head_commit` is absent and it fills it, and the fill is conditioned on that
-/// same absence in SQL, so the branch is never taken twice for one pull request.
+/// same absence in SQL, so the PERSIST happens at most once per pull request.
+/// The resolve attempt itself is not once-only — a pull request whose branch does
+/// not resolve stores nothing, so there is nothing to short-circuit on and the
+/// lookup runs again on every read until it succeeds.
 async fn rollup_head(
     state: &AppState,
     record: &crate::db::RepoRecord,
@@ -308,32 +319,40 @@ async fn rollup_head(
         return Ok(None);
     }
 
-    // Keyed the way the push path writes the row: the normalized owner key and
-    // the repo's own name, never the alias the caller happened to put in the URL.
-    let slug = format!(
-        "{}/{}",
-        crate::db::normalize_owner_key(&record.owner_did),
-        record.name
-    );
+    // The push path records the full ref while a pull request stores the bare
+    // branch name, the same mismatch `crate::api::repos::branch_from_ref`
+    // reconciles on the write side; this is that mapping run backwards. The empty
+    // branch is excluded for the same reason it is there: `refs/heads/` is not a
+    // branch and nothing can have written it.
+    if pr.source_branch.is_empty() {
+        return Ok(None);
+    }
+    let ref_name = format!("refs/heads/{}", pr.source_branch);
     #[cfg(test)]
     BRANCH_RESOLVES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let heads = state.db.list_branch_cids(&slug).await?;
-    let resolved = heads
-        .iter()
-        .find(|h| {
-            h.ref_name
-                .strip_prefix("refs/heads/")
-                .unwrap_or(&h.ref_name)
-                == pr.source_branch
-        })
+    let resolved = state
+        .db
+        .latest_push_sha_for_ref(&record.id, &ref_name)
+        .await?
         // A recorded head that is not a commit SHA is no target at all, and
         // storing it would leave the rollup pointing at nothing forever.
-        .and_then(|h| normalize_sha(&h.sha).ok());
+        .and_then(|sha| normalize_sha(&sha).ok());
 
     let Some(sha) = resolved else {
         return Ok(None);
     };
-    state.db.set_pr_head_if_absent(&pr.id, &sha).await?;
+    // Best effort, and deliberately not `?`. The head is already resolved and the
+    // response does not depend on this write landing, so a transient database
+    // failure here must not turn a served read into a 500; the next read resolves
+    // again and re-attempts the fill. Same catch-and-log the sibling writes on the
+    // push path use (`update_open_pr_heads`, `record_push_events`).
+    if let Err(e) = state.db.set_pr_head_if_absent(&pr.id, &sha).await {
+        tracing::warn!(
+            err = %e,
+            pr_id = %pr.id,
+            "failed to persist a resolved pull request head; serving the resolved head anyway"
+        );
+    }
     Ok(Some(sha))
 }
 
@@ -456,6 +475,7 @@ mod tests {
     const STRANGER: &str = "did:key:zSTATUSSTRANGERBBBBBBBBBBBBBBBBBBBBBBBBB";
     const SHA_A: &str = "1111111111111111111111111111111111111111";
     const SHA_B: &str = "2222222222222222222222222222222222222222";
+    const SHA_C: &str = "3333333333333333333333333333333333333333";
 
     fn seed_repo(owner_did: &str, name: &str, is_public: bool) -> RepoRecord {
         let now = chrono::Utc::now();
@@ -1633,38 +1653,59 @@ mod tests {
         }
     }
 
-    /// The key `branch_cids` rows are written under on the push path: the
-    /// normalized owner key and the repo's own name, not the path alias.
-    fn branch_slug(repo: &RepoRecord) -> String {
-        format!(
-            "{}/{}",
-            crate::db::normalize_owner_key(&repo.owner_did),
-            repo.name
-        )
-    }
-
+    /// Point a branch at a SHA the way the receive-pack path does: one
+    /// `repo_push_events` row, which is what the rollup's fallback resolves
+    /// through. Each call takes a strictly later timestamp than the last, so a
+    /// second call to the same branch reads as a later push rather than tying
+    /// with the first.
     async fn seed_branch_head(
         state: &crate::state::AppState,
         repo: &RepoRecord,
         branch: &str,
         sha: &str,
     ) {
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let created_at = format!("2026-01-01T00:00:00.{n:06}Z");
+        seed_push_event(state, repo, branch, sha, &created_at).await;
+    }
+
+    /// One `repo_push_events` row, exactly the shape `record_push_events` writes
+    /// on the receive-pack path: a FULL ref name and the post-push SHA. The
+    /// timestamp is explicit because the fallback picks the most recent row for
+    /// the ref and `created_at` is the ordering key; letting two seeds share a
+    /// wall clock would leave which one wins to the uuid tiebreak.
+    async fn seed_push_event(
+        state: &crate::state::AppState,
+        repo: &RepoRecord,
+        branch: &str,
+        sha: &str,
+        created_at: &str,
+    ) {
         state
             .db
-            .upsert_branch_cid(
-                &branch_slug(repo),
-                &format!("refs/heads/{branch}"),
-                sha,
-                "bafyseed",
-                OWNER,
-            )
+            .insert_repo_push_event(&crate::db::RepoPushEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                ref_name: format!("refs/heads/{branch}"),
+                after_sha: sha.to_string(),
+                created_at: created_at.to_string(),
+            })
             .await
-            .expect("seed branch head");
+            .expect("seed push event");
     }
+
+    const PUSH_T1: &str = "2026-01-01T00:00:00.000000Z";
+    const PUSH_T2: &str = "2026-01-02T00:00:00.000000Z";
 
     /// Serializes the tests that read [`super::BRANCH_RESOLVES`] and zeroes it, so
     /// the counter measures one test's requests rather than whatever else the
     /// harness is running in the same process. Held for the test's lifetime.
+    ///
+    /// Every test that TRIGGERS a resolve takes it too, not only the ones that
+    /// read the count. The counter is process-global while the databases are
+    /// per-test, so an unguarded resolver running concurrently inflates a
+    /// guarded test's count and the failure looks like a bug in the fallback.
     /// Async-aware on purpose: the guard is held across the test's awaits, which a
     /// blocking `std` mutex must not be.
     async fn resolve_count_guard() -> tokio::sync::MutexGuard<'static, ()> {
@@ -1797,6 +1838,7 @@ mod tests {
     /// which is the ONLY field separating it from the reported-nothing case above.
     #[sqlx::test]
     async fn unresolvable_head_differs_from_silent_head_on_head_resolved_alone(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
         let state = test_state(pool).await;
         let repo = seed_repo(OWNER, "rollup-gone", true);
         state.db.create_repo(&repo).await.unwrap();
@@ -1954,6 +1996,7 @@ mod tests {
     /// head for the next read.
     #[sqlx::test]
     async fn open_pr_without_a_stored_head_resolves_and_persists_the_branch_head(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
         let state = test_state(pool).await;
         let repo = seed_repo(OWNER, "rollup-fallback", true);
         state.db.create_repo(&repo).await.unwrap();
@@ -1977,6 +2020,139 @@ mod tests {
                 .head_commit,
             Some(SHA_A.to_string()),
             "the resolved head must be persisted as the stored head"
+        );
+    }
+
+    /// The fallback must resolve on a node with no object-storage pinning at all.
+    ///
+    /// `branch_cids` has exactly one production writer, and it only fires for a
+    /// ref whose objects came back with a pin CID, so on a node with no Pinata JWT
+    /// the table stays empty forever. `repo_push_events` is written unconditionally
+    /// for every ref update on the receive-pack path, which is why it is the
+    /// fallback's source. Nothing here seeds `branch_cids`: if the resolve still
+    /// went through it, this open pull request would answer `head_resolved: false`
+    /// permanently.
+    #[sqlx::test]
+    async fn fallback_resolves_from_push_events_with_no_pin_recorded(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(OWNER, "rollup-nopin", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        seed_push_event(&state, &repo, "feature", SHA_A, PUSH_T1).await;
+
+        let pinned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM branch_cids")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pinned, 0, "the unpinned node premise must hold");
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-nopin", 1)).await).await;
+        assert_eq!(
+            body["head_resolved"], true,
+            "a pushed branch must resolve on a node that pins nothing"
+        );
+        assert_eq!(body["sha"], SHA_A);
+        assert_eq!(
+            state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit,
+            Some(SHA_A.to_string()),
+            "the resolved head must still be persisted"
+        );
+    }
+
+    /// The fallback takes the LATEST push for the branch, not any push, and it
+    /// takes it for the right ref: a tag sharing the branch's name and a push to a
+    /// different branch are both seeded ahead of the real one, so a query missing
+    /// either predicate returns the wrong SHA rather than passing vacuously.
+    #[sqlx::test]
+    async fn fallback_takes_the_latest_push_for_that_exact_branch(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-latest", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+
+        seed_push_event(&state, &repo, "feature", SHA_A, PUSH_T1).await;
+        seed_push_event(&state, &repo, "other", SHA_C, PUSH_T2).await;
+        // A tag named like the branch, written the way the push path would.
+        state
+            .db
+            .insert_repo_push_event(&crate::db::RepoPushEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                repo_id: repo.id.clone(),
+                ref_name: "refs/tags/feature".to_string(),
+                after_sha: SHA_C.to_string(),
+                created_at: PUSH_T2.to_string(),
+            })
+            .await
+            .unwrap();
+        seed_push_event(&state, &repo, "feature", SHA_B, PUSH_T2).await;
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-latest", 1)).await).await;
+        assert_eq!(
+            body["sha"], SHA_B,
+            "the newest push to refs/heads/feature is the head"
+        );
+    }
+
+    /// A push recorded for a DIFFERENT repository must never resolve this one's
+    /// branch. Same branch name, same timestamp, no row for this repo.
+    #[sqlx::test]
+    async fn fallback_does_not_cross_repositories(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
+        let state = test_state(pool).await;
+        let mine = seed_repo(OWNER, "rollup-mine", true);
+        let theirs = seed_repo(OWNER, "rollup-theirs", true);
+        state.db.create_repo(&mine).await.unwrap();
+        state.db.create_repo(&theirs).await.unwrap();
+        let pr = seed_pr(&mine.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        seed_push_event(&state, &theirs, "feature", SHA_A, PUSH_T1).await;
+
+        let body =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-mine", 1)).await).await;
+        assert_eq!(
+            body["head_resolved"], false,
+            "another repository's push must not resolve this pull request's head"
+        );
+    }
+
+    /// The comment on `rollup_head` claims the PERSIST is once-per-pull-request,
+    /// not the resolve. This is what keeps that claim honest: an open pull request
+    /// whose branch never resolves runs the lookup again on every read, forever,
+    /// because there is nothing to store and therefore nothing to short-circuit on.
+    #[sqlx::test]
+    async fn an_unresolvable_head_re_runs_the_resolve_on_every_read(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "rollup-retry", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "never-pushed");
+        state.db.create_pr(&pr).await.unwrap();
+
+        let first =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-retry", 1)).await).await;
+        assert_eq!(first["head_resolved"], false);
+        assert_eq!(resolve_count(), 1, "the first read attempts the resolve");
+
+        let second =
+            body_json(get_rollup(&state, None, &rollup_uri(OWNER, "rollup-retry", 1)).await).await;
+        assert_eq!(second["head_resolved"], false);
+        assert_eq!(
+            resolve_count(),
+            2,
+            "with nothing stored there is nothing to short-circuit on, so the \
+             second read attempts the resolve again"
         );
     }
 
@@ -2045,6 +2221,70 @@ mod tests {
             resolve_count(),
             1,
             "the branch resolve must not run again once a head is stored"
+        );
+    }
+
+    /// The write-back is a cache fill, so its failure must not destroy an answer
+    /// the read already has. The head is resolved BEFORE the persist is attempted,
+    /// and the persist is the only thing that fails here.
+    ///
+    /// The failure is induced with a CHECK constraint that rejects any non-null
+    /// `head_commit`: the UPDATE errors while every read in the request path
+    /// (`repos`, `pull_requests`, `repo_push_events`) still works, which is what
+    /// isolates the write. Dropping a table would take the read down with it and
+    /// the test would pass for the wrong reason.
+    #[sqlx::test]
+    async fn a_failed_head_write_back_still_serves_the_resolved_head(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(OWNER, "rollup-wbfail", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let pr = seed_pr(&repo.id, 1, "feature");
+        state.db.create_pr(&pr).await.unwrap();
+        seed_push_event(&state, &repo, "feature", SHA_A, PUSH_T1).await;
+
+        sqlx::query(
+            "ALTER TABLE pull_requests
+             ADD CONSTRAINT no_head_commit_writes CHECK (head_commit IS NULL)",
+        )
+        .execute(&pool)
+        .await
+        .expect("install the write-blocking constraint");
+        // The premise: this exact call is the one the rollup makes, and it errors.
+        state
+            .db
+            .set_pr_head_if_absent(&pr.id, SHA_A)
+            .await
+            .expect_err("the persist must fail for this test to mean anything");
+
+        let resp = get_rollup(&state, None, &rollup_uri(OWNER, "rollup-wbfail", 1)).await;
+        let (status, bytes) = status_and_bytes(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a failed best-effort cache fill must not turn a resolved read into an \
+             error: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["head_resolved"], true);
+        assert_eq!(body["sha"], SHA_A);
+        assert_eq!(body["state"], "pending");
+        assert_eq!(
+            resolve_count(),
+            1,
+            "the read resolved the branch itself rather than reading a stored head"
+        );
+        assert_eq!(
+            state
+                .db
+                .get_pr(&repo.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .head_commit,
+            None,
+            "nothing was persisted, which is the point: the answer was served anyway"
         );
     }
 
@@ -2203,8 +2443,15 @@ mod tests {
             );
         }
         assert!(
-            body_of_module.contains("list_branch_cids("),
-            "the fallback's branch lookup must be the database-backed list_branch_cids"
+            body_of_module.contains("latest_push_sha_for_ref("),
+            "the fallback's branch lookup must be the database-backed \
+             latest_push_sha_for_ref over repo_push_events"
+        );
+        assert!(
+            !body_of_module.contains("list_branch_cids("),
+            "the fallback must not read branch_cids — that table has one writer \
+             and it only fires when the pushed objects came back with a pin CID, \
+             so on a node with no pinning configured it is never written"
         );
     }
 
@@ -2213,6 +2460,7 @@ mod tests {
     /// group without the layer reads every caller as anonymous.
     #[sqlx::test]
     async fn rollup_route_is_registered_with_optional_signature(pool: PgPool) {
+        let _counting = resolve_count_guard().await;
         let state = test_state(pool).await;
         let repo = seed_repo(OWNER, "rollup-wired", true);
         state.db.create_repo(&repo).await.unwrap();
