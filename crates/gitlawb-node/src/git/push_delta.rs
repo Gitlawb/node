@@ -262,10 +262,12 @@ pub struct PinCandidateSet {
 /// Every degraded path is **logged**, not silent: a full-scan fallback, a
 /// failed full scan, and a panicked blocking task each emit a warning. On a
 /// failed full scan or a task panic the candidate set is empty (pin nothing
-/// this push); that is a durability gap the reconciliation sweep backstops, and
-/// it can never leak because the withheld/fail-closed filter still runs on
-/// whatever set is returned. `full_scan` rides on the returned set so the caller
-/// knows when the dangling-inclusive filter is required.
+/// this push); that is a durability gap the reconciliation sweep backstops
+/// when it is enabled and a pin backend is configured (a node running with the
+/// sweep disabled or with no IPFS/Pinata backend has no backstop), and it can
+/// never leak because the withheld/fail-closed filter still runs on whatever
+/// set is returned. `full_scan` rides on the returned set so the caller knows
+/// when the dangling-inclusive filter is required.
 pub async fn resolve_candidates_for_push(
     repo_path: PathBuf,
     new_tips: Vec<String>,

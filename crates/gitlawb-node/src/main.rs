@@ -508,8 +508,9 @@ async fn main() -> Result<()> {
         let node_keypair = Arc::clone(&state.node_keypair);
         let node_did = state.node_did.clone();
         let shutdown_rx = state.subscribe_shutdown();
-        reconciliation::spawn(db, config, http_client, node_keypair, node_did, shutdown_rx);
-        info!("reconciliation sweep worker started");
+        if reconciliation::spawn(db, config, http_client, node_keypair, node_did, shutdown_rx) {
+            info!("reconciliation sweep worker started");
+        }
     }
 
     // On-chain operator setup: verify stake + spawn heartbeat loop

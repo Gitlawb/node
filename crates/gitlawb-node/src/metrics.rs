@@ -348,6 +348,8 @@ mod tests {
             .expect("PUSHES set after init")
             .with_label_values(&["alice/repo"])
             .inc();
+        record_reconciliation_gaps_found(7);
+        record_reconciliation_gaps_filled(3);
 
         let body = encode().expect("encode should succeed after init");
         assert!(
@@ -361,6 +363,14 @@ mod tests {
         assert!(
             body.contains("gitlawb_pushes_total{repo=\"alice/repo\"} 1"),
             "expected the incremented counter to be visible in: {body}"
+        );
+        assert!(
+            body.contains("gitlawb_reconciliation_gaps_found_total 7"),
+            "expected the reconciliation gaps-found counter to be visible in: {body}"
+        );
+        assert!(
+            body.contains("gitlawb_reconciliation_gaps_filled_total 3"),
+            "expected the reconciliation gaps-filled counter to be visible in: {body}"
         );
     }
 
