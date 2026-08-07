@@ -89,11 +89,13 @@ pub struct AppState {
     ///   * the libp2p swarm task
     ///   * the gossip, sync, operator heartbeat, and rate-limit cleanup loops
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
-    /// Bounds concurrent served git READ operations (upload-pack + both info/refs
-    /// advertisements). A read handler acquires a permit before spawning git and
-    /// holds it for the op; when none are free the request is shed with a 503.
-    /// Writes draw from `git_write_semaphore` so a read flood cannot shed an
-    /// authenticated push at admission (#174).
+    /// Bounds concurrent served git READ operations (upload-pack and its own
+    /// `info/refs` advertisement ONLY — the receive-pack advertisement draws from
+    /// `git_push_advert_semaphore`, so sizing this pool for both would undercount
+    /// the read capacity an operator gets). A read handler acquires a permit before
+    /// spawning git and holds it for the op; when none are free the request is shed
+    /// with a 503. Writes draw from `git_write_semaphore` so a read flood cannot
+    /// shed an authenticated push at admission (#174).
     pub git_read_semaphore: Arc<tokio::sync::Semaphore>,
     /// Bounds concurrent `git-receive-pack` (push) operations, a pool separate
     /// from `git_read_semaphore` so an anonymous READ flood can never shed an
