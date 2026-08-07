@@ -916,6 +916,43 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
         ],
     },
+    // 18 clears the range #135/#173 claimed (13/14) and #253 (16), so the
+    // backfill below cannot collide with any branch in flight. 18/19 are the
+    // next free integers after the merged max (17).
+    Migration {
+        version: 18,
+        name: "pinned_cids_clear_legacy_equal_cid",
+        stmts: &[
+            // R2-P2 provenance fix: v12 allowed cid = pinata_cid as a fallback for
+            // new rows, which made has_ipfs_cid infer local-IPFS provenance from
+            // CID *inequality*. That inference is wrong for a mirror whose
+            // Pinata CID happens to equal the local CID. Clear the legacy
+            // equal-cid rows so `has_ipfs_cid` reduces to `cid IS NOT NULL` and
+            // provenance is recorded, never guessed. The sweep re-pins the now
+            // "missing" objects on its next pass (they get a real cid then).
+            r#"UPDATE pinned_cids
+               SET cid = NULL
+               WHERE cid IS NOT NULL
+                 AND pinata_cid IS NOT NULL
+                 AND cid = pinata_cid"#,
+        ],
+    },
+    Migration {
+        version: 19,
+        name: "node_state",
+        stmts: &[
+            // R2-P1 cursor persistence: the reconciliation sweep's keyset cursor
+            // must survive a node restart so a dropped pass resumes where it
+            // stopped instead of re-walking every repo. A tiny key/value table
+            // keyed by opaque string (never a column per feature) keeps this a
+            // generic primitive future features can reuse.
+            r#"CREATE TABLE IF NOT EXISTS node_state (
+                key        TEXT NOT NULL PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )"#,
+        ],
+    },
 ];
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
@@ -2318,21 +2355,62 @@ impl Db {
     }
 }
 
+// ── Node state ────────────────────────────────────────────────────────────────
+
+impl Db {
+    /// Read an opaque node-state value. Returns `None` when the key has never
+    /// been written. Used by the reconciliation sweep to persist its keyset
+    /// cursor across restarts (R2-P1).
+    pub async fn get_node_state(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM node_state WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("value")))
+    }
+
+    /// Write an opaque node-state value (upsert). `None` deletes the key so a
+    /// cleared cursor does not accumulate stale rows.
+    pub async fn set_node_state(&self, key: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(v) => {
+                sqlx::query(
+                    "INSERT INTO node_state (key, value, updated_at)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(key)
+                .bind(v)
+                .bind(Utc::now().to_rfc3339())
+                .execute(&self.pool)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM node_state WHERE key = $1")
+                    .bind(key)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── Pinned CIDs ───────────────────────────────────────────────────────────────
 
 impl Db {
     /// Record the local IPFS CID for a git object.
-    /// If a Pinata-only row already exists (cid IS NULL or was set as Pinata
-    /// fallback so cid = pinata_cid), this replaces it with the real IPFS CID.
+    /// This unconditionally replaces any prior `cid` (NULL, Pinata-only, a
+    /// legacy fallback where cid = pinata_cid, OR a stale wrong CID). A stale
+    /// local CID must be repairable by the sweep, otherwise an object pinned
+    /// once with the wrong bytes is never corrected (R1-P2).
     pub async fn record_pinned_cid(&self, sha256_hex: &str, cid: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at)
              VALUES ($1, $2, $3)
              ON CONFLICT(sha256_hex) DO UPDATE SET
                cid = EXCLUDED.cid,
-               pinned_at = EXCLUDED.pinned_at
-             WHERE pinned_cids.cid IS NULL
-                OR pinned_cids.cid = pinned_cids.pinata_cid",
+               pinned_at = EXCLUDED.pinned_at",
         )
         .bind(sha256_hex)
         .bind(cid)
@@ -2429,14 +2507,14 @@ impl Db {
             .collect())
     }
 
-    /// Returns true when this object has a real local IPFS CID (not a legacy
-    /// Pinata fallback where cid was set to pinata_cid for new rows).
+    /// Returns true when this object has a real local IPFS CID. After migration
+    /// v18 cleared legacy `cid = pinata_cid` fallback rows (provenance is now
+    /// recorded, never inferred), `cid IS NOT NULL` is the complete predicate.
     pub async fn has_ipfs_cid(&self, sha256_hex: &str) -> Result<bool> {
         let row = sqlx::query(
             "SELECT COUNT(*) as cnt FROM pinned_cids
              WHERE sha256_hex = $1
-               AND cid IS NOT NULL
-               AND cid IS DISTINCT FROM pinata_cid",
+               AND cid IS NOT NULL",
         )
         .bind(sha256_hex)
         .fetch_one(&self.pool)
@@ -2457,48 +2535,72 @@ impl Db {
 
     /// Given a list of sha256_hex values, returns the subset that already have
     /// a Pinata CID recorded. Used by the reconciliation sweep to skip objects
-    /// that Pinata has already handled.
+    /// that Pinata has already handled. Chunked like `filter_ipfs_pinned_oids`
+    /// to bound the `ANY($1)` array size on full uncapped object lists (R1-P3).
     pub async fn filter_pinata_pinned_oids(&self, oids: &[String]) -> Result<Vec<String>> {
         if oids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
-            "SELECT sha256_hex FROM pinned_cids WHERE sha256_hex = ANY($1) AND pinata_cid IS NOT NULL",
-        )
-        .bind(oids)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|r| r.get("sha256_hex")).collect())
+        const CHUNK_SIZE: usize = 1000;
+        let mut out = Vec::new();
+        for chunk in oids.chunks(CHUNK_SIZE) {
+            let rows = sqlx::query(
+                "SELECT sha256_hex FROM pinned_cids WHERE sha256_hex = ANY($1) AND pinata_cid IS NOT NULL",
+            )
+            .bind(chunk)
+            .fetch_all(&self.pool)
+            .await?;
+            out.extend(rows.into_iter().map(|r| r.get("sha256_hex")));
+        }
+        Ok(out)
     }
 
     /// Given a list of sha256_hex values, returns the subset that have a real
-    /// local IPFS CID (excluding legacy Pinata fallback rows where cid equals
-    /// pinata_cid). Used by the reconciliation sweep to skip IPFS-complete objects.
+    /// local IPFS CID (`cid IS NOT NULL`; after migration v18 provenance is
+    /// recorded, never inferred from CID inequality). Used by the reconciliation
+    /// sweep to skip IPFS-complete objects.
+    ///
+    /// The input is processed in fixed-size chunks so the `ANY($1)` array sent
+    /// to Postgres is bounded even when the sweep hands over a full uncapped
+    /// object list (R1-P3).
     pub async fn filter_ipfs_pinned_oids(&self, oids: &[String]) -> Result<Vec<String>> {
         if oids.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = sqlx::query(
-            "SELECT sha256_hex FROM pinned_cids
-             WHERE sha256_hex = ANY($1)
-               AND cid IS NOT NULL
-               AND cid IS DISTINCT FROM pinata_cid",
-        )
-        .bind(oids)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(|r| r.get("sha256_hex")).collect())
+        const CHUNK_SIZE: usize = 1000;
+        let mut out = Vec::new();
+        for chunk in oids.chunks(CHUNK_SIZE) {
+            let rows = sqlx::query(
+                "SELECT sha256_hex FROM pinned_cids
+                 WHERE sha256_hex = ANY($1)
+                   AND cid IS NOT NULL",
+            )
+            .bind(chunk)
+            .fetch_all(&self.pool)
+            .await?;
+            out.extend(rows.into_iter().map(|r| r.get("sha256_hex")));
+        }
+        Ok(out)
     }
 
     /// Record the Pinata CID for a git object.
     /// `cid` is left NULL for new rows so that `has_ipfs_cid` (which checks
     /// `cid IS NOT NULL`) correctly distinguishes local IPFS state from
-    /// Pinata-only state.
+    /// Pinata-only state. A legacy row holding `cid = pinata_cid` fallback is
+    /// cleared here as well (belt-and-suspenders alongside migration v18): the
+    /// Pinata upload proves nothing about local IPFS state, so the old fallback
+    /// value must not be misread as a local pin.
     pub async fn record_pinata_cid(&self, sha256_hex: &str, pinata_cid: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
              VALUES ($1, $2, $3, $4)
-             ON CONFLICT(sha256_hex) DO UPDATE SET pinata_cid = EXCLUDED.pinata_cid",
+             ON CONFLICT(sha256_hex) DO UPDATE SET
+               pinata_cid = EXCLUDED.pinata_cid,
+               cid = CASE
+                 WHEN pinned_cids.cid IS NOT NULL
+                  AND pinned_cids.cid = pinned_cids.pinata_cid THEN NULL
+                 ELSE pinned_cids.cid
+               END",
         )
         .bind(sha256_hex)
         .bind(Option::<&str>::None) // cid is NULL for Pinata-only new rows
@@ -4063,6 +4165,10 @@ mod migration_tests {
     ///   (2) cid IS NOT NULL, cid != pinata_cid              → has_ipfs = true
     ///   (3) cid IS NOT NULL, cid = pinata_cid (legacy)      → has_ipfs = false
     ///
+    /// Legacy row (3) stops being a special case because migration v18 clears
+    /// `cid = pinata_cid` back to NULL, so `has_ipfs_cid` reduces to the plain
+    /// `cid IS NOT NULL` predicate (provenance recorded, never inferred).
+    ///
     /// After the migration we also test that a Pinata-only INSERT (cid = NULL)
     /// works and produces has_ipfs = false, has_pinata = true.
     #[sqlx::test]
@@ -4194,6 +4300,158 @@ mod migration_tests {
 
         // ── Idempotent re-run ──────────────────────────────────────────
         db.migrate().await.unwrap();
+    }
+
+    /// Migration v18 clears legacy rows where cid was set to pinata_cid as a
+    /// fallback, so `has_ipfs_cid` no longer has to infer provenance from CID
+    /// inequality (R2-P2). Rows where the CIDs genuinely differ are untouched.
+    #[sqlx::test]
+    async fn migration_v18_clears_legacy_equal_cid(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+        let now = "2026-07-01T12:00:00Z";
+
+        // Seed one legacy equal-cid row and one distinct-cid row, then mark
+        // v18 (and v19, applied after it) as not yet run so re-running
+        // migrate() exercises the backfill in isolation.
+        sqlx::query(
+            "INSERT INTO pinned_cids (sha256_hex, cid, pinned_at, pinata_cid)
+             VALUES ('sha_equal', 'QmSame', $1, 'QmSame'),
+                    ('sha_distinct', 'QmLocal', $1, 'QmPinata')",
+        )
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version >= 18")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        // Backfilled row now has no local CID; distinct row is untouched.
+        assert!(
+            !db.has_ipfs_cid("sha_equal").await.unwrap(),
+            "legacy equal-cid row must be cleared to NULL by v18"
+        );
+        assert!(
+            db.has_ipfs_cid("sha_distinct").await.unwrap(),
+            "distinct-cid row must survive the backfill"
+        );
+        assert!(db.has_pinata_cid("sha_equal").await.unwrap());
+    }
+
+    /// Migration v19 creates the node_state key/value table and the get/set
+    /// helpers round-trip through it (used by the sweep cursor persistence).
+    #[sqlx::test]
+    async fn node_state_roundtrip_and_delete(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        assert_eq!(
+            db.get_node_state("sweep_cursor").await.unwrap(),
+            None,
+            "absent key reads as None"
+        );
+
+        db.set_node_state("sweep_cursor", Some("repo/b"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_node_state("sweep_cursor").await.unwrap(),
+            Some("repo/b".to_string()),
+            "value survives a write + read"
+        );
+
+        // Upsert overwrites.
+        db.set_node_state("sweep_cursor", Some("repo/c"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_node_state("sweep_cursor").await.unwrap(),
+            Some("repo/c".to_string())
+        );
+
+        // None deletes the key.
+        db.set_node_state("sweep_cursor", None).await.unwrap();
+        assert_eq!(db.get_node_state("sweep_cursor").await.unwrap(), None);
+    }
+
+    /// record_pinned_cid must repair a stale WRONG local CID, not only fill a
+    /// NULL or Pinata-fallback slot (R1-P2): an object pinned once with the
+    /// wrong bytes is re-pinned by the sweep and the row overwritten.
+    #[sqlx::test]
+    async fn record_pinned_cid_repairs_stale_wrong_cid(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // A stale wrong CID that is neither NULL nor equal to pinata_cid.
+        db.record_pinned_cid("sha_stale", "QmStaleWrong")
+            .await
+            .unwrap();
+        db.record_pinata_cid("sha_stale", "QmPinataX")
+            .await
+            .unwrap();
+
+        // Re-pin with the correct CID — must overwrite despite the existing
+        // distinct cid column.
+        db.record_pinned_cid("sha_stale", "QmCorrect")
+            .await
+            .unwrap();
+
+        let cid: String =
+            sqlx::query_scalar("SELECT cid FROM pinned_cids WHERE sha256_hex = 'sha_stale'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(cid, "QmCorrect", "stale wrong CID must be repaired");
+    }
+
+    /// record_pinata_cid must clear a legacy cid = pinata_cid fallback (v18's
+    /// belt-and-suspenders) so a later Pinata-only row is never misread as a
+    /// local IPFS pin.
+    #[sqlx::test]
+    async fn record_pinata_cid_clears_legacy_equal_cid(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        db.record_pinned_cid("sha_fallback", "QmFallback")
+            .await
+            .unwrap();
+        // Simulate a legacy row where cid was forced equal to pinata_cid.
+        sqlx::query(
+            "UPDATE pinned_cids SET pinata_cid = 'QmFallback' WHERE sha256_hex = 'sha_fallback'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // Recording a new (different) Pinata CID must NULL the stale fallback cid.
+        db.record_pinata_cid("sha_fallback", "QmPinataNew")
+            .await
+            .unwrap();
+
+        let cid: Option<String> =
+            sqlx::query_scalar("SELECT cid FROM pinned_cids WHERE sha256_hex = 'sha_fallback'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(cid, None, "legacy equal-cid fallback must be cleared");
+
+        // But a genuine local pin plus a distinct Pinata CID is preserved.
+        db.record_pinned_cid("sha_genuine", "QmLocalGenuine")
+            .await
+            .unwrap();
+        db.record_pinata_cid("sha_genuine", "QmPinataGenuine")
+            .await
+            .unwrap();
+        let cid: String =
+            sqlx::query_scalar("SELECT cid FROM pinned_cids WHERE sha256_hex = 'sha_genuine'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(cid, "QmLocalGenuine");
     }
 }
 
