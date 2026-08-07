@@ -226,6 +226,10 @@ mod authz_guard {
             (protect, "list_protected_branches", "authorize_repo_read("),
             (labels, "list_labels", "authorize_repo_read("),
             (events, "list_repo_events", "authorize_repo_read("),
+            // The status read gates before any claim data is loaded, so its deny
+            // is the repo's own not-found rather than an existence oracle over
+            // which commits were reported on.
+            (status, "commit_status", "authorize_repo_read("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),

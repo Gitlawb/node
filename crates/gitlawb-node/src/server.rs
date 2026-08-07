@@ -203,6 +203,18 @@ pub fn build_router(state: AppState) -> Router {
         trust: state.push_limiter_trust,
     }));
 
+    // ── Status claim reads — open, behind `optional_signature` so the handler
+    // sees the caller when one signs and still answers a public repo for an
+    // anonymous reader. Without the layer the handler's optional auth extension
+    // is None for EVERY caller, including the owner, and every private repo
+    // reads as not-found.
+    let status_read_routes = Router::new()
+        .route(
+            "/api/v1/repos/{owner}/{repo}/commits/{sha}/status",
+            get(status::commit_status),
+        )
+        .layer(middleware::from_fn(auth::optional_signature));
+
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.
     // HTTP Signature is enforced on receive-pack (push) — the git-remote-gitlawb
@@ -490,6 +502,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(creation_routes)
         .merge(write_routes)
         .merge(status_write_routes)
+        .merge(status_read_routes)
         .merge(git_write_routes)
         .merge(git_read_routes)
         .merge(issue_write_routes)

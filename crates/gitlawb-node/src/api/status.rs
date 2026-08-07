@@ -1,6 +1,7 @@
-//! Commit status claim write path.
+//! Commit status claims: the write path and the combined read.
 //!
 //! POST /api/v1/repos/:owner/:repo/statuses/:sha — append one claim (owner only)
+//! GET  /api/v1/repos/:owner/:repo/commits/:sha/status — the combined projection
 //!
 //! Claims are append-only: a producer reporting twice for the same context
 //! leaves both rows and the visible status is a projection over the history.
@@ -9,7 +10,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::Utc;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::AuthenticatedDid;
@@ -121,6 +122,116 @@ pub async fn create_status(
         crate::db::ClaimInsert::CapExceeded(which) => Err(AppError::TooManyRequests(format!(
             "claim limit reached for {which}"
         ))),
+    }
+}
+
+/// One reported context in the combined response. Signature material is
+/// deliberately absent: it is write-time provenance, not read-surface data.
+#[derive(Serialize)]
+pub struct StatusEntry {
+    pub state: String,
+    pub context: String,
+    pub target_url: Option<String>,
+    pub description: Option<String>,
+    pub producer_did: String,
+    pub created_at: String,
+}
+
+/// The combined commit status. `state` never leaves the four-value set (KTD-1),
+/// so absence is carried by `total_count` 0 with the pending state rather than a
+/// fifth value, and `reported_only` (R19) says out loud that the state covers the
+/// contexts that reported, not every check a caller expected.
+#[derive(Serialize)]
+pub struct CombinedStatus {
+    pub state: String,
+    pub sha: String,
+    pub total_count: usize,
+    pub statuses: Vec<StatusEntry>,
+    pub reported_only: bool,
+}
+
+/// GET /api/v1/repos/:owner/:repo/commits/:sha/status
+///
+/// The auth extension is optional and MUST be last in the extractor list: the
+/// route group carries `optional_signature`, so an unsigned caller reaches here
+/// with no `AuthenticatedDid` at all and a public repo still answers.
+pub async fn commit_status(
+    State(state): State<AppState>,
+    Path((owner, name, sha)): Path<(String, String, String)>,
+    auth: Option<Extension<AuthenticatedDid>>,
+) -> Result<Json<CombinedStatus>> {
+    let caller = auth.as_ref().map(|Extension(a)| a.0.as_str());
+    // The gate runs first and on the requested path, before any claim data is
+    // touched. Its deny is the repo's own not-found, byte-identical to a missing
+    // repo, so the status surface cannot answer "does this repo exist".
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &name, caller, "/").await?;
+
+    let commit_sha = normalize_sha(&sha)?;
+    // KTD-5: current authorization, not write-time authorization. An ownership
+    // transfer drops the prior owner's claims from the projection while the
+    // append-only history keeps them.
+    let authorizing = authorizing_did_variants(&record.owner_did);
+    let claims = state
+        .db
+        .latest_status_claims(&record.id, &commit_sha, &authorizing)
+        .await?;
+
+    let statuses: Vec<StatusEntry> = claims
+        .into_iter()
+        .map(|c| StatusEntry {
+            state: c.state,
+            context: c.context,
+            target_url: c.target_url,
+            description: c.description,
+            producer_did: c.producer_did,
+            created_at: c.created_at,
+        })
+        .collect();
+
+    Ok(Json(CombinedStatus {
+        state: combined_state(&statuses).to_string(),
+        sha: commit_sha,
+        total_count: statuses.len(),
+        statuses,
+        reported_only: true,
+    }))
+}
+
+/// KTD-1's fold: any error or failure yields failure, else any pending yields
+/// pending, else success. An empty set is pending, never success — total absence
+/// of a verdict is its own state and must not read as a pass (R10).
+fn combined_state(statuses: &[StatusEntry]) -> &'static str {
+    if statuses.is_empty() {
+        return "pending";
+    }
+    if statuses
+        .iter()
+        .any(|s| s.state == "error" || s.state == "failure")
+    {
+        "failure"
+    } else if statuses.iter().any(|s| s.state == "pending") {
+        "pending"
+    } else {
+        "success"
+    }
+}
+
+/// The set of stored `authorizing_did` values that count as the current owner,
+/// reproducing [`crate::api::did_matches`] as a set so the filter can be a
+/// membership test inside the projection query. `did:key` collapses its full and
+/// bare forms; every other method matches exactly, because a bare base58 id must
+/// never match across methods.
+fn authorizing_did_variants(owner_did: &str) -> Vec<String> {
+    let key_id = owner_did.strip_prefix("did:key:").unwrap_or(owner_did);
+    if key_id.contains(':') {
+        return vec![owner_did.to_string()];
+    }
+    let full = format!("did:key:{key_id}");
+    if full == owner_did {
+        vec![owner_did.to_string(), key_id.to_string()]
+    } else {
+        vec![owner_did.to_string(), full]
     }
 }
 
@@ -677,6 +788,610 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "the status write route must exist and sit behind require_signature"
         );
+    }
+
+    // ── Read path (U4) ────────────────────────────────────────────────────
+
+    const NEW_OWNER: &str = "did:key:zSTATUSNEWOWNERCCCCCCCCCCCCCCCCCCCCCC";
+
+    fn read_router(state: crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/commits/{sha}/status",
+                axum::routing::get(super::commit_status),
+            )
+            .with_state(state)
+    }
+
+    fn status_uri(owner: &str, repo: &str, sha: &str) -> String {
+        format!("/api/v1/repos/{owner}/{repo}/commits/{sha}/status")
+    }
+
+    /// GET the read surface as `did`, or anonymously when it is `None` (no
+    /// `AuthenticatedDid` extension at all, which is what an unsigned caller
+    /// looks like once `optional_signature` has passed it through).
+    async fn get_status(
+        state: &crate::state::AppState,
+        did: Option<&str>,
+        uri: &str,
+    ) -> axum::response::Response {
+        let req = match did {
+            Some(d) => signed_request_as(d, Method::GET, uri, Body::empty()),
+            None => axum::http::Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        };
+        read_router(state.clone()).oneshot(req).await.unwrap()
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).expect("response body must be json")
+    }
+
+    /// One claim row with every field chosen by the caller, including the
+    /// authorizing DID and the display timestamp, so the projection's ordering
+    /// key and its current-authorization filter can both be driven directly.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_claim(
+        pool: &PgPool,
+        id: &str,
+        repo_id: &str,
+        sha: &str,
+        producer: &str,
+        authorizing: &str,
+        context: &str,
+        claim_state: &str,
+        created_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO status_claims
+             (id, repo_id, commit_sha, state, context, producer_did, authorizing_did,
+              signature, signature_input, signed_payload, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'','',''::bytea,$8)",
+        )
+        .bind(id)
+        .bind(repo_id)
+        .bind(sha)
+        .bind(claim_state)
+        .bind(context)
+        .bind(producer)
+        .bind(authorizing)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed claim");
+    }
+
+    /// Covers AE1. A context reported pending then success reads as success with
+    /// exactly one entry: the projection takes the LATEST claim per (producer,
+    /// context), not every row in the history.
+    #[sqlx::test]
+    async fn ae1_latest_claim_per_context_reads_as_success(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "read-ae1", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        for st in ["pending", "success"] {
+            let resp = post_as(
+                &state,
+                OWNER,
+                &uri(OWNER, "read-ae1", SHA_A),
+                body_of(st, "ci/build"),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{st} claim");
+        }
+
+        let resp = get_status(&state, Some(OWNER), &status_uri(OWNER, "read-ae1", SHA_A)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["state"], "success");
+        assert_eq!(body["total_count"], 1);
+        assert_eq!(body["statuses"].as_array().unwrap().len(), 1);
+        assert_eq!(body["statuses"][0]["state"], "success");
+        assert_eq!(body["statuses"][0]["context"], "ci/build");
+        assert_eq!(body["statuses"][0]["producer_did"], OWNER);
+        assert_eq!(
+            body["reported_only"], true,
+            "R19: the response marks that the state covers reported contexts only"
+        );
+    }
+
+    /// The latest claim for a context is the highest server-assigned `seq`
+    /// (KTD-3), never the newest timestamp and never the largest row id. The two
+    /// rows are seeded so every other candidate key picks the LOSING row: the
+    /// earlier claim carries a far-future `created_at` and a lexically larger
+    /// uuid than the later one.
+    #[sqlx::test]
+    async fn latest_claim_is_highest_seq_not_newest_timestamp_or_id(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(OWNER, "read-order", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        seed_claim(
+            &pool,
+            "zzzzzzzz-0000-0000-0000-000000000001",
+            &repo.id,
+            SHA_A,
+            OWNER,
+            OWNER,
+            "ci/build",
+            "pending",
+            "2099-01-01T00:00:00Z",
+        )
+        .await;
+        seed_claim(
+            &pool,
+            "aaaaaaaa-0000-0000-0000-000000000002",
+            &repo.id,
+            SHA_A,
+            OWNER,
+            OWNER,
+            "ci/build",
+            "success",
+            "2000-01-01T00:00:00Z",
+        )
+        .await;
+
+        let resp = get_status(&state, Some(OWNER), &status_uri(OWNER, "read-order", SHA_A)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["state"], "success",
+            "the highest-seq claim wins; ordering on created_at or on the row id \
+             would elect the stale pending claim"
+        );
+        assert_eq!(body["total_count"], 1);
+    }
+
+    /// Covers AE2. Two producers, two contexts, one success and one failure: the
+    /// combined state is failure and BOTH entries are present.
+    #[sqlx::test]
+    async fn ae2_two_producers_one_failure_reads_as_failure(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(OWNER, "read-ae2", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "read-ae2", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // A second producer, authorized by the same owner key.
+        seed_claim(
+            &pool,
+            "11111111-0000-0000-0000-000000000001",
+            &repo.id,
+            SHA_A,
+            STRANGER,
+            OWNER,
+            "ci/test",
+            "failure",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let resp = get_status(&state, Some(OWNER), &status_uri(OWNER, "read-ae2", SHA_A)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["state"], "failure");
+        assert_eq!(body["total_count"], 2);
+        let contexts: Vec<&str> = body["statuses"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["context"].as_str().unwrap())
+            .collect();
+        assert!(contexts.contains(&"ci/build"), "contexts: {contexts:?}");
+        assert!(contexts.contains(&"ci/test"), "contexts: {contexts:?}");
+    }
+
+    /// An error-state claim folds to the combined failure state (the error arm of
+    /// KTD-1, distinct from the failure arm the AE2 case covers).
+    #[sqlx::test]
+    async fn error_claim_folds_to_combined_failure(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "read-error", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        for (st, ctx) in [("success", "ci/build"), ("error", "ci/test")] {
+            let resp = post_as(
+                &state,
+                OWNER,
+                &uri(OWNER, "read-error", SHA_A),
+                body_of(st, ctx),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{st} claim");
+        }
+
+        let body = body_json(
+            get_status(&state, Some(OWNER), &status_uri(OWNER, "read-error", SHA_A)).await,
+        )
+        .await;
+        assert_eq!(
+            body["state"], "failure",
+            "an error claim must fold to failure, never to success or pending"
+        );
+    }
+
+    /// A pending claim alongside a success yields the combined pending state (the
+    /// middle arm of KTD-1).
+    #[sqlx::test]
+    async fn pending_alongside_success_reads_as_pending(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "read-pending", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        for (st, ctx) in [("success", "ci/build"), ("pending", "ci/test")] {
+            let resp = post_as(
+                &state,
+                OWNER,
+                &uri(OWNER, "read-pending", SHA_A),
+                body_of(st, ctx),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "{st} claim");
+        }
+
+        let body = body_json(
+            get_status(
+                &state,
+                Some(OWNER),
+                &status_uri(OWNER, "read-pending", SHA_A),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["state"], "pending");
+        assert_eq!(body["total_count"], 2);
+    }
+
+    /// Covers AE3. A commit nobody reported on is exactly 200 with the pending
+    /// zero-count body. The WHOLE body is asserted, not just the status: a client
+    /// that renders this must not be able to arrive at green through a missing
+    /// field, an empty object, or a success state with an empty array.
+    #[sqlx::test]
+    async fn ae3_commit_with_no_claims_is_pending_zero(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "read-ae3", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        let resp = get_status(&state, Some(OWNER), &status_uri(OWNER, "read-ae3", SHA_A)).await;
+        let (status, bytes) = status_and_bytes(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            format!(
+                r#"{{"state":"pending","sha":"{SHA_A}","total_count":0,"statuses":[],"reported_only":true}}"#
+            ),
+            "absence must serialize as the explicit pending zero-count body"
+        );
+    }
+
+    /// Covers AE4. An anonymous read of a PRIVATE repo that HAS a claim answers
+    /// byte for byte what the same caller gets for a repo that does not exist.
+    /// The claim is seeded first, so the deny cannot pass vacuously on an empty
+    /// projection.
+    #[sqlx::test]
+    async fn ae4_anon_private_repo_read_is_indistinguishable_from_missing(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let target = status_uri(OWNER, "read-ae4", SHA_A);
+
+        let missing = status_and_bytes(get_status(&state, None, &target).await).await;
+
+        let repo = seed_repo(OWNER, "read-ae4", false);
+        state.db.create_repo(&repo).await.unwrap();
+        seed_claim(
+            &pool,
+            "22222222-0000-0000-0000-000000000001",
+            &repo.id,
+            SHA_A,
+            OWNER,
+            OWNER,
+            "ci/build",
+            "success",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let denied = status_and_bytes(get_status(&state, None, &target).await).await;
+
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            denied, missing,
+            "a private-repo deny must be byte-identical to the missing-repo response"
+        );
+        assert!(
+            !String::from_utf8_lossy(&denied.1).contains("ci/build"),
+            "the deny must carry no trace of the claim"
+        );
+    }
+
+    /// The other half of the visibility pair: a PUBLIC repo's status is served to
+    /// an anonymous caller, so the gate above is a gate and not a blanket refusal.
+    #[sqlx::test]
+    async fn public_repo_status_served_to_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "read-public", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "read-public", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let resp = get_status(&state, None, &status_uri(OWNER, "read-public", SHA_A)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["state"], "success");
+        assert_eq!(body["statuses"][0]["context"], "ci/build");
+    }
+
+    /// KTD-2 regression: the projection is computed per read, so tightening
+    /// visibility AFTER a claim was written retroactively hides it. A write-time
+    /// gated derived index kept serving a repo made private afterwards
+    /// (docs/solutions/security-issues/write-time-visibility-gate-leaves-derived-index-stale.md);
+    /// this is that shape on the status surface.
+    #[sqlx::test]
+    async fn tightening_visibility_hides_existing_claims_from_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "read-tighten", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "read-tighten", SHA_A),
+            body_of("success", "ci/secret-build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let target = status_uri(OWNER, "read-tighten", SHA_A);
+        let served = get_status(&state, None, &target).await;
+        assert_eq!(
+            served.status(),
+            StatusCode::OK,
+            "the claim is anonymously readable while the repo is public"
+        );
+
+        // Tighten: a root rule with an empty reader list denies everyone but the
+        // owner, even though the repo row is still is_public.
+        state
+            .db
+            .set_visibility_rule(&repo.id, "/", crate::db::VisibilityMode::B, &[], OWNER)
+            .await
+            .unwrap();
+
+        let (status, bytes) = status_and_bytes(get_status(&state, None, &target).await).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a claim written while public must stop being served once visibility tightens"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("ci/secret-build"),
+            "the deny must carry no trace of the claim"
+        );
+    }
+
+    /// KTD-5: the projection filters on CURRENT authorization. After the repo
+    /// changes hands, the previous owner's claims drop out of the read, while the
+    /// append-only history keeps every row.
+    #[sqlx::test]
+    async fn claims_authorized_by_a_former_owner_leave_the_projection(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(OWNER, "read-transfer", true);
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "read-transfer", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        sqlx::query("UPDATE repos SET owner_did = $1 WHERE id = $2")
+            .bind(NEW_OWNER)
+            .bind(&repo_id)
+            .execute(&pool)
+            .await
+            .expect("transfer the repo");
+
+        let resp = get_status(
+            &state,
+            Some(NEW_OWNER),
+            &status_uri(NEW_OWNER, "read-transfer", SHA_A),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["state"], "pending",
+            "a claim the current owner never authorized must not decide the state"
+        );
+        assert_eq!(body["total_count"], 0);
+        assert!(body["statuses"].as_array().unwrap().is_empty());
+
+        assert_eq!(
+            state
+                .db
+                .list_status_claims(&repo_id, SHA_A)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the history row survives the transfer; only the projection drops it"
+        );
+    }
+
+    /// The current-authorization filter accepts the owner DID in either
+    /// representation, matching `did_matches`: a repo whose stored owner is the
+    /// BARE key still projects claims authorized under the full `did:key:` form.
+    #[sqlx::test]
+    async fn projection_matches_the_owner_in_either_did_form(pool: PgPool) {
+        let state = test_state(pool).await;
+        let bare = OWNER.strip_prefix("did:key:").unwrap();
+        let repo = seed_repo(bare, "read-didform", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "read-didform", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = body_json(
+            get_status(
+                &state,
+                Some(OWNER),
+                &status_uri(OWNER, "read-didform", SHA_A),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(body["state"], "success");
+        assert_eq!(body["total_count"], 1);
+    }
+
+    /// The lookup-failure path. With the claims table gone, the read is exactly
+    /// 500 carrying the stable `db_error` code — never a 200, and never an empty
+    /// statuses array. The message is the sqlx text and is not asserted; a
+    /// connectivity failure would take the separate 503 arm instead.
+    #[sqlx::test]
+    async fn claim_lookup_failure_is_500_never_empty_success(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(OWNER, "read-dberr", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "read-dberr", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        sqlx::query("DROP TABLE status_claims")
+            .execute(&pool)
+            .await
+            .expect("drop the claims table");
+
+        let resp = get_status(&state, Some(OWNER), &status_uri(OWNER, "read-dberr", SHA_A)).await;
+        let (status, bytes) = status_and_bytes(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed projection query must not render as a served status"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "db_error");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("statuses"),
+            "an error must not carry an empty statuses array: {text}"
+        );
+    }
+
+    /// The read route is registered on the production router AND its group kept
+    /// the `optional_signature` layer. A path axum never learned about answers
+    /// 404 for the anonymous case; a group missing the layer would ignore the
+    /// signature headers in the second case and serve 200 instead of 401.
+    #[sqlx::test]
+    async fn read_route_is_registered_with_optional_signature(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "read-wired", true);
+        state.db.create_repo(&repo).await.unwrap();
+        let target = status_uri(OWNER, "read-wired", SHA_A);
+
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(&target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the read route must exist on the production router and serve a public repo to anon"
+        );
+
+        let resp = crate::server::build_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(Method::GET)
+                    .uri(&target)
+                    .header("signature", "sig1=:bm90YXNpZw==:")
+                    .header("signature-input", "sig1=(\"@method\");alg=\"ed25519\"")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, bytes) = status_and_bytes(resp).await;
+        // A presented signature is verified, and this one is unusable (no keyid,
+        // required components missing), so the signature layer refuses it. Only
+        // the layer can produce this: the same request against a group without it
+        // is treated as anonymous and served 200 by the handler above.
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a presented signature must be verified, which only happens if the \
+             read group still carries optional_signature"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["error"], "invalid_signature",
+            "the refusal must come from the signature layer, not the handler"
+        );
+    }
+
+    /// The set the projection filters on reproduces `did_matches` exactly, in both
+    /// directions and across the cross-method cases: the filter has to live inside
+    /// the query, so it cannot call the helper itself.
+    #[test]
+    fn authorizing_variants_agree_with_did_matches() {
+        let cases = [
+            ("did:key:zABC", "did:key:zABC"),
+            ("did:key:zABC", "zABC"),
+            ("zABC", "did:key:zABC"),
+            ("zABC", "zABC"),
+            ("did:key:zABC", "did:key:zXYZ"),
+            ("did:key:zABC", "did:gitlawb:zABC"),
+            ("did:gitlawb:zABC", "did:key:zABC"),
+            ("did:web:example.com", "did:web:example.com"),
+            ("did:web:example.com", "example.com"),
+            ("", ""),
+        ];
+        for (owner, candidate) in cases {
+            let in_set = super::authorizing_did_variants(owner)
+                .iter()
+                .any(|v| v == candidate);
+            assert_eq!(
+                in_set,
+                crate::api::did_matches(candidate, owner),
+                "variant set for owner {owner:?} disagrees with did_matches on {candidate:?}"
+            );
+        }
     }
 
     /// `n` claims on one (repo, commit, producer, context) tuple, inserted in one

@@ -2246,6 +2246,45 @@ impl Db {
         .await?;
         Ok(rows.into_iter().map(row_to_status_claim).collect())
     }
+
+    /// The projection behind the commit-status read (KTD-2): the latest claim per
+    /// (producer, context) for one commit, restricted to claims whose authorizing
+    /// DID is in `authorizing_dids`.
+    ///
+    /// Computed on every read and never materialized, so a repo whose visibility
+    /// or ownership changes after a claim was written is answered from current
+    /// state with no reconciliation job. "Latest" is the highest `seq` (KTD-3):
+    /// the timestamp is producer-visible display data and the id is a random
+    /// uuid, so neither orders the history.
+    ///
+    /// The authorization filter is a set-membership test evaluated inside the
+    /// query rather than a per-claim check in Rust, which is the constraint the
+    /// delegated-capability follow-on inherits: it may widen the set, never move
+    /// the test into the read loop.
+    pub async fn latest_status_claims(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+        authorizing_dids: &[String],
+    ) -> Result<Vec<StatusClaim>> {
+        let rows = sqlx::query(
+            "SELECT * FROM (
+                 SELECT DISTINCT ON (producer_did, context)
+                        id,seq,repo_id,commit_sha,state,context,target_url,description,
+                        producer_did,authorizing_did,signature,signature_input,
+                        signed_payload,created_at
+                 FROM status_claims
+                 WHERE repo_id=$1 AND commit_sha=$2 AND authorizing_did = ANY($3)
+                 ORDER BY producer_did, context, seq DESC
+             ) latest ORDER BY seq ASC",
+        )
+        .bind(repo_id)
+        .bind(commit_sha)
+        .bind(authorizing_dids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_status_claim).collect())
+    }
 }
 
 // ── Webhooks ──────────────────────────────────────────────────────────────────
