@@ -13,6 +13,18 @@ use crate::state::AppState;
 /// shared collector's clamp and the per-handler request caps so they can't drift.
 const MAX_VISIBLE_REF_UPDATES: i64 = 200;
 
+/// Documented maximum page size of the repo-scoped push-event poll surface, and
+/// the value an over-large `limit` is clamped to. Named separately from the
+/// ref-update ceiling above because it bounds a different feed with a different
+/// gate; they happen to agree on a number today.
+const MAX_PUSH_EVENT_PAGE: i64 = 200;
+
+/// Smallest page the poll surface will serve. Not zero, and that is the point: a
+/// zero-row page reads to a cursor-persisting poller exactly like "you have
+/// reached the end", so combined with a cursor it could not carry forward it
+/// silently sent the poller back to the beginning of history.
+const MIN_PUSH_EVENT_PAGE: i64 = 1;
+
 /// Collect up to `limit` ref-update rows visible to `caller`, newest first,
 /// paging past rows the feed gate drops. Filtering after a plain SQL `LIMIT`
 /// under-serves an anonymous caller whenever the newest rows name private local
@@ -327,17 +339,45 @@ pub async fn list_repo_events(
     ))
 }
 
-/// GET /api/v1/repos/{owner}/{repo}/push-events?since=&since_id=&limit=
+/// A caller-supplied `cursor` value, or a 400.
+///
+/// The only legal cursor is one this surface issued: a non-negative sequence
+/// number. Anything else is refused rather than reinterpreted, because both
+/// silent readings are wrong in a way the poller cannot see. Reading it as "no
+/// cursor" replays the repo's whole history to a client that believed it was up
+/// to date; reading it as "the end" hides every event after it.
+fn parse_push_cursor(raw: &str) -> Result<i64> {
+    match raw.parse::<i64>() {
+        Ok(v) if v >= 0 => Ok(v),
+        _ => Err(crate::error::AppError::BadRequest(
+            "cursor must be a non-negative integer issued by this endpoint as \
+             `next_cursor`"
+                .into(),
+        )),
+    }
+}
+
+/// GET /api/v1/repos/{owner}/{repo}/push-events?cursor=&limit=
 ///
 /// The catch-up half of push notification. A subscriber whose webhook delivery
 /// failed polls this with the cursor it last saw and gets every push since,
 /// oldest first, so a missed delivery costs a poll rather than needing retry
 /// machinery on the send side.
 ///
-/// The cursor is the `(created_at, id)` pair the previous page returned as
-/// `next_since` / `next_since_id`, and rows are read strictly after it. Passing
-/// `since` alone (no `since_id`) is the first-poll form: an empty id sorts below
-/// every real one, so the page starts at the first row of that timestamp.
+/// The cursor is the `next_cursor` the previous page returned, a
+/// database-assigned sequence number, and rows are read strictly after it. It is
+/// one value rather than a timestamp pair because the timestamp is stamped by
+/// the application before the insert and cannot order these rows (see
+/// [`crate::db::Db::list_repo_push_events_keyset`]). Omitting it starts at the
+/// beginning of the repo's history.
+///
+/// `next_cursor` is always present, never null, and never lower than the cursor
+/// the request carried: an empty page hands back the position the caller already
+/// had. A poller that persists it therefore stays where it is when there is
+/// nothing new, instead of restarting from the beginning.
+///
+/// `limit` is clamped to [`MIN_PUSH_EVENT_PAGE`]..=[`MAX_PUSH_EVENT_PAGE`]. A
+/// value that does not parse falls back to the default page size.
 ///
 /// Rows come from `repo_push_events`, which only this node's own pushes write.
 /// The gossip-sourced `received_ref_updates` rows are a different data class on
@@ -351,9 +391,8 @@ pub async fn list_repo_push_events(
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<i64>().ok())
-        .map(|v| v.max(0))
         .unwrap_or(50)
-        .clamp(0, MAX_VISIBLE_REF_UPDATES);
+        .clamp(MIN_PUSH_EVENT_PAGE, MAX_PUSH_EVENT_PAGE);
 
     // Repo-root read gate on the requested path, before any event row is
     // touched: a caller who cannot read the repo gets the repo's own not-found,
@@ -365,13 +404,17 @@ pub async fn list_repo_push_events(
     let (record, _rules) =
         crate::api::authorize_repo_read(&state, &owner, &repo_name, caller, "/").await?;
 
-    let since = params.get("since").map(String::as_str);
-    let since_id = params.get("since_id").map(String::as_str).unwrap_or("");
-    let after = since.map(|ts| (ts, since_id));
+    // Cursor validation runs AFTER the gate on purpose: a caller who may not read
+    // this repo gets the not-found for every request shape, so a 400 can never
+    // become the tell that distinguishes a private repo from a missing one.
+    let cursor = match params.get("cursor") {
+        Some(raw) => Some(parse_push_cursor(raw)?),
+        None => None,
+    };
 
     let rows = state
         .db
-        .list_repo_push_events_keyset(&record.id, after, limit)
+        .list_repo_push_events_keyset(&record.id, cursor, limit)
         .await?;
 
     let events: Vec<serde_json::Value> = rows
@@ -385,13 +428,14 @@ pub async fn list_repo_push_events(
             })
         })
         .collect();
-    let next = rows.last().map(|e| (e.created_at.clone(), e.id.clone()));
+    // Never null and never backwards: an empty page returns the cursor the caller
+    // arrived with (or the start of history, if it arrived with none).
+    let next = rows.last().map_or(cursor.unwrap_or(0), |e| e.seq);
     let count = events.len();
     Ok(Json(serde_json::json!({
         "events": events,
         "count": count,
-        "next_since": next.as_ref().map(|(ts, _)| ts.clone()),
-        "next_since_id": next.as_ref().map(|(_, id)| id.clone()),
+        "next_cursor": next,
     })))
 }
 
@@ -1573,6 +1617,8 @@ mod push_events_tests {
     use sqlx::PgPool;
     use tower::ServiceExt;
 
+    use super::MAX_PUSH_EVENT_PAGE;
+
     const OWNER: &str = "did:key:z6MkOwner";
     const SHA_A: &str = "1111111111111111111111111111111111111111";
     const SHA_B: &str = "2222222222222222222222222222222222222222";
@@ -1669,6 +1715,32 @@ mod push_events_tests {
             .collect()
     }
 
+    /// Walk the whole poll surface one row at a time, following the cursor the
+    /// surface itself hands back, and return the event ids in the order served.
+    /// `max_steps` bounds the walk, so a cursor that fails to advance fails the
+    /// test instead of hanging it.
+    async fn walk_cursor(
+        state: &crate::state::AppState,
+        name: &str,
+        max_steps: usize,
+    ) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        let mut query = "limit=1".to_string();
+        for _ in 0..max_steps {
+            let body = body_json(poll(state, Some(OWNER), &poll_uri(name, &query)).await).await;
+            let rows = event_rows(&body);
+            if rows.is_empty() {
+                return ids;
+            }
+            ids.extend(rows.into_iter().map(|r| r.0));
+            query = format!(
+                "limit=1&cursor={}",
+                body["next_cursor"].as_i64().expect("next_cursor"),
+            );
+        }
+        panic!("the cursor walk did not terminate within {max_steps} steps: {ids:?}");
+    }
+
     /// Seed one push-event row directly, for the read-side scenarios that are
     /// about paging and gating rather than about the producer.
     async fn seed_event(
@@ -1683,6 +1755,8 @@ mod push_events_tests {
             .db
             .insert_repo_push_event(&RepoPushEvent {
                 id: id.into(),
+                // Ignored on insert; the database assigns the ordering key.
+                seq: 0,
                 repo_id: repo_id.into(),
                 ref_name: ref_name.into(),
                 after_sha: sha.into(),
@@ -1734,9 +1808,9 @@ mod push_events_tests {
             .await
             .unwrap();
 
-        // The cursor a subscriber last polled at, taken before the push, in the
-        // same canonical form the surface hands back.
-        let before = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        // The cursor a subscriber last polled at. The repo has never been pushed
+        // to, so that cursor is the start of history.
+        let before = 0;
 
         // The push happens. The webhook fires into the void.
         crate::api::repos::record_push_events(
@@ -1769,7 +1843,7 @@ mod push_events_tests {
             poll(
                 &state,
                 Some(OWNER),
-                &poll_uri("widget", &format!("since={before}")),
+                &poll_uri("widget", &format!("cursor={before}")),
             )
             .await,
         )
@@ -1786,18 +1860,16 @@ mod push_events_tests {
     }
 
     /// Two ref updates in one push share a timestamp by construction, which is
-    /// the case a timestamp-only cursor cannot page: it either repeats a row or
-    /// drops one. The collision is produced deterministically by pushing two refs
-    /// at once (the producer stamps one timestamp for the whole push), not raced
-    /// for. With a page size of one, the id tiebreak must walk both rows exactly
-    /// once and then terminate.
+    /// the case a timestamp-based cursor cannot page: it either repeats a row or
+    /// drops one at the boundary. The collision is produced deterministically by
+    /// pushing two refs at once (the producer stamps one timestamp for the whole
+    /// push), not raced for. With a page size of one, the walk must return both
+    /// rows exactly once and then terminate.
     ///
     /// The cursor is fed back verbatim into the query string, so this also pins
-    /// that the emitted cursor survives that round trip. It did not at first: a
-    /// `+00:00` offset decodes to a space in a query string, and the walk sat on
-    /// the same row forever.
+    /// that the emitted cursor survives that round trip.
     #[sqlx::test]
-    async fn colliding_timestamps_page_once_each_with_the_id_tiebreak(pool: PgPool) {
+    async fn colliding_timestamps_page_once_each(pool: PgPool) {
         let state = test_state(pool).await;
         state
             .db
@@ -1845,21 +1917,9 @@ mod push_events_tests {
             "page size of one must return one row, got {first}"
         );
 
-        let next_since = first["next_since"]
-            .as_str()
-            .expect("next_since")
-            .to_string();
-        assert!(
-            !next_since.contains('+'),
-            "the cursor is echoed into a query string, where `+` means a space; \
-             emitting one makes a naive poller re-read the same page forever, got \
-             {next_since}"
-        );
+        let next_cursor = first["next_cursor"].as_i64().expect("next_cursor");
 
-        let cursor = format!(
-            "since={next_since}&since_id={}&limit=1",
-            first["next_since_id"].as_str().expect("next_since_id"),
-        );
+        let cursor = format!("cursor={next_cursor}&limit=1");
         let second = body_json(poll(&state, Some(OWNER), &poll_uri("widget", &cursor)).await).await;
         let page2 = event_rows(&second);
         assert_eq!(
@@ -1870,7 +1930,7 @@ mod push_events_tests {
 
         assert_ne!(
             page1[0].0, page2[0].0,
-            "the id tiebreak must advance past the first row, not repeat it"
+            "the cursor must advance past the first row, not repeat it"
         );
         let mut refs = vec![page1[0].1.clone(), page2[0].1.clone()];
         refs.sort();
@@ -1884,14 +1944,202 @@ mod push_events_tests {
         );
 
         let cursor2 = format!(
-            "since={}&since_id={}&limit=1",
-            second["next_since"].as_str().expect("next_since"),
-            second["next_since_id"].as_str().expect("next_since_id"),
+            "cursor={}&limit=1",
+            second["next_cursor"].as_i64().expect("next_cursor"),
         );
         let third = body_json(poll(&state, Some(OWNER), &poll_uri("widget", &cursor2)).await).await;
         assert!(
             event_rows(&third).is_empty(),
             "the walk must terminate rather than repeat a row, got {third}"
+        );
+    }
+
+    /// The cursor must order on insertion, not on the wall clock. `created_at` is
+    /// stamped by the application before the insert, so a row stamped later can
+    /// commit earlier, and an NTP step backwards makes that ordinary rather than
+    /// a race. A poller that has already advanced past the later stamp then never
+    /// sees the earlier-stamped row at all.
+    ///
+    /// The disagreement is constructed rather than raced for: the first row
+    /// written carries the LATER timestamp. A walk must still return both rows
+    /// exactly once, in the order they were inserted.
+    #[sqlx::test]
+    async fn the_cursor_walk_follows_insertion_order_not_the_wall_clock(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-clock", "widget", true))
+            .await
+            .unwrap();
+
+        seed_event(
+            &state,
+            "evt-first",
+            "r-clock",
+            "refs/heads/one",
+            SHA_A,
+            "2026-08-07T13:00:00.000000Z",
+        )
+        .await;
+        seed_event(
+            &state,
+            "evt-second",
+            "r-clock",
+            "refs/heads/two",
+            SHA_B,
+            "2026-08-07T12:00:00.000000Z",
+        )
+        .await;
+
+        let walked = walk_cursor(&state, "widget", 6).await;
+        assert_eq!(
+            walked,
+            vec!["evt-first".to_string(), "evt-second".to_string()],
+            "the walk must return every row exactly once in insertion order; \
+             ordering on the application-stamped clock reverses these two and \
+             strands the second behind a cursor that has already passed it"
+        );
+    }
+
+    /// Seed two events and hand back the repo name plus the cursor that sits
+    /// between them, for the degenerate-input cases below.
+    async fn two_event_repo(state: &crate::state::AppState) -> i64 {
+        state
+            .db
+            .create_repo(&repo("r-bad", "widget", true))
+            .await
+            .unwrap();
+        seed_event(
+            state,
+            "evt-1",
+            "r-bad",
+            "refs/heads/one",
+            SHA_A,
+            "2026-08-07T12:00:00.000000Z",
+        )
+        .await;
+        seed_event(
+            state,
+            "evt-2",
+            "r-bad",
+            "refs/heads/two",
+            SHA_B,
+            "2026-08-07T12:00:01.000000Z",
+        )
+        .await;
+
+        let first = body_json(poll(state, Some(OWNER), &poll_uri("widget", "limit=1")).await).await;
+        first["next_cursor"].as_i64().expect("next_cursor")
+    }
+
+    /// A cursor the surface could not have issued is a client bug, and the only
+    /// safe answer is to say so. Silently treating it as "no cursor" replays the
+    /// repo's whole history to a poller that believed it was up to date, and
+    /// silently treating it as "the end" hides every event after it.
+    #[sqlx::test]
+    async fn a_malformed_cursor_is_rejected_with_a_400(pool: PgPool) {
+        let state = test_state(pool).await;
+        let mid = two_event_repo(&state).await;
+
+        for bad in [
+            "notanumber",
+            "",
+            "-1",
+            "1.5",
+            "99999999999999999999999999",
+            // Percent-encoded leading space: a valid URI that decodes to " 1".
+            "%201",
+        ] {
+            let resp = poll(
+                &state,
+                Some(OWNER),
+                &poll_uri("widget", &format!("cursor={bad}")),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "cursor={bad:?} must be refused, not reinterpreted"
+            );
+            let body = body_json(resp).await;
+            assert_eq!(
+                body["error"], "bad_request",
+                "the refusal needs a stable code a client can branch on, got {body}"
+            );
+        }
+
+        // The control: a cursor the surface actually issued still works, so the
+        // rejection above is validation and not a blanket refusal.
+        let ok = poll(
+            &state,
+            Some(OWNER),
+            &poll_uri("widget", &format!("cursor={mid}")),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(event_rows(&body_json(ok).await).len(), 1);
+    }
+
+    /// `limit=0` used to return an empty page carrying no cursor, which reads to
+    /// a cursor-persisting poller exactly like "you are at the end" while also
+    /// wiping the position it had, so the next poll started from the beginning
+    /// of history. A limit below one is clamped up instead: the page makes
+    /// progress, and the cursor it returns moves forward.
+    #[sqlx::test]
+    async fn a_zero_limit_makes_progress_instead_of_rewinding(pool: PgPool) {
+        let state = test_state(pool).await;
+        let mid = two_event_repo(&state).await;
+
+        let body = body_json(
+            poll(
+                &state,
+                Some(OWNER),
+                &poll_uri("widget", &format!("cursor={mid}&limit=0")),
+            )
+            .await,
+        )
+        .await;
+        let next = body["next_cursor"].as_i64().expect("next_cursor");
+        assert!(
+            next >= mid,
+            "a cursor must never move backwards; asked from {mid}, got {next} in {body}"
+        );
+        assert_eq!(
+            event_rows(&body).len(),
+            1,
+            "a limit below one is clamped to one row, not to an empty page, got {body}"
+        );
+    }
+
+    /// The upper clamp, from the other side: a caller asking for more than the
+    /// surface serves gets the documented maximum rather than an unbounded scan.
+    #[sqlx::test]
+    async fn an_oversized_limit_is_clamped_to_the_documented_maximum(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-big", "widget", true))
+            .await
+            .unwrap();
+        for i in 0..(MAX_PUSH_EVENT_PAGE + 5) {
+            seed_event(
+                &state,
+                &format!("evt-{i}"),
+                "r-big",
+                "refs/heads/main",
+                SHA_A,
+                "2026-08-07T12:00:00.000000Z",
+            )
+            .await;
+        }
+
+        let body =
+            body_json(poll(&state, Some(OWNER), &poll_uri("widget", "limit=100000")).await).await;
+        assert_eq!(
+            event_rows(&body).len() as i64,
+            MAX_PUSH_EVENT_PAGE,
+            "an oversized limit must be clamped, got {}",
+            event_rows(&body).len()
         );
     }
 
@@ -1916,12 +2164,7 @@ mod push_events_tests {
         )
         .await;
 
-        let resp = poll(
-            &state,
-            Some(OWNER),
-            &poll_uri("widget", "since=2026-08-07T13:00:00.000000Z"),
-        )
-        .await;
+        let resp = poll(&state, Some(OWNER), &poll_uri("widget", "cursor=999999")).await;
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -1933,9 +2176,26 @@ mod push_events_tests {
             "expected an empty page, got {body}"
         );
         assert_eq!(body["count"].as_u64(), Some(0));
-        assert!(
-            body["next_since"].is_null() && body["next_since_id"].is_null(),
-            "an empty page must not invent a cursor, got {body}"
+        assert_eq!(
+            body["next_cursor"].as_i64(),
+            Some(999_999),
+            "an empty page must hand back the cursor it was given; a null (or a \
+             lower value) tells a poller that persists it to start over from the \
+             beginning of history, got {body}"
+        );
+
+        // And the same on a repo with no events at all, where there is no row to
+        // derive a cursor from: the start of history is not a rewind.
+        state
+            .db
+            .create_repo(&repo("r-empty", "quiet", true))
+            .await
+            .unwrap();
+        let empty = body_json(poll(&state, Some(OWNER), &poll_uri("quiet", "")).await).await;
+        assert_eq!(
+            empty["next_cursor"].as_i64(),
+            Some(0),
+            "a first poll of a repo with no events starts at zero, got {empty}"
         );
     }
 

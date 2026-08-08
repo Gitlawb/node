@@ -173,7 +173,7 @@ mod authz_guard {
         let events = include_str!("events.rs");
         let tasks = include_str!("tasks.rs");
         let stars = include_str!("stars.rs");
-        let status = include_str!("status.rs");
+        let status = include_str!("status/mod.rs");
         let protect = include_str!("protect.rs");
         let visibility = include_str!("visibility.rs");
         let profiles = include_str!("profiles.rs");
@@ -509,7 +509,7 @@ mod authz_guard {
             (include_str!("replicas.rs"), "replicas.rs"),
             (include_str!("repos.rs"), "repos.rs"),
             (include_str!("stars.rs"), "stars.rs"),
-            (include_str!("status.rs"), "status.rs"),
+            (include_str!("status/mod.rs"), "status/mod.rs"),
             (include_str!("visibility.rs"), "visibility.rs"),
             (include_str!("webhooks.rs"), "webhooks.rs"),
         ];

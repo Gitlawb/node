@@ -202,11 +202,17 @@ pub struct Webhook {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoPushEvent {
     pub id: String,
+    /// Database-assigned ordering key, and the poll cursor itself. Ignored on
+    /// insert (see [`Db::insert_repo_push_events`]): nothing the writer supplies
+    /// can order these rows, because `created_at` is stamped before the insert
+    /// and a row stamped later can commit earlier.
+    pub seq: i64,
     pub repo_id: String,
     pub ref_name: String,
     /// The SHA the ref points at after the push. A deletion is never recorded,
     /// so this is always a real commit at the time it was written.
     pub after_sha: String,
+    /// Display data only. Never an ordering key; see `seq`.
     pub created_at: String,
 }
 
@@ -1045,20 +1051,64 @@ const MIGRATIONS: &[Migration] = &[
             // already defines for agent trust scoring on a different shape
             // (agent_did, commit_hash, object_count, pushed_at); reusing that
             // name would have been a silent no-op under IF NOT EXISTS.
+            // `seq` is a bigserial for the same reason `status_claims.seq` is: the
+            // poll cursor's ordering key must be assigned by the database. The
+            // application stamps `created_at` BEFORE the insert, so a row stamped
+            // later can commit earlier and a poller that has advanced past the
+            // later stamp never sees it, and an NTP step backwards makes that
+            // ordinary rather than a race. `created_at` stays as display data.
             r#"CREATE TABLE IF NOT EXISTS repo_push_events (
                 id         TEXT NOT NULL PRIMARY KEY,
+                seq        BIGSERIAL NOT NULL,
                 repo_id    TEXT NOT NULL,
                 ref_name   TEXT NOT NULL,
                 after_sha  TEXT NOT NULL,
                 created_at TEXT NOT NULL
             )"#,
-            // Keyset paging cursor: (created_at, id) ascending within a repo, so
-            // a poller with a since-cursor pages forward with an id tiebreak
-            // when two pushes share a timestamp.
-            "CREATE INDEX IF NOT EXISTS idx_repo_push_events_cursor ON repo_push_events(repo_id, created_at, id)",
+            // Keyset paging cursor: `seq` ascending within a repo. One column, so
+            // no tiebreak is needed: the sequence is unique by construction, and
+            // every row of one multi-ref push gets its own value even though they
+            // share a timestamp.
+            "CREATE INDEX IF NOT EXISTS idx_repo_push_events_cursor ON repo_push_events(repo_id, seq)",
+            // The pull request rollup's branch resolve: newest row for one ref,
+            // ordered on the same database-assigned key as the cursor.
+            "CREATE INDEX IF NOT EXISTS idx_repo_push_events_ref ON repo_push_events(repo_id, ref_name, seq DESC)",
         ],
     },
 ];
+
+// ── Push-path statement accounting ────────────────────────────────────────────
+
+// Count of database statements the receive-pack write path has executed, so a
+// test can assert on the WORK a push does and not only on the rows it leaves.
+// Those two come apart exactly where it matters: a loop issuing one round trip
+// per ref and a single multi-row statement produce byte-identical rows, and only
+// the first multiplies latency on the user's `git push`.
+//
+// Thread-local, not a process-global atomic: `#[sqlx::test]` gives each test its
+// own database but the whole suite shares one process, and other modules' tests
+// write push events too. A shared counter would need every one of them to take a
+// mutex, and the tests that forgot would show up as an inflated count in an
+// unrelated test. A thread-local is isolated by construction.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PUSH_WRITE_STATEMENTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Record one statement against the push-path counter. Compiles away entirely
+/// outside tests.
+#[inline]
+fn count_push_write_statement() {
+    #[cfg(test)]
+    PUSH_WRITE_STATEMENTS.with(|c| c.set(c.get() + 1));
+}
+
+/// Zero the counter and return what it held, so a test can measure one call.
+#[cfg(test)]
+pub(crate) fn take_push_write_statements() -> usize {
+    PUSH_WRITE_STATEMENTS.with(|c| c.replace(0))
+}
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
@@ -2030,21 +2080,73 @@ impl Db {
     /// stored head, so the recorded target stays the commit the decision was
     /// actually made against. `branch` is a bare name — callers on the push
     /// path see full refs and must strip `refs/heads/` first.
+    ///
+    /// Test-only since the push path started batching: production has exactly one
+    /// caller and it always has a whole push's worth of branches to write, so the
+    /// single-branch form exists to keep the many tests that seed one head
+    /// readable. Compiling it only under `cfg(test)` is what keeps that fact from
+    /// decaying into an unused production API.
+    #[cfg(test)]
     pub async fn set_open_pr_heads(
         &self,
         repo_id: &str,
         branch: &str,
         new_sha: &str,
     ) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE pull_requests SET head_commit=$1
-             WHERE repo_id=$2 AND source_branch=$3 AND status='open'",
-        )
-        .bind(new_sha)
-        .bind(repo_id)
-        .bind(branch)
-        .execute(&self.pool)
-        .await?;
+        self.set_open_pr_heads_batch(repo_id, &[(branch.to_string(), new_sha.to_string())])
+            .await
+    }
+
+    /// The same update for several branches of one repo, in a single statement.
+    ///
+    /// This is the shape the receive-pack path needs: one push carries many ref
+    /// updates, and issuing one round trip per ref put that latency directly on
+    /// the user's `git push` response. The per-branch new head rides along as a
+    /// `VALUES` list joined against the table, so the cost is one statement
+    /// regardless of how many branches moved. The casts on the first row are what
+    /// give Postgres the column types it cannot infer from parameters alone.
+    ///
+    /// Callers must bound the list (see `api::repos::MAX_PUSH_FAN_OUT`): every
+    /// pair costs two bind parameters, against a protocol ceiling of 65535.
+    ///
+    /// Same predicates as the single-branch form, and for the same reason:
+    /// `status='open'` is the freeze that keeps a decided pull request's head
+    /// from moving under a later push.
+    pub async fn set_open_pr_heads_batch(
+        &self,
+        repo_id: &str,
+        updates: &[(String, String)],
+    ) -> Result<u64> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        // $1 is the repo; each pair takes the next two positions.
+        let mut values = String::new();
+        for i in 0..updates.len() {
+            if i > 0 {
+                values.push(',');
+            }
+            let base = 2 + i * 2;
+            if i == 0 {
+                values.push_str(&format!("(${}::text, ${}::text)", base, base + 1));
+            } else {
+                values.push_str(&format!("(${}, ${})", base, base + 1));
+            }
+        }
+        let sql = format!(
+            "UPDATE pull_requests SET head_commit = v.sha
+             FROM (VALUES {values}) AS v(branch, sha)
+             WHERE pull_requests.repo_id = $1
+               AND pull_requests.source_branch = v.branch
+               AND pull_requests.status = 'open'"
+        );
+
+        let mut q = sqlx::query(&sql).bind(repo_id);
+        for (branch, sha) in updates {
+            q = q.bind(branch).bind(sha);
+        }
+        count_push_write_statement();
+        let result = q.execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
 
@@ -2929,19 +3031,64 @@ impl Db {
 
 impl Db {
     /// Record one local push event. Idempotent on the row id.
+    ///
+    /// Test-only, for the same reason as [`Db::set_open_pr_heads`]: the push path
+    /// writes a whole push in one statement, and this single-row form survives
+    /// only to keep row-seeding tests readable.
+    #[cfg(test)]
     pub async fn insert_repo_push_event(&self, event: &RepoPushEvent) -> Result<()> {
-        sqlx::query(
+        self.insert_repo_push_events(std::slice::from_ref(event))
+            .await
+    }
+
+    /// Record a whole push's events in one statement. Idempotent on the row ids.
+    ///
+    /// One multi-row insert rather than one round trip per ref: the receive-pack
+    /// path runs this inline on the user's `git push`, so a sequential loop makes
+    /// the push response pay a database round trip for every ref it carries.
+    ///
+    /// `seq` is not bound. It is a bigserial the database assigns in insert
+    /// order, which is exactly why the poll cursor can trust it; a value supplied
+    /// here would defeat that.
+    ///
+    /// Callers must bound the slice (see `api::repos::MAX_PUSH_FAN_OUT`): every
+    /// row costs five bind parameters, against a protocol ceiling of 65535.
+    pub async fn insert_repo_push_events(&self, events: &[RepoPushEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut values = String::new();
+        for i in 0..events.len() {
+            if i > 0 {
+                values.push(',');
+            }
+            let b = i * 5;
+            values.push_str(&format!(
+                "(${},${},${},${},${})",
+                b + 1,
+                b + 2,
+                b + 3,
+                b + 4,
+                b + 5
+            ));
+        }
+        let sql = format!(
             "INSERT INTO repo_push_events (id, repo_id, ref_name, after_sha, created_at)
-             VALUES ($1,$2,$3,$4,$5)
-             ON CONFLICT(id) DO NOTHING",
-        )
-        .bind(&event.id)
-        .bind(&event.repo_id)
-        .bind(&event.ref_name)
-        .bind(&event.after_sha)
-        .bind(&event.created_at)
-        .execute(&self.pool)
-        .await?;
+             VALUES {values}
+             ON CONFLICT(id) DO NOTHING"
+        );
+
+        let mut q = sqlx::query(&sql);
+        for e in events {
+            q = q
+                .bind(&e.id)
+                .bind(&e.repo_id)
+                .bind(&e.ref_name)
+                .bind(&e.after_sha)
+                .bind(&e.created_at);
+        }
+        count_push_write_statement();
+        q.execute(&self.pool).await?;
         Ok(())
     }
 
@@ -2956,10 +3103,11 @@ impl Db {
     /// which left the resolve permanently unable to answer.
     ///
     /// Both the ref filter and the ordering are the database's work: the caller
-    /// gets one row, not the repo's whole push history to scan. Ordering on
-    /// `(created_at, id)` rather than the timestamp alone matches the
-    /// `(repo_id, created_at, id)` index and is what makes "most recent" total —
-    /// one multi-ref push stamps every one of its rows with the same timestamp.
+    /// gets one row, not the repo's whole push history to scan. "Most recent" is
+    /// the highest `seq`, not the latest `created_at`: the timestamp is stamped
+    /// before the insert, so the last row written is not necessarily the one
+    /// carrying the largest stamp, and every row of one multi-ref push shares a
+    /// stamp anyway. `(repo_id, ref_name, seq DESC)` is the index this rides.
     pub async fn latest_push_sha_for_ref(
         &self,
         repo_id: &str,
@@ -2968,7 +3116,7 @@ impl Db {
         let row = sqlx::query(
             "SELECT after_sha FROM repo_push_events
              WHERE repo_id = $1 AND ref_name = $2
-             ORDER BY created_at DESC, id DESC LIMIT 1",
+             ORDER BY seq DESC LIMIT 1",
         )
         .bind(repo_id)
         .bind(ref_name)
@@ -2977,16 +3125,18 @@ impl Db {
         Ok(row.map(|r| r.get("after_sha")))
     }
 
-    /// One page of a repo's push events, OLDEST first, walked by a `(created_at,
-    /// id)` keyset cursor rather than an offset.
+    /// One page of a repo's push events, OLDEST first, walked by a `seq` keyset
+    /// cursor rather than an offset.
     ///
     /// `after` is the cursor a poller last saw; the page reads rows strictly
-    /// after it via the row-value predicate `(created_at, id) > (after_ts,
-    /// after_id)`, which matches the `ORDER BY` exactly. The id half is not
-    /// decoration: one multi-ref push stamps every one of its rows with the same
-    /// timestamp, so a timestamp-only cursor either repeats a row or drops one at
-    /// every page boundary that lands inside such a push. `(repo_id, created_at,
-    /// id)` is the index this predicate rides.
+    /// after it via `seq > after`, which matches the `ORDER BY` exactly. One
+    /// column is enough because `seq` is a database-assigned bigserial: it is
+    /// unique, so there is no tiebreak to get wrong, and it is assigned at insert
+    /// time rather than by the application, so it cannot disagree with the order
+    /// the rows actually became visible. `created_at` cannot do this job: it is
+    /// stamped before the insert, every row of one multi-ref push carries the
+    /// same value, and a clock that steps backwards makes a later row sort
+    /// earlier, stranding it behind a cursor that has already passed.
     ///
     /// Oldest-first is what makes the cursor stable under concurrent writes: a
     /// push landing mid-walk sorts after the window being paged, so it cannot
@@ -2994,24 +3144,24 @@ impl Db {
     pub async fn list_repo_push_events_keyset(
         &self,
         repo_id: &str,
-        after: Option<(&str, &str)>,
+        after: Option<i64>,
         limit: i64,
     ) -> Result<Vec<RepoPushEvent>> {
-        const COLS: &str = "id, repo_id, ref_name, after_sha, created_at";
+        const COLS: &str = "id, seq, repo_id, ref_name, after_sha, created_at";
 
-        // Positional params in bind order: repo_id, after_ts?, after_id?, limit.
+        // Positional params in bind order: repo_id, after?, limit.
         let (cursor_clause, limit_param) = match after {
-            Some(_) => (" AND (created_at, id) > ($2, $3)", 4),
+            Some(_) => (" AND seq > $2", 3),
             None => ("", 2),
         };
         let sql = format!(
             "SELECT {COLS} FROM repo_push_events WHERE repo_id = $1{cursor_clause} \
-             ORDER BY created_at ASC, id ASC LIMIT ${limit_param}"
+             ORDER BY seq ASC LIMIT ${limit_param}"
         );
 
         let mut q = sqlx::query(&sql).bind(repo_id.to_string());
-        if let Some((ts, id)) = after {
-            q = q.bind(ts.to_string()).bind(id.to_string());
+        if let Some(seq) = after {
+            q = q.bind(seq);
         }
         let rows = q.bind(limit).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(row_to_repo_push_event).collect())
@@ -3021,6 +3171,7 @@ impl Db {
 fn row_to_repo_push_event(r: sqlx::postgres::PgRow) -> RepoPushEvent {
     RepoPushEvent {
         id: r.get("id"),
+        seq: r.get("seq"),
         repo_id: r.get("repo_id"),
         ref_name: r.get("ref_name"),
         after_sha: r.get("after_sha"),
@@ -4673,6 +4824,64 @@ mod migration_tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// The rollup's branch resolve asks for the newest push on one ref, and
+    /// "newest" has to mean the last row written, not the largest `created_at`.
+    /// The stamp is applied before the insert, so a push that stamped later can
+    /// commit earlier, the same defect the poll cursor had, in the reader next
+    /// door. Constructed rather than raced for: the row written first carries the
+    /// later timestamp.
+    #[sqlx::test]
+    async fn latest_push_sha_for_ref_follows_insertion_not_the_stamp(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        insert_push_event(
+            &db,
+            "repo-1",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T13:00:00+00:00",
+        )
+        .await;
+        insert_push_event(
+            &db,
+            "repo-1",
+            "refs/heads/main",
+            SHA_B,
+            "2026-08-07T12:00:00+00:00",
+        )
+        .await;
+
+        assert_eq!(
+            db.latest_push_sha_for_ref("repo-1", "refs/heads/main")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(SHA_B),
+            "the resolve must return the last push written, not the one carrying \
+             the largest application-stamped timestamp"
+        );
+
+        // The ref filter is still doing its job, so the assertion above is not
+        // just reading whatever row happens to be newest in the whole repo.
+        insert_push_event(
+            &db,
+            "repo-1",
+            "refs/heads/other",
+            SHA_A,
+            "2026-08-07T14:00:00+00:00",
+        )
+        .await;
+        assert_eq!(
+            db.latest_push_sha_for_ref("repo-1", "refs/heads/main")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(SHA_B),
+            "a push to another ref must not move this ref's resolve"
+        );
     }
 
     /// Upgrade path, the load-bearing one: `#[sqlx::test]` hands out a fresh

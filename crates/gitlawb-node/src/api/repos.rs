@@ -1681,6 +1681,31 @@ pub(crate) struct RefUpdate {
 /// logged and skipped: the push itself already succeeded and the objects are on
 /// disk, so refusing the response over a missed poll row would be the worse
 /// trade.
+/// Ceiling on how many ref updates from a single push turn into database work.
+///
+/// `parse_ref_updates` puts no bound on how many refs a receive-pack request may
+/// declare, and both writers below run inline on the user's `git push`, so
+/// without a cap one request decides how much work the node does. Well past any
+/// real push: a repository-wide force-push of every branch is far below this.
+/// Truncation is logged rather than silent.
+pub(crate) const MAX_PUSH_FAN_OUT: usize = 256;
+
+/// The prefix of `ref_updates` this push is allowed to fan out into, with a
+/// warning when the request declared more than that.
+fn bounded_fan_out<'a>(ref_updates: &'a [RefUpdate], what: &str, repo_id: &str) -> &'a [RefUpdate] {
+    if ref_updates.len() <= MAX_PUSH_FAN_OUT {
+        return ref_updates;
+    }
+    tracing::warn!(
+        repo_id = %repo_id,
+        declared = ref_updates.len(),
+        cap = MAX_PUSH_FAN_OUT,
+        "push ref updates truncated at the per-push fan-out cap for {what}: {} declared",
+        ref_updates.len()
+    );
+    &ref_updates[..MAX_PUSH_FAN_OUT]
+}
+
 pub(crate) async fn record_push_events(
     db: &crate::db::Db,
     repo_id: &str,
@@ -1695,26 +1720,33 @@ pub(crate) async fn record_push_events(
     // then re-read the page it just consumed, forever.
     let created_at =
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, /* use_z */ true);
-    for update in ref_updates {
-        // A deletion carries an all-zero new SHA. Recording it would hand a
-        // poller a target that resolves to no commit.
-        if update.new_sha == ZERO_SHA {
-            continue;
-        }
-        let event = crate::db::RepoPushEvent {
-            id: uuid::Uuid::new_v4().to_string(),
-            repo_id: repo_id.to_string(),
-            ref_name: update.ref_name.clone(),
-            after_sha: update.new_sha.clone(),
-            created_at: created_at.clone(),
-        };
-        if let Err(e) = db.insert_repo_push_event(&event).await {
-            tracing::warn!(
-                err = %e,
-                ref_name = %update.ref_name,
-                "failed to record a push event for the catch-up poll surface"
-            );
-        }
+    let events: Vec<crate::db::RepoPushEvent> =
+        bounded_fan_out(ref_updates, "push events", repo_id)
+            .iter()
+            // A deletion carries an all-zero new SHA. Recording it would hand a
+            // poller a target that resolves to no commit.
+            .filter(|update| update.new_sha != ZERO_SHA)
+            .map(|update| crate::db::RepoPushEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                // Ignored on insert; the database assigns the ordering key.
+                seq: 0,
+                repo_id: repo_id.to_string(),
+                ref_name: update.ref_name.clone(),
+                after_sha: update.new_sha.clone(),
+                created_at: created_at.clone(),
+            })
+            .collect();
+
+    // One statement for the whole push. A loop here would put a database round
+    // trip per ref onto the push response, which is what the fan-out cap and this
+    // batch together exist to prevent.
+    if let Err(e) = db.insert_repo_push_events(&events).await {
+        tracing::warn!(
+            err = %e,
+            repo_id = %repo_id,
+            refs = events.len(),
+            "failed to record push events for the catch-up poll surface"
+        );
     }
 }
 
@@ -1736,13 +1768,15 @@ fn branch_from_ref(ref_name: &str) -> Option<&str> {
 
 /// Point every open pull request fed by this push at the branch's new tip.
 ///
-/// One UPDATE per ref update, each keyed on (repo, source branch, open) — no
-/// per-PR probing, no repo listing, no filesystem access, and the cost does not
-/// grow with the number of open pull requests. A failure is logged and skipped:
-/// the push itself already succeeded and the objects are on disk, so refusing
-/// the response over a stale rollup target would be the worse trade.
+/// One UPDATE for the whole push, keyed on (repo, source branch, open): no
+/// per-PR probing, no repo listing, no filesystem access, and the cost grows
+/// with neither the number of open pull requests nor the number of refs pushed.
+/// A failure is logged and skipped: the push itself already succeeded and the
+/// objects are on disk, so refusing the response over a stale rollup target
+/// would be the worse trade.
 async fn update_open_pr_heads(db: &crate::db::Db, repo_id: &str, ref_updates: &[RefUpdate]) {
-    for update in ref_updates {
+    let mut heads: Vec<(String, String)> = Vec::new();
+    for update in bounded_fan_out(ref_updates, "stored pull request heads", repo_id) {
         // A deletion carries an all-zero new SHA. Storing it would hand the
         // rollup a target that resolves to no commit, so leave the last real
         // head standing.
@@ -1752,13 +1786,21 @@ async fn update_open_pr_heads(db: &crate::db::Db, repo_id: &str, ref_updates: &[
         let Some(branch) = branch_from_ref(&update.ref_name) else {
             continue;
         };
-        if let Err(e) = db.set_open_pr_heads(repo_id, branch, &update.new_sha).await {
-            tracing::warn!(
-                err = %e,
-                ref_name = %update.ref_name,
-                "failed to update stored pull request heads for a pushed branch"
-            );
-        }
+        // Last write wins, as the per-ref loop this replaced did. A single
+        // request naming one branch twice is not something git produces, but a
+        // `VALUES` join over duplicate branches would pick a row arbitrarily,
+        // and an arbitrary head is worse than a deterministic one.
+        heads.retain(|(existing, _)| existing != branch);
+        heads.push((branch.to_string(), update.new_sha.clone()));
+    }
+
+    if let Err(e) = db.set_open_pr_heads_batch(repo_id, &heads).await {
+        tracing::warn!(
+            err = %e,
+            repo_id = %repo_id,
+            branches = heads.len(),
+            "failed to update stored pull request heads for a pushed branch"
+        );
     }
 }
 
@@ -2916,16 +2958,12 @@ mod tests {
     #[test]
     fn the_push_handler_actually_calls_the_head_update() {
         let src = include_str!("repos.rs");
-        let start = src
-            .find("fn git_receive_pack(")
-            .expect("git_receive_pack not found (renamed or removed?)");
-        let rest = &src[start..];
-        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
-        let body: String = rest[..end]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = crate::test_support::scrape_source_region(
+            src,
+            Some("fn git_receive_pack("),
+            Some("\n}"),
+        )
+        .expect("git_receive_pack not found (renamed or removed?)");
 
         assert!(
             body.contains("update_open_pr_heads(&state.db, &record.id, &ref_updates)"),
@@ -2960,6 +2998,176 @@ mod tests {
             Some(PR_SHA_NEW.to_string())
         );
         assert_eq!(head_of(&db, "repo-1", 2).await, Some(other.to_string()));
+    }
+
+    // ── Push-path fan-out: bounded work, not one round trip per ref ───────
+
+    /// Statements executed on the push write path since the last call. The
+    /// counter is thread-local, so it measures this test alone with no
+    /// cross-test serialization to remember to take.
+    fn statements_since_last_check() -> usize {
+        crate::db::take_push_write_statements()
+    }
+
+    /// A `tracing` sink for the current thread, so "the drop is logged" is a
+    /// property the test observes rather than one it takes on trust. The
+    /// subscriber is installed for the lifetime of the returned value and
+    /// captures whatever this thread emits while it lives.
+    struct LogCapture {
+        buf: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        _guard: tracing::subscriber::DefaultGuard,
+    }
+
+    #[derive(Clone)]
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+        type Writer = LogSink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl LogCapture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.buf.lock().expect("log buffer")).into_owned()
+        }
+    }
+
+    fn capture_logs() -> LogCapture {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(LogSink(buf.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        LogCapture {
+            buf,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    /// `n` distinct branch updates. The SHAs start at 1, not 0: forty hex zeroes
+    /// is the deletion sentinel, which both writers skip on purpose, and a
+    /// generator that emitted one would silently make every count here one short.
+    fn many_ref_updates(n: usize) -> Vec<RefUpdate> {
+        (0..n)
+            .map(|i| ref_update(&format!("refs/heads/b{i}"), PR_SHA_OLD, &sha_for(i)))
+            .collect()
+    }
+
+    fn sha_for(i: usize) -> String {
+        format!("{:040x}", i + 1)
+    }
+
+    /// The cost of a push must not grow with the number of refs in it. Both
+    /// writers on the receive-pack path used to issue one sequential round trip
+    /// per ref, so a push of many refs multiplied database latency onto the
+    /// user's `git push` response.
+    ///
+    /// This asserts on the WORK, not on the rows: a per-ref loop and a batched
+    /// statement leave byte-identical rows behind, so a row-count assertion
+    /// passes against either and proves nothing about the thing that was wrong.
+    #[sqlx::test]
+    async fn a_multi_ref_push_costs_one_statement_per_writer(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        seed_open_pr(&db, "repo-fan", 1, "b0").await;
+        seed_open_pr(&db, "repo-fan", 2, "b3").await;
+        let updates = many_ref_updates(8);
+
+        statements_since_last_check();
+        record_push_events(&db, "repo-fan", &updates).await;
+        assert_eq!(
+            statements_since_last_check(),
+            1,
+            "recording an 8-ref push must be one multi-row insert, not one round \
+             trip per ref"
+        );
+
+        update_open_pr_heads(&db, "repo-fan", &updates).await;
+        assert_eq!(
+            statements_since_last_check(),
+            1,
+            "moving the stored heads for an 8-ref push must be one statement"
+        );
+
+        // And the batching did not cost correctness: every row still landed, and
+        // both open pull requests still followed their own branch.
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM repo_push_events WHERE repo_id = 'repo-fan'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, 8, "every ref must still be recorded");
+        assert_eq!(head_of(&db, "repo-fan", 1).await, Some(sha_for(0)));
+        assert_eq!(head_of(&db, "repo-fan", 2).await, Some(sha_for(3)));
+    }
+
+    /// `parse_ref_updates` puts no ceiling on how many refs one request may
+    /// declare, so the fan-out has to bound itself. Beyond the cap the extra refs
+    /// are dropped, and the drop is logged rather than silent. A push that
+    /// quietly loses ref updates is worse than one that says so.
+    #[sqlx::test]
+    async fn a_push_beyond_the_fan_out_cap_truncates_and_says_so(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        let over = MAX_PUSH_FAN_OUT + 7;
+        let updates = many_ref_updates(over);
+
+        let logs = capture_logs();
+        record_push_events(&db, "repo-cap", &updates).await;
+        update_open_pr_heads(&db, "repo-cap", &updates).await;
+        let logged = logs.contents();
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM repo_push_events WHERE repo_id = 'repo-cap'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            rows as usize, MAX_PUSH_FAN_OUT,
+            "the per-push fan-out must stop at the cap, got {rows} rows for a \
+             {over}-ref push"
+        );
+        assert!(
+            logged.contains("truncated") && logged.contains(&over.to_string()),
+            "truncation must be logged with the size that caused it, got: {logged}"
+        );
+    }
+
+    /// The cap is a ceiling, not a floor: an ordinary push is unaffected by it.
+    #[sqlx::test]
+    async fn a_push_under_the_cap_is_recorded_whole(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        let updates = many_ref_updates(MAX_PUSH_FAN_OUT);
+
+        let logs = capture_logs();
+        record_push_events(&db, "repo-atcap", &updates).await;
+        let logged = logs.contents();
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM repo_push_events WHERE repo_id = 'repo-atcap'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows as usize, MAX_PUSH_FAN_OUT,
+            "a push exactly at the cap keeps every ref"
+        );
+        assert!(
+            !logged.contains("truncated"),
+            "a push at the cap must not report a truncation, got: {logged}"
+        );
     }
 
     /// The receive-pack *advertisement* (`GET info/refs?service=git-receive-pack`)
@@ -3069,16 +3277,12 @@ mod push_event_wiring_tests {
     #[test]
     fn the_push_handler_actually_records_push_events() {
         let src = include_str!("repos.rs");
-        let start = src
-            .find("fn git_receive_pack(")
-            .expect("git_receive_pack not found (renamed or removed?)");
-        let rest = &src[start..];
-        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
-        let body: String = rest[..end]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = crate::test_support::scrape_source_region(
+            src,
+            Some("fn git_receive_pack("),
+            Some("\n}"),
+        )
+        .expect("git_receive_pack not found (renamed or removed?)");
 
         assert!(
             body.contains("record_push_events(&state.db, &record.id, &ref_updates)"),
@@ -3095,13 +3299,23 @@ mod push_event_wiring_tests {
     #[test]
     fn the_push_event_recorder_never_targets_the_gossip_table() {
         let src = include_str!("repos.rs");
-        let start = src
-            .find("async fn record_push_events(")
-            .expect("record_push_events not found (renamed or removed?)");
-        let rest = &src[start..];
-        let end = rest.find("\n}").map(|i| i + 2).unwrap_or(rest.len());
+        let body = crate::test_support::scrape_source_region(
+            src,
+            Some("async fn record_push_events("),
+            Some("\n}"),
+        )
+        .expect("record_push_events not found (renamed or removed?)");
+
+        // This is a must-not assertion, so it passes on an empty region. Pin what
+        // the scan covered first: without this, a helper that returned nothing
+        // would make the guard below green while proving nothing.
         assert!(
-            !rest[..end].contains("insert_ref_update"),
+            body.contains("insert_repo_push_events("),
+            "the scan must cover the recorder's own body, which writes through \
+             insert_repo_push_events; got: {body}"
+        );
+        assert!(
+            !body.contains("insert_ref_update"),
             "a local push must not be written into received_ref_updates, which the \
              anonymous /api/v1/events/ref-updates feed also reads"
         );
