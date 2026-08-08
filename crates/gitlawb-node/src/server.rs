@@ -14,7 +14,7 @@ use tracing::Level;
 
 use crate::api::{
     agents, arweave, bounties, certs, changelog, events, ipfs, issues, labels, peers, profiles,
-    protect, pulls, register, replicas, repos, resolve, stars, tasks, visibility, webhooks,
+    protect, pulls, register, replicas, repos, resolve, stars, status, tasks, visibility, webhooks,
 };
 use crate::auth;
 use crate::rate_limit;
@@ -182,6 +182,50 @@ pub fn build_router(state: AppState) -> Router {
             ),
         state.clone(),
     );
+
+    // ── Status claim writes — signature, plus the per-DID throttle AND the
+    // per-IP flood brake `creation_routes` carries. Not in `write_routes`, which
+    // has neither: every call here appends a row, so an unthrottled writer grows
+    // the claim log on demand and the three per-repo caps would be the only bound.
+    let status_write_routes = add_auth_layers(
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/statuses/{sha}",
+                post(status::create_status),
+            )
+            .layer(middleware::from_fn(rate_limit::rate_limit_by_did))
+            .layer(axum::Extension(state.rate_limiter.clone())),
+        state.clone(),
+    )
+    // The one route that persists the signed request body, so the one route
+    // whose signature material carries it. Applied OUTSIDE `add_auth_layers`
+    // (outermost = runs first) because `require_signature` reads this marker to
+    // decide whether to carry the body; a layer added inside the auth pair runs
+    // after the middleware and is never seen. `create_status` refuses an absent
+    // body rather than storing an empty column, so getting this order wrong
+    // fails loudly instead of quietly writing unverifiable claims.
+    .layer(axum::Extension(auth::PersistsSignedBody))
+    .layer(middleware::from_fn(rate_limit::rate_limit_by_ip))
+    .layer(axum::Extension(rate_limit::IpRateLimiter {
+        limiter: state.create_ip_rate_limiter.clone(),
+        trust: state.push_limiter_trust,
+    }));
+
+    // ── Status claim reads — open, behind `optional_signature` so the handler
+    // sees the caller when one signs and still answers a public repo for an
+    // anonymous reader. Without the layer the handler's optional auth extension
+    // is None for EVERY caller, including the owner, and every private repo
+    // reads as not-found.
+    let status_read_routes = Router::new()
+        .route(
+            "/api/v1/repos/{owner}/{repo}/commits/{sha}/status",
+            get(status::commit_status),
+        )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/pulls/{number}/status",
+            get(status::pull_request_status),
+        )
+        .layer(middleware::from_fn(auth::optional_signature));
 
     // Body limit is raised to GITLAWB_MAX_PACK_BYTES (default 2 GB) for git
     // routes only — all other API routes keep axum's default 2 MB cap.
@@ -373,6 +417,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/repos/{owner}/{repo}/events",
             get(events::list_repo_events),
         )
+        .route(
+            "/api/v1/repos/{owner}/{repo}/push-events",
+            get(events::list_repo_push_events),
+        )
         .route("/api/v1/agents", get(agents::list_agents))
         .route("/api/v1/agents/{did}", get(agents::show_agent))
         .route("/api/v1/agents/{did}/trust", get(agents::get_trust))
@@ -469,6 +517,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(profile_write_routes)
         .merge(creation_routes)
         .merge(write_routes)
+        .merge(status_write_routes)
+        .merge(status_read_routes)
         .merge(git_write_routes)
         .merge(git_read_routes)
         .merge(issue_write_routes)

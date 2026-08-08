@@ -81,8 +81,80 @@ pub struct PullRequest {
     pub status: String, // "open" | "merged" | "closed"
     pub merged_by_did: Option<String>,
     pub merged_at: Option<String>,
+    /// Head commit of the source branch, tracked while the pull request is open
+    /// and frozen at close or merge. Null until something pushes to that branch.
+    pub head_commit: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// One append-only commit-status claim. A producer reporting twice for the same
+/// context leaves both rows; the visible status is a projection over the history,
+/// ordered on the database-assigned `seq`.
+/// No `Serialize`: the signature material below must not reach a response body,
+/// and the write path's 201 uses a dedicated type
+/// ([`crate::api::status::CreatedStatus`]) that carries none of it. Dropping the
+/// derive is what stops the leak from reappearing by accident.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StatusClaim {
+    pub id: String,
+    /// Database-assigned ordering key. Ignored on insert (see
+    /// [`Db::insert_status_claim`]); nothing the producer supplies orders the
+    /// projection.
+    // Read back by the row mapper and asserted in tests, but no production
+    // reader takes it off the record: the projection orders on `seq` inside SQL,
+    // and the write response reports the value the insert returned directly.
+    #[allow(dead_code)]
+    pub seq: i64,
+    pub repo_id: String,
+    /// Lowercase 40-character hex commit SHA. Never existence-checked.
+    pub commit_sha: String,
+    pub state: String,
+    pub context: String,
+    pub target_url: Option<String>,
+    pub description: Option<String>,
+    pub producer_did: String,
+    pub authorizing_did: String,
+    /// The producer's RFC 9421 `Signature` header value, and below it the
+    /// `Signature-Input`, the canonical string the signature was verified over,
+    /// and the request body itself. Captured at write time because none of it
+    /// can be recovered once the request is gone, which is what keeps a claim
+    /// verifiable as history.
+    ///
+    /// Both of the last two are needed, and neither substitutes for the other.
+    /// The signing string covers the body only through a content-digest, so with
+    /// the signing string alone a reader can confirm that somebody signed a
+    /// request carrying some digest but cannot show that THIS row is what they
+    /// signed. `request_body` is what closes that gap: recompute its digest,
+    /// find it in `signing_string`, verify `signature` over that string.
+    pub signature: String,
+    pub signature_input: String,
+    pub signing_string: String,
+    pub request_body: Vec<u8>,
+    /// Stable digest over the four fields above: the request's identity.
+    ///
+    /// Unique across the table, so an exact replay of an accepted request cannot
+    /// append a second row. See [`crate::api::status::request_digest`] for what
+    /// goes into it and [`Db::insert_status_claim_capped`] for what happens when
+    /// it collides.
+    pub request_digest: String,
+    /// Server-assigned rfc3339 timestamp. Display data only; ordering is `seq`.
+    pub created_at: String,
+}
+
+/// One row of the commit-status projection: what the read surfaces render and
+/// nothing else. Deliberately NOT a [`StatusClaim`]. The claim carries the
+/// signature material, which no read renders and which runs to kilobytes per row
+/// (`signing_string` plus `request_body`), so reading the projection as claims
+/// pulled that weight off disk on every public status request.
+#[derive(Debug, Clone)]
+pub struct StatusProjection {
+    pub state: String,
+    pub context: String,
+    pub target_url: Option<String>,
+    pub description: Option<String>,
+    pub producer_did: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +195,32 @@ pub struct Webhook {
     pub created_by_did: String,
     pub created_at: String,
     pub active: bool,
+}
+
+/// One local push event: a single ref update observed on this node's
+/// receive-pack path, recorded so a subscriber that missed the push webhook can
+/// still discover the work by polling.
+///
+/// Stored in `repo_push_events`, deliberately NOT in `received_ref_updates`.
+/// That table is also read by the unauthenticated global feed at
+/// `GET /api/v1/events/ref-updates`, so writing a local push there would publish
+/// a private repo's push metadata to anonymous callers. This one is read only by
+/// the repo-scoped poll surface, behind that repo's read gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoPushEvent {
+    pub id: String,
+    /// Database-assigned ordering key, and the poll cursor itself. Ignored on
+    /// insert (see [`Db::insert_repo_push_events`]): nothing the writer supplies
+    /// can order these rows, because `created_at` is stamped before the insert
+    /// and a row stamped later can commit earlier.
+    pub seq: i64,
+    pub repo_id: String,
+    pub ref_name: String,
+    /// The SHA the ref points at after the push. A deletion is never recorded,
+    /// so this is always a real commit at the time it was written.
+    pub after_sha: String,
+    /// Display data only. Never an ordering key; see `seq`.
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -901,7 +999,137 @@ const MIGRATIONS: &[Migration] = &[
             "ALTER TABLE sync_queue ADD COLUMN IF NOT EXISTS attempted_at TEXT",
         ],
     },
+    // Reservation: v24, not main's current_max + 1 (which is 18). Same reason as
+    // v17 above — the runner keys the applied set on the version integer alone,
+    // so a version another in-flight branch also claims is skipped in full on
+    // whichever side merges second, silently and with schema_migrations still
+    // reading healthy. Two open branches claim 18 through 23 under their own
+    // names: origin/pr-173 and origin/fix/issue-135-ipfs-cid-tree-gate. 24
+    // clears both. Gaps are harmless; the runner never requires contiguity.
+    //
+    // The whole commit-status surface lands in this one entry rather than three,
+    // because a merged entry is never edited and a second version would collide
+    // with the same branches this one already had to clear.
+    Migration {
+        version: 24,
+        name: "status_claims_pr_head_and_push_events",
+        stmts: &[
+            // Append-only claim history. `seq` is a bigserial because the
+            // ordering key must be assigned by the database: the producer
+            // supplies nothing that orders the projection, and created_at is
+            // display data that can collide within a single second.
+            r#"CREATE TABLE IF NOT EXISTS status_claims (
+                id               TEXT NOT NULL PRIMARY KEY,
+                seq              BIGSERIAL NOT NULL,
+                repo_id          TEXT NOT NULL,
+                commit_sha       TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                context          TEXT NOT NULL,
+                target_url       TEXT,
+                description      TEXT,
+                producer_did     TEXT NOT NULL,
+                authorizing_did  TEXT NOT NULL,
+                signature        TEXT NOT NULL,
+                signature_input  TEXT NOT NULL,
+                -- The canonical RFC 9421 string the signature was verified over,
+                -- and the request body it covers through a content-digest. Two
+                -- columns because one cannot stand in for the other: the signing
+                -- string proves a signature exists, the body proves this row is
+                -- what it signed.
+                signing_string   TEXT NOT NULL,
+                request_body     BYTEA NOT NULL,
+                -- Stable digest over the material that identifies one request:
+                -- the signature, its input, the signing string and the body. Two
+                -- rows carrying the same value are the same request written
+                -- twice, which is what the unique index below refuses.
+                request_digest   TEXT NOT NULL,
+                created_at       TEXT NOT NULL
+            )"#,
+            // Replay containment, and the reason it is an index and not a check
+            // in Rust: `require_signature` bounds the clock skew on `created` and
+            // nothing else, so a captured request stays acceptable for the whole
+            // window. A read-then-insert would race, and losing that race is not
+            // a duplicate row, because the projection takes the highest `seq` per
+            // (producer, context), so a replayed row earns a FRESH sequence
+            // number and puts a superseded verdict back in front of the one that
+            // replaced it. The database is what has to hold this.
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_status_claims_request_digest ON status_claims(request_digest)",
+            // Read path: every claim for one commit.
+            "CREATE INDEX IF NOT EXISTS idx_status_claims_repo_commit ON status_claims(repo_id, commit_sha)",
+            // Cap count and latest-per-tuple lookup, which orders on seq DESC.
+            "CREATE INDEX IF NOT EXISTS idx_status_claims_tuple ON status_claims(repo_id, commit_sha, producer_did, context, seq DESC)",
+            // The per-repo write bound, which counts the rows a repo wrote inside
+            // a trailing window rather than every row it ever wrote.
+            "CREATE INDEX IF NOT EXISTS idx_status_claims_repo_created ON status_claims(repo_id, created_at)",
+            // Stored head of a pull request's source branch. Nullable: a PR
+            // opened before anything pushed has no head yet.
+            "ALTER TABLE pull_requests ADD COLUMN IF NOT EXISTS head_commit TEXT",
+            // Local push events, one row per ref update observed on the
+            // receive-pack path. Deliberately NOT received_ref_updates, which
+            // the unauthenticated global feed at /api/v1/events/ref-updates also
+            // reads: writing local pushes there would publish private-repo
+            // pushes on an anonymous surface. Also not `push_events`, which v1
+            // already defines for agent trust scoring on a different shape
+            // (agent_did, commit_hash, object_count, pushed_at); reusing that
+            // name would have been a silent no-op under IF NOT EXISTS.
+            // `seq` is a bigserial for the same reason `status_claims.seq` is: the
+            // poll cursor's ordering key must be assigned by the database. The
+            // application stamps `created_at` BEFORE the insert, so a row stamped
+            // later can commit earlier and a poller that has advanced past the
+            // later stamp never sees it, and an NTP step backwards makes that
+            // ordinary rather than a race. `created_at` stays as display data.
+            r#"CREATE TABLE IF NOT EXISTS repo_push_events (
+                id         TEXT NOT NULL PRIMARY KEY,
+                seq        BIGSERIAL NOT NULL,
+                repo_id    TEXT NOT NULL,
+                ref_name   TEXT NOT NULL,
+                after_sha  TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )"#,
+            // Keyset paging cursor: `seq` ascending within a repo. One column, so
+            // no tiebreak is needed: the sequence is unique by construction, and
+            // every row of one multi-ref push gets its own value even though they
+            // share a timestamp.
+            "CREATE INDEX IF NOT EXISTS idx_repo_push_events_cursor ON repo_push_events(repo_id, seq)",
+            // The pull request rollup's branch resolve: newest row for one ref,
+            // ordered on the same database-assigned key as the cursor.
+            "CREATE INDEX IF NOT EXISTS idx_repo_push_events_ref ON repo_push_events(repo_id, ref_name, seq DESC)",
+        ],
+    },
 ];
+
+// ── Push-path statement accounting ────────────────────────────────────────────
+
+// Count of database statements the receive-pack write path has executed, so a
+// test can assert on the WORK a push does and not only on the rows it leaves.
+// Those two come apart exactly where it matters: a loop issuing one round trip
+// per ref and a single multi-row statement produce byte-identical rows, and only
+// the first multiplies latency on the user's `git push`.
+//
+// Thread-local, not a process-global atomic: `#[sqlx::test]` gives each test its
+// own database but the whole suite shares one process, and other modules' tests
+// write push events too. A shared counter would need every one of them to take a
+// mutex, and the tests that forgot would show up as an inflated count in an
+// unrelated test. A thread-local is isolated by construction.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PUSH_WRITE_STATEMENTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Record one statement against the push-path counter. Compiles away entirely
+/// outside tests.
+#[inline]
+fn count_push_write_statement() {
+    #[cfg(test)]
+    PUSH_WRITE_STATEMENTS.with(|c| c.set(c.get() + 1));
+}
+
+/// Zero the counter and return what it held, so a test can measure one call.
+#[cfg(test)]
+pub(crate) fn take_push_write_statements() -> usize {
+    PUSH_WRITE_STATEMENTS.with(|c| c.replace(0))
+}
 
 // ── Repos ─────────────────────────────────────────────────────────────────────
 
@@ -909,6 +1137,34 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
     match did.strip_prefix("did:key:") {
         Some(rest) if !rest.contains(':') => rest,
         _ => did,
+    }
+}
+
+/// The canonical spelling of an identity for a column that stores one identity
+/// per row, as `status_claims.producer_did` and `authorizing_did` do: the full
+/// `did:key:<id>` form for a `did:key` in either spelling, the value unchanged
+/// for every other method.
+///
+/// Written as a function of [`normalize_owner_key`] rather than beside it, so the
+/// two cannot disagree about which identities are the same one: `canonical_did`
+/// is injective over the normalized key, which makes
+/// `canonical_did(a) == canonical_did(b)` exactly `did_matches(a, b)`. Pinned by
+/// `canonical_did_agrees_with_did_matches`.
+///
+/// It expands where `normalize_owner_key` collapses because the two answer
+/// different questions. The owner key is a lookup key; a stored `producer_did` is
+/// evidence, and a claim has to stay verifiable from the row alone — a bare
+/// base58 id does not parse as a DID, so the key behind the signature could not
+/// be recovered from it.
+pub(crate) fn canonical_did(did: &str) -> std::borrow::Cow<'_, str> {
+    let key = normalize_owner_key(did);
+    // A residual carrying ':' is a full DID of some other method (or a value that
+    // is not a did:key at all); prefixing it would merge two identities that
+    // `did_matches` keeps apart.
+    if key.contains(':') {
+        std::borrow::Cow::Borrowed(key)
+    } else {
+        std::borrow::Cow::Owned(format!("did:key:{key}"))
     }
 }
 
@@ -923,7 +1179,49 @@ const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(
 
 #[cfg(test)]
 mod normalize_owner_key_tests {
-    use super::normalize_owner_key;
+    use super::{canonical_did, normalize_owner_key};
+
+    /// `canonical_did` is what the claim columns store, and the projection
+    /// compares stored values for equality. That comparison is the authorization
+    /// filter, so it must decide exactly what `did_matches` decides: equal
+    /// canonical spellings for identities that match, distinct ones for
+    /// identities that do not. Both directions, including the cross-method cases
+    /// a bare base58 id must never reach across.
+    #[test]
+    fn canonical_did_agrees_with_did_matches() {
+        let values = [
+            "did:key:zABC",
+            "zABC",
+            "did:key:zXYZ",
+            "zXYZ",
+            "did:gitlawb:zABC",
+            "did:web:example.com",
+            "example.com",
+            "did:key:did:gitlawb:zABC",
+            "z:A",
+            "did:key:z:A",
+            "did:key:",
+            "",
+        ];
+        for a in values {
+            for b in values {
+                assert_eq!(
+                    canonical_did(a) == canonical_did(b),
+                    crate::api::did_matches(a, b),
+                    "canonical_did disagrees with did_matches on ({a:?}, {b:?})"
+                );
+            }
+        }
+    }
+
+    /// The stored spelling has to parse as a DID: a claim is evidence, and
+    /// recovering the key behind its signature starts from `producer_did`.
+    #[test]
+    fn canonical_did_keeps_a_did_key_parseable() {
+        assert_eq!(canonical_did("zABC"), "did:key:zABC");
+        assert_eq!(canonical_did("did:key:zABC"), "did:key:zABC");
+        assert_eq!(canonical_did("did:gitlawb:zABC"), "did:gitlawb:zABC");
+    }
 
     // Boundary set matching the SQL CASE: did:key short/full, empty residual,
     // did:key:z:extra, non-key, bare, empty, uppercase.
@@ -1773,7 +2071,7 @@ impl Db {
     pub async fn list_prs(&self, repo_id: &str) -> Result<Vec<PullRequest>> {
         let rows = sqlx::query(
             "SELECT id,repo_id,number,title,body,author_did,source_branch,target_branch,
-                    status,merged_by_did,merged_at,created_at,updated_at
+                    status,merged_by_did,merged_at,head_commit,created_at,updated_at
              FROM pull_requests WHERE repo_id=$1 ORDER BY number DESC",
         )
         .bind(repo_id)
@@ -1785,7 +2083,7 @@ impl Db {
     pub async fn get_pr(&self, repo_id: &str, number: i64) -> Result<Option<PullRequest>> {
         let row = sqlx::query(
             "SELECT id,repo_id,number,title,body,author_did,source_branch,target_branch,
-                    status,merged_by_did,merged_at,created_at,updated_at
+                    status,merged_by_did,merged_at,head_commit,created_at,updated_at
              FROM pull_requests WHERE repo_id=$1 AND number=$2",
         )
         .bind(repo_id)
@@ -1795,16 +2093,133 @@ impl Db {
         Ok(row.map(row_to_pr))
     }
 
-    pub async fn merge_pr(&self, pr_id: &str, merged_by_did: &str) -> Result<()> {
+    /// Point every OPEN pull request in `repo_id` whose source branch is
+    /// `branch` at `new_sha`, in one statement. Returns the rows updated.
+    ///
+    /// The `status='open'` predicate is the freeze: once a pull request is
+    /// closed or merged, later pushes to the same branch no longer move its
+    /// stored head, so the recorded target stays the commit the decision was
+    /// actually made against. `branch` is a bare name — callers on the push
+    /// path see full refs and must strip `refs/heads/` first.
+    ///
+    /// Test-only since the push path started batching: production has exactly one
+    /// caller and it always has a whole push's worth of branches to write, so the
+    /// single-branch form exists to keep the many tests that seed one head
+    /// readable. Compiling it only under `cfg(test)` is what keeps that fact from
+    /// decaying into an unused production API.
+    #[cfg(test)]
+    pub async fn set_open_pr_heads(
+        &self,
+        repo_id: &str,
+        branch: &str,
+        new_sha: &str,
+    ) -> Result<u64> {
+        self.set_open_pr_heads_batch(repo_id, &[(branch.to_string(), new_sha.to_string())])
+            .await
+    }
+
+    /// The same update for several branches of one repo, in a single statement.
+    ///
+    /// This is the shape the receive-pack path needs: one push carries many ref
+    /// updates, and issuing one round trip per ref put that latency directly on
+    /// the user's `git push` response. The per-branch new head rides along as a
+    /// `VALUES` list joined against the table, so the cost is one statement
+    /// regardless of how many branches moved. The casts on the first row are what
+    /// give Postgres the column types it cannot infer from parameters alone.
+    ///
+    /// Callers must chunk the list (see `api::repos::PUSH_WRITE_CHUNK`): every
+    /// pair costs two bind parameters, against a protocol ceiling of 65535. The
+    /// chunking bounds one STATEMENT, not the push: a caller that dropped the
+    /// tail instead would leave those pull requests pointing at a commit the
+    /// push already replaced.
+    ///
+    /// Same predicates as the single-branch form, and for the same reason:
+    /// `status='open'` is the freeze that keeps a decided pull request's head
+    /// from moving under a later push.
+    pub async fn set_open_pr_heads_batch(
+        &self,
+        repo_id: &str,
+        updates: &[(String, String)],
+    ) -> Result<u64> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        // $1 is the repo; each pair takes the next two positions.
+        let mut values = String::new();
+        for i in 0..updates.len() {
+            if i > 0 {
+                values.push(',');
+            }
+            let base = 2 + i * 2;
+            if i == 0 {
+                values.push_str(&format!("(${}::text, ${}::text)", base, base + 1));
+            } else {
+                values.push_str(&format!("(${}, ${})", base, base + 1));
+            }
+        }
+        let sql = format!(
+            "UPDATE pull_requests SET head_commit = v.sha
+             FROM (VALUES {values}) AS v(branch, sha)
+             WHERE pull_requests.repo_id = $1
+               AND pull_requests.source_branch = v.branch
+               AND pull_requests.status = 'open'"
+        );
+
+        let mut q = sqlx::query(&sql).bind(repo_id);
+        for (branch, sha) in updates {
+            q = q.bind(branch).bind(sha);
+        }
+        count_push_write_statement();
+        let result = q.execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Record `sha` as the head of one OPEN pull request that has none yet.
+    /// Returns the rows updated, so a caller can tell a fill from a no-op.
+    ///
+    /// Both predicates are the point. `head_commit IS NULL` makes the write
+    /// self-limiting: the rollup's read-side fallback is reachable by an
+    /// unauthenticated GET, and this is what stops it from firing more than once
+    /// per pull request, or from rolling a head a concurrent push already
+    /// recorded back to a staler branch tip. `status='open'` is the same freeze
+    /// [`Db::set_open_pr_heads`] applies: a closed or merged pull request's head,
+    /// including its absence, is a decided fact and not back-fillable.
+    pub async fn set_pr_head_if_absent(&self, pr_id: &str, sha: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE pull_requests SET head_commit=$1
+             WHERE id=$2 AND head_commit IS NULL AND status='open'",
+        )
+        .bind(sha)
+        .bind(pr_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Mark a pull request merged, stamping the source head it merged.
+    ///
+    /// `head_commit` is what the merge actually consumed, read under the repo
+    /// write lock: the caller loaded the row before taking that lock, so a push
+    /// landing in between moved the branch and the row's own value is stale.
+    /// `None` (an unresolvable source head) leaves the stored value alone
+    /// rather than nulling a head the push path had already recorded.
+    pub async fn merge_pr(
+        &self,
+        pr_id: &str,
+        merged_by_did: &str,
+        head_commit: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "UPDATE pull_requests
-             SET status='merged', merged_by_did=$1, merged_at=$2, updated_at=$2
+             SET status='merged', merged_by_did=$1, merged_at=$2, updated_at=$2,
+                 head_commit=COALESCE($4, head_commit)
              WHERE id=$3",
         )
         .bind(merged_by_did)
         .bind(&now)
         .bind(pr_id)
+        .bind(head_commit)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1965,6 +2380,316 @@ impl Db {
                 created_at: r.get("created_at"),
             })
             .collect())
+    }
+}
+
+// ── Status Claims ─────────────────────────────────────────────────────────────
+
+const INSERT_STATUS_CLAIM_SQL: &str = "INSERT INTO status_claims
+     (id, repo_id, commit_sha, state, context, target_url, description,
+      producer_did, authorizing_did, signature, signature_input,
+      signing_string, request_body, request_digest, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+     RETURNING seq";
+
+/// The same insert, made a no-op when the request has already been recorded.
+/// The column list must stay identical to [`INSERT_STATUS_CLAIM_SQL`]: both are
+/// bound by [`status_claim_insert`], so a divergence is a parameter-count error
+/// on the first write either way runs.
+///
+/// `DO NOTHING` rather than an error, so `RETURNING` yields no row at all. That
+/// empty result is how the caller learns the write was a replay; see
+/// [`Db::insert_status_claim_capped`].
+const INSERT_STATUS_CLAIM_IF_NEW_SQL: &str = "INSERT INTO status_claims
+     (id, repo_id, commit_sha, state, context, target_url, description,
+      producer_did, authorizing_did, signature, signature_input,
+      signing_string, request_body, request_digest, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+     ON CONFLICT (request_digest) DO NOTHING
+     RETURNING seq";
+
+/// The claim a given request already wrote, if any. Rides the unique index the
+/// replay containment is built on, so it is one probe rather than a scan.
+///
+/// Takes the transaction rather than the pool: the caller runs it inside the
+/// capped insert, both before the caps and again after a conflict, and reading
+/// outside that transaction would answer from a different snapshot.
+async fn claim_by_digest(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    digest: &str,
+) -> Result<Option<StatusClaim>> {
+    let row = sqlx::query(
+        "SELECT id,seq,repo_id,commit_sha,state,context,target_url,description,
+                producer_did,authorizing_did,signature,signature_input,
+                signing_string,request_body,request_digest,created_at
+         FROM status_claims WHERE request_digest = $1",
+    )
+    .bind(digest)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(row_to_status_claim))
+}
+
+/// The bind chain for [`INSERT_STATUS_CLAIM_SQL`], shared by the plain and the
+/// capped insert so the two can never bind different columns.
+///
+/// Both DIDs are normalized here, at the one place claims are written, rather
+/// than at each call site. The owner gate accepts `did:key:X` and the bare `X` as
+/// the same identity, so a producer who alternates spellings would otherwise
+/// store two values for one identity: the projection dedupes on the raw
+/// `producer_did`, and the per-tuple cap counts on it, so both would be split in
+/// half and the superseded claim would keep voting in the combined state.
+fn status_claim_insert<'a>(
+    sql: &'a str,
+    claim: &'a StatusClaim,
+) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    sqlx::query(sql)
+        .bind(&claim.id)
+        .bind(&claim.repo_id)
+        .bind(&claim.commit_sha)
+        .bind(&claim.state)
+        .bind(&claim.context)
+        .bind(&claim.target_url)
+        .bind(&claim.description)
+        .bind(canonical_did(&claim.producer_did).into_owned())
+        .bind(canonical_did(&claim.authorizing_did).into_owned())
+        .bind(&claim.signature)
+        .bind(&claim.signature_input)
+        .bind(&claim.signing_string)
+        .bind(&claim.request_body)
+        .bind(&claim.request_digest)
+        .bind(&claim.created_at)
+}
+
+/// The projection behind the commit-status read, with its own column list: only
+/// the fields a read surface renders. `seq` is selected in the inner query for
+/// the ordering and dropped by the outer one. The signature material is
+/// deliberately absent — see [`StatusProjection`].
+const LATEST_STATUS_CLAIMS_SQL: &str =
+    "SELECT state,context,target_url,description,producer_did,created_at FROM (
+     SELECT DISTINCT ON (producer_did, context)
+            seq,state,context,target_url,description,producer_did,created_at
+     FROM status_claims
+     WHERE repo_id=$1 AND commit_sha=$2 AND authorizing_did = $3
+     ORDER BY producer_did, context, seq DESC
+ ) latest ORDER BY seq ASC";
+
+/// The trailing window the per-repo bound counts over. Named here, next to the
+/// query that uses it, and quoted in the refusal message the handler surfaces.
+const CLAIM_REPO_WINDOW_HOURS: i64 = 24;
+
+/// The three write-path bounds. All three are checked in the insert transaction:
+/// one alone bounds nothing, because the context string and the commit SHA are
+/// both caller-chosen and the SHA is never existence-checked.
+pub struct ClaimCaps {
+    /// Claims for one (repo, commit, producer, context).
+    pub per_tuple: i64,
+    /// Distinct contexts for one (repo, commit).
+    pub contexts_per_commit: i64,
+    /// Claim rows for one repo within the trailing
+    /// [`CLAIM_REPO_WINDOW_HOURS`]-hour window.
+    ///
+    /// A window and not an all-time total. Nothing prunes this table, so a
+    /// lifetime bound would be a dead end: the repo's claim count never falls,
+    /// the refusal never becomes satisfiable, and the surface is closed for
+    /// good — while the 429 tells every CI client to retry forever. As a rate it
+    /// still bounds the fan-out this cap exists for (the commit SHA is
+    /// caller-chosen and never existence-checked, so the other two bounds do not
+    /// contain it), and the refusal is honest: waiting out the window works.
+    pub per_repo_window: i64,
+}
+
+/// Outcome of a capped append. `CapExceeded` names the bound that refused, for
+/// the caller's 429 message; it is not a database error.
+///
+/// `AlreadyRecorded` carries the row the identical request wrote the first time,
+/// so the caller can answer with the claim it already has instead of an error. A
+/// refusal would be wrong twice over: it tells a CI client whose response was
+/// lost to the network that its report failed when it succeeded, and it makes
+/// the honest retry indistinguishable from the attack.
+pub enum ClaimInsert {
+    Inserted(i64),
+    AlreadyRecorded(Box<StatusClaim>),
+    CapExceeded(&'static str),
+}
+
+impl Db {
+    /// Append one claim. `claim.seq` is ignored: the column is a `bigserial` and
+    /// the database assigns the value, which is returned here so a caller can
+    /// report the row it just wrote without a second read.
+    // The write handler uses the capped form below; this stays the uncapped
+    // primitive the db tests drive directly.
+    #[allow(dead_code)]
+    pub async fn insert_status_claim(&self, claim: &StatusClaim) -> Result<i64> {
+        let row = status_claim_insert(INSERT_STATUS_CLAIM_SQL, claim)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("seq"))
+    }
+
+    /// Append one claim only if it is new and all three caps still admit it.
+    ///
+    /// A request already recorded returns its original row and writes nothing,
+    /// BEFORE any cap is consulted. That order matters: a client retrying a
+    /// request whose response was lost must not be told 429 by a tuple cap its
+    /// own earlier write filled.
+    ///
+    /// Writers against one repo are serialized on a transaction-scoped advisory
+    /// lock taken before the first count. A transaction alone would not hold the
+    /// bounds: Postgres runs READ COMMITTED, so concurrent writers each count the
+    /// rows committed when they started, every one of them reads a value under the
+    /// cap, and every one of them inserts — the table ends up over the bound by
+    /// the concurrency, which is exactly the burst the caps exist to stop.
+    ///
+    /// The lock is keyed on the repo id, which is the coarsest of the three
+    /// bounds, so one key covers all of them. It is released by the commit or the
+    /// rollback, including the early returns below. `hashtext` collisions put two
+    /// unrelated repos behind one key, which costs a little serialization on the
+    /// write path and nothing in correctness.
+    pub async fn insert_status_claim_capped(
+        &self,
+        claim: &StatusClaim,
+        caps: &ClaimCaps,
+    ) -> Result<ClaimInsert> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&claim.repo_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Replay first, and cheapest: one unique-index probe. Under the repo
+        // lock this settles every same-repo racer, and the index below settles
+        // the rest.
+        if let Some(existing) = claim_by_digest(&mut tx, &claim.request_digest).await? {
+            return Ok(ClaimInsert::AlreadyRecorded(Box::new(existing)));
+        }
+
+        // The tuple bound and the context-fanout bound read the same
+        // (repo, commit) rows, so they are one aggregate over one scan rather
+        // than two round trips: the tuple count is the same scan narrowed by a
+        // FILTER.
+        let row = sqlx::query(
+            "SELECT count(*) FILTER (WHERE producer_did=$3 AND context=$4) AS tuple_count,
+                    count(DISTINCT context) AS contexts,
+                    COALESCE(bool_or(context = $4), false) AS present
+             FROM status_claims WHERE repo_id=$1 AND commit_sha=$2",
+        )
+        .bind(&claim.repo_id)
+        .bind(&claim.commit_sha)
+        // Canonicalized to match what the insert stores (see
+        // status_claim_insert): counting on the raw DID would give one identity a
+        // fresh cap per spelling.
+        .bind(canonical_did(&claim.producer_did).into_owned())
+        .bind(&claim.context)
+        .fetch_one(&mut *tx)
+        .await?;
+        let tuple_count: i64 = row.get("tuple_count");
+        let contexts: i64 = row.get("contexts");
+        let present: bool = row.get("present");
+
+        if tuple_count >= caps.per_tuple {
+            return Ok(ClaimInsert::CapExceeded(
+                "claims for this commit, producer and context",
+            ));
+        }
+
+        // A context already present does not widen the fanout, so only a NEW
+        // context is measured against the limit.
+        if !present && contexts >= caps.contexts_per_commit {
+            return Ok(ClaimInsert::CapExceeded(
+                "distinct contexts for this commit",
+            ));
+        }
+
+        // Trailing window, not an all-time count: see ClaimCaps::per_repo_window.
+        // `created_at` is TEXT, and the server writes every row as one rfc3339
+        // UTC format, so the comparison is chronological as well as lexical.
+        let window_start =
+            (Utc::now() - chrono::Duration::hours(CLAIM_REPO_WINDOW_HOURS)).to_rfc3339();
+        let repo_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM status_claims WHERE repo_id=$1 AND created_at >= $2",
+        )
+        .bind(&claim.repo_id)
+        .bind(&window_start)
+        .fetch_one(&mut *tx)
+        .await?;
+        if repo_rows >= caps.per_repo_window {
+            return Ok(ClaimInsert::CapExceeded(
+                "claims for this repository in the last 24 hours",
+            ));
+        }
+
+        // The probe above is the fast path, not the guarantee: two nodes sharing
+        // this database, or two requests the repo lock does not cover, can both
+        // pass it. The unique index is what actually holds, and `DO NOTHING`
+        // turns losing that race into an empty result rather than an error.
+        let inserted = status_claim_insert(INSERT_STATUS_CLAIM_IF_NEW_SQL, claim)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(inserted) = inserted else {
+            let existing = claim_by_digest(&mut tx, &claim.request_digest)
+                .await?
+                .context("status claim insert conflicted on request_digest but the conflicting row could not be read back")?;
+            return Ok(ClaimInsert::AlreadyRecorded(Box::new(existing)));
+        };
+        let seq = inserted.get::<i64, _>("seq");
+        tx.commit().await?;
+        Ok(ClaimInsert::Inserted(seq))
+    }
+
+    /// Every claim recorded for one commit, oldest first. Ordering is on `seq`,
+    /// never on the timestamp, which is display data and can collide.
+    #[allow(dead_code)]
+    pub async fn list_status_claims(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+    ) -> Result<Vec<StatusClaim>> {
+        let rows = sqlx::query(
+            "SELECT id,seq,repo_id,commit_sha,state,context,target_url,description,
+                    producer_did,authorizing_did,signature,signature_input,
+                    signing_string,request_body,request_digest,created_at
+             FROM status_claims WHERE repo_id=$1 AND commit_sha=$2 ORDER BY seq ASC",
+        )
+        .bind(repo_id)
+        .bind(commit_sha)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_status_claim).collect())
+    }
+
+    /// The projection behind the commit-status read (KTD-2): the latest claim per
+    /// (producer, context) for one commit, restricted to claims authorized by
+    /// `authorizing_did`.
+    ///
+    /// Computed on every read and never materialized, so a repo whose visibility
+    /// or ownership changes after a claim was written is answered from current
+    /// state with no reconciliation job. "Latest" is the highest `seq` (KTD-3):
+    /// the timestamp is producer-visible display data and the id is a random
+    /// uuid, so neither orders the history.
+    ///
+    /// The authorization filter is one equality evaluated inside the query rather
+    /// than a per-claim check in Rust, which is the constraint the
+    /// delegated-capability follow-on inherits: it may widen the filter, never
+    /// move the test into the read loop. It is a single comparison and not a set
+    /// expansion because the column is already canonicalized on write through
+    /// [`canonical_did`], which is defined over the same [`normalize_owner_key`]
+    /// that `did_matches` collapses with, so the `did:key` rule has one definition
+    /// instead of a copy per query.
+    pub async fn latest_status_claims(
+        &self,
+        repo_id: &str,
+        commit_sha: &str,
+        authorizing_did: &str,
+    ) -> Result<Vec<StatusProjection>> {
+        let rows = sqlx::query(LATEST_STATUS_CLAIMS_SQL)
+            .bind(repo_id)
+            .bind(commit_sha)
+            .bind(canonical_did(authorizing_did).into_owned())
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_to_status_projection).collect())
     }
 }
 
@@ -2396,6 +3121,266 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+// ── Repo Push Events ──────────────────────────────────────────────────────────
+
+/// How long a push-event write waits for its repo's lock before its statement
+/// is cancelled, in milliseconds.
+///
+/// Well under the pool's `acquire_timeout` (5 seconds by default), and
+/// deliberately so: a writer that queued on the lock is holding a pooled
+/// connection while it waits, so a wait longer than the acquire timeout would
+/// convert one slow repo into pool exhaustion for every unrelated request.
+/// Three attempts at this bound stay inside that budget.
+const PUSH_LOCK_TIMEOUT_MS: u32 = 1_000;
+
+/// How many times a push-event write may be re-attempted after its lock wait
+/// expired. Bounded, because the caller runs inline on the user's `git push`.
+const PUSH_LOCK_ATTEMPTS: u32 = 3;
+
+/// Postgres `lock_not_available`, which is what `SET LOCAL lock_timeout`
+/// cancels a statement with. The retryable failure, as distinct from every
+/// other database error, which is returned on the first attempt.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+fn is_lock_timeout(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == LOCK_NOT_AVAILABLE)
+}
+
+impl Db {
+    /// Record one local push event. Idempotent on the row id.
+    ///
+    /// Test-only, for the same reason as [`Db::set_open_pr_heads`]: the push path
+    /// writes a whole push in one statement, and this single-row form survives
+    /// only to keep row-seeding tests readable.
+    #[cfg(test)]
+    pub async fn insert_repo_push_event(&self, event: &RepoPushEvent) -> Result<()> {
+        self.insert_repo_push_events(std::slice::from_ref(event))
+            .await
+    }
+
+    /// Record a whole push's events in one statement, under the repo's write
+    /// lock. Idempotent on the row ids.
+    ///
+    /// One multi-row insert rather than one round trip per ref: the receive-pack
+    /// path runs this inline on the user's `git push`, so a sequential loop makes
+    /// the push response pay a database round trip for every ref it carries.
+    ///
+    /// `seq` is not bound. It is a bigserial the database assigns in insert
+    /// order, which is exactly why the poll cursor can trust it; a value supplied
+    /// here would defeat that.
+    ///
+    /// WRITERS AGAINST ONE REPO ARE SERIALIZED, on the same transaction-scoped
+    /// advisory lock [`Db::insert_status_claim_capped`] takes, so the two agree
+    /// on what a repo lock means. Insert order alone is not enough for the
+    /// cursor: `nextval` allocates the sequence at INSERT and the row becomes
+    /// visible at COMMIT, and it does not roll back, so two overlapping writers
+    /// can commit out of allocation order. When they do, the poller reads the
+    /// higher sequence, advances its cursor past the lower one, and that row,
+    /// once it commits, is never delivered by any later poll. Holding the lock
+    /// across the commit is what makes allocation order equal visibility order
+    /// within a repo. Across repos nothing is serialized, and nothing needs to
+    /// be: the cursor is per repo.
+    ///
+    /// The wait is bounded rather than indefinite, because this runs on the
+    /// user's push: `SET LOCAL lock_timeout` cancels the wait and the write is
+    /// re-attempted [`PUSH_LOCK_ATTEMPTS`] times before the error is returned.
+    /// The caller must not swallow it (see `api::repos::record_push_events`); a
+    /// dropped chunk is the same permanent loss the lock exists to prevent.
+    ///
+    /// Callers must chunk the slice (see `api::repos::PUSH_WRITE_CHUNK`): every
+    /// row costs five bind parameters, against a protocol ceiling of 65535. The
+    /// chunking bounds one STATEMENT, not the push: every ref receive-pack
+    /// accepted is written, across as many chunks as that takes. The lock is
+    /// therefore taken once per chunk, which still holds the property: each
+    /// chunk commits before any other writer can allocate.
+    pub async fn insert_repo_push_events(&self, events: &[RepoPushEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Every repo the batch touches, in one fixed order. In practice a push
+        // is one repo and this is one key; sorting is what keeps two batches
+        // that did span repos from taking the same keys in opposite orders and
+        // deadlocking.
+        let mut repo_ids: Vec<&str> = events.iter().map(|e| e.repo_id.as_str()).collect();
+        repo_ids.sort_unstable();
+        repo_ids.dedup();
+
+        let mut values = String::new();
+        for i in 0..events.len() {
+            if i > 0 {
+                values.push(',');
+            }
+            let b = i * 5;
+            values.push_str(&format!(
+                "(${},${},${},${},${})",
+                b + 1,
+                b + 2,
+                b + 3,
+                b + 4,
+                b + 5
+            ));
+        }
+        let sql = format!(
+            "INSERT INTO repo_push_events (id, repo_id, ref_name, after_sha, created_at)
+             VALUES {values}
+             ON CONFLICT(id) DO NOTHING"
+        );
+
+        let mut attempt = 1;
+        loop {
+            match self.push_events_attempt(&sql, &repo_ids, events).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < PUSH_LOCK_ATTEMPTS && is_lock_timeout(&e) => {
+                    tracing::debug!(
+                        attempt,
+                        repos = repo_ids.len(),
+                        "push-event write timed out waiting for the repo lock; retrying"
+                    );
+                    attempt += 1;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// One attempt at the write above: take the repo locks, insert, commit.
+    ///
+    /// The lock releases with the transaction, so the commit here is what makes
+    /// the next writer's allocation safe.
+    async fn push_events_attempt(
+        &self,
+        sql: &str,
+        repo_ids: &[&str],
+        events: &[RepoPushEvent],
+    ) -> std::result::Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        // First statement of the transaction, so it bounds the lock waits below
+        // and nothing else: `SET LOCAL` reverts at commit or rollback.
+        sqlx::query(&format!(
+            "SET LOCAL lock_timeout = '{PUSH_LOCK_TIMEOUT_MS}ms'"
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        for repo_id in repo_ids {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind(*repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let mut q = sqlx::query(sql);
+        for e in events {
+            q = q
+                .bind(&e.id)
+                .bind(&e.repo_id)
+                .bind(&e.ref_name)
+                .bind(&e.after_sha)
+                .bind(&e.created_at);
+        }
+        count_push_write_statement();
+        q.execute(&mut *tx).await?;
+
+        tx.commit().await
+    }
+
+    /// The SHA of the most recent push this node recorded for one ref of a repo,
+    /// or `None` if it has never seen a push for it.
+    ///
+    /// This is the pull request rollup's branch resolve. It reads
+    /// `repo_push_events` rather than `branch_cids` because that table is written
+    /// unconditionally for every ref update on the receive-pack path, while
+    /// `branch_cids` only gets a row when the pushed objects came back carrying a
+    /// pin CID — on a node with no pinning configured it is never written at all,
+    /// which left the resolve permanently unable to answer.
+    ///
+    /// Both the ref filter and the ordering are the database's work: the caller
+    /// gets one row, not the repo's whole push history to scan. "Most recent" is
+    /// the highest `seq`, not the latest `created_at`: the timestamp is stamped
+    /// before the insert, so the last row written is not necessarily the one
+    /// carrying the largest stamp, and every row of one multi-ref push shares a
+    /// stamp anyway. `(repo_id, ref_name, seq DESC)` is the index this rides.
+    pub async fn latest_push_sha_for_ref(
+        &self,
+        repo_id: &str,
+        ref_name: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT after_sha FROM repo_push_events
+             WHERE repo_id = $1 AND ref_name = $2
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(repo_id)
+        .bind(ref_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("after_sha")))
+    }
+
+    /// One page of a repo's push events, OLDEST first, walked by a `seq` keyset
+    /// cursor rather than an offset.
+    ///
+    /// `after` is the cursor a poller last saw; the page reads rows strictly
+    /// after it via `seq > after`, which matches the `ORDER BY` exactly. One
+    /// column is enough because `seq` is a database-assigned bigserial: it is
+    /// unique, so there is no tiebreak to get wrong, and it is assigned at insert
+    /// time rather than by the application. It does not follow from that alone
+    /// that the sequence agrees with the order the rows became visible: the
+    /// value is allocated at INSERT and published at COMMIT, so two overlapping
+    /// writers can commit out of allocation order and strand the lower row
+    /// behind a cursor that has already passed it. What makes the agreement
+    /// hold is the write side, where [`Db::insert_repo_push_events`] serializes
+    /// a repo's writers on an advisory lock held across the commit.
+    /// `created_at` cannot do this job either: it is
+    /// stamped before the insert, every row of one multi-ref push carries the
+    /// same value, and a clock that steps backwards makes a later row sort
+    /// earlier, stranding it behind a cursor that has already passed.
+    ///
+    /// Oldest-first is what makes the cursor stable under concurrent writes: a
+    /// push landing mid-walk sorts after the window being paged, so it cannot
+    /// shift it, and the next poll picks it up.
+    pub async fn list_repo_push_events_keyset(
+        &self,
+        repo_id: &str,
+        after: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<RepoPushEvent>> {
+        const COLS: &str = "id, seq, repo_id, ref_name, after_sha, created_at";
+
+        // Positional params in bind order: repo_id, after?, limit.
+        let (cursor_clause, limit_param) = match after {
+            Some(_) => (" AND seq > $2", 3),
+            None => ("", 2),
+        };
+        let sql = format!(
+            "SELECT {COLS} FROM repo_push_events WHERE repo_id = $1{cursor_clause} \
+             ORDER BY seq ASC LIMIT ${limit_param}"
+        );
+
+        let mut q = sqlx::query(&sql).bind(repo_id.to_string());
+        if let Some(seq) = after {
+            q = q.bind(seq);
+        }
+        let rows = q.bind(limit).fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(row_to_repo_push_event).collect())
+    }
+}
+
+fn row_to_repo_push_event(r: sqlx::postgres::PgRow) -> RepoPushEvent {
+    RepoPushEvent {
+        id: r.get("id"),
+        seq: r.get("seq"),
+        repo_id: r.get("repo_id"),
+        ref_name: r.get("ref_name"),
+        after_sha: r.get("after_sha"),
+        created_at: r.get("created_at"),
     }
 }
 
@@ -2867,8 +3852,41 @@ fn row_to_pr(r: sqlx::postgres::PgRow) -> PullRequest {
         status: r.get("status"),
         merged_by_did: r.get("merged_by_did"),
         merged_at: r.get("merged_at"),
+        head_commit: r.get("head_commit"),
         created_at: r.get("created_at"),
         updated_at: r.get("updated_at"),
+    }
+}
+
+fn row_to_status_claim(r: sqlx::postgres::PgRow) -> StatusClaim {
+    StatusClaim {
+        id: r.get("id"),
+        seq: r.get("seq"),
+        repo_id: r.get("repo_id"),
+        commit_sha: r.get("commit_sha"),
+        state: r.get("state"),
+        context: r.get("context"),
+        target_url: r.get("target_url"),
+        description: r.get("description"),
+        producer_did: r.get("producer_did"),
+        authorizing_did: r.get("authorizing_did"),
+        signature: r.get("signature"),
+        signature_input: r.get("signature_input"),
+        signing_string: r.get("signing_string"),
+        request_body: r.get("request_body"),
+        request_digest: r.get("request_digest"),
+        created_at: r.get("created_at"),
+    }
+}
+
+fn row_to_status_projection(r: sqlx::postgres::PgRow) -> StatusProjection {
+    StatusProjection {
+        state: r.get("state"),
+        context: r.get("context"),
+        target_url: r.get("target_url"),
+        description: r.get("description"),
+        producer_did: r.get("producer_did"),
+        created_at: r.get("created_at"),
     }
 }
 
@@ -3838,6 +4856,1007 @@ mod migration_tests {
 
         // Idempotent re-run.
         db.migrate().await.unwrap();
+    }
+
+    // ── Status claims, stored PR head, push events (v24) ─────────────────────
+
+    /// The version this branch's migration claims. Kept as a named constant so
+    /// the upgrade test's rollback target is derived from `MIGRATIONS` rather
+    /// than hard-coded twice.
+    const V24: i64 = 24;
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Seed a stored head without going through the code under test, so a
+    /// freeze assertion cannot pass just because the writer never ran.
+    async fn set_head_directly(db: &super::Db, pr_id: &str, sha: &str) {
+        sqlx::query("UPDATE pull_requests SET head_commit=$1 WHERE id=$2")
+            .bind(sha)
+            .bind(pr_id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    fn sample_claim(repo_id: &str, sha: &str, context: &str) -> super::StatusClaim {
+        super::StatusClaim {
+            id: uuid::Uuid::new_v4().to_string(),
+            // Ignored on insert: the database assigns the ordering key.
+            seq: 0,
+            repo_id: repo_id.to_string(),
+            commit_sha: sha.to_string(),
+            state: "success".to_string(),
+            context: context.to_string(),
+            target_url: Some("https://ci.example.com/runs/1".to_string()),
+            description: Some("all checks passed".to_string()),
+            producer_did: "did:key:zProducer".to_string(),
+            authorizing_did: "did:key:zOwner".to_string(),
+            signature: "sig1=:YWJj:".to_string(),
+            signature_input: "sig1=(\"@method\" \"@target-uri\");created=1754524800".to_string(),
+            signing_string: "\"@method\": POST\n\"@path\": /api/v1/repos/o/r/statuses/aaa"
+                .to_string(),
+            request_body: b"{\"state\":\"success\"}".to_vec(),
+            // Fresh per call, the way two real requests are: a genuine signature
+            // covers a `created` parameter and the body's digest, so no two
+            // distinct requests carry the same material. A constant here would
+            // make the second sample_claim of any test a replay of the first,
+            // which is a different property than the one under test.
+            request_digest: uuid::Uuid::new_v4().to_string(),
+            created_at: "2026-08-07T00:00:00+00:00".to_string(),
+        }
+    }
+
+    async fn table_exists(db: &super::Db, table: &str) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+            .bind(format!("public.{table}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn column_exists(db: &super::Db, table: &str, column: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns
+             WHERE table_name = $1 AND column_name = $2)",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    }
+
+    async fn insert_push_event(db: &super::Db, repo_id: &str, ref_name: &str, sha: &str, at: &str) {
+        sqlx::query(
+            "INSERT INTO repo_push_events (id, repo_id, ref_name, after_sha, created_at)
+             VALUES ($1,$2,$3,$4,$5)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(sha)
+        .bind(at)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    fn sample_pr(repo_id: &str, number: i64) -> super::PullRequest {
+        super::PullRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            repo_id: repo_id.to_string(),
+            number,
+            title: "add a thing".to_string(),
+            body: None,
+            author_did: "did:key:zAuthor".to_string(),
+            source_branch: "feature".to_string(),
+            target_branch: "main".to_string(),
+            status: "open".to_string(),
+            merged_by_did: None,
+            merged_at: None,
+            head_commit: None,
+            created_at: "2026-08-07T00:00:00+00:00".to_string(),
+            updated_at: "2026-08-07T00:00:00+00:00".to_string(),
+        }
+    }
+
+    /// Fresh-database path: the whole chain on an empty database creates all
+    /// three v24 objects, and a claim round-trips field for field, including
+    /// the nullable columns in both directions.
+    #[sqlx::test]
+    async fn migration_v24_fresh_chain_round_trips_a_claim(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        assert!(table_exists(&db, "status_claims").await);
+        assert!(table_exists(&db, "repo_push_events").await);
+        assert!(column_exists(&db, "pull_requests", "head_commit").await);
+
+        let full = sample_claim("repo-1", SHA_A, "ci/build");
+        let seq = db.insert_status_claim(&full).await.unwrap();
+        assert!(seq > 0, "the database must assign a positive sequence");
+
+        // Same tuple, nullable fields absent.
+        let mut sparse = sample_claim("repo-1", SHA_A, "ci/build");
+        sparse.state = "pending".to_string();
+        sparse.target_url = None;
+        sparse.description = None;
+        db.insert_status_claim(&sparse).await.unwrap();
+
+        let claims = db.list_status_claims("repo-1", SHA_A).await.unwrap();
+        assert_eq!(claims.len(), 2, "both claims are kept, nothing overwritten");
+
+        let got = &claims[0];
+        assert_eq!(got.id, full.id);
+        assert_eq!(got.seq, seq);
+        assert_eq!(got.repo_id, full.repo_id);
+        assert_eq!(got.commit_sha, full.commit_sha);
+        assert_eq!(got.state, full.state);
+        assert_eq!(got.context, full.context);
+        assert_eq!(got.target_url, full.target_url);
+        assert_eq!(got.description, full.description);
+        assert_eq!(got.producer_did, full.producer_did);
+        assert_eq!(got.authorizing_did, full.authorizing_did);
+        assert_eq!(got.signature, full.signature);
+        assert_eq!(got.signature_input, full.signature_input);
+        assert_eq!(got.signing_string, full.signing_string);
+        assert_eq!(got.request_body, full.request_body);
+        assert_eq!(got.created_at, full.created_at);
+
+        let sparse_row = &claims[1];
+        assert_eq!(sparse_row.id, sparse.id);
+        assert_eq!(sparse_row.state, "pending");
+        assert_eq!(sparse_row.target_url, None, "nullable column reads as None");
+        assert_eq!(
+            sparse_row.description, None,
+            "nullable column reads as None"
+        );
+
+        // A different commit does not see this commit's claims.
+        assert!(db
+            .list_status_claims("repo-1", &"b".repeat(40))
+            .await
+            .unwrap()
+            .is_empty());
+
+        // The push-events table takes a row per observed ref update.
+        insert_push_event(
+            &db,
+            "repo-1",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T00:00:00+00:00",
+        )
+        .await;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM repo_push_events WHERE repo_id = $1")
+                .bind("repo-1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The rollup's branch resolve asks for the newest push on one ref, and
+    /// "newest" has to mean the last row written, not the largest `created_at`.
+    /// The stamp is applied before the insert, so a push that stamped later can
+    /// commit earlier, the same defect the poll cursor had, in the reader next
+    /// door. Constructed rather than raced for: the row written first carries the
+    /// later timestamp.
+    #[sqlx::test]
+    async fn latest_push_sha_for_ref_follows_insertion_not_the_stamp(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.run_migrations().await.unwrap();
+
+        insert_push_event(
+            &db,
+            "repo-1",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T13:00:00+00:00",
+        )
+        .await;
+        insert_push_event(
+            &db,
+            "repo-1",
+            "refs/heads/main",
+            SHA_B,
+            "2026-08-07T12:00:00+00:00",
+        )
+        .await;
+
+        assert_eq!(
+            db.latest_push_sha_for_ref("repo-1", "refs/heads/main")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(SHA_B),
+            "the resolve must return the last push written, not the one carrying \
+             the largest application-stamped timestamp"
+        );
+
+        // The ref filter is still doing its job, so the assertion above is not
+        // just reading whatever row happens to be newest in the whole repo.
+        insert_push_event(
+            &db,
+            "repo-1",
+            "refs/heads/other",
+            SHA_A,
+            "2026-08-07T14:00:00+00:00",
+        )
+        .await;
+        assert_eq!(
+            db.latest_push_sha_for_ref("repo-1", "refs/heads/main")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(SHA_B),
+            "a push to another ref must not move this ref's resolve"
+        );
+    }
+
+    /// One push event on a caller-owned transaction, returning the sequence the
+    /// database allocated. The allocation is what these tests are about, so the
+    /// row goes in through raw SQL rather than the public writer: the writer now
+    /// owns its own transaction and the reproduction below needs to own the
+    /// commit boundaries itself.
+    async fn raw_push_insert(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        repo_id: &str,
+        ref_name: &str,
+        sha: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO repo_push_events (id, repo_id, ref_name, after_sha, created_at)
+             VALUES ($1,$2,$3,$4,$5) RETURNING seq",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(sha)
+        .bind("2026-08-07T00:00:00+00:00")
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+    }
+
+    fn push_event(repo_id: &str, ref_name: &str, sha: &str) -> super::RepoPushEvent {
+        super::RepoPushEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            seq: 0,
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            after_sha: sha.to_string(),
+            created_at: "2026-08-07T00:00:00+00:00".to_string(),
+        }
+    }
+
+    /// The defect the repo lock exists to stop, pinned at the layer it lives in.
+    ///
+    /// `seq` is a bigserial: `nextval` allocates at INSERT and the row becomes
+    /// visible at COMMIT, and the two orders are independent. A writer that
+    /// allocates first and commits second leaves its row behind a cursor that
+    /// has already passed, and no later poll asks for it again, so the event is
+    /// lost silently and permanently.
+    ///
+    /// Driven with two test-owned transactions rather than two racing calls to
+    /// the public writer, because the test has to decide when each one commits.
+    /// A barrier around the public writer cannot reproduce this: allocate and
+    /// commit were a single round trip, so there was no client-side window to
+    /// interleave. This test therefore holds against the shape the write had
+    /// before the lock as well as after it; what it documents is the mechanism,
+    /// and the guard that the writer actually takes the lock is the test below.
+    #[sqlx::test]
+    async fn out_of_order_commits_strand_a_row_behind_the_cursor(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let mut first = pool.begin().await.unwrap();
+        let seq_first = raw_push_insert(&mut first, "repo-1", "refs/heads/main", SHA_A).await;
+        let mut second = pool.begin().await.unwrap();
+        let seq_second = raw_push_insert(&mut second, "repo-1", "refs/heads/other", SHA_B).await;
+        assert!(
+            seq_first < seq_second,
+            "the fixture must allocate in this order to be the case under test"
+        );
+
+        // The later allocation commits first, which is exactly what an
+        // unserialized pair of writers can do.
+        second.commit().await.unwrap();
+
+        let page = db
+            .list_repo_push_events_keyset("repo-1", None, 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![seq_second],
+            "only the committed row is visible, so the poller's cursor lands past \
+             the uncommitted one"
+        );
+        let cursor = page.last().unwrap().seq;
+        assert!(cursor > seq_first);
+
+        first.commit().await.unwrap();
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM repo_push_events WHERE repo_id = 'repo-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(total, 2, "both rows are committed and visible");
+        assert!(
+            db.list_repo_push_events_keyset("repo-1", Some(cursor), 50)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the row that committed second is now unreachable: every later poll \
+             asks for seq > {cursor} and it will never be delivered"
+        );
+    }
+
+    /// The writer waits on its own repo's lock and on no other repo's.
+    ///
+    /// Probed directly rather than inferred from timing between two writers: a
+    /// transaction owned by the test holds the advisory lock for one repo, so
+    /// "does the writer take this lock" becomes an observation rather than a
+    /// race. The negative half is the one that matters and it is asserted
+    /// first-class: a write for a different repo must not queue behind an
+    /// unrelated repo's push.
+    #[sqlx::test]
+    async fn a_push_write_waits_on_its_own_repo_lock_and_no_others(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        let db = super::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind("repo-held")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        // Both failure modes are one assertion on purpose: a key too coarse
+        // makes this write either hang until the outer timeout or fail its own
+        // bounded lock wait, and either way the property that broke is the same
+        // one.
+        let free = tokio::time::timeout(
+            Duration::from_secs(10),
+            db.insert_repo_push_events(&[push_event("repo-free", "refs/heads/main", SHA_A)]),
+        )
+        .await;
+        assert!(
+            matches!(free, Ok(Ok(()))),
+            "a write for another repo must not wait on this repo's lock; got {free:?}"
+        );
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            db.insert_repo_push_events(&[push_event("repo-held", "refs/heads/main", SHA_A)]),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a write for a repo whose lock is held must wait rather than allocate \
+             a sequence, or its row can commit after a later one and be stranded"
+        );
+        let held_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM repo_push_events WHERE repo_id = 'repo-held'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(held_rows, 0, "the blocked write must not have committed");
+
+        holder.rollback().await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            db.insert_repo_push_events(&[push_event("repo-held", "refs/heads/main", SHA_B)]),
+        )
+        .await
+        .expect("the write must proceed once the lock is released")
+        .unwrap();
+    }
+
+    /// A wait that never ends returns an error rather than holding the push
+    /// open, and it spends its whole retry budget getting there.
+    ///
+    /// Both halves matter and neither implies the other. Without the bound the
+    /// user's `git push` hangs for as long as the lock is held, which on the
+    /// inline path is a pooled connection held with it. Without the retries a
+    /// single slow neighbour turns into a lost chunk, which is the loss the lock
+    /// exists to prevent, arriving by another road.
+    #[sqlx::test]
+    async fn a_lock_wait_that_never_clears_is_retried_and_then_returned(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        let db = super::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind("repo-held")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let lock_wait = Duration::from_millis(super::PUSH_LOCK_TIMEOUT_MS.into());
+        let started = std::time::Instant::now();
+        // A fixed ceiling, not one derived from the constants above: the point
+        // of this half is that the write terminates on its own, and an
+        // expectation computed from the same values it is checking would move
+        // with them.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            db.insert_repo_push_events(&[push_event("repo-held", "refs/heads/main", SHA_A)]),
+        )
+        .await
+        .expect("the write must give up on its own rather than wait on the lock forever");
+        let elapsed = started.elapsed();
+
+        let err = outcome.expect_err("the write cannot have succeeded under a held lock");
+        assert!(
+            err.to_string().contains("lock timeout"),
+            "the error must be the lock wait expiring, not something else the \
+             retry classified wrongly; got: {err}"
+        );
+        assert!(
+            elapsed >= lock_wait * 2,
+            "the write must wait out more than one lock timeout before giving \
+             up; it returned after {elapsed:?}, which is a single attempt"
+        );
+
+        holder.rollback().await.unwrap();
+    }
+
+    /// Two writers against one repo, in flight at once: every row is delivered
+    /// by a cursor walk exactly once, and none is skipped.
+    ///
+    /// `tokio::spawn` and a `tokio::sync::Barrier`, never a thread: the
+    /// push-write statement counter is a thread-local that depends on
+    /// `#[sqlx::test]` building a single-threaded runtime, and a writer moved
+    /// off that thread splits the count for every test that measures it.
+    #[sqlx::test]
+    async fn concurrent_writers_are_each_delivered_exactly_once(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        const WRITERS: usize = 4;
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let db = db.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                let event = push_event("repo-race", &format!("refs/heads/b{i}"), SHA_A);
+                gate.wait().await;
+                db.insert_repo_push_events(std::slice::from_ref(&event))
+                    .await
+                    .unwrap();
+                event.id
+            }));
+        }
+        let mut written = Vec::new();
+        for handle in handles {
+            written.push(handle.await.unwrap());
+        }
+
+        // Page one row at a time, the way a poller that persists its cursor
+        // does, so a skipped row shows up as a missing id rather than being
+        // hidden inside one large page.
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = db
+                .list_repo_push_events_keyset("repo-race", cursor, 1)
+                .await
+                .unwrap();
+            let Some(row) = page.into_iter().next() else {
+                break;
+            };
+            seen.push(row.id);
+            cursor = Some(row.seq);
+        }
+
+        assert_eq!(
+            seen.len(),
+            WRITERS,
+            "the walk returned {} rows for {WRITERS} writers",
+            seen.len()
+        );
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "no row may be delivered twice");
+        let mut expected = written;
+        expected.sort();
+        assert_eq!(unique, expected, "every writer's row must be reachable");
+    }
+
+    /// Upgrade path, the load-bearing one: `#[sqlx::test]` hands out a fresh
+    /// database that runs the entire chain, so the fresh-chain test above stays
+    /// green even if the v24 statements were appended to an already-applied
+    /// entry. Only a simulated existing node catches that.
+    #[sqlx::test]
+    async fn migration_v24_upgrade_path_adds_claims_head_commit_and_push_events(
+        pool: sqlx::PgPool,
+    ) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Roll the database back to the state of a node at the highest version
+        // below 24 that this build declares.
+        sqlx::query("DROP TABLE IF EXISTS status_claims")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE IF EXISTS repo_push_events")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE pull_requests DROP COLUMN IF EXISTS head_commit")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM schema_migrations WHERE version >= $1")
+            .bind(V24)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let prior = MIGRATIONS
+            .iter()
+            .map(|m| m.version)
+            .filter(|v| *v < V24)
+            .max()
+            .expect("MIGRATIONS must declare a version below 24");
+        let recorded_max: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded_max, prior,
+            "the simulated node must sit at the highest version below {V24}"
+        );
+
+        // A pull request written by the old node, before the column existed.
+        let legacy = sample_pr("repo-legacy", 1);
+        db.create_pr(&legacy).await.unwrap();
+
+        // Upgrade through the real entry point rather than hand-copied SQL.
+        db.migrate().await.unwrap();
+
+        assert!(
+            table_exists(&db, "status_claims").await,
+            "status_claims missing after upgrade on an existing node"
+        );
+        assert!(
+            table_exists(&db, "repo_push_events").await,
+            "repo_push_events missing after upgrade on an existing node"
+        );
+        assert!(
+            column_exists(&db, "pull_requests", "head_commit").await,
+            "head_commit missing after upgrade on an existing node"
+        );
+
+        let col: (String, String) = sqlx::query_as(
+            "SELECT data_type, is_nullable
+             FROM information_schema.columns
+             WHERE table_name = 'pull_requests' AND column_name = 'head_commit'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(col.0, "text");
+        assert_eq!(col.1, "YES", "head_commit must be nullable");
+
+        // The pre-existing row survives with a null head.
+        let survived = db.get_pr("repo-legacy", 1).await.unwrap().unwrap();
+        assert_eq!(survived.head_commit, None);
+
+        // And the runtime paths work against the upgraded schema.
+        let claim = sample_claim("repo-legacy", SHA_A, "ci/build");
+        let seq = db.insert_status_claim(&claim).await.unwrap();
+        let claims = db.list_status_claims("repo-legacy", SHA_A).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].id, claim.id);
+        assert_eq!(claims[0].seq, seq);
+        assert_eq!(claims[0].target_url, claim.target_url);
+        insert_push_event(
+            &db,
+            "repo-legacy",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T00:00:00+00:00",
+        )
+        .await;
+
+        let recorded: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM schema_migrations WHERE version = 24")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, 1, "v24 must be recorded as applied");
+
+        // Idempotent re-run.
+        db.migrate().await.unwrap();
+    }
+
+    /// A pull request opened before anything pushed to its source branch has no
+    /// stored head, on both read paths.
+    #[sqlx::test]
+    async fn pr_created_before_any_push_has_no_head_commit(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        db.create_pr(&sample_pr("repo-1", 1)).await.unwrap();
+
+        let one = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        assert_eq!(
+            one.head_commit, None,
+            "get_pr must read a null head as None"
+        );
+
+        let listed = db.list_prs("repo-1").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].head_commit, None,
+            "list_prs must read a null head as None"
+        );
+    }
+
+    /// The push-side update is one statement keyed on (repo, source branch,
+    /// open). Prove every arm of that WHERE clause in both directions in one
+    /// pass: the open PR on the branch moves, an open PR on a different branch
+    /// does not, and the closed and merged PRs on the *same* branch keep the
+    /// head they froze at. The status predicate is the whole freeze mechanism,
+    /// so a missing one shows up here as a moved head on a closed PR.
+    #[sqlx::test]
+    async fn set_open_pr_heads_moves_open_prs_on_the_branch_and_freezes_the_rest(
+        pool: sqlx::PgPool,
+    ) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // #1 open on `feature` — must move.
+        db.create_pr(&sample_pr("repo-1", 1)).await.unwrap();
+        // #2 open on `other` — must not move.
+        let mut other = sample_pr("repo-1", 2);
+        other.source_branch = "other".to_string();
+        db.create_pr(&other).await.unwrap();
+        // #3 closed on `feature`, frozen at SHA_A.
+        let closed = sample_pr("repo-1", 3);
+        db.create_pr(&closed).await.unwrap();
+        set_head_directly(&db, &closed.id, SHA_A).await;
+        db.close_pr(&closed.id).await.unwrap();
+        // #4 merged on `feature`, frozen at SHA_A.
+        let merged = sample_pr("repo-1", 4);
+        db.create_pr(&merged).await.unwrap();
+        set_head_directly(&db, &merged.id, SHA_A).await;
+        db.merge_pr(&merged.id, "did:key:zMerger", None)
+            .await
+            .unwrap();
+
+        let moved = db
+            .set_open_pr_heads("repo-1", "feature", SHA_B)
+            .await
+            .unwrap();
+        assert_eq!(moved, 1, "only the one open PR on `feature` may be updated");
+
+        assert_eq!(
+            db.get_pr("repo-1", 1).await.unwrap().unwrap().head_commit,
+            Some(SHA_B.to_string()),
+            "an open PR on the pushed branch must track the new head"
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
+            None,
+            "a PR on an unrelated branch must be untouched"
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 3).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "a closed PR's head is frozen"
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 4).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "a merged PR's head is frozen"
+        );
+    }
+
+    /// A same-named branch is the common case across repos, so a missing repo
+    /// predicate would be invisible to every single-repo assertion above.
+    #[sqlx::test]
+    async fn set_open_pr_heads_is_scoped_to_the_named_repo(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        db.create_pr(&sample_pr("repo-1", 1)).await.unwrap();
+        db.create_pr(&sample_pr("repo-2", 1)).await.unwrap();
+
+        let moved = db
+            .set_open_pr_heads("repo-1", "feature", SHA_B)
+            .await
+            .unwrap();
+        assert_eq!(moved, 1, "the sibling repo's PR must not be counted");
+
+        assert_eq!(
+            db.get_pr("repo-1", 1).await.unwrap().unwrap().head_commit,
+            Some(SHA_B.to_string())
+        );
+        assert_eq!(
+            db.get_pr("repo-2", 1).await.unwrap().unwrap().head_commit,
+            None,
+            "a push in one repo must not move a same-named branch's PR elsewhere"
+        );
+    }
+
+    /// The merge stamp writes the head it actually merged, overwriting whatever
+    /// a racing push left. Passing `None` (a merge that could not resolve the
+    /// source head) must preserve the stored value rather than null it out.
+    #[sqlx::test]
+    async fn merge_pr_stamps_the_supplied_head_and_none_preserves_it(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        let stamped = sample_pr("repo-1", 1);
+        db.create_pr(&stamped).await.unwrap();
+        set_head_directly(&db, &stamped.id, SHA_A).await;
+        db.merge_pr(&stamped.id, "did:key:zMerger", Some(SHA_B))
+            .await
+            .unwrap();
+        let after = db.get_pr("repo-1", 1).await.unwrap().unwrap();
+        assert_eq!(after.status, "merged");
+        assert_eq!(
+            after.head_commit,
+            Some(SHA_B.to_string()),
+            "the merge stamps the head it merged, not the one the row carried"
+        );
+
+        let preserved = sample_pr("repo-1", 2);
+        db.create_pr(&preserved).await.unwrap();
+        set_head_directly(&db, &preserved.id, SHA_A).await;
+        db.merge_pr(&preserved.id, "did:key:zMerger", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "an unresolvable source head must not null a stored head"
+        );
+    }
+
+    /// The read-side fallback's write, which an UNAUTHENTICATED rollup read can
+    /// trigger. It has to be self-limiting in SQL, not by handler ordering: it
+    /// fills an absent head on an open pull request and refuses every other case,
+    /// so a concurrent push that already recorded a newer head cannot be rolled
+    /// back to a staler branch tip, and a closed pull request's frozen head (or
+    /// frozen absence) is never written at all.
+    #[sqlx::test]
+    async fn set_pr_head_if_absent_fills_only_an_absent_open_head(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        // Absent head, open: filled.
+        let fresh = sample_pr("repo-1", 1);
+        db.create_pr(&fresh).await.unwrap();
+        assert_eq!(db.set_pr_head_if_absent(&fresh.id, SHA_A).await.unwrap(), 1);
+        assert_eq!(
+            db.get_pr("repo-1", 1).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string())
+        );
+
+        // Head already present: refused, and the stored value stands.
+        assert_eq!(
+            db.set_pr_head_if_absent(&fresh.id, SHA_B).await.unwrap(),
+            0,
+            "a stored head must never be overwritten by a read-side fallback"
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 1).await.unwrap().unwrap().head_commit,
+            Some(SHA_A.to_string()),
+            "a stored head must never be overwritten by a read-side fallback"
+        );
+
+        // Absent head but closed: refused.
+        let closed = sample_pr("repo-1", 2);
+        db.create_pr(&closed).await.unwrap();
+        db.close_pr(&closed.id).await.unwrap();
+        assert_eq!(
+            db.set_pr_head_if_absent(&closed.id, SHA_A).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 2).await.unwrap().unwrap().head_commit,
+            None,
+            "a closed pull request's head must not be back-filled"
+        );
+
+        // Absent head but merged: refused.
+        let merged = sample_pr("repo-1", 3);
+        db.create_pr(&merged).await.unwrap();
+        db.merge_pr(&merged.id, "did:key:zMerger", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.set_pr_head_if_absent(&merged.id, SHA_A).await.unwrap(),
+            0
+        );
+        assert_eq!(
+            db.get_pr("repo-1", 3).await.unwrap().unwrap().head_commit,
+            None
+        );
+    }
+
+    /// The projection orders on `seq`, so prove the database hands out strictly
+    /// increasing values in insertion order rather than assuming it.
+    #[sqlx::test]
+    async fn status_claim_seq_is_monotonic_within_a_tuple(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        let mut seqs = Vec::new();
+        let mut ids = Vec::new();
+        for state in ["pending", "failure", "success"] {
+            let mut claim = sample_claim("repo-1", SHA_A, "ci/build");
+            claim.state = state.to_string();
+            // Identical server timestamp on every row: nothing but `seq` can
+            // recover the insertion order.
+            claim.created_at = "2026-08-07T00:00:00+00:00".to_string();
+            seqs.push(db.insert_status_claim(&claim).await.unwrap());
+            ids.push(claim.id);
+        }
+
+        assert!(
+            seqs[0] < seqs[1] && seqs[1] < seqs[2],
+            "seq must strictly increase in insertion order, got {seqs:?}"
+        );
+
+        let claims = db.list_status_claims("repo-1", SHA_A).await.unwrap();
+        assert_eq!(
+            claims.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            ids,
+            "claims must read back in seq order"
+        );
+        assert_eq!(
+            claims.iter().map(|c| c.seq).collect::<Vec<_>>(),
+            seqs,
+            "the stored seq must be the one the insert reported"
+        );
+    }
+
+    /// The replay containment lives in the schema, not in the Rust that reads it.
+    ///
+    /// The capped insert probes for the digest before it writes, but that probe
+    /// is a fast path: it is a read, and a read cannot exclude a writer it has
+    /// not seen commit. This drives the raw insert past the probe entirely, so
+    /// what refuses is the unique index or nothing. Asserted here rather than
+    /// only through the handler because the handler's own replay tests stay green
+    /// on the probe alone, which is exactly how a guard rots into decoration.
+    #[sqlx::test]
+    async fn the_schema_refuses_a_second_claim_with_the_same_request_digest(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        let first = sample_claim("repo-digest", SHA_A, "ci/build");
+        db.insert_status_claim(&first).await.unwrap();
+
+        // Different row in every other respect: a fresh id, another commit, a
+        // different context and verdict. Only the request identity repeats.
+        let mut replay = sample_claim("repo-digest", SHA_B, "ci/other");
+        replay.state = "failure".to_string();
+        replay.request_digest = first.request_digest.clone();
+
+        let err = db
+            .insert_status_claim(&replay)
+            .await
+            .expect_err("the database must refuse a second row carrying a digest it already has");
+        let text = err.to_string();
+        assert!(
+            text.contains("uq_status_claims_request_digest") || text.contains("duplicate key"),
+            "the refusal must come from the request-digest uniqueness, got: {text}"
+        );
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM status_claims WHERE repo_id = 'repo-digest'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1, "the refused write must leave no row");
+    }
+
+    /// The caps have to hold against writers racing each other, which is the only
+    /// case they are actually for: a sequential caller hitting a cap is a
+    /// misbehaving client, a burst of them is the fan-out the bound exists to
+    /// stop. Eight writers are released together onto a tuple seeded to `cap - 1`,
+    /// so exactly one of them may win. Counting rows under READ COMMITTED and then
+    /// inserting is not enough: each writer's count is taken before any of the
+    /// others commit, so every one of them reads `cap - 1` and inserts, and the
+    /// table ends up over the bound by the concurrency.
+    #[sqlx::test]
+    async fn capped_insert_holds_the_bound_against_concurrent_writers(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool.clone());
+        db.migrate().await.unwrap();
+
+        const CAP: i64 = 3;
+        const WRITERS: usize = 8;
+        // Only the per-tuple bound is under test; the other two are left far out
+        // of reach so the refusal cannot come from them.
+        fn caps() -> super::ClaimCaps {
+            super::ClaimCaps {
+                per_tuple: CAP,
+                contexts_per_commit: 1_000,
+                per_repo_window: 1_000_000,
+            }
+        }
+
+        for _ in 0..CAP - 1 {
+            db.insert_status_claim(&sample_claim("repo-race", SHA_A, "ci/build"))
+                .await
+                .unwrap();
+        }
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for _ in 0..WRITERS {
+            let db = db.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                let claim = sample_claim("repo-race", SHA_A, "ci/build");
+                // Every writer reaches the capped insert at the same moment, so
+                // the count-then-insert windows overlap instead of queueing.
+                gate.wait().await;
+                db.insert_status_claim_capped(&claim, &caps())
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut accepted = 0;
+        for handle in handles {
+            if let super::ClaimInsert::Inserted(_) = handle.await.unwrap() {
+                accepted += 1;
+            }
+        }
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM status_claims WHERE repo_id = 'repo-race'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows, CAP,
+            "the bound is {CAP} rows; {WRITERS} concurrent writers left {rows}"
+        );
+        assert_eq!(
+            accepted, 1,
+            "exactly one writer may be told its claim was accepted"
+        );
+    }
+
+    /// The public commit-status read must not pull the signature material off
+    /// disk. `signing_string` and `request_body` are write-time provenance that
+    /// no read surface renders, and together they run to kilobytes per claim, so
+    /// selecting them costs the anonymous read path on every request. Asserted on
+    /// the query text, because a widened column list is invisible in the response
+    /// body: the extra bytes are read and then dropped.
+    #[test]
+    fn projection_selects_no_signature_columns() {
+        for banned in [
+            "signature",
+            "signature_input",
+            "signing_string",
+            "request_body",
+        ] {
+            assert!(
+                !super::LATEST_STATUS_CLAIMS_SQL.contains(banned),
+                "the commit-status projection must not select `{banned}`: it is \
+                 write-time provenance no read surface renders"
+            );
+        }
     }
 
     #[sqlx::test]
