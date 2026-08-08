@@ -73,6 +73,17 @@ impl HttpSignature {
             .map(|s| s.trim_matches('"').to_string())
             .collect();
 
+        // RFC 9421 §2.1: a component identifier appears at most once. A repeat
+        // says nothing extra and only lengthens the signing string a verifier
+        // has to build, so it is refused rather than folded.
+        for (i, c) in components.iter().enumerate() {
+            if components[i + 1..].contains(c) {
+                return Err(Error::HttpSignature(format!(
+                    "duplicate covered component '{c}' in Signature-Input"
+                )));
+            }
+        }
+
         let params = parse_params(params_str)?;
 
         let key_id: Did = params
@@ -270,6 +281,33 @@ mod tests {
         let missing = sig.missing_components();
         assert!(missing.contains(&"@path"));
         assert!(missing.contains(&"content-digest"));
+    }
+
+    /// RFC 9421 §2.1: a component identifier must not appear twice in the
+    /// covered list. Repeating one is not a way to say anything, but it does
+    /// repeat a line in the signing string, so the size of what a verifier
+    /// builds (and what a node persists alongside a claim) is set by how many
+    /// times the caller chose to write the same name.
+    #[test]
+    fn parse_rejects_duplicate_components() {
+        let kp = Keypair::generate();
+        let did = kp.did();
+        let sig_input = format!(
+            r#"sig1=("@method" "@path" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        let err = HttpSignature::parse(&sig_input, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:")
+            .expect_err("a repeated component must be refused");
+        assert!(
+            err.to_string().contains("duplicate"),
+            "the error must name the duplication, got: {err}"
+        );
+
+        // The control: the same list without the repeat still parses.
+        let ok = format!(
+            r#"sig1=("@method" "@path" "content-digest");keyid="{did}";alg="ed25519";created=1000"#
+        );
+        HttpSignature::parse(&ok, "sig1=:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:")
+            .expect("a distinct component list must still parse");
     }
 
     #[test]
