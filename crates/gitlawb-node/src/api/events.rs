@@ -13,6 +13,18 @@ use crate::state::AppState;
 /// shared collector's clamp and the per-handler request caps so they can't drift.
 const MAX_VISIBLE_REF_UPDATES: i64 = 200;
 
+/// Documented maximum page size of the repo-scoped push-event poll surface, and
+/// the value an over-large `limit` is clamped to. Named separately from the
+/// ref-update ceiling above because it bounds a different feed with a different
+/// gate; they happen to agree on a number today.
+const MAX_PUSH_EVENT_PAGE: i64 = 200;
+
+/// Smallest page the poll surface will serve. Not zero, and that is the point: a
+/// zero-row page reads to a cursor-persisting poller exactly like "you have
+/// reached the end", so combined with a cursor it could not carry forward it
+/// silently sent the poller back to the beginning of history.
+const MIN_PUSH_EVENT_PAGE: i64 = 1;
+
 /// Collect up to `limit` ref-update rows visible to `caller`, newest first,
 /// paging past rows the feed gate drops. Filtering after a plain SQL `LIMIT`
 /// under-serves an anonymous caller whenever the newest rows name private local
@@ -325,6 +337,106 @@ pub async fn list_repo_events(
     Ok(Json(
         serde_json::json!({ "events": all_events, "count": count }),
     ))
+}
+
+/// A caller-supplied `cursor` value, or a 400.
+///
+/// The only legal cursor is one this surface issued: a non-negative sequence
+/// number. Anything else is refused rather than reinterpreted, because both
+/// silent readings are wrong in a way the poller cannot see. Reading it as "no
+/// cursor" replays the repo's whole history to a client that believed it was up
+/// to date; reading it as "the end" hides every event after it.
+fn parse_push_cursor(raw: &str) -> Result<i64> {
+    match raw.parse::<i64>() {
+        Ok(v) if v >= 0 => Ok(v),
+        _ => Err(crate::error::AppError::BadRequest(
+            "cursor must be a non-negative integer issued by this endpoint as \
+             `next_cursor`"
+                .into(),
+        )),
+    }
+}
+
+/// GET /api/v1/repos/{owner}/{repo}/push-events?cursor=&limit=
+///
+/// The catch-up half of push notification. A subscriber whose webhook delivery
+/// failed polls this with the cursor it last saw and gets every push since,
+/// oldest first, so a missed delivery costs a poll rather than needing retry
+/// machinery on the send side.
+///
+/// The cursor is the `next_cursor` the previous page returned, a
+/// database-assigned sequence number, and rows are read strictly after it. It is
+/// one value rather than a timestamp pair because the timestamp is stamped by
+/// the application before the insert and cannot order these rows (see
+/// [`crate::db::Db::list_repo_push_events_keyset`]). Omitting it starts at the
+/// beginning of the repo's history.
+///
+/// `next_cursor` is always present, never null, and never lower than the cursor
+/// the request carried: an empty page hands back the position the caller already
+/// had. A poller that persists it therefore stays where it is when there is
+/// nothing new, instead of restarting from the beginning.
+///
+/// `limit` is clamped to [`MIN_PUSH_EVENT_PAGE`]..=[`MAX_PUSH_EVENT_PAGE`]. A
+/// value that does not parse falls back to the default page size.
+///
+/// Rows come from `repo_push_events`, which only this node's own pushes write.
+/// The gossip-sourced `received_ref_updates` rows are a different data class on
+/// a different surface, and nothing here reads or writes them.
+pub async fn list_repo_push_events(
+    State(state): State<AppState>,
+    Path((owner, repo_name)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+    auth: Option<Extension<AuthenticatedDid>>,
+) -> Result<Json<serde_json::Value>> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(MIN_PUSH_EVENT_PAGE, MAX_PUSH_EVENT_PAGE);
+
+    // Repo-root read gate on the requested path, before any event row is
+    // touched: a caller who cannot read the repo gets the repo's own not-found,
+    // byte-identical to a repo that does not exist here, so the surface is not an
+    // oracle for which private repos are being pushed to. Rows are keyed by the
+    // unique repo record id, so unlike the gossip feed there is no lossy wire
+    // slug to re-gate per row.
+    let caller = auth.as_ref().map(|e| e.0 .0.as_str());
+    let (record, _rules) =
+        crate::api::authorize_repo_read(&state, &owner, &repo_name, caller, "/").await?;
+
+    // Cursor validation runs AFTER the gate on purpose: a caller who may not read
+    // this repo gets the not-found for every request shape, so a 400 can never
+    // become the tell that distinguishes a private repo from a missing one.
+    let cursor = match params.get("cursor") {
+        Some(raw) => Some(parse_push_cursor(raw)?),
+        None => None,
+    };
+
+    let rows = state
+        .db
+        .list_repo_push_events_keyset(&record.id, cursor, limit)
+        .await?;
+
+    let events: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "id":         e.id,
+                "ref_name":   e.ref_name,
+                "after_sha":  e.after_sha,
+                "created_at": e.created_at,
+            })
+        })
+        .collect();
+    // Never null and never backwards: an empty page returns the cursor the caller
+    // arrived with (or the start of history, if it arrived with none).
+    let next = rows.last().map_or(cursor.unwrap_or(0), |e| e.seq);
+    let count = events.len();
+    Ok(Json(serde_json::json!({
+        "events": events,
+        "count": count,
+        "next_cursor": next,
+    })))
 }
 
 #[cfg(test)]
@@ -1490,6 +1602,753 @@ mod ref_updates_feed_tests {
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
             "a DB error in the cert fetch must fail closed (500), never an empty 200"
+        );
+    }
+}
+
+#[cfg(test)]
+mod push_events_tests {
+    use crate::db::{RepoPushEvent, RepoRecord};
+    use crate::test_support::{signed_request_as, test_state};
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use axum::Router;
+    use chrono::Utc;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    use super::MAX_PUSH_EVENT_PAGE;
+
+    const OWNER: &str = "did:key:z6MkOwner";
+    const SHA_A: &str = "1111111111111111111111111111111111111111";
+    const SHA_B: &str = "2222222222222222222222222222222222222222";
+
+    fn repo(id: &str, name: &str, is_public: bool) -> RepoRecord {
+        let now = Utc::now();
+        RepoRecord {
+            id: id.into(),
+            name: name.into(),
+            owner_did: OWNER.into(),
+            description: None,
+            is_public,
+            default_branch: "main".into(),
+            created_at: now,
+            updated_at: now,
+            disk_path: format!("/tmp/{id}"),
+            forked_from: None,
+            machine_id: None,
+        }
+    }
+
+    fn poll_router(state: crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/repos/{owner}/{repo}/push-events",
+                axum::routing::get(super::list_repo_push_events),
+            )
+            .with_state(state)
+    }
+
+    fn global_feed_router(state: crate::state::AppState) -> Router {
+        Router::new()
+            .route(
+                "/api/v1/events/ref-updates",
+                axum::routing::get(super::list_ref_updates),
+            )
+            .with_state(state)
+    }
+
+    fn poll_uri(name: &str, query: &str) -> String {
+        let base = format!("/api/v1/repos/{OWNER}/{name}/push-events");
+        if query.is_empty() {
+            base
+        } else {
+            format!("{base}?{query}")
+        }
+    }
+
+    async fn poll(
+        state: &crate::state::AppState,
+        caller: Option<&str>,
+        uri: &str,
+    ) -> axum::response::Response {
+        let req = match caller {
+            Some(did) => signed_request_as(did, Method::GET, uri, Body::empty()),
+            None => Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request builder"),
+        };
+        poll_router(state.clone()).oneshot(req).await.unwrap()
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// Status plus the full response body, for the byte-identical deny comparison.
+    async fn status_and_bytes(resp: axum::response::Response) -> (StatusCode, Vec<u8>) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, bytes)
+    }
+
+    fn event_rows(v: &serde_json::Value) -> Vec<(String, String, String)> {
+        v["events"]
+            .as_array()
+            .expect("events array")
+            .iter()
+            .map(|e| {
+                (
+                    e["id"].as_str().expect("id").to_string(),
+                    e["ref_name"].as_str().expect("ref_name").to_string(),
+                    e["after_sha"].as_str().expect("after_sha").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Walk the whole poll surface one row at a time, following the cursor the
+    /// surface itself hands back, and return the event ids in the order served.
+    /// `max_steps` bounds the walk, so a cursor that fails to advance fails the
+    /// test instead of hanging it.
+    async fn walk_cursor(
+        state: &crate::state::AppState,
+        name: &str,
+        max_steps: usize,
+    ) -> Vec<String> {
+        let mut ids: Vec<String> = Vec::new();
+        let mut query = "limit=1".to_string();
+        for _ in 0..max_steps {
+            let body = body_json(poll(state, Some(OWNER), &poll_uri(name, &query)).await).await;
+            let rows = event_rows(&body);
+            if rows.is_empty() {
+                return ids;
+            }
+            ids.extend(rows.into_iter().map(|r| r.0));
+            query = format!(
+                "limit=1&cursor={}",
+                body["next_cursor"].as_i64().expect("next_cursor"),
+            );
+        }
+        panic!("the cursor walk did not terminate within {max_steps} steps: {ids:?}");
+    }
+
+    /// Seed one push-event row directly, for the read-side scenarios that are
+    /// about paging and gating rather than about the producer.
+    async fn seed_event(
+        state: &crate::state::AppState,
+        id: &str,
+        repo_id: &str,
+        ref_name: &str,
+        sha: &str,
+        at: &str,
+    ) {
+        state
+            .db
+            .insert_repo_push_event(&RepoPushEvent {
+                id: id.into(),
+                // Ignored on insert; the database assigns the ordering key.
+                seq: 0,
+                repo_id: repo_id.into(),
+                ref_name: ref_name.into(),
+                after_sha: sha.into(),
+                created_at: at.into(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A TCP port with nothing listening on it: bind, read the port, drop the
+    /// listener. Used to make "the webhook target is unreachable" a property the
+    /// test observes rather than one it assumes.
+    fn dead_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let port = l.local_addr().expect("local addr").port();
+        drop(l);
+        port
+    }
+
+    /// Covers AE6. The repo's webhook points at a port nothing is listening on,
+    /// so the push notification cannot be delivered; the test proves that by
+    /// firing a request at the same target with the same client and observing the
+    /// transport error, rather than assuming it. The push still records its event,
+    /// and a poll with a cursor from before the push returns the pushed ref and
+    /// SHA. That is the whole point of the unit: delivery reliability becomes a
+    /// read-side property, with no retry machinery anywhere.
+    #[sqlx::test]
+    async fn ae6_poll_catches_up_when_the_webhook_target_is_unreachable(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-ae6", "widget", true))
+            .await
+            .unwrap();
+
+        let url = format!("http://127.0.0.1:{}/hook", dead_port());
+        state
+            .db
+            .create_webhook(&crate::db::Webhook {
+                id: "hook-ae6".into(),
+                repo_id: "r-ae6".into(),
+                url: url.clone(),
+                secret: None,
+                events: vec!["push".into()],
+                created_by_did: OWNER.into(),
+                created_at: Utc::now().to_rfc3339(),
+                active: true,
+            })
+            .await
+            .unwrap();
+
+        // The cursor a subscriber last polled at. The repo has never been pushed
+        // to, so that cursor is the start of history.
+        let before = 0;
+
+        // The push happens. The webhook fires into the void.
+        crate::api::repos::record_push_events(
+            &state.db,
+            "r-ae6",
+            &[crate::api::repos::RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: SHA_A.into(),
+                ref_name: "refs/heads/main".into(),
+            }],
+        )
+        .await;
+        crate::webhooks::fire_event(
+            state.db.clone(),
+            state.http_client.clone(),
+            "r-ae6",
+            "push",
+            serde_json::json!({ "ref": "refs/heads/main", "after": SHA_A }),
+        );
+
+        // The target really is unreachable: same client, same URL, transport error.
+        let delivery = state.http_client.post(&url).body("{}").send().await;
+        assert!(
+            delivery.is_err(),
+            "the webhook target must be unreachable for this scenario to prove \
+             anything; got {delivery:?}"
+        );
+
+        let body = body_json(
+            poll(
+                &state,
+                Some(OWNER),
+                &poll_uri("widget", &format!("cursor={before}")),
+            )
+            .await,
+        )
+        .await;
+        let rows = event_rows(&body);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the missed push must be discoverable by polling, got {body}"
+        );
+        assert_eq!(rows[0].1, "refs/heads/main");
+        assert_eq!(rows[0].2, SHA_A);
+        assert_eq!(body["count"].as_u64(), Some(1));
+    }
+
+    /// Two ref updates in one push share a timestamp by construction, which is
+    /// the case a timestamp-based cursor cannot page: it either repeats a row or
+    /// drops one at the boundary. The collision is produced deterministically by
+    /// pushing two refs at once (the producer stamps one timestamp for the whole
+    /// push), not raced for. With a page size of one, the walk must return both
+    /// rows exactly once and then terminate.
+    ///
+    /// The cursor is fed back verbatim into the query string, so this also pins
+    /// that the emitted cursor survives that round trip.
+    #[sqlx::test]
+    async fn colliding_timestamps_page_once_each(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-tie", "widget", true))
+            .await
+            .unwrap();
+
+        crate::api::repos::record_push_events(
+            &state.db,
+            "r-tie",
+            &[
+                crate::api::repos::RefUpdate {
+                    old_sha: "0".repeat(40),
+                    new_sha: SHA_A.into(),
+                    ref_name: "refs/heads/main".into(),
+                },
+                crate::api::repos::RefUpdate {
+                    old_sha: "0".repeat(40),
+                    new_sha: SHA_B.into(),
+                    ref_name: "refs/heads/other".into(),
+                },
+            ],
+        )
+        .await;
+
+        let all = body_json(poll(&state, Some(OWNER), &poll_uri("widget", "")).await).await;
+        let stamps: Vec<&str> = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["created_at"].as_str().unwrap())
+            .collect();
+        assert_eq!(stamps.len(), 2);
+        assert_eq!(
+            stamps[0], stamps[1],
+            "the scenario needs a real timestamp collision to test, got {stamps:?}"
+        );
+
+        let first =
+            body_json(poll(&state, Some(OWNER), &poll_uri("widget", "limit=1")).await).await;
+        let page1 = event_rows(&first);
+        assert_eq!(
+            page1.len(),
+            1,
+            "page size of one must return one row, got {first}"
+        );
+
+        let next_cursor = first["next_cursor"].as_i64().expect("next_cursor");
+
+        let cursor = format!("cursor={next_cursor}&limit=1");
+        let second = body_json(poll(&state, Some(OWNER), &poll_uri("widget", &cursor)).await).await;
+        let page2 = event_rows(&second);
+        assert_eq!(
+            page2.len(),
+            1,
+            "the second row must survive the page boundary, got {second}"
+        );
+
+        assert_ne!(
+            page1[0].0, page2[0].0,
+            "the cursor must advance past the first row, not repeat it"
+        );
+        let mut refs = vec![page1[0].1.clone(), page2[0].1.clone()];
+        refs.sort();
+        assert_eq!(
+            refs,
+            vec![
+                "refs/heads/main".to_string(),
+                "refs/heads/other".to_string()
+            ],
+            "both colliding-timestamp rows must be returned, once each"
+        );
+
+        let cursor2 = format!(
+            "cursor={}&limit=1",
+            second["next_cursor"].as_i64().expect("next_cursor"),
+        );
+        let third = body_json(poll(&state, Some(OWNER), &poll_uri("widget", &cursor2)).await).await;
+        assert!(
+            event_rows(&third).is_empty(),
+            "the walk must terminate rather than repeat a row, got {third}"
+        );
+    }
+
+    /// The cursor must order on insertion, not on the wall clock. `created_at` is
+    /// stamped by the application before the insert, so a row stamped later can
+    /// commit earlier, and an NTP step backwards makes that ordinary rather than
+    /// a race. A poller that has already advanced past the later stamp then never
+    /// sees the earlier-stamped row at all.
+    ///
+    /// The disagreement is constructed rather than raced for: the first row
+    /// written carries the LATER timestamp. A walk must still return both rows
+    /// exactly once, in the order they were inserted.
+    #[sqlx::test]
+    async fn the_cursor_walk_follows_insertion_order_not_the_wall_clock(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-clock", "widget", true))
+            .await
+            .unwrap();
+
+        seed_event(
+            &state,
+            "evt-first",
+            "r-clock",
+            "refs/heads/one",
+            SHA_A,
+            "2026-08-07T13:00:00.000000Z",
+        )
+        .await;
+        seed_event(
+            &state,
+            "evt-second",
+            "r-clock",
+            "refs/heads/two",
+            SHA_B,
+            "2026-08-07T12:00:00.000000Z",
+        )
+        .await;
+
+        let walked = walk_cursor(&state, "widget", 6).await;
+        assert_eq!(
+            walked,
+            vec!["evt-first".to_string(), "evt-second".to_string()],
+            "the walk must return every row exactly once in insertion order; \
+             ordering on the application-stamped clock reverses these two and \
+             strands the second behind a cursor that has already passed it"
+        );
+    }
+
+    /// Seed two events and hand back the repo name plus the cursor that sits
+    /// between them, for the degenerate-input cases below.
+    async fn two_event_repo(state: &crate::state::AppState) -> i64 {
+        state
+            .db
+            .create_repo(&repo("r-bad", "widget", true))
+            .await
+            .unwrap();
+        seed_event(
+            state,
+            "evt-1",
+            "r-bad",
+            "refs/heads/one",
+            SHA_A,
+            "2026-08-07T12:00:00.000000Z",
+        )
+        .await;
+        seed_event(
+            state,
+            "evt-2",
+            "r-bad",
+            "refs/heads/two",
+            SHA_B,
+            "2026-08-07T12:00:01.000000Z",
+        )
+        .await;
+
+        let first = body_json(poll(state, Some(OWNER), &poll_uri("widget", "limit=1")).await).await;
+        first["next_cursor"].as_i64().expect("next_cursor")
+    }
+
+    /// A cursor the surface could not have issued is a client bug, and the only
+    /// safe answer is to say so. Silently treating it as "no cursor" replays the
+    /// repo's whole history to a poller that believed it was up to date, and
+    /// silently treating it as "the end" hides every event after it.
+    #[sqlx::test]
+    async fn a_malformed_cursor_is_rejected_with_a_400(pool: PgPool) {
+        let state = test_state(pool).await;
+        let mid = two_event_repo(&state).await;
+
+        for bad in [
+            "notanumber",
+            "",
+            "-1",
+            "1.5",
+            "99999999999999999999999999",
+            // Percent-encoded leading space: a valid URI that decodes to " 1".
+            "%201",
+        ] {
+            let resp = poll(
+                &state,
+                Some(OWNER),
+                &poll_uri("widget", &format!("cursor={bad}")),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "cursor={bad:?} must be refused, not reinterpreted"
+            );
+            let body = body_json(resp).await;
+            assert_eq!(
+                body["error"], "bad_request",
+                "the refusal needs a stable code a client can branch on, got {body}"
+            );
+        }
+
+        // The control: a cursor the surface actually issued still works, so the
+        // rejection above is validation and not a blanket refusal.
+        let ok = poll(
+            &state,
+            Some(OWNER),
+            &poll_uri("widget", &format!("cursor={mid}")),
+        )
+        .await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(event_rows(&body_json(ok).await).len(), 1);
+    }
+
+    /// `limit=0` used to return an empty page carrying no cursor, which reads to
+    /// a cursor-persisting poller exactly like "you are at the end" while also
+    /// wiping the position it had, so the next poll started from the beginning
+    /// of history. A limit below one is clamped up instead: the page makes
+    /// progress, and the cursor it returns moves forward.
+    #[sqlx::test]
+    async fn a_zero_limit_makes_progress_instead_of_rewinding(pool: PgPool) {
+        let state = test_state(pool).await;
+        let mid = two_event_repo(&state).await;
+
+        let body = body_json(
+            poll(
+                &state,
+                Some(OWNER),
+                &poll_uri("widget", &format!("cursor={mid}&limit=0")),
+            )
+            .await,
+        )
+        .await;
+        let next = body["next_cursor"].as_i64().expect("next_cursor");
+        assert!(
+            next >= mid,
+            "a cursor must never move backwards; asked from {mid}, got {next} in {body}"
+        );
+        assert_eq!(
+            event_rows(&body).len(),
+            1,
+            "a limit below one is clamped to one row, not to an empty page, got {body}"
+        );
+    }
+
+    /// The upper clamp, from the other side: a caller asking for more than the
+    /// surface serves gets the documented maximum rather than an unbounded scan.
+    #[sqlx::test]
+    async fn an_oversized_limit_is_clamped_to_the_documented_maximum(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-big", "widget", true))
+            .await
+            .unwrap();
+        for i in 0..(MAX_PUSH_EVENT_PAGE + 5) {
+            seed_event(
+                &state,
+                &format!("evt-{i}"),
+                "r-big",
+                "refs/heads/main",
+                SHA_A,
+                "2026-08-07T12:00:00.000000Z",
+            )
+            .await;
+        }
+
+        let body =
+            body_json(poll(&state, Some(OWNER), &poll_uri("widget", "limit=100000")).await).await;
+        assert_eq!(
+            event_rows(&body).len() as i64,
+            MAX_PUSH_EVENT_PAGE,
+            "an oversized limit must be clamped, got {}",
+            event_rows(&body).len()
+        );
+    }
+
+    /// A caller already up to date polls with the cursor it got last time. That is
+    /// the steady state of this surface, and it is a 200 with an empty page, not
+    /// an error and not a repeat of the last row.
+    #[sqlx::test]
+    async fn cursor_past_the_last_event_returns_an_empty_page(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-tail", "widget", true))
+            .await
+            .unwrap();
+        seed_event(
+            &state,
+            "evt-1",
+            "r-tail",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T12:00:00.000000Z",
+        )
+        .await;
+
+        let resp = poll(&state, Some(OWNER), &poll_uri("widget", "cursor=999999")).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an exhausted cursor is not an error"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            event_rows(&body).is_empty(),
+            "expected an empty page, got {body}"
+        );
+        assert_eq!(body["count"].as_u64(), Some(0));
+        assert_eq!(
+            body["next_cursor"].as_i64(),
+            Some(999_999),
+            "an empty page must hand back the cursor it was given; a null (or a \
+             lower value) tells a poller that persists it to start over from the \
+             beginning of history, got {body}"
+        );
+
+        // And the same on a repo with no events at all, where there is no row to
+        // derive a cursor from: the start of history is not a rewind.
+        state
+            .db
+            .create_repo(&repo("r-empty", "quiet", true))
+            .await
+            .unwrap();
+        let empty = body_json(poll(&state, Some(OWNER), &poll_uri("quiet", "")).await).await;
+        assert_eq!(
+            empty["next_cursor"].as_i64(),
+            Some(0),
+            "a first poll of a repo with no events starts at zero, got {empty}"
+        );
+    }
+
+    /// An anonymous poll of a PRIVATE repo answers byte for byte what the same
+    /// caller gets for a repo that does not exist. Events are seeded first, so the
+    /// deny cannot pass vacuously on an empty projection.
+    #[sqlx::test]
+    async fn anon_poll_on_a_private_repo_is_indistinguishable_from_missing(pool: PgPool) {
+        let state = test_state(pool).await;
+        let target = poll_uri("secret", "");
+
+        let missing = status_and_bytes(poll(&state, None, &target).await).await;
+
+        state
+            .db
+            .create_repo(&repo("r-priv", "secret", false))
+            .await
+            .unwrap();
+        seed_event(
+            &state,
+            "evt-priv",
+            "r-priv",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T12:00:00.000000Z",
+        )
+        .await;
+
+        let denied = status_and_bytes(poll(&state, None, &target).await).await;
+
+        assert_eq!(missing.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            denied, missing,
+            "a private-repo deny must be byte-identical to the missing-repo response"
+        );
+        assert!(
+            !String::from_utf8_lossy(&denied.1).contains(SHA_A),
+            "the deny must carry no trace of the seeded event"
+        );
+    }
+
+    /// The other half of the gate: a public repo's push events are served to an
+    /// anonymous caller, so the deny above is a gate and not a blanket refusal.
+    #[sqlx::test]
+    async fn public_repo_push_events_served_to_anon(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-pub", "openrepo", true))
+            .await
+            .unwrap();
+        seed_event(
+            &state,
+            "evt-pub",
+            "r-pub",
+            "refs/heads/main",
+            SHA_A,
+            "2026-08-07T12:00:00.000000Z",
+        )
+        .await;
+
+        let body = body_json(poll(&state, None, &poll_uri("openrepo", "")).await).await;
+        assert_eq!(
+            event_rows(&body).len(),
+            1,
+            "a public repo's events are anonymous-readable"
+        );
+    }
+
+    /// Containment. A push to a PRIVATE repo must not surface on the
+    /// unauthenticated global feed at `/api/v1/events/ref-updates`, which reads
+    /// `received_ref_updates`. If the producer ever wrote there instead of into
+    /// the repo-scoped table, this unit would be introducing an anonymous leak of
+    /// private-repo push metadata.
+    #[sqlx::test]
+    async fn a_private_push_never_reaches_the_anonymous_global_feed(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-contain", "secret", false))
+            .await
+            .unwrap();
+
+        crate::api::repos::record_push_events(
+            &state.db,
+            "r-contain",
+            &[crate::api::repos::RefUpdate {
+                old_sha: "0".repeat(40),
+                new_sha: SHA_A.into(),
+                ref_name: "refs/heads/main".into(),
+            }],
+        )
+        .await;
+
+        let anon = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/events/ref-updates")
+            .body(Body::empty())
+            .expect("request builder");
+        let resp = global_feed_router(state.clone())
+            .oneshot(anon)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let raw = String::from_utf8(
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            !raw.contains(SHA_A) && !raw.contains("refs/heads/main"),
+            "a local push must not appear on the anonymous global feed, got {raw}"
+        );
+
+        // And the row really was written somewhere: the owner's poll finds it, so
+        // the assertion above is not passing because nothing was recorded at all.
+        let body = body_json(poll(&state, Some(OWNER), &poll_uri("secret", "")).await).await;
+        assert_eq!(
+            event_rows(&body).len(),
+            1,
+            "the push event must exist on the repo-scoped surface, got {body}"
+        );
+    }
+
+    /// A branch deletion carries an all-zero new SHA. Recording it would hand a
+    /// poller a target that resolves to no commit, so the producer skips it, the
+    /// same way the stored-head update does.
+    #[sqlx::test]
+    async fn a_branch_deletion_records_no_push_event(pool: PgPool) {
+        let state = test_state(pool).await;
+        state
+            .db
+            .create_repo(&repo("r-del", "widget", true))
+            .await
+            .unwrap();
+
+        crate::api::repos::record_push_events(
+            &state.db,
+            "r-del",
+            &[crate::api::repos::RefUpdate {
+                old_sha: SHA_A.into(),
+                new_sha: "0".repeat(40),
+                ref_name: "refs/heads/gone".into(),
+            }],
+        )
+        .await;
+
+        let body = body_json(poll(&state, Some(OWNER), &poll_uri("widget", "")).await).await;
+        assert!(
+            event_rows(&body).is_empty(),
+            "a deletion must not record a push event, got {body}"
         );
     }
 }

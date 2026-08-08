@@ -109,6 +109,114 @@ pub(crate) fn signed_request_as(did: &str, method: Method, uri: &str, body: Body
         .expect("request builder")
 }
 
+/// Slice a region out of a module's own source (obtained with `include_str!`)
+/// and drop full-line `//` comments from it.
+///
+/// Several guards in `api/` assert that a piece of PRODUCTION code does or does
+/// not contain something: that the receive-pack handler really calls the
+/// push-event recorder, that the status module never acquires the repository.
+/// Each guard carried its own copy of this parse, and three copies of a parser
+/// is three places for the slicing to drift apart while every guard still reads
+/// green.
+///
+/// `start` and `end` are literal anchors. The region runs from the first
+/// occurrence of `start` (inclusive; the top of the file when `None`) to the
+/// next occurrence of `end` (exclusive; end of file when `None`).
+///
+/// Returns `None` when an anchor is missing, rather than silently falling back
+/// to a larger or empty region. Each caller supplies its own message for that
+/// case and keeps its own assertion that the region really covers what it claims
+/// to, which is what stops a bug in this one helper from turning every guard
+/// that uses it into a vacuous pass.
+///
+/// Comment lines are stripped so that a doc comment naming the very call a guard
+/// searches for cannot stand in for the call itself.
+pub(crate) fn scrape_source_region(
+    src: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Option<String> {
+    let from = match start {
+        Some(anchor) => src.find(anchor)?,
+        None => 0,
+    };
+    let rest = &src[from..];
+    let to = match end {
+        // Search past the first byte, so an `end` anchor that also matches at the
+        // very start of the region cannot collapse it to nothing.
+        Some(anchor) => rest.get(1..)?.find(anchor)? + 1,
+        None => rest.len(),
+    };
+    Some(
+        rest[..to]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+#[cfg(test)]
+mod scrape_source_region_tests {
+    use super::scrape_source_region;
+
+    const SRC: &str = "prelude line\nfn target() {\n    // calls_the_thing()\n    calls_the_thing();\n}\nfn later() {\n    calls_the_thing();\n}\n";
+
+    #[test]
+    fn stops_at_the_end_anchor_so_a_later_function_cannot_satisfy_a_guard() {
+        let body = scrape_source_region(SRC, Some("fn target()"), Some("\n}")).unwrap();
+        assert!(body.contains("calls_the_thing();"));
+        assert!(
+            !body.contains("fn later()"),
+            "the region must stop at the first column-zero brace, got: {body}"
+        );
+    }
+
+    #[test]
+    fn strips_full_line_comments_so_a_doc_comment_cannot_stand_in_for_code() {
+        let commented = "fn target() {\n    // calls_the_thing();\n}\n";
+        let body = scrape_source_region(commented, Some("fn target()"), Some("\n}")).unwrap();
+        assert!(
+            !body.contains("calls_the_thing"),
+            "a commented-out call must not survive the scrape, got: {body}"
+        );
+    }
+
+    #[test]
+    fn no_start_anchor_reads_from_the_top_of_the_file() {
+        let body = scrape_source_region(SRC, None, Some("fn later()")).unwrap();
+        assert!(body.starts_with("prelude line"));
+        assert!(!body.contains("fn later()"));
+    }
+
+    #[test]
+    fn no_end_anchor_reads_to_the_end_of_the_file() {
+        let body = scrape_source_region(SRC, Some("fn later()"), None).unwrap();
+        assert!(body.trim_end().ends_with('}'));
+    }
+
+    /// A missing anchor is None, never a silently wider or empty region: that is
+    /// what lets each caller keep its own "the thing I meant to scan is gone"
+    /// message instead of asserting against whatever the fallback produced.
+    #[test]
+    fn a_missing_anchor_is_none_rather_than_a_fallback_region() {
+        assert!(scrape_source_region(SRC, Some("fn absent()"), Some("\n}")).is_none());
+        assert!(scrape_source_region(SRC, Some("fn target()"), Some("~absent~")).is_none());
+    }
+
+    /// The end anchor is searched past the first byte, so a region whose own
+    /// start also matches the end anchor is not collapsed to nothing.
+    #[test]
+    fn an_end_anchor_matching_at_the_start_does_not_collapse_the_region() {
+        let src = "\n}\nfn target() {\n    body();\n}\n";
+        let body = scrape_source_region(src, None, Some("\n}")).unwrap();
+        assert!(
+            body.contains("fn target()") && body.contains("body();"),
+            "got: {body}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

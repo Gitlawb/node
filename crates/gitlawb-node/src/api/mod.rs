@@ -22,6 +22,7 @@ pub mod replicas;
 pub mod repos;
 pub mod resolve;
 pub mod stars;
+pub mod status;
 pub mod tasks;
 pub mod visibility;
 pub mod webhooks;
@@ -67,17 +68,14 @@ pub(crate) async fn authorize_repo_read(
 /// representation only within `did:key`; never let a bare id match across methods —
 /// `did:web` / `did:gitlawb` share the base58 space with `did:key`, so a
 /// trailing-segment compare would treat `did:key:X` and `did:gitlawb:X` as equal.
+///
+/// The collapse itself lives in exactly one place, [`crate::db::normalize_owner_key`],
+/// which is also the function the stored `owner_did` / `authorizing_did` columns
+/// are normalized through and which `OWNER_KEY_CASE_SQL` mirrors byte for byte.
+/// Two identities match when they normalize to the same key; a second copy of the
+/// rule here is how the Rust gate and the SQL filters would drift apart.
 pub(crate) fn did_matches(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    fn key_id(d: &str) -> &str {
-        d.strip_prefix("did:key:").unwrap_or(d)
-    }
-    let (ka, kb) = (key_id(a), key_id(b));
-    // After stripping `did:key:`, a value still containing ':' is a non-key full
-    // DID — do not let it match a bare `did:key` id.
-    !ka.contains(':') && !kb.contains(':') && ka == kb
+    crate::db::normalize_owner_key(a) == crate::db::normalize_owner_key(b)
 }
 
 /// 403 unless `caller` is the repo owner. Uses [`did_matches`] so the owner check
@@ -175,6 +173,7 @@ mod authz_guard {
         let events = include_str!("events.rs");
         let tasks = include_str!("tasks.rs");
         let stars = include_str!("stars.rs");
+        let status = include_str!("status/mod.rs");
         let protect = include_str!("protect.rs");
         let visibility = include_str!("visibility.rs");
         let profiles = include_str!("profiles.rs");
@@ -195,6 +194,13 @@ mod authz_guard {
             // (existence hiding) and require_repo_owner guards the owner half.
             (webhooks, "list_webhooks", "authorize_repo_read("),
             (webhooks, "list_webhooks", "require_repo_owner("),
+            // Same two-half shape as list_webhooks: authorize_repo_read runs
+            // first (a quarantined or unreadable repo gets the missing-repo
+            // not-found, never a 403 that would confirm existence), then
+            // require_repo_owner 403s a non-owner of a readable repo. Both halves
+            // are pinned, because dropping either changes what a stranger learns.
+            (status, "create_status", "authorize_repo_read("),
+            (status, "create_status", "require_repo_owner("),
             (labels, "add_label", "require_repo_owner("),
             (labels, "remove_label", "require_repo_owner("),
             // Bucket A' — owner OR author (did_matches against the author)
@@ -217,6 +223,19 @@ mod authz_guard {
             (protect, "list_protected_branches", "authorize_repo_read("),
             (labels, "list_labels", "authorize_repo_read("),
             (events, "list_repo_events", "authorize_repo_read("),
+            // The catch-up poll surface gates before any push-event row is read,
+            // so a stranger cannot use it to learn that a private repo exists or
+            // is being pushed to.
+            (events, "list_repo_push_events", "authorize_repo_read("),
+            // The status read gates before any claim data is loaded, so its deny
+            // is the repo's own not-found rather than an existence oracle over
+            // which commits were reported on.
+            (status, "commit_status", "authorize_repo_read("),
+            // The rollup gates on the same helper before the pull request row is
+            // loaded, so a caller who cannot read the repo cannot learn which
+            // pull request numbers exist on it — and the fallback's branch
+            // resolve and head persist sit behind that same gate.
+            (status, "pull_request_status", "authorize_repo_read("),
             // Bucket C — signer-self: the acting DID is matched/bound to auth.0
             (tasks, "create_task", "did_matches("),
             (tasks, "claim_task", "did_matches("),
@@ -490,6 +509,7 @@ mod authz_guard {
             (include_str!("replicas.rs"), "replicas.rs"),
             (include_str!("repos.rs"), "repos.rs"),
             (include_str!("stars.rs"), "stars.rs"),
+            (include_str!("status/mod.rs"), "status/mod.rs"),
             (include_str!("visibility.rs"), "visibility.rs"),
             (include_str!("webhooks.rs"), "webhooks.rs"),
         ];
