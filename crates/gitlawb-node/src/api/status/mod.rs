@@ -5,6 +5,10 @@
 //!
 //! Claims are append-only: a producer reporting twice for the same context
 //! leaves both rows and the visible status is a projection over the history.
+//! Reporting twice means two REQUESTS, though. An exact repeat of one already
+//! accepted is answered with 200 and the row it wrote, not a second row: the
+//! projection elects the highest `seq`, so a replayed claim would not duplicate
+//! a verdict but overturn the one that superseded it.
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -157,6 +161,7 @@ pub async fn create_status(
     )?;
     bound("request body", material.body.len(), MAX_REQUEST_BODY_BYTES)?;
 
+    let digest = request_digest(&material);
     let (signature, signature_input, signing_string, request_body) = (
         material.signature,
         material.signature_input,
@@ -182,6 +187,7 @@ pub async fn create_status(
         signature_input,
         signing_string,
         request_body,
+        request_digest: digest,
         created_at: Utc::now().to_rfc3339(),
     };
 
@@ -195,10 +201,51 @@ pub async fn create_status(
             StatusCode::CREATED,
             Json(CreatedStatus::from_claim(claim, seq)),
         )),
+        // Already recorded, so 200 and the original row rather than 201 and a
+        // second one. The claim the caller gets back is the stored one, id and
+        // seq included, which is what makes a retry safe to treat as success.
+        crate::db::ClaimInsert::AlreadyRecorded(existing) => {
+            let seq = existing.seq;
+            Ok((
+                StatusCode::OK,
+                Json(CreatedStatus::from_claim(*existing, seq)),
+            ))
+        }
         crate::db::ClaimInsert::CapExceeded(which) => Err(AppError::TooManyRequests(format!(
             "claim limit reached for {which}"
         ))),
     }
+}
+
+/// The identity of one signed write, as a hex sha-256.
+///
+/// All four inputs together, because a replay is the same bytes arriving twice:
+/// the signature, the input that names what it covers, the canonical string it
+/// was verified over, and the body that string covers through a content-digest.
+/// The signature alone would nearly do (it covers the other three transitively),
+/// but hashing what is actually stored means the digest describes the row rather
+/// than a claim about it.
+///
+/// Each field is length-prefixed so no two different requests can concatenate to
+/// the same bytes: without it, a signature ending in some prefix of the next
+/// field would collide with the shorter signature that absorbed it.
+///
+/// This is not a nonce, and deliberately so. A nonce table needs pruning and a
+/// pruning window is a second replay window; the claim row IS the record of what
+/// was accepted, so uniqueness on it is self-maintaining.
+fn request_digest(material: &crate::auth::SignatureMaterial) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [
+        material.signature.as_bytes(),
+        material.signature_input.as_bytes(),
+        material.signing_string.as_bytes(),
+        &material.body,
+    ] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part);
+    }
+    format!("{:x}", h.finalize())
 }
 
 /// One reported context in the combined response. Signature material is

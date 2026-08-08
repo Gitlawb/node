@@ -131,6 +131,13 @@ pub struct StatusClaim {
     pub signature_input: String,
     pub signing_string: String,
     pub request_body: Vec<u8>,
+    /// Stable digest over the four fields above: the request's identity.
+    ///
+    /// Unique across the table, so an exact replay of an accepted request cannot
+    /// append a second row. See [`crate::api::status::request_digest`] for what
+    /// goes into it and [`Db::insert_status_claim_capped`] for what happens when
+    /// it collides.
+    pub request_digest: String,
     /// Server-assigned rfc3339 timestamp. Display data only; ordering is `seq`.
     pub created_at: String,
 }
@@ -1031,8 +1038,22 @@ const MIGRATIONS: &[Migration] = &[
                 -- what it signed.
                 signing_string   TEXT NOT NULL,
                 request_body     BYTEA NOT NULL,
+                -- Stable digest over the material that identifies one request:
+                -- the signature, its input, the signing string and the body. Two
+                -- rows carrying the same value are the same request written
+                -- twice, which is what the unique index below refuses.
+                request_digest   TEXT NOT NULL,
                 created_at       TEXT NOT NULL
             )"#,
+            // Replay containment, and the reason it is an index and not a check
+            // in Rust: `require_signature` bounds the clock skew on `created` and
+            // nothing else, so a captured request stays acceptable for the whole
+            // window. A read-then-insert would race, and losing that race is not
+            // a duplicate row, because the projection takes the highest `seq` per
+            // (producer, context), so a replayed row earns a FRESH sequence
+            // number and puts a superseded verdict back in front of the one that
+            // replaced it. The database is what has to hold this.
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_status_claims_request_digest ON status_claims(request_digest)",
             // Read path: every claim for one commit.
             "CREATE INDEX IF NOT EXISTS idx_status_claims_repo_commit ON status_claims(repo_id, commit_sha)",
             // Cap count and latest-per-tuple lookup, which orders on seq DESC.
@@ -2106,8 +2127,11 @@ impl Db {
     /// regardless of how many branches moved. The casts on the first row are what
     /// give Postgres the column types it cannot infer from parameters alone.
     ///
-    /// Callers must bound the list (see `api::repos::MAX_PUSH_FAN_OUT`): every
-    /// pair costs two bind parameters, against a protocol ceiling of 65535.
+    /// Callers must chunk the list (see `api::repos::PUSH_WRITE_CHUNK`): every
+    /// pair costs two bind parameters, against a protocol ceiling of 65535. The
+    /// chunking bounds one STATEMENT, not the push: a caller that dropped the
+    /// tail instead would leave those pull requests pointing at a commit the
+    /// push already replaced.
     ///
     /// Same predicates as the single-branch form, and for the same reason:
     /// `status='open'` is the freeze that keeps a decided pull request's head
@@ -2364,9 +2388,47 @@ impl Db {
 const INSERT_STATUS_CLAIM_SQL: &str = "INSERT INTO status_claims
      (id, repo_id, commit_sha, state, context, target_url, description,
       producer_did, authorizing_did, signature, signature_input,
-      signing_string, request_body, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+      signing_string, request_body, request_digest, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
      RETURNING seq";
+
+/// The same insert, made a no-op when the request has already been recorded.
+/// The column list must stay identical to [`INSERT_STATUS_CLAIM_SQL`]: both are
+/// bound by [`status_claim_insert`], so a divergence is a parameter-count error
+/// on the first write either way runs.
+///
+/// `DO NOTHING` rather than an error, so `RETURNING` yields no row at all. That
+/// empty result is how the caller learns the write was a replay; see
+/// [`Db::insert_status_claim_capped`].
+const INSERT_STATUS_CLAIM_IF_NEW_SQL: &str = "INSERT INTO status_claims
+     (id, repo_id, commit_sha, state, context, target_url, description,
+      producer_did, authorizing_did, signature, signature_input,
+      signing_string, request_body, request_digest, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+     ON CONFLICT (request_digest) DO NOTHING
+     RETURNING seq";
+
+/// The claim a given request already wrote, if any. Rides the unique index the
+/// replay containment is built on, so it is one probe rather than a scan.
+///
+/// Takes the transaction rather than the pool: the caller runs it inside the
+/// capped insert, both before the caps and again after a conflict, and reading
+/// outside that transaction would answer from a different snapshot.
+async fn claim_by_digest(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    digest: &str,
+) -> Result<Option<StatusClaim>> {
+    let row = sqlx::query(
+        "SELECT id,seq,repo_id,commit_sha,state,context,target_url,description,
+                producer_did,authorizing_did,signature,signature_input,
+                signing_string,request_body,request_digest,created_at
+         FROM status_claims WHERE request_digest = $1",
+    )
+    .bind(digest)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row.map(row_to_status_claim))
+}
 
 /// The bind chain for [`INSERT_STATUS_CLAIM_SQL`], shared by the plain and the
 /// capped insert so the two can never bind different columns.
@@ -2377,10 +2439,11 @@ const INSERT_STATUS_CLAIM_SQL: &str = "INSERT INTO status_claims
 /// store two values for one identity: the projection dedupes on the raw
 /// `producer_did`, and the per-tuple cap counts on it, so both would be split in
 /// half and the superseded claim would keep voting in the combined state.
-fn status_claim_insert(
-    claim: &StatusClaim,
-) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
-    sqlx::query(INSERT_STATUS_CLAIM_SQL)
+fn status_claim_insert<'a>(
+    sql: &'a str,
+    claim: &'a StatusClaim,
+) -> sqlx::query::Query<'a, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    sqlx::query(sql)
         .bind(&claim.id)
         .bind(&claim.repo_id)
         .bind(&claim.commit_sha)
@@ -2394,6 +2457,7 @@ fn status_claim_insert(
         .bind(&claim.signature_input)
         .bind(&claim.signing_string)
         .bind(&claim.request_body)
+        .bind(&claim.request_digest)
         .bind(&claim.created_at)
 }
 
@@ -2437,8 +2501,15 @@ pub struct ClaimCaps {
 
 /// Outcome of a capped append. `CapExceeded` names the bound that refused, for
 /// the caller's 429 message; it is not a database error.
+///
+/// `AlreadyRecorded` carries the row the identical request wrote the first time,
+/// so the caller can answer with the claim it already has instead of an error. A
+/// refusal would be wrong twice over: it tells a CI client whose response was
+/// lost to the network that its report failed when it succeeded, and it makes
+/// the honest retry indistinguishable from the attack.
 pub enum ClaimInsert {
     Inserted(i64),
+    AlreadyRecorded(Box<StatusClaim>),
     CapExceeded(&'static str),
 }
 
@@ -2450,11 +2521,18 @@ impl Db {
     // primitive the db tests drive directly.
     #[allow(dead_code)]
     pub async fn insert_status_claim(&self, claim: &StatusClaim) -> Result<i64> {
-        let row = status_claim_insert(claim).fetch_one(&self.pool).await?;
+        let row = status_claim_insert(INSERT_STATUS_CLAIM_SQL, claim)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.get::<i64, _>("seq"))
     }
 
-    /// Append one claim only if all three caps still admit it.
+    /// Append one claim only if it is new and all three caps still admit it.
+    ///
+    /// A request already recorded returns its original row and writes nothing,
+    /// BEFORE any cap is consulted. That order matters: a client retrying a
+    /// request whose response was lost must not be told 429 by a tuple cap its
+    /// own earlier write filled.
     ///
     /// Writers against one repo are serialized on a transaction-scoped advisory
     /// lock taken before the first count. A transaction alone would not hold the
@@ -2479,6 +2557,13 @@ impl Db {
             .bind(&claim.repo_id)
             .execute(&mut *tx)
             .await?;
+
+        // Replay first, and cheapest: one unique-index probe. Under the repo
+        // lock this settles every same-repo racer, and the index below settles
+        // the rest.
+        if let Some(existing) = claim_by_digest(&mut tx, &claim.request_digest).await? {
+            return Ok(ClaimInsert::AlreadyRecorded(Box::new(existing)));
+        }
 
         // The tuple bound and the context-fanout bound read the same
         // (repo, commit) rows, so they are one aggregate over one scan rather
@@ -2535,7 +2620,19 @@ impl Db {
             ));
         }
 
-        let inserted = status_claim_insert(claim).fetch_one(&mut *tx).await?;
+        // The probe above is the fast path, not the guarantee: two nodes sharing
+        // this database, or two requests the repo lock does not cover, can both
+        // pass it. The unique index is what actually holds, and `DO NOTHING`
+        // turns losing that race into an empty result rather than an error.
+        let inserted = status_claim_insert(INSERT_STATUS_CLAIM_IF_NEW_SQL, claim)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(inserted) = inserted else {
+            let existing = claim_by_digest(&mut tx, &claim.request_digest)
+                .await?
+                .context("status claim insert conflicted on request_digest but the conflicting row could not be read back")?;
+            return Ok(ClaimInsert::AlreadyRecorded(Box::new(existing)));
+        };
         let seq = inserted.get::<i64, _>("seq");
         tx.commit().await?;
         Ok(ClaimInsert::Inserted(seq))
@@ -2552,7 +2649,7 @@ impl Db {
         let rows = sqlx::query(
             "SELECT id,seq,repo_id,commit_sha,state,context,target_url,description,
                     producer_did,authorizing_did,signature,signature_input,
-                    signing_string,request_body,created_at
+                    signing_string,request_body,request_digest,created_at
              FROM status_claims WHERE repo_id=$1 AND commit_sha=$2 ORDER BY seq ASC",
         )
         .bind(repo_id)
@@ -3051,8 +3148,10 @@ impl Db {
     /// order, which is exactly why the poll cursor can trust it; a value supplied
     /// here would defeat that.
     ///
-    /// Callers must bound the slice (see `api::repos::MAX_PUSH_FAN_OUT`): every
-    /// row costs five bind parameters, against a protocol ceiling of 65535.
+    /// Callers must chunk the slice (see `api::repos::PUSH_WRITE_CHUNK`): every
+    /// row costs five bind parameters, against a protocol ceiling of 65535. The
+    /// chunking bounds one STATEMENT, not the push: every ref receive-pack
+    /// accepted is written, across as many chunks as that takes.
     pub async fn insert_repo_push_events(&self, events: &[RepoPushEvent]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -3669,6 +3768,7 @@ fn row_to_status_claim(r: sqlx::postgres::PgRow) -> StatusClaim {
         signature_input: r.get("signature_input"),
         signing_string: r.get("signing_string"),
         request_body: r.get("request_body"),
+        request_digest: r.get("request_digest"),
         created_at: r.get("created_at"),
     }
 }
@@ -4691,6 +4791,12 @@ mod migration_tests {
             signing_string: "\"@method\": POST\n\"@path\": /api/v1/repos/o/r/statuses/aaa"
                 .to_string(),
             request_body: b"{\"state\":\"success\"}".to_vec(),
+            // Fresh per call, the way two real requests are: a genuine signature
+            // covers a `created` parameter and the body's digest, so no two
+            // distinct requests carry the same material. A constant here would
+            // make the second sample_claim of any test a replay of the first,
+            // which is a different property than the one under test.
+            request_digest: uuid::Uuid::new_v4().to_string(),
             created_at: "2026-08-07T00:00:00+00:00".to_string(),
         }
     }
@@ -5235,6 +5341,46 @@ mod migration_tests {
             seqs,
             "the stored seq must be the one the insert reported"
         );
+    }
+
+    /// The replay containment lives in the schema, not in the Rust that reads it.
+    ///
+    /// The capped insert probes for the digest before it writes, but that probe
+    /// is a fast path: it is a read, and a read cannot exclude a writer it has
+    /// not seen commit. This drives the raw insert past the probe entirely, so
+    /// what refuses is the unique index or nothing. Asserted here rather than
+    /// only through the handler because the handler's own replay tests stay green
+    /// on the probe alone, which is exactly how a guard rots into decoration.
+    #[sqlx::test]
+    async fn the_schema_refuses_a_second_claim_with_the_same_request_digest(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool);
+        db.migrate().await.unwrap();
+
+        let first = sample_claim("repo-digest", SHA_A, "ci/build");
+        db.insert_status_claim(&first).await.unwrap();
+
+        // Different row in every other respect: a fresh id, another commit, a
+        // different context and verdict. Only the request identity repeats.
+        let mut replay = sample_claim("repo-digest", SHA_B, "ci/other");
+        replay.state = "failure".to_string();
+        replay.request_digest = first.request_digest.clone();
+
+        let err = db
+            .insert_status_claim(&replay)
+            .await
+            .expect_err("the database must refuse a second row carrying a digest it already has");
+        let text = err.to_string();
+        assert!(
+            text.contains("uq_status_claims_request_digest") || text.contains("duplicate key"),
+            "the refusal must come from the request-digest uniqueness, got: {text}"
+        );
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM status_claims WHERE repo_id = 'repo-digest'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 1, "the refused write must leave no row");
     }
 
     /// The caps have to hold against writers racing each other, which is the only

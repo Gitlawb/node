@@ -57,10 +57,20 @@ fn signed_with_material(did: &str, uri: &str, body: Body) -> axum::http::Request
     req
 }
 
-/// Stand-in material, well inside every bound.
+/// Stand-in material, well inside every bound, and DISTINCT on every call.
+///
+/// Distinct because that is what production looks like: a real signature covers
+/// a `created` parameter and the body's own digest, so two genuine requests
+/// never carry the same bytes. A constant stand-in would make the second write
+/// of any test an exact replay of the first, and the write path answers a replay
+/// with the row it already has. The replay tests below get their identical bytes
+/// the honest way, by signing once and putting the same headers on the wire
+/// twice through the production router.
 fn sample_material() -> crate::auth::SignatureMaterial {
+    static NTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     crate::auth::SignatureMaterial {
-        signature: "sig1=:dGVzdA==:".to_string(),
+        signature: format!("sig1=:dGVzdA=={nth}:"),
         signature_input: "sig1=(\"@method\" \"@path\" \"content-digest\");alg=\"ed25519\""
             .to_string(),
         signing_string: "\"@method\": POST".to_string(),
@@ -125,7 +135,7 @@ async fn owner_writes_a_claim_recording_both_dids(pool: PgPool) {
     assert!(claims[0].seq > 0, "seq is assigned by the database");
     // The verified RFC 9421 material is persisted with the row: a claim that
     // cannot be re-verified after the request is gone is not history.
-    assert_eq!(claims[0].signature, "sig1=:dGVzdA==:");
+    assert!(claims[0].signature.starts_with("sig1=:dGVzdA=="));
     assert!(claims[0].signature_input.starts_with("sig1=("));
     assert_eq!(claims[0].signing_string, "\"@method\": POST");
     assert_eq!(claims[0].request_body, b"{}");
@@ -677,6 +687,22 @@ async fn post_really_signed(
     gitlawb_core::http_sig::SignedHeaders,
 ) {
     let signed = gitlawb_core::http_sig::sign_request(kp, "POST", path, body);
+    let resp = post_signed_headers(state, path, body, &signed).await;
+    (resp, signed)
+}
+
+/// POST `body` to `path` under signature headers that were produced earlier.
+///
+/// Splitting this out of [`post_really_signed`] is what makes a REPLAY
+/// expressible: sign once, then put the identical bytes on the wire a second
+/// time. Signing twice would not be a replay, because a fresh signature covers
+/// a fresh `created` parameter.
+async fn post_signed_headers(
+    state: &crate::state::AppState,
+    path: &str,
+    body: &[u8],
+    signed: &gitlawb_core::http_sig::SignedHeaders,
+) -> axum::response::Response {
     let req = axum::http::Request::builder()
         .method(Method::POST)
         .uri(path)
@@ -686,11 +712,10 @@ async fn post_really_signed(
         .header("signature", signed.signature.clone())
         .body(Body::from(body.to_vec()))
         .unwrap();
-    let resp = crate::server::build_router(state.clone())
+    crate::server::build_router(state.clone())
         .oneshot(req)
         .await
-        .unwrap();
-    (resp, signed)
+        .unwrap()
 }
 
 /// Re-verify a stored claim from the row alone, the way a third party
@@ -853,6 +878,130 @@ async fn middleware_persists_the_material_the_client_actually_sent(pool: PgPool)
     assert_eq!(claim.context, "ci/wire");
 }
 
+/// A captured signed write, put on the wire a second time, returns the claim
+/// it already recorded instead of appending a new one.
+///
+/// `require_signature` bounds only the clock skew on `created`, so the same
+/// bytes are accepted again for as long as that window lasts. The row count is
+/// asserted directly: a response that merely LOOKS right while a second row
+/// landed is the failure this is written against.
+#[sqlx::test]
+async fn a_replayed_signed_write_returns_the_original_claim_and_writes_no_second_row(pool: PgPool) {
+    let state = test_state(pool).await;
+    let kp = gitlawb_core::identity::Keypair::generate();
+    let did = kp.did().to_string();
+    let repo = seed_repo(&did, "replay-repo", true);
+    let repo_id = repo.id.clone();
+    state.db.create_repo(&repo).await.unwrap();
+
+    let path = uri(&did, "replay-repo", SHA_A);
+    let body = br#"{"state":"success","context":"ci/build"}"#;
+
+    let (first, signed) = post_really_signed(&state, &kp, &path, body).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let first_body = body_json(first).await;
+
+    let replay = post_signed_headers(&state, &path, body, &signed).await;
+    assert_eq!(
+        replay.status(),
+        StatusCode::OK,
+        "an exact replay is already recorded, not newly created"
+    );
+    let replay_body = body_json(replay).await;
+    assert_eq!(
+        replay_body, first_body,
+        "the replay must answer with the claim the first request wrote, id and \
+         seq included"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM status_claims WHERE repo_id = $1")
+        .bind(&repo_id)
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows, 1,
+        "a replayed request must leave exactly one row; got {rows}"
+    );
+}
+
+/// The consequence the replay actually buys an attacker: resurrecting a
+/// superseded verdict.
+///
+/// The projection takes the latest claim per (producer, context) by `seq`, and
+/// `seq` is assigned at insert. So a replay does not merely duplicate a row.
+/// It earns a FRESH sequence number, which puts the stale `success` ahead of
+/// the `failure` that superseded it and flips the commit's answer back.
+#[sqlx::test]
+async fn a_replayed_success_cannot_overturn_the_later_failure(pool: PgPool) {
+    let state = test_state(pool).await;
+    let kp = gitlawb_core::identity::Keypair::generate();
+    let did = kp.did().to_string();
+    let repo = seed_repo(&did, "replay-order-repo", true);
+    state.db.create_repo(&repo).await.unwrap();
+
+    let path = uri(&did, "replay-order-repo", SHA_A);
+    let success = br#"{"state":"success","context":"ci/build"}"#;
+    let failure = br#"{"state":"failure","context":"ci/build"}"#;
+
+    let (resp, captured) = post_really_signed(&state, &kp, &path, success).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let (resp, _) = post_really_signed(&state, &kp, &path, failure).await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let read = status_uri(&did, "replay-order-repo", SHA_A);
+    let before = body_json(get_status(&state, Some(&did), &read).await).await;
+    assert_eq!(before["state"], "failure", "the later claim is the verdict");
+
+    // The capture, replayed inside the skew window. Accepted either way: which
+    // status it carries is the previous test's business, and this one is about
+    // what the commit reads afterwards.
+    let replay = post_signed_headers(&state, &path, success, &captured).await;
+    assert!(replay.status().is_success());
+
+    let after = body_json(get_status(&state, Some(&did), &read).await).await;
+    assert_eq!(
+        after["state"], "failure",
+        "a replayed success must not outrank the failure that superseded it"
+    );
+    assert_eq!(after["total_count"], 1);
+    assert_eq!(after["statuses"][0]["state"], "failure");
+}
+
+/// The idempotency key is the request, not the tuple it writes about. Two
+/// genuinely different signed requests for one producer and context both
+/// record, and the append-only history keeps both.
+#[sqlx::test]
+async fn two_distinct_signed_writes_for_one_context_both_record(pool: PgPool) {
+    let state = test_state(pool).await;
+    let kp = gitlawb_core::identity::Keypair::generate();
+    let did = kp.did().to_string();
+    let repo = seed_repo(&did, "distinct-repo", true);
+    let repo_id = repo.id.clone();
+    state.db.create_repo(&repo).await.unwrap();
+
+    let path = uri(&did, "distinct-repo", SHA_A);
+    for body in [
+        &br#"{"state":"pending","context":"ci/build"}"#[..],
+        &br#"{"state":"success","context":"ci/build"}"#[..],
+    ] {
+        let (resp, _) = post_really_signed(&state, &kp, &path, body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "a distinct request is a new claim, not a replay"
+        );
+    }
+
+    let claims = state.db.list_status_claims(&repo_id, SHA_A).await.unwrap();
+    let states: Vec<&str> = claims.iter().map(|c| c.state.as_str()).collect();
+    assert_eq!(
+        states,
+        vec!["pending", "success"],
+        "both distinct claims must remain, ordered by seq"
+    );
+}
+
 /// The route is registered on the production router AND its group reached the
 /// merge chain: an unsigned request is refused by the signature layer with 401,
 /// which a path axum never learned about would answer 404 instead.
@@ -936,8 +1085,9 @@ async fn seed_claim(
     sqlx::query(
         "INSERT INTO status_claims
              (id, repo_id, commit_sha, state, context, producer_did, authorizing_did,
-              signature, signature_input, signing_string, request_body, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,'','','',''::bytea,$8)",
+              signature, signature_input, signing_string, request_body, request_digest,
+              created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'','','',''::bytea,gen_random_uuid()::text,$8)",
     )
     .bind(id)
     .bind(repo_id)
@@ -1569,9 +1719,11 @@ async fn seed_claims(
     sqlx::query(
         "INSERT INTO status_claims
              (id, repo_id, commit_sha, state, context, producer_did, authorizing_did,
-              signature, signature_input, signing_string, request_body, created_at)
+              signature, signature_input, signing_string, request_body, request_digest,
+              created_at)
              SELECT md5(random()::text || g::text), $1, $2, 'success', $3, $4, $4,
-                    '', '', '', ''::bytea, '2026-01-01T00:00:00Z'
+                    '', '', '', ''::bytea, gen_random_uuid()::text,
+                    '2026-01-01T00:00:00Z'
              FROM generate_series(1, $5) g",
     )
     .bind(repo_id)
@@ -1598,11 +1750,12 @@ async fn seed_claims_across_shas(
     sqlx::query(
         "INSERT INTO status_claims
              (id, repo_id, commit_sha, state, context, producer_did, authorizing_did,
-              signature, signature_input, signing_string, request_body, created_at)
+              signature, signature_input, signing_string, request_body, request_digest,
+              created_at)
              SELECT md5(random()::text || g::text), $1,
                     substr(md5(g::text) || md5((g + 1)::text), 1, 40),
                     'success', 'ci/build', $2, $2,
-                    '', '', '', ''::bytea, $4
+                    '', '', '', ''::bytea, gen_random_uuid()::text, $4
              FROM generate_series(1, $3) g",
     )
     .bind(repo_id)
