@@ -1768,12 +1768,37 @@ pub(crate) async fn record_push_events(
     // event is written either way, because receive-pack has already accepted
     // them.
     for chunk in events.chunks(PUSH_WRITE_CHUNK) {
-        if let Err(e) = db.insert_repo_push_events(chunk).await {
+        let mut outcome = db.insert_repo_push_events(chunk).await;
+        if let Err(first) = &outcome {
+            // One retry, because the write now waits on a per-repo lock and the
+            // failures that wait produces are transient by construction: a lock
+            // wait that expired, or a pool acquire that timed out behind the
+            // queue. The retry is bounded because this runs inline on the push.
             tracing::warn!(
+                err = %first,
+                repo_id = %repo_id,
+                refs = chunk.len(),
+                "recording push events failed; retrying once"
+            );
+            outcome = db.insert_repo_push_events(chunk).await;
+        }
+        if let Err(e) = outcome {
+            // Error, not a warning, and it names the rows. receive-pack has
+            // already told the client it took these refs, and no later poll asks
+            // for an event that was never written, so this is permanent loss on
+            // a surface whose whole purpose is that nothing is missed. The refs
+            // and SHAs are what make it recoverable by hand.
+            let lost = chunk
+                .iter()
+                .map(|e| format!("{}@{}", e.ref_name, e.after_sha))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::error!(
                 err = %e,
                 repo_id = %repo_id,
                 refs = chunk.len(),
-                "failed to record push events for the catch-up poll surface"
+                lost = %lost,
+                "push events lost; the catch-up poll surface will never deliver them"
             );
         }
     }
@@ -3296,6 +3321,51 @@ mod tests {
             chunks,
             "moving the stored heads for a {over}-ref push must be {chunks} \
              statements"
+        );
+    }
+
+    /// A chunk the database refuses is retried once and then escalated, never
+    /// dropped behind a warning.
+    ///
+    /// receive-pack has already told the client it took these refs, so a write
+    /// that fails here is a permanent hole in the catch-up surface: no later
+    /// poll asks for those events again. The write now waits on a per-repo lock,
+    /// which makes a bounded failure (lock timeout, pool exhaustion under the
+    /// queue it creates) a real outcome rather than a theoretical one, so the
+    /// caller has to say what was lost loudly enough for an operator to find it.
+    #[sqlx::test]
+    async fn a_chunk_that_cannot_be_written_is_retried_and_then_escalated(pool: sqlx::PgPool) {
+        let db = pr_head_db(pool).await;
+        // The table is gone, so every attempt fails the same way a real outage
+        // would, in both attempts rather than only the first.
+        sqlx::query("DROP TABLE repo_push_events")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let updates = many_ref_updates(2);
+        let logs = capture_logs();
+        statements_since_last_check();
+        record_push_events(&db, "repo-lost", &updates).await;
+        let statements = statements_since_last_check();
+        let logged = logs.contents();
+
+        assert_eq!(
+            statements, 2,
+            "a chunk that failed must be attempted a second time before it is \
+             given up on; got {statements} attempts"
+        );
+        assert!(
+            logged.contains("ERROR"),
+            "events that are gone for good must escalate above the warning level \
+             a poller can never see; got: {logged}"
+        );
+        assert!(
+            logged.contains("repo-lost")
+                && logged.contains("refs/heads/b0")
+                && logged.contains(&sha_for(0)),
+            "the escalation must name the repo, the refs and the SHAs that were \
+             lost, or nothing can be replayed by hand; got: {logged}"
         );
     }
 

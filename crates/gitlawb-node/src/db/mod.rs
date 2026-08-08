@@ -3126,6 +3126,31 @@ impl Db {
 
 // ── Repo Push Events ──────────────────────────────────────────────────────────
 
+/// How long a push-event write waits for its repo's lock before its statement
+/// is cancelled, in milliseconds.
+///
+/// Well under the pool's `acquire_timeout` (5 seconds by default), and
+/// deliberately so: a writer that queued on the lock is holding a pooled
+/// connection while it waits, so a wait longer than the acquire timeout would
+/// convert one slow repo into pool exhaustion for every unrelated request.
+/// Three attempts at this bound stay inside that budget.
+const PUSH_LOCK_TIMEOUT_MS: u32 = 1_000;
+
+/// How many times a push-event write may be re-attempted after its lock wait
+/// expired. Bounded, because the caller runs inline on the user's `git push`.
+const PUSH_LOCK_ATTEMPTS: u32 = 3;
+
+/// Postgres `lock_not_available`, which is what `SET LOCAL lock_timeout`
+/// cancels a statement with. The retryable failure, as distinct from every
+/// other database error, which is returned on the first attempt.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+fn is_lock_timeout(err: &sqlx::Error) -> bool {
+    err.as_database_error()
+        .and_then(|e| e.code())
+        .is_some_and(|code| code == LOCK_NOT_AVAILABLE)
+}
+
 impl Db {
     /// Record one local push event. Idempotent on the row id.
     ///
@@ -3138,7 +3163,8 @@ impl Db {
             .await
     }
 
-    /// Record a whole push's events in one statement. Idempotent on the row ids.
+    /// Record a whole push's events in one statement, under the repo's write
+    /// lock. Idempotent on the row ids.
     ///
     /// One multi-row insert rather than one round trip per ref: the receive-pack
     /// path runs this inline on the user's `git push`, so a sequential loop makes
@@ -3148,14 +3174,43 @@ impl Db {
     /// order, which is exactly why the poll cursor can trust it; a value supplied
     /// here would defeat that.
     ///
+    /// WRITERS AGAINST ONE REPO ARE SERIALIZED, on the same transaction-scoped
+    /// advisory lock [`Db::insert_status_claim_capped`] takes, so the two agree
+    /// on what a repo lock means. Insert order alone is not enough for the
+    /// cursor: `nextval` allocates the sequence at INSERT and the row becomes
+    /// visible at COMMIT, and it does not roll back, so two overlapping writers
+    /// can commit out of allocation order. When they do, the poller reads the
+    /// higher sequence, advances its cursor past the lower one, and that row,
+    /// once it commits, is never delivered by any later poll. Holding the lock
+    /// across the commit is what makes allocation order equal visibility order
+    /// within a repo. Across repos nothing is serialized, and nothing needs to
+    /// be: the cursor is per repo.
+    ///
+    /// The wait is bounded rather than indefinite, because this runs on the
+    /// user's push: `SET LOCAL lock_timeout` cancels the wait and the write is
+    /// re-attempted [`PUSH_LOCK_ATTEMPTS`] times before the error is returned.
+    /// The caller must not swallow it (see `api::repos::record_push_events`); a
+    /// dropped chunk is the same permanent loss the lock exists to prevent.
+    ///
     /// Callers must chunk the slice (see `api::repos::PUSH_WRITE_CHUNK`): every
     /// row costs five bind parameters, against a protocol ceiling of 65535. The
     /// chunking bounds one STATEMENT, not the push: every ref receive-pack
-    /// accepted is written, across as many chunks as that takes.
+    /// accepted is written, across as many chunks as that takes. The lock is
+    /// therefore taken once per chunk, which still holds the property: each
+    /// chunk commits before any other writer can allocate.
     pub async fn insert_repo_push_events(&self, events: &[RepoPushEvent]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
+
+        // Every repo the batch touches, in one fixed order. In practice a push
+        // is one repo and this is one key; sorting is what keeps two batches
+        // that did span repos from taking the same keys in opposite orders and
+        // deadlocking.
+        let mut repo_ids: Vec<&str> = events.iter().map(|e| e.repo_id.as_str()).collect();
+        repo_ids.sort_unstable();
+        repo_ids.dedup();
+
         let mut values = String::new();
         for i in 0..events.len() {
             if i > 0 {
@@ -3177,7 +3232,51 @@ impl Db {
              ON CONFLICT(id) DO NOTHING"
         );
 
-        let mut q = sqlx::query(&sql);
+        let mut attempt = 1;
+        loop {
+            match self.push_events_attempt(&sql, &repo_ids, events).await {
+                Ok(()) => return Ok(()),
+                Err(e) if attempt < PUSH_LOCK_ATTEMPTS && is_lock_timeout(&e) => {
+                    tracing::debug!(
+                        attempt,
+                        repos = repo_ids.len(),
+                        "push-event write timed out waiting for the repo lock; retrying"
+                    );
+                    attempt += 1;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    /// One attempt at the write above: take the repo locks, insert, commit.
+    ///
+    /// The lock releases with the transaction, so the commit here is what makes
+    /// the next writer's allocation safe.
+    async fn push_events_attempt(
+        &self,
+        sql: &str,
+        repo_ids: &[&str],
+        events: &[RepoPushEvent],
+    ) -> std::result::Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+
+        // First statement of the transaction, so it bounds the lock waits below
+        // and nothing else: `SET LOCAL` reverts at commit or rollback.
+        sqlx::query(&format!(
+            "SET LOCAL lock_timeout = '{PUSH_LOCK_TIMEOUT_MS}ms'"
+        ))
+        .execute(&mut *tx)
+        .await?;
+
+        for repo_id in repo_ids {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+                .bind(*repo_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let mut q = sqlx::query(sql);
         for e in events {
             q = q
                 .bind(&e.id)
@@ -3187,8 +3286,9 @@ impl Db {
                 .bind(&e.created_at);
         }
         count_push_write_statement();
-        q.execute(&self.pool).await?;
-        Ok(())
+        q.execute(&mut *tx).await?;
+
+        tx.commit().await
     }
 
     /// The SHA of the most recent push this node recorded for one ref of a repo,
@@ -3231,8 +3331,14 @@ impl Db {
     /// after it via `seq > after`, which matches the `ORDER BY` exactly. One
     /// column is enough because `seq` is a database-assigned bigserial: it is
     /// unique, so there is no tiebreak to get wrong, and it is assigned at insert
-    /// time rather than by the application, so it cannot disagree with the order
-    /// the rows actually became visible. `created_at` cannot do this job: it is
+    /// time rather than by the application. It does not follow from that alone
+    /// that the sequence agrees with the order the rows became visible: the
+    /// value is allocated at INSERT and published at COMMIT, so two overlapping
+    /// writers can commit out of allocation order and strand the lower row
+    /// behind a cursor that has already passed it. What makes the agreement
+    /// hold is the write side, where [`Db::insert_repo_push_events`] serializes
+    /// a repo's writers on an advisory lock held across the commit.
+    /// `created_at` cannot do this job either: it is
     /// stamped before the insert, every row of one multi-ref push carries the
     /// same value, and a clock that steps backwards makes a later row sort
     /// earlier, stranding it behind a cursor that has already passed.
@@ -4988,6 +5094,285 @@ mod migration_tests {
             Some(SHA_B),
             "a push to another ref must not move this ref's resolve"
         );
+    }
+
+    /// One push event on a caller-owned transaction, returning the sequence the
+    /// database allocated. The allocation is what these tests are about, so the
+    /// row goes in through raw SQL rather than the public writer: the writer now
+    /// owns its own transaction and the reproduction below needs to own the
+    /// commit boundaries itself.
+    async fn raw_push_insert(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        repo_id: &str,
+        ref_name: &str,
+        sha: &str,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO repo_push_events (id, repo_id, ref_name, after_sha, created_at)
+             VALUES ($1,$2,$3,$4,$5) RETURNING seq",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(repo_id)
+        .bind(ref_name)
+        .bind(sha)
+        .bind("2026-08-07T00:00:00+00:00")
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+    }
+
+    fn push_event(repo_id: &str, ref_name: &str, sha: &str) -> super::RepoPushEvent {
+        super::RepoPushEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            seq: 0,
+            repo_id: repo_id.to_string(),
+            ref_name: ref_name.to_string(),
+            after_sha: sha.to_string(),
+            created_at: "2026-08-07T00:00:00+00:00".to_string(),
+        }
+    }
+
+    /// The defect the repo lock exists to stop, pinned at the layer it lives in.
+    ///
+    /// `seq` is a bigserial: `nextval` allocates at INSERT and the row becomes
+    /// visible at COMMIT, and the two orders are independent. A writer that
+    /// allocates first and commits second leaves its row behind a cursor that
+    /// has already passed, and no later poll asks for it again, so the event is
+    /// lost silently and permanently.
+    ///
+    /// Driven with two test-owned transactions rather than two racing calls to
+    /// the public writer, because the test has to decide when each one commits.
+    /// A barrier around the public writer cannot reproduce this: allocate and
+    /// commit were a single round trip, so there was no client-side window to
+    /// interleave. This test therefore holds against the shape the write had
+    /// before the lock as well as after it; what it documents is the mechanism,
+    /// and the guard that the writer actually takes the lock is the test below.
+    #[sqlx::test]
+    async fn out_of_order_commits_strand_a_row_behind_the_cursor(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let mut first = pool.begin().await.unwrap();
+        let seq_first = raw_push_insert(&mut first, "repo-1", "refs/heads/main", SHA_A).await;
+        let mut second = pool.begin().await.unwrap();
+        let seq_second = raw_push_insert(&mut second, "repo-1", "refs/heads/other", SHA_B).await;
+        assert!(
+            seq_first < seq_second,
+            "the fixture must allocate in this order to be the case under test"
+        );
+
+        // The later allocation commits first, which is exactly what an
+        // unserialized pair of writers can do.
+        second.commit().await.unwrap();
+
+        let page = db
+            .list_repo_push_events_keyset("repo-1", None, 50)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![seq_second],
+            "only the committed row is visible, so the poller's cursor lands past \
+             the uncommitted one"
+        );
+        let cursor = page.last().unwrap().seq;
+        assert!(cursor > seq_first);
+
+        first.commit().await.unwrap();
+
+        let total: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM repo_push_events WHERE repo_id = 'repo-1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(total, 2, "both rows are committed and visible");
+        assert!(
+            db.list_repo_push_events_keyset("repo-1", Some(cursor), 50)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the row that committed second is now unreachable: every later poll \
+             asks for seq > {cursor} and it will never be delivered"
+        );
+    }
+
+    /// The writer waits on its own repo's lock and on no other repo's.
+    ///
+    /// Probed directly rather than inferred from timing between two writers: a
+    /// transaction owned by the test holds the advisory lock for one repo, so
+    /// "does the writer take this lock" becomes an observation rather than a
+    /// race. The negative half is the one that matters and it is asserted
+    /// first-class: a write for a different repo must not queue behind an
+    /// unrelated repo's push.
+    #[sqlx::test]
+    async fn a_push_write_waits_on_its_own_repo_lock_and_no_others(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        let db = super::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind("repo-held")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        // Both failure modes are one assertion on purpose: a key too coarse
+        // makes this write either hang until the outer timeout or fail its own
+        // bounded lock wait, and either way the property that broke is the same
+        // one.
+        let free = tokio::time::timeout(
+            Duration::from_secs(10),
+            db.insert_repo_push_events(&[push_event("repo-free", "refs/heads/main", SHA_A)]),
+        )
+        .await;
+        assert!(
+            matches!(free, Ok(Ok(()))),
+            "a write for another repo must not wait on this repo's lock; got {free:?}"
+        );
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(500),
+            db.insert_repo_push_events(&[push_event("repo-held", "refs/heads/main", SHA_A)]),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a write for a repo whose lock is held must wait rather than allocate \
+             a sequence, or its row can commit after a later one and be stranded"
+        );
+        let held_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM repo_push_events WHERE repo_id = 'repo-held'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(held_rows, 0, "the blocked write must not have committed");
+
+        holder.rollback().await.unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            db.insert_repo_push_events(&[push_event("repo-held", "refs/heads/main", SHA_B)]),
+        )
+        .await
+        .expect("the write must proceed once the lock is released")
+        .unwrap();
+    }
+
+    /// A wait that never ends returns an error rather than holding the push
+    /// open, and it spends its whole retry budget getting there.
+    ///
+    /// Both halves matter and neither implies the other. Without the bound the
+    /// user's `git push` hangs for as long as the lock is held, which on the
+    /// inline path is a pooled connection held with it. Without the retries a
+    /// single slow neighbour turns into a lost chunk, which is the loss the lock
+    /// exists to prevent, arriving by another road.
+    #[sqlx::test]
+    async fn a_lock_wait_that_never_clears_is_retried_and_then_returned(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        let db = super::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind("repo-held")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let lock_wait = Duration::from_millis(super::PUSH_LOCK_TIMEOUT_MS.into());
+        let started = std::time::Instant::now();
+        // A fixed ceiling, not one derived from the constants above: the point
+        // of this half is that the write terminates on its own, and an
+        // expectation computed from the same values it is checking would move
+        // with them.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            db.insert_repo_push_events(&[push_event("repo-held", "refs/heads/main", SHA_A)]),
+        )
+        .await
+        .expect("the write must give up on its own rather than wait on the lock forever");
+        let elapsed = started.elapsed();
+
+        let err = outcome.expect_err("the write cannot have succeeded under a held lock");
+        assert!(
+            err.to_string().contains("lock timeout"),
+            "the error must be the lock wait expiring, not something else the \
+             retry classified wrongly; got: {err}"
+        );
+        assert!(
+            elapsed >= lock_wait * 2,
+            "the write must wait out more than one lock timeout before giving \
+             up; it returned after {elapsed:?}, which is a single attempt"
+        );
+
+        holder.rollback().await.unwrap();
+    }
+
+    /// Two writers against one repo, in flight at once: every row is delivered
+    /// by a cursor walk exactly once, and none is skipped.
+    ///
+    /// `tokio::spawn` and a `tokio::sync::Barrier`, never a thread: the
+    /// push-write statement counter is a thread-local that depends on
+    /// `#[sqlx::test]` building a single-threaded runtime, and a writer moved
+    /// off that thread splits the count for every test that measures it.
+    #[sqlx::test]
+    async fn concurrent_writers_are_each_delivered_exactly_once(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool.clone());
+        db.run_migrations().await.unwrap();
+
+        const WRITERS: usize = 4;
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let db = db.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                let event = push_event("repo-race", &format!("refs/heads/b{i}"), SHA_A);
+                gate.wait().await;
+                db.insert_repo_push_events(std::slice::from_ref(&event))
+                    .await
+                    .unwrap();
+                event.id
+            }));
+        }
+        let mut written = Vec::new();
+        for handle in handles {
+            written.push(handle.await.unwrap());
+        }
+
+        // Page one row at a time, the way a poller that persists its cursor
+        // does, so a skipped row shows up as a missing id rather than being
+        // hidden inside one large page.
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = db
+                .list_repo_push_events_keyset("repo-race", cursor, 1)
+                .await
+                .unwrap();
+            let Some(row) = page.into_iter().next() else {
+                break;
+            };
+            seen.push(row.id);
+            cursor = Some(row.seq);
+        }
+
+        assert_eq!(
+            seen.len(),
+            WRITERS,
+            "the walk returned {} rows for {WRITERS} writers",
+            seen.len()
+        );
+        let mut unique = seen.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), seen.len(), "no row may be delivered twice");
+        let mut expected = written;
+        expected.sort();
+        assert_eq!(unique, expected, "every writer's row must be reachable");
     }
 
     /// Upgrade path, the load-bearing one: `#[sqlx::test]` hands out a fresh
