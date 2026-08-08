@@ -135,6 +135,21 @@ pub struct StatusClaim {
     pub created_at: String,
 }
 
+/// One row of the commit-status projection: what the read surfaces render and
+/// nothing else. Deliberately NOT a [`StatusClaim`]. The claim carries the
+/// signature material, which no read renders and which runs to kilobytes per row
+/// (`signing_string` plus `request_body`), so reading the projection as claims
+/// pulled that weight off disk on every public status request.
+#[derive(Debug, Clone)]
+pub struct StatusProjection {
+    pub state: String,
+    pub context: String,
+    pub target_url: Option<String>,
+    pub description: Option<String>,
+    pub producer_did: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrReview {
     pub id: String,
@@ -1016,6 +1031,9 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS idx_status_claims_repo_commit ON status_claims(repo_id, commit_sha)",
             // Cap count and latest-per-tuple lookup, which orders on seq DESC.
             "CREATE INDEX IF NOT EXISTS idx_status_claims_tuple ON status_claims(repo_id, commit_sha, producer_did, context, seq DESC)",
+            // The per-repo write bound, which counts the rows a repo wrote inside
+            // a trailing window rather than every row it ever wrote.
+            "CREATE INDEX IF NOT EXISTS idx_status_claims_repo_created ON status_claims(repo_id, created_at)",
             // Stored head of a pull request's source branch. Nullable: a PR
             // opened before anything pushed has no head yet.
             "ALTER TABLE pull_requests ADD COLUMN IF NOT EXISTS head_commit TEXT",
@@ -1051,6 +1069,34 @@ pub(crate) fn normalize_owner_key(did: &str) -> &str {
     }
 }
 
+/// The canonical spelling of an identity for a column that stores one identity
+/// per row, as `status_claims.producer_did` and `authorizing_did` do: the full
+/// `did:key:<id>` form for a `did:key` in either spelling, the value unchanged
+/// for every other method.
+///
+/// Written as a function of [`normalize_owner_key`] rather than beside it, so the
+/// two cannot disagree about which identities are the same one: `canonical_did`
+/// is injective over the normalized key, which makes
+/// `canonical_did(a) == canonical_did(b)` exactly `did_matches(a, b)`. Pinned by
+/// `canonical_did_agrees_with_did_matches`.
+///
+/// It expands where `normalize_owner_key` collapses because the two answer
+/// different questions. The owner key is a lookup key; a stored `producer_did` is
+/// evidence, and a claim has to stay verifiable from the row alone — a bare
+/// base58 id does not parse as a DID, so the key behind the signature could not
+/// be recovered from it.
+pub(crate) fn canonical_did(did: &str) -> std::borrow::Cow<'_, str> {
+    let key = normalize_owner_key(did);
+    // A residual carrying ':' is a full DID of some other method (or a value that
+    // is not a did:key at all); prefixing it would merge two identities that
+    // `did_matches` keeps apart.
+    if key.contains(':') {
+        std::borrow::Cow::Borrowed(key)
+    } else {
+        std::borrow::Cow::Owned(format!("did:key:{key}"))
+    }
+}
+
 /// SQL CASE expression byte-identical to `normalize_owner_key`. All queries that
 /// filter or group by owner key use this const so the Rust and SQL sides cannot
 /// drift apart. If you change `normalize_owner_key`, update this const too.
@@ -1062,7 +1108,49 @@ const PROFILE_DID_CASE_SQL: &str = "CASE WHEN did LIKE 'did:key:%' AND position(
 
 #[cfg(test)]
 mod normalize_owner_key_tests {
-    use super::normalize_owner_key;
+    use super::{canonical_did, normalize_owner_key};
+
+    /// `canonical_did` is what the claim columns store, and the projection
+    /// compares stored values for equality. That comparison is the authorization
+    /// filter, so it must decide exactly what `did_matches` decides: equal
+    /// canonical spellings for identities that match, distinct ones for
+    /// identities that do not. Both directions, including the cross-method cases
+    /// a bare base58 id must never reach across.
+    #[test]
+    fn canonical_did_agrees_with_did_matches() {
+        let values = [
+            "did:key:zABC",
+            "zABC",
+            "did:key:zXYZ",
+            "zXYZ",
+            "did:gitlawb:zABC",
+            "did:web:example.com",
+            "example.com",
+            "did:key:did:gitlawb:zABC",
+            "z:A",
+            "did:key:z:A",
+            "did:key:",
+            "",
+        ];
+        for a in values {
+            for b in values {
+                assert_eq!(
+                    canonical_did(a) == canonical_did(b),
+                    crate::api::did_matches(a, b),
+                    "canonical_did disagrees with did_matches on ({a:?}, {b:?})"
+                );
+            }
+        }
+    }
+
+    /// The stored spelling has to parse as a DID: a claim is evidence, and
+    /// recovering the key behind its signature starts from `producer_did`.
+    #[test]
+    fn canonical_did_keeps_a_did_key_parseable() {
+        assert_eq!(canonical_did("zABC"), "did:key:zABC");
+        assert_eq!(canonical_did("did:key:zABC"), "did:key:zABC");
+        assert_eq!(canonical_did("did:gitlawb:zABC"), "did:gitlawb:zABC");
+    }
 
     // Boundary set matching the SQL CASE: did:key short/full, empty residual,
     // did:key:z:extra, non-key, bare, empty, uppercase.
@@ -2180,6 +2268,13 @@ const INSERT_STATUS_CLAIM_SQL: &str = "INSERT INTO status_claims
 
 /// The bind chain for [`INSERT_STATUS_CLAIM_SQL`], shared by the plain and the
 /// capped insert so the two can never bind different columns.
+///
+/// Both DIDs are normalized here, at the one place claims are written, rather
+/// than at each call site. The owner gate accepts `did:key:X` and the bare `X` as
+/// the same identity, so a producer who alternates spellings would otherwise
+/// store two values for one identity: the projection dedupes on the raw
+/// `producer_did`, and the per-tuple cap counts on it, so both would be split in
+/// half and the superseded claim would keep voting in the combined state.
 fn status_claim_insert(
     claim: &StatusClaim,
 ) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
@@ -2191,14 +2286,31 @@ fn status_claim_insert(
         .bind(&claim.context)
         .bind(&claim.target_url)
         .bind(&claim.description)
-        .bind(&claim.producer_did)
-        .bind(&claim.authorizing_did)
+        .bind(canonical_did(&claim.producer_did).into_owned())
+        .bind(canonical_did(&claim.authorizing_did).into_owned())
         .bind(&claim.signature)
         .bind(&claim.signature_input)
         .bind(&claim.signing_string)
         .bind(&claim.request_body)
         .bind(&claim.created_at)
 }
+
+/// The projection behind the commit-status read, with its own column list: only
+/// the fields a read surface renders. `seq` is selected in the inner query for
+/// the ordering and dropped by the outer one. The signature material is
+/// deliberately absent — see [`StatusProjection`].
+const LATEST_STATUS_CLAIMS_SQL: &str =
+    "SELECT state,context,target_url,description,producer_did,created_at FROM (
+     SELECT DISTINCT ON (producer_did, context)
+            seq,state,context,target_url,description,producer_did,created_at
+     FROM status_claims
+     WHERE repo_id=$1 AND commit_sha=$2 AND authorizing_did = $3
+     ORDER BY producer_did, context, seq DESC
+ ) latest ORDER BY seq ASC";
+
+/// The trailing window the per-repo bound counts over. Named here, next to the
+/// query that uses it, and quoted in the refusal message the handler surfaces.
+const CLAIM_REPO_WINDOW_HOURS: i64 = 24;
 
 /// The three write-path bounds. All three are checked in the insert transaction:
 /// one alone bounds nothing, because the context string and the commit SHA are
@@ -2208,8 +2320,17 @@ pub struct ClaimCaps {
     pub per_tuple: i64,
     /// Distinct contexts for one (repo, commit).
     pub contexts_per_commit: i64,
-    /// Total claim rows for one repo.
-    pub per_repo: i64,
+    /// Claim rows for one repo within the trailing
+    /// [`CLAIM_REPO_WINDOW_HOURS`]-hour window.
+    ///
+    /// A window and not an all-time total. Nothing prunes this table, so a
+    /// lifetime bound would be a dead end: the repo's claim count never falls,
+    /// the refusal never becomes satisfiable, and the surface is closed for
+    /// good — while the 429 tells every CI client to retry forever. As a rate it
+    /// still bounds the fan-out this cap exists for (the commit SHA is
+    /// caller-chosen and never existence-checked, so the other two bounds do not
+    /// contain it), and the refusal is honest: waiting out the window works.
+    pub per_repo_window: i64,
 }
 
 /// Outcome of a capped append. `CapExceeded` names the bound that refused, for
@@ -2231,9 +2352,20 @@ impl Db {
         Ok(row.get::<i64, _>("seq"))
     }
 
-    /// Append one claim only if all three caps still admit it, with the counts
-    /// and the insert in one transaction so a concurrent writer cannot slip an
-    /// extra row past a bound that was counted a moment earlier.
+    /// Append one claim only if all three caps still admit it.
+    ///
+    /// Writers against one repo are serialized on a transaction-scoped advisory
+    /// lock taken before the first count. A transaction alone would not hold the
+    /// bounds: Postgres runs READ COMMITTED, so concurrent writers each count the
+    /// rows committed when they started, every one of them reads a value under the
+    /// cap, and every one of them inserts — the table ends up over the bound by
+    /// the concurrency, which is exactly the burst the caps exist to stop.
+    ///
+    /// The lock is keyed on the repo id, which is the coarsest of the three
+    /// bounds, so one key covers all of them. It is released by the commit or the
+    /// rollback, including the early returns below. `hashtext` collisions put two
+    /// unrelated repos behind one key, which costs a little serialization on the
+    /// write path and nothing in correctness.
     pub async fn insert_status_claim_capped(
         &self,
         claim: &StatusClaim,
@@ -2241,16 +2373,34 @@ impl Db {
     ) -> Result<ClaimInsert> {
         let mut tx = self.pool.begin().await?;
 
-        let tuple_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM status_claims
-             WHERE repo_id=$1 AND commit_sha=$2 AND producer_did=$3 AND context=$4",
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+            .bind(&claim.repo_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // The tuple bound and the context-fanout bound read the same
+        // (repo, commit) rows, so they are one aggregate over one scan rather
+        // than two round trips: the tuple count is the same scan narrowed by a
+        // FILTER.
+        let row = sqlx::query(
+            "SELECT count(*) FILTER (WHERE producer_did=$3 AND context=$4) AS tuple_count,
+                    count(DISTINCT context) AS contexts,
+                    COALESCE(bool_or(context = $4), false) AS present
+             FROM status_claims WHERE repo_id=$1 AND commit_sha=$2",
         )
         .bind(&claim.repo_id)
         .bind(&claim.commit_sha)
-        .bind(&claim.producer_did)
+        // Canonicalized to match what the insert stores (see
+        // status_claim_insert): counting on the raw DID would give one identity a
+        // fresh cap per spelling.
+        .bind(canonical_did(&claim.producer_did).into_owned())
         .bind(&claim.context)
         .fetch_one(&mut *tx)
         .await?;
+        let tuple_count: i64 = row.get("tuple_count");
+        let contexts: i64 = row.get("contexts");
+        let present: bool = row.get("present");
+
         if tuple_count >= caps.per_tuple {
             return Ok(ClaimInsert::CapExceeded(
                 "claims for this commit, producer and context",
@@ -2259,31 +2409,28 @@ impl Db {
 
         // A context already present does not widen the fanout, so only a NEW
         // context is measured against the limit.
-        let row = sqlx::query(
-            "SELECT count(DISTINCT context) AS contexts,
-                    COALESCE(bool_or(context = $3), false) AS present
-             FROM status_claims WHERE repo_id=$1 AND commit_sha=$2",
-        )
-        .bind(&claim.repo_id)
-        .bind(&claim.commit_sha)
-        .bind(&claim.context)
-        .fetch_one(&mut *tx)
-        .await?;
-        let contexts: i64 = row.get("contexts");
-        let present: bool = row.get("present");
         if !present && contexts >= caps.contexts_per_commit {
             return Ok(ClaimInsert::CapExceeded(
                 "distinct contexts for this commit",
             ));
         }
 
-        let repo_rows: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM status_claims WHERE repo_id=$1")
-                .bind(&claim.repo_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if repo_rows >= caps.per_repo {
-            return Ok(ClaimInsert::CapExceeded("claims for this repository"));
+        // Trailing window, not an all-time count: see ClaimCaps::per_repo_window.
+        // `created_at` is TEXT, and the server writes every row as one rfc3339
+        // UTC format, so the comparison is chronological as well as lexical.
+        let window_start =
+            (Utc::now() - chrono::Duration::hours(CLAIM_REPO_WINDOW_HOURS)).to_rfc3339();
+        let repo_rows: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM status_claims WHERE repo_id=$1 AND created_at >= $2",
+        )
+        .bind(&claim.repo_id)
+        .bind(&window_start)
+        .fetch_one(&mut *tx)
+        .await?;
+        if repo_rows >= caps.per_repo_window {
+            return Ok(ClaimInsert::CapExceeded(
+                "claims for this repository in the last 24 hours",
+            ));
         }
 
         let inserted = status_claim_insert(claim).fetch_one(&mut *tx).await?;
@@ -2314,8 +2461,8 @@ impl Db {
     }
 
     /// The projection behind the commit-status read (KTD-2): the latest claim per
-    /// (producer, context) for one commit, restricted to claims whose authorizing
-    /// DID is in `authorizing_dids`.
+    /// (producer, context) for one commit, restricted to claims authorized by
+    /// `authorizing_did`.
     ///
     /// Computed on every read and never materialized, so a repo whose visibility
     /// or ownership changes after a claim was written is answered from current
@@ -2323,33 +2470,27 @@ impl Db {
     /// the timestamp is producer-visible display data and the id is a random
     /// uuid, so neither orders the history.
     ///
-    /// The authorization filter is a set-membership test evaluated inside the
-    /// query rather than a per-claim check in Rust, which is the constraint the
-    /// delegated-capability follow-on inherits: it may widen the set, never move
-    /// the test into the read loop.
+    /// The authorization filter is one equality evaluated inside the query rather
+    /// than a per-claim check in Rust, which is the constraint the
+    /// delegated-capability follow-on inherits: it may widen the filter, never
+    /// move the test into the read loop. It is a single comparison and not a set
+    /// expansion because the column is already canonicalized on write through
+    /// [`canonical_did`], which is defined over the same [`normalize_owner_key`]
+    /// that `did_matches` collapses with, so the `did:key` rule has one definition
+    /// instead of a copy per query.
     pub async fn latest_status_claims(
         &self,
         repo_id: &str,
         commit_sha: &str,
-        authorizing_dids: &[String],
-    ) -> Result<Vec<StatusClaim>> {
-        let rows = sqlx::query(
-            "SELECT * FROM (
-                 SELECT DISTINCT ON (producer_did, context)
-                        id,seq,repo_id,commit_sha,state,context,target_url,description,
-                        producer_did,authorizing_did,signature,signature_input,
-                        signing_string,request_body,created_at
-                 FROM status_claims
-                 WHERE repo_id=$1 AND commit_sha=$2 AND authorizing_did = ANY($3)
-                 ORDER BY producer_did, context, seq DESC
-             ) latest ORDER BY seq ASC",
-        )
-        .bind(repo_id)
-        .bind(commit_sha)
-        .bind(authorizing_dids)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_status_claim).collect())
+        authorizing_did: &str,
+    ) -> Result<Vec<StatusProjection>> {
+        let rows = sqlx::query(LATEST_STATUS_CLAIMS_SQL)
+            .bind(repo_id)
+            .bind(commit_sha)
+            .bind(canonical_did(authorizing_did).into_owned())
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_to_status_projection).collect())
     }
 }
 
@@ -3377,6 +3518,17 @@ fn row_to_status_claim(r: sqlx::postgres::PgRow) -> StatusClaim {
         signature_input: r.get("signature_input"),
         signing_string: r.get("signing_string"),
         request_body: r.get("request_body"),
+        created_at: r.get("created_at"),
+    }
+}
+
+fn row_to_status_projection(r: sqlx::postgres::PgRow) -> StatusProjection {
+    StatusProjection {
+        state: r.get("state"),
+        context: r.get("context"),
+        target_url: r.get("target_url"),
+        description: r.get("description"),
+        producer_did: r.get("producer_did"),
         created_at: r.get("created_at"),
     }
 }
@@ -4874,6 +5026,97 @@ mod migration_tests {
             seqs,
             "the stored seq must be the one the insert reported"
         );
+    }
+
+    /// The caps have to hold against writers racing each other, which is the only
+    /// case they are actually for: a sequential caller hitting a cap is a
+    /// misbehaving client, a burst of them is the fan-out the bound exists to
+    /// stop. Eight writers are released together onto a tuple seeded to `cap - 1`,
+    /// so exactly one of them may win. Counting rows under READ COMMITTED and then
+    /// inserting is not enough: each writer's count is taken before any of the
+    /// others commit, so every one of them reads `cap - 1` and inserts, and the
+    /// table ends up over the bound by the concurrency.
+    #[sqlx::test]
+    async fn capped_insert_holds_the_bound_against_concurrent_writers(pool: sqlx::PgPool) {
+        let db = super::Db::for_testing(pool.clone());
+        db.migrate().await.unwrap();
+
+        const CAP: i64 = 3;
+        const WRITERS: usize = 8;
+        // Only the per-tuple bound is under test; the other two are left far out
+        // of reach so the refusal cannot come from them.
+        fn caps() -> super::ClaimCaps {
+            super::ClaimCaps {
+                per_tuple: CAP,
+                contexts_per_commit: 1_000,
+                per_repo_window: 1_000_000,
+            }
+        }
+
+        for _ in 0..CAP - 1 {
+            db.insert_status_claim(&sample_claim("repo-race", SHA_A, "ci/build"))
+                .await
+                .unwrap();
+        }
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        let mut handles = Vec::new();
+        for _ in 0..WRITERS {
+            let db = db.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                let claim = sample_claim("repo-race", SHA_A, "ci/build");
+                // Every writer reaches the capped insert at the same moment, so
+                // the count-then-insert windows overlap instead of queueing.
+                gate.wait().await;
+                db.insert_status_claim_capped(&claim, &caps())
+                    .await
+                    .unwrap()
+            }));
+        }
+
+        let mut accepted = 0;
+        for handle in handles {
+            if let super::ClaimInsert::Inserted(_) = handle.await.unwrap() {
+                accepted += 1;
+            }
+        }
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM status_claims WHERE repo_id = 'repo-race'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows, CAP,
+            "the bound is {CAP} rows; {WRITERS} concurrent writers left {rows}"
+        );
+        assert_eq!(
+            accepted, 1,
+            "exactly one writer may be told its claim was accepted"
+        );
+    }
+
+    /// The public commit-status read must not pull the signature material off
+    /// disk. `signing_string` and `request_body` are write-time provenance that
+    /// no read surface renders, and together they run to kilobytes per claim, so
+    /// selecting them costs the anonymous read path on every request. Asserted on
+    /// the query text, because a widened column list is invisible in the response
+    /// body: the extra bytes are read and then dropped.
+    #[test]
+    fn projection_selects_no_signature_columns() {
+        for banned in [
+            "signature",
+            "signature_input",
+            "signing_string",
+            "request_body",
+        ] {
+            assert!(
+                !super::LATEST_STATUS_CLAIMS_SQL.contains(banned),
+                "the commit-status projection must not select `{banned}`: it is \
+                 write-time provenance no read surface renders"
+            );
+        }
     }
 
     #[sqlx::test]

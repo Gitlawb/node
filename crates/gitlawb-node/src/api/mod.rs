@@ -68,17 +68,14 @@ pub(crate) async fn authorize_repo_read(
 /// representation only within `did:key`; never let a bare id match across methods —
 /// `did:web` / `did:gitlawb` share the base58 space with `did:key`, so a
 /// trailing-segment compare would treat `did:key:X` and `did:gitlawb:X` as equal.
+///
+/// The collapse itself lives in exactly one place, [`crate::db::normalize_owner_key`],
+/// which is also the function the stored `owner_did` / `authorizing_did` columns
+/// are normalized through and which `OWNER_KEY_CASE_SQL` mirrors byte for byte.
+/// Two identities match when they normalize to the same key; a second copy of the
+/// rule here is how the Rust gate and the SQL filters would drift apart.
 pub(crate) fn did_matches(a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    fn key_id(d: &str) -> &str {
-        d.strip_prefix("did:key:").unwrap_or(d)
-    }
-    let (ka, kb) = (key_id(a), key_id(b));
-    // After stripping `did:key:`, a value still containing ':' is a non-key full
-    // DID — do not let it match a bare `did:key` id.
-    !ka.contains(':') && !kb.contains(':') && ka == kb
+    crate::db::normalize_owner_key(a) == crate::db::normalize_owner_key(b)
 }
 
 /// 403 unless `caller` is the repo owner. Uses [`did_matches`] so the owner check

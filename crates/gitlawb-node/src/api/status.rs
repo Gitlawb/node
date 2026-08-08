@@ -24,10 +24,13 @@ const MAX_CLAIMS_PER_TUPLE: i64 = 100;
 /// Distinct contexts for one (repo, commit). The context string is caller-chosen
 /// and free-form, so the tuple cap alone bounds nothing.
 const MAX_CONTEXTS_PER_COMMIT: i64 = 50;
-/// Total claim rows for one repo. The commit SHA is caller-chosen and never
-/// existence-checked, so a writer at the two caps above can still fan out over
-/// fresh 40-hex strings without this one.
-const MAX_CLAIMS_PER_REPO: i64 = 10_000;
+/// Claim rows for one repo within the trailing window the db layer counts over.
+/// The commit SHA is caller-chosen and never existence-checked, so a writer at
+/// the two caps above can still fan out over fresh 40-hex strings without this
+/// one. It bounds the RATE of that fan-out rather than a lifetime total, because
+/// nothing prunes the table: a lifetime bound would close the surface on a repo
+/// permanently while answering with a status every client retries.
+const MAX_CLAIMS_PER_REPO_PER_WINDOW: i64 = 10_000;
 
 #[derive(Deserialize)]
 pub struct CreateStatusRequest {
@@ -185,7 +188,7 @@ pub async fn create_status(
     let caps = crate::db::ClaimCaps {
         per_tuple: MAX_CLAIMS_PER_TUPLE,
         contexts_per_commit: MAX_CONTEXTS_PER_COMMIT,
-        per_repo: MAX_CLAIMS_PER_REPO,
+        per_repo_window: MAX_CLAIMS_PER_REPO_PER_WINDOW,
     };
     match state.db.insert_status_claim_capped(&claim, &caps).await? {
         crate::db::ClaimInsert::Inserted(seq) => Ok((
@@ -264,10 +267,9 @@ async fn project_claims(
     record: &crate::db::RepoRecord,
     commit_sha: &str,
 ) -> Result<Vec<StatusEntry>> {
-    let authorizing = authorizing_did_variants(&record.owner_did);
     let claims = state
         .db
-        .latest_status_claims(&record.id, commit_sha, &authorizing)
+        .latest_status_claims(&record.id, commit_sha, &record.owner_did)
         .await?;
     Ok(claims
         .into_iter()
@@ -445,24 +447,6 @@ fn combined_state(statuses: &[StatusEntry]) -> &'static str {
         "pending"
     } else {
         "success"
-    }
-}
-
-/// The set of stored `authorizing_did` values that count as the current owner,
-/// reproducing [`crate::api::did_matches`] as a set so the filter can be a
-/// membership test inside the projection query. `did:key` collapses its full and
-/// bare forms; every other method matches exactly, because a bare base58 id must
-/// never match across methods.
-fn authorizing_did_variants(owner_did: &str) -> Vec<String> {
-    let key_id = owner_did.strip_prefix("did:key:").unwrap_or(owner_did);
-    if key_id.contains(':') {
-        return vec![owner_did.to_string()];
-    }
-    let full = format!("did:key:{key_id}");
-    if full == owner_did {
-        vec![owner_did.to_string(), key_id.to_string()]
-    } else {
-        vec![owner_did.to_string(), full]
     }
 }
 
@@ -959,9 +943,9 @@ mod tests {
         );
     }
 
-    /// Seed the per-repo row limit across distinct well-formed SHAs; a claim
-    /// against a fresh SHA is exactly 429, which is the bound the caller-chosen
-    /// (never existence-checked) SHA would otherwise escape.
+    /// Seed the per-repo limit across distinct well-formed SHAs, all inside the
+    /// window; a claim against a fresh SHA is exactly 429, which is the bound the
+    /// caller-chosen (never existence-checked) SHA would otherwise escape.
     #[sqlx::test]
     async fn repo_row_cap_refuses_a_fresh_sha(pool: PgPool) {
         let state = test_state(pool.clone()).await;
@@ -969,7 +953,14 @@ mod tests {
         let repo_id = repo.id.clone();
         state.db.create_repo(&repo).await.unwrap();
 
-        seed_claims_across_shas(&pool, &repo_id, OWNER, super::MAX_CLAIMS_PER_REPO).await;
+        seed_claims_across_shas(
+            &pool,
+            &repo_id,
+            OWNER,
+            super::MAX_CLAIMS_PER_REPO_PER_WINDOW,
+            &chrono::Utc::now().to_rfc3339(),
+        )
+        .await;
 
         let resp = post_as(
             &state,
@@ -979,6 +970,45 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// The per-repo bound is a rate, not a lifetime quota, and 429 says so
+    /// honestly: a client that waits and retries eventually gets through. The same
+    /// rows dated before the window admit a fresh claim, so a repo that once burst
+    /// to the limit is not permanently unable to accept a status while every CI
+    /// client retries a refusal that could never succeed.
+    #[sqlx::test]
+    async fn repo_cap_is_a_window_so_the_refusal_is_actually_retryable(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let repo = seed_repo(OWNER, "repo-window-repo", true);
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+
+        // Enough rows to blow a lifetime bound, every one of them older than the
+        // window: this is the repo that reached the cap yesterday.
+        let long_ago = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        seed_claims_across_shas(
+            &pool,
+            &repo_id,
+            OWNER,
+            super::MAX_CLAIMS_PER_REPO_PER_WINDOW,
+            &long_ago,
+        )
+        .await;
+
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "repo-window-repo", SHA_B),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "claims outside the window must not count against it; a repo cannot be \
+             permanently barred from accepting a status"
+        );
     }
 
     /// A handler reached without the verified signature material writes NOTHING
@@ -1856,6 +1886,51 @@ mod tests {
         assert_eq!(body["total_count"], 1);
     }
 
+    /// One identity spelled two ways is one producer. The owner reports the same
+    /// context first as `did:key:X` and then as the bare `X` — both pass the owner
+    /// gate, which normalizes — so the stored producer DID has to be normalized
+    /// too. Without that the projection's dedupe compares raw strings, leaves two
+    /// entries for one context, and the superseded claim keeps voting in the
+    /// combined state.
+    #[sqlx::test]
+    async fn one_identity_in_two_did_forms_projects_as_one_entry(pool: PgPool) {
+        let state = test_state(pool).await;
+        let bare = OWNER.strip_prefix("did:key:").unwrap();
+        let repo = seed_repo(OWNER, "read-diddedupe", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        for (did, claim_state) in [(OWNER, "failure"), (bare, "success")] {
+            let resp = post_as(
+                &state,
+                did,
+                &uri(OWNER, "read-diddedupe", SHA_A),
+                body_of(claim_state, "ci/build"),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "claim as {did}");
+        }
+
+        let body = body_json(
+            get_status(
+                &state,
+                Some(OWNER),
+                &status_uri(OWNER, "read-diddedupe", SHA_A),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            body["total_count"], 1,
+            "the two spellings are one producer reporting one context"
+        );
+        assert_eq!(body["statuses"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["state"], "success",
+            "the newer claim supersedes the older one; a stale failure must not \
+             keep voting because it was written under the other spelling"
+        );
+    }
+
     /// The lookup-failure path. With the claims table gone, the read is exactly
     /// 500 carrying the stable `db_error` code — never a 200, and never an empty
     /// statuses array. The message is the sqlx text and is not asserted; a
@@ -1952,33 +2027,66 @@ mod tests {
         );
     }
 
-    /// The set the projection filters on reproduces `did_matches` exactly, in both
-    /// directions and across the cross-method cases: the filter has to live inside
-    /// the query, so it cannot call the helper itself.
+    /// The `did:key` collapse is a security predicate, and it has exactly one
+    /// definition: `db::normalize_owner_key`, which the owner gate (`did_matches`)
+    /// and the projection's stored identity both go through. A second copy in this
+    /// module is how the two drift apart, one of them lagging a hardening, so the
+    /// production half is scanned for one.
     #[test]
-    fn authorizing_variants_agree_with_did_matches() {
-        let cases = [
-            ("did:key:zABC", "did:key:zABC"),
-            ("did:key:zABC", "zABC"),
-            ("zABC", "did:key:zABC"),
-            ("zABC", "zABC"),
-            ("did:key:zABC", "did:key:zXYZ"),
-            ("did:key:zABC", "did:gitlawb:zABC"),
-            ("did:gitlawb:zABC", "did:key:zABC"),
-            ("did:web:example.com", "did:web:example.com"),
-            ("did:web:example.com", "example.com"),
-            ("", ""),
-        ];
-        for (owner, candidate) in cases {
-            let in_set = super::authorizing_did_variants(owner)
-                .iter()
-                .any(|v| v == candidate);
-            assert_eq!(
-                in_set,
-                crate::api::did_matches(candidate, owner),
-                "variant set for owner {owner:?} disagrees with did_matches on {candidate:?}"
-            );
-        }
+    fn status_module_holds_no_second_copy_of_the_did_collapse() {
+        let src = include_str!("status.rs");
+        let (body_of_module, rest) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("module has a tests module");
+        assert!(
+            !rest.is_empty() && body_of_module.contains("project_claims"),
+            "the scan must cover the whole production half of the module"
+        );
+        assert!(
+            !body_of_module.contains("did:key:"),
+            "this module must not reimplement the did:key collapse — the \
+             projection's identity comparison goes through db::normalize_owner_key"
+        );
+    }
+
+    /// The must-not case the collapse exists to preserve: a bare base58 id must
+    /// never match across DID methods. A claim authorized by `did:gitlawb:X` is
+    /// not authorized by the owner `did:key:X`, so it stays out of the projection.
+    #[sqlx::test]
+    async fn a_cross_method_authorizing_did_never_projects(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let key_id = OWNER.strip_prefix("did:key:").unwrap();
+        let repo = seed_repo(OWNER, "read-crossmethod", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        seed_claim(
+            &pool,
+            "cccccccc-0000-0000-0000-000000000001",
+            &repo.id,
+            SHA_A,
+            &format!("did:gitlawb:{key_id}"),
+            &format!("did:gitlawb:{key_id}"),
+            "ci/build",
+            "success",
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+
+        let body = body_json(
+            get_status(
+                &state,
+                Some(OWNER),
+                &status_uri(OWNER, "read-crossmethod", SHA_A),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            body["total_count"], 0,
+            "did:gitlawb:X and did:key:X share the base58 space and are different \
+             identities; the projection must not treat one as the other"
+        );
+        assert_eq!(body["state"], "pending");
     }
 
     /// `n` claims on one (repo, commit, producer, context) tuple, inserted in one
@@ -2010,8 +2118,16 @@ mod tests {
     }
 
     /// `n` claims on one repo spread across `n` distinct 40-hex SHAs, one claim
-    /// each, so no tuple or context cap is reached before the per-repo one.
-    async fn seed_claims_across_shas(pool: &PgPool, repo_id: &str, producer: &str, n: i64) {
+    /// each, so no tuple or context cap is reached before the per-repo one. The
+    /// timestamp is explicit because the per-repo bound is a rolling window: it
+    /// decides whether these rows are inside it.
+    async fn seed_claims_across_shas(
+        pool: &PgPool,
+        repo_id: &str,
+        producer: &str,
+        n: i64,
+        created_at: &str,
+    ) {
         sqlx::query(
             "INSERT INTO status_claims
              (id, repo_id, commit_sha, state, context, producer_did, authorizing_did,
@@ -2019,12 +2135,13 @@ mod tests {
              SELECT md5(random()::text || g::text), $1,
                     substr(md5(g::text) || md5((g + 1)::text), 1, 40),
                     'success', 'ci/build', $2, $2,
-                    '', '', '', ''::bytea, '2026-01-01T00:00:00Z'
+                    '', '', '', ''::bytea, $4
              FROM generate_series(1, $3) g",
         )
         .bind(repo_id)
         .bind(producer)
         .bind(n)
+        .bind(created_at)
         .execute(pool)
         .await
         .expect("seed claims across shas");
