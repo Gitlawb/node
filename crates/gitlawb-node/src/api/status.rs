@@ -41,9 +41,64 @@ pub struct CreateStatusRequest {
 /// stays distinguishable without a fifth value no client understands.
 const CLAIM_STATES: [&str; 4] = ["error", "failure", "pending", "success"];
 
+/// Bounds on the signature material this write path persists verbatim. Every one
+/// of the four is caller-influenced: the headers come off the request, the
+/// signing string grows with the component list the caller's Signature-Input
+/// chose, and the body is the caller's. Without a bound the claim log's row size
+/// is set by whoever writes to it, so these are explicit and generous rather than
+/// implicit and absent. A conforming `sign_request` produces roughly 100, 200 and
+/// 400 bytes for the first three.
+const MAX_SIGNATURE_CHARS: usize = 512;
+const MAX_SIGNATURE_INPUT_CHARS: usize = 1024;
+const MAX_SIGNING_STRING_CHARS: usize = 4096;
+/// The body is a `CreateStatusRequest`, whose own fields are already capped at
+/// roughly 3.3 KB in total by the three limits below; this leaves room for JSON
+/// framing and nothing more.
+const MAX_REQUEST_BODY_BYTES: usize = 8192;
+
 const MAX_CONTEXT_CHARS: usize = 255;
 const MAX_TARGET_URL_CHARS: usize = 2048;
 const MAX_DESCRIPTION_CHARS: usize = 1024;
+
+/// The 201 body for an accepted claim: what the client needs to identify the row
+/// it just wrote, and nothing else.
+///
+/// Deliberately not the stored [`StatusClaim`]. That struct carries the signature
+/// material, and serializing it echoed the signature, the signing string and the
+/// whole request body back on every write — the body as a JSON array of integers.
+/// Write-time provenance belongs in the row, not on the wire, which is the same
+/// line [`StatusEntry`] draws on the read side.
+#[derive(Serialize)]
+pub struct CreatedStatus {
+    pub id: String,
+    /// The database-assigned ordering key, so the client can name its own row.
+    pub seq: i64,
+    pub repo_id: String,
+    pub commit_sha: String,
+    pub state: String,
+    pub context: String,
+    pub target_url: Option<String>,
+    pub description: Option<String>,
+    pub producer_did: String,
+    pub created_at: String,
+}
+
+impl CreatedStatus {
+    fn from_claim(claim: StatusClaim, seq: i64) -> Self {
+        Self {
+            id: claim.id,
+            seq,
+            repo_id: claim.repo_id,
+            commit_sha: claim.commit_sha,
+            state: claim.state,
+            context: claim.context,
+            target_url: claim.target_url,
+            description: claim.description,
+            producer_did: claim.producer_did,
+            created_at: claim.created_at,
+        }
+    }
+}
 
 /// POST /api/v1/repos/:owner/:repo/statuses/:sha
 pub async fn create_status(
@@ -52,7 +107,7 @@ pub async fn create_status(
     Path((owner, name, sha)): Path<(String, String, String)>,
     material: Option<Extension<crate::auth::SignatureMaterial>>,
     Json(req): Json<CreateStatusRequest>,
-) -> Result<(StatusCode, Json<StatusClaim>)> {
+) -> Result<(StatusCode, Json<CreatedStatus>)> {
     // Read-visibility first, then owner, and the order is the security property.
     // authorize_repo_read denies a quarantined repo before the visibility gate and
     // answers with the repo's own not-found, byte-identical to a missing repo, so
@@ -84,10 +139,26 @@ pub async fn create_status(
              the route is not behind require_signature"
         )));
     };
-    let (signature, signature_input, signed_payload) = (
+    // Bounded before anything is written. The material is verified, which says
+    // the caller holds the key, not that what they signed is a reasonable size.
+    bound("signature", material.signature.len(), MAX_SIGNATURE_CHARS)?;
+    bound(
+        "signature_input",
+        material.signature_input.len(),
+        MAX_SIGNATURE_INPUT_CHARS,
+    )?;
+    bound(
+        "signing_string",
+        material.signing_string.len(),
+        MAX_SIGNING_STRING_CHARS,
+    )?;
+    bound("request body", material.body.len(), MAX_REQUEST_BODY_BYTES)?;
+
+    let (signature, signature_input, signing_string, request_body) = (
         material.signature,
         material.signature_input,
-        material.signing_string.into_bytes(),
+        material.signing_string,
+        material.body.to_vec(),
     );
 
     let claim = StatusClaim {
@@ -106,7 +177,8 @@ pub async fn create_status(
         authorizing_did: auth.0,
         signature,
         signature_input,
-        signed_payload,
+        signing_string,
+        request_body,
         created_at: Utc::now().to_rfc3339(),
     };
 
@@ -116,9 +188,10 @@ pub async fn create_status(
         per_repo: MAX_CLAIMS_PER_REPO,
     };
     match state.db.insert_status_claim_capped(&claim, &caps).await? {
-        crate::db::ClaimInsert::Inserted(seq) => {
-            Ok((StatusCode::CREATED, Json(StatusClaim { seq, ..claim })))
-        }
+        crate::db::ClaimInsert::Inserted(seq) => Ok((
+            StatusCode::CREATED,
+            Json(CreatedStatus::from_claim(claim, seq)),
+        )),
         crate::db::ClaimInsert::CapExceeded(which) => Err(AppError::TooManyRequests(format!(
             "claim limit reached for {which}"
         ))),
@@ -405,6 +478,16 @@ fn normalize_sha(sha: &str) -> Result<String> {
     }
 }
 
+/// One size bound on persisted signature material, measured in bytes.
+fn bound(what: &str, len: usize, max: usize) -> Result<()> {
+    if len > max {
+        return Err(AppError::BadRequest(format!(
+            "{what} must be at most {max} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_state(state: &str) -> Result<String> {
     if CLAIM_STATES.contains(&state) {
         Ok(state.to_string())
@@ -516,13 +599,19 @@ mod tests {
     /// real path instead of a missing-material branch.
     fn signed_with_material(did: &str, uri: &str, body: Body) -> axum::http::Request<Body> {
         let mut req = signed_request_as(did, Method::POST, uri, body);
-        req.extensions_mut().insert(crate::auth::SignatureMaterial {
+        req.extensions_mut().insert(sample_material());
+        req
+    }
+
+    /// Stand-in material, well inside every bound.
+    fn sample_material() -> crate::auth::SignatureMaterial {
+        crate::auth::SignatureMaterial {
             signature: "sig1=:dGVzdA==:".to_string(),
             signature_input: "sig1=(\"@method\" \"@path\" \"content-digest\");alg=\"ed25519\""
                 .to_string(),
             signing_string: "\"@method\": POST".to_string(),
-        });
-        req
+            body: axum::body::Bytes::from_static(b"{}"),
+        }
     }
 
     async fn post_as(
@@ -584,7 +673,8 @@ mod tests {
         // cannot be re-verified after the request is gone is not history.
         assert_eq!(claims[0].signature, "sig1=:dGVzdA==:");
         assert!(claims[0].signature_input.starts_with("sig1=("));
-        assert_eq!(claims[0].signed_payload, b"\"@method\": POST");
+        assert_eq!(claims[0].signing_string, "\"@method\": POST");
+        assert_eq!(claims[0].request_body, b"{}");
     }
 
     /// Covers AE1. Two claims for one context both survive: the history is
@@ -927,6 +1017,344 @@ mod tests {
         );
     }
 
+    /// Every piece of signature material is bounded before it is persisted, and
+    /// an oversized one is exactly 400 with no row written.
+    ///
+    /// The signing string is the one that actually grows: it carries a line per
+    /// covered component, and the component list comes from the caller's own
+    /// Signature-Input. The other three are bounded for the same reason, since
+    /// all four are caller-supplied bytes that the write path stores verbatim.
+    #[sqlx::test]
+    async fn oversized_signature_material_is_rejected_with_400(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "material-cap-repo", true);
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+
+        let cases: Vec<(&str, crate::auth::SignatureMaterial)> = vec![
+            (
+                "signature",
+                crate::auth::SignatureMaterial {
+                    signature: "s".repeat(super::MAX_SIGNATURE_CHARS + 1),
+                    ..sample_material()
+                },
+            ),
+            (
+                "signature-input",
+                crate::auth::SignatureMaterial {
+                    signature_input: "i".repeat(super::MAX_SIGNATURE_INPUT_CHARS + 1),
+                    ..sample_material()
+                },
+            ),
+            (
+                "signing string",
+                crate::auth::SignatureMaterial {
+                    signing_string: "c".repeat(super::MAX_SIGNING_STRING_CHARS + 1),
+                    ..sample_material()
+                },
+            ),
+            (
+                "request body",
+                crate::auth::SignatureMaterial {
+                    body: vec![b'b'; super::MAX_REQUEST_BODY_BYTES + 1].into(),
+                    ..sample_material()
+                },
+            ),
+        ];
+
+        for (label, material) in cases {
+            let mut req = signed_request_as(
+                OWNER,
+                Method::POST,
+                &uri(OWNER, "material-cap-repo", SHA_A),
+                body_of("success", "ci/build"),
+            );
+            req.extensions_mut().insert(material);
+            let resp = router(state.clone()).oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "an oversized {label} must be rejected with 400"
+            );
+        }
+
+        assert!(
+            state
+                .db
+                .list_status_claims(&repo_id, SHA_A)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused write must leave no row"
+        );
+
+        // The control: the same request with material inside every bound writes.
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "material-cap-repo", SHA_A),
+            body_of("success", "ci/build"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CREATED,
+            "material inside the bounds must still write, or the caps prove nothing"
+        );
+    }
+
+    /// The 201 body carries exactly the client-facing fields and no signature
+    /// material. Asserted as the whole key set, not field by field, so a field
+    /// added to the response type later has to be added here deliberately
+    /// instead of leaking on the next serialize.
+    #[sqlx::test]
+    async fn create_response_carries_no_signature_material(pool: PgPool) {
+        let state = test_state(pool).await;
+        let repo = seed_repo(OWNER, "response-repo", true);
+        state.db.create_repo(&repo).await.unwrap();
+
+        let resp = post_as(
+            &state,
+            OWNER,
+            &uri(OWNER, "response-repo", SHA_A),
+            Body::from(
+                r#"{"state":"success","context":"ci/build","target_url":"https://ci.example/1","description":"ok"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = body_json(resp).await;
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .expect("the 201 body must be a json object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "commit_sha",
+                "context",
+                "created_at",
+                "description",
+                "id",
+                "producer_did",
+                "repo_id",
+                "seq",
+                "state",
+                "target_url",
+            ],
+            "the write response must carry exactly the client-facing fields"
+        );
+
+        assert_eq!(body["state"], "success");
+        assert_eq!(body["context"], "ci/build");
+        assert_eq!(body["commit_sha"], SHA_A);
+        assert_eq!(body["producer_did"], OWNER);
+        assert!(
+            body["seq"].as_i64().unwrap() > 0,
+            "the response must report the seq the database assigned"
+        );
+    }
+
+    // ── Signed writes through the production router ───────────────────────
+    //
+    // Everything above injects a hand-built `SignatureMaterial` onto a bare
+    // router, which cannot see a middleware that populates the material wrongly.
+    // These drive a genuinely signed request through `build_router`.
+
+    /// Sign `body` for `path` with `kp` and POST it through the production
+    /// router, headers and all. Returns the headers that went on the wire
+    /// alongside the response, so a test can compare them against what the node
+    /// persisted.
+    async fn post_really_signed(
+        state: &crate::state::AppState,
+        kp: &gitlawb_core::identity::Keypair,
+        path: &str,
+        body: &[u8],
+    ) -> (
+        axum::response::Response,
+        gitlawb_core::http_sig::SignedHeaders,
+    ) {
+        let signed = gitlawb_core::http_sig::sign_request(kp, "POST", path, body);
+        let req = axum::http::Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("content-digest", signed.content_digest.clone())
+            .header("signature-input", signed.signature_input.clone())
+            .header("signature", signed.signature.clone())
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+        let resp = crate::server::build_router(state.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        (resp, signed)
+    }
+
+    /// Re-verify a stored claim from the row alone, the way a third party
+    /// adopting this history would have to:
+    ///
+    ///   1. the row's own fields are the ones the stored body carries,
+    ///   2. the digest of the stored body is the one the signing string covers,
+    ///   3. the stored signature verifies over that signing string under the
+    ///      producer's key.
+    ///
+    /// Returns the first broken link rather than panicking, so the negative case
+    /// can drive the same procedure and observe it refuse.
+    fn re_verify(claim: &crate::db::StatusClaim) -> std::result::Result<(), String> {
+        let body: serde_json::Value = serde_json::from_slice(&claim.request_body)
+            .map_err(|e| format!("stored body is not json: {e}"))?;
+        if body["state"] != claim.state.as_str() {
+            return Err(format!(
+                "row state {:?} is not the state the signed body carries ({:?})",
+                claim.state, body["state"]
+            ));
+        }
+        if body["context"] != claim.context.as_str() {
+            return Err(format!(
+                "row context {:?} is not the context the signed body carries ({:?})",
+                claim.context, body["context"]
+            ));
+        }
+
+        let digest = gitlawb_core::http_sig::compute_content_digest(&claim.request_body);
+        let covered = format!("\"content-digest\": {digest}");
+        if !claim.signing_string.contains(&covered) {
+            return Err(format!(
+                "the signing string does not cover the stored body's digest ({covered})"
+            ));
+        }
+
+        let did: gitlawb_core::did::Did = claim
+            .producer_did
+            .parse()
+            .map_err(|e| format!("producer did does not parse: {e}"))?;
+        let key = did
+            .to_verifying_key()
+            .map_err(|e| format!("producer did does not resolve to a key: {e}"))?;
+        let parsed =
+            gitlawb_core::http_sig::HttpSignature::parse(&claim.signature_input, &claim.signature)
+                .map_err(|e| format!("stored signature headers do not parse: {e}"))?;
+        let bytes: [u8; 64] = parsed
+            .signature_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "stored signature is not 64 bytes".to_string())?;
+        gitlawb_core::identity::verify(&key, claim.signing_string.as_bytes(), &bytes)
+            .map_err(|e| format!("signature does not verify over the stored signing string: {e}"))
+    }
+
+    /// The stored row is re-verifiable end to end, and the chain closes: mutating
+    /// the row's `state` after the fact breaks it.
+    ///
+    /// This is the property the whole write path exists for. Storing only the
+    /// signing string would pass the signature check and still leave step 1 and 2
+    /// unanswerable, because the signing string covers the body only through a
+    /// digest of bytes nobody kept.
+    #[sqlx::test]
+    async fn stored_claim_re_verifies_and_a_tampered_row_does_not(pool: PgPool) {
+        let state = test_state(pool.clone()).await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let did = kp.did().to_string();
+        let repo = seed_repo(&did, "verify-repo", true);
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+
+        let path = uri(&did, "verify-repo", SHA_A);
+        let body = br#"{"state":"success","context":"ci/build"}"#;
+        let (resp, _) = post_really_signed(&state, &kp, &path, body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let claims = state.db.list_status_claims(&repo_id, SHA_A).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        re_verify(&claims[0]).expect("a stored claim must be re-verifiable from the row alone");
+
+        // The negative: change the claim's verdict in place. Nothing about the
+        // signature material changes, so this passes unless the stored body is
+        // what ties the row to the signature.
+        sqlx::query("UPDATE status_claims SET state='failure' WHERE id=$1")
+            .bind(&claims[0].id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let tampered = state.db.list_status_claims(&repo_id, SHA_A).await.unwrap();
+        assert_eq!(tampered[0].state, "failure");
+        let err = re_verify(&tampered[0])
+            .expect_err("a row whose state no longer matches the signed body must not re-verify");
+        assert!(
+            err.contains("row state"),
+            "the mutated verdict must be what refuses, got: {err}"
+        );
+    }
+
+    /// What `require_signature` puts in the extension is what the client sent,
+    /// field for field.
+    ///
+    /// Every other 201-path test injects the material by hand onto a bare router,
+    /// so a middleware that swapped, truncated or corrupted these fields would
+    /// leave all of them green. This drives the real router and compares the
+    /// persisted row against the headers that went on the wire.
+    #[sqlx::test]
+    async fn middleware_persists_the_material_the_client_actually_sent(pool: PgPool) {
+        use gitlawb_core::http_sig::{build_signing_string, COVERED_COMPONENTS};
+
+        let state = test_state(pool).await;
+        let kp = gitlawb_core::identity::Keypair::generate();
+        let did = kp.did().to_string();
+        let repo = seed_repo(&did, "material-wire-repo", true);
+        let repo_id = repo.id.clone();
+        state.db.create_repo(&repo).await.unwrap();
+
+        let path = uri(&did, "material-wire-repo", SHA_A);
+        let body = br#"{"state":"pending","context":"ci/wire","description":"in flight"}"#;
+        let (resp, signed) = post_really_signed(&state, &kp, &path, body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let claims = state.db.list_status_claims(&repo_id, SHA_A).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        let claim = &claims[0];
+
+        assert_eq!(
+            claim.signature, signed.signature,
+            "the stored Signature is the header the client sent"
+        );
+        assert_eq!(
+            claim.signature_input, signed.signature_input,
+            "the stored Signature-Input is the header the client sent"
+        );
+        assert_eq!(
+            claim.request_body,
+            body.to_vec(),
+            "the stored body is the request body, whole and unaltered"
+        );
+
+        // The signing string the node verified must be the one the client signed,
+        // rebuilt here independently rather than read back from the row.
+        let mut values = std::collections::HashMap::new();
+        values.insert("@method".to_string(), "POST".to_string());
+        values.insert("@path".to_string(), path.clone());
+        values.insert("content-digest".to_string(), signed.content_digest.clone());
+        let expected = build_signing_string(
+            COVERED_COMPONENTS,
+            signed.signature_input.strip_prefix("sig1=").unwrap(),
+            &values,
+        )
+        .unwrap();
+        assert_eq!(
+            claim.signing_string, expected,
+            "the stored signing string is the canonical string the client signed"
+        );
+
+        assert_eq!(claim.producer_did, did);
+        assert_eq!(claim.state, "pending");
+        assert_eq!(claim.context, "ci/wire");
+    }
+
     /// The route is registered on the production router AND its group reached the
     /// merge chain: an unsigned request is refused by the signature layer with 401,
     /// which a path axum never learned about would answer 404 instead.
@@ -1010,8 +1438,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO status_claims
              (id, repo_id, commit_sha, state, context, producer_did, authorizing_did,
-              signature, signature_input, signed_payload, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,'','',''::bytea,$8)",
+              signature, signature_input, signing_string, request_body, created_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'','','',''::bytea,$8)",
         )
         .bind(id)
         .bind(repo_id)
@@ -1566,9 +1994,9 @@ mod tests {
         sqlx::query(
             "INSERT INTO status_claims
              (id, repo_id, commit_sha, state, context, producer_did, authorizing_did,
-              signature, signature_input, signed_payload, created_at)
+              signature, signature_input, signing_string, request_body, created_at)
              SELECT md5(random()::text || g::text), $1, $2, 'success', $3, $4, $4,
-                    '', '', ''::bytea, '2026-01-01T00:00:00Z'
+                    '', '', '', ''::bytea, '2026-01-01T00:00:00Z'
              FROM generate_series(1, $5) g",
         )
         .bind(repo_id)
@@ -1587,11 +2015,11 @@ mod tests {
         sqlx::query(
             "INSERT INTO status_claims
              (id, repo_id, commit_sha, state, context, producer_did, authorizing_did,
-              signature, signature_input, signed_payload, created_at)
+              signature, signature_input, signing_string, request_body, created_at)
              SELECT md5(random()::text || g::text), $1,
                     substr(md5(g::text) || md5((g + 1)::text), 1, 40),
                     'success', 'ci/build', $2, $2,
-                    '', '', ''::bytea, '2026-01-01T00:00:00Z'
+                    '', '', '', ''::bytea, '2026-01-01T00:00:00Z'
              FROM generate_series(1, $3) g",
         )
         .bind(repo_id)

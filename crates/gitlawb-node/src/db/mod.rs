@@ -91,12 +91,20 @@ pub struct PullRequest {
 /// One append-only commit-status claim. A producer reporting twice for the same
 /// context leaves both rows; the visible status is a projection over the history,
 /// ordered on the database-assigned `seq`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// No `Serialize`: the signature material below must not reach a response body,
+/// and the write path's 201 uses a dedicated type
+/// ([`crate::api::status::CreatedStatus`]) that carries none of it. Dropping the
+/// derive is what stops the leak from reappearing by accident.
+#[derive(Debug, Clone, Deserialize)]
 pub struct StatusClaim {
     pub id: String,
     /// Database-assigned ordering key. Ignored on insert (see
     /// [`Db::insert_status_claim`]); nothing the producer supplies orders the
     /// projection.
+    // Read back by the row mapper and asserted in tests, but no production
+    // reader takes it off the record: the projection orders on `seq` inside SQL,
+    // and the write response reports the value the insert returned directly.
+    #[allow(dead_code)]
     pub seq: i64,
     pub repo_id: String,
     /// Lowercase 40-character hex commit SHA. Never existence-checked.
@@ -108,12 +116,21 @@ pub struct StatusClaim {
     pub producer_did: String,
     pub authorizing_did: String,
     /// The producer's RFC 9421 `Signature` header value, and below it the
-    /// `Signature-Input` and the canonical bytes they covered. Captured at write
-    /// time because none of it can be recovered once the request is gone, which
-    /// is what keeps a claim verifiable as history.
+    /// `Signature-Input`, the canonical string the signature was verified over,
+    /// and the request body itself. Captured at write time because none of it
+    /// can be recovered once the request is gone, which is what keeps a claim
+    /// verifiable as history.
+    ///
+    /// Both of the last two are needed, and neither substitutes for the other.
+    /// The signing string covers the body only through a content-digest, so with
+    /// the signing string alone a reader can confirm that somebody signed a
+    /// request carrying some digest but cannot show that THIS row is what they
+    /// signed. `request_body` is what closes that gap: recompute its digest,
+    /// find it in `signing_string`, verify `signature` over that string.
     pub signature: String,
     pub signature_input: String,
-    pub signed_payload: Vec<u8>,
+    pub signing_string: String,
+    pub request_body: Vec<u8>,
     /// Server-assigned rfc3339 timestamp. Display data only; ordering is `seq`.
     pub created_at: String,
 }
@@ -986,7 +1003,13 @@ const MIGRATIONS: &[Migration] = &[
                 authorizing_did  TEXT NOT NULL,
                 signature        TEXT NOT NULL,
                 signature_input  TEXT NOT NULL,
-                signed_payload   BYTEA NOT NULL,
+                -- The canonical RFC 9421 string the signature was verified over,
+                -- and the request body it covers through a content-digest. Two
+                -- columns because one cannot stand in for the other: the signing
+                -- string proves a signature exists, the body proves this row is
+                -- what it signed.
+                signing_string   TEXT NOT NULL,
+                request_body     BYTEA NOT NULL,
                 created_at       TEXT NOT NULL
             )"#,
             // Read path: every claim for one commit.
@@ -2151,8 +2174,8 @@ impl Db {
 const INSERT_STATUS_CLAIM_SQL: &str = "INSERT INTO status_claims
      (id, repo_id, commit_sha, state, context, target_url, description,
       producer_did, authorizing_did, signature, signature_input,
-      signed_payload, created_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      signing_string, request_body, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
      RETURNING seq";
 
 /// The bind chain for [`INSERT_STATUS_CLAIM_SQL`], shared by the plain and the
@@ -2172,7 +2195,8 @@ fn status_claim_insert(
         .bind(&claim.authorizing_did)
         .bind(&claim.signature)
         .bind(&claim.signature_input)
-        .bind(&claim.signed_payload)
+        .bind(&claim.signing_string)
+        .bind(&claim.request_body)
         .bind(&claim.created_at)
 }
 
@@ -2279,7 +2303,7 @@ impl Db {
         let rows = sqlx::query(
             "SELECT id,seq,repo_id,commit_sha,state,context,target_url,description,
                     producer_did,authorizing_did,signature,signature_input,
-                    signed_payload,created_at
+                    signing_string,request_body,created_at
              FROM status_claims WHERE repo_id=$1 AND commit_sha=$2 ORDER BY seq ASC",
         )
         .bind(repo_id)
@@ -2314,7 +2338,7 @@ impl Db {
                  SELECT DISTINCT ON (producer_did, context)
                         id,seq,repo_id,commit_sha,state,context,target_url,description,
                         producer_did,authorizing_did,signature,signature_input,
-                        signed_payload,created_at
+                        signing_string,request_body,created_at
                  FROM status_claims
                  WHERE repo_id=$1 AND commit_sha=$2 AND authorizing_did = ANY($3)
                  ORDER BY producer_did, context, seq DESC
@@ -3351,7 +3375,8 @@ fn row_to_status_claim(r: sqlx::postgres::PgRow) -> StatusClaim {
         authorizing_did: r.get("authorizing_did"),
         signature: r.get("signature"),
         signature_input: r.get("signature_input"),
-        signed_payload: r.get("signed_payload"),
+        signing_string: r.get("signing_string"),
+        request_body: r.get("request_body"),
         created_at: r.get("created_at"),
     }
 }
@@ -4360,7 +4385,9 @@ mod migration_tests {
             authorizing_did: "did:key:zOwner".to_string(),
             signature: "sig1=:YWJj:".to_string(),
             signature_input: "sig1=(\"@method\" \"@target-uri\");created=1754524800".to_string(),
-            signed_payload: b"POST /api/v1/repos/o/r/statuses/aaa\n{}".to_vec(),
+            signing_string: "\"@method\": POST\n\"@path\": /api/v1/repos/o/r/statuses/aaa"
+                .to_string(),
+            request_body: b"{\"state\":\"success\"}".to_vec(),
             created_at: "2026-08-07T00:00:00+00:00".to_string(),
         }
     }
@@ -4458,7 +4485,8 @@ mod migration_tests {
         assert_eq!(got.authorizing_did, full.authorizing_did);
         assert_eq!(got.signature, full.signature);
         assert_eq!(got.signature_input, full.signature_input);
-        assert_eq!(got.signed_payload, full.signed_payload);
+        assert_eq!(got.signing_string, full.signing_string);
+        assert_eq!(got.request_body, full.request_body);
         assert_eq!(got.created_at, full.created_at);
 
         let sparse_row = &claims[1];

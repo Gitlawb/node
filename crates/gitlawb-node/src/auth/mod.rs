@@ -34,6 +34,18 @@ pub struct SignatureMaterial {
     pub signature_input: String,
     /// The canonical bytes the signature covered.
     pub signing_string: String,
+    /// The buffered request body. The signing string covers it only through the
+    /// content-digest, so without these bytes a stored claim can be shown to
+    /// carry *a* valid signature over *some* digest and nothing more. Carried
+    /// here because the body is consumed downstream by the extractor and cannot
+    /// be recovered afterwards.
+    ///
+    /// `Bytes`, not `Vec<u8>`, because every signed request pays for this field
+    /// and a receive-pack POST is capped at GITLAWB_MAX_PACK_BYTES (2 GB by
+    /// default). Cloning the buffer here would double the peak memory of every
+    /// push to carry a value only the status write path ever reads; a `Bytes`
+    /// clone is a refcount bump over the buffer the middleware already holds.
+    pub body: axum::body::Bytes,
 }
 
 /// Whether `caller` is authorized to push to `record`.
@@ -257,17 +269,20 @@ pub async fn require_signature(request: Request, next: Next) -> Response {
 
     tracing::info!(did = %sig.key_id, "✓ authenticated request");
 
+    let material = SignatureMaterial {
+        signature: sig_header,
+        signature_input: sig_input,
+        signing_string,
+        body: body_bytes.clone(),
+    };
+
     let mut request = Request::from_parts(parts, Body::from(body_bytes));
     request
         .extensions_mut()
         .insert(AuthenticatedDid(sig.key_id.to_string()));
     // Carry the verified material forward for handlers that persist a signed
     // claim; none of it can be recovered once the request is gone.
-    request.extensions_mut().insert(SignatureMaterial {
-        signature: sig_header,
-        signature_input: sig_input,
-        signing_string,
-    });
+    request.extensions_mut().insert(material);
     next.run(request).await
 }
 
